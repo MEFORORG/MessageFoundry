@@ -182,6 +182,10 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # folded into [dicom].
 # pydicom is capped below 3.1 because the deflate guard replays private pydicom header readers, and the
 # agreement test (tests/test_dicom_deflate_guard.py) only proves the locked release (BACKLOG #1926).
+# pynetdicom stays capped below 4 (its original reason is unrecorded) because no 4.x exists to vet: none on
+# PyPI or in the GitHub tags, and upstream main is 3.1.0.dev0, still pydicom>=3,<4 (checked 2026-10-01,
+# BACKLOG #2505). Sources:
+# https://pypi.org/pypi/pynetdicom/json and https://github.com/pydicom/pynetdicom/tags
 dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<3.1"]
 # Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so
 # the tolerant X12Peek/X12Message hot path (the default) never needs it. pyx12 is the reference
@@ -233,7 +237,14 @@ webauthn = ["webauthn>=3.0.0,<4"]
 # (both ubiquitous, mature; the lock resolves urllib3>=2.7.0 — CVE-2025-50181/50182 SSRF-redirect fixes)
 # plus charset-normalizer/idna/certifi. hvac ships NO type stubs — mypy-strict containment lives inside
 # store/keyprovider_vault.py (a targeted typed local), never a repo-wide ignore.
-vault = ["hvac>=2.3.0,<3"]
+# requests>=2.32.2 is DECLARED, not left to hvac (vault BACKLOG #2548): the strict reply adapter
+# (transports/strict_requests.py) runs most of its send-time hop checks (#300, #2317, the strict-head
+# and narrowed-pool checks) in HTTPAdapter's `get_connection_with_tls_context`, a public hook requests
+# first calls in 2.32.2. 2.32.0 and 2.32.1 call a private `_get_connection` instead, and older
+# releases neither, so on those the checks would silently not run. hvac's own requirement does not
+# imply 2.32.2. (The #2547 proxy-credential check also runs in `proxy_manager_for`, on any version.)
+# tests/test_vault_extra_floor.py pins this floor against the hook.
+vault = ["hvac>=2.3.0,<3", "requests>=2.32.2"]
 # Coverage-guided fuzzing of the tolerant parsers (ADR 0191) -- the `fuzz/` harness and the advisory
 # `.github/workflows/fuzz.yml` job, never the engine. Atheris is Google's libFuzzer binding for
 # CPython; it instruments the parser at import and mutates toward new branches.

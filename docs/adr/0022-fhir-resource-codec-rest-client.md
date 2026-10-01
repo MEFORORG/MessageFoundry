@@ -221,7 +221,13 @@ str) -> DeliveryResponse | None`, optional `aclose`/`test_connection` overrides,
      #1965, ASVS 14.2.1, owner ruling R3):** the engine now sends an update as the one entry of a `transaction`
      Bundle POSTed to `{base}`, with `PUT {ResourceType}/{id}` in the entry's `request`, so the message-derived
      id never appears in the request URL. See [CONNECTIONS.md](../CONNECTIONS.md), "An update keeps the
-     resource id out of the URL";
+     resource id out of the URL". **Amended again (vault BACKLOG #2550, 2026-10-01):** at least Epic and
+     Oracle Health document no `transaction` interaction, so a connection may opt back into the plain
+     `PUT {base}/{ResourceType}/{id}` with `update_url_form="path"`, and `if-match` then carries its ETag
+     in the `If-Match` header again. The id stays gated to the FHIR id grammar, a dot-only id is refused,
+     and the default stays `"transaction"`. The opt-in is a listed loosening of R3 in
+     [SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md), warned at construction and named by
+     `messagefoundry check`;
    - **Bundle transaction/batch** — `POST {base}` with a `Bundle` body (`Bundle.type =
      transaction`/`batch`). The engine *builds/posts* the Bundle; the FHIR **server** applies it (transaction =
      all-or-nothing, batch = independent per entry) — this is a server-side semantic the engine never executes.

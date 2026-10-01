@@ -1009,3 +1009,177 @@ async def test_the_malformed_reply_arm_leaves_the_probe_neighbours_alone() -> No
     with pytest.raises(DeliveryError) as ei:
         await dest.test_connection()
     assert str(ei.value) == f"FHIR {BASE} rejected an invalid request value"
+
+
+# --- vault BACKLOG #2550: update_url_form="path", the listed opt-in back to PUT {base}/{type}/{id} ---
+
+
+def test_update_url_form_defaults_to_transaction() -> None:
+    # Control arm. The factory default and the connector default agree, and the default still
+    # resolves an update to a transaction ENTRY rather than a request URL.
+    assert FHIR(url=BASE).settings["update_url_form"] == "transaction"
+    dest = _dest(interaction="update")
+    assert dest.update_url_form == "transaction"
+    assert dest._resolve_request(UPDATE_1965) == ("PUT", f"Patient/{ID_1965}", {}, True)
+
+
+@pytest.mark.parametrize(
+    ("over", "if_match"),
+    [({"interaction": "update"}, None), ({"conditional": "if-match"}, 'W/"7"')],
+    ids=["update", "if-match"],
+)
+async def test_path_form_sends_a_plain_put_with_the_etag_in_if_match(
+    over: dict[str, str], if_match: str | None
+) -> None:
+    dest = _dest(update_url_form="path", **over)
+    opener = _FakeOpener(body=UPDATE_1965.encode())
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965)
+    [req] = opener.requests
+    assert req.method == "PUT"
+    assert req.full_url == f"{BASE}/Patient/{ID_1965}"
+    # The resource goes out as itself, not wrapped in a Bundle.
+    assert req.data == UPDATE_1965.encode("utf-8")
+    assert req.get_header("If-match") == if_match
+
+
+async def test_path_form_keeps_a_static_conditional_header_on_the_put() -> None:
+    # The transaction form moves a static If-Match into the entry; the path form has no entry, so
+    # the header stays on the request it qualifies.
+    dest = _dest(interaction="update", update_url_form="path", headers={"If-Match": 'W/"1"'})
+    assert dest._static_conditionals == {}
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965)
+    assert opener.requests[0].get_header("If-match") == 'W/"1"'
+
+
+async def test_path_form_captures_the_plain_resource_reply() -> None:
+    # Capture is back to the plain-resource form: the reply is the resource, and ETag comes from
+    # the reply header, as on any PUT.
+    reply_headers = email.message.Message()
+    reply_headers["ETag"] = 'W/"8"'
+    dest = _dest(
+        interaction="update",
+        update_url_form="path",
+        capture_response=True,
+        capture_response_headers=["ETag"],
+    )
+    dest._opener = _FakeOpener(body=UPDATE_1965.encode(), headers=reply_headers)  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    assert resp is not None
+    assert (resp.outcome, resp.body, resp.headers) == ("accepted", UPDATE_1965, {"ETag": 'W/"8"'})
+
+
+async def test_path_form_classifies_an_error_reply_on_the_http_status() -> None:
+    dest = _dest(conditional="if-match", update_url_form="path")
+    dest._opener = _FakeOpener(_http_error(412))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and "HTTP 412" in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        ".",
+        "..",
+        "...",
+        "a/b",
+        "../$reindex",
+        "p?x=1",
+        "p#f",
+        "p 1",
+        "p%2F1",
+        "x" * 65,
+        "p\r\n1",
+        "",
+    ],
+)
+async def test_path_form_refuses_an_id_outside_the_grammar_and_never_sends_it(bad_id: str) -> None:
+    dest = _dest(interaction="update", update_url_form="path")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    body = json.dumps({"resourceType": "Patient", "id": bad_id})
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(body)
+    assert ei.value.permanent is True
+    assert opener.requests == []
+
+
+async def test_path_form_admits_a_grammar_id_with_dots_inside() -> None:
+    # Control arm for the dot-only refusal: a dot is in the id grammar, and only an id made of
+    # nothing else is refused.
+    dest = _dest(interaction="update", update_url_form="path")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(json.dumps({"resourceType": "Patient", "id": "a.b-1"}))
+    assert opener.requests[0].full_url == f"{BASE}/Patient/a.b-1"
+
+
+def test_path_form_warns_at_construction_naming_the_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.fhir"):
+        _dest(interaction="update")
+    assert "update_url_form" not in caplog.text  # control: the default is silent
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.fhir"):
+        _dest(interaction="update", update_url_form="path")
+    assert "OB_FHIR" in caplog.text and "update_url_form='path'" in caplog.text
+    assert "owner ruling R3" in caplog.text and "ASVS 14.2.1" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"interaction": "create"},
+        {"interaction": "transaction"},
+        {"conditional": "if-none-exist", "conditional_query": "identifier=s|v"},
+        {"conditional": "conditional-update", "conditional_query": "identifier=s|v"},
+    ],
+    ids=["create", "transaction", "if-none-exist", "conditional-update"],
+)
+def test_path_form_is_refused_where_it_would_do_nothing(over: dict[str, str]) -> None:
+    # Both layers refuse: the factory, so the loaded graph never holds one and `check` never names
+    # one, and the connector, for settings that did not come through the factory.
+    with pytest.raises(ValueError, match="update_url_form='path' applies only"):
+        FHIR(url=BASE, update_url_form="path", **over)  # type: ignore[arg-type]
+    settings = {**FHIR(url=BASE, **over).settings, "update_url_form": "path"}  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="update_url_form='path' applies only"):
+        build_destination(Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings))
+
+
+def test_unknown_update_url_form_is_refused() -> None:
+    with pytest.raises(ValueError, match="update_url_form must be one of"):
+        _dest(interaction="update", update_url_form="query")
+
+
+def _write_feed(tmp_path: Any, body: str) -> Any:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("from messagefoundry import FHIR, outbound\n" + body, "utf-8")
+    return cfg
+
+
+def test_check_names_every_path_form_connection(tmp_path: Any) -> None:
+    from messagefoundry.checks import run_checks
+    from messagefoundry.config.wiring import load_config, path_form_fhir_updates
+
+    cfg = _write_feed(
+        tmp_path,
+        f'outbound("OB_EPIC", FHIR(url="{BASE}", interaction="update", update_url_form="path"))\n'
+        f'outbound("OB_DEFAULT", FHIR(url="{BASE}", interaction="update"))\n',
+    )
+    assert path_form_fhir_updates(load_config(cfg)) == ["OB_EPIC"]
+    [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
+    assert r.ok and not r.required and not r.skipped
+    assert "OB_EPIC" in r.detail and "OB_DEFAULT" not in r.detail
+    assert "owner ruling R3" in r.detail
+
+
+def test_check_says_none_when_no_connection_takes_the_path_form(tmp_path: Any) -> None:
+    from messagefoundry.checks import run_checks
+
+    cfg = _write_feed(tmp_path, f'outbound("OB", FHIR(url="{BASE}", interaction="update"))\n')
+    [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
+    assert "no FHIR connection sets update_url_form='path'" in r.detail

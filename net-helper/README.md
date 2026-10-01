@@ -154,7 +154,8 @@ rewrite a log or replace an `nssm.exe` kept there.
 
 1. [Build the helper](#build-it).
 2. Download the NSSM archive that `$NssmUrl` names in
-   [install-service.ps1](../scripts/service/install-service.ps1). That script's `Resolve-Nssm` uses the
+   [install-service.ps1](../scripts/service/install-service.ps1). If that host is down, use a copy
+   from `$NssmMirrorUrls` in the same script; step 3 checks it the same way. That script's `Resolve-Nssm` uses the
    same archive.
 3. Check it: `(Get-FileHash <archive>).Hash -eq '<the $NssmSha256 value>'` must print `True`.
 4. Extract the `nssm.exe` under `win64` from the archive into the build output folder.

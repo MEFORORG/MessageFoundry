@@ -41,7 +41,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
 from fastapi import (
@@ -2768,8 +2768,41 @@ def create_app(
         # Controlling an inbound connection is scoped per-channel (the connection IS the channel).
         # `client` (ADR 0150) is the denied caller's address, threaded from the route's request.
         if not identity.can_access_channel(name):
-            await _audit_channel_denied(engine, identity, name, client)
-            raise HTTPException(403, "not authorized for this connection")
+            await _deny_connection(engine, identity, name, client)
+
+    async def _deny_connection(
+        engine: Engine, identity: Identity, name: str, client: str | None
+    ) -> NoReturn:
+        # The one refusal a channel-scoped caller gets for a connection it may not reach. It names
+        # no reason on purpose: a body naming "shared outbound" would tell an outbound apart from an
+        # out-of-scope inbound or a name that exists nowhere (BACKLOG #2551).
+        await _audit_channel_denied(engine, identity, name, client)
+        raise HTTPException(403, "not authorized for this connection")
+
+    async def _guarded_direction(
+        engine: Engine, identity: Identity, name: str, client: str | None
+    ) -> tuple[RegistryRunner, Literal["in", "out"]]:
+        """The runner, and which side of its registry holds ``name``, checked against the caller's channel scope
+        BEFORE its existence is (BACKLOG #2551).
+
+        A channel-scoped caller gets one answer, :func:`_deny_connection`, for an inbound outside its
+        scope, for any outbound (an outbound spans channels), and for a name that exists nowhere. Had
+        the 404 come first, on a first deployment such a caller could tell which names exist by
+        probing. An unscoped caller, or a scoped one naming a channel in its own scope, still gets
+        404 for an unknown name. An inbound wins when a name is both, as on the control routes.
+        Raises 503 when the engine has no runner."""
+        rr = engine.registry_runner
+        if rr is None:
+            raise HTTPException(503, "engine not started")
+        if name in rr.registry.inbound:
+            await _control_guard(engine, identity, name, client)  # inbound is per-channel
+            return rr, "in"
+        if name in rr.registry.outbound:
+            if identity.allowed_channels is not None:
+                await _deny_connection(engine, identity, name, client)
+            return rr, "out"
+        await _control_guard(engine, identity, name, client)
+        raise HTTPException(404, f"no such connection: {name}")
 
     async def _dual_role_control(
         engine: Engine,
@@ -2815,11 +2848,9 @@ def create_app(
             return {"name": name, "running": running}
         if rr is not None and want_out and name in rr.registry.outbound:
             # A shared outbound spans channels, so a channel-scoped user can't control one (mirrors purge).
+            # The refusal is the one an unknown name gets, so it names no outbound (BACKLOG #2551).
             if identity.allowed_channels is not None:
-                await _audit_channel_denied(engine, identity, name, client)
-                raise HTTPException(
-                    403, "channel-scoped users cannot control a shared outbound connection"
-                )
+                await _deny_connection(engine, identity, name, client)
             try:
                 if action == "start":
                     await rr.start_outbound(name)
@@ -2952,14 +2983,9 @@ def create_app(
     ) -> ConnectionMetadata:
         """The UNREDACTED metadata row for ``name``, after the per-channel scope check. Only
         :func:`connection_metadata` calls it, and it redacts the row before returning it."""
-        rr = engine.registry_runner
-        if rr is None:
-            raise HTTPException(503, "engine not started")
-        ic = rr.registry.inbound.get(name)
-        if ic is not None:
-            await _control_guard(
-                engine, identity, name, client_ip(request)
-            )  # inbound config is per-channel
+        rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
+        if direction == "in":
+            ic = rr.registry.inbound[name]
             return ConnectionMetadata(
                 name=name,
                 direction="in",
@@ -2972,28 +2998,19 @@ def create_app(
                 error=rr.inbound_failed(name) or rr.inbound_filtered(name),
                 fault=_fault(rr.inbound_failed(name), rr.inbound_filtered(name)),
             )
-        oc = rr.registry.outbound.get(name)
-        if oc is not None:
-            if identity.allowed_channels is not None:
-                # An outbound spans channels, so a channel-scoped user can't read a shared one — the
-                # same boundary /test and /purge enforce (don't disclose shared-outbound topology).
-                await _audit_channel_denied(engine, identity, name, client_ip(request))
-                raise HTTPException(
-                    403, "channel-scoped users cannot read a shared outbound connection"
-                )
-            return ConnectionMetadata(
-                name=name,
-                direction="out",
-                method=oc.spec.type.value,
-                running=rr.running,
-                metadata=dict(oc.metadata) if oc.metadata else None,
-                settings=redacted_settings(oc.spec.settings),
-                simulated=rr.outbound_simulated(name),
-                # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
-                error=rr.outbound_failed(name) or rr.outbound_filtered(name),
-                fault=_fault(rr.outbound_failed(name), rr.outbound_filtered(name)),
-            )
-        raise HTTPException(404, f"no such connection: {name}")
+        oc = rr.registry.outbound[name]
+        return ConnectionMetadata(
+            name=name,
+            direction="out",
+            method=oc.spec.type.value,
+            running=rr.running,
+            metadata=dict(oc.metadata) if oc.metadata else None,
+            settings=redacted_settings(oc.spec.settings),
+            simulated=rr.outbound_simulated(name),
+            # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
+            error=rr.outbound_failed(name) or rr.outbound_filtered(name),
+            fault=_fault(rr.outbound_failed(name), rr.outbound_filtered(name)),
+        )
 
     @app.post("/connections/{name}/test", response_model=ConnectionTestResult)
     async def connection_test(
@@ -3008,24 +3025,8 @@ def create_app(
         Paced by the #193 per-actor floor (ASVS 2.4.2): the probe fires a **live outbound dial** (a
         reachability connect), so an unpaced actor could amplify it into an SSRF/port-scan sweep. It
         draws from the same shared admin-write bucket as the other mutating flows."""
-        rr = engine.registry_runner
-        if rr is None:
-            raise HTTPException(503, "engine not started")
-        is_inbound = name in rr.registry.inbound
-        if not is_inbound and name not in rr.registry.outbound:
-            raise HTTPException(404, f"no such connection: {name}")
-        direction = "in" if is_inbound else "out"
-        if is_inbound:
-            await _control_guard(
-                engine, identity, name, client_ip(request)
-            )  # inbound test is per-channel
-        elif identity.allowed_channels is not None:
-            # An outbound spans channels, so a channel-scoped user can't probe a shared one (like purge).
-            await _audit_channel_denied(engine, identity, name, client_ip(request))
-            raise HTTPException(
-                403, "channel-scoped users cannot test a shared outbound connection"
-            )
-
+        # Scope before existence, so a scoped caller cannot probe for names (BACKLOG #2551).
+        rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
         result = await _run_connection_test(rr, name, direction)
         await engine.store.record_audit(
             "connection_test",
@@ -3060,28 +3061,12 @@ def create_app(
         an alternate-credential share gets a clear, *targeted* "the credential reaches the share / does
         not" answer rather than the generic connection test. Disjoint from ``/test`` (a separate route);
         audited as ``connection_credential_test``."""
-        rr = engine.registry_runner
-        if rr is None:
-            raise HTTPException(503, "engine not started")
-        conn = rr.registry.inbound.get(name) or rr.registry.outbound.get(name)
-        if conn is None:
-            raise HTTPException(404, f"no such connection: {name}")
-        is_inbound = name in rr.registry.inbound
-        # Authorize BEFORE disclosing anything about the connection's type / credential config — so an
-        # out-of-scope channel-scoped caller gets a UNIFORM 403 regardless of whether the connection is a
-        # File endpoint with an alt credential (which would otherwise leak via the 400 below). Matches the
-        # sibling /test route and the _dual_role_control "guard first so a scoped user gets 403 rather than
-        # learning about an out-of-scope name" convention.
-        if is_inbound:
-            await _control_guard(
-                engine, identity, name, client_ip(request)
-            )  # inbound test is per-channel
-        elif identity.allowed_channels is not None:
-            # An outbound spans channels, so a channel-scoped user can't probe a shared one (like /test).
-            await _audit_channel_denied(engine, identity, name, client_ip(request))
-            raise HTTPException(
-                403, "channel-scoped users cannot test a shared outbound connection"
-            )
+        # Authorize BEFORE disclosing anything about the connection — its existence included (BACKLOG
+        # #2551) — so an out-of-scope channel-scoped caller gets a UNIFORM 403 whether the name is a
+        # File endpoint with an alt credential (which would otherwise leak via the 400 below), any other
+        # connection, or no connection at all. Matches the sibling /test and /metadata routes.
+        rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
+        conn = rr.registry.inbound[name] if direction == "in" else rr.registry.outbound[name]
         if (
             conn.spec.type is not ConnectorType.FILE
             or "credential_username" not in conn.spec.settings
@@ -3094,7 +3079,6 @@ def create_app(
                 f"connection {name!r} has no alternate Windows credential configured "
                 "(set File credential_username / credential_password)",
             )
-        direction = "in" if is_inbound else "out"
         result = await _run_connection_test(rr, name, direction)
         await engine.store.record_audit(
             "connection_credential_test",

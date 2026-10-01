@@ -87,6 +87,16 @@ $ErrorActionPreference = "Stop"
 # copy is checked against before it runs.
 $NssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
 $NssmSha256 = "727D1E42275C605E0F04ABA98095C38A8E1E46DEF453CDFFCE42869428AA6743"
+# Tried in order when $NssmUrl fails, so an nssm.cc outage does not stop an install (BACKLOG #2504).
+# A mirror is as safe as the primary only because every download is checked against $NssmSha256
+# before it is opened. Add only a copy whose bytes you have hashed against that pin.
+#
+# The Internet Archive's raw capture (the id_ suffix) of $NssmUrl. Measured 2026-10-01: the archive
+# hashes to $NssmSha256 and its win64 nssm.exe to $NssmExeSha256. The Archive recorded one payload
+# digest for this URL in every capture from 2015 to 2025.
+$NssmMirrorUrls = @(
+    "https://web.archive.org/web/20250427013751id_/https://nssm.cc/release/nssm-2.24.zip"
+)
 
 # BEGIN pinned-hash check (kept byte-identical in install-service.ps1 and install-net-helper.ps1;
 # guarded by tests/test_nssm_pin.py, which fails if the two copies drift)
@@ -501,9 +511,13 @@ function Save-PinnedNssm {
     <#
       Download the pinned NSSM archive, check it against $NssmSha256, and write its win64 nssm.exe to
       $Destination. The caller checks the written file against $NssmExeSha256.
+
+      $NssmUrl first, then each of $NssmMirrorUrls. The first download that matches $NssmSha256 is
+      the one used. A source that fails, or serves other bytes, is skipped with a warning; nothing
+      from it is opened. When no source matches, this throws and writes nothing.
     #>
     param([Parameter(Mandatory)][string]$Destination)
-    Write-Host "NSSM not found - downloading $NssmUrl ..."
+    Write-Host "NSSM not found - downloading the pinned release ..."
     # GetTempPath, not $env:TEMP. The variable is unset on Linux pwsh, where the tests lift this
     # function, and Join-Path refuses a null. On Windows GetTempPath reads TMP, then TEMP, then falls
     # back to the profile, so it names the same folder.
@@ -517,17 +531,51 @@ function Save-PinnedNssm {
     $work = Join-Path $temp ("nssm-mefor-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $work | Out-Null
     try {
-        $zip = Join-Path $work "nssm-2.24.zip"
         $extract = Join-Path $work "extract"
         [Net.ServicePointManager]::SecurityProtocol =
             [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $NssmUrl -OutFile $zip -UseBasicParsing
-        $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash
-        if ($hash -ne $NssmSha256) {
-            Remove-Item $zip -Force -ErrorAction SilentlyContinue
-            throw "NSSM download failed integrity check (got $hash, expected $NssmSha256)."
+        # Timeouts, so a source that hangs does not keep the mirrors from being tried. -TimeoutSec
+        # covers the connection and the response headers. A body that stalls after them is covered
+        # by -OperationTimeoutSeconds on PowerShell 7.4 and later, which otherwise waits forever,
+        # and by the framework's own read timeout, about five minutes, on Windows PowerShell 5.1.
+        $timeouts = @{ TimeoutSec = 60 }
+        if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey("OperationTimeoutSeconds")) {
+            $timeouts["OperationTimeoutSeconds"] = 180
         }
-        Expand-Archive -Path $zip -DestinationPath $extract
+        $failures = @()
+        $verified = $false
+        $attempt = 0
+        foreach ($url in @(@($NssmUrl) + @($NssmMirrorUrls) | Where-Object { $_ })) {
+            # A file of its own per source, so a rejected download that cannot be deleted is never
+            # mistaken for the next source's.
+            $attempt++
+            $zip = Join-Path $work "nssm-2.24-$attempt.zip"
+            Write-Host "  trying $url"
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing @timeouts
+                $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
+            } catch {
+                $failures += "$url : $($_.Exception.Message)"
+                Write-Warning "NSSM download failed from $url : $($_.Exception.Message)"
+                continue
+            }
+            if ($hash -ne $NssmSha256) {
+                Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+                $failures += "$url : failed integrity check (got $hash, expected $NssmSha256)"
+                Write-Warning ("NSSM download from $url failed integrity check (got $hash, " +
+                    "expected $NssmSha256). Not using it.")
+                continue
+            }
+            $verified = $true
+            break
+        }
+        if (-not $verified) {
+            # Every download is in $work, which the finally below deletes.
+            throw ("NSSM download failed from every source, so nothing was installed. With no " +
+                "internet access, pass -NssmPath with the win64 nssm.exe from nssm-2.24.zip. " +
+                "Sources: " + ($failures -join " | "))
+        }
+        Expand-Archive -LiteralPath $zip -DestinationPath $extract
         $exe = Get-ChildItem -Path $extract -Recurse -Filter nssm.exe |
             Where-Object { $_.Directory.Name -eq "win64" } | Select-Object -First 1
         if (-not $exe) { throw "win64\nssm.exe not found in the downloaded NSSM archive." }

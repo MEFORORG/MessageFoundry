@@ -51,9 +51,11 @@ import stat
 import subprocess
 import sys
 import uuid
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -73,6 +75,8 @@ _BEGIN = "# BEGIN pinned-hash check"
 _END = "# END pinned-hash check"
 _PIN_RE = re.compile(r'^\$NssmExeSha256\s*=\s*"([^"]*)"', re.M)
 _ARCHIVE_RE = re.compile(r'\$NssmSha256\s*=\s*"([^"]*)"')
+# install-service.ps1's top-level download settings, which the harness runs as written (#2504).
+_DOWNLOAD_VARS = ("NssmUrl", "NssmMirrorUrls", "NssmSha256")
 
 # Stand-ins for nssm.exe. Never executed: every function under test only hashes or copies them.
 _GOOD = b"stand-in for the pinned nssm.exe\n"
@@ -166,7 +170,20 @@ _FUNCTIONS = {
 _STUBS = """
   $broadFor = @{}
   function Get-BroadWriteHolders { param($Path) if ($broadFor.ContainsKey("$Path")) { $broadFor["$Path"] } }
-  function Invoke-WebRequest { throw 'NETWORK TOUCHED' }
+  # The network is refused unless a case serves a URL: $webFiles maps a URL to the file it returns,
+  # $webErrors to the message it fails with. Every URL asked for is recorded, in order.
+  $webFiles = @{}
+  $webErrors = @{}
+  $webCalls = [Collections.Generic.List[string]]::new()
+  $webTimeouts = [Collections.Generic.List[string]]::new()
+  function Invoke-WebRequest {
+    param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec, $OperationTimeoutSeconds)
+    $webCalls.Add("$Uri")
+    $webTimeouts.Add("$TimeoutSec/$OperationTimeoutSeconds")
+    if ($webErrors.ContainsKey("$Uri")) { throw $webErrors["$Uri"] }
+    if (-not $webFiles.ContainsKey("$Uri")) { throw 'NETWORK TOUCHED' }
+    Copy-Item -LiteralPath $webFiles["$Uri"] -Destination $OutFile -Force
+  }
   $icaclsCalls = [Collections.Generic.List[string]]::new()
   function icacls { $icaclsCalls.Add(($args -join ' ')) }
   $registry = @{}
@@ -198,6 +215,8 @@ _STUBS = """
 """
 
 _CASES = r"""
+  # The real download sources, in the order Save-PinnedNssm tries them.
+  $res['sources'] = @(@($NssmUrl) + @($NssmMirrorUrls))
   # --- Get-FilePinProblem
   Invoke-Case 'pin-good' 'path-none' { Get-FilePinProblem -Path $good -Expected $NssmExeSha256 }
   Invoke-Case 'pin-good-lower' 'path-none' {
@@ -217,9 +236,42 @@ _CASES = r"""
   # that on every host.
   $savedTemp = $env:TEMP; $savedTmp = $env:TMP
   $env:TEMP = $null; $env:TMP = $null
+  $webCalls.Clear(); $webTimeouts.Clear()
   Invoke-Case 'install-path-bad' 'path-bad' {
     Resolve-Nssm -NssmDir (Join-Path $root 'home-path-bad') }
+  $res['install-path-bad-calls'] = @($webCalls)
+  $res['install-path-bad-timeouts'] = @($webTimeouts)
   $env:TEMP = $savedTemp; $env:TMP = $savedTmp
+  # --- install-service.ps1 Save-PinnedNssm: the primary, then each mirror (#2504). Stand-in URLs and
+  # a stand-in archive pin, so each case says exactly which source serves what.
+  $primary = 'https://primary.invalid/nssm-2.24.zip'
+  $mirrorA = 'https://mirror-a.invalid/nssm-2.24.zip'
+  $mirrorB = 'https://mirror-b.invalid/nssm-2.24.zip'
+  function Invoke-DownloadCase([string]$Key, [hashtable]$Files, [hashtable]$Errors, [scriptblock]$Action) {
+    $webFiles = $Files; $webErrors = $Errors; $webCalls.Clear()
+    $NssmUrl = $primary; $NssmMirrorUrls = @($mirrorA, $mirrorB); $NssmSha256 = $zipGoodSha
+    $dest = Join-Path $root "dl-$Key/nssm.exe"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+    if (-not $Action) { $Action = { Save-PinnedNssm -Destination $dest } }
+    Invoke-Case $Key 'path-none' $Action
+    $res["$Key-calls"] = @($webCalls)
+    $res["$Key-written"] = $(if (Test-Path -LiteralPath $dest) {
+      (Get-FileHash -Algorithm SHA256 -LiteralPath $dest).Hash } else { '' })
+  }
+  $down = '(503) Server Unavailable'
+  Invoke-DownloadCase 'dl-primary-good' @{ $primary = $zipGood } @{}
+  Invoke-DownloadCase 'dl-primary-down' @{ $mirrorA = $zipGood } @{ $primary = $down }
+  Invoke-DownloadCase 'dl-primary-tampered' @{ $primary = $zipBad; $mirrorA = $zipGood } @{}
+  Invoke-DownloadCase 'dl-second-mirror' @{ $mirrorB = $zipGood } @{
+    $primary = $down; $mirrorA = 'The operation has timed out.' }
+  Invoke-DownloadCase 'dl-mirrors-tampered' @{ $mirrorA = $zipBad; $mirrorB = $zipBad } @{
+    $primary = $down }
+  Invoke-DownloadCase 'dl-all-down' @{} @{ $primary = $down; $mirrorA = $down; $mirrorB = $down }
+  # The same, end to end through the resolver: what reaches -NssmDir.
+  Invoke-DownloadCase 'install-download-mirror' @{ $mirrorA = $zipGood } @{ $primary = $down } {
+    Resolve-Nssm -NssmDir (Join-Path $root 'home-download-mirror') }
+  Invoke-DownloadCase 'install-download-tampered' @{ $mirrorA = $zipBad; $mirrorB = $zipBad } @{
+    $primary = $down } { Resolve-Nssm -NssmDir (Join-Path $root 'home-download-tampered') }
   Invoke-Case 'install-home-good' 'path-bad' {
     Resolve-Nssm -NssmDir (Join-Path $root 'home-good') }
   Invoke-Case 'install-home-bad' 'path-good' {
@@ -361,6 +413,15 @@ _AST_PROBES = """
 """
 
 
+def _archive(path: Path, win64: bytes) -> Path:
+    """A stand-in NSSM release archive. Its win32 copy is always the planted bytes, so a download
+    that took the wrong architecture's nssm.exe would fail the binary pin."""
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("nssm-2.24/win32/nssm.exe", _BAD)
+        zf.writestr("nssm-2.24/win64/nssm.exe", win64)
+    return path
+
+
 def _stand_in(directory: Path, data: bytes) -> None:
     """An nssm on a PATH directory: nssm.exe for Windows, an executable `nssm` elsewhere."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -382,6 +443,8 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     _stand_in(root / "path-good", _GOOD)
     _stand_in(root / "path-bad", _BAD)
     (root / "path-none").mkdir()
+    zip_good = _archive(root / "archive-good.zip", _GOOD)
+    zip_bad = _archive(root / "archive-bad.zip", _BAD)
 
     lines = ["& {", "  $ErrorActionPreference = 'Stop'"]
     for script, names in _FUNCTIONS.items():
@@ -396,10 +459,26 @@ def report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
             "    . ([scriptblock]::Create($fn.Extent.Text))",
             "  }",
         ]
+    # The download sources and the archive pin, run from install-service.ps1's own top-level
+    # assignments, so a case that refuses the network sees the real list.
+    lines += [
+        "  $tree = [System.Management.Automation.Language.Parser]::ParseFile("
+        f"{_psq(str(_path('install-service.ps1')))}, [ref]$null, [ref]$null)",
+        "  foreach ($v in @(" + ", ".join(_psq(v) for v in _DOWNLOAD_VARS) + ")) {",
+        "    $a = @($tree.EndBlock.Statements | Where-Object {",
+        "      $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and",
+        "      $_.Left.VariablePath.UserPath -eq $v })",
+        '    if ($a.Count -ne 1) { throw "install-service.ps1 must assign $v once at top level" }',
+        "    . ([scriptblock]::Create($a[0].Extent.Text))",
+        "  }",
+    ]
     lines += [
         _STUBS,
         # The pin is the stand-in's hash, so the positive controls have something to match.
         f"  $NssmExeSha256 = {_psq(_sha(_GOOD))}",
+        f"  $zipGood = {_psq(str(zip_good))}",
+        f"  $zipBad = {_psq(str(zip_bad))}",
+        f"  $zipGoodSha = {_psq(_sha(zip_good.read_bytes()))}",
         f"  $root = {_psq(str(root))}",
         f"  $scripts = {_psq(str(_DIR))}",
         "  $res = @{}",
@@ -527,10 +606,116 @@ def test_the_installer_skips_a_path_copy_that_does_not_match(report: dict[str, A
     # It went on to the download, which the stub refuses: proof the PATH copy was not used.
     assert case["threw"] is True and "NETWORK TOUCHED" in str(case["error"]), case
     warnings = case["warnings"]
-    assert isinstance(warnings, list) and len(warnings) == 1, warnings
-    assert "PATH" in warnings[0] and "-NssmPath" in warnings[0], warnings[0]
-    _names_both_hashes(warnings[0])
+    assert isinstance(warnings, list), warnings
+    # The download warns once per source it could not use; those are counted in the next test.
+    on_path = [w for w in warnings if "Not using the nssm on PATH" in w]
+    assert len(on_path) == 1, warnings
+    assert "-NssmPath" in on_path[0], on_path[0]
+    _names_both_hashes(on_path[0])
     assert report["homes"]["home-path-bad"] == "", "the mismatched PATH copy was copied in"
+
+
+# ------------------------------------------------------------- the download and its mirrors (#2504)
+
+
+def test_the_real_sources_are_https_with_nssm_cc_first_and_a_mirror_elsewhere(
+    report: dict[str, Any],
+) -> None:
+    sources = report["sources"]
+    assert isinstance(sources, list) and len(sources) >= 2, (
+        f"install-service.ps1 should try nssm.cc and at least one mirror, so an nssm.cc outage does "
+        f"not stop an install: {sources}"
+    )
+    assert all(isinstance(s, str) and s.startswith("https://") for s in sources), sources
+    assert urlsplit(sources[0]).hostname == "nssm.cc", f"nssm.cc must be tried first: {sources}"
+    assert len(set(sources)) == len(sources), f"a source is listed twice: {sources}"
+    assert any(urlsplit(s).hostname != "nssm.cc" for s in sources[1:]), (
+        f"every fallback is on nssm.cc, so an nssm.cc outage still stops an install: {sources}"
+    )
+    # With the network refused, every real source was asked, in order, and each failure warned.
+    assert report["install-path-bad-calls"] == sources, report["install-path-bad-calls"]
+    # Each with both timeouts, since the stub takes both, as PowerShell 7.4 does: without them a
+    # source that hangs, before or after its headers, keeps the mirrors from being tried.
+    timeouts = report["install-path-bad-timeouts"]
+    assert len(timeouts) == len(sources), timeouts
+    for pair in timeouts:
+        connect, operation = str(pair).split("/")
+        assert connect.isdigit() and int(connect) > 0, f"a download has no -TimeoutSec: {pair}"
+        assert operation.isdigit() and int(operation) > 0, (
+            f"a download has no -OperationTimeoutSeconds where the cmdlet takes one: {pair}"
+        )
+    case = _case(report, "install-path-bad")
+    for url in sources:
+        assert url in str(case["error"]), f"the final refusal does not name {url}: {case['error']}"
+        assert any(url in w for w in case["warnings"]), f"no warning names {url}"
+
+
+_PRIMARY = "https://primary.invalid/nssm-2.24.zip"
+_MIRROR_A = "https://mirror-a.invalid/nssm-2.24.zip"
+_MIRROR_B = "https://mirror-b.invalid/nssm-2.24.zip"
+
+
+@pytest.mark.parametrize(
+    ("key", "calls"),
+    [
+        ("dl-primary-good", [_PRIMARY]),
+        ("dl-primary-down", [_PRIMARY, _MIRROR_A]),
+        ("dl-primary-tampered", [_PRIMARY, _MIRROR_A]),
+        ("dl-second-mirror", [_PRIMARY, _MIRROR_A, _MIRROR_B]),
+    ],
+)
+def test_the_first_source_that_matches_the_archive_pin_is_used(
+    report: dict[str, Any], key: str, calls: list[str]
+) -> None:
+    """Positive controls: a source that is down, or serves other bytes, is skipped, and the search
+    stops at the first archive that matches. The win64 copy is taken, not the win32 one."""
+    case = _case(report, key)
+    assert case["threw"] is False, case
+    assert report[f"{key}-calls"] == calls, report[f"{key}-calls"]
+    assert report[f"{key}-written"] == _sha(_GOOD), (
+        f"{key}: the nssm.exe written is not the win64 copy from the matching archive"
+    )
+    assert len(case["warnings"]) == len(calls) - 1, case["warnings"]
+
+
+def test_a_mirror_that_fails_the_archive_pin_is_refused(report: dict[str, Any]) -> None:
+    case = _case(report, "dl-mirrors-tampered")
+    assert case["threw"] is True, "an archive that fails the pin was accepted"
+    assert report["dl-mirrors-tampered-calls"] == [_PRIMARY, _MIRROR_A, _MIRROR_B]
+    assert report["dl-mirrors-tampered-written"] == "", "a refused archive's nssm.exe was written"
+    error = str(case["error"])
+    assert "every source" in error, error
+    zip_bad = Path(str(report["_root"])) / "archive-bad.zip"
+    zip_good = Path(str(report["_root"])) / "archive-good.zip"
+    assert _sha(zip_bad.read_bytes()) in error.upper(), (
+        f"the refusal does not name the hash: {error}"
+    )
+    assert _sha(zip_good.read_bytes()) in error.upper(), (
+        f"the refusal does not name the pin: {error}"
+    )
+    assert "(503)" in error, f"the refusal does not say why the primary failed: {error}"
+
+
+def test_no_source_reachable_writes_nothing_and_names_the_offline_route(
+    report: dict[str, Any],
+) -> None:
+    case = _case(report, "dl-all-down")
+    assert case["threw"] is True, case
+    assert report["dl-all-down-calls"] == [_PRIMARY, _MIRROR_A, _MIRROR_B]
+    assert report["dl-all-down-written"] == ""
+    assert "-NssmPath" in str(case["error"]), case["error"]
+
+
+def test_the_resolver_installs_from_a_mirror_and_refuses_a_tampered_one(
+    report: dict[str, Any],
+) -> None:
+    good = _case(report, "install-download-mirror")
+    assert good["threw"] is False, good
+    assert _from(good["value"], "home-download-mirror"), good["value"]
+    assert report["homes"]["home-download-mirror"] == _sha(_GOOD)
+    bad = _case(report, "install-download-tampered")
+    assert bad["threw"] is True and "every source" in str(bad["error"]), bad
+    assert report["homes"]["home-download-tampered"] == "", "a tampered mirror reached -NssmDir"
 
 
 @pytest.mark.parametrize(
@@ -988,3 +1173,97 @@ def test_the_service_smoke_runs_the_copy_it_had_the_installer_check() -> None:
         f"{_SMOKE_JOB} should set, start and stop the service through the checked copy; it does "
         f"{sorted(verbs)}"
     )
+
+
+_CACHED_VAR = "SMOKE_NSSM_CACHED_EXE"
+_SHA_PINNED = re.compile(r"^actions/cache/(restore|save)@[0-9a-f]{40}$")
+
+
+def test_the_service_smoke_caches_nssm_only_through_the_installers_check() -> None:
+    """A warm cache spares the smoke the NSSM download, and nssm.cc with it (#2504).
+
+    The cached file reaches the service only as ``-NssmPath``, which the installer refuses unless it
+    matches the pin, and is handed over only after the step itself compared it, so a bad entry falls
+    back to the download. The key is the pin, read from the installer, so a new pin is a new key. The
+    copy saved is the one the installer checked, compared to the pin again, and a merge-queue run
+    saves nothing it could not share.
+    """
+    job = _jobs("ci.yml").get(_SMOKE_JOB)
+    assert job, f"CONTROL FAILED: ci.yml has no {_SMOKE_JOB} job"
+    assert (job.get("env") or {}).get(_CACHED_VAR), f"{_SMOKE_JOB} does not set {_CACHED_VAR}"
+    steps = _steps(job)
+    names = [str(s.get("name")) for s in steps]
+
+    def index(predicate: Callable[[dict[str, Any]], bool], what: str) -> int:
+        found = [i for i, s in enumerate(steps) if predicate(s)]
+        assert len(found) == 1, f"{_SMOKE_JOB} should have exactly one {what} step: {names}"
+        return found[0]
+
+    def uses(kind: str) -> Callable[[dict[str, Any]], bool]:
+        return lambda s: str(s.get("uses", "")).startswith(f"actions/cache/{kind}@")
+
+    pin = index(lambda s: s.get("id") == "nssm-pin", "pin-reading")
+    restore = index(uses("restore"), "cache restore")
+    save = index(uses("save"), "cache save")
+    install = index(
+        lambda s: any(
+            _script_named("install-service.ps1", line) and not line.lstrip().startswith("#")
+            for line in str(s.get("run", "")).splitlines()
+        ),
+        "install-service.ps1",
+    )
+    assert pin < restore < install < save, f"the cache steps are out of order: {names}"
+    assert "$NssmExeSha256" in str(steps[pin].get("run")), "the cache key is not read from the pin"
+
+    for i in (restore, save):
+        step = steps[i]
+        assert _SHA_PINNED.match(str(step["uses"])), f"not pinned by commit SHA: {step['uses']}"
+        with_ = step.get("with") or {}
+        assert with_.get("path") == "${{ env." + _CACHED_VAR + " }}", with_
+        assert "steps.nssm-pin.outputs.pin" in str(with_.get("key")), with_
+        assert "restore-keys" not in with_, "a partial key match would restore some other binary"
+    assert steps[restore]["with"]["key"] == steps[save]["with"]["key"]
+
+    # The install hands the cached file over only as -NssmPath, so the installer checks it, and
+    # only once it has matched the pin, so a bad entry falls back to the download.
+    install_step = steps[install]
+    run = str(install_step["run"])
+    assert f"$hit = $env:{_CACHED_VAR}" in run, run
+    # One guarded statement: the file exists AND matches the pin, THEN it becomes -NssmPath.
+    guarded = re.compile(
+        r"if \(\(Test-Path -LiteralPath \$hit\) -and \(Get-FileHash -Algorithm SHA256 "
+        r"-LiteralPath \$hit\)\.Hash -eq \$env:NSSM_PIN\) \{ \$cached\['NssmPath'\] = \$hit \}"
+    )
+    assert guarded.search(run), "a cache hit is used without first matching it to the pin"
+    assert run.count("$cached['NssmPath']") == 1, "the cached copy is handed over on another path"
+    assert "@cached" in run, "the install does not pass the cached copy on"
+    # Outside the queue the restore is lookup-only and restores no file, so only the queue may
+    # treat a hit as a file to use.
+    hit_env = str((install_step.get("env") or {}).get("NSSM_CACHE_HIT"))
+    assert "github.event_name == 'merge_group'" in hit_env, hit_env
+    assert steps[restore]["with"].get("lookup-only") == "${{ github.event_name != 'merge_group' }}"
+    assert sum(_CACHED_VAR in line for line in run.splitlines()) == 1, (
+        f"the install step uses {_CACHED_VAR} other than as -NssmPath"
+    )
+    pin_ref = "steps.nssm-pin.outputs.pin"
+    assert pin_ref in str((install_step.get("env") or {}).get("NSSM_PIN")), install_step.get("env")
+
+    # What is saved is a copy of the nssm.exe the installer checked, only when it matches the pin,
+    # and only off the queue.
+    stage = [
+        s
+        for s in steps[install + 1 : save]
+        if _CHECKED_PATH in str(s.get("run", "")) and _CACHED_VAR in str(s.get("run", ""))
+    ]
+    assert len(stage) == 1, f"no step copies the checked nssm.exe into the cache path: {names}"
+    staging = stage[0]
+    condition = str(staging.get("if", ""))
+    for needed in ("!cancelled()", "cache-hit != 'true'", "github.event_name != 'merge_group'"):
+        assert needed in condition, f"the staging step's condition lacks {needed}: {condition}"
+    assert "-ne $env:NSSM_PIN" in str(staging["run"]), "the staged copy is not compared to the pin"
+    assert pin_ref in str((staging.get("env") or {}).get("NSSM_PIN")), staging.get("env")
+    save_if = str(steps[save].get("if", ""))
+    assert f"steps.{staging.get('id')}.outputs.staged == 'true'" in save_if, save_if
+    # Caching is a convenience: a failure in it must not skip the smoke steps after it.
+    for step in (staging, steps[save]):
+        assert step.get("continue-on-error") is True, f"{step.get('name')} can red the smoke"

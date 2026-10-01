@@ -1226,6 +1226,23 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
+- **With `overwrite = false`, the rename refuses a name taken since the listing (BACKLOG #2553).**
+  The upload lists `remote_dir` to pick a free name before it writes, and a partner can write that
+  name while the temp uploads. So the publish checks again, and if the name is taken it moves on to
+  the next free one, on the same connection. After `PUBLISH_NAME_ATTEMPTS` names it fails as a
+  transient error and retries with a fresh listing. The log names the upload only through
+  `safe_name`.
+  - **SFTP:** atomic where the server honours the SFTP `RENAME`, which refuses an existing name.
+    OpenSSH's server does, on a filesystem with hard links. `_SftpClient.publish` in
+    `transports/remotefile.py` states where it does not hold, and two costs: on OpenSSH the final
+    name appears by a hard link, so a partner watching for a move event does not see it, and a
+    server that refuses `RENAME` outright fails every delivery. Either site sets
+    `overwrite = true` with a per-message `filename`.
+  - **FTP and FTPS: not atomic.** A partner file written in the few round trips between the
+    publish's own listing and `RNTO` is still replaced on a server whose `RNTO` replaces.
+    `_FtpClient.publish` states why. The check costs one more directory listing per delivery.
+
+  With `overwrite = true`, nothing changes: the rename replaces any entry of the same name.
 - **Mostly the same file policy as `File(...)`.** A remote source is one of the *directory sources* the
   [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
   content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is
@@ -2006,8 +2023,9 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `fhir_version` | `R4B` | `R4B` (default) / `R5` / `STU3` — explicit (no plain-R4 on pydantic-v2 wheels) |
 | `format` | `json` | `json` only; FHIR-XML is deferred to a hardened-`lxml` path |
 | `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
-| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry) |
+| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
+| `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
@@ -2045,7 +2063,8 @@ What a site needs to know:
 - The server must support the `transaction` interaction, and for `if-match` it must honor an entry's
   `request.ifMatch`. A server that accepts transactions but ignores `ifMatch` would apply the update
   unconditionally, and nothing would fail. Check both before pointing an `update` or `if-match`
-  connection at a server.
+  connection at a server. A server with no `transaction` interaction needs the
+  [path-form opt-in](#vendor-compatibility-and-the-path-form-opt-in) below.
 - The entry carries a `fullUrl` of `{base}/{ResourceType}/{id}`, because FHIR requires one on a `PUT`
   entry. Like the rest of the entry, it is in the body.
 - The resource goes out byte for byte. It is spliced into the `Bundle` unchanged, so a decimal such as
@@ -2069,6 +2088,47 @@ What a site needs to know:
 The read site is outside this. A `fhir_lookup` read-by-id is `GET {base}/{ResourceType}/{id}`, which is what
 a RESTful read is by specification. Owner ruling R3 names the update and if-match writes only, and the
 vault row records that it does not decide the read site.
+
+##### Vendor compatibility and the path-form opt-in
+
+At least two large EHR vendors document no `transaction` interaction, so the default form would fail
+against them on a first deployment. These readings were taken on 2026-10-01 and are not a vendor
+guarantee; check the server you will point at.
+
+- **Epic.** The CapabilityStatement of Epic's public R4 sandbox (its `metadata` endpoint, reached from
+  <https://fhir.epic.com>) declares no system-level interaction: no `transaction` and no `batch`. Epic documents a plain `PUT api/FHIR/R4/{Type}/{ID}` on a
+  narrow set of APIs, with the version check in an `If-Match` header. One example is Observation.Update
+  (<https://fhir.epic.com/Specifications/Api?id=974>).
+- **Oracle Health (Millennium).** The bundle endpoint
+  (<https://docs.oracle.com/en/industries/health/millennium-platform-apis/mfrap/op--post.html>) allows only
+  `type: batch`, entry method `POST`, and the Provenance resource. Its CapabilityStatement declares `batch`
+  only. A plain `PUT [base]/[type]/[id]` is documented for at least AllergyIntolerance, Condition,
+  DocumentReference, FamilyMemberHistory, Immunization, Observation and QuestionnaireResponse, with
+  `If-Match` required on most.
+
+For a server like these, a connection can opt back into the plain form:
+
+```python
+outbound("OB_EPIC_OBS", FHIR(url=env("epic_fhir_base"), conditional="if-match", update_url_form="path"))
+```
+
+With `update_url_form="path"`, an `update` or `if-match` is sent as `PUT {base}/{ResourceType}/{id}`:
+
+- The id must match the FHIR id grammar, `[A-Za-z0-9\-\.]{1,64}`, and must not be only dots. Any other id
+  is refused as a bad message and dead-lettered. It is never sent. A valid id is percent-encoded into the
+  path.
+- The `if-match` ETag goes in the `If-Match` header, and a static `If-Match` in `headers` stays on the
+  request.
+- The reply is the plain resource, so capture and `capture_response_headers` work as on any `PUT`.
+- The setting applies only to `update` and `if-match`. Set on any other connection, it is refused at load,
+  because it would do nothing.
+
+**It puts each message's resource id back in the request URL**, and so in the receiving server's access
+logs. That relaxes owner ruling R3 (ASVS 14.2.1), so it is a listed loosening in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#update_url_form--path-on-a-fhir-connection--the-resource-id-in-the-request-url).
+The engine logs a WARNING naming the connection at every construction, and `messagefoundry check` names
+every connection that sets it. Set it only on the connection that needs it. FHIR is not a
+`connections.toml` transport, so the setting is a `FHIR()` keyword only. This is vault BACKLOG #2550.
 
 **OperationOutcome & delivery semantics.** A 2xx is **delivered** (a returned `OperationOutcome` is captured,
 never an error). On an error status the HTTP code decides, refined by the `OperationOutcome`: 5xx → retry; a

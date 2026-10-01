@@ -18,8 +18,10 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
 **Destination** uploads each payload to ``remote_dir``/``filename`` (``{HL7-path}`` placeholders
 resolved via :func:`render_filename`). The write goes to a temp name then a **rename** to the final
 name, so a poller on the far side never sees a partial file. A name collision is uniquified (never a
-silent clobber). A transient failure (connect/timeout/transient FTP error) → :class:`DeliveryError`
-(retried); a permanent server refusal (auth failure, no-such-dir, a 5xx-class permanent FTP error) →
+silent clobber), and with ``overwrite`` off the rename itself refuses a name taken since the
+listing (:meth:`_RemoteClient.publish` and its overrides say how far that holds per protocol). A
+transient failure (connect/timeout/transient FTP error) → :class:`DeliveryError` (retried); a
+permanent server refusal (auth failure, no-such-dir, a 5xx-class permanent FTP error) →
 :class:`NegativeAckError` (``permanent=True``), which dead-letters. With ``overwrite`` off, the
 upload first lists the directory to find a free name; :meth:`RemoteFileDestination._unique` states
 what a failed listing does.
@@ -58,6 +60,7 @@ import contextlib
 import ftplib  # nosec B402 — plain FTP is gated: cleartext credentials are refused (see _validate_common); FTPS/SFTP are the encrypted defaults
 import hashlib
 import io
+import itertools
 import logging
 import posixpath
 import re
@@ -66,7 +69,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, TypeVar
 
 from messagefoundry.config.models import (
@@ -151,6 +154,12 @@ RETRIEVE_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 #: The same value bounds opening the SFTP session, before the first read (BACKLOG #1936; see
 #: :func:`_open_sftp_within`).
 SFTP_CHANNEL_READ_TIMEOUT_SECONDS = 120.0
+
+#: Most names one upload tries to publish under, with ``overwrite`` off (BACKLOG #2553). Each try
+#: that finds its name taken moves on to the next free name in the listing. A partner filling those
+#: names as fast as the upload tries them could otherwise hold it in that loop for good, so past this
+#: many the delivery fails transient, and its retry lists the directory again.
+PUBLISH_NAME_ATTEMPTS = 8
 
 
 def _is_contained_name(name: object) -> bool:
@@ -293,6 +302,65 @@ def _sftp_size(attrs: Any) -> int | None:
     return None if size is None else int(size)
 
 
+def _sftp_exists(sftp: Any, path: str) -> bool:
+    """True when ``lstat`` shows an entry of any type at ``path``; a symlink counts as itself,
+    whatever it points at. Some servers answer a missing path with a failure other than "no such
+    file", or refuse ``lstat`` to an account that may still write. Either reads as False: a check
+    before a rename then leaves the decision to the ``RENAME``'s own refusal, and a check after
+    one confirms nothing, so the refusal raises. A timeout raises, for ``_op`` to map."""
+    try:
+        sftp.lstat(path)
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
+    return True
+
+
+def _sftp_refused(sftp: Any, exc: Exception, src: str) -> bool:
+    """True when a failed SFTP ``RENAME`` was the server refusing and nothing moved (BACKLOG
+    #2553). paramiko raises a refusal status as an ``OSError``; SFTP version 3 has no "already
+    exists" code, so a refused existing target arrives as a plain failure with no errno. Not a
+    refusal: a timeout, where the server may still have renamed; "no such file", which keeps its
+    permanent class; or any failure after which the temp is gone."""
+    if isinstance(exc, (TimeoutError, FileNotFoundError)):
+        return False
+    return _sftp_exists(sftp, src)
+
+
+def _publish_first(
+    candidates: Sequence[str],
+    *,
+    taken: Callable[[str, bool], bool],
+    rename: Callable[[str], object],
+    refusals: tuple[type[Exception], ...],
+    refused: Callable[[Exception], bool],
+) -> str | None:
+    """The loop every client's :meth:`_RemoteClient.publish` runs on its one connection, so the
+    collision rule lives in one place (BACKLOG #2553).
+
+    For each candidate: skip it when ``taken(dst, False)`` says something holds it; else
+    ``rename`` onto it. A rename failing with one of ``refusals`` is a collision only when
+    ``refused(exc)`` says the server refused and moved nothing, and ``taken(dst, True)`` then
+    finds the name held
+    (``True`` asks for a fresh answer where a client caches one). Anything else re-raises
+    unchanged for the client to classify, as it was before #2553. A rename the server may have
+    carried out, such as one whose reply timed out, must never count as a refusal: the loop would
+    skip a name holding this very message and fail on the next. Returns the name published, or
+    ``None`` when every candidate was taken."""
+    for dst in candidates:
+        if taken(dst, False):
+            continue
+        try:
+            rename(dst)
+        except refusals as exc:
+            if refused(exc) and taken(dst, True):
+                continue
+            raise
+        return dst
+    return None
+
+
 def _ftp_size(ftp: ftplib.FTP, path: str) -> int | None:
     """The file's size from ``SIZE`` (RFC 3659), or ``None`` when the server will not say.
 
@@ -376,7 +444,18 @@ class _RemoteClient(abc.ABC):
 
     @abc.abstractmethod
     def rename(self, src: str, dst: str) -> None:
-        """Rename ``src`` to ``dst`` (atomic publish / move-to-processed)."""
+        """Rename ``src`` to ``dst``, replacing anything there: the ``overwrite = true`` publish and
+        the source's moves."""
+
+    @abc.abstractmethod
+    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
+        """Rename ``src`` to the first of ``candidates`` that nothing holds, never replacing an
+        entry of any type (BACKLOG #2553). Every try shares one connection.
+
+        Returns the candidate, exactly as given, that ``src`` was published under, or ``None``
+        when every candidate was taken, leaving ``src`` in place. Any other failure raises, classified as for :meth:`rename`.
+        Abstract so that each client states how far its refusal is atomic; a check-then-rename
+        default would let a new client inherit the race silently."""
 
     @abc.abstractmethod
     def remove(self, path: str) -> None:
@@ -793,6 +872,69 @@ class _FtpClient(_RemoteClient):
 
     def rename(self, src: str, dst: str) -> None:
         self._op(lambda ftp: ftp.rename(src, dst))
+
+    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
+        """See :meth:`_RemoteClient.publish`. **Not atomic on FTP.** RFC 959 does not say what
+        ``RNTO`` does to an existing name: some servers refuse it and some replace it. So this lists
+        the directory, then sends ``RNFR`` and ``RNTO``, all on one connection. On a server that
+        replaces, a partner file written after the listing and before ``RNTO`` is still replaced:
+        a gap of a few round trips, where it used to span the whole upload.
+
+        The candidates share one directory, as :meth:`RemoteFileDestination._unique` builds them.
+        Its listing is reused for each and taken again only after ``RNTO`` is refused. Only a
+        refused ``RNTO`` can count as a collision: a refused ``RNFR`` means the temp is gone. That
+        fresh listing compares case-blind, since a case-insensitive server refuses a case variant
+        too; if it fails, it confirms nothing and the refusal raises as it was. The first listing
+        failing is transient, as every send-path listing is (the #1936 rule in
+        :meth:`RemoteFileDestination._unique`)."""
+
+        def run(ftp: ftplib.FTP) -> str | None:
+            listing: set[str] | None = None
+            rnto_sent = False
+
+            def taken(dst: str, fresh: bool) -> bool:
+                nonlocal listing
+                directory, name = posixpath.split(dst)
+                if fresh:
+                    try:
+                        listing = self._names(ftp, directory)
+                    except ftplib.error_perm as exc:
+                        logger.warning(
+                            "REMOTEFILE could not list the upload directory to confirm a refused "
+                            "RNTO, so the refusal stands: %s",
+                            exc,
+                        )
+                        return False
+                    return name.casefold() in {n.casefold() for n in listing}
+                if listing is None:
+                    try:
+                        listing = self._names(ftp, directory)
+                    except ftplib.error_perm as exc:
+                        raise _RemoteError(
+                            f"FTP could not list the upload directory to check a name: {exc}",
+                            permanent=False,
+                        ) from exc
+                return name in listing
+
+            def rename(dst: str) -> None:
+                # ftplib.FTP.rename's two commands, split so a refusal is known to answer RNTO.
+                nonlocal rnto_sent
+                rnto_sent = False
+                reply = ftp.sendcmd(f"RNFR {src}")
+                if not reply.startswith("3"):
+                    raise ftplib.error_reply(reply)
+                rnto_sent = True
+                ftp.voidcmd(f"RNTO {dst}")
+
+            return _publish_first(
+                candidates,
+                taken=taken,
+                rename=rename,
+                refusals=(ftplib.error_perm, ftplib.error_temp),
+                refused=lambda exc: rnto_sent,
+            )
+
+        return self._op(run)
 
     def remove(self, path: str) -> None:
         self._op(lambda ftp: ftp.delete(path))
@@ -1434,6 +1576,39 @@ class _SftpClient(_RemoteClient):
     def rename(self, src: str, dst: str) -> None:
         self._op(lambda sftp: sftp.posix_rename(src, dst))
 
+    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
+        """See :meth:`_RemoteClient.publish`. Publishes with the plain SFTP ``RENAME``
+        (``sftp.rename``), never ``posix_rename``.
+
+        The SFTP version 3 draft says ``RENAME`` fails when the target exists, and paramiko's own
+        docstring for ``SFTPClient.rename`` says the new name "must not exist already". OpenSSH's
+        sftp-server meets that with ``link`` then ``unlink``, which refuses an existing name
+        atomically. On a filesystem without hard links it falls back to a ``stat`` then a
+        ``rename``, which is not atomic. ``posix_rename`` is a plain ``rename(2)`` there, which
+        replaces. A server that implements ``RENAME`` as a replace gets no refusal from it.
+
+        So this also checks with ``lstat`` first, on the same connection, which narrows the gap on
+        such a server to one round trip. What counts as a refused ``RENAME`` is
+        :func:`_sftp_refused`'s to say.
+
+        Two costs of the plain ``RENAME``, against the ``posix_rename`` it replaced. On OpenSSH the
+        final name appears by a hard link, not a move, so a far-side watcher waiting for a move
+        event (inotify ``IN_MOVED_TO``) does not see it. And a server that refuses ``RENAME``
+        outright fails every delivery, transient until the retry cap; nothing falls back to
+        ``posix_rename``, since that would bring back the replace. Either site sets ``overwrite =
+        true`` with a per-message filename."""
+
+        def run(sftp: Any) -> str | None:
+            return _publish_first(
+                candidates,
+                taken=lambda dst, fresh: _sftp_exists(sftp, dst),
+                rename=lambda dst: sftp.rename(src, dst),
+                refusals=(OSError,),
+                refused=lambda exc: _sftp_refused(sftp, exc, src),
+            )
+
+        return self._op(run)
+
     def remove(self, path: str) -> None:
         self._op(lambda sftp: sftp.remove(path))
 
@@ -1758,9 +1933,8 @@ class RemoteFileDestination(DestinationConnector):
         name = render_filename(self._filename_template, payload, fallback="message.hl7")
         data = payload.encode(self._encoding)
         self._prepare_remote_dir()
-        final = posixpath.join(self._remote_dir, name)
-        if not self._overwrite:
-            final = self._unique(final)
+        # With overwrite off, list for free names BEFORE anything is written (the #1936 rule).
+        candidates = [] if self._overwrite else self._unique(name)
         # Write to a unique temp name then rename, so a poller on the far side never sees a partial
         # file. The temp suffix is unguessable so two concurrent uploads never collide on it.
         tmp = posixpath.join(self._remote_dir, f".{name}.{uuid.uuid4().hex}.part")
@@ -1778,7 +1952,10 @@ class RemoteFileDestination(DestinationConnector):
                 self._remove_temp(tmp, name, "store")
             raise
         try:
-            self._client.rename(tmp, final)
+            if self._overwrite:  # replacing is what it asks for
+                self._client.rename(tmp, posixpath.join(self._remote_dir, name))
+            else:
+                self._publish_new(tmp, name, candidates)
         except _RemoteError:
             # Publish failed — don't leave the temp behind. Best-effort cleanup, then re-raise so the
             # delivery is classified (retry/dead-letter) by send(). Unlike the store branch, this
@@ -1786,6 +1963,28 @@ class RemoteFileDestination(DestinationConnector):
             # the temp, and the lane stops right after, so it costs one more login at most.
             self._remove_temp(tmp, name, "rename")
             raise
+
+    def _publish_new(self, tmp: str, name: str, candidates: list[str]) -> None:
+        """Publish ``tmp`` under the first of ``candidates`` still free when the client tries it,
+        never replacing an entry (BACKLOG #2553). The listing ran before the store, so a partner can
+        take a name in between; the client's :meth:`_RemoteClient.publish` refuses that name and
+        moves on to the next. When all are taken it raises transient, and the retry lists again.
+        ``name`` is logged only through ``safe_name``, and the names taken never are."""
+        published = self._client.publish(tmp, candidates)
+        if published is None:
+            raise _RemoteError(
+                f"REMOTEFILE upload to {_redact(self._host, self._remote_dir)} found all "
+                f"{len(candidates)} names it tried taken after the listing, and overwrite is off, "
+                "so it published nothing; the retry lists again",
+                permanent=False,
+            )
+        if published != candidates[0]:
+            logger.warning(
+                "REMOTEFILE upload for %s: %d chosen name(s) were taken after the listing, "
+                "so it published under the next free one",
+                safe_name(name),
+                candidates.index(published),
+            )
 
     def _remove_temp(self, tmp: str, name: str, after: str) -> None:
         """Best-effort removal of an upload's temp file after a failed ``after`` step. The temp name
@@ -1800,9 +1999,13 @@ class RemoteFileDestination(DestinationConnector):
                 after,
             )
 
-    def _unique(self, final: str) -> str:
-        """Return ``final`` or, if anything already exists there, ``name-1.ext``, ``name-2.ext``, …
-        Never clobbers an existing entry silently (mirrors the File destination).
+    def _unique(self, name: str) -> list[str]:
+        """List ``remote_dir``, and return the first :data:`PUBLISH_NAME_ATTEMPTS` paths the
+        listing shows free, in order: ``name`` itself, then ``name-1.ext``, ``name-2.ext``, …
+        skipping each one listed. Never clobbers an existing entry silently. Unlike the File
+        destination, which splits at the last dot, the suffix goes before the first. The listing is
+        only a first guess: :meth:`_publish_new` lets the publish refuse a name taken since
+        (BACKLOG #2553).
 
         **THIS IS THE ONE STATEMENT OF THE RULE (BACKLOG #1936); everything else points here.** With
         ``overwrite`` off, a listing that fails is never read as "nothing to collide with": it is
@@ -1816,24 +2019,18 @@ class RemoteFileDestination(DestinationConnector):
 
         A missing directory earns no exception. ``_upload`` runs :meth:`_prepare_remote_dir` first,
         which lists it or tries to create it. ``ensure_dir`` is best-effort, so the directory can
-        still be missing here, but then the store into it would fail too, so ``final`` never delivered
-        that message. What changes is the disposition: the row now retries at this listing instead of
-        dead-lettering at the store."""
+        still be missing here, but then the store into it would fail too, so the upload never
+        delivered that message. What changes is the disposition: the row now retries at this
+        listing instead of dead-lettering at the store."""
         existing = self._list_or_retry(
             self._client.list_names,
             "could not be listed to check the upload name for a collision, and overwrite is "
             "off, so nothing was written",
         )
-        base = posixpath.basename(final)
-        if base not in existing:
-            return final
-        stem, dot, ext = base.partition(".")
-        n = 1
-        while True:
-            candidate = f"{stem}-{n}{dot}{ext}"
-            if candidate not in existing:
-                return posixpath.join(self._remote_dir, candidate)
-            n += 1
+        stem, dot, ext = name.partition(".")
+        names = (name if n == 0 else f"{stem}-{n}{dot}{ext}" for n in itertools.count())
+        free = (posixpath.join(self._remote_dir, n) for n in names if n not in existing)
+        return list(itertools.islice(free, PUBLISH_NAME_ATTEMPTS))
 
     async def test_connection(self) -> None:
         # Connect + authenticate + ensure the upload dir (the destination's normal first step) — no

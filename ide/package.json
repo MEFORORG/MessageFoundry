@@ -174,9 +174,14 @@
         "icon": "$(pulse)"
       },
       {
-        "command": "messagefoundry.toggleRevealValues",
-        "title": "MessageFoundry: Reveal Values (Live Debug)",
+        "command": "messagefoundry.revealValuesOnce",
+        "title": "MessageFoundry: Reveal Values for One Run (Live Debug)",
         "icon": "$(eye)"
+      },
+      {
+        "command": "messagefoundry.hideValues",
+        "title": "MessageFoundry: Hide Revealed Values (Live Debug)",
+        "icon": "$(eye-closed)"
       },
       {
         "command": "messagefoundry.newConnectionQuickInput",

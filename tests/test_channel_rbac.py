@@ -38,11 +38,16 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine) -> AuthService:
+async def _service(engine: Engine, *, admin_write_rate_limit: bool = True) -> AuthService:
     # Channel-scope RBAC test, not an MFA test: pin require_mfa=False so the admin's step-up scope
     # endpoint isn't blocked first by the BACKLOG #187 secure default (require_mfa now ON).
     service = AuthService(
-        engine.store, AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            admin_write_rate_limit_enabled=admin_write_rate_limit,
+            require_mfa=False,
+        ),
     )
     await service.initialize()
     return service
@@ -179,8 +184,9 @@ async def test_scoped_user_connection_control_and_purge(engine: Engine) -> None:
 
 
 async def test_scoped_user_cannot_test_or_read_shared_outbound(engine: Engine) -> None:
-    # A graph so the outbound exists (the test/metadata endpoints 404 a missing name before the scope
-    # check). A channel-scoped operator may probe/read their OWN inbound, but a shared outbound — which
+    # A graph so the outbound exists. A scoped caller gets the same 403 for a missing name since
+    # BACKLOG #2551, so these 403s alone no longer prove OB_X exists; the parity test below pins
+    # the outbound branch with a control. A channel-scoped operator may probe/read their OWN inbound, but a shared outbound — which
     # spans channels — is off-limits, mirroring the purge boundary.
     reg = Registry()
     reg.add_inbound(
@@ -312,9 +318,95 @@ async def test_credential_test_route_authorizes_before_disclosing_config(engine:
             r_cred.status_code == r_mllp.status_code
         )  # indistinguishable to an unauthorized caller
         # In scope: authorization passes, so an authorized caller does get the (config-disclosing) 400
-        # for a File endpoint that has no alt credential — and a 404 for a truly unknown name.
+        # for a File endpoint that has no alt credential.
         assert (await c.post("/connections/IB_A/test-credential", headers=h)).status_code == 400
-        assert (await c.post("/connections/IB_NOPE/test-credential", headers=h)).status_code == 404
+        # A name that exists nowhere is outside the scope too, so it gets the same 403 as the two
+        # above rather than a 404 that would confirm it does not exist (BACKLOG #2551).
+        assert (await c.post("/connections/IB_NOPE/test-credential", headers=h)).status_code == 403
+
+
+# Routes that look a connection name up in the registry. Each must check the caller's channel
+# scope BEFORE the name's existence, and refuse a shared outbound with the body an unknown name
+# gets (BACKLOG #2551). Not a complete list: /flag and /purge have other shapes.
+_LOOKUP_ROUTES = (
+    ("GET", "/connections/{}/metadata"),
+    ("POST", "/connections/{}/test"),
+    ("POST", "/connections/{}/test-credential"),
+    ("POST", "/connections/{}/start"),
+    ("POST", "/connections/{}/stop"),
+    ("POST", "/connections/{}/restart"),
+)
+
+
+async def _probe(
+    c: httpx.AsyncClient, engine: Engine, h: dict[str, str], method: str, path: str
+) -> tuple[int, object, list[tuple[str, str | None]]]:
+    """One request's status, JSON body, and the audit rows it wrote as (action, channel_id)."""
+    latest = await engine.store.list_audit(limit=1)  # newest first
+    last_id = latest[0]["id"] if latest else 0
+    r = await c.request(method, path, headers=h)
+    # One request writes a few rows at most, so the newest 50 hold all of them.
+    rows = [r2 for r2 in await engine.store.list_audit(limit=50) if r2["id"] > last_id]
+    return r.status_code, r.json(), [(row["action"], row["channel_id"]) for row in rows]
+
+
+async def test_scoped_caller_cannot_tell_which_connection_names_exist(engine: Engine) -> None:
+    """BACKLOG #2551: a channel-scoped caller gets ONE answer -- status, body and audit kind -- for
+    an inbound outside its scope, a shared outbound, and a name that exists nowhere. Before the fix
+    the registry lookup ran first and the last of those three answered 404, so on a first
+    deployment such a caller could have listed the estate's connection names by probing."""
+    reg = Registry()
+    reg.add_inbound(  # in scope; File with no alt credential, so /test-credential answers 400
+        InboundConnection(
+            "IB_A", ConnectionSpec(ConnectorType.FILE, {"directory": "./a"}), router="r"
+        )
+    )
+    reg.add_inbound(  # out of scope
+        InboundConnection("IB_B", ConnectionSpec(ConnectorType.MLLP, {"port": 2577}), router="r")
+    )
+    reg.add_outbound(
+        OutboundConnection("OB_X", ConnectionSpec(ConnectorType.FILE, {"directory": "./out"}))
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
+    # The per-actor admin-write ceiling is off: this test sends about thirty paced writes from one
+    # actor, and a 429 would hide the answer under test.
+    service = await _service(engine, admin_write_rate_limit=False)
+    scoped_uid = await _add(service, "op", Role.OPERATOR)
+    # IB_GONE is in the scope and exists nowhere: the in-scope control below.
+    await service.set_channel_scope(scoped_uid, ["IB_A", "IB_GONE"], actor="admin")
+    wide_uid = await _add(service, "boss", Role.OPERATOR)
+    await service.set_channel_scope(wide_uid, [ALL_CHANNELS], actor="admin")
+
+    async with _client(engine, service) as c:
+        h = await _login(c, "op")
+        for method, template in _LOOKUP_ROUTES:
+            answers = {}
+            for name in ("IB_B", "OB_X", "IB_NOPE"):
+                status, body, audit = await _probe(c, engine, h, method, template.format(name))
+                # The denial row names the probed name, so compare actions across the three names.
+                assert ("auth.channel_denied", name) in audit, (template, name, status, body, audit)
+                answers[name] = (status, body, sorted(action for action, _ in audit))
+            assert answers["IB_B"] == answers["OB_X"] == answers["IB_NOPE"], (template, answers)
+            assert answers["IB_NOPE"][0] == 403, (template, answers)
+
+        # Control: the scoped caller still reads its own connection...
+        meta = await c.get("/connections/IB_A/metadata", headers=h)
+        assert meta.status_code == 200 and meta.json()["name"] == "IB_A"
+        assert (await c.post("/connections/IB_A/test-credential", headers=h)).status_code == 400
+        # ...and a name inside its own scope that exists nowhere is still a plain 404, unaudited.
+        for method, template in _LOOKUP_ROUTES:
+            status, _, audit = await _probe(c, engine, h, method, template.format("IB_GONE"))
+            assert status == 404, (template, status)
+            assert not [a for a in audit if a[0] == "auth.channel_denied"], (template, audit)
+
+        # Control: an unscoped caller still gets 404 for an unknown name, and reads the outbound.
+        hb = await _login(c, "boss")
+        for method, template in _LOOKUP_ROUTES:
+            status, _, audit = await _probe(c, engine, hb, method, template.format("IB_NOPE"))
+            assert status == 404, (template, status)
+            assert not [a for a in audit if a[0] == "auth.channel_denied"], (template, audit)
+        assert (await c.get("/connections/OB_X/metadata", headers=hb)).status_code == 200
 
 
 async def test_unprovisioned_operator_reaches_nothing_until_granted(engine: Engine) -> None:

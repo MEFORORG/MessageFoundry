@@ -430,6 +430,8 @@ Two results, and the second is the one that matters:
       Evidence bearing on it sits in §"Status and what gates wiring", including at least that
       section's 2026-08-25 correction and its real-surface measurements. Nothing is re-decided here.
       Whether the decision still holds is part of the contradiction below, which stays the owner's.
+      *(Settled 2026-10-01 by owner ruling: see the RESOLVED note at the end of the contradiction
+      quote below. The decision holds, and the "never delivered mail" premise is withdrawn.)*
       This note re-checks one detail of the quote and no other. Its `install-coordination.ps1:305`
       anchor has moved; search that file for `Async = $true` to find the row.
   > **THE SHIPPED STATE CONTRADICTS THIS DECISION (measured 2026-08-25, BACKLOG #1215).**
@@ -440,6 +442,27 @@ Two results, and the second is the one that matters:
   > owner decision, so it is NOT re-decided here:** either the decision changed and the record did
   > not, or the tier was wired without it. Which of those it is, and what the record should say,
   > is the owner's to settle.
+  >
+  > **RESOLVED 2026-10-01 by owner ruling (BACKLOG #1215).** Owner ruling 2026-10-01, given in the
+  > batch 183 Manager's session: *"the 2026-08-06 NOT WIRED decision for mail-watch stands; the
+  > urgent mail tier is retired."* It followed an independent adversarial review. What the record
+  > now says:
+  >
+  > - **The tier was wired without the decision.** Commit `d19fa68f0a` (landed as `06245f4b0c`,
+  >   PR #337, merged 2026-08-12) added the row with no review, citing no owner decision and no
+  >   latency incident. Its own message says that waking a session idle at a prompt is NOT
+  >   established, and nothing since has established it.
+  > - **The decision stands on its demand gate.** "Revisit only if someone hits the latency in
+  >   practice" has no recorded hit.
+  > - **Its other premise is WITHDRAWN.** "The default tier has never delivered mail in real use"
+  >   is no longer true: `.git/mefor-coord/mail/receipts/` held 1,793 `Stop` `shown-consumed`
+  >   receipts at 2026-10-01T14:47Z, the earliest at 2026-08-22T21:02:22Z, across 18 distinct
+  >   dates. The drain prunes old receipts as it runs, so the count is a floor and falls over time.
+  > - **The installer now strips it.** The `mail-watch` row in `install-coordination.ps1` is marked
+  >   `Retired`: an install run removes any installed copy and never adds it, and `-Status` reports
+  >   a copy that is still installed. The row is kept, not deleted, because the installer strips
+  >   only rows it knows; deleting it would orphan the installed hooks. The owner re-runs the
+  >   installer on each config root to take it off.
 - [x] Owner approval to wire the drain rows, which places a hook on `SessionStart` and `Stop` for
       every session in this repo. **Given 2026-08-05/06, in two steps:** `Stop` first, then
       `SessionStart` once the show/consume split made a discarded session unable to consume what it
@@ -452,7 +475,15 @@ Two results, and the second is the one that matters:
       calling worktree, so a session on any branch runs the primary's copy once the primary has pulled
       it. The installer's own header is the source of record for that order. The installer also wires
       every config root it finds, not only the default one this box names. Whether that wider wiring
-      fits this approval is the owner's call. §"Status and what gates wiring" says wiring is gated on
+      fits this approval is the owner's call.
+      §"Status and what gates wiring" says wiring is gated on
       the work tracked as [BACKLOG #1028](../BACKLOG.md), and that no approval through that gate is
-      recorded. This note does not decide whether the approval above meets it. That also stays the
+      recorded. This note does not decide whether the approval above meets it. That stays the
       owner's.
+      **RESOLVED 2026-09-30 by owner ruling (BACKLOG #1215).** The first of the two questions above,
+      *"Whether that wider wiring fits this approval is the owner's call"*, is now answered. Owner
+      ruling 2026-09-30, answered in the batch 183 Manager's session: *"the drain approval covers
+      every config root the installer wires."* So "Default config root only" above records the
+      approval as first given, and the wider wiring is within it. The ruling settles scope only. The
+      #1028 gate question in the sentence before this note stays the owner's, and the `mail-watch.ps1`
+      contradiction is settled separately, in its own RESOLVED note above.

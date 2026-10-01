@@ -72,6 +72,7 @@ have the same gap.
 from __future__ import annotations
 
 import http.client
+import re
 import socket
 import ssl
 import urllib.parse
@@ -343,6 +344,12 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         self.poolmanager.pool_classes_by_scheme = self._pool_classes
 
     def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+        # BACKLOG #2547, before each send: checked at construction too; this catches a proxy that
+        # appeared since. get_connection_with_tls_context checks first, before requests parses the
+        # URL. This second check is where requests reads credentials out of the proxy URL (the
+        # Proxy-Authorization header, or the SOCKS user and password), on every proxied request on
+        # any requests version, before any connection opens and before a manager is cached.
+        _refuse_cleartext_proxy_credentials(proxy, connector=self._connector)
         manager = super().proxy_manager_for(proxy, **proxy_kwargs)
         # Only a plain proxy manager's pools are the stock ones. A SOCKS manager's pools open SOCKS
         # connections, and swapping them would send around the proxy, so those are left alone and
@@ -359,6 +366,12 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         proxies: dict[str, str] | None = None,
         cert: Any = None,
     ) -> urllib3.connectionpool.HTTPConnectionPool:
+        # BACKLOG #2547, before requests parses the proxy URL: a credentialed URL that will not
+        # parse would otherwise fail in requests' own parser, whose error can quote the password.
+        # proxy_manager_for checks again, on a requests too old to call this hook.
+        _refuse_cleartext_proxy_credentials(
+            requests.utils.select_proxy(request.url or "", proxies), connector=self._connector
+        )
         pool = super().get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
         # Both halves: the class is one of ours, and nothing below it put the stock reader back.
         if not (
@@ -537,7 +550,67 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     )
 
 
-def _prepared_vault_hop(session: requests.Session, url: object) -> tuple[str, str | None] | None:
+#: The fixed text of the proxy-credential refusal. Like the cleartext one, it names no part of the
+#: proxy URL, because the part it is about is a password.
+_CLEARTEXT_PROXY_CREDENTIALS = (
+    "the proxy in front of the Vault address carries credentials in its URL and is not an "
+    "https:// proxy, or its URL cannot be read. requests would send those credentials to the "
+    "proxy in cleartext. Use an https:// proxy, or a proxy that takes no credentials in its URL; "
+    "refusing (BACKLOG #2547)"
+)
+
+
+def _proxy_carries_cleartext_credentials(proxy: str) -> bool:
+    """Whether requests would send credentials from ``proxy``'s URL over a hop with no TLS.
+
+    **Any** ``@`` **in the URL counts as credentials.** User information needs a literal ``@``, so
+    this misses none. It also catches URLs the parsers read in ways that hide them. requests
+    re-reads a scheme-less ``user:pw@host:3128`` as scheme ``user``, and a backslash before the
+    ``@`` moves the user name into the host. Neither proxy works, and an operator who wrote either
+    meant to send credentials, so it is refused here with fixed text rather than failing later on a
+    parser error that quotes the URL.
+
+    The scheme is read the way requests reads it before building the proxy's pool: a missing one
+    becomes ``http`` (``prepend_scheme_if_needed``), parsed by ``urllib3.util.parse_url``. Only an
+    ``https://`` proxy carries credentials inside TLS. Every other scheme sends them in the clear,
+    ``http`` in a ``Proxy-Authorization`` header and ``socks`` in the SOCKS greeting. A URL that will
+    not parse counts as not ``https://``.
+
+    ``transports.rest.proxy_url_sends_userinfo`` (BACKLOG #1182) asks a similar question for the
+    urllib egress and is not reused. It reads the URL as urllib's ``ProxyHandler`` does, which is a
+    different client library, and it answers what a user-declared ``proxy_url`` sends. This one
+    fails closed on a URL from the environment that nobody declared."""
+    if "@" not in proxy:
+        return False
+    try:
+        scheme = urllib3.util.parse_url(
+            requests.utils.prepend_scheme_if_needed(proxy, "http")
+        ).scheme
+    except ValueError:  # LocationParseError
+        return True
+    return (scheme or "").lower() != "https"
+
+
+def _refuse_cleartext_proxy_credentials(proxy: str | None, *, connector: str) -> None:
+    """Refuse a Vault hop whose proxy would receive its credentials in cleartext (BACKLOG #2547).
+
+    ``proxy`` is the proxy requests would send the hop through, or ``None``. An ``https://``
+    Vault behind an ``http://`` proxy keeps its token inside the TLS tunnel, which is why
+    :func:`_refuse_a_cleartext_vault_hop` allows it. But a ``user:password@`` in that proxy's URL
+    is sent to the proxy itself, in the clear, on the ``CONNECT`` that opens the tunnel. Behind a
+    SOCKS proxy it goes in the SOCKS greeting instead, also in the clear.
+
+    Refused under every ``[security].enforcement`` setting, for the reason the cleartext refusal
+    gives: this hop has no posture in scope and no acceptance field. There is no loopback
+    exception. Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` with fixed
+    text."""
+    if proxy and _proxy_carries_cleartext_credentials(proxy):
+        raise InsecureHopRefused(f"{connector}: {_CLEARTEXT_PROXY_CREDENTIALS}")
+
+
+def _prepared_vault_hop(
+    session: requests.Session, url: object, request_proxies: object = None
+) -> tuple[str, str | None] | None:
     """The URL requests would send for ``url`` and the proxy it would pick, or ``None``.
 
     ``None`` means the address cannot be read as one URL: it is not a string, requests will not
@@ -548,9 +621,15 @@ def _prepared_vault_hop(session: requests.Session, url: object) -> tuple[str, st
 
     The URL is prepared exactly as requests prepares one before sending (``prepare_url``), so the
     build-time decision is made on the same URL the send-time check sees. The proxy comes from the
-    two calls ``Session.request`` makes: the environment and, on Windows, the Internet Settings
-    proxy, minus ``NO_PROXY``, which override the session's own proxies. It is looked up only for
-    an ``http://`` address, because nothing else needs it."""
+    two calls ``Session.request`` makes, in its order: ``request_proxies`` (the proxies the client
+    passes with every request; hvac passes its configured ones), then the environment and, on
+    Windows, the Internet Settings proxy, minus ``NO_PROXY``, then the session's own proxies.
+
+    It is looked up for an ``https://`` address too, because that proxy's URL can carry
+    credentials (BACKLOG #2547). If the lookup itself fails, an ``https://`` address goes on with no
+    proxy, because the adapter's send-time check still sees whatever proxy the send picks. Any
+    other address behaves as before: refused on a ``ValueError`` or a requests error, and the error
+    raised as it is otherwise, since its own text points at the proxy settings."""
     if not isinstance(url, str):
         return None
     try:
@@ -559,34 +638,50 @@ def _prepared_vault_hop(session: requests.Session, url: object) -> tuple[str, st
         sent = prepared.url or ""
         if urllib.parse.urlsplit(url.strip()).hostname != urllib.parse.urlsplit(sent).hostname:
             return None
-        if _scheme_of(sent) != "http":
-            return sent, None
-        settings = session.merge_environment_settings(sent, {}, None, None, None)
-        return sent, requests.utils.select_proxy(sent, settings["proxies"])
     except (ValueError, requests.exceptions.RequestException):
         return None
+    # A copy: merge_environment_settings writes the environment's proxies into the dict it gets.
+    proxies = dict(request_proxies) if isinstance(request_proxies, dict) else {}
+    try:
+        settings = session.merge_environment_settings(sent, proxies, None, None, None)
+        return sent, requests.utils.select_proxy(sent, settings["proxies"])
+    except (ValueError, requests.exceptions.RequestException):
+        return (sent, None) if _scheme_of(sent) == "https" else None
+    # re.error: proxy_bypass_registry compiles each Windows ProxyOverride entry as a pattern.
+    except (OSError, re.error):
+        if _scheme_of(sent) == "https":
+            return sent, None
+        raise
 
 
 def _refuse_an_insecure_vault_hop(
-    session: requests.Session, url: object, *, connector: str
+    session: requests.Session,
+    url: object,
+    *,
+    connector: str,
+    request_proxies: object = None,
 ) -> None:
-    """Refuse at construction a Vault hop that would send its token unprotected.
+    """Refuse at construction a Vault hop that would send its token or proxy credentials unprotected.
 
-    Two refusals, in this order, on the URL and proxy :func:`_prepared_vault_hop` returns:
+    Three refusals, in this order, on the URL and proxy :func:`_prepared_vault_hop` returns. It is
+    the order the send-time checks run in, so a hop gets the same refusal at both points:
 
+    * A proxy whose URL carries credentials and is not ``https://``, whatever the Vault address
+      (:func:`_refuse_cleartext_proxy_credentials`, BACKLOG #2547).
     * An ``https://`` proxy in front of an ``http://`` Vault, for the reason
       :func:`_unverifiable_proxy_leg` gives (BACKLOG #300).
     * Anything :func:`_refuse_a_cleartext_vault_hop` refuses (BACKLOG #2317): a direct ``http://``
       address that is not loopback, any ``http://`` address behind a proxy, and an address that
       cannot be read as one URL.
 
-    An ``https://`` Vault needs no more; :func:`_narrowed_pool_classes` covers its proxy leg. Both
-    refusals raise :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, outside any
-    ``except``, so neither carries a parser error that quotes the address. The proxy settings can
+    An ``https://`` Vault needs no more; :func:`_narrowed_pool_classes` covers its proxy leg. All
+    three raise :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, outside any
+    ``except``, so none carries a parser error that quotes the address. The proxy settings can
     change after this runs, so the adapter checks again before each send."""
-    hop = _prepared_vault_hop(session, url)
+    hop = _prepared_vault_hop(session, url, request_proxies)
     sent, proxy = hop if hop is not None else ("", None)
-    if proxy and _scheme_of(proxy) == "https":
+    _refuse_cleartext_proxy_credentials(proxy, connector=connector)
+    if _scheme_of(sent) == "http" and proxy and _scheme_of(proxy) == "https":
         raise InsecureHopRefused(_unverifiable_proxy_leg(connector))
     _refuse_a_cleartext_vault_hop(sent, proxy, connector=connector)
 
@@ -615,8 +710,10 @@ def mount_strict_reply_adapter(
     Also raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a
     :class:`ValueError`, when the Vault address is not ``https://``, unless it is loopback and
     reached with no proxy (BACKLOG #2317), and when requests would send an ``http://`` Vault
-    address through an ``https://`` proxy, whose TLS leg requests would not verify (BACKLOG #300).
-    At least the three Vault clients the engine builds today call this; a new one must too.
+    address through an ``https://`` proxy, whose TLS leg requests would not verify (BACKLOG #300),
+    and when requests would send the Vault hop, of any scheme, through a proxy whose URL carries
+    credentials and is not ``https://``, which would send those credentials in cleartext (BACKLOG
+    #2547). At least the three Vault clients the engine builds today call this; a new one must too.
     """
     session = getattr(getattr(client, "adapter", None), "session", None)
     if not isinstance(session, requests.Session):
@@ -624,8 +721,17 @@ def mount_strict_reply_adapter(
             f"{connector}: cannot mount the strict reply reader, because the Vault client exposes "
             f"no requests session at client.adapter.session"
         )
+    # hvac keeps the proxies it passes with every request in `_kwargs`, private but the only place
+    # they live. Read here so the build-time proxy is the one the send picks; when the attribute
+    # is missing, the adapter's send-time checks still cover them. A test pins the name.
+    request_kwargs = getattr(client.adapter, "_kwargs", None)
     _refuse_an_insecure_vault_hop(
-        session, getattr(client.adapter, "base_uri", None), connector=connector
+        session,
+        getattr(client.adapter, "base_uri", None),
+        connector=connector,
+        request_proxies=(
+            request_kwargs.get("proxies") if isinstance(request_kwargs, dict) else None
+        ),
     )
     adapter = StrictReplyAdapter(
         connector=connector, limit=limit, ssl_context_factory=ssl_context_factory

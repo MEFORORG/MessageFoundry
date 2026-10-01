@@ -23,6 +23,7 @@ Synthetic data only: the token, key names and host names are made up.
 
 from __future__ import annotations
 
+import re
 import socket
 import threading
 from collections.abc import Callable, Iterator
@@ -521,3 +522,347 @@ def test_provision_admin_shows_the_cleartext_refusal_not_the_canned_text(
         assert "well-formed https://" in str(caught.value)
     else:
         assert str(caught.value) == cli._PROVISION_AUTH_REFUSALS["reference"]
+
+
+# --- vault BACKLOG #2547: a proxy URL that carries credentials ------------------------------------
+#
+# An https:// Vault behind an http:// proxy is allowed above, because the token rides inside the TLS
+# tunnel. A user:password@ in that proxy's URL does not: requests sends it to the proxy itself, in
+# the clear, in the Proxy-Authorization header of the CONNECT that opens the tunnel. So a proxy URL
+# that carries credentials and is not https:// is refused, at construction and before each send.
+
+_PROXY_USER = "synthetic-proxy-user"
+_PROXY_PW = "synthetic-proxy-pw"  # nosec B105 - a made-up test value, not a credential
+_PROXY_AUTH = f"{_PROXY_USER}:{_PROXY_PW}"
+_HTTPS_VAULT = "https://vault.synthetic.test:8200"
+
+
+def _assert_names_no_proxy_part(text: str, port: int) -> None:
+    for fragment in (_PROXY_USER, _PROXY_PW, "127.0.0.1", str(port), "vault.synthetic.test"):
+        assert fragment not in text
+
+
+@_ENTRY_POINTS
+@pytest.mark.parametrize(
+    ("variable", "form"),
+    [
+        ("HTTPS_PROXY", "http://{auth}@127.0.0.1:{port}"),
+        ("https_proxy", "http://{auth}@127.0.0.1:{port}"),
+        ("ALL_PROXY", "http://{auth}@127.0.0.1:{port}"),
+        ("all_proxy", "http://{auth}@127.0.0.1:{port}"),
+        # No scheme: requests reads it as http://, so the credentials go in the clear the same way.
+        ("HTTPS_PROXY", "{auth}@127.0.0.1:{port}"),
+    ],
+    ids=["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "no-scheme"],
+)
+def test_an_https_vault_behind_a_credentialed_http_proxy_is_refused(
+    entry: EntryPoint,
+    variable: str,
+    form: str,
+    monkeypatch: pytest.MonkeyPatch,
+    listener: _Listener,
+) -> None:
+    """RED before the change: each entry point built its client and sent the CONNECT to the proxy,
+    with the credentials in a cleartext Proxy-Authorization header. On Windows the lower- and
+    upper-case names are one variable; both are kept so the case holds on POSIX too."""
+    monkeypatch.setenv(variable, form.format(auth=_PROXY_AUTH, port=listener.port))
+    dials = _no_dial(monkeypatch)
+    with pytest.raises(_FAIL_CLOSED, match="carries credentials in its URL") as caught:
+        entry(monkeypatch, _HTTPS_VAULT)
+    _assert_refused(caught, entry)
+    _assert_names_no_proxy_part(str(caught.value), listener.port)
+    assert dials == []
+    assert listener.connections == 0, "a socket reached the proxy"
+
+
+@pytest.mark.parametrize(
+    "form",
+    ["https://{auth}@127.0.0.1:{port}", "http://127.0.0.1:{port}"],
+    ids=["credentialed-https-proxy", "credential-free-http-proxy"],
+)
+def test_control_an_https_vault_behind_these_proxies_is_built_and_sent(
+    form: str, monkeypatch: pytest.MonkeyPatch, listener: _Listener
+) -> None:
+    """The two control arms. An https:// proxy carries its credentials inside TLS, and an http://
+    proxy with none has nothing to leak. Each builds and sends to the proxy, which hangs up: a
+    requests error, never the refusal. InsecureHopRefused is not a RequestException, so it would
+    escape this ``raises``. Mutation: refuse every credentialed proxy, whatever its scheme; red on
+    the first arm."""
+    import requests
+
+    from messagefoundry.config import secretprovider_vault
+
+    monkeypatch.setenv("HTTPS_PROXY", form.format(auth=_PROXY_AUTH, port=listener.port))
+    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    with pytest.raises(requests.exceptions.RequestException):
+        client.adapter.get("v1/secret/data/mefor/ad")
+    assert listener.connections >= 1
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "http://{auth}@127.0.0.1:{port}",
+        # Will not parse: requests' own error for this quoted the whole URL, password included,
+        # when the send-time check ran only after requests parsed it (code-review round 2).
+        "http://{auth}@127.0.0.1:99999",
+        # requests' InvalidProxyURL, not the refusal, when the check ran after its parse.
+        "{auth}@127.0.0.1:{port}",
+    ],
+    ids=["well-formed", "unparseable-port", "no-scheme"],
+)
+def test_a_credentialed_proxy_that_appears_after_construction_is_refused_before_sending(
+    form: str, monkeypatch: pytest.MonkeyPatch, listener: _Listener
+) -> None:
+    """The construction check reads the proxy settings once, so the adapter checks again before
+    each send, before requests parses the proxy URL. Mutation: drop the send-time calls; red, the
+    CONNECT reaches the proxy. Mutation: drop only the first one; red on the second and third
+    arms."""
+    from messagefoundry.config import secretprovider_vault
+
+    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    monkeypatch.setenv("HTTPS_PROXY", form.format(auth=_PROXY_AUTH, port=listener.port))
+    with pytest.raises(InsecureHopRefused, match="carries credentials in its URL") as caught:
+        client.adapter.get("v1/secret/data/mefor/ad")
+    _assert_names_no_proxy_part(str(caught.value), listener.port)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert listener.connections == 0, "a socket reached the proxy"
+
+
+def test_proxy_manager_for_refuses_on_its_own() -> None:
+    """The second send-time check, where requests reads the credentials. On this requests the
+    hook check above runs first, so it is driven directly: it is the one that still runs on a
+    requests too old to call the hook. Mutation: drop it; red."""
+    import ssl
+
+    from messagefoundry.transports.strict_requests import StrictReplyAdapter
+
+    adapter = StrictReplyAdapter(
+        connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+    )
+    with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
+        adapter.proxy_manager_for(f"http://{_PROXY_AUTH}@127.0.0.1:3128")
+    assert adapter.proxy_manager == {}, "a manager was built for the refused proxy"
+
+
+def test_a_configured_credentialed_proxy_is_refused_at_construction(
+    listener: _Listener,
+) -> None:
+    """A proxy configured on the client, not in the environment: ``hvac.Client(proxies=...)``
+    puts it on the session, and the construction check merges the session's proxies the way
+    requests does. Mutation: drop the construction call; red, the client builds."""
+    import ssl
+
+    import hvac
+
+    from messagefoundry.transports import strict_requests
+
+    proxy = f"http://{_PROXY_AUTH}@127.0.0.1:{listener.port}"
+    client = hvac.Client(url=_HTTPS_VAULT, token=_TOKEN, proxies={"https": proxy})
+    with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
+        strict_requests.mount_strict_reply_adapter(
+            client, connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+        )
+    assert listener.connections == 0, "a socket reached the proxy"
+
+
+@pytest.mark.parametrize(
+    ("environment", "configured", "refused"),
+    [
+        ("http://127.0.0.1:{port}", "http://{auth}@127.0.0.1:{port}", True),
+        ("http://{auth}@127.0.0.1:{port}", "http://127.0.0.1:{port}", False),
+    ],
+    ids=["configured-credentialed-wins", "configured-clean-wins"],
+)
+def test_the_build_check_picks_the_proxy_the_send_picks(
+    environment: str,
+    configured: str,
+    refused: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    listener: _Listener,
+) -> None:
+    """hvac passes its configured proxies with every request, and requests lets those beat the
+    environment. The build check merges them in the same order. RED before the round-1 repair:
+    the first case built, and the second was refused for a proxy the send would not use."""
+    import ssl
+
+    import hvac
+
+    from messagefoundry.transports import strict_requests
+
+    monkeypatch.setenv("HTTPS_PROXY", environment.format(auth=_PROXY_AUTH, port=listener.port))
+    # A key hvac's dict lacks, so a merge that wrote into it would show below.
+    monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{listener.port}")
+    client = hvac.Client(
+        url=_HTTPS_VAULT,
+        token=_TOKEN,
+        proxies={"https": configured.format(auth=_PROXY_AUTH, port=listener.port)},
+    )
+
+    def mount() -> None:
+        strict_requests.mount_strict_reply_adapter(
+            client, connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+        )
+
+    if refused:
+        with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
+            mount()
+        assert listener.connections == 0
+    # The environment's proxies were not written into hvac's own: requests' merge mutates the
+    # dict it is given, so the build check must hand it a copy. This also pins hvac's private
+    # name for the dict, which the build check reads.
+    assert set(client.adapter._kwargs["proxies"]) == {"https"}
+    if not refused:
+        mount()
+        # And the send agrees: it goes through the clean configured proxy, which hangs up, rather
+        # than being refused for the credentialed environment one.
+        import requests
+
+        with pytest.raises(requests.exceptions.RequestException):
+            client.adapter.get("v1/secret/data/mefor/ad")
+        assert listener.connections >= 1
+
+
+def _failing_proxy_lookup(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    import requests
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(requests.Session, "merge_environment_settings", boom)
+
+
+_LOOKUP_ERRORS = pytest.mark.parametrize(
+    "error",
+    [
+        OSError("synthetic: the proxy settings could not be read"),
+        # What proxy_bypass_registry raises on a Windows ProxyOverride entry that is no pattern.
+        re.error("synthetic: not a pattern"),
+        ValueError("synthetic: not a proxy setting"),
+    ],
+    ids=["OSError", "re.error", "ValueError"],
+)
+
+
+@_LOOKUP_ERRORS
+def test_an_https_vault_whose_proxy_lookup_fails_is_still_built(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The build check looks the proxy up for an https:// address now. If that lookup raises, the
+    address is not refused as malformed and the error does not escape: the send-time checks still
+    see the proxy the send picks. Mutation: let the lookup error escape; red."""
+    from messagefoundry.config import secretprovider_vault
+
+    _failing_proxy_lookup(monkeypatch, error)
+    secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+
+
+@_LOOKUP_ERRORS
+def test_an_http_vault_whose_proxy_lookup_fails_behaves_as_before(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The http:// arm keeps engine PR 1880's behaviour. A ValueError is refused with the fixed
+    cleartext text. Any other error is raised as it is, because its own text points at the proxy
+    settings, where a 'malformed address' refusal would point at a valid address."""
+    from messagefoundry.config import secretprovider_vault
+
+    _failing_proxy_lookup(monkeypatch, error)
+    address = f"http://127.0.0.1:{_closed_port()}"
+    if isinstance(error, ValueError):
+        with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
+            secretprovider_vault._build_client(address, _TOKEN)
+        _assert_refused(caught)
+    else:
+        with pytest.raises(type(error)):
+            secretprovider_vault._build_client(address, _TOKEN)
+
+
+def test_a_configured_credentialed_proxy_is_refused_before_sending(
+    listener: _Listener,
+) -> None:
+    """hvac passes its configured proxies on every request too. The send-time check reads the
+    proxies requests merged for that request, so a per-request proxy is covered."""
+    from messagefoundry.config import secretprovider_vault
+
+    client = secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+    # Where hvac.Client(proxies=...) keeps them for each request.
+    client.adapter._kwargs["proxies"] = {"https": f"http://{_PROXY_AUTH}@127.0.0.1:{listener.port}"}
+    with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
+        client.adapter.get("v1/secret/data/mefor/ad")
+    assert listener.connections == 0, "a socket reached the proxy"
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        "http://synthetic-user:synthetic-pw@proxy.synthetic.test:3128",
+        "HTTP://synthetic-user:synthetic-pw@proxy.synthetic.test:3128",
+        "http://synthetic-user@proxy.synthetic.test:3128",
+        "http://:synthetic-pw@proxy.synthetic.test:3128",
+        "synthetic-user:synthetic-pw@proxy.synthetic.test:3128",
+        # SOCKS sends them in its greeting, also in the clear.
+        "socks5://synthetic-user:synthetic-pw@proxy.synthetic.test:1080",
+        # No loopback exception: the rule is about the URL, not where the proxy is.
+        "http://synthetic-user:synthetic-pw@127.0.0.1:3128",
+        # The parsers disagree on a backslash before the @; one reading finds credentials.
+        "http://synthetic-user\\@proxy.synthetic.test:3128",
+        # Will not parse, so its credentials cannot be ruled out.
+        "http://synthetic-user:synthetic-pw@[proxy.synthetic.test:3128",
+    ],
+)
+def test_a_proxy_url_with_cleartext_credentials_is_refused(proxy: str) -> None:
+    from messagefoundry.transports.strict_requests import _refuse_cleartext_proxy_credentials
+
+    with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
+        _refuse_cleartext_proxy_credentials(proxy, connector="Vault test hop")
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        None,
+        "",
+        "http://proxy.synthetic.test:3128",
+        "proxy.synthetic.test:3128",
+        "https://synthetic-user:synthetic-pw@proxy.synthetic.test:3128",
+        "HTTPS://synthetic-user:synthetic-pw@proxy.synthetic.test:3128",
+    ],
+)
+def test_control_these_proxy_urls_pass(proxy: str | None) -> None:
+    from messagefoundry.transports.strict_requests import _refuse_cleartext_proxy_credentials
+
+    _refuse_cleartext_proxy_credentials(proxy, connector="Vault test hop")
+
+
+def test_the_proxy_refusal_is_fixed_text_that_echoes_no_part_of_the_url() -> None:
+    from messagefoundry.transports.strict_requests import _refuse_cleartext_proxy_credentials
+
+    texts = []
+    for proxy in (
+        "http://operator:synthetic-pw@proxy.synthetic.test:3181",
+        "http://other:another-pw@10.9.8.7:3999",
+    ):
+        with pytest.raises(InsecureHopRefused) as caught:
+            _refuse_cleartext_proxy_credentials(proxy, connector="Vault test hop")
+        texts.append(str(caught.value))
+    assert texts[0] == texts[1]
+    for fragment in ("operator", "synthetic-pw", "proxy.synthetic.test", "3181", "10.9.8.7"):
+        assert fragment not in texts[0]
+    assert texts[0].startswith("Vault test hop: ")
+
+
+def test_the_proxy_refusal_ignores_the_enforcement_dial(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refused, not warned, under a non-enforcing posture and the global insecure-TLS escape."""
+    from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
+    from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+    from messagefoundry.transports.strict_requests import _refuse_cleartext_proxy_credentials
+
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with (
+        active_hop_posture(HopPosture(enforcing=False)),
+        pytest.raises(InsecureHopRefused),
+    ):
+        _refuse_cleartext_proxy_credentials(
+            "http://synthetic-user:synthetic-pw@proxy.synthetic.test:3128",
+            connector="Vault test hop",
+        )

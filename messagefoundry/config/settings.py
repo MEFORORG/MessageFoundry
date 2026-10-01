@@ -2426,6 +2426,17 @@ class RetentionSettings(_Section):
         return self._parse_clock(self.vacuum_at) if self.vacuum_at else None
 
 
+def is_ldaps_address(server: str) -> bool:
+    """Whether an ``[auth].ad_server`` value names an LDAPS endpoint (vault BACKLOG #2354).
+
+    The scheme ``ldaps://`` and nothing looser. A bare host such as ``ldapsrv01.corp.example`` starts
+    with ``ldaps`` too, but ldap3 dials it on 389 with no TLS, so a prefix test without ``://`` would
+    take a cleartext bind for an encrypted one. ``AuthSettings`` and ``LdapAuthenticator`` both read
+    this, so the settings refusal and the TLS the authenticator builds agree on what is plain.
+    Surrounding whitespace is ignored, because ldap3 strips it before it reads the scheme."""
+    return server.strip().lower().startswith("ldaps://")
+
+
 def split_kerberos_spn(spn: str) -> tuple[str, str]:
     """Split ``[auth].kerberos_spn`` into ``(service, hostname)`` for pyspnego (BACKLOG #275).
 
@@ -2672,7 +2683,11 @@ class AuthSettings(_Section):
     # independent of [security].enforcement (a substituted AD anchor permits an LDAPS MITM). Dormant
     # when None. Block-scoped (direct-read by the preflight, not desugared).
     ad_tls_ca_cert_pin: str | None = None
-    ad_allow_insecure_ldap: bool = False  # explicit opt-in to a non-ldaps:// bind (trusted-net dev)
+    # Explicit opt-in to a non-ldaps:// bind (trusted-net dev). Honoured only under
+    # [security].enforcement = warn, and named as a loosening there (vault BACKLOG #2354). Under enforce it
+    # is inert: ServiceSettings refuses the plain bind at load, as the MEFOR_ALLOW_INSECURE_TLS escape is
+    # inert there.
+    ad_allow_insecure_ldap: bool = False
     # Finite network timeouts for EVERY ldap3 Server/Connection the authenticator builds (ASVS 13.1.3).
     # ldap3's own defaults are None on both, and the engine never calls socket.setdefaulttimeout, so
     # without these an unresponsive domain controller made the TCP connect and every LDAP response read
@@ -3180,20 +3195,27 @@ class AuthSettings(_Section):
             )
         return value
 
+    @property
+    def plain_ldap_bind(self) -> bool:
+        """Whether AD is on and its ``ad_server`` is not an LDAPS address (vault BACKLOG #2354).
+
+        Read by at least the opt-in check below, the ``enforce`` refusal in :class:`ServiceSettings`
+        and :func:`security_loosenings`. The scheme test is :func:`is_ldaps_address`, which
+        ``LdapAuthenticator`` shares."""
+        return (
+            self.ad_enabled and self.ad_server is not None and not is_ldaps_address(self.ad_server)
+        )
+
     @model_validator(mode="after")
     def _require_ad_fields(self) -> AuthSettings:
         """AD/SSO need their connection essentials present when enabled."""
         if self.ad_enabled and (self.ad_server is None or self.ad_user_search_base is None):
             raise ValueError("ad_enabled requires: ad_server, ad_user_search_base")
-        if (
-            self.ad_enabled
-            and self.ad_server is not None
-            and not self.ad_server.lower().startswith("ldaps://")
-            and not self.ad_allow_insecure_ldap
-        ):
+        if self.plain_ldap_bind and not self.ad_allow_insecure_ldap:
             raise ValueError(
                 "ad_enabled requires an ldaps:// ad_server (credentials go over a SIMPLE bind); "
-                "set ad_allow_insecure_ldap=true only for a trusted-network dev override"
+                "ad_allow_insecure_ldap=true overrides this only under [security].enforcement = warn, "
+                "for a trusted-network dev box"
             )
         if self.ad_enabled and self.ad_bind_dn is None:
             raise ValueError("ad_enabled requires a service account: ad_bind_dn")
@@ -5531,7 +5553,7 @@ class SecuritySettings(_Section):
     # The interstitial itself. On by default (ADR-less: this IS the 3.7.3 control). Turning it off is
     # a posture decision, not a convenience one, and the serve gate says so.
     external_link_interstitial: bool = True
-    # ⚠️ THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
+    # WARNING: THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
     # notification and no cancel — precisely what 3.7.3 asks for. It exists because operators have
     # legitimate high-volume external destinations they do not want to declare as their own domain.
     # Same label-boundary matching. Non-empty produces a startup warning naming every entry; the
@@ -5688,6 +5710,34 @@ class ServiceSettings(BaseModel):
                 "[auth].oidc_enabled requires an external origin (the federated redirect URI is "
                 "derived from it); set [security].web_console_public_address to the browser-reachable "
                 "origin, e.g. 'https://ops.example.com' or 'http://localhost:8765' for a loopback lab"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _plain_ldap_refused_under_enforce(self) -> ServiceSettings:
+        """Under ``[security].enforcement = enforce``, ``[auth].ad_allow_insecure_ldap`` is inert, so a
+        plain ``ldap://`` AD bind is refused (vault BACKLOG #2354).
+
+        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way (ADR 0092 decision 2, and
+        ``weakened_tls_escape_permitted``). This one was honoured at any dial, so on a first deployment
+        at the shipped ``enforce`` it would have sent the service-account and user passwords over a
+        cleartext SIMPLE bind. The dial and the bind live in different sections, so the check lives
+        here, where the existing ``ldap://`` check already runs at load. ``LdapAuthenticator`` repeats
+        it at build for a caller that hands it an ``AuthSettings`` alone. Under ``warn`` the opt-in is
+        honoured, warned at build and named by :func:`security_loosenings`.
+
+        Not keyed on ``[auth].enabled``: with sign-in off nothing dials the directory, but turning
+        sign-in on would make the bind live with no second check, so the config is refused either way.
+        A loopback ``ldap://`` (an on-box LDAPS proxy) is refused too; the cleartext-hop gradient's
+        loopback ALLOW was not extended to this hop."""
+        if self.auth.plain_ldap_bind and self.security.enforcement is SecurityEnforcement.ENFORCE:
+            raise ValueError(
+                "[auth].ad_server is not an ldaps:// address, and [auth].ad_allow_insecure_ldap is "
+                "inert under [security].enforcement = enforce: the service-account and user passwords "
+                "would cross the network in cleartext. Use an ldaps:// ad_server, and anchor an "
+                "internal CA with ad_tls_ca_cert_file if the directory needs one. The opt-in is "
+                "honoured only under enforcement = warn, and that relaxes every serve gate, not only "
+                "this one"
             )
         return self
 
@@ -6604,7 +6654,8 @@ def security_loosenings(
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
     ``[store].allow_unmarked_ciphertext`` (#1169),
-    ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
+    ``[auth].ad_session_recheck_seconds``, ``[auth].ad_allow_insecure_ldap`` with a live ``ldap://``
+    bind (vault BACKLOG #2354), ``[auth].admin_new_ip_step_up`` (#288), the ``[auth]``
     sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap and OIDC flow-cache
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131), an
     ``[api].trusted_proxies`` set of ranges covering every peer of a family (#1131),
@@ -6618,10 +6669,12 @@ def security_loosenings(
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
-    ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
+    ``ad_tls_verify``, ``oidc_require_mfa_claim``,
     ``password_check_breached``) that are gated elsewhere and are not reported here. That list is
     enumerated in the floor test's exemption set so the gap is a written decision that a new switch
-    cannot silently join.
+    cannot silently join. That set also holds at least one switch this registry DOES report,
+    ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's lone
+    flip never builds; its own tests pin it.
 
     **``[auth].initial_password_expiry_hours`` is also unreported, and BACKLOG #1245 made it
     load-bearing — recorded here as the written decision this paragraph demands, not left implied.**
@@ -6897,6 +6950,20 @@ def security_loosenings(
                 "ad_session_recheck_seconds",
                 "directory revocation does NOT propagate — an AD account disabled or deleted keeps its "
                 "live engine sessions until they expire on their own",
+            )
+        )
+    # Vault BACKLOG #2354: a plain ldap:// AD bind. ServiceSettings refuses it at load under enforce, so a
+    # loaded config reaches this only at warn. Conditional on the bind being live: the flag beside an
+    # ldaps:// address, with AD off, or with sign-in off (nothing builds the authenticator) changes
+    # nothing and is not named. Sign-in is read off [security], as for the limiter entries below, so
+    # `security set` turning it on shows this at once.
+    if sec.require_sign_in and auth.plain_ldap_bind:
+        out.append(
+            (
+                "ad_allow_insecure_ldap",
+                "AD binds over plain ldap:// -- the service-account password and every signing-in "
+                "user's password cross the network in cleartext, and nothing authenticates the "
+                "domain controller",
             )
         )
     # BACKLOG #288: the new-client-IP step-up defaults ON. Conditional on auth, like the entry above is

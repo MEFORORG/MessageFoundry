@@ -912,8 +912,8 @@ throughput — only the leader processes.
   "Finding something to work on", names the routes.
 - **Security vulnerabilities:** use the repository's **private security advisory** process per
   `.github/SECURITY.md` — do **not** open a public issue for a vulnerability.
-- **Before you share a problem:** verify it against current `main` (pre-1.0, latest-main-only
-  support). Include the engine version, config shape, and relevant **non-PHI** log excerpts.
+- **Before you share a problem:** verify it against the latest engine release (the
+  `messagefoundry` package), the only supported version before 1.0 (`docs/SUPPORT-POLICY.md`). Include the engine version, config shape, and relevant **non-PHI** log excerpts.
 - **Never attach real PHI** to anything you share, including a log excerpt or a reproduction.
   Redact hostnames, IP addresses and partner names. Reproduce with a synthetic corpus from
   `messagefoundry generate`.

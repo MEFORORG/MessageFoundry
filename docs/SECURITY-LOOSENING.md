@@ -72,6 +72,7 @@ section reference.
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
+| | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
 | | `[auth].admin_new_ip_step_up` | `true` (*conditional* — a loosening only while auth is on) |
 | | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (*conditional* — a loosening only while auth is on; minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
@@ -88,29 +89,32 @@ section reference.
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
+| | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
-`[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
+`[auth].ad_allow_insecure_ldap`, `[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies` and
 `[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
-settings at all. They are listed and reported here anyway, because the rule is *one shipped
+settings at all. They are listed here anyway, and all but `update_url_form` are reported, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[secret_rotation]`/`[api]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
-exactly which surfaces see them, and which cannot).
+exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
+yet: `update_url_form`, whose entry names the two records it does have.
 
 > **Scope, stated plainly.** The registry covers *every* `[security]` switch (a completeness floor in
 > `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one), the connection
 > factories' TLS-shaped parameters (a second floor in the same file censuses the factory signatures,
 > because a per-connection deviation is outside `model_fields`' reach by construction) and the
-> enumerated deviations above. It is **not yet** an exhaustive register of every security-relevant
+> enumerated deviations above, except `update_url_form` (its entry says which records it has). It is
+> **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
-> `[auth].enabled` / `require_mfa` / `ad_tls_verify` / `ad_allow_insecure_ldap` /
+> `[auth].enabled` / `require_mfa` / `ad_tls_verify` /
 > `oidc_require_mfa_claim` are gated by their own serve-time refusals and are **not** reported here.
 > That gap is enumerated in the floor test's exemption set, so it is a written decision rather than an
 > accident, and a *new* switch in either section cannot join it silently. Closing it is owed work.
@@ -414,7 +418,8 @@ is refused, so an opt-out does nothing and is not reported.
 ### `enforcement = warn` — warn instead of refuse on the PHI serve-gate floor
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
-  (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again, but only where the
+  (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) and `[auth].ad_allow_insecure_ldap` are
+  **honoured** again, the first two only where the
   code knows this posture. A check that reads no posture refuses the escape whatever the dial says
   (vault BACKLOG #2354): at least the CLI commands that open the store without one. This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
@@ -535,6 +540,24 @@ This section is kept rather than deleted, because the claim it used to make is t
   (`auth.ad_session_revoked`) under review. The reconciler is **fail-open** on DC unavailability by
   design, so it was never a substitute for these.
 - **See:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) (2026-07-28 amendment).
+
+### `[auth].ad_allow_insecure_ldap = true` **with a plain `ldap://` `ad_server`** — AD binds in cleartext
+> **Conditional**, and reachable only at `[security].enforcement = warn`. Under `enforce` the switch is
+> inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
+> #2354). A loopback `ldap://` address is refused too.
+> It is reported only while a plain bind is live, which needs at least `ad_enabled`,
+> `[security].require_sign_in` and an `ad_server` that is not `ldaps://`.
+- **What you lose:** the encryption and the server authentication on the AD hop. Both binds are SIMPLE
+  binds, so the service-account password and the password of every user who signs in or steps up cross
+  the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
+  can read the passwords or answer as the directory.
+- **When acceptable:** a trusted-network dev or test box with a lab directory and throwaway accounts.
+  Never with a real domain account.
+- **Compensating controls:** none that substitute. Use `ldaps://`, and anchor an internal CA with
+  `ad_tls_ca_cert_file` rather than turning verification off. Startup logs a WARNING from the
+  authenticator, and `serve` and `GET /security/posture` name the switch on every boot. No audit row
+  is written, as for the other settings-scoped loosenings.
+- **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
 > **Conditional** on sign-in. With `[security].require_sign_in = false` there is no session for the signal to
@@ -879,6 +902,34 @@ This section is kept rather than deleted, because the claim it used to make is t
   `cleartext_accepted`. Where it is NOT reported is the same list as `cleartext_accepted` above:
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
 
+### `update_url_form = "path"` on a FHIR connection — the resource id in the request URL
+> **Connection-scoped**, like `tls_allow_expired` above: a keyword on one `FHIR()` outbound, which
+> applies only to `interaction="update"` or `conditional="if-match"`. FHIR is not a `connections.toml`
+> transport, so there is no data-authored form. Vault BACKLOG #2550, relaxing owner ruling R3 under
+> ASVS 14.2.1 (vault BACKLOG #1965).
+- **What you lose:** the shipped form sends an update as the one entry of a `transaction` `Bundle`, so
+  no message-derived id appears in a request URL. The path form sends `PUT {base}/{ResourceType}/{id}`.
+  Each message's resource id is then in the request line, and so in the receiving server's access logs
+  and in any proxy log on the path. An id can be a medical record number or another identifier.
+- **What you keep:** the id must still match the FHIR id grammar and must not be only dots, or the
+  message is dead-lettered and nothing is sent. The hop's TLS, egress allow-list, redirect refusal and
+  authentication are unchanged. Only update and if-match change form; `create` and the conditional
+  searches never carried the id.
+- **When acceptable:** the receiving server has no `transaction` interaction, so the shipped form cannot
+  work there. On 2026-10-01 that was true of at least Epic and Oracle Health (Millennium);
+  [CONNECTIONS.md](CONNECTIONS.md#vendor-compatibility-and-the-path-form-opt-in) gives the readings and
+  sources. Set it on the one connection that needs it.
+- **Compensating controls:** treat the server's access logs as PHI-bearing, with the access control and
+  retention that implies, and confirm who can read any proxy log on the path.
+- **It is never silent:** a WARNING at every construction naming the connection, never an id, and a
+  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it.
+- **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
+  `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
+  and `[security].enforcement = enforce` does not refuse it. It is **not yet** in
+  `security_loosenings()`, so `GET /security/posture` and the serve-time loosening warning do not name
+  it. The construction WARNING and the `check` line are its only records today; adding it to the
+  registry is owed work.
+
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the flag entries above it is not a flag anyone sets — it is the *absence* of a
 > verifying keyword. It applies to a `Database(...)` outbound **or** a `DatabasePoll(...)` inbound with
@@ -1050,6 +1101,7 @@ chapter was not part of the verification above.
 | `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
+| `[auth].ad_allow_insecure_ldap` (plain `ldap://` AD bind) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold`, `[auth].lockout_max_minutes` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].phi_read_rate_limit_*`, `[auth].admin_write_*`, `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds` (PHI-read and admin-write pacing, second-step time floors) | V2 Validation and Business Logic (anti-automation, 2.4.1 / 2.4.2) | **SC-5** Denial-of-Service Protection | §164.312(a)(1) Access Control |
