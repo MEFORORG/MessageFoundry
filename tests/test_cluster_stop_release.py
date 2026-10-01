@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from types import TracebackType
 
 from messagefoundry.pipeline.cluster import (
     STOP_WRITE_TIMEOUT_SECONDS,
@@ -113,51 +112,33 @@ class _Writes:
         return 1
 
 
-class _PgAcquired:
-    """``pool.acquire(timeout=...)`` as asyncpg 0.31.0 shapes it, for one write."""
-
-    def __init__(self, pool: _PgPool, timeout: float | None) -> None:
-        self._pool = pool
-        self._timeout = timeout
-
-    async def __aenter__(self) -> _PgPool:
-        self._pool.acquire_timeouts.append(self._timeout)
-        return self._pool
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        writes = self._pool.writes
-        cancelled = exc_type is not None and issubclass(exc_type, asyncio.CancelledError)
-        if cancelled and writes.hung_in_flight:
-            # asyncpg: a statement cancelled in flight leaves the protocol cancelling, and the pool's
-            # shielded release waits for the server to acknowledge that cancel for as long as the
-            # ACQUIRE's timeout, then terminates the connection and re-raises. None waits forever. A
-            # partitioned server never acknowledges, so this wait is the whole question.
-            writes.hung_in_flight = False
-            await asyncio.wait_for(asyncio.Event().wait(), self._timeout)
-
-
 class _PgPool:
-    """One node's asyncpg-shaped view of the shared row. ``execute`` serves both ``pool.execute`` (the
-    stepdown's unbounded path) and ``con.execute`` (stop()'s path through ``acquire``)."""
+    """One node's asyncpg-shaped view of the shared row. It lends itself as the connection, so
+    ``con.execute`` and ``con.fetchrow`` land here; since BACKLOG #2523 every statement the
+    coordinator sends borrows through ``acquire`` and hands the connection back through ``release``.
+    """
 
     def __init__(self, lease: _LeaseRow) -> None:
         self._lease = lease
         self.writes = _Writes(lease)
         self.acquire_timeouts: list[float | None] = []
 
-    async def fetchrow(
-        self, sql: str, *args: object, timeout: float | None = None
-    ) -> dict[str, object] | None:
+    async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
         assert "INSERT INTO leader_lease" in sql
         return self._lease.claim(args[1])
 
-    def acquire(self, *, timeout: float | None = None) -> _PgAcquired:
-        return _PgAcquired(self, timeout)
+    async def acquire(self, *, timeout: float | None = None) -> _PgPool:
+        self.acquire_timeouts.append(timeout)
+        return self
+
+    async def release(self, con: object, *, timeout: float | None = None) -> None:
+        if self.writes.hung_in_flight:
+            # asyncpg 0.31.0: a statement cancelled in flight leaves the protocol cancelling, and the
+            # pool's shielded release waits for the server to acknowledge that cancel for as long as
+            # the release's timeout, then terminates the connection and re-raises. None waits for
+            # ever. A partitioned server never acknowledges, so this wait is the whole question.
+            self.writes.hung_in_flight = False
+            await asyncio.wait_for(asyncio.Event().wait(), timeout)
 
     async def execute(self, sql: str, *args: object) -> str:
         # Lease release args: (lease_key, owner). Tombstone args: ("left", last_seen, node_id).
@@ -266,6 +247,8 @@ async def test_pg_stop_writes_go_through_a_bounded_acquire() -> None:
     pool = _PgPool(lease)
     a = _pg(pool, "A", _Clock(0.0))
     await _lead_then_self_fence(a)
+    # The claim borrowed too, at the renew clamp (BACKLOG #2523); only stop()'s two writes count here.
+    pool.acquire_timeouts.clear()
     await a.stop()
     assert pool.acquire_timeouts == [_BOUND, _BOUND]
 
@@ -337,15 +320,12 @@ async def test_a_release_that_fails_fast_still_sends_the_tombstone() -> None:
 
 class _ReleaseFailsAfterCommit:
     """A connection whose statement returns and whose return to the pool then fails, as asyncpg's
-    release does when its reset round trip misses the acquire budget."""
+    release does when its reset round trip misses the release budget."""
 
-    def acquire(self, *, timeout: float | None = None) -> _ReleaseFailsAfterCommit:
+    async def acquire(self, *, timeout: float | None = None) -> _ReleaseFailsAfterCommit:
         return self
 
-    async def __aenter__(self) -> _ReleaseFailsAfterCommit:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
+    async def release(self, con: object, *, timeout: float | None = None) -> None:
         raise TimeoutError
 
     async def execute(self, sql: str, *args: object) -> str:

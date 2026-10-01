@@ -65,7 +65,7 @@ leader_fence_timeout_seconds  = 20.0  # a leader that can't renew within this se
 #   EXPIRED lease (handicap). A preferred site keeps 0.0; a warm remote-DR node sets a positive value so
 #   a preferred node wins the routine take-over race. NEVER delays a renewal by the current leader, and
 #   only ever makes a node claim LATER — so it can't open a two-leader window. Governs take-over of an
-#   EXPIRED lease only; the very first election on an empty table is a plain race.
+#   EXPIRED lease only; the very first election on an empty table is a plain race. 0 to 3600.
 acquire_delay_seconds = 0.0
 # promotable: false = this node may NEVER become leader (never inserts/takes-over/renews the lease); a
 #   node that somehow already leads steps down cleanly on its next tick. Use it for a warm, passive DR
@@ -394,7 +394,7 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
   reports for each node as `fresh`. If it
   finds none, stepping down would leave no node able to take the lease, so it refuses and changes
   nothing. That covers a clustered install running one node, and one whose only sibling is
-  `promotable = false`, has stopped heartbeating, or has an infinite `acquire_delay_seconds`. The check is a snapshot: a sibling that dies just
+  `promotable = false` or has stopped heartbeating. The check is a snapshot: a sibling that dies just
   after it still counted.
 - **`force` drains the node anyway, and waives nothing else.** Send `{"force": true}` to step down the
   last promotable node on purpose. It does not turn a `400` or a `409` into a success. **It does not keep
@@ -495,6 +495,26 @@ that it can take over again if its successor fails. On a cluster with no other p
 such a call is refused with `412` unless you send `force`. Give every node the same
 `heartbeat_seconds`: the pause is counted in the drained node's own heartbeats, so a sibling with a
 longer one can miss it. A clean stop needs no pause, because a stopped node does not claim.
+
+**A slow store during the pause does not block a retried stepdown.** While paused, each tick reads
+who owns the lease, and it reads while holding the lock a stepdown waits on. A stepdown waits for
+that lock only up to `leader_fence_timeout_seconds`, and the retry after a `release-unconfirmed` is
+the call most likely to arrive then. So the read gets its own limit: the smaller of the store's
+statement timeout and three quarters of the fence timeout. At the shipped settings that is 15
+seconds on SQL Server, where `[store].command_timeout` (30) is longer than the fence (20), and the
+4.5 second renew timeout on Postgres. A read that misses the limit fails, the node logs it and stays
+paused, and the stepdown gets the lock in time ([BACKLOG #2540](BACKLOG.md)).
+
+The limit is on the read, and cleaning up after a stalled read takes a little longer. On Postgres the
+driver may wait as long again to hand the connection back, so the read can hold the lock for up to
+9 seconds at the shipped settings. On SQL Server the cleanup is normally instant, but it can take up
+to 5 more seconds. **So keep `leader_fence_timeout_seconds` above 20 on SQL Server** if a retried
+stepdown must never see `503 lock-timeout` while the store is slow.
+
+We chose that limit over two other designs. Moving the read into the claim statement would break
+the retry of an unconfirmed release, which relies on a claim that finds no row to clear the owed
+write ([BACKLOG #1508](BACKLOG.md)). Moving the read outside the lock would let it race a stepdown
+running at the same time.
 
 **A node that has already self-fenced can be drained.** It has given up leadership in memory but still
 owns a live lease row, which `GET /cluster/nodes` shows as `lease_owner`. A stepdown there expires that

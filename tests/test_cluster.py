@@ -44,6 +44,7 @@ from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 from messagefoundry.transports.base import InboundHandler, SourceConnector
+from tests._pool_lend import LendsItself
 
 # host:pid:hex8 — the shared identity shape (== PostgresStore._owner).
 _NODE_ID_RE = re.compile(r"^.+:\d+:[0-9a-f]{8}$")
@@ -111,7 +112,7 @@ class _NotLeaderCoordinator:
         return (None, None)
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         # A follower holds no leadership to release (ADR 0056 slice 1), so the honest answer is the
         # same one NullCoordinator gives. Present so this stand-in still structurally satisfies the
@@ -255,7 +256,7 @@ async def _members_via_helper(rows: _Rows) -> list[ClusterMember]:
 
 
 async def _members_via_db_coordinator(rows: _Rows) -> list[ClusterMember]:
-    class _Pool:
+    class _Pool(LendsItself):
         async def fetch(self, sql: str, *args: object) -> _Rows:
             assert "FROM nodes" in sql
             return rows
@@ -1260,7 +1261,7 @@ async def test_null_coordinator_step_down_releases_nothing() -> None:
     # pretending a failover happened. POST /cluster/stepdown never reaches here (it refuses a
     # single-node caller with 400 first), but the Protocol answer must still be truthful.
     c = NullCoordinator("solo")
-    assert await c.step_down_leadership() == (False, None, False)
+    assert await c.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, False)
     assert c.is_leader() is True  # and single-node stays leader, byte-identically
 
 
@@ -1294,7 +1295,9 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
     coord._last_renew_ok = 0.0
     coord._leader_epoch = 3
 
-    was_leader, released_at, lease_released = await coord.step_down_leadership()
+    was_leader, released_at, lease_released = await coord.step_down_leadership(
+        sibling_acquire_delay_seconds=0.0
+    )
 
     assert was_leader is True and released_at is not None and lease_released is True
     assert coord.is_leader() is False and coord.current_epoch() is None
@@ -1307,5 +1310,9 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
     assert coord._no_claim_until == 20.0
     # A second stepdown releases nothing and issues no further write.
     writes = len(store.executed)
-    assert await coord.step_down_leadership() == (False, None, False)
+    assert await coord.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (
+        False,
+        None,
+        False,
+    )
     assert len(store.executed) == writes

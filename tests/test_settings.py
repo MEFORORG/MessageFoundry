@@ -16,6 +16,7 @@ from messagefoundry.config.settings import (
     _DEFAULT_FILE,
     ApiSettings,
     AuthSettings,
+    ClusterSettings,
     DeliverySettings,
     DrSettings,
     ServiceSettings,
@@ -1325,6 +1326,27 @@ def test_cluster_acquire_delay_must_be_non_negative(tmp_path: Path) -> None:
     )
     with pytest.raises(ValidationError, match="acquire_delay_seconds"):
         load_settings(config_path=cfg, environ={})
+
+
+@pytest.mark.parametrize("value", ["3600.5", "86400", "inf", "nan"])
+def test_cluster_acquire_delay_has_an_upper_bound(tmp_path: Path, value: str) -> None:
+    # BACKLOG #2539: a stepdown pauses the drained node for the longest sibling delay, so a typo of
+    # a few extra digits, or a delay that can never be met, would hold that node out for hours or for
+    # good. TOML spells the non-finite values `inf` and `nan`.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        f"[cluster]\nenabled = true\nacquire_delay_seconds = {value}\n",
+    )
+    with pytest.raises(ValidationError, match="between 0 and 3600"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_acquire_delay_accepts_the_bound_itself() -> None:
+    # The control for the test above: the bound is inclusive, so an hour is still a legal delay.
+    assert (
+        ClusterSettings(enabled=True, acquire_delay_seconds=3600.0).acquire_delay_seconds == 3600.0
+    )
 
 
 # --- [cluster.vip] engine-managed virtual IP (ADR 0056) ---------------------

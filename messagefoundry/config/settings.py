@@ -4421,6 +4421,13 @@ def _derived_renew_timeout_seconds(margin_seconds: float) -> float:
     )
 
 
+#: The largest ``[cluster].acquire_delay_seconds`` the config accepts (BACKLOG #2539). Picked, not
+#: derived; ``ClusterSettings._nonneg_acquire_delay`` says why. The stepdown pause also clamps a
+#: sibling delay to it (``pipeline.cluster.stepdown_pause_seconds``), because that delay is read
+#: back from a ``nodes`` row, which something other than this validator may have written.
+MAX_ACQUIRE_DELAY_SECONDS = 3600.0
+
+
 class ClusterSettings(_Section):
     """``[cluster]`` — active-passive HA coordination (Track B Steps 3-7).
 
@@ -4519,7 +4526,7 @@ class ClusterSettings(_Section):
     # LONGER than the un-handicapped expiry, so it can never open a two-leader window (the split-brain
     # guarantee is preserved). It governs take-over of an EXPIRED lease (the routine-transition path); the
     # very first election on an empty lease table is a plain race — use ``promotable`` / operator ordering
-    # to control cold bring-up. Must be >= 0.
+    # to control cold bring-up. Must be between 0 and 3600 (BACKLOG #2539).
     acquire_delay_seconds: float = 0.0
     # NON-PROMOTABLE standby flag (ADR 0096). True (default) = a normal HA node. False = this node may
     # NEVER become leader: it never inserts a fresh lease, never takes over an expired one, and does not
@@ -4561,9 +4568,16 @@ class ClusterSettings(_Section):
     def _nonneg_acquire_delay(cls, value: float) -> float:
         # 0.0 (the default) = no handicap; a negative delay would let a node claim BEFORE the lease
         # expires (a two-leader window), so it is rejected at config load.
-        if value < 0:
+        #
+        # BACKLOG #2539: bounded above too. A planned stepdown pauses the drained node for the
+        # longest promotable sibling's delay, so a typo of a few extra digits on any one sibling
+        # left that node unable to reclaim for hours, and an infinite or NaN delay could never be
+        # met at all. 3600 s is picked, not derived: the docs only ever describe delays of seconds
+        # to minutes, and an hour leaves ample room above that.
+        if not 0 <= value <= MAX_ACQUIRE_DELAY_SECONDS:
             raise ValueError(
-                "acquire_delay_seconds must be >= 0 (0 disables the leader-preference handicap)"
+                "acquire_delay_seconds must be between 0 and "
+                f"{MAX_ACQUIRE_DELAY_SECONDS:g} (0 disables the leader-preference handicap)"
             )
         return value
 
