@@ -2497,6 +2497,142 @@ def test_a_call_with_no_data_wrapping_a_nested_call_keeps_its_own_scope() -> Non
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
 
 
+# --- a statement the flow does not read unbinds every handle; handle case is ignored --------------
+#
+# The Manager's decisions after the re-cut, all fail closed. Synthetic fixtures only.
+
+_WRITE_BARE_INPUT = _write("input-handle", "ADT", "X")
+_SEND_BARE_INPUT = _role_send("input-handle", "ADT", "OB_IN")
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(f'<Line Data="MsgCreate ADT {_A04}"/>', id="markup-free-msgcreate"),
+        pytest.param('<Line Data="MsgTreeCopy NEW/ to ADT/"/>', id="markup-free-copy"),
+        pytest.param('<Line Data="MsgLoad ADT"/>', id="unread-verb"),
+    ],
+)
+def test_a_whole_write_of_a_handle_without_percent_unbinds_the_input(statement: str) -> None:
+    """Open finding 1 of the re-cut, verified as ``Send("OB_IN", msg)``: a markup-free whole-tree
+    write of a handle spelled without ``%`` was invisible. Now the send raises. The control, the
+    same list without the statement, still sends msg."""
+    control = _handler_body(_handler_source(_WRITE_BARE_INPUT + _SEND_BARE_INPUT))
+    assert '    sends.append(Send("OB_IN", msg))' in control
+    body = _handler_body(_handler_source(_WRITE_BARE_INPUT + statement + _SEND_BARE_INPUT))
+    assert 'Send("OB_IN"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
+
+
+_UNREAD_STATEMENTS = [
+    pytest.param('<Line Data="CallActionList &quot;Rebuild&quot; pass %ADT"/>', id="call-alias"),
+    pytest.param(
+        f'<Call Data="ActionListExit"><Actions>{_create("%OUT", _ADT_A04)}</Actions></Call>',
+        id="call-tag-with-another-verb",
+    ),
+    pytest.param('<Line Data="EnvLogText &quot;x&quot;"/>', id="unread-verb-naming-no-handle"),
+    pytest.param(
+        _role_line("MsgCreate " + _span("keyword", "MsgLog") + " " + _span("other-handle", "%P")),
+        id="verb-misread-from-a-later-span",
+    ),
+    pytest.param(
+        _role_line(
+            _span("keyword", "MsgTreeCopy")
+            + " "
+            + _span("other-handle", "%NEW")
+            + _span("path", "/")
+            + " to "
+            + "<span class='handle'>OUT</span>"
+        ),
+        id="unlisted-span-class",
+    ),
+]
+
+
+@pytest.mark.parametrize("statement", _UNREAD_STATEMENTS)
+def test_a_statement_the_flow_does_not_read_unbinds_every_handle(statement: str) -> None:
+    """Open findings 2 and 3, and their family: a verb the flow does not model, an
+    ``ActionListCall`` under another spelling, a ``<Call>`` carrying another verb, or a verb read
+    from a later span may write any handle. Neither the clone nor the input is sent after it."""
+    body = _handler_body(
+        _handler_source(
+            _WRITE_INPUT
+            + _CLONE_OUT
+            + statement
+            + _SEND_OUT
+            + _role_send("input-handle", "%ADT", "OB_IN")
+        )
+    )
+    assert 'Send("OB_OUT"' not in body
+    assert 'Send("OB_IN"' not in body
+
+
+@pytest.mark.parametrize("statement", _UNREAD_STATEMENTS)
+def test_a_statement_the_flow_does_not_read_unbinds_every_handle_in_a_loop(statement: str) -> None:
+    """The same rule through a loop: a later pass may start from what it wrote, so the send at the
+    top of the loop raises too."""
+    loop = "<Foreach><List>" + _SEND_OUT + statement + "</List></Foreach>"
+    body = _handler_body(_handler_source(_CLONE_OUT + loop))
+    assert 'Send("OB_OUT"' not in body
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(_MSGLOG_P, id="msglog"),
+        pytest.param('<Line Data="MsgLog %P"/>', id="markup-free-msglog"),
+        pytest.param(_write("input-handle", "%ADT", "Y"), id="field-write"),
+        pytest.param('<Line Data="ItemClear %OUT/PID-19"/>', id="markup-free-field-write"),
+    ],
+)
+def test_a_read_only_statement_between_a_clone_and_its_send_keeps_the_clone(
+    statement: str,
+) -> None:
+    """The control: a statement the flow does read, and that names the clone only as a path or
+    not at all, leaves the clone bound."""
+    body = _handler_body(_handler_source(_CLONE_OUT + statement + _SEND_OUT))
+    assert '    sends.append(Send("OB_OUT", out_msg))' in body
+
+
+@pytest.mark.parametrize(
+    ("export", "dest"),
+    [
+        pytest.param(
+            _WRITE_INPUT + _create("%adt", _ADT_A04) + _role_send("input-handle", "%ADT", "OB_IN"),
+            "OB_IN",
+            id="msgcreate-into-the-input-in-another-case",
+        ),
+        pytest.param(
+            _WRITE_INPUT
+            + _root_copy("other-handle", "%NEW", "other-handle", "%adt")
+            + _role_send("input-handle", "%ADT", "OB_IN"),
+            "OB_IN",
+            id="copy-into-the-input-in-another-case",
+        ),
+        pytest.param(
+            _CLONE_OUT + _create("%out", _ADT_A04) + _SEND_OUT,
+            "OB_OUT",
+            id="msgcreate-over-a-clone-in-another-case",
+        ),
+        pytest.param(
+            _CLONE_OUT
+            + _root_copy("input-handle", "%ADT", "other-handle", "%Out")
+            + _write("other-handle", "%Out", "Y")
+            + _SEND_OUT,
+            "OB_OUT",
+            id="clone-over-a-clone-in-another-case",
+        ),
+    ],
+)
+def test_handle_case_is_ignored_for_every_unbind(export: str, dest: str) -> None:
+    """Corepoint's handle case-sensitivity is unverified, so the import assumes the worst: a write
+    to ``%adt`` may overwrite ``%ADT``. A later send of ``%ADT`` raises rather than send the old
+    local."""
+    body = _handler_body(_handler_source(export))
+    assert f'Send("{dest}"' not in body
+    assert f'raise NotImplementedError("Corepoint import: MsgSend to {dest}:' in body
+
+
 def test_a_called_lists_input_is_not_the_callers_msg() -> None:
     """Inside the called list, its input handle is whatever was passed, not the caller's msg. A
     write there must not land on msg, and a handle the list binds is not the caller's to send."""

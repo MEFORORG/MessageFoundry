@@ -100,7 +100,7 @@ from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.message import Message
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
         Element,
     )
@@ -191,7 +191,8 @@ class _Deferred:
     # Every handle the statement names as a whole tree, in EITHER reading of its markup, so a span
     # class the role layer does not list does not hide a ``%`` handle from the fail-closed write
     # rule. It is still blind to at least a handle spelled with no ``%`` in a markup-free or
-    # unlisted-class statement, which is why a call is never judged from it (see _Flow._call_keys).
+    # unlisted-class statement, which is why such a statement leaves every handle unknown (see
+    # _unread) and a call is never judged from it (see _Flow._call_keys).
     named: frozenset[str] = frozenset()
     # Every word of the statement that is neither an operand nor the verb, styled or not (see
     # :func:`_statement_words`). Field writes, clones and ``MsgCreate`` are all judged on these.
@@ -1529,7 +1530,10 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
         label = statement or note or tag
         return [Control("disabled", source, label, body=tuple(body))]
 
-    if tag.lower() not in _STATEMENT_TAGS:
+    # A ``<Call>`` whose verb is not ``ActionListCall`` (``ActionListExit``) is read as unmodelled
+    # too: splicing its body in as some other construct would run a called list in the caller's
+    # scope, and the flow vouches for no handle after it.
+    if tag.lower() not in _STATEMENT_TAGS or (tag.lower() == "call" and kind != "call"):
         # An element in a statement position whose tag this layer does not model. Reported and counted,
         # with its parsed subtree inlined beneath the marker — never dropped (count-and-log). The marker
         # says the element's SCOPE was lost, because an unmodelled construct may well have been
@@ -1537,7 +1541,7 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
         # The element still ran in Corepoint, so its own whole-tree writes are carried for the flow.
         deferred = (
             _Deferred(verb, handle_operands, qualified=qualified, named=named, words=words)
-            if named
+            if statement
             else None
         )
         return [Control("unknown", tag, statement or note, body=tuple(body), deferred=deferred)]
@@ -1875,8 +1879,12 @@ _EVERY_LOCAL = "\x00every-local"
 
 
 def _handle_key(handle: str) -> str:
-    """A handle's name for matching a statement's own whole-tree writes: no ``%``, case-folded."""
-    return handle.lstrip("%").lower()
+    """A handle's name for matching a statement's own whole-tree writes: no ``%``, case-folded.
+
+    Whether Corepoint handle names are case-sensitive is unverified, so the import assumes the
+    worst: a write to ``%adt`` may be a write to ``%ADT``. Only unbinding reads this key; how a
+    local is NAMED does not."""
+    return handle.lstrip("%").casefold()
 
 
 def _hit(keys: frozenset[str], handle: str, local: str) -> bool:
@@ -1887,10 +1895,61 @@ def _hit(keys: frozenset[str], handle: str, local: str) -> bool:
     return _handle_key(handle) in keys
 
 
+def _unbind_key(env: _Env, handles: Iterable[str]) -> None:
+    """Unbind every bound handle whose key (see :func:`_handle_key`) matches one of ``handles``."""
+    keys = {_handle_key(h) for h in handles}
+    for bound in list(env):
+        if _handle_key(bound) in keys:
+            env.unbind(bound)
+
+
 def _forget(env: _Env, deferred: _Deferred) -> None:
-    """Unbind every handle the statement may overwrite whole (see :func:`_whole_written`)."""
-    for handle in _whole_written(deferred):
+    """Unbind every handle the statement may overwrite whole (see :func:`_whole_written`), in any
+    spelling of its case."""
+    _unbind_key(env, _whole_written(deferred))
+
+
+def _forget_all(env: _Env) -> None:
+    for handle in list(env):
         env.unbind(handle)
+
+
+#: The verbs the flow reads, each with the only connective words it may carry. Every other verb may
+#: write a handle the flow cannot see, so a statement using one leaves every handle unknown.
+_READ_VERB_WORDS = {
+    **_VERB_CONNECTIVES,
+    "msgtreecopy": frozenset({"to"}),
+    "msgcreate": _MSGCREATE_CONNECTIVES,
+    "msglog": frozenset[str](),
+}
+
+
+def _unread(step: Control) -> bool:
+    """Whether the flow cannot read everything ``step`` (a ``"pending"`` statement) may write.
+
+    It reads a statement only when its verb is one it models (:data:`_READ_VERB_WORDS`), that verb
+    is the statement's first word (so a verb is never misread from a later span), and every other
+    word is one that verb may carry. A markup-free statement must also spell every handle with a
+    ``%``: a bare word may be a handle (``MsgCreate ADT as ...``), which no operand reading sees.
+    Anything else may overwrite any handle, the input included, so nothing is vouched for after it.
+    That is judged by verb and shape, never by a handle's name."""
+    deferred = step.deferred
+    if deferred is None:
+        return True
+    verb = deferred.verb.lower()
+    allowed = _READ_VERB_WORDS.get(verb)
+    if allowed is None or [w.lower() for w in step.detail.split()[:1]] != [verb]:
+        return True
+    if not {w.lower() for w in deferred.words} <= allowed:
+        return True
+    if deferred.flat is None:
+        return False
+    return any(
+        o.kind == "literal"
+        and not (len(o.text) >= 2 and o.text[0] == o.text[-1] == '"')
+        and o.text.lower() not in allowed
+        for o in deferred.operands
+    )
 
 
 #: The only call line that may spare the input: the list name, then at most ``pass <one word>``.
@@ -1984,7 +2043,10 @@ class _Flow:
             if not isinstance(step, Control) or step.kind == "disabled":
                 continue
             if step.deferred is not None and step.kind in ("pending", "unknown"):
-                found.update(_handle_key(h) for h in _whole_written(step.deferred))
+                if step.kind == "unknown" or _unread(step):
+                    found.add(_EVERY_HANDLE)  # see _statement
+                else:
+                    found.update(_handle_key(h) for h in _whole_written(step.deferred))
             if step.kind == "call":
                 found |= self._call_keys(step)  # what a call leaves unknown (see _call)
             if _drops_statements(step):
@@ -2063,9 +2125,10 @@ class _Flow:
             settled = replace(step, body=tuple(body), branches=tuple(branches))
         else:
             # "unknown", an orphaned branch marker, "break", "exit": the body is inlined in place
-            # but its own scope was lost, so nothing it binds is trusted after it.
+            # but its own scope was lost, so nothing it binds is trusted after it. An unmodelled
+            # element carrying a statement may write any handle, so nothing is vouched for at all.
             if kind == "unknown" and step.deferred is not None:
-                _forget(env, step.deferred)
+                _forget_all(env)
             body, changes = self._arm(step.body, env)
             env.narrow([changes])
             settled = replace(step, body=tuple(body))
@@ -2192,6 +2255,8 @@ class _Flow:
     def _statement(self, step: Control, deferred: _Deferred, env: _Env) -> Step:
         """Settle one transform statement: a field write, a clone, a ``MsgCreate``, or a marker."""
         verb, operands = deferred.verb, deferred.operands
+        if _unread(step):
+            _forget_all(env)
         if deferred.flat is not None:
             result = self._flat_write(deferred.flat, deferred, env)
         elif _clone_target(deferred):
@@ -2282,7 +2347,8 @@ class _Flow:
     def _tree_copy(self, step: Control, operands: tuple[Operand, ...], env: _Env) -> Step:
         source, dest = _whole_tree(operands[0]), _whole_tree(operands[1])
         verb = step.source_verb
-        if dest == self._input:
+        _unbind_key(env, [dest])  # every spelling of its case, the input's included
+        if _handle_key(dest) == _handle_key(self._input):
             # Rebinding msg would leave every later write and send of the input addressing a
             # different object than the one that arrived. Unknown from here on instead.
             env.unbind(dest)
@@ -2312,7 +2378,7 @@ class _Flow:
         handle = _whole_tree(deferred.operands[0])
         _forget(env, deferred)  # every handle it names, not only the one it builds
         name = _comment_text(handle, 60)
-        if handle == self._input:
+        if _handle_key(handle) == _handle_key(self._input):
             why = "a new message in the input handle would replace msg, the message that arrived"
         else:
             skeleton, why = _create_skeleton(deferred)

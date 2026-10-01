@@ -244,11 +244,26 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   operand makes it an unread statement. Field writes are judged on the same words, so a mode word
   styled as a keyword declines a write just as an unstyled one does. A field write whose verb itself
   is unstyled still declines, as it did before step 2.
-- Every other statement may overwrite every handle it names as a whole tree, in either reading of
-  its markup. That covers an unread verb (`MsgLoad`, among others), a `MsgCreate` whose handle is
-  not its first operand, and a span class the role layer does not list. Each such handle is unknown
-  afterwards. Only `MsgSend` and `MsgLog` are read-only. That read-only list is kept small on
-  purpose: a missing verb costs a raise, while a wrongly listed one would deliver the wrong message.
+- The flow reads a statement only when its verb is one it models (`ItemCopy`, `ItemClear`,
+  `ItemAppend`, `MsgTreeCopy`, `MsgCreate`, `MsgLog`; `MsgSend` is a send), that verb is the
+  statement's first word, and every other word is one that verb may carry. A markup-free statement
+  must also spell every handle with a `%`, because a bare word may be a handle no operand reading
+  sees (`MsgCreate ADT as ...`). **Any other statement leaves every handle unknown, the input
+  included (Manager decision, #313 step 2).** That covers at least an unread verb (`MsgLoad`,
+  `EnvLogText`), an `ActionListCall` under another verb spelling, a `<Call>` whose `@Data` verb is
+  not `ActionListCall` (read as an unmodelled element, never spliced in as another construct), a
+  verb misread from a later span, and a span class the role layer does not list. An element this
+  module does not model leaves every handle unknown too when it carries a statement.
+- A statement the flow does read may still overwrite every handle it names as a whole tree, in
+  either reading of its markup, such as a `MsgCreate` whose handle is not its first operand. Each
+  such handle is unknown afterwards. Only `MsgSend` and `MsgLog` are read-only. That read-only list
+  is kept small on purpose: a missing verb costs a raise, while a wrongly listed one would deliver
+  the wrong message.
+- **Handle case.** Whether Corepoint handle names are case-sensitive is unverified, so the import
+  assumes the worst. Every unbind ignores case: a write to `%adt` makes `%ADT` unknown, and a clone
+  or `MsgCreate` into a handle whose name case-folds to the input's is a whole write of the input.
+  Every ambiguity test keeps case: two `input-handle` spellings that differ only in case leave the
+  list with no input. How a local is named is unchanged.
 - An inlined `ActionListCall` runs in its own scope, because nothing ties the handle names inside a
   called list to the caller's. The called list starts knowing no handle, so its writes and sends of
   any handle it did not bind there decline or raise. An `input-handle` span inside the called list
@@ -280,13 +295,14 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   touches it. So does a send of the input after almost any call. A human finishes each one. That
   is the importer's fail-closed contract: a raise costs a hand edit, while a stale local would
   deliver the wrong message.
-- **Known gap, outside the call rule.** The whole-tree write rule above reads the handles a
-  statement names. It cannot see at least a handle spelled with no `%` in a markup-free statement,
-  so a `MsgCreate ADT ...` there leaves a bound `ADT` bound. An `ActionListCall` under another verb
-  spelling, and a `<Call>` whose `@Data` verb maps to another kind, are not read as calls either.
-  Closing those is open work.
-- A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
-  its whole-tree writes. Nothing it binds is trusted after it.
+- **The cost of the unread-statement rule.** Any send after a statement the flow does not read
+  raises, a send of the input included, even when that statement only logs (`EnvLogText`).
+  *Corrected:* the re-cut first listed a markup-free `MsgCreate ADT ...`, an `ActionListCall` under
+  another verb spelling, and a `<Call>` carrying another verb as an open gap. The rule above closes
+  all three.
+- A statement in a branch its construct cannot continue still counts its whole-tree writes, and an
+  unmodelled element carrying a statement leaves every handle unknown. Nothing either binds is
+  trusted after it.
 
 **Markup-free `MsgSend` (gap 2).** A send with no role markup is judged by the handle its first
 operand names (`%NAME` or `%NAME/`). If that handle holds a known message, the send delivers it.
