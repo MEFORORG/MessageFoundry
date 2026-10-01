@@ -66,7 +66,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
@@ -2179,8 +2179,12 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     validated up front (see ``StoreSettings._no_odbc_injection``).
 
     ``posture`` is the deriving instance's :class:`HopPosture` (threaded from ``open_store`` by the
-    serve/engine caller). ``None`` (a backup/restore utility, embedding, or unit test) leaves the escape
-    unclamped — byte-identical to pre-#200."""
+    serve/engine caller). ``None`` reads the ambient posture, and with none the escape is NOT
+    permitted (vault BACKLOG #2354). CORRECTED: this read *"``None`` (a backup/restore utility,
+    embedding, or unit test) leaves the escape unclamped"*; that let a CLI command cross a weakened
+    store hop under ``enforce``."""
+    if posture is None:
+        posture = current_hop_posture()
     # A weakened TLS posture (TrustServerCertificate=yes, or Encrypt=no) is MITM-able, so it REFUSES
     # unless the explicit MEFOR_ALLOW_INSECURE_TLS dev escape is set (ASVS 12.3.2) — it can't be
     # silently turned on in production. #200 (ADR 0092 decision 2): the engine<->store hop routes the
@@ -2192,8 +2196,9 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     ) and not weakened_tls_escape_permitted(posture):
         raise ValueError(
             "SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
-            f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 to "
-            "explicitly allow it for a trusted-network dev/test bind."
+            f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
+            "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "
+            "bind (the escape has no effect while enforcing, the default, or with no posture)."
         )
     parts = [
         "DRIVER={ODBC Driver 18 for SQL Server}",

@@ -25,6 +25,7 @@ from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import AuthSettings, SqlAuth, StoreBackend, StoreSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.logging_setup import ControlCharScrubFilter, configure_logging
 from messagefoundry.parsing import sniff
 from messagefoundry.parsing.sniff import (
@@ -37,6 +38,9 @@ from messagefoundry.store.sqlserver import connection_string
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports.file import _content_matches_declared, _looks_like_hl7
 from tests._admin_account import login_admin
+
+#: The escape is honoured only on a known non-enforcing posture (vault BACKLOG #2354).
+_WARN = HopPosture(enforcing=False)
 
 # --- WP-4: argon2 parameters pinned -----------------------------------------
 
@@ -175,7 +179,7 @@ def test_webhook_allows_plaintext_http_with_insecure_escape(
 ) -> None:
     # With the explicit escape set, a plaintext target constructs (trusted-network dev only).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    t = WebhookTransport("http://hooks.example/x")
+    t = WebhookTransport("http://hooks.example/x", posture=_WARN)
     assert t.url == "http://hooks.example/x"
 
 
@@ -383,7 +387,7 @@ def test_sqlserver_connection_string_refuses_weak_tls(monkeypatch: pytest.Monkey
         connection_string(s)
     # The explicit dev escape permits it.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    assert "TrustServerCertificate=yes" in connection_string(s)
+    assert "TrustServerCertificate=yes" in connection_string(s, posture=_WARN)
 
 
 def test_ldap_authenticator_refuses_disabled_cert_verification(
@@ -402,4 +406,4 @@ def test_ldap_authenticator_refuses_disabled_cert_verification(
         LdapAuthenticator(s)
     # With the dev escape, construction is allowed (it only warns; no bind happens here).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    LdapAuthenticator(s)
+    LdapAuthenticator(s, posture=_WARN)

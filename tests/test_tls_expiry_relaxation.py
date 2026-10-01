@@ -201,7 +201,9 @@ def test_dicom_scu_context_relaxes_only_when_flag_set(tmp_path: Path) -> None:
     assert on.verify_flags & _NO_CHECK_TIME and on.check_hostname is True
 
 
-def test_verify_off_path_ignores_allow_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verify_off_path_ignores_allow_expired(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # tls_verify=false is CERT_NONE; tls_allow_expired must not touch that path (it stays a plain
     # verify-off context, still gated by the escape) — no NO_CHECK_TIME bit smuggled onto it.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")

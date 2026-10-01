@@ -260,7 +260,7 @@ async def test_pool_connect_hook_names_a_slow_build_without_posing_as_pool_exhau
     ],
 )
 async def test_pool_connect_hook_is_absent_on_the_weakened_escapes(
-    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
 ) -> None:
     """The hook is for VERIFYING hops. The dev escapes keep the plain ``ssl=`` value: a verify-off
     context reads no trust store, and plaintext has no context at all.

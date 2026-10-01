@@ -45,6 +45,7 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.direct import DirectDestination
@@ -395,10 +396,17 @@ def test_cleartext_refusals(monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
         DirectDestination(_dest(pki, use_tls=False))
     # With the escape but credentials → still refused.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with pytest.raises(ValueError, match="credentials"):
+    with (
+        active_hop_posture(HopPosture(enforcing=False)),
+        pytest.raises(ValueError, match="credentials"),
+    ):
         DirectDestination(_dest(pki, use_tls=False, username="svc", password="pw"))
-    # With the escape and no credentials → allowed (loud warning).
-    d = DirectDestination(_dest(pki, use_tls=False))
+    # With the escape and no credentials, on a warn posture → allowed (loud warning). With no
+    # posture the escape alone is refused (vault BACKLOG #2354).
+    with active_hop_posture(None), pytest.raises(ValueError, match="cleartext"):
+        DirectDestination(_dest(pki, use_tls=False))
+    with active_hop_posture(HopPosture(enforcing=False)):
+        d = DirectDestination(_dest(pki, use_tls=False))
     assert d.use_tls is False
 
 

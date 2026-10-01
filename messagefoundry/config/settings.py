@@ -349,19 +349,20 @@ def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
-    be set at all, AND the hop must not be enforcing PHI. ``None``
-    (a backup utility / embedding / test outside the construction gate) falls back to the **unclamped**
-    escape — byte-identical to pre-#200 — since the enforced serve/reload gate already vetted the real
-    production posture, so this fallback never loosens the clamp.
+    be set, AND a posture must be known, AND it must not be enforcing.
+
+    **``None`` FAILS CLOSED (vault BACKLOG #2354).** No posture means the escape is NOT permitted.
+    CORRECTED: this read *"``None`` (a backup utility / embedding / test outside the construction gate)
+    falls back to the **unclamped** escape -- byte-identical to pre-#200 -- since the enforced
+    serve/reload gate already vetted the real production posture"*. That premise was false for every
+    caller the gate never reaches: a reference sync, and every CLI command that opens the store. Each
+    let the escape cross a weakened hop under ``enforce``. A caller that needs the escape on a
+    ``warn`` instance passes that posture explicitly; there is no other way to say "not enforcing".
 
     The clamp used to require an enforcing **PHI** hop. Every instance carries patient data now
     (BACKLOG #1279), so the second conjunct could not vary and is gone: under ``enforce`` the blunt
     escape is inert, full stop."""
-    if not insecure_tls_allowed():
-        return False
-    if posture is None:
-        return True
-    return not posture.enforcing
+    return insecure_tls_allowed() and posture is not None and not posture.enforcing
 
 
 def weakened_tls_escape_permitted_here() -> bool:
@@ -5406,8 +5407,9 @@ class SecuritySettings(_Section):
     # `active_hop_posture` scope, so they read the CLAMPED weakened_tls_escape_permitted_here() and an
     # enforcing PHI hop can never be relaxed. The alerts notifier is constructed in the API lifespan,
     # OUTSIDE that scope (measured: the contextvar is stamped only in pipeline/wiring_runner.py), where
-    # current_hop_posture() is None and the clamp degrades to the UNCLAMPED escape — i.e. the connectors'
-    # mechanism would silently provide no refusal at all here. So the refusal is keyed on this explicit
+    # current_hop_posture() is None and the clamp degraded to the UNCLAMPED escape — i.e. the connectors'
+    # mechanism would silently have provided no refusal at all here. (Since vault BACKLOG #2354 a None
+    # posture fails closed instead; this switch is unchanged by that.) So the refusal is keyed on this explicit
     # switch at the serve gate instead, in the shape of allow_unencrypted_phi_under_strict_enforcement.
     # Default FALSE and byte-identical when unset. Setting it TRUE is a LOOSENING: security_loosenings()
     # names it, so the opt-out is never silent.

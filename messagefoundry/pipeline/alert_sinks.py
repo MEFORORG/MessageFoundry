@@ -340,8 +340,8 @@ class WebhookTransport:
         # the escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
         # instance the blunt env var can never re-permit a cleartext alert POST. The webhook sink is
         # built out of the connector-construction gate (notifier_from_settings, in the app lifespan), so
-        # the posture is threaded explicitly; None (a direct/test construction) falls back to the
-        # unclamped escape — byte-identical to the pre-#329 bare read.
+        # the posture is threaded explicitly; None (a direct/test construction) fails closed since
+        # vault BACKLOG #2354. It used to fall back to the unclamped escape.
         #
         # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
         # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen

@@ -108,8 +108,9 @@ def test_ldaps_verifyoff_clamped_prod_phi_even_with_escape(
     with caplog.at_level(logging.WARNING):
         LdapAuthenticator(s, posture=STAGING_PHI)
     assert any("DISABLED" in r.getMessage() for r in caplog.records)
-    # Unstamped posture (a direct/test construction) falls back to the unclamped escape — byte-identical.
-    LdapAuthenticator(s, posture=None)
+    # No posture fails closed (vault BACKLOG #2354): the escape needs a known non-enforcing posture.
+    with pytest.raises(LdapError, match="ad_tls_verify=false"):
+        LdapAuthenticator(s, posture=None)
 
 
 async def test_ldaps_authservice_threads_posture(
@@ -151,9 +152,10 @@ def test_webhook_cleartext_clamped_prod_phi_even_with_escape(
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with pytest.raises(ValueError, match="plaintext http"):
         WebhookTransport("http://hooks.example/x", posture=PROD_PHI)
-    # Non-enforcing PHI and unstamped both cross with the escape (byte-identical to before).
+    # Non-enforcing PHI crosses with the escape; no posture fails closed (vault BACKLOG #2354).
     WebhookTransport("http://hooks.example/x", posture=STAGING_PHI)
-    WebhookTransport("http://hooks.example/x", posture=None)
+    with pytest.raises(ValueError, match="plaintext http"):
+        WebhookTransport("http://hooks.example/x", posture=None)
 
 
 def test_webhook_notifier_threads_posture(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -209,7 +211,8 @@ def test_ai_broker_cleartext_clamped_prod_phi_even_with_escape(
     with pytest.raises(AiBrokerError, match="cleartext http"):
         _build(PROD_PHI)
     _build(STAGING_PHI)  # crosses with the escape on non-enforcing PHI
-    _build(None)  # unstamped falls back to the unclamped escape — byte-identical
+    with pytest.raises(AiBrokerError, match="cleartext http"):
+        _build(None)  # no posture fails closed (vault BACKLOG #2354)
 
 
 def test_ai_broker_factory_threads_posture(monkeypatch: pytest.MonkeyPatch) -> None:

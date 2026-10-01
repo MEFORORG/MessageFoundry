@@ -21,6 +21,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
 from messagefoundry.transports import build_destination, build_source
@@ -205,8 +206,10 @@ def test_build_dsn_weak_tls_refused_without_escape(monkeypatch: pytest.MonkeyPat
 
 
 def test_build_dsn_weak_tls_allowed_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The escape needs a known non-enforcing posture (vault BACKLOG #2354).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    assert "Encrypt=no" in _build_dsn({"server": "s", "database": "d", "encrypt": False})
+    with active_hop_posture(HopPosture(enforcing=False)):
+        assert "Encrypt=no" in _build_dsn({"server": "s", "database": "d", "encrypt": False})
 
 
 def test_build_dsn_bad_auth() -> None:

@@ -41,9 +41,14 @@ async def _append(tag: str, count: int, ready: Path, go: Path) -> None:
     # Imported inside the coroutine so an import failure still reaches the parent as a non-zero exit
     # with a readable traceback on stderr, rather than as a silent barrier timeout.
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.store.sqlserver import SqlServerStore
 
-    store = await SqlServerStore.open(load_settings(environ=os.environ).store)
+    # The CI container's certificate is self-signed, so its weakened-TLS escape needs a warn posture,
+    # and a child does not inherit the parent's (vault BACKLOG #2354; see tests/conftest.py).
+    store = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+    )
     try:
         ready.write_text(str(os.getpid()), encoding="utf-8")
         _wait_for(go)

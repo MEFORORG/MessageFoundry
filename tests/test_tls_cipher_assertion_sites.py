@@ -433,7 +433,7 @@ def test_postgres_pinned_ca_context_asserts(every_suite_looks_weak: None, tmp_pa
 
 
 def test_postgres_trust_server_certificate_context_asserts(
-    every_suite_looks_weak: None, monkeypatch: pytest.MonkeyPatch
+    escape_at_warn: None, every_suite_looks_weak: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``_build_ssl``, ``trust_server_certificate`` arm — reachable only behind the dev escape, still
     encrypted, so still asserted."""

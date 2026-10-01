@@ -400,7 +400,10 @@ def _dicom_listener(k: Kit) -> object:
 
 def _postgres_verify_off(k: Kit) -> object:
     k.monkeypatch.setenv(settings_module.INSECURE_TLS_ESCAPE_ENV, "1")
-    return postgres._build_ssl(StoreSettings(trust_server_certificate=True))
+    # The escape needs a known warn posture (vault BACKLOG #2354).
+    return postgres._build_ssl(
+        StoreSettings(trust_server_certificate=True), posture=tls_policy.HopPosture(enforcing=False)
+    )
 
 
 def _ldaps(k: Kit) -> object:
