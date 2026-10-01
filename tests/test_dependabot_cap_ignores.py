@@ -2,27 +2,24 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Every upper bound in pyproject.toml has a Dependabot ignore range, or a stated exemption.
 
-Dependabot WIDENS a declared cap instead of respecting it. ``.github/dependabot.yml`` says so, and
-says a load-bearing cap must be restated there as an ``ignore`` range "or the cap is decorative".
-PR #66 widened ruff's and annotated-types' caps that way, and Dependabot PR 1773 tried to widen
-uvicorn's. Until BACKLOG #2505 nothing held the two files together, and three caps had no entry.
+Dependabot WIDENS a declared cap instead of respecting it; ``.github/dependabot.yml`` says so above
+its uv ``ignore`` list, with the history. Until BACKLOG #2505 nothing held the two files together,
+and three caps had no entry.
 
 THE CONTRACT, both directions:
 
 * Every upper bound in ``[build-system].requires``, ``[project.dependencies]``,
   ``[project.optional-dependencies]`` and ``[dependency-groups]`` (``<``, ``~=``, ``==``, or an
-  ``==X.*`` wildcard) has a uv-ecosystem ``ignore`` entry whose range is exactly ``>=`` the first
-  version the cap excludes. That is the one range that blocks everything the cap excludes and
-  nothing it allows. Or the package is in ``_EXEMPT`` below, with its reason.
+  ``==X.*`` wildcard) has a uv-ecosystem ``ignore`` entry whose range is exactly ``>=`` the
+  version ``_cap_of`` derives. Or the package is in ``_EXEMPT`` below, in the table it names, with
+  its reason.
 * Every uv ``ignore`` entry names a package that pyproject.toml caps. dependabot.yml says to lift a
   cap and delete its entry in the same PR; this is what makes that rule fail when skipped. It is
   also this test's positive control: a parser that found no caps would red on every real entry, so
   the first test cannot pass vacuously.
 
-AN EXACT ``==`` PIN COVERS THE NEXT MINOR, NOT THE NEXT PATCH. That is the ``sigstore`` entry's
-documented scope (``>=4.5.0`` for ``==4.4.0``): it blocks the minor the owner declined and leaves
-the patch track open. It is the only ignored pin today; a new one takes the same scope or a
-deliberate change here.
+For a ``<`` cap the derived version is the bound itself. For an exact ``==`` pin it is the next
+minor, which is the scope dependabot.yml's sigstore note records: the pin's patch track stays open.
 
 The mutation arms break a made-up cap and entry pair added to copies of the real files, never a
 real one, so lifting a real cap cannot break an arm.
@@ -49,33 +46,45 @@ from tests.test_ci_venv_pinning import EXACT_GROUP_PINS
 _ROOT = Path(__file__).resolve().parents[1]
 _PYPROJECT = _ROOT / "pyproject.toml"
 _DEPENDABOT = _ROOT / ".github" / "dependabot.yml"
+_GROUPS = "[dependency-groups]"
 
-#: The exact ``==`` pins in ``[dependency-groups]`` that are deliberately NOT ignored. Each must stay
-#: an ``==`` pin in a dependency group. ``sigstore`` is the one exact group pin that IS ignored, by
-#: owner ruling; dependabot.yml's sigstore note says why. If that ruling is lifted and its entry
-#: deleted, drop sigstore from this subtraction in the same PR.
+#: The exact ``==`` pins in ``[dependency-groups]`` that are deliberately NOT ignored. ``sigstore``
+#: is the one exact group pin that IS ignored, by owner ruling; dependabot.yml's sigstore note says
+#: why. If that ruling is lifted and its entry deleted, drop sigstore from this subtraction too.
 _GROUP_PINS = frozenset(EXACT_GROUP_PINS) - {"sigstore"}
 _GROUP_PIN_REASON = (
     ".github/dependabot.yml, 'NOT IGNORED, deliberately': ignoring the exact pins in "
     "[dependency-groups] would freeze the hash-pinned CI toolchain"
 )
 
-#: Every cap with no ignore entry, by package, with the reason. Read the reason where it points.
-_EXEMPT: dict[str, str] = {
-    **dict.fromkeys(_GROUP_PINS, _GROUP_PIN_REASON),
-    "hvac": "pyproject.toml's comment above the [vault] extra says why hvac's cap is not mirrored",
-    "hatchling": "pyproject.toml's [build-system] comment expects Dependabot to bump this pin",
+#: Every cap with no ignore entry: package -> (the table it must sit in, the reason). The table is a
+#: prefix of ``Cap.where``. A cap on the same package anywhere else is not exempt. An exemption in
+#: ``[dependency-groups]`` must also be an exact ``==`` pin. Read each reason where it points.
+_EXEMPT: dict[str, tuple[str, str]] = {
+    **dict.fromkeys(_GROUP_PINS, (_GROUPS, _GROUP_PIN_REASON)),
+    "hvac": (
+        "[project.optional-dependencies].vault",
+        "pyproject.toml's comment above the [vault] extra says why hvac's cap is not mirrored",
+    ),
+    "hatchling": (
+        "[build-system].requires",
+        "pyproject.toml's [build-system] comment expects Dependabot to bump this pin",
+    ),
 }
 
 
 class Cap(NamedTuple):
-    """One upper bound: where it sits, and the first version it excludes."""
+    """One upper bound: where it sits, and the version its ignore range must start at."""
 
     package: str
     where: str
     spec: str
     exact_pin: bool
-    first_excluded: Version
+    ignore_from: Version
+
+
+def _is_pin(spec: Specifier) -> bool:
+    return spec.operator == "==" and not spec.version.endswith(".*")
 
 
 def _bump(release: tuple[int, ...]) -> Version:
@@ -84,19 +93,18 @@ def _bump(release: tuple[int, ...]) -> Version:
 
 
 def _cap_of(spec: Specifier) -> Version | None:
-    """The first version an upper-bound specifier excludes, or None for a floor or ``!=``."""
+    """Where an upper-bound specifier's ignore range starts, or None for a floor or ``!=``."""
     op, raw = spec.operator, spec.version
     if op in (">", ">=", "!="):
         return None
     if op == "<":
         return Version(raw)
-    wildcard = op == "==" and raw.endswith(".*")
-    if op == "~=" or wildcard:
-        release = Version(raw.removesuffix(".*")).release
-        return _bump(release if wildcard else release[:-1])
-    if op == "==":
+    if _is_pin(spec):
         pinned = Version(raw)
         return Version(f"{pinned.major}.{pinned.minor + 1}.0")
+    if op in ("~=", "=="):  # `==` here is the `==X.*` wildcard
+        release = Version(raw.removesuffix(".*")).release
+        return _bump(release if op == "==" else release[:-1])
     # `<=` and `===` have no use in pyproject.toml today. Model one deliberately when it arrives.
     raise AssertionError(f"unmodelled upper-bound operator {op!r} in {spec}")
 
@@ -113,8 +121,7 @@ def _caps(pyproject: dict[str, Any]) -> list[Cap]:
         for name, reqs in project.get("optional-dependencies", {}).items()
     ]
     tables += [
-        (f"[dependency-groups].{name}", reqs)
-        for name, reqs in pyproject.get("dependency-groups", {}).items()
+        (f"{_GROUPS}.{name}", reqs) for name, reqs in pyproject.get("dependency-groups", {}).items()
     ]
     caps: list[Cap] = []
     for where, reqs in tables:
@@ -124,9 +131,7 @@ def _caps(pyproject: dict[str, Any]) -> list[Cap]:
             req = Requirement(raw)  # markers parse apart from the specifier, so never read as caps
             bounds = [b for s in req.specifier if (b := _cap_of(s)) is not None]
             if bounds:
-                pin = any(
-                    s.operator == "==" and not s.version.endswith(".*") for s in req.specifier
-                )
+                pin = any(_is_pin(s) for s in req.specifier)
                 caps.append(Cap(canonicalize_name(req.name), where, str(req), pin, min(bounds)))
     return caps
 
@@ -143,30 +148,27 @@ def _uv_entry(dependabot: dict[str, Any]) -> dict[str, Any]:
 
 
 def _uv_ignores(dependabot: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """The root uv entry's ignore list, keyed by canonical package name.
-
-    Extras are dropped first, as dependabot-core's Python name normaliser does, so an entry named
-    ``uvicorn[standard]`` matches a ``uvicorn`` cap.
-    """
+    """The root uv entry's ignore list, keyed by canonical package name."""
     ignores: dict[str, list[dict[str, Any]]] = {}
     for entry in _uv_entry(dependabot).get("ignore", []):
-        name = canonicalize_name(entry["dependency-name"].split("[", 1)[0])
-        ignores.setdefault(name, []).append(entry)
+        ignores.setdefault(canonicalize_name(entry["dependency-name"]), []).append(entry)
     return ignores
 
 
-def _ranges(entry: dict[str, Any]) -> list[str]:
+def _ranges(entry: dict[str, Any]) -> list[Any]:
     versions = entry.get("versions", [])
-    return [versions] if isinstance(versions, str) else list(versions)
+    return versions if isinstance(versions, list) else [versions]
 
 
-def _is_exactly_from(rng: str, first: Version) -> bool:
-    """Whether ``rng`` is the single specifier ``>=first``."""
+def _is_exactly_from(rng: Any, start: Version) -> bool:
+    """Whether ``rng`` is the single specifier ``>=start``."""
+    if not isinstance(rng, str):  # an unquoted YAML number, say
+        return False
     try:
         specs = list(SpecifierSet(rng))
     except InvalidSpecifier:
         return False
-    return len(specs) == 1 and specs[0].operator == ">=" and Version(specs[0].version) == first
+    return len(specs) == 1 and specs[0].operator == ">=" and Version(specs[0].version) == start
 
 
 def _violations(pyproject: dict[str, Any], dependabot: dict[str, Any]) -> list[str]:
@@ -176,23 +178,21 @@ def _violations(pyproject: dict[str, Any], dependabot: dict[str, Any]) -> list[s
 
     for cap in caps:
         label = f"{cap.where}: {cap.spec}"
-        first = cap.first_excluded
-        want = f">={first.major}.{first.minor}.{first.micro}"
+        want = f">={cap.ignore_from}"
         if cap.package in _EXEMPT:
-            if cap.package in _GROUP_PINS and not (
-                cap.exact_pin and cap.where.startswith("[dependency-groups]")
-            ):
+            table, reason = _EXEMPT[cap.package]
+            if not cap.where.startswith(table):
+                problems.append(f"{label} is exempt only in {table}, and this cap is elsewhere")
+            elif table == _GROUPS and not cap.exact_pin:
                 problems.append(f"{label} is exempt as a group `==` pin, but is not one")
             elif cap.package in ignores:
-                problems.append(
-                    f"{label} is exempt ({_EXEMPT[cap.package]}) yet has an ignore entry"
-                )
+                problems.append(f"{label} is exempt ({reason}) yet has an ignore entry")
             continue
         entries = ignores.get(cap.package)
         if not entries:
             problems.append(
-                f'{label} has no uv ignore entry in {_DEPENDABOT.name}; add one with versions ["{want}"], '
-                f"or an exemption with its reason in {Path(__file__).name}"
+                f"{label} has no uv ignore entry in {_DEPENDABOT.name}; add one with "
+                f'versions ["{want}"], or an exemption with its reason in {Path(__file__).name}'
             )
             continue
         if any("update-types" in e for e in entries):
@@ -200,18 +200,15 @@ def _violations(pyproject: dict[str, Any], dependabot: dict[str, Any]) -> list[s
                 f"{label}: an `update-types` ignore cannot restate a range; use `versions` only"
             )
         ranges = [rng for e in entries for rng in _ranges(e)]
-        if not ranges or not all(_is_exactly_from(rng, first) for rng in ranges):
-            problems.append(
-                f"{label}: its ignore range must be exactly {want!r}, which blocks what the cap "
-                f"excludes and nothing it allows; found {ranges}"
-            )
+        if not ranges or not all(_is_exactly_from(rng, cap.ignore_from) for rng in ranges):
+            problems.append(f"{label}: its ignore range must be exactly {want!r}; found {ranges}")
 
     capped = {cap.package for cap in caps}
     for name in sorted(set(ignores) - capped):
         problems.append(
-            f"{_DEPENDABOT.name} ignores {name!r}, which pyproject.toml does not cap. An entry "
-            "here restates a cap, so delete it in the PR that lifts the cap, or model the new "
-            f"kind of entry in {Path(__file__).name}"
+            f"{_DEPENDABOT.name} ignores {name!r}, which pyproject.toml does not cap. Name the bare "
+            "package; an entry here restates a cap, so delete it in the PR that lifts the cap, "
+            f"or model the new kind of entry in {Path(__file__).name}"
         )
     for name in sorted(set(_EXEMPT) - capped):
         problems.append(f"exemption for {name!r} names no capped requirement in pyproject.toml")
@@ -233,7 +230,7 @@ def test_every_cap_has_an_ignore_entry_or_a_stated_exemption() -> None:
 
 
 @pytest.mark.parametrize(
-    ("spec", "first"),
+    ("spec", "start"),
     [
         ("<0.50", "0.50"),
         ("<4", "4"),
@@ -246,8 +243,8 @@ def test_every_cap_has_an_ignore_entry_or_a_stated_exemption() -> None:
         ("!=1.2.*", None),
     ],
 )
-def test_cap_arithmetic(spec: str, first: str | None) -> None:
-    assert _cap_of(Specifier(spec)) == (Version(first) if first else None)
+def test_cap_arithmetic(spec: str, start: str | None) -> None:
+    assert _cap_of(Specifier(spec)) == (Version(start) if start else None)
 
 
 # A made-up cap and entry pair for each shape the mutation arms break. No real package is named,
@@ -274,21 +271,13 @@ def _fixture() -> tuple[dict[str, Any], dict[str, Any]]:
     return pyproject, dependabot
 
 
-_Mutation = Callable[[dict[str, Any], dict[str, Any]], None]
-
-
-def _rename_entry(_p: dict[str, Any], d: dict[str, Any]) -> None:
-    _fake_entry(d, "mefor-fake-cap")["dependency-name"] = "Mefor_Fake_Cap[extra]"
-
-
-@pytest.mark.parametrize("mutate", [None, _rename_entry], ids=["unbroken", "extras-and-case"])
-def test_the_mutation_fixture_is_clean(mutate: _Mutation | None) -> None:
+def test_the_mutation_fixture_is_clean() -> None:
     """Control: the arms below are discriminating only if the unbroken fixture passes."""
-    pyproject, dependabot = _fixture()
-    if mutate:
-        mutate(pyproject, dependabot)
-    problems = _violations(pyproject, dependabot)
+    problems = _violations(*_fixture())
     assert not problems, "\n".join(problems)
+
+
+_Mutation = Callable[[dict[str, Any], dict[str, Any]], None]
 
 
 def _drop_entry(_p: dict[str, Any], d: dict[str, Any]) -> None:
@@ -296,9 +285,9 @@ def _drop_entry(_p: dict[str, Any], d: dict[str, Any]) -> None:
     uv["ignore"] = [e for e in uv["ignore"] if e["dependency-name"] != "mefor-fake-cap"]
 
 
-def _set_versions(name: str, versions: list[str]) -> _Mutation:
+def _set_entry(name: str, key: str, value: Any) -> _Mutation:
     def mutate(_p: dict[str, Any], d: dict[str, Any]) -> None:
-        _fake_entry(d, name)["versions"] = versions
+        _fake_entry(d, name)[key] = value
 
     return mutate
 
@@ -315,27 +304,37 @@ def _lift_cap(p: dict[str, Any], _d: dict[str, Any]) -> None:
 
 
 _EXACT = "must be exactly"
+_CAP_VERSIONS = "mefor-fake-cap", "versions"
 
 
 @pytest.mark.parametrize(
     ("mutate", "expect"),
     [
         pytest.param(_drop_entry, "no uv ignore entry", id="entry-deleted"),
-        pytest.param(_set_versions("mefor-fake-cap", [">=2.6.0"]), _EXACT, id="gap-at-cap"),
-        pytest.param(_set_versions("mefor-fake-cap", [">=2.4.0"]), _EXACT, id="freezes"),
+        pytest.param(_set_entry(*_CAP_VERSIONS, [">=2.6.0"]), _EXACT, id="gap-at-cap"),
+        pytest.param(_set_entry(*_CAP_VERSIONS, [">=2.4.0"]), _EXACT, id="freezes"),
         pytest.param(
-            _set_versions("mefor-fake-cap", ["==2.5.*", ">=3.0.0"]), _EXACT, id="hole-above-cap"
+            _set_entry(*_CAP_VERSIONS, ["==2.5.*", ">=3.0.0"]), _EXACT, id="hole-above-cap"
         ),
         pytest.param(
-            _set_versions("mefor-fake-cap", [">=1.2.0,<1.4.0", ">=2.5.0"]),
+            _set_entry(*_CAP_VERSIONS, [">=1.2.0,<1.4.0", ">=2.5.0"]),
             _EXACT,
             id="blocks-an-allowed-range",
         ),
-        pytest.param(_set_versions("mefor-fake-cap", ["2.5.0"]), _EXACT, id="not-a-specifier"),
-        pytest.param(_set_versions("mefor-fake-pin", [">=3.2.0"]), _EXACT, id="blocks-pin"),
-        pytest.param(_set_versions("mefor-fake-pin", [">=4.0.0"]), _EXACT, id="pin-gap"),
+        pytest.param(_set_entry(*_CAP_VERSIONS, ["2.5.0"]), _EXACT, id="not-a-specifier"),
+        pytest.param(_set_entry(*_CAP_VERSIONS, [2.5]), _EXACT, id="not-a-string"),
+        pytest.param(_set_entry(*_CAP_VERSIONS, 4), _EXACT, id="not-a-list"),
+        pytest.param(
+            _set_entry("mefor-fake-pin", "versions", [">=3.2.0"]), _EXACT, id="blocks-pin"
+        ),
+        pytest.param(_set_entry("mefor-fake-pin", "versions", [">=4.0.0"]), _EXACT, id="pin-gap"),
         pytest.param(_to_update_types, "update-types", id="update-types"),
         pytest.param(_lift_cap, "does not cap", id="stale-entry"),
+        pytest.param(
+            _set_entry("mefor-fake-cap", "dependency-name", "mefor-fake-cap[extra]"),
+            "does not cap",
+            id="name-with-extras",
+        ),
     ],
 )
 def test_the_checker_reds_on_a_mutated_config(mutate: _Mutation, expect: str) -> None:
@@ -347,19 +346,48 @@ def test_the_checker_reds_on_a_mutated_config(mutate: _Mutation, expect: str) ->
 
 
 @pytest.mark.parametrize(
-    ("group_pin", "exempt", "expect"),
+    ("name", "table", "added", "expect"),
     [
-        pytest.param(False, "mefor-fake-cap", "yet has an ignore entry", id="exempt-with-entry"),
-        pytest.param(False, "mefor-never-capped", "names no capped", id="dead-exemption"),
-        pytest.param(True, "mefor-fake-cap", "but is not one", id="group-pin-not-a-pin"),
+        pytest.param(
+            "mefor-fake-cap",
+            "[project.dependencies]",
+            None,
+            "yet has an ignore entry",
+            id="exempt-with-entry",
+        ),
+        pytest.param(
+            "mefor-never-capped", "[project.dependencies]", None, "names no", id="dead-exemption"
+        ),
+        pytest.param(
+            "mefor-fake-cap", "[build-system]", None, "is exempt only in", id="exempt-elsewhere"
+        ),
+        pytest.param(
+            "mefor-gp",
+            _GROUPS,
+            ("dependencies", "mefor-gp==1.0.0"),
+            "only in",
+            id="pin-not-in-group",
+        ),
+        pytest.param(
+            "mefor-gp", _GROUPS, ("group", "mefor-gp>=1,<2"), "is not one", id="group-cap-not-a-pin"
+        ),
     ],
 )
 def test_the_checker_reds_on_a_broken_exemption(
-    monkeypatch: pytest.MonkeyPatch, group_pin: bool, exempt: str, expect: str
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    table: str,
+    added: tuple[str, str] | None,
+    expect: str,
 ) -> None:
-    """Mutation arm for the exemption table, again over the made-up pair only."""
-    monkeypatch.setitem(_EXEMPT, exempt, "test reason")
-    if group_pin:
-        monkeypatch.setattr(f"{__name__}._GROUP_PINS", _GROUP_PINS | {exempt})
-    problems = _violations(*_fixture())
+    """Mutation arm for the exemption table, over made-up packages only."""
+    monkeypatch.setitem(_EXEMPT, name, (table, "test reason"))
+    pyproject, dependabot = _fixture()
+    if added:
+        where, req = added
+        if where == "group":
+            pyproject["dependency-groups"]["mefor-fake"].append(req)
+        else:
+            pyproject["project"]["dependencies"].append(req)
+    problems = _violations(pyproject, dependabot)
     assert any(expect in p for p in problems), f"no violation mentioning {expect!r}: {problems}"
