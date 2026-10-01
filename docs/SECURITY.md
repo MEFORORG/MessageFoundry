@@ -1322,6 +1322,16 @@ the same permission set on the same method reds CI until it is listed here.
 > route above against a scoped caller with an all-channels caller as the control, and reds if the
 > prose and the app disagree.
 
+> **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
+> This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
+> `/test-credential`, `/start`, `/stop` and `/restart`. Each checks the scope before it looks the
+> name up. A scoped caller gets one 403, one body and one `auth.channel_denied` row in three cases:
+> an inbound outside its scope, a shared outbound, and a name that exists nowhere. A name in the
+> caller's own scope that exists nowhere still answers 404, as any unknown name does for an
+> unscoped caller. Names still show elsewhere. At least the Prometheus exposition above and
+> `GET /alerts/rules` list them, and `POST /connections/{name}/flag` has no per-channel check.
+> `tests/test_channel_rbac.py` pins the six routes, not that list.
+
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
 > the server's startup `--config` dir or an entry in `[api].config_reload_roots` — otherwise it is
