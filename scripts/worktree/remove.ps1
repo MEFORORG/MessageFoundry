@@ -55,8 +55,11 @@ param(
     # fixture so the real logic is what gets exercised.
     [string]$RepoRoot,
     # Remove <main worktree>\.claude\worktrees\<Name> instead of the <repo>-<Name> sibling: the teardown
-    # for `new.ps1 -Nested` (BACKLOG #1038). Every guard below applies, plus two of its own.
-    [switch]$Nested
+    # for `new.ps1 -Nested` (BACKLOG #1038). Every guard below applies, plus four of its own.
+    [switch]$Nested,
+    # The Claude config root(s) whose session registry the -Nested occupancy fence reads. Defaults to
+    # every <userprofile>\.claude* root; tests point it at a fixture, as prune-merged.ps1's do.
+    [string[]]$ConfigRoot
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,28 +70,54 @@ else { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path }
 
 if ($Nested) {
     # Under the MAIN worktree, where new.ps1 -Nested puts it. Live harness and subagent sessions sit in
-    # this directory too, so -Nested adds two refusals the sibling path does not need (BACKLOG #1038):
+    # this directory too, so -Nested adds four refusals the sibling path does not have (BACKLOG #1038):
     #   * the path must be a worktree git REGISTERS. A leftover directory here is not one, and every
     #     `git -C` below would then answer for the enclosing main worktree instead;
-    #   * untracked, not-ignored files refuse removal unless -Force. They are a Builder's new files not
-    #     yet added, and `worktree remove --force` would destroy them.
-    # It does NOT consult session occupancy; see prune-merged.ps1 for the fence that does.
+    #   * the caller must not be standing inside it;
+    #   * no live session may be recorded in it (occupancy.ps1, the fence prune-merged.ps1 uses), and a
+    #     registry that cannot be read refuses rather than clears;
+    #   * untracked, not-ignored files refuse removal unless -Force, and a git error refuses outright.
+    #     They are a Builder's new files not yet added, and `worktree remove --force` would destroy them.
     if ($Name -match '\A\.+\z') { throw "-Name may not be only dots under -Nested: '$Name'" }
+    . "$PSScriptRoot\..\coord\occupancy.ps1"
     # @() around the WHOLE pipeline: one worktree yields one string, and indexing a string gives a char.
     $wtLines = @(@(& git -C $RepoRoot worktree list --porcelain 2>$null) | Where-Object { $_ -like 'worktree *' })
     if (-not $wtLines) { throw "cannot list the worktrees of $RepoRoot" }
     $MainRoot = [System.IO.Path]::GetFullPath($wtLines[0].Substring('worktree '.Length))
     $WorktreePath = Join-Path (Join-Path (Join-Path $MainRoot ".claude") "worktrees") $Name
-    $norm = { param($p) ([System.IO.Path]::GetFullPath($p) -replace '\\', '/').TrimEnd('/').ToLowerInvariant() }
-    $registered = @($wtLines | ForEach-Object { & $norm $_.Substring('worktree '.Length) })
-    if ((Test-Path $WorktreePath) -and $registered -notcontains (& $norm $WorktreePath)) {
-        throw "Not a registered worktree (a leftover directory?): $WorktreePath"
-    }
-    if ((Test-Path $WorktreePath) -and -not $Force) {
-        $untracked = @(& git -C $WorktreePath ls-files --others --exclude-standard 2>$null)
-        if ($untracked.Count -gt 0) {
-            throw ("Worktree has $($untracked.Count) untracked file(s) that are not ignored, e.g. " +
-                   "'$($untracked[0])'. Add or delete them, or re-run with -Force.")
+    if (Test-Path $WorktreePath) {
+        $there = ConvertTo-Norm $WorktreePath
+        $registered = @($wtLines | ForEach-Object { ConvertTo-Norm $_.Substring('worktree '.Length) })
+        if ($registered -notcontains $there) {
+            throw "Not a registered worktree (a leftover directory?): $WorktreePath"
+        }
+        $here = ConvertTo-Norm $PWD.ProviderPath
+        if ($here -eq $there -or $here.StartsWith("$there/")) {
+            throw "You are standing inside '$WorktreePath'. Run this from another checkout. Nothing was removed."
+        }
+        # READABLE AND EMPTY CLEARS; UNREADABLE REFUSES. occupancy.ps1 reports Available false both when
+        # it could not read a record and when it read a registry holding none. The second leaves no
+        # session that could be in the target; the first could hide one.
+        $occ = Get-WorktreeOccupancy -Repo $MainRoot -ConfigRoot $ConfigRoot
+        $readableEmpty = (-not $occ.Available) -and $occ.RootsExamined -gt 0 -and
+            $occ.RecordsUnplaceable -eq 0 -and $occ.RecordsExamined -eq 0
+        if (-not $occ.Available -and -not $readableEmpty) {
+            throw "Occupancy unknown: $($occ.Detail). Nothing was removed."
+        }
+        $who = @(Get-WorktreeOccupants -Occupancy $occ -Path $WorktreePath -IncludeNested)
+        if ($who.Count -gt 0) {
+            $list = ($who | ForEach-Object { "$($_.State) $($_.Short) pid $($_.Pid)" }) -join '; '
+            throw "Target is occupied by $($who.Count) session(s): $list. Nothing was removed."
+        }
+        if (-not $Force) {
+            $untracked = @(& git -C $WorktreePath ls-files --others --exclude-standard 2>$null)
+            if ($LASTEXITCODE -ne 0) {
+                throw "git ls-files failed in '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed."
+            }
+            if ($untracked.Count -gt 0) {
+                throw ("Worktree has $($untracked.Count) untracked file(s) that are not ignored, e.g. " +
+                       "'$($untracked[0])'. Add or delete them, or re-run with -Force.")
+            }
         }
     }
 }
@@ -99,6 +128,29 @@ else {
 }
 
 if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
+
+# A DETACHED HEAD WHOSE COMMIT NO REF HOLDS is lost with the worktree: removal deletes the HEAD reflog
+# too, so nothing reaches it afterwards. Both layouts, and -Force does not override it -- -Force means
+# "discard changes", nothing else. The shape is the vault remove.ps1's (vault PR 2125). Refs are read
+# with --glob=refs/*, not --all, which would add this worktree's own HEAD and so never find anything
+# at risk. Transient refs that do not keep a commit alive for long are excluded; each --exclude binds
+# to the --glob after it.
+& git -C $WorktreePath symbolic-ref -q HEAD *> $null
+if ($LASTEXITCODE -ne 0) {
+    $head = "$(& git -C $WorktreePath rev-parse --verify --quiet HEAD 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $head) {
+        throw "Could not read the detached HEAD of '$WorktreePath'. Nothing was removed."
+    }
+    $atRisk = "$(& git -C $RepoRoot rev-list --count $head --not --exclude=refs/stash --exclude=refs/prefetch/* --exclude=refs/bisect/* --exclude=refs/rewritten/* --exclude=refs/original/* --glob=refs/* 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or $atRisk -notmatch '^\d+$') {
+        throw "Could not tell whether the detached HEAD $head is held by a ref. Nothing was removed."
+    }
+    if ([int]$atRisk -gt 0) {
+        Write-Host "Keep them first, for example:  git -C `"$RepoRoot`" branch <name> $head" -ForegroundColor Red
+        throw ("'$WorktreePath' is detached at $head, and $atRisk commit(s) there are held by no ref. " +
+               "Removing it would leave them in no ref and no reflog. Nothing was removed.")
+    }
+}
 
 # Guard against losing UNCOMMITTED tracked work. Note this does NOT see committed-but-unpushed
 # commits -- `status --porcelain` is empty for a clean worktree holding them; -DeleteBranch's own

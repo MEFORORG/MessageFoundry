@@ -239,7 +239,13 @@ def test_the_advice_that_used_to_be_printed_still_throws_today(fx: Fixture) -> N
 
 def _run_new_nested(fx: Fixture, name: str) -> subprocess.CompletedProcess[str]:
     """Drive a COPY of new.ps1 living in the fixture, so it anchors there and never on this checkout."""
-    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
+    # remove.ps1 -Nested dot-sources the occupancy fence, which dot-sources the session registry.
+    for rel in (
+        "scripts/worktree/new.ps1",
+        "scripts/coord/lock.ps1",
+        "scripts/coord/occupancy.ps1",
+        "scripts/coord/session-registry.ps1",
+    ):
         dst = fx.primary / rel
         if not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -278,7 +284,18 @@ def test_new_ps1_NESTED_lands_under_dot_claude_worktrees_and_its_own_advice_remo
         (wt / ".venv").mkdir(exist_ok=True)
 
         argv = [t.strip('"') for t in shlex.split(line, posix=False)]
-        proc = _run(argv)
+        # The printed remove.ps1 -Nested line reads the session registry under USERPROFILE. Point it
+        # at an empty fixture registry, never the developer's real one.
+        home = fx.root / "home"
+        (home / ".claude" / "sessions").mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+            env={**os.environ, "USERPROFILE": str(home)},
+        )
 
         assert proc.returncode == 0, f"advice failed: {line}\n{proc.stdout}\n{proc.stderr}"
         assert not wt.exists(), f"advice ran but left the worktree behind: {line}"

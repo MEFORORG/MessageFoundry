@@ -1174,9 +1174,10 @@ def test_bash_and_powershell_get_the_same_answer_for_the_same_command(
 
 #: Placeholder -> a concrete value of the right shape, so a printed line becomes a runnable command.
 _ROUTE_FILL = {
-    "<base>": "main",
     "origin/<branch>": "victim-branch",
     "<branch>": "victim-branch",
+    "<base>": "main",
+    "<b>": "victim-branch",
     "<tree>": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
     "<tip>": "main",
     "<batch>": "batch-184",
@@ -1204,32 +1205,43 @@ def _printed_route(reason: str, fresh: Path) -> list[str]:
 def test_the_class_B_deny_teaches_the_compose_then_create_route(
     hijack_repo: HijackRepo, hijack_repos_file: Path, tmp_path: Path
 ) -> None:
-    """Red before this change: the deny named no route at all."""
+    """Red before this change: the deny named no route at all. Two pwsh launches (BACKLOG #1304)."""
     reason = _class_b_reason(hijack_repo, hijack_repos_file)
     for needle in (
         "git fetch origin",
-        "merge-tree --write-tree",
-        "commit-tree",
+        "git rev-parse origin/main origin/<branch>",
+        "use only those shas",
+        "merge-tree --write-tree <base> <b>",
+        "<tree> is the first line of its output",
+        "commit-tree <tree> -p <base> -p <b>",
         "worktree add --detach",
         "exit 1 with conflict",
+        "leave that item",
+        "continue with the rest",
         "isolation: worktree",
-        "your own worktree",
+        "only if the directory you are standing in is your own working tree",
+        "parent's worktree",
         "plain terminal",
     ):
         assert needle in reason.lower(), f"{needle!r} missing from the class B deny:\n{reason}"
     route = _printed_route(reason, tmp_path / "GateRepo-batch")
-    assert len(route) == 5, route
+    assert len(route) == 6, route
+    # The batched check below is only evidence if a refused line inside the batch still refuses it.
+    poisoned = "\n".join([*route, f'git -C "{hijack_repo.victim}" merge main'])
+    assert_denied(run_gate(bash(poisoned, cwd=hijack_repo.mine), hijack_repos_file))
 
 
 @pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
 def test_every_route_line_the_deny_PRINTS_is_allowed_and_the_merge_still_is_not(
     hijack_repo: HijackRepo, hijack_repos_file: Path, tmp_path: Path, tool: str
 ) -> None:
-    """Driven from the seat that was just refused, through the same tool."""
+    """Driven from the seat that was just refused, through the same tool. The lines go through the gate
+    as ONE multi-line command, so the item costs two pwsh launches rather than seven: the gate scans
+    every line and denies if any does, and the poisoned-batch control above shows that it does."""
     reason = _class_b_reason(hijack_repo, hijack_repos_file, tool)
-    for line in _printed_route(reason, tmp_path / "GateRepo-batch"):
-        verdict = run_gate(bash(line, cwd=hijack_repo.mine, tool=tool), hijack_repos_file)
-        assert verdict is None, f"the deny teaches a line the gate refuses: {line}"
+    route = "\n".join(_printed_route(reason, tmp_path / "GateRepo-batch"))
+    verdict = run_gate(bash(route, cwd=hijack_repo.mine, tool=tool), hijack_repos_file)
+    assert verdict is None, f"the deny teaches a line the gate refuses:\n{route}\n{verdict}"
 
 
 @pytest.mark.parametrize(

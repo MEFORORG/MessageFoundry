@@ -797,3 +797,35 @@ def test_a_primary_new_ps1_WITHOUT_nested_gets_the_plain_form(repo: SimpleNamesp
 
     assert "-Nested" not in line, line
     assert _primary_new_ps1(repo, line), line
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["[switch]$Retired # [switch]$Nested", "<# [switch]$Nested #> [switch]$Retired"],
+    ids=["line_comment", "block_comment"],
+)
+def test_a_COMMENTED_OUT_nested_declaration_gets_the_plain_form(
+    repo: SimpleNamespace, spelling: str
+) -> None:
+    """Red before round three: a regex sniff matched the comment and printed a flag the script lacks.
+    The probe now asks PowerShell's parser for the param block."""
+    text = repo.new_ps1.read_text(encoding="utf-8").replace("[switch]$Nested", spelling)
+    repo.new_ps1.write_text(text, encoding="utf-8")
+    reader = _nested_reader(repo)
+
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, reader))
+
+    assert "-Nested" not in line, line
+
+
+def test_an_UNREADABLE_primary_new_ps1_gets_the_plain_form(repo: SimpleNamespace) -> None:
+    """Fails CLOSED. Red before round three: a read that threw under the gate's SilentlyContinue left
+    the flag set, so -Nested was printed unverified. A directory in the script's place cannot be read
+    as a file on any platform."""
+    repo.new_ps1.unlink()
+    repo.new_ps1.mkdir()
+    reader = _nested_reader(repo)
+
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, reader))
+
+    assert "-Nested" not in line, line

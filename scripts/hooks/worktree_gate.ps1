@@ -2530,10 +2530,23 @@ function Get-OwnWorktreeRemedy([string]$CwdRaw, [object[]]$List, [string]$MainWt
     # The installed hook is decoupled from the checkout it names: the primary's new.ps1 can predate
     # -Nested, and printing the flag then hands the reader a command that dies at parameter binding --
     # the #1032 defect. So the flag is printed only if that file declares it. One file read, deny path only.
+    # FAILS CLOSED: the flag is printed only on a positive answer from PowerShell's own parser, which
+    # reads the param block and so ignores a commented-out declaration. Any exception, a parse error,
+    # or a missing file means no -Nested.
     if ($nested) {
-        $newPs1 = Join-Path (Join-Path (Join-Path $root 'scripts') 'worktree') 'new.ps1'
-        $nested = (Test-Path -LiteralPath $newPs1) -and
-                  ([System.IO.File]::ReadAllText($newPs1) -match '\[switch\]\$Nested\b')
+        $declared = $false
+        try {
+            $newPs1 = Join-Path (Join-Path (Join-Path $root 'scripts') 'worktree') 'new.ps1'
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($newPs1, [ref]$tokens, [ref]$parseErrors)
+            if ($ast -and $ast.ParamBlock -and @($parseErrors).Count -eq 0) {
+                $declared = @($ast.ParamBlock.Parameters |
+                        Where-Object { $_.Name.VariablePath.UserPath -eq 'Nested' }).Count -gt 0
+            }
+        }
+        catch { $declared = $false }
+        $nested = $declared
     }
     $newHintQ = Get-SafeForCommand $root -Suffix '\scripts\worktree\new.ps1'
     if ($nested) {
@@ -2718,20 +2731,26 @@ What to do instead:
   * To COMBINE branches -- a wave, a batch -- compose the result in git's object store, then give it a
     NEW worktree. None of these moves any worktree's HEAD, so this gate allows every one, from any
     worktree of this repository:
-      1. Fetch, and start <base> at origin/main:
+      1. Fetch, then resolve every ref ONCE to a SHA. Use only those SHAs below: a ref read twice can
+         move between the reads, and the commit would then record parents that do not match its tree.
         git fetch origin
-      2. Per branch, name it as origin/<branch> and read merge-tree's EXIT CODE, not its first line:
-        git merge-tree --write-tree <base> origin/<branch>
-         Exit 1 with CONFLICT lines is a conflict: stop, and send that item back to a Builder. Any other
-         failure (an unknown ref, exit 128) is an error to fix, not a conflict.
+        git rev-parse origin/main origin/<branch>
+         The first SHA is <base>. Each branch's SHA is its <b>.
+      2. Per branch, merge in the object store and read the EXIT CODE:
+        git merge-tree --write-tree <base> <b>
+         Exit 0: <tree> is the first line of its output. Exit 1 with CONFLICT lines: leave that item
+         out of this wave, send it back to a Builder, and continue with the rest from the same <base>.
+         Any other failure (an unknown SHA, exit 128) is an error to fix, not a conflict.
       3. Commit the tree. commit-tree runs no hooks, so the checks in step 4 stand in for them:
-        git commit-tree <tree> -p <base> -p origin/<branch> -m 'merge <branch>'
-         The new commit is the next <base>. Repeat step 2 for each branch.
+        git commit-tree <tree> -p <base> -p <b> -m 'merge <branch>'
+         The SHA it prints is the next <base>. Repeat step 2 for each branch.
       4. Make a worktree on the last commit, <tip>. Run ensure-venv.ps1 and the checks there, then push:
         git worktree add --detach <new path> <tip>
         git push origin <tip>:refs/heads/<batch>
-  * If this is YOUR work, do it in YOUR OWN worktree -- drop the `-C` (or the `cd`) that aims this command
-    at that directory, and run it where you are standing.
+  * ONLY IF the directory you are standing in is YOUR OWN working tree: drop the `-C` (or the `cd`)
+    that aims this command at that directory, and run it where you stand. A subagent whose cwd is its
+    PARENT's worktree is NOT in that case, and running it there moves the parent's branch. Use the
+    route above, or report back to whoever dispatched you.
   * If you dispatch Builder subagents, do it from YOUR OWN worktree (rule 2 refuses a dispatch from the
     primary) and with ``isolation: worktree``. Each Builder's payload cwd is then its own tree, so a merge,
     rebase or reset there is its own work and this rule allows it.
