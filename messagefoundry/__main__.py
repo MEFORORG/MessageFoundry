@@ -3671,7 +3671,8 @@ def _serve(args: argparse.Namespace) -> int:
     # on-path attacker read all of it. The connectors (EMAIL/DIRECT, layers 1-2) key their refusal on the
     # CLAMPED weakened_tls_escape_permitted_here(), but that mechanism is INERT here — this notifier is
     # built in the API lifespan, outside build_check_registry's active_hop_posture scope, so
-    # current_hop_posture() is None and the clamp degrades to the unclamped escape. Hence an explicit
+    # current_hop_posture() is None. The clamp degraded to the unclamped escape there; since vault
+    # BACKLOG #2354 it fails closed instead, and neither can express an acknowledgment. Hence an explicit
     # acknowledgment switch at this gate instead, in the shape of the keyless-PHI second ack (ADR 0140).
     #
     # IT COVERS BOTH UNAUTHENTICATED SHAPES, DELIBERATELY. email_use_tls=false (no TLS at all) is

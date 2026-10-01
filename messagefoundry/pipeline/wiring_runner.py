@@ -3727,7 +3727,8 @@ class RegistryRunner:
             # set the runner), so without this the raw/MLLP/DB guards no-op (a prod-PHI plaintext outbound
             # would ship cleartext) and the HTTP guards fail-closed (a legit non-prod cleartext lane would
             # wrongly refuse) on the primary serve path. Mirrors _start_inbound_unsafe threading posture
-            # into the exposure checks. No-op (None) in a test/embedding that derives no posture.
+            # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
+            # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
             with active_hop_posture(self._hop_posture):
                 connector = build_destination(dest)
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver

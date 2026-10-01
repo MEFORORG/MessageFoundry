@@ -242,11 +242,9 @@ def test_use_tls_false_allowed_with_escape_but_no_credentials(
     assert d.use_tls is False
 
 
-def test_credentials_over_cleartext_refused_even_with_escape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with pytest.raises(ValueError, match="credentials"):
+def test_credentials_over_cleartext_refused_even_with_escape(escape_at_warn: None) -> None:
+    # On a warn posture the escape passes the cleartext gate, so the credential arm is what refuses.
+    with pytest.raises(ValueError, match="authentication credentials over cleartext"):
         EmailDestination(_dest(use_tls=False, username="svc", password="pw"))
 
 

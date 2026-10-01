@@ -524,9 +524,10 @@ needs the escape on a `warn` instance passes that posture.
 - The three Vault hops need a scheme gate. That is vault BACKLOG #2317.
 - `ad_allow_insecure_ldap` is to be clamped inert under `enforce`, like every other weakened-TLS
   escape. That waits on engine PR 1877, which rewrites `auth/ldap.py`.
-- A CLI command that opens a store with weakened TLS now refuses even at `enforcement = warn`,
-  because it passes no posture. A site that needs one on a dev store gives it a verifying certificate
-  instead, or the command is changed to pass its posture.
+- The CLI commands in the third row refuse a weakened store even at `enforcement = warn`, because
+  they pass no posture. At least `provision-admin`, `store provision-schema` and `check-privileges`
+  pass one and keep the escape at `warn`. A site that needs the others on a dev store gives it a
+  verifying certificate, or the command is changed to pass its posture.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
   one. `generic_odbc_no_tls_params` records that residual.
 

@@ -202,7 +202,7 @@ def _build_dsn(
             "secure by other means (a proxy-terminated or isolated segment; reported as a loosening); "
             f"or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to "
             "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
-            "the default)."
+            "the default, or with no posture)."
         )
     if (trust or not encrypt) and attested:
         _audit_attested_weakened_tls("DATABASE connection", connection=connection)

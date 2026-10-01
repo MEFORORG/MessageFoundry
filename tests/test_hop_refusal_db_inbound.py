@@ -204,7 +204,15 @@ def test_destination_carries_its_build_posture_to_send_time(
     with active_hop_posture(STAGING_PHI):
         dest = DatabaseDestination(_db_dest())
     assert dest._hop_posture is STAGING_PHI
-    _assert_send_hop(weakened=dest._weakened_tls, attested=False, posture=dest._hop_posture)
+
+    async def _no_pool() -> object:
+        raise _StopBeforeDial
+
+    # Through send() itself, outside the scope: the tripwire passes on the captured warn posture and
+    # the call reaches the pool. Were send() to read the ambient posture (None here), it would refuse.
+    monkeypatch.setattr(dest, "_get_pool", _no_pool)
+    with active_hop_posture(None), pytest.raises(_StopBeforeDial):
+        asyncio.run(dest.send('{"x": 1}'))
 
 
 def test_assert_send_hop_noop_when_not_weakened() -> None:

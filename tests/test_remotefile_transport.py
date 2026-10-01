@@ -2503,8 +2503,10 @@ def _config_fault_dest(
         _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
     else:
         _scripted_plain_ftp(monkeypatch, refuse_at=refuse_at, reply=reply)
-    # A credentialed plain-ftp hop needs the escape on a warn posture (vault BACKLOG #2354).
-    with active_hop_posture(HopPosture(enforcing=False)):
+    # A credentialed plain-ftp hop needs the escape on a warn posture (vault BACKLOG #2354). FTPS
+    # needs no escape, so it keeps the default (unstamped) posture.
+    posture = HopPosture(enforcing=False) if kind == "plain" else None
+    with active_hop_posture(posture):
         return build_destination(
             _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over)
         )

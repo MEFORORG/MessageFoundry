@@ -401,7 +401,7 @@ def test_cleartext_refusals(monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
         pytest.raises(ValueError, match="credentials"),
     ):
         DirectDestination(_dest(pki, use_tls=False, username="svc", password="pw"))
-    # With the escape and no credentials, on a warn posture → allowed (loud warning). With no
+    # With the escape and no credentials, on a warn posture, allowed (loud warning). With no
     # posture the escape alone is refused (vault BACKLOG #2354).
     with active_hop_posture(None), pytest.raises(ValueError, match="cleartext"):
         DirectDestination(_dest(pki, use_tls=False))

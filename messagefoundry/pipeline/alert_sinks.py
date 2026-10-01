@@ -475,8 +475,9 @@ def send_plain_email(
     ``tls_verify=False`` is the audited escape and is **not** gated here. This cell is built OUTSIDE
     ``build_check_registry``'s ``active_hop_posture`` scope — measured: the contextvar is stamped only
     in ``pipeline/wiring_runner.py`` — so the connectors' clamped
-    ``weakened_tls_escape_permitted_here()`` would fall back to the UNCLAMPED escape here and an
-    enforcing PHI instance would get no refusal at all. The refusal is therefore an acknowledgment
+    ``weakened_tls_escape_permitted_here()`` read no posture here. It fell back to the UNCLAMPED escape
+    and gave an enforcing PHI instance no refusal at all; since vault BACKLOG #2354 it fails closed,
+    which would refuse with no way across. Either way it cannot carry an acknowledgment. The refusal is therefore an acknowledgment
     switch at the **serve gate** (``[security].allow_unverified_alert_smtp_tls``) instead, which is
     also why layer 3 was deferred out of layers 1–2 rather than folded in.
 

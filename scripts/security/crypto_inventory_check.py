@@ -378,6 +378,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the engine mints, so no client ever races a file that doesn't exist until the engine writes it.
     # Non-prod only: the pair lives in a per-process temp dir and covers loopback names alone.
     "harness/load/tlsmat.py": frozenset({"ssl"}),
+    # Vault BACKLOG #2354: these two rigs open a server store against a self-signed dev container
+    # directly, so they pass an explicit warn HopPosture; a missing posture now refuses the escape.
+    # A value type only: no context is built through it.
+    "harness/load/connscale/runner.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "harness/load/shardcert.py": frozenset({"messagefoundry.config.tls_policy"}),
     # ADR 0041 (D3): SHA-256 hashes of the loaded first-party modules vs the wheel dist-info/RECORD at
     # startup self-attestation — drift detection (integrity/tamper-evidence, not a secret); the engine
     # alerts by default and (opt-in) fails closed on drift.

@@ -418,7 +418,8 @@ def _ftps_ssl_context(
     the internal CA never bypasses the ``tls_verify=false`` refusal above."""
     # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
     # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
-    # arm). Byte-identical off the construction gate (posture unstamped → unclamped escape).
+    # arm). Off the construction gate (posture unstamped) the escape is refused since vault BACKLOG
+    # #2354; it used to be honoured there unclamped.
     verify = bool(settings.get("tls_verify", True))
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
@@ -1253,7 +1254,7 @@ class _SftpClient(_RemoteClient):
         # FTPS tls_verify=false sibling at :176 that this class is built alongside), so under an
         # enforcing-PHI posture the escape is INERT — the accept-unknown policy then stays RejectPolicy
         # and an unknown host key is refused at connect (:392-394), as today. Off the construction gate
-        # (posture unstamped) the escape is unclamped, byte-identical to the pre-#329 bare read.
+        # (posture unstamped) the escape is refused since vault BACKLOG #2354 (it used to be unclamped).
         self._accept_unknown = weakened_tls_escape_permitted_here()
         if self._accept_unknown:
             logger.warning(

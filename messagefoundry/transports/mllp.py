@@ -587,7 +587,8 @@ def _mllp_ssl_context(
     # Outbound (client): verify the server cert unless explicitly — and loudly — disabled. #200 (ADR
     # 0092 decision 2): the escape is CLAMPED to non production-PHI (weakened_tls_escape_permitted_here),
     # so tls_verify=false can no longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance —
-    # matching the plaintext-MLLP InsecureHopGuard. Byte-identical off the construction gate (unstamped).
+    # matching the plaintext-MLLP InsecureHopGuard. Off the construction gate (unstamped) the escape is
+    # refused since vault BACKLOG #2354; it used to be honoured there unclamped.
     verify = bool(s.get("tls_verify", True))
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(

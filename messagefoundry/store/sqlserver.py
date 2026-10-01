@@ -3098,6 +3098,10 @@ class SqlServerStore:
     ) -> SqlServerStore:
         """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
         (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
+        # Resolve the ambient posture ONCE, so every later connection of this store (claim connection,
+        # sync-handoff pool) decides as the open did, wherever it is reached from (vault BACKLOG #2354).
+        if posture is None:
+            posture = current_hop_posture()
         try:
             import aioodbc  # noqa: F401 - fail on a missing extra before any connect is attempted
         except ImportError as exc:  # pragma: no cover - exercised only without the extra

@@ -334,7 +334,7 @@ def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
     return insecure_tls_allowed() and not enforcing
 
 
-def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
+def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
     CLAMPED so an enforcing PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
 
