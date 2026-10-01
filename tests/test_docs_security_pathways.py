@@ -740,7 +740,7 @@ def test_local_row_scopes_the_second_factor_to_step_up_and_administrator() -> No
     """
     service = AuthService.__new__(AuthService)
     service._settings = AuthSettings(require_mfa=True)
-    # Carries only auth_provider, the one field _mfa_required_for reads off a user.
+    # A placeholder user: _mfa_required_for reads no field off it, provider included (BACKLOG #1144).
     user: UserRecord = SimpleNamespace(auth_provider=AuthProvider.LOCAL.value)  # type: ignore[assignment]
     assert (
         service._mfa_required_for(user, frozenset({Role.OPERATOR}), second_factor_enrolled=False)
@@ -1868,7 +1868,7 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     # require_mfa = false frees any un-enrolled account. Called on a stand-in self, so this pins the
     # rule the doc states rather than a whole AuthService.
     admin, other = frozenset({Role.ADMINISTRATOR}), frozenset({Role.OPERATOR})
-    # Carries only auth_provider, the one field _mfa_required_for reads off a user.
+    # A placeholder user: _mfa_required_for reads no field off it, provider included (BACKLOG #1144).
     user: UserRecord = SimpleNamespace(auth_provider=AuthProvider.LOCAL.value)  # type: ignore[assignment]
 
     def required(scope: str, roles: frozenset[Role], *, on: bool, enrolled: bool) -> bool:
