@@ -248,6 +248,21 @@ class Orphan:
 
 
 @dataclass(frozen=True)
+class FlatOpen:
+    """A construct line that owns nothing, then its would-be body as siblings, then ``EndIf``: the
+    flat form some exporter may write. Whether the siblings are conditional is not known."""
+
+    body: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
+class OffList:
+    """A ``<List>`` wrapper carrying ``@Disabled``: whether its statements run is not known."""
+
+    body: tuple[Node, ...]
+
+
+@dataclass(frozen=True)
 class Nested:
     """A ``<Line>`` whose verb is no construct, carrying a nested list: an unmodelled construct."""
 
@@ -276,6 +291,8 @@ Node = (
     | Off
     | Orphan
     | Nested
+    | FlatOpen
+    | OffList
 )
 
 
@@ -435,6 +452,8 @@ def _render_one(node: Node, inp: str, disabled: str = "") -> str:
                 data = f"ForEach {over.name} in %SRC/OBX"
             elif over.cls == "verbless":  # a <Foreach> whose @Data does not start with its verb
                 data = f"{over.name} in %SRC/OBX"
+            elif over.cls == "rootish":  # a path span that may still mean the whole tree
+                data = f"{_kw('ForEach')} {_hs(H(over.name), inp)}{_span('path', '/.')}"
             else:
                 data = f"{_kw('ForEach')} {_hs(over, inp)}"
             if form == "line":
@@ -467,6 +486,10 @@ def _render_one(node: Node, inp: str, disabled: str = "") -> str:
             return _line(kind, disabled=off) + _render(body, inp)
         case Nested(body, verb):
             return _line(_kw(verb), _render(body, inp), disabled)
+        case FlatOpen(body):
+            return _line('If (x = "1")') + _render(body, inp) + _line("EndIf")
+        case OffList(body):
+            return f'<List Disabled="1">{_render(body, inp)}</List>'
     raise AssertionError(f"unrendered node {node!r}")
 
 
@@ -490,6 +513,10 @@ class _Env:
         self.default = default
         # No path reaches this point: an exit ended every one that got here.
         self.ended = False
+        # Some path that would have reached this point may have stopped before it: an exit on one
+        # arm, or something whose completion nothing here can tell (an unmodelled element, a call
+        # whose list is not inlined, a LoopExit with no loop, an orphan marker).
+        self.may_end = False
 
     def get(self, key: str) -> frozenset[Val]:
         return frozenset() if self.ended else self.vals.get(key, self.default)
@@ -498,6 +525,7 @@ class _Env:
         env = _Env(self.default)
         env.vals = dict(self.vals)
         env.ended = self.ended
+        env.may_end = self.may_end
         return env
 
     def havoc(self) -> None:
@@ -508,6 +536,7 @@ class _Env:
         keys = self.vals.keys() | other.vals.keys()
         return (
             self.ended == other.ended
+            and self.may_end == other.may_end
             and self.default == other.default
             and all(self.get(k) == other.get(k) for k in keys)
         )
@@ -522,6 +551,7 @@ def _join(envs: Sequence[_Env]) -> _Env:
     out = _Env(frozenset().union(*(e.default for e in live)))
     for key in set().union(*(e.vals.keys() for e in live)):
         out.vals[key] = frozenset().union(*(e.get(key) for e in live))
+    out.may_end = len(live) < len(envs) or any(e.may_end for e in live)
     return out
 
 
@@ -552,6 +582,7 @@ class _Oracle:
         self.send_keys: dict[str, set[str]] = {}
         self.dead: set[str] = set()
         self.doubt: set[str] = set()
+        self.may_skip: set[str] = set()
         self.lits: dict[Val, set[str]] = {}
         self.sources: dict[Val, set[Val]] = {}
         env = _Env()
@@ -604,6 +635,8 @@ class _Oracle:
                     self.dead.add(dest)
                 if ctx.doubt:
                     self.doubt.add(dest)
+                if env.may_end:
+                    self.may_skip.add(dest)
             case Unread():
                 env.havoc()
             case Exit():
@@ -615,6 +648,10 @@ class _Oracle:
             case LoopExit():
                 if ctx.loops:
                     ctx.loops[-1].append(env.copy())
+                else:  # with no loop here, it may leave a caller's loop, ending this list
+                    stopped = env.copy()
+                    stopped.ended = True
+                    env = _join([env, stopped])
             case Raw(_, havoc):
                 if havoc:
                     env.havoc()
@@ -659,19 +696,26 @@ class _Oracle:
                 if inlined and plain and body and all(isinstance(n, Log) for n in body):
                     return env  # a list that only logs writes nothing, whatever its scope
                 # Nothing ties the called list's names to the caller's: what it sends is unknown,
-                # and afterwards so is every caller handle.
-                self.run(body, _Env(frozenset({UNK})), ctx)
+                # and afterwards so is every caller handle. A list nothing here can see, or one
+                # that may stop, may stop the caller too.
+                called = self.run(body, _Env(frozenset({UNK})), ctx)
                 env.havoc()
+                if not inlined or called.ended or called.may_end:
+                    env.may_end = True
             case Unknown(body) | Nested(body):
                 env.havoc()
                 env = _join([env.copy(), self.run(body, env.copy(), ctx.lost())])
                 env.havoc()
+                env.may_end = True  # an unmodelled construct may itself stop the list
+            case FlatOpen(body) | OffList(body):
+                env = _join([env.copy(), self.run(body, env.copy(), ctx.lost())])
             case Off(inner, value):
                 if value.strip().lower() in _DISABLED_SURE:
                     return env
                 env = _join([env.copy(), self.run((inner,), env.copy(), ctx.cond())])
             case Orphan(_, body, _):
                 env = _join([env.copy(), self.run(body, env.copy(), ctx.lost())])
+                env.may_end = True  # what a marker with no construct means is not known
         return env
 
     def loop(self, body: tuple[Node, ...], env: _Env, ctx: _Ctx) -> _Env:
@@ -697,6 +741,7 @@ class _Verdict:
     keys: dict[str, list[tuple[str, str]]]  # dest -> [(input key, sent key)] per reading
     dead: set[str]
     doubt: set[str]
+    may_skip: set[str]
     lits: dict[Val, set[str]]
     sources: dict[Val, set[Val]]
 
@@ -716,7 +761,7 @@ class _Verdict:
 
 def _oracle(shape: Shape) -> _Verdict:
     worlds = [_Oracle(shape, fold) for fold in (False, True)]
-    verdict = _Verdict(tuple(w.inp_key for w in worlds), {}, {}, set(), set(), {}, {})
+    verdict = _Verdict(tuple(w.inp_key for w in worlds), {}, {}, set(), set(), set(), {}, {})
     for w in worlds:
         for dest, vals in w.sends.items():
             verdict.sends.setdefault(dest, set()).update(vals)
@@ -724,6 +769,7 @@ def _oracle(shape: Shape) -> _Verdict:
             verdict.keys.setdefault(dest, []).extend((w.inp_key, k) for k in keys)
         verdict.dead |= w.dead
         verdict.doubt |= w.doubt
+        verdict.may_skip |= w.may_skip
         for v, lits in w.lits.items():
             verdict.lits.setdefault(v, set()).update(lits)
         for v, srcs in w.sources.items():
@@ -884,6 +930,9 @@ def _violations(shape: Shape) -> list[str]:
         if dest in verdict.doubt:
             found.append(f"(ii) {dest} sends {local} live where the import lost the scope")
             continue
+        if dest in verdict.may_skip:
+            found.append(f"(reach) {dest} sends {local} live, but Corepoint may stop before it")
+            continue
         why = provable(dest, is_msg)
         if why:
             found.append(f"(render) {dest} sends {local} live: {why}")
@@ -997,7 +1046,9 @@ def _wrap(kind: str, body: tuple[Node, ...], b: _Build) -> Node:
     # a span whose class the reader must not trust (a variable or literal holding a handle name).
     over = None
     if rng.random() < 0.6:
-        over_cls = rng.choice(("", "plain", "verbless", "variable", "literal", "handle"))
+        over_cls = rng.choice(
+            ("", "plain", "verbless", "variable", "literal", "handle", "description", "rootish")
+        )
         over = H(b.spell(rng.choice((b.inp, b.out))).name, over_cls)
     form = rng.choice(_IF_FORMS)
     if kind == "if":
@@ -1060,10 +1111,39 @@ def _wrap(kind: str, body: tuple[Node, ...], b: _Build) -> Node:
     if kind == "nested-line":
         return Nested(body)
     if kind == "block-label":
-        # A Block whose label is itself a writing statement.
+        # A Block whose label is itself a writing statement, marked up, plain, or plain inside a
+        # span of the label's own class.
         label = _leaf_data(b.clone(b.new, b.out), b.inp.name)
         assert label is not None
+        if rng.random() < 0.3:
+            plain = _leaf_data(Clone(b.new, b.out, 0, False), b.inp.name)
+            assert plain is not None
+            label = _span("block", plain)
         return Block(body, label, havoc=True)
+    if kind == "may-stop-first":
+        # Something that may stop the list, then the body.
+        first: Node = rng.choice(
+            (
+                Off(Exit(), "on"),
+                If((("If", None, (Exit(),)),)),
+                If((("If", None, (LoopExit(),)),)),
+                Try((LoopExit(),), ((b.log(b.inp),),)),
+                Call((), "", inlined=False),
+                Unknown(()),
+                If(
+                    (
+                        ("If", None, (b.log(b.inp),)),
+                        ("Else", None, (b.log(b.inp), Orphan("ElseIf", (Exit(),)))),
+                    ),
+                    "wrapper",
+                ),
+            )
+        )
+        return Block((first, *body))
+    if kind == "flat-open":
+        return FlatOpen(body)
+    if kind == "disabled-list":
+        return OffList(body)
     if kind == "stray":
         # A bodyless branch marker inside a construct that cannot continue it: the importer adopts
         # it and renders it after the construct, with its scope lost.
@@ -1102,6 +1182,9 @@ _KINDS = (
     "disabled-branch-line",
     "nested-line",
     "block-label",
+    "may-stop-first",
+    "flat-open",
+    "disabled-list",
 )
 
 
@@ -1399,6 +1482,63 @@ def _seed_shapes() -> Iterator[Shape]:
                 SendS(_OUT, "OB_AFTER"),
             ),
         )
+    # The Lander's QA of db8873d19e (PR 1900): a ForEach or Catch naming the clone in a span whose
+    # class says it is not a handle, or with a path that may still mean the whole tree.
+    for cls in ("variable", "literal", "numeral", "description", "comment", "detail", "rootish"):
+        over = H("%OUT", cls)
+        yield Shape(
+            f"lander-db8873d19e-foreach-{cls}",
+            "%ADT",
+            (Clone(_ADT, _OUT, 1), Each((Log(_P),), over, "line"), SendS(_OUT, "OB_OUT")),
+        )
+        if cls != "rootish":
+            yield Shape(
+                f"lander-db8873d19e-catch-{cls}",
+                "%ADT",
+                (
+                    Clone(_ADT, _OUT, 1),
+                    Try((Log(_P),), ((Log(_P),),), over, "wrapper"),
+                    SendS(_OUT, "OB_OUT"),
+                ),
+            )
+        # And the same span ahead of the first bind, naming the input.
+        yield Shape(
+            f"lander-db8873d19e-input-{cls}",
+            "%ADT",
+            (Each((Log(_P),), H("%ADT", cls), "line"), Clone(_ADT, _OUT, 1), SendS(_OUT, "OB_OUT")),
+        )
+    # The code review of this branch, round 3: what may stop the list before a top-level build.
+    stops: dict[str, Node] = {
+        "unsure-exit": Off(Exit(), "on"),
+        "exit-in-if": If((("If", None, (Exit(),)),)),
+        "unsure-if-with-exit": Off(If((("If", None, (Exit(),)),)), "on"),
+        "loopexit-in-if": If((("If", None, (LoopExit(),)),)),
+        "loopexit-in-try": Try((LoopExit(),), ((Log(_ADT),),)),
+        "bare-call": Call((), "", inlined=False),
+        "bodyless-unknown": Unknown(()),
+        "exit-in-a-branch-of-a-branch": If(
+            (("If", None, (Log(_ADT),)), ("Else", None, (Orphan("ElseIf", (Exit(),)),))),
+            "wrapper",
+        ),
+        "flat-open": FlatOpen(()),
+        "stray-branch": Each((Orphan("Matching", (Log(_ADT),)),)),
+    }
+    for name, stop in stops.items():
+        yield Shape(f"review-r3-{name}", "%ADT", (Log(_ADT), stop, *new_sent))
+        yield Shape(
+            f"review-r3-{name}-after-a-bind", "%ADT", (Clone(_ADT, _OUT, 1), stop, *new_sent)
+        )
+    yield Shape("review-r3-disabled-list", "%ADT", (Log(_ADT), OffList(new_sent)))
+    yield Shape("review-r3-flat-open-body", "%ADT", (Log(_ADT), FlatOpen(new_sent)))
+    yield Shape(
+        "review-r3-block-span-label",
+        "%ADT",
+        (
+            Block((), _span("block", "MsgTreeCopy %NEW/ to %ADT/"), havoc=True),
+            Clone(_ADT, _OUT, 1),
+            SendS(_OUT, "OB_OUT"),
+        ),
+    )
     # The existing hostile spellings, each cloned, called over and sent.
     for name in ("%OUT-", "%ÄÖ-ß.x", "%OUT(1)", "%OUT;A", "%_", "%1OUT"):
         h = H(name)

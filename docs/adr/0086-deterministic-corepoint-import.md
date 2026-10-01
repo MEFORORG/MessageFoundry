@@ -234,7 +234,12 @@ validated against an export, so this rule was written from the HL7 shapes alone.
 **Flow rules.** These keep the step 1 raise wherever they cannot say what a handle holds:
 
 - A handle bound only inside a branch is unknown after the branch ends. This holds even when every
-  branch binds it, because every condition is a dead placeholder until a human writes it.
+  branch binds it, because every condition is a dead placeholder until a human writes it. It holds
+  too for a handle bound before the branch and bound again inside it: a local keeps one name for the
+  whole handler, so the join judges which handles a path touched, never which name each holds.
+  *Corrected 2026-10-01:* the join compared local names, read such a rebind as no change, and sent
+  the local after the branch. Under the narrowing nothing binds inside a branch, so this can no
+  longer happen; the join keeps the touched rule because it is the correct one.
 - A handle that any path overwrites with something unknown is unknown after the join.
 - Inside a loop body, and in a `Catch`, a handle the body may overwrite is unknown throughout. A
   `Try` with no `Catch` re-raises, so after it the body's own bindings hold.
@@ -261,13 +266,75 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   `@Data` verb is not `ActionListCall` (it keeps its own construct, so an `If` stays under its
   placeholder and a `MsgSend` still raises, never filters), a `<Call>` carrying an attribute other
   than `Data`, `Comment` or `Disabled`, a control or send whose verb is not its first word, a send
-  naming more than one message or carrying a word other than `to` and `connection`, a construct
-  whose own line names a whole message (`ForEach %ADT in %BATCH`), a step whose `@Disabled` value is
-  not `1`, `true` or `yes`, and a `<Line>` carrying a statement outside `@Data`. Such a step's
+  naming more than one message or carrying a word other than `to` and `connection`, a step whose
+  `@Disabled` value is not `1`, `true` or `yes`, and a `<Line>` carrying a statement outside
+  `@Data`. A construct or a branch is never bracketed by markers (see the next rule). Such a step's
   `input-handle` names may make the input ambiguous but never supply it. A `<Call>` with no `@Data`
   never reads its `@Comment` as its call line. An unread statement never binds a local and never
   maps a write. Every element this module does not model leaves every handle unknown. An element
   carrying two attributes that fold to one name with different values is refused outright.
+- **The narrowing (Manager decision, #313 step 2, 2026-10-01).** A local other than `msg` is
+  bound only by a statement at the top level of the list, a `<Block>`'s body included, and only
+  while the list is still straight-line. Inside any construct nothing binds: a clone or a
+  `MsgCreate` there renders a TODO, and its handle is unknown from there on. Once a local other than
+  `msg` is bound, any top-level step but a statement, a send, a `<Block>` or a disabled step
+  unbinds every handle, the input included, and turns binding off for the rest of the handler.
+  Every later send then raises, a send of the input included. Step 1 sent `msg` there, so that
+  part is a fail-closed cost. Before any such local is bound, a top-level step that may not
+  complete turns binding off too: what follows it may never run in Corepoint, while the render runs
+  it for every message. That covers at least an exit, a `LoopExit` anywhere, an unmodelled element
+  or marker (a step whose `@Disabled` value may mean enabled is bracketed by one), a call whose list
+  is not inlined, a branch marker with no construct or a branch its construct cannot continue, a
+  construct line that owns nothing, a branch carrying branches of its own, and any construct holding
+  one of these. Why: every review round of step 2 found a shape in which a local bound or kept under
+  a construct went out with a tree Corepoint never sent, and each repair of the join, loop, call or
+  scope rules opened another. Under the narrowing, a live send of a local other than `msg` sits on
+  the straight-line path, where the guard executes it and compares the tree it delivers, and where
+  nothing before it may stop the list. **The cost:** a message built or cloned inside a construct,
+  or sent after the first construct that follows a bind, raises and is finished by hand. The join,
+  loop, `Try`, call and scope rules in this section still decide what the input holds, and they
+  bind nothing else.
+- **A `<List>` or `<Actions>` wrapper carrying `@Disabled` renders its statements as an unmodelled
+  element's body.** Whether Corepoint runs them is not known, so nothing there binds and no handle
+  is vouched for after it. *Corrected 2026-10-01:* the wrapper was flattened into its parent, so
+  its statements bound and sent as straight-line code.
+- **A construct or a branch whose own line the flow cannot trust carries the reason itself and keeps
+  its place in its chain.** That covers at least a construct whose line names a whole message (`If
+  %ADT exists`), and a `ForEach` or `Catch` line carrying a word not known to name something other
+  than a whole tree. The flow vouches for no handle in any arm of that chain or after it, and the
+  render writes one TODO line ahead of the construct for each such line. *Corrected 2026-10-01:*
+  markers used to bracket the line itself. A marker after an `If` hid it from the `Else` that
+  followed, and a marker around an `Else`, `ElseIf` or `Catch` hid it from its construct, so in the
+  export's wrapper and sibling forms the branch came loose and its body ran for every message (the
+  Lander's HIGH on d26545d6f, PR 1900). Under the narrowing that body can no longer bind, but a send
+  of `msg` in it still needs the branch kept under its placeholder.
+- **A condition is read as reading; a `ForEach` or a `Catch` may bind.** An `If`, `ElseIf`, `Loop`,
+  `ChooseFrom` or `Matching` line is read as reading the handles it names, never writing them. That
+  is an assumption, not a measurement of Corepoint, and the differential guard below makes the same
+  one. The import still treats such a line that names a whole message as untrusted, the rule above:
+  that fails closed, and costs a raise at a later send of the input. A `ForEach` or `Catch` line may
+  bind the handle it names, in any spelling. So it is read only when its first word is its own verb
+  and every later word is `in`, `into`, a path into a named handle that addresses an HL7 segment or
+  field, a `$variable`, a quoted literal or a number (`ForEach %ADT/OBX $obx`). Each word is judged
+  by its text and never by its span class: a `literal`, `variable` or `numeral` span is judged like
+  any word, and so is prose (`description`, `comment`, `detail`), except a path's own `(...)` label
+  holding no `%` or `$`. A path such as `/.`, `/*` or `//x` may still mean the whole tree, so it
+  does not pass. *Corrected 2026-10-01:* those span classes passed whatever their text said, and
+  prose was skipped (the Lander's MEDIUM and LOW on db8873d19e, PR 1900).
+  Any other word may be a handle spelled without a `%`, or text in a span class neither reading
+  lists. This matters most for the input before the first bind: a loop that rebinds it, then a
+  clone of it, would copy the message that arrived.
+- **A statement `<Line>` that carries a nested list renders as an unmodelled element.** Its verb is
+  no construct (`Otherwise`, say), so its scope is not modelled: the body is inlined under a TODO,
+  and no handle is vouched for after it. A nested list holding only comments and empty lines stays
+  in line, because nothing in it runs. *Corrected 2026-10-01:* the body was flattened into the
+  parent list, so the flow walked it as straight-line code and could bind and send there.
+- **A `<Block>` whose label may be a statement leaves every handle unknown, before and after it.**
+  A label may be a statement when it carries any span beyond prose, or when any run of its text, a
+  `block` span's included, holds a `%` or `$` word or opens with a word shaped like a verb
+  (`MsgTreeCopy %NEW/ to %OUT/`). Telling a label from a statement is not modelled, so this is
+  deliberately broad. Step 1's scan read such a label as a
+  write and raised; the head kept the local and sent it.
 - A statement the flow does read may still overwrite every handle it names as a whole tree, in
   either reading of its markup, such as a `MsgCreate` whose handle is not its first operand. Each
   such handle is unknown afterwards. Only `MsgSend` and `MsgLog` are read-only. That read-only list
@@ -317,11 +384,65 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   all three.
 - A statement in a branch its construct cannot continue still counts its whole-tree writes, and an
   unmodelled element leaves every handle unknown. Nothing either binds is trusted after it.
-- **Still open.** A `<Block>`, `<Foreach>`, `<If>`, `<Loop>`, `<Try>` or `<Case>` whose `@Data` is
-  itself a writing statement (`<Block Data="MsgTreeCopy ...">`) is read as a label or a condition,
-  so nothing is unbound. Telling a statement from a label's prose is open work. Each marker also
+- **Still open.** An `<If>`, `<Loop>`, `<Try>` or `<Case>` whose `@Data` is itself a writing
+  statement is read as a condition, so nothing is unbound by it. A `<Block>` and a `<Foreach>` are
+  no longer in this list (see the label rule and the word rule above). Telling a statement from a label's prose is open work. Each marker also
   counts as one more unmapped step and renders as an unmodelled element, so the summary overstates
-  unmapped work for a bracketed step.
+  unmapped work for a bracketed step. A construct or branch line the flow cannot trust counts as
+  one unmapped step for its TODO line, and not as mapped control flow as well.
+
+**The differential guard (2026-10-01).** `tests/test_corepoint_import_differential.py` checks
+every repair against a battery instead of one shape. A grammar generates action-lists: clones,
+`MsgCreate`, field writes, logs, sends, unread statements and exits, inside every ordered pair of 26
+construct kinds. Those include at least `If`, `Else` and `ElseIf` in five export spellings and with
+a disabled branch line, `ChooseFrom`, `ForEach` in several spellings of what it binds, `Loop`, `Try`
+and `Catch` in three spellings, a `Block` with a prose or a statement label, inlined and bare calls,
+an unmodelled tag, a `<Line>` carrying a nested list, a disabled `<List>` wrapper, a flat-form
+construct line, `@Disabled` sure and unsure on a whole construct or on one branch marker, an orphan
+marker, a stray branch, and something that may stop the list ahead of a build. Role markup is
+present, absent or mixed, and handle spellings are hostile. Every repro from every review of PR
+1900 is a fixed seed. The seed is fixed, so a failure reproduces.
+
+Each shape is imported by the head and by the step 1 importer, vendored byte for byte from main at
+`bca583f2a` and pinned by its git blob id. A vendored copy, because once step 2 merges, main is the
+head. An abstract interpreter over the shape itself, in both a case-sensitive and a case-insensitive
+reading of handle names, says which trees the export may send at each `MsgSend`, and whether some
+path may stop before it: an exit ends a path, and an unmodelled element, a call whose list is not
+inlined, a `LoopExit` with no loop or an orphan marker may. Both generated handlers run against one
+synthetic input, past every refusal, as if a human had deleted each `raise NotImplementedError`.
+Sends made before any other exception are read too. Their source is read as well. The guard fails
+when the head:
+
+1. delivers, where step 1 raised or filtered, a message the interpreter cannot prove;
+2. puts a live send at a shallower indent than step 1 puts that send, or runs a send the interpreter
+   places in a branch on the path where every placeholder is false;
+3. sends `msg` for a handle that is not the input, or where the export sends another tree;
+4. renders any live send, on any path, of a tree that is not the one known tree the export sends
+   there, or renders one, not live in step 1, where the import lost the scope or where Corepoint may
+   stop before it;
+5. binds or sends a local other than `msg` anywhere but the handler's own level. With the execution
+   past every refusal, that puts every such send on the executed path, so (1) compares the very
+   tree it delivers.
+
+The battery holds 5,320 shapes: 264 fixed seeds, 4,056 paired shapes and 1,000 random ones. At this
+head it fails none, and offline sweeps of about 110,000 more shapes on eleven other seeds found
+nothing further. It fails 1,591 at d26545d6f, including every seed of the HIGH, 1,403 at the first
+repair of this branch, and 37 at the first narrowing. Check 5 is most of the first two, because a
+head that binds inside constructs fails it by design. The guard's first version, without check 4's
+reach half and check 5, failed 500 of 3,325 at d26545d6f, and code review then built six shapes that
+passed it yet failed open; a second review built six more that passed the next version. Each is a
+seed now. Undoing any one of 14 rules above fails between 1 and 305 shapes. Two more, the chain
+placement of an untrusted branch line and the touched join, guard shapes the narrowing already
+closes, so named unit tests in `tests/test_corepoint_import.py` pin what they keep.
+
+- **A branch-group wrapper is a container whose children are all its own branch lines.** A `<Try>`
+  or `<If>` with no `@Data` dissolves into its chain only when every child is a live `<Line>`, or an
+  element of its own tag, whose `@Data` carries the construct's verb or one of its branch verbs.
+  *Corrected 2026-10-01:* it dissolved whenever its body held any construct of the same kind, so a
+  `<Try>` holding a nested `<Try>` element came apart, its `Catch` arms rendered with no enclosing
+  construct, and a clone in its body read as made on every path. The guard's wider sweep found it;
+  step 1 had the same rule. A `@Disabled` child keeps the wrapper whole, or an `Else` after a
+  disabled `If` line would render for every message.
 
 **Markup-free `MsgSend` (gap 2).** A send with no role markup is judged by the handle its first
 operand names (`%NAME` or `%NAME/`). If that handle holds a known message, the send delivers it.

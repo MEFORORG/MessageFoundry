@@ -1476,7 +1476,10 @@ def _parse_list(container: Element, in_control: bool, depth: int = 0) -> list[St
         tag = _local(child.tag).lower()
         if tag in _LIST_TAGS:
             # A doubly-wrapped list: flatten rather than lose the statements.
-            steps.extend(_parse_list(child, in_control, depth + 1))
+            inner = _parse_list(child, in_control, depth + 1)
+            # A @Disabled wrapper still renders its statements (they run in step 1 too), but
+            # whether Corepoint runs them is not known, so their scope is not modelled.
+            steps.extend(_scoped(tag, inner) if _is_disabled(child) else inner)
             continue
         # EVERY other child is a statement position and goes through _parse_statement — including a tag
         # this layer does not model, which comes back as an "unknown" marker plus its parsed subtree.
@@ -1590,39 +1593,44 @@ def _names_no_whole_tree(data: str, kind: str) -> bool:
     whole message tree, so the line can bind none.
 
     The first word must be the construct's own verb. Every other word passes only as ``in``/
-    ``into``, a path INTO a named handle, a ``$variable``, a quoted literal or a number, judged by
-    its text: a span's class is never trusted for it. Everything else may be a handle: one spelled
-    with no ``%``, a whole ``%HANDLE``, or text in a span class neither reading lists. This is
-    judged on words, never on which handle a reading found, because every rule that trusted a
-    reading to find the handles missed some spelling."""
+    ``into``, a path INTO a named handle that addresses an HL7 segment or field, a ``$variable``, a
+    quoted literal or a number, judged by its text: a span's class is never trusted for it, and
+    prose spans are words too. The one exception is a path's own label, a ``(...)`` detail span right
+    after the path, holding no ``%`` or ``$``. Everything else may be a handle: one spelled with no
+    ``%``, a whole ``%HANDLE``, or text in a span class neither reading lists. This is judged on
+    words, never on which handle a reading found, because every rule that trusted a reading to find
+    the handles missed some spelling."""
     roles = parse_roles(data)
-    words: list[str] = []
     if not roles:
-        words = tokenize_statement(strip_markup(data))
-    else:
-        handle = False
-        for token in roles:
-            if token.role in _PROSE_ROLES:
-                continue
-            if handle and token.role != "path":
-                return False  # a handle span with no path after it: a whole tree
-            if token.role == "handle":
-                handle = True
-            elif token.role == "path":
-                if not handle or _is_root_path(token.text):
-                    return False
-                handle = False
-            elif token.role in ("keyword", "text"):
-                words.extend(tokenize_statement(token.text))
-            elif token.role in ("literal", "variable", "numeral"):
-                words.append(token.text.strip())
-            else:
-                return False  # a span that falls out of both readings
-        if handle:
-            return False
-    if not words:
-        return True
-    if _KIND_BY_VERB.get(words[0].lower()) != kind:
+        plain = tokenize_statement(strip_markup(data))
+        return not plain or _verb_then_harmless(plain, kind)
+    words: list[str] = []
+    handle = False
+    after_path = False
+    for token in roles:
+        label = after_path and token.role == "detail"
+        after_path = False
+        if label and _is_path_label(token.text):
+            continue
+        if handle and token.role != "path":
+            return False  # a handle span with no path after it: a whole tree
+        if token.role == "handle":
+            handle = True
+        elif token.role == "path":
+            if not handle or not _addresses_hl7(token.text):
+                return False
+            handle = False
+            after_path = True
+        elif token.role in ("keyword", "text", "literal", "variable", "numeral", *_PROSE_ROLES):
+            words.extend(tokenize_statement(token.text))
+        else:
+            return False  # a span that falls out of both readings
+    return not handle and _verb_then_harmless(words, kind)
+
+
+def _verb_then_harmless(words: list[str], kind: str) -> bool:
+    """Whether ``words`` open with the construct's own verb and every later word names no tree."""
+    if not words or _KIND_BY_VERB.get(words[0].lower()) != kind:
         return False
     return all(_names_no_tree(word) for word in words[1:])
 
@@ -1634,7 +1642,19 @@ def _names_no_tree(word: str) -> bool:
     if re.fullmatch(r"\$\w+|\d+(?:\.\d+)?", word):
         return True
     name, _, rest = word.partition("/")
-    return word.startswith("%") and len(name) > 1 and bool(rest.strip("/").strip())
+    return word.startswith("%") and len(name) > 1 and _addresses_hl7("/" + rest)
+
+
+def _addresses_hl7(path: str) -> bool:
+    """Whether a path span (or the part of a ``%`` word after its handle) addresses an HL7 segment
+    or field. ``/.``, ``/*`` or ``//x`` may mean the whole tree, which nothing here can tell."""
+    return _corepoint_path(path) is not None or _corepoint_segment(path) is not None
+
+
+def _is_path_label(text: str) -> bool:
+    """Whether a ``detail`` span is a path's human label: ``(...)`` with no ``%`` or ``$`` in it."""
+    body = text.strip()
+    return body.startswith("(") and body.endswith(")") and not any(c in body for c in "%$")
 
 
 # A first word that may be a Corepoint verb, which no label's prose is expected to start with.
@@ -1646,17 +1666,26 @@ def _label_may_write(data: str) -> bool:
 
     Fail closed and deliberately broad, because telling a label from a statement is not modelled:
     any span the role layer reads as more than prose (a verb, a handle, a path, a value, an unlisted
-    class), or, with no markup, a ``%`` or ``$`` word or a first word shaped like a verb."""
+    class), or, in any prose run, a ``%`` or ``$`` word or a run whose first word is shaped like a
+    verb. A ``block`` span's text is judged the same way: its class is not trusted."""
     roles = parse_roles(data)
-    if roles:
-        return any(
-            t.role not in ("block", "text", *_PROSE_ROLES) or (t.role == "text" and t.source_class)
-            for t in roles
-        )
-    words = strip_markup(data).split()
-    return any(w.startswith(("%", "$")) for w in words) or bool(
-        words and (_KIND_BY_VERB.get(words[0].lower()) or _VERB_SHAPED.fullmatch(words[0]))
-    )
+    if not roles:
+        return _run_may_write(strip_markup(data))
+    for token in roles:
+        if token.role not in ("block", "text", *_PROSE_ROLES):
+            return True
+        if (token.role == "text" and token.source_class) or _run_may_write(token.text):
+            return True
+    return False
+
+
+def _run_may_write(run: str) -> bool:
+    words = run.split()
+    if any(w.startswith(("%", "$")) for w in words):
+        return True
+    return bool(
+        words and (_KIND_BY_VERB.get(words[0].lower()) or _READ_VERB_WORDS.get(words[0].lower()))
+    ) or bool(words and _VERB_SHAPED.fullmatch(words[0]))
 
 
 def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
@@ -1824,10 +1853,19 @@ def _scoped(tag: str, body: list[Step]) -> list[Step]:
     an unmodelled element does: a TODO marker with the body inlined, after which no handle is
     vouched for. *Corrected 2026-10-01:* the body was flattened into the parent list, so the flow
     walked it as straight-line code and could bind and send there."""
-    if not body:
-        return []
+    if all(
+        isinstance(s, UnmappedAction)
+        or (isinstance(s, Control) and s.kind == "block" and not s.body)
+        for s in body
+    ):
+        # Nothing in it runs: only comments and lines carrying no statement. Kept in line.
+        return list(body)
     detail = "a statement carrying a nested list, whose scope this import does not model"
-    return [Control("unknown", tag, detail, body=tuple(body), deferred=_Deferred("", ()))]
+    return [
+        Control(
+            "unknown", f"{tag} nested list", detail, body=tuple(body), deferred=_Deferred("", ())
+        )
+    ]
 
 
 def _holds_branch_lines(elem: Element, kind: str) -> bool:
@@ -2261,15 +2299,30 @@ _NO_BIND = (
 )
 
 
-def _holds_an_exit(step: Control) -> bool:
-    """Whether ``step``, or any live step beneath it, is an exit (``Returns``, ``ActionListExit``,
-    ``ActionListStop``): what follows it may never run."""
+def _may_not_complete(step: Control) -> bool:
+    """Whether Corepoint may stop the list at ``step`` or inside it, so what follows may never run.
+
+    Fail closed: at least an exit (``Returns``, ``ActionListExit``, ``ActionListStop``), a
+    ``LoopExit`` anywhere (outside a loop it may leave the caller's), an element this module does not
+    model (a marker included: what it brackets may be any of these, a step whose ``@Disabled`` value
+    may mean enabled among them), a call whose list is not inlined, a branch marker with no
+    construct or a branch its construct cannot continue, a construct line that owns nothing (it may
+    open a flat-form block), and a branch carrying branches of its own, which nothing here walks. A
+    surely disabled step never runs."""
     if step.kind == "disabled":
         return False
-    if step.kind == "exit":
+    if step.kind in ("exit", "break", "unknown") or step.kind in _BRANCH_PARENT:
         return True
+    if step.kind == "call" and not step.body:
+        return True
+    if step.kind in _NESTING_KINDS and not step.body and not step.branches:
+        return True
+    if _drops_statements(step):
+        return True
+    if any(not _renders_as_branch(step.kind, branch.kind) for branch in step.branches):
+        return True  # a stray branch: a marker its construct cannot continue
     nested = (step.body, *(branch.body for branch in step.branches))
-    return any(isinstance(s, Control) and _holds_an_exit(s) for body in nested for s in body)
+    return any(isinstance(s, Control) and _may_not_complete(s) for body in nested for s in body)
 
 
 def _bracketed(step: Control) -> bool:
@@ -2352,21 +2405,22 @@ class _Flow:
         return not self._depth and not self._frozen
 
     def _enter(self, step: Control, env: _Env) -> None:
-        """Apply the narrowing at ``step``, a construct about to be settled.
+        """Apply the narrowing at ``step``: every step but a statement, a send, a block (whose body
+        is walked in line) and a disabled step.
 
-        Only the top level decides. Once a local other than msg is bound, the first branch, loop,
-        ``Try``, ``ChooseFrom``, call, unmodelled element with a body, orphan branch marker or exit
-        unbinds every handle, the input included, and turns binding off for the rest of the
-        handler: from there every send raises, as step 1's did. Before any such local is bound, a
-        construct changes nothing here, because nothing inside a construct binds. An exit, an
-        orphan branch marker, or a construct holding an exit turns binding off even then: what
-        follows it may never run in Corepoint, and the render runs it for every message."""
-        if self._depth or (step.kind == "unknown" and not step.body):
-            return  # nested, or a statement-shaped marker that leaves every handle unknown itself
+        Only the top level decides. Once a local other than msg is bound, any such step unbinds
+        every handle, the input included, and turns binding off for the rest of the handler: from
+        there every send raises, a send of the input included. Before any such local is bound, a
+        construct that surely completes changes nothing here, because nothing inside a construct
+        binds. One that may not complete (see :func:`_may_not_complete`) turns binding off even
+        then: what follows it may never run in Corepoint, and the render runs it for every
+        message."""
+        if self._depth:
+            return
         if self._bound:
             _forget_all(env)
             self._frozen = True
-        elif step.kind in ("exit", "break", *_BRANCH_PARENT) or _holds_an_exit(step):
+        elif _may_not_complete(step):
             self._frozen = True
 
     def _arm(self, steps: tuple[Step, ...], env: _Env) -> tuple[list[Step], dict[str, str | None]]:
@@ -3627,7 +3681,8 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
                 # list, so not reported as shipped.
                 unmapped.append(step.source_verb)
             elif (
-                step.kind in _MAPPED_CONTROL_KINDS
+                not step.unread
+                and step.kind in _MAPPED_CONTROL_KINDS
                 and step.kind not in _BRANCH_PARENT
                 and (step.kind != "break" or in_loop)
             ):
@@ -3656,6 +3711,8 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
             for branch in step.branches:
                 # A branch the render cannot emit as control flow becomes a TODO marker instead, so
                 # it lands in the unmapped bucket; its body statements are real and counted above.
+                if branch.unread:
+                    continue  # counted unmapped with its TODO line, above
                 if _renders_as_branch(step.kind, branch.kind):
                     mapped += 1
                 else:

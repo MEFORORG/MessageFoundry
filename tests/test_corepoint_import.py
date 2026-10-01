@@ -1470,15 +1470,18 @@ def test_a_write_to_the_sent_clone_still_maps() -> None:
 
 
 def test_a_disabled_list_wrapper_is_scanned_as_the_render_emits_it() -> None:
-    """The render flattens a ``<List>`` wrapper even under ``@Disabled``, so its send is live and
-    is judged like any other: a send of a handle nobody bound refuses beside the live input send."""
+    """The render keeps a ``<List>`` wrapper's statements even under ``@Disabled``, so its send is
+    live and is judged like any other: a send of a handle nobody bound refuses. Whether Corepoint
+    runs a disabled wrapper's statements is not known, so they render as an unmodelled element's
+    body, and no handle is vouched for after it: the input send after it refuses too (it used to
+    send; the scope is fail-closed now)."""
     wrapped = '<List Disabled="1">' + _role_send("other-handle", "%OUT", "OB_ACME") + "</List>"
-    body = _handler_body(
-        _handler_source(_WRITE_INPUT + wrapped + _role_send("input-handle", "%ADT", "OB_IN"))
-    )
+    send_in = _role_send("input-handle", "%ADT", "OB_IN")
+    body = _handler_body(_handler_source(_WRITE_INPUT + wrapped + send_in))
     assert "raise NotImplementedError" in body
     assert 'Send("OB_ACME"' not in body
-    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert 'Send("OB_IN"' not in body
+    assert "nested list" in body
 
 
 def test_a_refused_send_with_no_destination_still_raises() -> None:
@@ -3540,7 +3543,7 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
 
 
 # --- the d26545d6f HIGH on PR 1900, and the shapes the differential guard found with it ----------
-# tests/test_corepoint_import_differential.py runs these shapes and about 2,900 more against step 1;
+# tests/test_corepoint_import_differential.py runs these shapes and about 5,300 more against step 1;
 # these name the HIGH's four shapes so a reader sees them without the guard's machinery.
 
 _NEW_SENT = _create("%NEW", _ADT_A04) + _role_send("other-handle", "%NEW", "OB_NEW")
@@ -3660,7 +3663,7 @@ def test_a_try_holding_a_nested_try_is_not_a_branch_group_wrapper() -> None:
     are all the construct's own branch lines dissolves (the differential guard's sweep, seed 4)."""
     inner = "<Try><List>" + _MSGLOG_P + _CATCH_LINE + _MSGLOG_P + "</List></Try>"
     outer = "<Try><List>" + inner + _CLONE_OUT + _CATCH_LINE + _MSGLOG_P + "</List></Try>"
-    # In a Block, so a loose Catch's lost scope ends before the send (see _Flow._lost).
+    # In a Block, so the old reading's loose Catch was not the last line before the send.
     block = '<Block Data="Section"><List>' + outer + "</List></Block>"
     body = _handler_body(_handler_source(_WRITE_INPUT + block + _SEND_OUT))
     assert "with no enclosing construct" not in body
@@ -3669,3 +3672,14 @@ def test_a_try_holding_a_nested_try_is_not_a_branch_group_wrapper() -> None:
 
 
 _CATCH_LINE = '<Line Data="Catch"/>'
+
+
+def test_a_nested_list_holding_only_comments_stays_in_line() -> None:
+    """A nested list under a statement is an unmodelled element only when something in it runs. A
+    list of comments and empty lines changes nothing, so a send of msg after it still sends, as in
+    step 1 (round 3 of code review on PR 1900: it raised)."""
+    log = _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%ADT"))
+    nested = log[:-2] + '><List><Line Comment="why"/></List></Line>'
+    body = _handler_body(_handler_source(nested + _SEND_INPUT))
+    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert "nested list" not in body
