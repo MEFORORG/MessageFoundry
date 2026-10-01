@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from messagefoundry.corepoint_import import (
     _corepoint_path,
     _corepoint_segment,
     _count_steps,
+    _Deferred,
     _operands_from_roles,
     _role_prose,
     _role_verb,
@@ -1562,7 +1564,11 @@ def test_a_send_that_falls_back_to_msg_is_caught(
         return 'Send("OB_ACME", msg)' in _handler_body(_handler_source(body))
 
     assert not delivers_msg(send_before_clone)
-    monkeypatch.setattr(importer, "_send_refusal", lambda sent, live: "")
+
+    def falls_back(self: object, step: Control, env: object) -> Control:
+        return replace(step, message="msg")  # the mutant: every send delivers msg
+
+    monkeypatch.setattr(importer._Flow, "_send", falls_back)
     assert delivers_msg(send_before_clone)  # the mutant renders the old fallback ...
     inbound = Message.parse(_INBOUND)
     result = _run_handler(tmp_path, send_before_clone, inbound)
@@ -1857,10 +1863,10 @@ def test_deeply_nested_loops_and_trys_settle_in_linear_work(
     calls = 0
     real = importer._whole_written
 
-    def counting(verb: str, operands: tuple[object, ...]) -> tuple[str, ...]:
+    def counting(deferred: _Deferred) -> frozenset[str]:
         nonlocal calls
         calls += 1
-        return real(verb, operands)  # type: ignore[arg-type]
+        return real(deferred)
 
     monkeypatch.setattr(importer, "_whole_written", counting)
     src = _handler_source(body)
@@ -1870,6 +1876,130 @@ def test_deeply_nested_loops_and_trys_settle_in_linear_work(
     assert 0 < calls <= 2 * statements
     # The handle the loops overwrite is unknown after them, so the send refuses rather than guess.
     assert 'Send("OB_A"' not in _handler_body(src)
+
+
+_CLONE_OUT = _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
+_SEND_OUT = _role_send("other-handle", "%OUT", "OB_OUT")
+
+
+@pytest.mark.parametrize(
+    "overwrite",
+    [
+        pytest.param(
+            _tree_copy(
+                _span("input-handle", "%ADT") + _span("path", "/"),
+                _span("other-handle", "%OUT") + _span("path", "/"),
+            ).replace(" to ", " merging into "),
+            id="mode-word",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgTreeCopy")
+                + " "
+                + _span("variable", "$saved")
+                + " to "
+                + _span("other-handle", "%OUT")
+                + _span("path", "/")
+                + " mode "
+                + _span("literal", '"replace"')
+            ),
+            id="third-operand",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgCreate")
+                + " "
+                + _span("literal", '"ADT^A04"')
+                + " "
+                + _span("literal", '"2.5.1"')
+                + " in "
+                + _span("other-handle", "%OUT")
+            ),
+            id="msgcreate-handle-last",
+        ),
+        pytest.param(
+            "<Line Data=\"&lt;span class='kw'&gt;MsgTreeCopy&lt;/span&gt; "
+            "&lt;span class='pth'&gt;%OTHER/&lt;/span&gt; "
+            "&lt;span class='pth'&gt;%OUT/&lt;/span&gt;\"/>",
+            id="unlisted-span-classes",
+        ),
+        pytest.param(
+            '<Call Data="ActionListCall &quot;Rebuild&quot; pass %OUT"><Actions/></Call>',
+            id="call-naming-the-handle",
+        ),
+        pytest.param('<Line Data="ItemAppend %OUT/ &quot;x&quot;"/>', id="flat-whole-write"),
+    ],
+)
+def test_a_statement_that_may_overwrite_a_bound_handle_unbinds_it(overwrite: str) -> None:
+    """Fail closed: a statement this module does not read as a plain clone or a field write may
+    overwrite every handle it names, whatever operand order or markup it uses. A later send of
+    that handle raises rather than deliver the clone made before it."""
+    body = _handler_body(_handler_source(_CLONE_OUT + overwrite + _SEND_OUT))
+    assert "out_msg = msg.copy()" in body
+    assert 'Send("OB_OUT"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
+
+
+def test_a_tree_copy_read_the_other_way_round_does_not_bind() -> None:
+    """``MsgTreeCopy %OUT/ from %A2/`` names its operands in the other order: it overwrites %OUT.
+    Reading it as a clone would bind %A2 from the stale %OUT and keep %OUT, so it is not a clone and
+    both handles it names are unknown after it."""
+    reverse = _tree_copy(
+        _span("other-handle", "%OUT") + _span("path", "/"),
+        _span("other-handle", "%A2") + _span("path", "/"),
+    ).replace(" to ", " from ")
+    body = _handler_body(_handler_source(_CLONE_OUT + reverse + _SEND_OUT))
+    assert "a2_msg" not in body
+    assert 'Send("OB_OUT"' not in body
+
+
+def test_a_msgcreate_with_a_word_it_does_not_read_raises() -> None:
+    """An unstyled word beyond ``as``/``version`` may change what is built, so it refuses."""
+    merging = _create("%NEW", _ADT_A04, " merging input")
+    body = _handler_body(_handler_source(merging + _role_send("other-handle", "%NEW", "OB_NEW")))
+    assert "Message.parse(" not in body
+    assert "a word this import does not read" in body
+
+
+def test_a_markup_free_write_lands_on_the_handle_it_addresses() -> None:
+    """Once the list names an input, a markup-free write to a clone lands on the clone's local, and
+    one to a handle nobody bound declines rather than land on msg."""
+    body = _handler_body(
+        _handler_source(
+            _CLONE_OUT
+            + '<Line Data="ItemClear %OUT/PID-19"/>'
+            + '<Line Data="ItemClear %GONE/PID-20"/>'
+            + _SEND_OUT
+        )
+    )
+    assert '    set_field(out_msg, "PID-19", "")' in body
+    assert "PID-20" not in body.split("# TODO")[0]
+    assert 'set_field(msg, "PID-20"' not in body
+    assert '    sends.append(Send("OB_OUT", out_msg))' in body
+
+
+def test_a_try_with_no_catch_keeps_what_its_body_bound() -> None:
+    """No Catch renders as ``except Exception: raise``, so the code after it runs only when the body
+    completed: a clone made in the body is bound there."""
+    body = _handler_body(_handler_source("<Try><List>" + _CLONE_OUT + "</List></Try>" + _SEND_OUT))
+    assert '    sends.append(Send("OB_OUT", out_msg))' in body
+    with_catch = _handler_body(
+        _handler_source(
+            "<Try><List>" + _CLONE_OUT + '<Line Data="Catch"/></List></Try>' + _SEND_OUT
+        )
+    )
+    assert 'Send("OB_OUT"' not in with_catch
+
+
+def test_a_disabled_write_names_the_local_it_would_write() -> None:
+    """Re-enabling a preserved write must not lose which message it targeted."""
+    disabled = (
+        '<Block Disabled="1" Data="old"><List>'
+        + _write("other-handle", "%OUT", "Y")
+        + "</List></Block>"
+    )
+    src = _handler_source(_CLONE_OUT + disabled + _SEND_OUT)
+    assert 'ItemCopy -> set_field("MSH-6", "Y") on out_msg' in src
 
 
 def test_a_module_with_scratch_locals_round_trips_through_the_lens() -> None:

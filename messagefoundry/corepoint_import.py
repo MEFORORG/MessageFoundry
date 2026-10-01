@@ -84,6 +84,7 @@ import html
 import json
 import keyword
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import Path
@@ -99,7 +100,7 @@ from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.message import Message
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
         Element,
     )
@@ -188,6 +189,9 @@ class _Deferred:
     qualified: bool = False
     in_control: bool = False
     flat: Action | UnmappedAction | None = None
+    # Every handle the statement names as a whole tree, in EITHER reading of its markup, so a span
+    # class the role layer does not list cannot hide a handle from the fail-closed write rule.
+    named: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -238,8 +242,9 @@ class Control:
     branches: tuple[Control, ...] = field(default_factory=tuple)
     # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` and ``"create"`` set it.
     refusal: str = ""
-    # The local a ``"send"`` delivers. A name this module generated, never export text.
-    message: str = "msg"
+    # The local a ``"send"`` delivers. A name this module generated, never export text. Empty until
+    # :class:`_Flow` binds it, and the render refuses an empty one, so no send can default to ``msg``.
+    message: str = ""
     # What :class:`_Flow` reads to settle a ``"pending"``/``"send"``, and the writes of an ``"unknown"``.
     deferred: _Deferred | None = None
 
@@ -1129,7 +1134,7 @@ def _map_statement(verb: str, operands: list[str], statement: str) -> Action | U
     return UnmappedAction(verb or "<unparsed>", f"{lead}: {statement}")
 
 
-def _field_of(operand: Operand, live: dict[str, str]) -> str | None:
+def _field_of(operand: Operand, live: Mapping[str, str]) -> str | None:
     """The :class:`Message` path this operand addresses on a handle with a live local, or ``None``.
 
     Three conditions, all required: the operand is a path, the handle it addresses holds a message
@@ -1141,7 +1146,7 @@ def _field_of(operand: Operand, live: dict[str, str]) -> str | None:
     return _corepoint_path(operand.text)
 
 
-def _decline_reason(operands: tuple[Operand, ...], live: dict[str, str]) -> str:
+def _decline_reason(operands: tuple[Operand, ...], live: Mapping[str, str]) -> str:
     """Why a role-parsed statement could not be mapped — named precisely so a human can act on it.
 
     A generic "no mapping" marker makes 5,000 TODOs look identical; naming the *cause* is what lets a
@@ -1208,7 +1213,7 @@ def _writable(path: str | None) -> bool:
 def _map_roles(
     verb: str,
     operands: tuple[Operand, ...],
-    live: dict[str, str],
+    live: Mapping[str, str],
     *,
     connectives: tuple[str, ...],
     qualified: bool,
@@ -1276,7 +1281,7 @@ def _map_roles(
     return None
 
 
-def _decline(verb: str, operands: tuple[Operand, ...], live: dict[str, str]) -> UnmappedAction:
+def _decline(verb: str, operands: tuple[Operand, ...], live: Mapping[str, str]) -> UnmappedAction:
     """Turn a declined role-parsed statement into a TODO marker that says *why*, and emits no code.
 
     The recovered target is the first operand that is genuinely ``msg``'s own field, so the hand-finish
@@ -1309,7 +1314,7 @@ def _role_send_args(operands: tuple[Operand, ...]) -> tuple[str, ...]:
     return ()
 
 
-def _send_refusal(sent: str, live: dict[str, str]) -> str:
+def _send_refusal(sent: str, live: Mapping[str, str]) -> str:
     """Why a ``MsgSend`` of handle ``sent`` (``""`` when it names none) must not render, or ``""``.
 
     A Handler can send any Message it holds, but the import knows what a handle holds only where
@@ -1479,8 +1484,11 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
     # whose body stays at the same indentation, so it does not deepen control scope.
     body = _container_steps(elem, in_control or kind in _NESTING_KINDS, depth)
     # The handle operands, read the same way for both layers, so a markup-free statement is judged
-    # by the same flow rules as a role-parsed one.
-    handle_operands = role_operands if roles else _flat_operands(operands)
+    # by the same flow rules as a role-parsed one. A role reading that found no operand at all (its
+    # spans carry classes the role layer does not list) falls back to the flat reading.
+    flat_operands = _flat_operands(operands)
+    handle_operands = role_operands or flat_operands
+    named = frozenset(h for h in map(_whole_tree, (*role_operands, *flat_operands)) if h)
 
     if _is_disabled(elem):
         # Preserved in full as commented-out pseudo-source — the subtree is parsed (so it is visible and
@@ -1494,7 +1502,7 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
         # says the element's SCOPE was lost, because an unmodelled construct may well have been
         # conditional: inlining its body is the honest, visible degradation, guessing the scope is not.
         # The element still ran in Corepoint, so its own whole-tree writes are carried for the flow.
-        deferred = _Deferred(verb, handle_operands) if handle_operands else None
+        deferred = _Deferred(verb, handle_operands, named=named) if named else None
         return [Control("unknown", tag, statement or note, body=tuple(body), deferred=deferred)]
 
     if not data and any(isinstance(s, Control) and s.kind == kind for s in body):
@@ -1519,18 +1527,19 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
                 "pending",
                 verb,
                 statement,
-                deferred=_Deferred(verb, role_operands, connectives, qualified, in_control),
+                deferred=_Deferred(
+                    verb, role_operands, connectives, qualified, in_control, named=named
+                ),
             )
         elif statement:
+            # The markup-free reading maps without handles. The flow still decides which local a
+            # mapped write lands on, and sees any whole-tree write it makes.
             flat = _map_statement(verb, operands, statement)
-            # The markup-free reading maps without handles, but a whole-tree write it makes still
-            # changes what a later send of that handle delivers, so the flow must see it.
-            mapped = (
-                Control(
-                    "pending", verb, statement, deferred=_Deferred(verb, handle_operands, flat=flat)
-                )
-                if _whole_written(verb, handle_operands)
-                else flat
+            mapped = Control(
+                "pending",
+                verb,
+                statement,
+                deferred=_Deferred(verb, flat_operands, flat=flat, named=named),
             )
         else:
             # No statement at all — reported rather than skipped, because a silently-ignored element is
@@ -1547,14 +1556,24 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
         # (the break/exit path below always kept its body — this one silently did not). Whether the
         # handle it names holds a known message is the flow's question, settled in statement order.
         args = _role_send_args(role_operands) if roles else _send_args(operands)
-        deferred = _Deferred(verb, handle_operands)
+        deferred = _Deferred(verb, handle_operands, named=named)
         return [Control("send", source, statement, args=args, deferred=deferred), *body]
     if kind in ("break", "exit"):
         return [Control(kind, source, statement), *body]
     if kind in ("block", "call"):
         # A ``<Block>`` is a section LABEL, not an action, and a ``<Call>``'s target list is inlined:
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
-        return [Control(kind, source, statement or note or tag, body=tuple(body))]
+        # A call may hand a handle to a list that rebuilds it, so the flow sees what it names.
+        call_writes = _Deferred(verb, handle_operands, named=named) if kind == "call" else None
+        return [
+            Control(
+                kind,
+                source,
+                statement or note or tag,
+                body=tuple(body),
+                deferred=call_writes if named else None,
+            )
+        ]
 
     inner, branches = _split_branches(body)
     detail = _strip_leading_verb(statement, verb)
@@ -1641,25 +1660,34 @@ def _flat_operands(tokens: list[str]) -> tuple[Operand, ...]:
 # verb wrongly in it lets a handle keep a local after Corepoint replaced its content, which costs a
 # delivery of the wrong message.
 _READ_ONLY_VERBS = frozenset({"msgsend", "msglog"})
-# Verbs whose destination is their LAST operand (``<source> to <destination>``, or the one operand).
-_DESTINATION_LAST_VERBS = frozenset({"msgtreecopy", "itemcopy", "itemappend", "itemclear"})
 
 
-def _whole_written(verb: str, operands: tuple[Operand, ...]) -> tuple[str, ...]:
-    """The handles a statement may overwrite as a WHOLE tree, judged from its verb and operands alone.
+def _clone_target(deferred: _Deferred) -> str:
+    """The destination handle of a ``MsgTreeCopy`` this module reads as a plain whole-tree copy, or
+    ``""``.
 
-    A field write (a path into a handle) is not here: it changes part of a tree the local still holds.
-    A verb this module does not read is assumed to overwrite every handle it names whole, because
-    nothing says it does not."""
-    lowered = verb.lower()
-    if not operands or lowered in _READ_ONLY_VERBS:
-        return ()
-    whole = [_whole_tree(o) for o in operands]
-    if lowered in _DESTINATION_LAST_VERBS:
-        return (whole[-1],) if whole[-1] else ()
-    if lowered == "msgcreate":
-        return (whole[0],) if whole[0] else ()
-    return tuple(h for h in whole if h)
+    The shape is exact: two operands, a whole-tree destination, no qualifier, and no connective but
+    ``to``. A mode flag (``merge``, ``append``), a ``from`` that reverses the direction, or a third
+    operand means the copy is not a plain one, so the statement falls to the fail-closed rule below."""
+    if deferred.verb.lower() != "msgtreecopy" or len(deferred.operands) != 2 or deferred.qualified:
+        return ""
+    if not {c.lower() for c in deferred.connectives} <= {"to"}:
+        return ""
+    return _whole_tree(deferred.operands[1])
+
+
+def _whole_written(deferred: _Deferred) -> frozenset[str]:
+    """The handles a statement may overwrite as a WHOLE tree, judged from the statement alone.
+
+    A plain clone overwrites only its destination, and a read-only verb overwrites nothing. Every
+    other statement may overwrite every handle it names whole, in either reading of its markup,
+    because nothing this module reads says which operand it writes. That is fail-closed: a handle
+    wrongly unbound costs a raise at a later send, a handle wrongly kept costs a wrong delivery. A
+    field write (a path into a handle) is not here: it changes part of a tree the local still holds."""
+    if deferred.verb.lower() in _READ_ONLY_VERBS:
+        return frozenset()
+    target = _clone_target(deferred)
+    return frozenset({target}) if target else deferred.named
 
 
 # The message-type and version shapes a ``MsgCreate`` must name to build a valid MSH. Only the caret
@@ -1667,6 +1695,9 @@ def _whole_written(verb: str, operands: tuple[Operand, ...]) -> tuple[str, ...]:
 # splitting an underscore would guess which of the two the export meant.
 _MESSAGE_TYPE = re.compile(r"^([A-Z0-9]{3})\^([A-Z0-9]{3})(?:\^([A-Z0-9_]{3,7}))?$")
 _HL7_VERSION = re.compile(r"^2\.[1-9](?:\.[1-9])?$")
+# The only unstyled words a ``MsgCreate`` may carry. Anything else (``merging input``) may change what
+# is built, and the skeleton would silently drop it.
+_MSGCREATE_CONNECTIVES = frozenset({"as", "version"})
 
 
 def _create_skeleton(deferred: _Deferred) -> tuple[str, str]:
@@ -1680,6 +1711,11 @@ def _create_skeleton(deferred: _Deferred) -> tuple[str, str]:
     whose header the skeleton would silently omit."""
     if deferred.qualified:
         return "", "the statement carries a qualifier this import does not read"
+    if not {c.lower() for c in deferred.connectives} <= _MSGCREATE_CONNECTIVES:
+        return (
+            "",
+            "the statement carries a word this import does not read, which may change the build",
+        )
     types: list[re.Match[str]] = []
     versions: list[str] = []
     for operand in deferred.operands[1:]:
@@ -1707,21 +1743,67 @@ def _create_skeleton(deferred: _Deferred) -> tuple[str, str]:
     return skeleton.encode().rstrip("\r"), ""
 
 
-def _narrow(live: dict[str, str], outcomes: list[dict[str, str]]) -> None:
-    """Drop from ``live`` every handle not still bound, on the same local, after every path.
+class _Env(Mapping[str, str]):
+    """Which local each handle holds at the current point of the walk, with an undo journal.
 
-    ``live`` is what held where the paths began. A handle bound on some paths only, or overwritten on
-    any, is unknown after they meet. A handle each path binds afresh is unknown too: the conditions are
-    dead placeholders until a human writes them, so no path is known to run."""
-    for handle, local in list(live.items()):
-        if any(out.get(handle) != local for out in outcomes):
-            del live[handle]
+    A construct's arms each start from the same state. Copying the whole map for every arm costs the
+    number of bound handles per construct, which an untrusted export can make quadratic. Instead each
+    arm runs in place, reports the handles it touched, and is undone, so the cost of an arm is the
+    number of handles it actually changes."""
+
+    def __init__(self, initial: dict[str, str]) -> None:
+        self._live = dict(initial)
+        self._journal: list[tuple[str, str | None]] = []
+
+    def __getitem__(self, handle: str) -> str:
+        return self._live[handle]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._live)
+
+    def __len__(self) -> int:
+        return len(self._live)
+
+    def bind(self, handle: str, local: str) -> None:
+        self._journal.append((handle, self._live.get(handle)))
+        self._live[handle] = local
+
+    def unbind(self, handle: str) -> None:
+        if handle in self._live:
+            self._journal.append((handle, self._live.pop(handle)))
+
+    def mark(self) -> int:
+        return len(self._journal)
+
+    def changes(self, mark: int) -> dict[str, str | None]:
+        """Each handle touched since ``mark``, with the local it holds now (``None``: unbound)."""
+        return {handle: self._live.get(handle) for handle, _ in self._journal[mark:]}
+
+    def undo(self, mark: int) -> None:
+        while len(self._journal) > mark:
+            handle, previous = self._journal.pop()
+            if previous is None:
+                self._live.pop(handle, None)
+            else:
+                self._live[handle] = previous
+
+    def narrow(self, outcomes: list[dict[str, str | None]]) -> None:
+        """Unbind every handle some path left on a different local than it holds here.
+
+        Each outcome is a :meth:`changes` of a path that began at this state. A handle bound on some
+        paths only, or overwritten on any, is unknown after they meet. A handle each path binds afresh
+        is unknown too: the conditions are dead placeholders until a human writes them, so no path is
+        known to run."""
+        for outcome in outcomes:
+            for handle, local in outcome.items():
+                if self._live.get(handle) != local:
+                    self.unbind(handle)
 
 
-def _forget(live: dict[str, str], verb: str, operands: tuple[Operand, ...]) -> None:
+def _forget(env: _Env, deferred: _Deferred) -> None:
     """Unbind every handle the statement may overwrite whole (see :func:`_whole_written`)."""
-    for handle in _whole_written(verb, operands):
-        live.pop(handle, None)
+    for handle in _whole_written(deferred):
+        env.unbind(handle)
 
 
 class _Flow:
@@ -1738,8 +1820,9 @@ class _Flow:
     runs in. Each local name is fixed per handle for the whole handler, so a handle bound again inside
     a branch rebinds the same Python variable and the join stays faithful.
 
-    The export is untrusted, so the walk is linear in the size of the tree: :meth:`_written` is
-    memoized per body, and :meth:`_local` resumes each name's counter instead of probing from 2."""
+    The export is untrusted, so the work stays near-linear in the size of the tree: :meth:`_written`
+    is memoized per body, each arm runs in place on an :class:`_Env` and is undone, and :meth:`_local`
+    resumes each name's counter instead of probing from 2."""
 
     def __init__(self, input_handle: str) -> None:
         self._input = input_handle
@@ -1751,19 +1834,20 @@ class _Flow:
         self._written_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
 
     def handler(self, steps: tuple[Step, ...]) -> tuple[Step, ...]:
-        resolved, _ = self._run(steps, {self._input: "msg"} if self._input else {})
-        return tuple(resolved)
+        env = _Env({self._input: "msg"} if self._input else {})
+        return tuple(self._run_in_line(steps, env))
 
-    def _run(
-        self, steps: tuple[Step, ...], entry: dict[str, str]
-    ) -> tuple[list[Step], dict[str, str]]:
-        """Settle ``steps`` from a copy of ``entry``; return them and what holds after them."""
-        live = dict(entry)
-        return self._run_in_line(steps, live), live
+    def _run_in_line(self, steps: tuple[Step, ...], env: _Env) -> list[Step]:
+        """Settle ``steps`` in line, leaving ``env`` at what holds after them."""
+        return [self._step(step, env) for step in steps]
 
-    def _run_in_line(self, steps: tuple[Step, ...], live: dict[str, str]) -> list[Step]:
-        """Settle ``steps`` in line, updating ``live`` itself to what holds after them."""
-        return [self._step(step, live) for step in steps]
+    def _arm(self, steps: tuple[Step, ...], env: _Env) -> tuple[list[Step], dict[str, str | None]]:
+        """Settle one path from the current state, then restore it; return the path's changes."""
+        mark = env.mark()
+        settled = self._run_in_line(steps, env)
+        changes = env.changes(mark)
+        env.undo(mark)
+        return settled, changes
 
     def _written(self, steps: tuple[Step, ...]) -> frozenset[str]:
         """Every handle any live statement in ``steps`` may overwrite whole, nested constructs included.
@@ -1779,8 +1863,8 @@ class _Flow:
         for step in steps:
             if not isinstance(step, Control) or step.kind == "disabled":
                 continue
-            if step.deferred is not None and step.kind in ("pending", "unknown"):
-                found.update(_whole_written(step.deferred.verb, step.deferred.operands))
+            if step.deferred is not None and step.kind in ("pending", "unknown", "call"):
+                found |= _whole_written(step.deferred)
             found |= self._written(step.body)
             for branch in step.branches:
                 found |= self._written(branch.body)
@@ -1807,77 +1891,88 @@ class _Flow:
         self._names[handle] = name
         return name
 
-    def _step(self, step: Step, live: dict[str, str]) -> Step:
-        """Settle one step, updating ``live`` to what holds after it."""
+    def _step(self, step: Step, env: _Env) -> Step:
+        """Settle one step, leaving ``env`` at what holds after it."""
         if not isinstance(step, Control):
             return step
         kind = step.kind
         if kind == "disabled":
             # Settled for the comment block only: it never ran, so nothing it binds leaks out.
-            body, _ = self._run(step.body, live)
+            body, _ = self._arm(step.body, env)
             return replace(step, body=tuple(body))
         if kind == "pending":
             assert step.deferred is not None
-            return self._statement(step, step.deferred, live)
+            return self._statement(step, step.deferred, env)
         if kind == "send":
-            assert step.deferred is not None  # the parse gives every send its operands
-            operands = step.deferred.operands
-            sent = _whole_tree(operands[0]) if operands else ""
-            if sent and sent in live:
-                return replace(step, message=live[sent])
-            return replace(step, refusal=_send_refusal(sent, live))
+            return self._send(step, env)
         if kind in ("block", "call"):
-            # A label: its body runs in line.
-            settled = replace(step, body=tuple(self._run_in_line(step.body, live)))
+            # A label, or an inlined call: its body runs in line. A call may hand a handle to a list
+            # that rebuilds it, so what the call line names is unknown from here on.
+            if step.deferred is not None:
+                _forget(env, step.deferred)
+            settled = replace(step, body=tuple(self._run_in_line(step.body, env)))
         elif kind in _LOOP_KINDS:
             # A later pass may start from what an earlier one overwrote, so a handle the body may
             # overwrite is unknown throughout it, and after it (the body may run no times at all).
             for handle in self._written(step.body):
-                live.pop(handle, None)
-            body, _ = self._run(step.body, live)
+                env.unbind(handle)
+            body, _ = self._arm(step.body, env)
             settled = replace(step, body=tuple(body))
         elif kind == "try":
-            body, body_out = self._run(step.body, live)
-            # A Catch may start anywhere in the body, so what the body may overwrite is unknown there.
-            written = self._written(step.body)
-            caught = {h: v for h, v in live.items() if h not in written}
-            outcomes = [body_out]
-            branches: list[Control] = []
-            for branch in step.branches:
-                if _renders_as_branch(kind, branch.kind):
-                    arm, arm_out = self._run(branch.body, caught)
-                    outcomes.append(arm_out)
-                    branches.append(replace(branch, body=tuple(arm)))
-                else:
-                    branches.append(branch)  # a stray, settled below where the render puts it
-            _narrow(live, outcomes)
-            settled = replace(step, body=tuple(body), branches=tuple(branches))
+            settled = self._try(step, env)
         elif kind in ("if", "case"):
             if kind == "case":
                 # A ChooseFrom's statements before its first arm run unconditionally, in line.
-                body = self._run_in_line(step.body, live)
+                body = self._run_in_line(step.body, env)
                 outcomes = []
             else:
-                body, body_out = self._run(step.body, live)
-                outcomes = [body_out]
-            branches = []
+                body, first = self._arm(step.body, env)
+                outcomes = [first]
+            branches: list[Control] = []
             for branch in step.branches:
-                arm, arm_out = self._run(branch.body, live)
-                outcomes.append(arm_out)
+                arm, changes = self._arm(branch.body, env)
+                outcomes.append(changes)
                 branches.append(replace(branch, body=tuple(arm)))
-            _narrow(live, outcomes)
+            env.narrow(outcomes)
             settled = replace(step, body=tuple(body), branches=tuple(branches))
         else:
             # "unknown", an orphaned branch marker, "break", "exit": the body is inlined in place
             # but its own scope was lost, so nothing it binds is trusted after it.
             if kind == "unknown" and step.deferred is not None:
-                _forget(live, step.deferred.verb, step.deferred.operands)
-            body, body_out = self._run(step.body, live)
-            _narrow(live, [body_out])
+                _forget(env, step.deferred)
+            body, changes = self._arm(step.body, env)
+            env.narrow([changes])
             settled = replace(step, body=tuple(body))
-        return self._strays(settled, live)
+        return self._strays(settled, env)
 
-    def _strays(self, ctrl: Control, live: dict[str, str]) -> Control:
+    def _try(self, step: Control, env: _Env) -> Control:
+        """Settle a ``Try``: its body, then each ``Catch`` from what the body cannot have changed."""
+        catches = [b for b in step.branches if _renders_as_branch(step.kind, b.kind)]
+        if not catches:
+            # No Catch renders as ``except Exception: raise``, so the code after the Try runs only
+            # when the body completed, and the body's state is exactly what holds there.
+            body = self._run_in_line(step.body, env)
+            return replace(step, body=tuple(body))
+        body, body_changes = self._arm(step.body, env)
+        outcomes = [body_changes]
+        # A Catch may start anywhere in the body, so what the body may overwrite is unknown there.
+        mark = env.mark()
+        for handle in self._written(step.body):
+            env.unbind(handle)
+        settled_catches: dict[int, Control] = {}
+        for branch in catches:
+            start = env.mark()
+            arm = self._run_in_line(branch.body, env)
+            outcomes.append(env.changes(mark))  # from the Try's start: the unbinds and this Catch
+            env.undo(start)
+            settled_catches[id(branch)] = replace(branch, body=tuple(arm))
+        env.undo(mark)
+        env.narrow(outcomes)
+        # A stray stays as it is here; :meth:`_strays` settles it where the render puts it.
+        branches = tuple(settled_catches.get(id(b), b) for b in step.branches)
+        return replace(step, body=tuple(body), branches=branches)
+
+    def _strays(self, ctrl: Control, env: _Env) -> Control:
         """Settle the branches the render inlines AFTER ``ctrl`` (see :func:`_stray_branches`)."""
         if all(_renders_as_branch(ctrl.kind, branch.kind) for branch in ctrl.branches):
             return ctrl
@@ -1886,54 +1981,81 @@ class _Flow:
             if _renders_as_branch(ctrl.kind, branch.kind):
                 branches.append(branch)
                 continue
-            arm, arm_out = self._run(branch.body, live)
-            _narrow(live, [arm_out])
+            arm, changes = self._arm(branch.body, env)
+            env.narrow([changes])
             branches.append(replace(branch, body=tuple(arm)))
         return replace(ctrl, branches=tuple(branches))
 
-    def _statement(self, step: Control, deferred: _Deferred, live: dict[str, str]) -> Step:
+    def _send(self, step: Control, env: _Env) -> Control:
+        """A send of a bound handle delivers its local; anything else raises at the send site."""
+        assert step.deferred is not None  # the parse gives every send its operands
+        operands = step.deferred.operands
+        sent = _whole_tree(operands[0]) if operands else ""
+        refusal = _send_refusal(sent, env)
+        if refusal:
+            return replace(step, refusal=refusal)
+        return replace(step, message=env[sent])
+
+    def _statement(self, step: Control, deferred: _Deferred, env: _Env) -> Step:
         """Settle one transform statement: a field write, a clone, a ``MsgCreate``, or a marker."""
         verb, operands = deferred.verb, deferred.operands
-        lowered = verb.lower()
         if deferred.flat is not None:
-            _forget(live, verb, operands)
-            return deferred.flat
-        if lowered == "msgtreecopy" and len(operands) == 2 and _whole_tree(operands[1]):
-            return self._tree_copy(step, operands, live)
-        if lowered == "msgcreate" and operands and _whole_tree(operands[0]):
-            return self._create(step, deferred, live)
-        mapped = _map_roles(
-            verb,
-            operands,
-            live,
-            connectives=deferred.connectives,
-            qualified=deferred.qualified,
-            in_control=deferred.in_control,
-        )
-        result: Step = mapped if mapped is not None else _decline(verb, operands, live)
-        _forget(live, verb, operands)
+            result = self._flat_write(deferred.flat, deferred, env)
+        elif _clone_target(deferred):
+            return self._tree_copy(step, operands, env)
+        elif verb.lower() == "msgcreate" and operands and _whole_tree(operands[0]):
+            return self._create(step, deferred, env)
+        else:
+            mapped = _map_roles(
+                verb,
+                operands,
+                env,
+                connectives=deferred.connectives,
+                qualified=deferred.qualified,
+                in_control=deferred.in_control,
+            )
+            result = mapped if mapped is not None else _decline(verb, operands, env)
+        _forget(env, deferred)
         return result
 
-    def _tree_copy(
-        self, step: Control, operands: tuple[Operand, ...], live: dict[str, str]
-    ) -> Step:
+    def _flat_write(
+        self, flat: Action | UnmappedAction, deferred: _Deferred, env: _Env
+    ) -> Action | UnmappedAction:
+        """Point a markup-free write at the local of the one handle its paths address.
+
+        A list with no role markup identifies no input handle, so its writes keep the superseded
+        model's reading and land on ``msg``. Once the list names an input, a markup-free write to
+        another handle must not land on ``msg``: it lands on that handle's local, or declines."""
+        if not isinstance(flat, Action) or not self._input:
+            return flat
+        handles = {o.handle for o in deferred.operands if o.kind == "path"}
+        handle = next(iter(handles)) if len(handles) == 1 else ""
+        if handle in env:
+            return replace(flat, target=env[handle])
+        return UnmappedAction(
+            flat.source_class,
+            "a markup-free write that addresses a message handle that holds no message this "
+            "import can identify at this point (cross-message)",
+        )
+
+    def _tree_copy(self, step: Control, operands: tuple[Operand, ...], env: _Env) -> Step:
         source, dest = _whole_tree(operands[0]), _whole_tree(operands[1])
         verb = step.source_verb
         if dest == self._input:
             # Rebinding msg would leave every later write and send of the input addressing a
             # different object than the one that arrived. Unknown from here on instead.
-            live.pop(dest, None)
+            env.unbind(dest)
             return UnmappedAction(
                 verb,
                 "overwrites the input handle; msg stays the message that arrived, so the input is "
                 "unknown from here on",
             )
-        if source and source in live:
-            expression = f"{live[source]}.copy()"
+        if source and source in env:
+            expression = f"{env[source]}.copy()"
             local = self._local(dest)
-            live[dest] = local
+            env.bind(dest, local)
             return Control("clone", verb, step.detail, args=(local, expression))
-        live.pop(dest, None)
+        env.unbind(dest)
         what = (
             f"{_comment_text(source, 60)}, which holds no message this import can identify here"
             if source
@@ -1943,9 +2065,9 @@ class _Flow:
             verb, f"copies {what} over {_comment_text(dest, 60)}, which is unknown from here on"
         )
 
-    def _create(self, step: Control, deferred: _Deferred, live: dict[str, str]) -> Step:
+    def _create(self, step: Control, deferred: _Deferred, env: _Env) -> Step:
         handle = _whole_tree(deferred.operands[0])
-        live.pop(handle, None)
+        _forget(env, deferred)  # every handle it names, not only the one it builds
         name = _comment_text(handle, 60)
         if handle == self._input:
             why = "a new message in the input handle would replace msg, the message that arrived"
@@ -1953,7 +2075,7 @@ class _Flow:
             skeleton, why = _create_skeleton(deferred)
             if not why:
                 local = self._local(handle)
-                live[handle] = local
+                env.bind(handle, local)
                 return Control(
                     "create",
                     step.source_verb,
@@ -2325,6 +2447,12 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
                 f"{pad}# TODO: Corepoint {ctrl.source_verb} — hand-finish: no destination named "
                 f"({label})"
             ]
+        if not ctrl.message:
+            # :class:`_Flow` either binds the local or sets a refusal. Neither happened, which is a
+            # defect in this module; guessing ``msg`` here is the exact fallback #313 removed.
+            raise CorepointImportError(
+                f"internal: a Corepoint {ctrl.source_verb} reached the render with no message"
+            )
         return [
             f"{pad}sends.append(Send({ctrl.args[0]}, {ctrl.message}))  # Corepoint {ctrl.source_verb}"
         ]
@@ -2530,10 +2658,12 @@ def _disabled_body(steps: tuple[Step, ...], pad: str, depth: int) -> list[str]:
     prefix = f"{pad}#{'  ' * depth}"
     for step in steps:
         if isinstance(step, Action):
-            # ``args`` are already rendered literals (escaped by _lit); ``source_class`` is not.
+            # ``args`` are already rendered literals (escaped by _lit); ``source_class`` is not. A
+            # write to a local other than msg names it, so re-enabling it keeps its message.
+            on = "" if step.target == "msg" else f" on {step.target}"
             out.append(
                 f"{prefix}{_comment_text(step.source_class, 60)} -> "
-                f"{step.vocabulary}({', '.join(step.args)})"
+                f"{step.vocabulary}({', '.join(step.args)}){on}"
             )
         elif isinstance(step, UnmappedAction):
             out.append(f"{prefix}{_comment_text(step.source_class, 60)} (no vocabulary mapping)")

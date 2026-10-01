@@ -223,6 +223,7 @@ emits the encoded result as one literal. It holds the default encoding character
 message type in MSH-9 and the version in MSH-12, and nothing else. Every other header field is
 whatever the action-list writes. The export must name the type in caret form (`ADT^A04`, with an
 optional structure) and the version as `2.x` or `2.x.y`, each exactly once, with no other operand.
+The only unstyled words it may carry are `as` and `version`; any other word may change what is built.
 An underscore form such as `ADT_A04` is refused, because HL7 also spells a message structure that way.
 Anything else renders a TODO marker and `raise NotImplementedError(...)` at the `MsgCreate`, because
 a message whose header the importer cannot build would be guessed. The `MsgCreate` grammar is not yet
@@ -233,21 +234,36 @@ validated against an export, so this rule was written from the HL7 shapes alone.
 - A handle bound only inside a branch is unknown after the branch ends. This holds even when every
   branch binds it, because every condition is a dead placeholder until a human writes it.
 - A handle that any path overwrites with something unknown is unknown after the join.
-- Inside a loop body, and in a `Catch`, a handle the body may overwrite is unknown throughout.
+- Inside a loop body, and in a `Catch`, a handle the body may overwrite is unknown throughout. A
+  `Try` with no `Catch` re-raises, so after it the body's own bindings hold.
 - The input handle is never rebound. A whole-tree write into it makes it unknown from that point.
-- A whole-tree write by a verb the importer does not read (`MsgLoad`, among others) makes that handle
-  unknown too. Only `MsgSend` and `MsgLog` are treated as read-only. That list is kept small on
-  purpose: a missing verb costs a raise, while a wrongly listed one would deliver the wrong message.
+- Only a plain clone is read as one: two operands, a whole-tree destination, no qualifier, and no
+  unstyled word but `to`. A mode word, a `from` that reverses the direction, or a third operand
+  makes it an unread statement.
+- Every other statement may overwrite every handle it names as a whole tree, in either reading of
+  its markup. That covers an unread verb (`MsgLoad`, among others), a `MsgCreate` whose handle is
+  not its first operand, an `ActionListCall` that passes a handle, and a span class the role layer
+  does not list. Each such handle is unknown afterwards. Only `MsgSend` and `MsgLog` are read-only.
+  The list is kept small on purpose: a missing verb costs a raise, while a wrongly listed one would
+  deliver the wrong message.
 - A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
   its whole-tree writes. Nothing it binds is trusted after it.
 
 **Markup-free `MsgSend` (gap 2).** A send with no role markup is judged by the handle its first
 operand names (`%NAME` or `%NAME/`). If that handle holds a known message, the send delivers it.
 Otherwise it raises, as a role-parsed send does. This was the Manager's decision in the #313 step 2
-brief. It changes the synthetic fixture: its `MsgSend $out [OB_ACME_ADT]` names a `$variable`, so it
-now raises where it used to send `msg`. The fixture's import summary moves from 21 mapped and 8
-unmapped to 20 and 9. A markup-free whole-tree write (`MsgTreeCopy %A %B`) also makes its
-destination unknown, though the markup-free layer still maps field writes without handles.
+brief.
+
+A list with no role markup at all names no input handle, so no handle in it is known. **Every send in
+a wholly markup-free list therefore raises**, even `MsgSend %ADT [OB]`. Its field writes keep the
+superseded model's reading and still land on `msg`. That is how the synthetic fixture changed: its
+markup-free list ends `MsgSend $out [OB_ACME_ADT]`, which now raises where it used to send `msg`. The
+fixture's import summary moves from 21 mapped and 8 unmapped to 20 and 9.
+
+In a list that does name an input, a markup-free field write lands on the local of the one handle
+its paths address. If that handle holds no known message, the write declines to a TODO marker
+rather than land on `msg`. A markup-free whole-tree write makes the handles it names unknown, as
+above.
 
 **What the Steps lens shows.** `set_field(out_msg, ...)` projects as an `action` row that looks the
 same as `set_field(msg, ...)`. The row carries no field naming the message it writes. A send row lists
@@ -263,6 +279,10 @@ At least these still refuse or stay out of scope:
 - A field write inside a branch or loop is still declined, as (b′) says. A clone or a send there
   renders in place.
 - A list with two or more distinct `input-handle` names still refuses every send of the input.
+
+A write to a local after it was sent does not reach the earlier send in the engine:
+`[pipeline].snapshot_on_send` (ADR 0104, on by default) snapshots each `Send` as it is built. A
+handler called outside a transform run, as the tests call it, holds the live reference instead.
 
 ### (c) Unmapped actions are never silently dropped (count-and-log)
 
