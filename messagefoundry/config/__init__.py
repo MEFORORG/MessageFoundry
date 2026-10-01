@@ -11,6 +11,11 @@ decorate ``@router``/``@handler`` scripts; a directory of such modules loads via
 
 from __future__ import annotations
 
+# PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Importing the
+# leaf `config.tls_policy`, which every CLI command reaches through `logging_setup`, then no longer
+# loads pydantic and the models: about 80 modules. A use of a re-exported name loads them.
+__lazy_modules__ = ["messagefoundry.config.models"]
+
 from messagefoundry.config.models import (
     AckMode,
     ConnectorType,

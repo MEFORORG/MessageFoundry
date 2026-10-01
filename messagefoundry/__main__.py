@@ -21,6 +21,11 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 
 from __future__ import annotations
 
+# PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
+# open a store or read a service TOML use these. The rest below runs on every command or is the
+# logging chain, so it stays eager. The heavy import is deferred in config/__init__.py.
+__lazy_modules__ = ["sqlite3", "tomllib"]
+
 import argparse
 import functools
 import json
