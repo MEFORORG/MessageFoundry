@@ -1373,14 +1373,13 @@ own fail-closed error, and again before each send in case a proxy appeared since
 part of the address, and `[security].enforcement` does not relax it. An `https://` Vault behind an
 `http://` proxy is still allowed: the token rides inside the TLS tunnel to Vault.
 **A proxy URL that carries credentials must be `https://`** (BACKLOG #2547). requests sends a
-`user:password@` from the proxy URL to the proxy itself, in the header that opens the tunnel. Over
-an `http://` proxy, or any proxy that is not `https://`, that header crosses the network in
-cleartext. So the Vault clients refuse such a proxy, whatever the Vault address and wherever the
-proxy is, loopback included. Any `@` in the proxy URL counts as credentials. This covers a proxy
-from any source requests reads: the proxy variables in either case, `ALL_PROXY`, the Windows system
-proxy, and proxies set on the client. The refusal comes at the same two points and in the same form
-as the one above, its text names no part of the proxy URL, and `[security].enforcement` does not
-relax it. Use an `https://` proxy, or one that takes no credentials in its URL.
+`user:password@` from the proxy URL to the proxy itself. Through any proxy that is not `https://`,
+those credentials cross the network in cleartext. So the Vault clients refuse such a proxy,
+whatever the Vault address and wherever the proxy is, loopback included. Any `@` in the proxy URL
+counts as credentials. The check reads the proxy variables in either case, `ALL_PROXY` and the
+Windows system proxy. It refuses at the same two points and in the same form as the rule above.
+Its text names no part of the proxy URL, and `[security].enforcement` does not relax it. Use an
+`https://` proxy, or one that takes no credentials in its URL.
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.

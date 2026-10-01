@@ -1365,7 +1365,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.6" },
     { name = "pyx12", marker = "extra == 'x12'", specifier = ">=4.0.0" },
     { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
-    { name = "requests", marker = "extra == 'vault'", specifier = ">=2.32" },
+    { name = "requests", marker = "extra == 'vault'", specifier = ">=2.32.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4,<0.16" },
     { name = "signxml", marker = "extra == 'xml'", specifier = ">=4.0.0" },
     { name = "starlette", specifier = ">=1.3.1" },

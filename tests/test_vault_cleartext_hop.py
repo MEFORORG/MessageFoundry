@@ -634,6 +634,89 @@ def test_a_configured_credentialed_proxy_is_refused_at_construction(
     assert listener.connections == 0, "a socket reached the proxy"
 
 
+@pytest.mark.parametrize(
+    ("environment", "configured", "refused"),
+    [
+        ("http://127.0.0.1:{port}", "http://{auth}@127.0.0.1:{port}", True),
+        ("http://{auth}@127.0.0.1:{port}", "http://127.0.0.1:{port}", False),
+    ],
+    ids=["configured-credentialed-wins", "configured-clean-wins"],
+)
+def test_the_build_check_picks_the_proxy_the_send_picks(
+    environment: str,
+    configured: str,
+    refused: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    listener: _Listener,
+) -> None:
+    """hvac passes its configured proxies with every request, and requests lets those beat the
+    environment. The build check merges them in the same order. RED before the round-1 repair:
+    the first case built, and the second was refused for a proxy the send would not use."""
+    import ssl
+
+    import hvac
+
+    from messagefoundry.transports import strict_requests
+
+    monkeypatch.setenv("HTTPS_PROXY", environment.format(auth=_PROXY_AUTH, port=listener.port))
+    # A key hvac's dict lacks, so a merge that wrote into it would show below.
+    monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{listener.port}")
+    client = hvac.Client(
+        url=_HTTPS_VAULT,
+        token=_TOKEN,
+        proxies={"https": configured.format(auth=_PROXY_AUTH, port=listener.port)},
+    )
+
+    def mount() -> None:
+        strict_requests.mount_strict_reply_adapter(
+            client, connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+        )
+
+    if refused:
+        with pytest.raises(InsecureHopRefused, match="carries credentials in its URL"):
+            mount()
+    else:
+        mount()
+    # The environment's proxies were not written into hvac's own: requests' merge mutates the
+    # dict it is given, so the build check must hand it a copy.
+    assert set(client.adapter._kwargs["proxies"]) == {"https"}
+    assert listener.connections == 0
+
+
+def test_an_https_vault_whose_proxy_lookup_fails_is_still_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The build check looks the proxy up for an https:// address now. If that lookup raises, the
+    address is not refused as malformed and the error does not escape: the send-time check still
+    sees the proxy the send picks. Mutation: let the lookup error escape; red."""
+    import requests
+
+    from messagefoundry.config import secretprovider_vault
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic: the proxy settings could not be read")
+
+    monkeypatch.setattr(requests.Session, "merge_environment_settings", boom)
+    secretprovider_vault._build_client(_HTTPS_VAULT, _TOKEN)
+
+
+def test_an_http_vault_whose_proxy_lookup_fails_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The http:// arm of the same failure fails closed, with the fixed cleartext text."""
+    import requests
+
+    from messagefoundry.config import secretprovider_vault
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic: the proxy settings could not be read")
+
+    monkeypatch.setattr(requests.Session, "merge_environment_settings", boom)
+    with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
+        secretprovider_vault._build_client(f"http://127.0.0.1:{_closed_port()}", _TOKEN)
+    _assert_refused(caught)
+
+
 def test_a_configured_credentialed_proxy_is_refused_before_sending(
     listener: _Listener,
 ) -> None:
