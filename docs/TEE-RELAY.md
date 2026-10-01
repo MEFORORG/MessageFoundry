@@ -20,13 +20,15 @@ cut over — with rollback being "just stop the relay."
 
 This diagram shows where each copy of a message goes during a parallel run. The source sends MLLP to
 the tee relay, which always ACKs on receipt and forwards the unchanged bytes to Corepoint, the
-production path. Once Corepoint answers, the relay queues a copy for MEFOR in shadow, with its egress
-suppressed. An optional second listener takes the copies Corepoint sends of its own output, the
-reverse feed, for comparison.
+production path. Once Corepoint answers, the relay queues a copy for MEFOR, the shadow instance,
+whose own outbound Connections are set to `simulate` mode so that its egress is suppressed. An
+optional second listener takes the copies Corepoint sends of its own output, the reverse feed, for
+comparison.
 
 **Legend.** A dotted arrow is an MLLP hop between processes. A solid arrow stays inside the relay
-process and its SQLite file. Each arrow follows the message. Grey is a system outside MessageFoundry,
-pink is the tee relay, green is the shadow MessageFoundry instance, and orange is a store.
+process and its SQLite file: a queued copy, a log row, or a captured body. The tee relay is one
+process and imports no engine code. Grey is a system outside MessageFoundry, pink is the tee relay,
+green is the shadow MessageFoundry instance, and orange is a store.
 
 ```mermaid
 flowchart LR
@@ -39,7 +41,7 @@ flowchart LR
   COREPOINT(["Corepoint<br/>production, unchanged"]):::ext
   MEFOR["MEFOR, the shadow instance<br/>outbound Connections in simulate mode<br/>egress suppressed"]:::core
 
-  subgraph TEE["Tee relay, python -m tee, imports no engine code"]
+  subgraph TEE["Tee relay, python -m tee"]
     TEE_A["Listener A, the tee<br/>always ACKs AA on receipt"]:::standalone
     TEE_B["Listener B, the copy feed, optional<br/>ACKs AA on receipt"]:::standalone
     TEE_QUEUE["Shadow queue and worker<br/>bounded, in memory"]:::standalone
