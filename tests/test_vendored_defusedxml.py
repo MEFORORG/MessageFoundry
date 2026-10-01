@@ -152,9 +152,13 @@ def test_every_vendored_package_is_in_the_finalized_sbom(tmp_path: Path) -> None
     extras = sbom_finalize._VENDOR_DIR_EXTRAS
     vendored = sorted(Path(p.name).stem for p in VENDOR.parent.iterdir() if p.name not in extras)
     assert "defusedxml" in vendored, f"the enumeration found {vendored}; it has gone blind"
+    # The absence check below walks `vendored`, so it passes on an empty walk; pin both inputs.
+    assert len(vendored) >= 1, "the vendor enumeration found nothing"
+    components = _finalized_sbom(tmp_path)["components"]
+    assert len(components) >= 1, "the finalized SBOM has no components"
     listed = {
         prop["value"]
-        for c in _finalized_sbom(tmp_path)["components"]
+        for c in components
         for prop in c.get("properties", [])
         if prop["name"] == sbom_finalize.VENDORED_PROPERTY
     }
