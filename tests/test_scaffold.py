@@ -131,8 +131,19 @@ def verify_step(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path]:
     return require_bash(root), script
 
 
+#: A ``gh`` that answers ``--version`` with ``$FAKE_GH_VERSION`` and records any other call's argv.
+_GH_STUB = (
+    b"#!/usr/bin/env bash\n"
+    b'if [ "$1" = "--version" ]; then echo "gh version $FAKE_GH_VERSION (2026-09-30)"; exit 0; fi\n'
+    b'printf "%s\\n" "$@" > "$GH_LOG"\n'
+)
+
+
 def _run_verify_step(
-    verify_step: tuple[str, Path], tmp_path: Path, wheels: list[str]
+    verify_step: tuple[str, Path],
+    tmp_path: Path,
+    wheels: list[str],
+    gh_version: str = "2.102.0",
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run the step with ``wheels`` in dist-verify/ and a ``gh`` on PATH that records its argv."""
     bash, script = verify_step
@@ -143,12 +154,13 @@ def _run_verify_step(
     stub_dir = tmp_path / "ghstub"
     stub_dir.mkdir()
     stub = stub_dir / "gh"
-    stub.write_bytes(b'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$GH_LOG"\n')
+    stub.write_bytes(_GH_STUB)
     stub.chmod(0o755)
     log = tmp_path / "gh.log"
     env = probe_env(Path(bash), dict(os.environ))
     env["PATH"] = f"{stub_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}"
     env["GH_LOG"] = log.as_posix()
+    env["FAKE_GH_VERSION"] = gh_version
     proc = subprocess.run(
         [bash, "-e", script.as_posix()],
         cwd=work,
@@ -213,6 +225,40 @@ def test_the_scaffolded_verify_step_refuses_what_it_cannot_verify(
     assert proc.returncode == 1, f"{explain_returncode(proc.returncode)}\n{output}"
     assert message in output, output
     assert not log.exists(), f"gh ran although the step should have refused: {log.read_text()}"
+
+
+_WEAK_PIN = "gives a weaker pin"
+
+
+@pytest.mark.parametrize(
+    ("gh_version", "verifies", "warns"),
+    [
+        ("2.67.0", False, False),  # no --source-ref at all: refuse
+        ("2.68.0", True, True),  # the floor: verify, but warn the pin is weaker
+        ("2.101.9", True, True),
+        ("2.102.0", True, False),  # signer-workflow and source-ref matched exactly
+        ("3.0.0", True, False),
+    ],
+)
+def test_the_scaffolded_verify_step_checks_the_gh_version(
+    verify_step: tuple[str, Path], tmp_path: Path, gh_version: str, verifies: bool, warns: bool
+) -> None:
+    """Below gh 2.68.0 the step refuses; below 2.102.0 it verifies and warns (BACKLOG #2534).
+
+    The rows on each side of both thresholds are each other's control.
+    """
+    proc, log = _run_verify_step(
+        verify_step, tmp_path, ["messagefoundry-0.4.0-py3-none-any.whl"], gh_version
+    )
+    output = proc.stdout + proc.stderr
+    if not verifies:
+        assert proc.returncode == 1, f"{explain_returncode(proc.returncode)}\n{output}"
+        assert "needs gh 2.68.0 or later" in output, output
+        assert not log.exists(), f"gh verify ran on a gh with no --source-ref: {log.read_text()}"
+        return
+    assert proc.returncode == 0, f"{explain_returncode(proc.returncode)}\n{output}"
+    assert log.read_text(encoding="utf-8").splitlines()[:2] == ["attestation", "verify"]
+    assert (_WEAK_PIN in output) is warns, output
 
 
 def test_scaffold_refuses_nonempty_without_force(tmp_path: Path) -> None:

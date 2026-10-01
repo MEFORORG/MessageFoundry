@@ -167,7 +167,8 @@ as its own `messagefoundry-webconsole` wheel.
 **Verify the release before you install.** MessageFoundry ships one signed wheel to many PHI-bearing
 instances, so verify the artifact's provenance *before* installing — pinning a version (or a hash) proves
 you got a *fixed* file, not that it is the one MessageFoundry built. Every release carries **SLSA build
-provenance** and a **Sigstore signature**; check both with the **GitHub CLI** (`gh` ≥ 2.68), and
+provenance** and a **Sigstore signature**; check both with the **GitHub CLI** (`gh` 2.68.0 or later
+is required, and 2.102.0 or later is recommended, because older `gh` gives a weaker pin), and
 optionally `sigstore` (`pip install sigstore`). Install **only** the file that passes:
 
 ```powershell

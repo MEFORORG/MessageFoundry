@@ -81,8 +81,8 @@ MessageFoundry ships **one signed wheel to many PHI-bearing instances**, so veri
 provenance *before* installing it — pinning a version (or a hash) proves you got a *fixed* file, not that
 it's the one MessageFoundry built. Every release carries **SLSA build provenance** (binding the wheel's
 SHA-256 → the source commit → the GitHub Actions builder) and a **Sigstore signature**. Check both with
-the **GitHub CLI** (`gh` ≥ 2.68), and optionally `sigstore` (`pip install sigstore`); install **only** the
-file that passes.
+the **GitHub CLI** (`gh` 2.68.0 or later is required, and 2.102.0 or later is recommended), and
+optionally `sigstore` (`pip install sigstore`); install **only** the file that passes.
 
 ```powershell
 $V = "0.4.0"   # the exact version you intend to install, as its wheel spells it
@@ -119,7 +119,9 @@ if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
 
 > **Keep `--signer-workflow` and `--source-ref`.** With `--repo` alone, `gh attestation verify`
 > accepts an attestation from any workflow in the repository, on any ref
-> ([SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) says more). `--source-ref` needs `gh` 2.68 or later. Set `$V`
+> ([SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) says more). `--source-ref` needs `gh` 2.68.0 or later. Before
+> 2.102.0, `gh` gives a weaker pin: it matches `--signer-workflow` against only the start of the
+> signing identity and compares `--source-ref` ignoring case. Set `$V`
 > as the wheel spells the version. Each block works out `$Tag`, the tag's spelling, from it: a
 > pre-release wheel says `0.5.0rc1`, while its tag says `v0.5.0-rc1`.
 
