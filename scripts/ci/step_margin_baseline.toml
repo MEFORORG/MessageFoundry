@@ -104,6 +104,8 @@ source = "measured 2026-08-08; same pool as the ubuntu row; n=360. 35:47 is the 
 # 36608371219 and 36640762359 sat exactly at 3:13 and 4:11 by API and still logged RE-DERIVE. So
 # read them as close, not exact. Nothing acted on it until LOW
 # reds began ejecting merge groups and failing pull requests. RE-DERIVE is a note, not a gate.
+# Since PR 1825 (BACKLOG #1842) `step_margin.py` also raises it as a `::warning` annotation on the run
+# page; it still never changes the exit code. See that script's `record_escalation`.
 
 [[baseline]]
 step = "Web console tests (pytest)"

@@ -360,7 +360,7 @@ def test_the_sizing_rule_is_ceil_minute_one_point_three_five_floored_at_five() -
     assert sized_cap_minutes(60) == 5  # the floor binds
     assert sized_cap_minutes(222) == 5  # 1.35 x 3:42 = 4:59.7
     assert sized_cap_minutes(223) == 6  # 1.35 x 3:43 = 5:01.05
-    assert sized_cap_minutes(305) == 7  # windows-2022's 5:05 row
+    assert sized_cap_minutes(305) == 7  # a 5:05 row sizes to 7 (6:52 rounded up)
     assert sized_cap_minutes(2800) == 63  # exactly 63:00; the raw float product ceils to 64
 
 
@@ -401,7 +401,7 @@ leg = "<fixture leg>"
 max_passing = "5:05"
 censored = false
 censored_by = ""
-source = "a test fixture shaped like the 2026-09-29 windows-2022 web console row; no pool at all."
+source = "a synthetic test fixture: a 5:05 row under a 7:00 cap; no pool at all."
 """
 
 
@@ -1122,9 +1122,9 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
     cap lowered past its row, leaves a leg whose worst KNOWN green run would red the gate -- the
     state #1842 was filed against, with 5 of 30 merge groups ejected. A cap raised by hand with no
     new row is the other drift: a bound derived from another bound. So two assertions: the row is
-    not LOW at its cap, against the gate's own floor; and the cap is exactly the sizing rule ci.yml's
-    "THE SECOND RE-DERIVATION" note states and "THE THIRD RE-DERIVATION" applies, ceil_minute(1.35x
-    the row), floored at 5:00.
+    not LOW at its cap, against the gate's own floor; and the cap is exactly the sizing rule that
+    `step_margin.sized_cap_minutes` holds, ceil_minute(1.35x the row), floored at 5:00. ci.yml's
+    "THE SECOND RE-DERIVATION" note states it and "THE THIRD RE-DERIVATION" applies it.
 
     Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:43 row (7:00 /
     5:43 = 1.224x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
