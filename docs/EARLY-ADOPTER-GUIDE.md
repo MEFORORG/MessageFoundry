@@ -862,7 +862,8 @@ mode, an F5, a cloud **L4 / network** LB, …).
 Failover is **not instantaneous** — quantify *your* window from these drills; don't assume zero-downtime.
 
 - [ ] **Clean switchover** (planned): gracefully stop the primary's service. It **expires its lease**, so
-      a standby promotes on its next heartbeat (**≈ one `heartbeat_seconds`**). Watch `leader_node_id`
+      a standby promotes on its next heartbeat (**≈ one `heartbeat_seconds`**), or after its
+      `acquire_delay_seconds` if every standby has one. Watch `leader_node_id`
       move on `/cluster/nodes`, watch the VIP repoint, and keep synthetic traffic flowing throughout.
 - [ ] **Crash** (unplanned): hard-kill / power off the primary. Its lease **ages out**, so a standby
       promotes after **up to `leader_lease_ttl_seconds`** (~30 s default); a partitioned old primary

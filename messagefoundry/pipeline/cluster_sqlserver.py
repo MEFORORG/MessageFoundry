@@ -471,8 +471,14 @@ class SqlServerCoordinator:
         if self._monotonic() < self._no_claim_until:
             # JUST STEPPED DOWN (ADR 0056 slice 1): decline for a bounded window so a sibling wins the
             # expired lease instead of this node renewing it straight back via the un-delayed t.owner = me
-            # branch. Mirrors DbCoordinator._claim_or_renew_lease — read its comment there.
-            return False
+            # branch, and lift the pause once the row names another node (BACKLOG #1986). Mirrors
+            # DbCoordinator._claim_or_renew_lease — read its comment there.
+            current = await self._store._fetchone(
+                "SELECT owner FROM leader_lease WHERE lease_key = ?", (self._lease_key,)
+            )
+            if current is not None and current["owner"] == self.node_id:
+                return False
+            self._no_claim_until = 0.0
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
             f" DECLARE @now FLOAT = {_DB_NOW};"
@@ -614,9 +620,12 @@ class SqlServerCoordinator:
             async with asyncio.timeout(timeout):  # None = unbounded, the stepdown's case
                 # The expiry is the DB clock's now, read by the same _DB_NOW expression the MERGE's
                 # take-over predicate reads, so each sibling waits its own acquire_delay (BACKLOG
-                # #1986). DbCoordinator._release_leadership carries the reasoning.
+                # #1986), and never later than the row's own expiry. DbCoordinator._release_leadership
+                # carries the reasoning. A CASE, because LEAST needs SQL Server 2022.
                 rows = await self._store._execute(
-                    f"UPDATE leader_lease SET lease_expires_at = {_DB_NOW}"
+                    "UPDATE leader_lease SET lease_expires_at ="
+                    f" CASE WHEN lease_expires_at < {_DB_NOW} THEN lease_expires_at"
+                    f" ELSE {_DB_NOW} END"
                     " WHERE lease_key = ? AND owner = ?",
                     (self._lease_key, self.node_id),
                 )

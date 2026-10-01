@@ -74,7 +74,8 @@ class _LeaseRow:
     def release(self, owner: object) -> int:
         row = self.row
         if row is not None and row["owner"] == owner:
-            row["lease_expires_at"] = self._db_clock()  # the DB clock's now (BACKLOG #1986)
+            # The DB clock's now, never later than the row's own expiry (BACKLOG #1986).
+            row["lease_expires_at"] = min(float(row["lease_expires_at"]), self._db_clock())  # type: ignore[arg-type]
             return 1
         return 0
 

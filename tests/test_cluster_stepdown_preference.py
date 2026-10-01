@@ -22,6 +22,7 @@ tell the fix from the defect.
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from pathlib import Path
 from types import TracebackType
@@ -207,6 +208,59 @@ async def test_without_the_delay_term_the_drained_node_reclaims(backend: str) ->
 
 
 @BACKENDS
+async def test_the_pause_lifts_once_a_successor_holds_the_row(backend: str) -> None:
+    # The pause guards only the drained node's undelayed renew of its own released row. Once the row
+    # names a successor that arm cannot match, so a long delay term must not also bar the drained node
+    # from taking over a successor that crashes inside the pause.
+    #
+    # MUTATION ARM, measured: drop the lift (return not-held for the whole pause, as before this
+    # change) and this fails at +50: nothing leads until A's 320 s pause ends.
+    cluster = _Cluster(backend)
+    a = cluster.node("A")
+    successor = cluster.node("P")
+    dr = cluster.node("DR", delay=300.0)
+    await _lead(a)
+
+    await a.step_down_leadership(sibling_acquire_delay_seconds=300.0)
+    assert a._no_claim_until == 320.0
+    cluster.advance(_HEARTBEAT)
+    await successor._maintain_leadership()
+    assert successor.is_leader() is True
+    await a._maintain_leadership()  # reads the row naming P, so the pause ends; P's lease is live
+    assert a.is_leader() is False
+    assert a._no_claim_until == 0.0
+
+    # P crashes: it stops renewing, and its lease (taken at +10, TTL 30) has expired by +50.
+    cluster.advance(4 * _HEARTBEAT)
+    await dr._maintain_leadership()
+    assert dr.is_leader() is False  # 300 s delay
+    await a._maintain_leadership()
+    assert a.is_leader() is True, "the drained node was barred from taking over a crashed successor"
+
+
+@BACKENDS
+async def test_a_release_never_moves_an_aged_out_expiry_later(backend: str) -> None:
+    # A node whose lease has already aged out (a hung pool, a self-fence) is then stopped. Its forced
+    # release must not restart the siblings' delays by stamping a later expiry. The row expired at
+    # +30, so a 60 s sibling may take it after +90 whatever the stop wrote at +85.
+    #
+    # MUTATION ARM, measured: write the DB now without LEAST / CASE (and the stand-in to match) and
+    # this fails at +95: the expiry moved to +85 and the sibling must wait until +145.
+    cluster = _Cluster(backend)
+    a = cluster.node("A")
+    delayed = cluster.node("D", delay=60.0)
+    await _lead(a)  # expires at +30; A never renews again
+
+    cluster.advance(85.0)
+    await a.stop()
+    assert cluster.db.row is not None and cluster.db.row["lease_expires_at"] == _EPOCH_NOW + _TTL
+
+    cluster.advance(10.0)
+    await delayed._maintain_leadership()
+    assert delayed.is_leader() is True
+
+
+@BACKENDS
 async def test_a_delayed_only_cluster_gets_a_leader_after_the_delay(backend: str) -> None:
     # The accepted cost (ADR 0096, 2026-09-30 amendment): a handover to delayed-only siblings is
     # leaderless for about the smallest delay, and then it gets a leader. Both halves are pinned.
@@ -271,6 +325,9 @@ def test_the_pause_adds_the_sibling_delay_and_never_shortens() -> None:
     assert stepdown_pause_seconds(10.0) == 20.0
     assert stepdown_pause_seconds(10.0, 45.0) == 65.0
     assert stepdown_pause_seconds(10.0, -5.0) == 20.0
+    # A non-finite delay would make the pause endless and the cluster leaderless until a restart.
+    assert stepdown_pause_seconds(10.0, math.inf) == 20.0
+    assert stepdown_pause_seconds(10.0, math.nan) == 20.0
 
 
 def _with_delay(member: ClusterMember, delay: float) -> ClusterMember:
@@ -285,6 +342,8 @@ def test_the_longest_delay_counts_only_the_siblings_that_could_take_the_lease() 
         _with_delay(_member("node-d", promotable=False), 90.0),
         _with_delay(_member("node-e", fresh=False), 120.0),
         _with_delay(_member("node-f", status="left"), 150.0),
+        # Can never take over an expired lease, so there is nothing to wait for.
+        _with_delay(_member("node-g"), math.inf),
     ]
     assert longest_promotable_sibling_delay(members, "node-a") == 45.0
     assert longest_promotable_sibling_delay(members[:1], "node-a") == 0.0

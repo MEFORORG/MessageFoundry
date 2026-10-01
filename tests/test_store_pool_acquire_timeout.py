@@ -403,9 +403,12 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # Cluster 10 -> 9 on 2026-09-30: stop()'s `left` tombstone moved to cluster._execute_within, which
     # borrows through `pool.acquire(timeout=...)` (BACKLOG #1987). That note is about the store's
     # helper and does not describe the coordinator, so it needed no change.
-    assert (len(store_sites), len(cluster_sites)) == (36, 9), (
+    # Cluster 9 -> 10 on 2026-09-30: the stepdown pause reads the lease row's owner each tick until a
+    # successor holds it (BACKLOG #1986). It is a `fetchrow` carrying the same per-statement timeout
+    # as the claim beside it, and like that claim it borrows inside asyncpg.
+    assert (len(store_sites), len(cluster_sites)) == (36, 10), (
         "the measured population of pool borrows OUTSIDE the bounded helper moved from 36 (store)"
-        " + 9 (cluster), measured 2026-09-30. Re-read the CONNECTIONS.md scope note before changing"
+        " + 10 (cluster), measured 2026-09-30. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
 

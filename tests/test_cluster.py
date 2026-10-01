@@ -1272,8 +1272,12 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
             self.executed.append(sql)
             return 1  # the owner-scoped release matched this node's row
 
-        async def _fetchone(self, *a: object, **k: object) -> object:
-            raise AssertionError("a paused node must not query the store to claim")
+        async def _fetchone(self, sql: str, *a: object, **k: object) -> object:
+            # Since BACKLOG #1986 a paused node READS the lease owner, to lift the pause once a
+            # successor holds the row. It must still never send the claim.
+            if sql == "SELECT owner FROM leader_lease WHERE lease_key = ?":
+                return {"owner": "N"}  # the row this node released still names it
+            raise AssertionError("a paused node must not send the claim")
 
     store = _Store()
     coord = SqlServerCoordinator(store, "N", heartbeat_seconds=10.0, monotonic=lambda: 0.0)
@@ -1290,8 +1294,10 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
     assert any("UPDATE leader_lease" in sql for sql in store.executed)
     assert fired == [1]
     assert coord._no_claim_until == 20.0  # two heartbeats
-    # Inside the pause the claim short-circuits before touching the store (_fetchone would raise).
+    # Inside the pause, with the row still naming this node, the claim is never sent (the fake
+    # raises on it), and the pause stays armed.
     assert await coord._claim_or_renew_lease() is False
+    assert coord._no_claim_until == 20.0
     # A second stepdown releases nothing and issues no further write.
     writes = len(store.executed)
     assert await coord.step_down_leadership() == (False, None, False)

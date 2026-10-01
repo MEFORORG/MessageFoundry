@@ -99,12 +99,17 @@ class _FakeLeaseDB:
         delayed sibling waits its delay past the release. It used to be 0.0, the epoch, and **against
         a DB clock that starts at 0.0 the two readings cannot be told apart**: most tests here start
         there, so the preference tests use a realistic epoch clock. The predicate is strict, so a
-        sibling needs the DB clock to move past the release before even a delay of 0 matches."""
+        sibling needs the DB clock to move past the release before even a delay of 0 matches. Never
+        later than the row's own expiry: a row that already aged out keeps it (LEAST / CASE)."""
         row = self.row
         if row is not None and row["owner"] == owner:
-            row["lease_expires_at"] = self._db_clock()
+            row["lease_expires_at"] = min(float(row["lease_expires_at"]), self._db_clock())  # type: ignore[arg-type]
             return 1
         return 0
+
+    def owner(self) -> dict[str, object] | None:
+        """The stepdown pause's ``SELECT owner`` read (BACKLOG #1986)."""
+        return None if self.row is None else {"owner": self.row["owner"]}
 
 
 class _FakeLeasePool:
@@ -152,6 +157,8 @@ class _FakeLeasePool:
             await asyncio.sleep(0)  # the claim round trip is in flight; let another task run
         if self.fail:
             raise RuntimeError("partitioned from db")
+        if sql == "SELECT owner FROM leader_lease WHERE lease_key = $1":
+            return self._db.owner()  # the stepdown pause's read (BACKLOG #1986)
         # Mirrors _claim_or_renew_lease's INSERT ... ON CONFLICT ... WHERE owner OR expired RETURNING.
         # The 4th arg is the ADR-0096 acquire_delay.
         assert "leader_lease" in sql and "INSERT" in sql
@@ -176,9 +183,10 @@ class _FakeLeasePool:
         # Mirrors _release_leadership's UPDATE ... SET lease_expires_at = <DB now> WHERE lease_key AND
         # owner, on the clock the claim predicate reads.
         assert "leader_lease" in sql and "UPDATE" in sql
-        assert "SET lease_expires_at = EXTRACT(EPOCH FROM clock_timestamp()) " in sql, (
-            "the release must write the DB clock's now (BACKLOG #1986)"
-        )
+        assert (
+            "SET lease_expires_at = LEAST(lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())) "
+            in sql
+        ), "the release must write the DB clock's now, never later (BACKLOG #1986)"
         _lease_key, owner = args
         return f"UPDATE {self._db.release(owner)}"  # asyncpg's command tag
 
@@ -531,9 +539,9 @@ _EPOCH_NOW = 1_790_000_000.0
 
 
 async def test_the_handicap_still_holds_against_a_lease_that_expired_on_its_own() -> None:
-    # The other half, so the test above cannot be read as "the delay is ignored". A lease that ages
-    # out WITHOUT a release keeps its real expiry, and a handicapped sibling still waits the delay
-    # past it. That is the crash-failover case ADR 0096 exists for.
+    # A lease that ages out WITHOUT a release keeps its real expiry, and a handicapped sibling waits
+    # the delay past it. That is the crash-failover case ADR 0096 exists for. A RELEASED lease gets the
+    # same treatment since BACKLOG #1986; tests/test_cluster_stepdown_preference.py pins that half.
     db_clock = _Clock(_EPOCH_NOW)
     db = _FakeLeaseDB(db_clock)
     a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A", ttl=30.0)
@@ -1301,6 +1309,8 @@ class _FakeSqlLeaseStore:
             await asyncio.sleep(0)  # the MERGE round trip is in flight; let another task run
         if self.fail:
             raise RuntimeError("partitioned from db")
+        if sql == "SELECT owner FROM leader_lease WHERE lease_key = ?":
+            return self._db.owner()  # the stepdown pause's read (BACKLOG #1986)
         assert "MERGE leader_lease" in sql, "not the claim statement"
         assert "leader_epoch" in sql, "claim SQL must maintain the H1 fencing epoch"
         # Positional params of the MERGE: (lease_key, owner, delay, owner, ttl, owner, ...).
@@ -1317,9 +1327,10 @@ class _FakeSqlLeaseStore:
         if self.fail:
             raise RuntimeError("partitioned from db")
         assert "leader_lease" in sql and "UPDATE" in sql, "not the release statement"
-        assert f"SET lease_expires_at = {_SQLSERVER_DB_NOW} " in sql, (
-            "the release must write the DB clock's now (BACKLOG #1986)"
-        )
+        assert (
+            f"SET lease_expires_at = CASE WHEN lease_expires_at < {_SQLSERVER_DB_NOW}"
+            f" THEN lease_expires_at ELSE {_SQLSERVER_DB_NOW} END " in sql
+        ), "the release must write the DB clock's now, never later (BACKLOG #1986)"
         _lease_key, owner = params
         return self._db.release(owner)  # the store's _execute returns the driver's row count
 

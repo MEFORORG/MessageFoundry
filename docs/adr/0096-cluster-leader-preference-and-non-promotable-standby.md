@@ -92,8 +92,8 @@ short-circuits, and the added `nodes` columns default to `0`/`TRUE`.
   lease expires, THE SYSTEM SHALL let the preferred node win the routine take-over race.
   → `tests/test_cluster_lease.py::test_preferred_node_wins_routine_expired_lease_race`.
   [Amendment A](#amendment-a-2026-09-30--ac-2-binds-a-planned-stepdown-and-a-clean-stop) extends this
-  to a lease a leader released by a planned stepdown or a clean stop
-  → `tests/test_cluster_stepdown_preference.py`
+  to a lease a leader released by a planned stepdown or a clean stop. Tested by
+  `tests/test_cluster_stepdown_preference.py`.
 - **AC-3** — WHILE a node is the current leader, THE SYSTEM SHALL renew its lease without the acquire
   delay.
   → `tests/test_cluster_lease.py::test_delay_does_not_delay_the_current_leaders_renew`
@@ -159,12 +159,15 @@ crash failover.
    clock_timestamp())` on Postgres and the coordinator's `SYSUTCDATETIME()` epoch expression on SQL
    Server. Each is the clock that backend's take-over predicate reads, so node clock skew does not
    enter. A sibling may then take a released lease only once its own delay has passed on that clock.
-   Both the stepdown and `stop()` send this release.
-2. The stepdown's claim pause grows by the longest `acquire_delay_seconds` among the other promotable
-   nodes with a fresh heartbeat, read from the membership read the endpoint already takes. The drained
-   node reclaims through the renew branch, which carries no delay term. Without the extra term, a node
-   whose siblings were all delayed past its two-heartbeat pause took its own lease back first, which
-   is the defect BACKLOG #1507 described.
+   Both the stepdown and `stop()` send this release. It never moves an expiry later: a row that has
+   already aged out keeps its own expiry, so a release cannot restart the siblings' delays.
+2. The stepdown's claim pause grows by the longest finite `acquire_delay_seconds` among the other
+   promotable nodes with a fresh heartbeat, read from the membership read the endpoint already takes.
+   The drained node reclaims through the renew branch, which carries no delay term. Without the extra
+   term, a node whose siblings were all delayed past its two-heartbeat pause took its own lease back
+   first, which is the defect BACKLOG #1507 described. The pause ends early once a claim tick reads
+   the lease row naming another node, because the renew branch it guards can no longer match. So a
+   long pause does not stop the drained node taking over a successor that crashes inside it.
 3. `stop()` needs no pause. A stopped node has no maintenance task, so it cannot reclaim.
 
 **The no-two-leader argument is unchanged.** A later stored expiry only makes the take-over predicate
@@ -179,7 +182,8 @@ consequences above already accept for a routine crash transition.
 
 **Tests.** `tests/test_cluster_stepdown_preference.py` runs each case on both coordinators at a
 realistic DB clock: the preferred sibling wins after a stepdown and after a stop, a drained node with
-only delayed siblings does not reclaim, a delayed-only cluster gets a leader after the delay, and the
+only delayed siblings does not reclaim, the pause lifts once a successor holds the row, a release
+never moves an aged-out expiry later, a delayed-only cluster gets a leader after the delay, and the
 endpoint passes the longest promotable sibling delay. `test_a_released_lease_honours_leader_preference`
 in `tests/test_cluster_failover_postgres.py` and `tests/test_cluster_failover_sqlserver.py` runs the
 real release statements against a live server.

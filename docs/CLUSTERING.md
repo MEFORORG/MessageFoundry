@@ -337,7 +337,9 @@ There is a promotion window, as in Rhapsody (minutes-class) — quantify it from
 benchmark, don't assume zero-downtime:
 
 - **Clean stop** (graceful shutdown): the leaving primary **expires its lease**, so a standby acquires on
-  its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`). A slow database can turn this
+  its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`). A standby with an
+  `acquire_delay_seconds` waits that long first, so a cluster whose only standbys are delayed has no
+  leader for about the smallest delay. A slow database can turn this
   into the crash case below: the stop gives that write 2 seconds, then leaves the lease to age out. A **planned switchover** that
   leaves the node running takes the same path, without the shutdown — see `POST /cluster/stepdown` below.
 - **Crash / partition**: the primary's lease **ages out**, so a standby acquires after up to
@@ -356,7 +358,8 @@ benchmark, don't assume zero-downtime:
 
 Ask the current primary to hand over on purpose, before you patch or reboot it, instead of pulling the
 service out from under a live feed. The node **releases its leadership lease and keeps running**, demoted
-to standby: a standby acquires the expired lease on its next heartbeat and promotes its graph, and the
+to standby: a standby acquires the expired lease on its next heartbeat, or after its
+`acquire_delay_seconds` if it has one, and promotes its graph, and the
 node you drained stays up, heartbeating, ready to take leadership back later.
 
 The web console's **High Availability** page (`/ui/cluster`) makes this call for the node that serves
@@ -430,7 +433,8 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
     listener can still hold its port; established connections drain in the background; and a message
     already inside a handler still finishes its commit and its ACK, which count-and-log requires.
     Confirm quiescence with `GET /cluster/nodes` plus the connection view before you touch the node.
-  - **If it committed**, a standby acquires on its next heartbeat and the failover is proceeding
+  - **If it committed**, a standby acquires on its next heartbeat (a delayed one after its delay) and
+    the failover is proceeding
     normally, whatever the error page says.
   - **If it did not**, the lease is still live and still owned by a node that has given up leadership,
     so on a first deployment nothing carries the feeds until that node renews itself back in when its
@@ -486,7 +490,8 @@ promotable nodes with a fresh heartbeat. It reads those delays from the membersh
 already takes. The delay term matters: the drained node reclaims through its own renew, which carries
 no delay, so without it a node whose siblings are all delayed would take its lease back before any of
 them could ([BACKLOG #1507](BACKLOG.md)). At the shipped default and with no delayed sibling the pause
-is 20 seconds. On a cluster with no other promotable node that window is leaderless, which is why
+is 20 seconds. The pause ends early once the drained node sees the lease row name another node, so it
+can still take over if that successor fails during the pause. On a cluster with no other promotable node that window is leaderless, which is why
 such a call is refused with `412` unless you send `force`. Give every node the same
 `heartbeat_seconds`: the pause is counted in the drained node's own heartbeats, so a sibling with a
 longer one can miss it. A clean stop needs no pause, because a stopped node does not claim.
