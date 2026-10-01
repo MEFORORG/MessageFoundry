@@ -22,7 +22,7 @@ constraints bound the choice (reliability/purity, count-and-log, no-grouping-uni
 > the [Secure Development Standards §5.](../Secure_Development_Standards.md) Forms: ubiquitous
 > `THE SYSTEM SHALL …` · event-driven `WHEN <trigger> THE SYSTEM SHALL <response>` · state-driven
 > `WHILE <state> …` · unwanted-behaviour `IF <condition> THEN THE SYSTEM SHALL …` · optional
-> `WHERE <feature> …`. `messagefoundry adr-analyze` checks each `→` link resolves to a real file.
+> `WHERE <feature> …`. `messagefoundry-toolkit adr-analyze` checks each `→` link resolves to a real file.
 
 - **AC-1** — WHEN <trigger>, THE SYSTEM SHALL <response>.
   → `tests/test_<area>.py::test_<name>`

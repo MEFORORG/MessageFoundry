@@ -17,7 +17,7 @@
 #                 against a tag would satisfy a ref-only guard and publish to PyPI — which is what
 #                 "run it manually to dry-run it" invites an operator to do. Reading the old guard as
 #                 "a branch ref isn't `refs/tags/...`" is what hid this: a true sentence about the
-#                 wrong half of the trigger. The steps carrying the pair are at least the three PyPI
+#                 wrong half of the trigger. The steps carrying the pair are at least the four PyPI
 #                 publishes, the three GitHub-release mutations, and the SLSA build-provenance
 #                 attestation (BACKLOG #1805; the step's own comment says why). The COUNT is pinned in
 #                 tests/test_release_pipeline.py, which is its one authority — do not restate a
@@ -51,6 +51,12 @@
 # Publisher — a PENDING publisher for repo MEFORORG/MessageFoundry + workflow `release.yml` (blank
 # environment, matching the engine) — then (2) sets repo variable PUBLISH_HARNESS=true. Until then the
 # job still BUILDS + version-checks the harness wheel each release and attaches it to the GitHub release.
+#
+# THIRD distribution — `messagefoundry-toolkit` (the authoring and development commands, ADR 0201,
+# packaging/messagefoundry-toolkit/) — is built, gated, smoked and published INSIDE the `release` job,
+# in lockstep, and uploaded BEFORE the engine; the steps there say why. OWNER PREREQ (one-time, before
+# the first tag carrying those steps): a PENDING Trusted Publisher for `messagefoundry-toolkit`, repo
+# MEFORORG/MessageFoundry, workflow `release.yml`, blank environment. It is NOT gated on a variable.
 #
 # The version is single-sourced from messagefoundry/__init__.py (hatchling dynamic version), so the built
 # artifact's version must match the tag.
@@ -392,6 +398,165 @@ jobs:
             fi
           fi
 
+      # THE TOOLKIT DISTRIBUTION RIDES THIS JOB, NOT A JOB OF ITS OWN (ADR 0201 section 1, BACKLOG #1192).
+      # `messagefoundry-toolkit` carries the authoring commands the engine wheel no longer ships, and
+      # the engine built above names it (its refusal line and --help epilog). Its PyPI name is claimed
+      # by its first upload, so it uploads in THIS job, just before the engine's own upload: a failure
+      # anywhere in these steps stops the job before the engine reaches PyPI, so no engine that names
+      # the toolkit is published while the name is unclaimed, and no person has to remember an order.
+      # A separate job gated on a repository variable, as `release-harness` is, was rejected: a variable
+      # that can be unset IS that window. Built into toolkit-dist/, never dist/: sharing dist/ would
+      # pull the toolkit into the engine smoke above, the py.typed check, the signing and the staged
+      # engine upload.
+      - name: Build the toolkit wheel (wheel-only, into toolkit-dist/ — ADR 0201)
+        run: |
+          # HASH-PINNED, and installed HERE rather than trusted from the engine's build step: a step
+          # that runs a release tool installs it itself (tests/test_ci_venv_pinning.py), so reordering
+          # the job cannot leave this step running a `build` nothing pinned. Wheel-only for the
+          # harness's reason: messagefoundry_toolkit/ is force-included from the repo root, so an
+          # sdist would not be self-contained. Version read from messagefoundry/__init__.py (lockstep).
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m build --wheel ./packaging/messagefoundry-toolkit --outdir toolkit-dist
+          ls -l toolkit-dist/
+
+      - name: Member gate — the toolkit wheel (maintainer files, test content, the engine and toolkit split)
+        # Its own id: `member-gate` is the engine gate's, and the artifact-upload guard below reads it.
+        id: toolkit-member-gate
+        run: python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
+
+      - name: Smoke-check the toolkit wheel (clean venv, install, lockstep pin, version == tag)
+        run: |
+          # The harness smoke's shape, for the same reasons: tests/test_packaging.py does not run at tag
+          # time, so the built wheel is the last place the lockstep pin is checkable before an upload
+          # burns the version. Throwaway venv, --no-deps, isolated mode. See the harness job below.
+          # NO PIPE: sed prints the first match and quits, so no `| head -1` discards sed's exit code
+          # with pipefail off (tests/test_workflow_pipefail_screen.py).
+          PKG_PIN="$(sed -n '/^packaging==/{s/^packaging==\([^ ;]*\).*/\1/p;q;}' constraints.lock)"
+          if [ -z "$PKG_PIN" ]; then
+            echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
+          fi
+          echo "packaging pin from constraints.lock: $PKG_PIN"
+          python -m venv /tmp/toolkitsmoke
+          /tmp/toolkitsmoke/bin/pip install --quiet "packaging==$PKG_PIN"
+          # --no-deps IS LOAD-BEARING: the toolkit depends on the engine, so a full install would
+          # resolve it FROM PYPI inside a job holding id-token: write. Install the built wheel alone.
+          /tmp/toolkitsmoke/bin/pip install --quiet --no-deps toolkit-dist/*.whl
+          built=$(/tmp/toolkitsmoke/bin/python -I - <<'PYSMOKE'
+          import importlib
+          import sys
+          from importlib.metadata import distribution
+          from pathlib import Path
+
+          DIST = "messagefoundry-toolkit"
+          PKG = "messagefoundry_toolkit"
+
+          prefix = Path(sys.prefix).resolve()
+
+          # The PACKAGE, not its __main__: the entry module imports the engine at module level, and
+          # --no-deps installed no engine. messagefoundry_toolkit/ is a regular package, so a real
+          # __init__.py gives a real __file__; a namespace directory with no module gives None.
+          try:
+              package = importlib.import_module(PKG)
+          except ImportError as exc:
+              raise SystemExit(
+                  f"::error::cannot import {PKG} from the smoke venv ({exc}) — the wheel shipped no "
+                  f"package tree, or shipped one this interpreter cannot load"
+              ) from None
+          if not getattr(package, "__file__", None):
+              raise SystemExit(
+                  f"::error::{PKG} has no __file__ — the wheel shipped no package tree there"
+              )
+          origin = Path(package.__file__).resolve()
+          if not origin.is_relative_to(prefix):
+              raise SystemExit(
+                  f"::error::{PKG} resolved to {origin}, OUTSIDE the smoke venv {prefix} — the "
+                  f"checkout shadowed the wheel and this step inspected the wrong tree"
+              )
+
+          dist = distribution(DIST)
+          recorded = [name for f in (dist.files or []) if (name := str(f)).startswith(PKG + "/")]
+          if not recorded:
+              raise SystemExit(
+                  f"::error::{DIST} RECORD lists no {PKG}/ members — the wheel is metadata wrapped "
+                  f"around an empty package tree (a broken force-include builds and installs cleanly)"
+              )
+          if not any(Path(f.locate()).resolve() == origin for f in (dist.files or [])):
+              raise SystemExit(
+                  f"::error::{origin} is not a file {DIST} recorded — the module this step imported "
+                  f"belongs to something else on sys.path, so the wheel was never inspected"
+              )
+          # The console script's target, `messagefoundry_toolkit.__main__:main`, must have shipped.
+          # Checked by RECORD rather than imported, for the --no-deps reason above.
+          if f"{PKG}/__main__.py" not in recorded:
+              raise SystemExit(
+                  f"::error::{DIST} ships no {PKG}/__main__.py — the messagefoundry-toolkit console "
+                  f"script would fail on first run"
+              )
+
+          # THE LOCKSTEP PIN ON THE BUILT ARTIFACT (ADR 0201 AC-7). Exactly one requirement, on the
+          # engine, with no extra and `==` this wheel's own version, compared as PEP 440 versions.
+          # The toolkit declares nothing else: its third-party imports are core engine dependencies.
+          from packaging.requirements import Requirement
+          from packaging.version import InvalidVersion, Version
+
+          declared = [Requirement(raw) for raw in (dist.metadata.get_all("Requires-Dist") or [])]
+          try:
+              shipped = Version(dist.version)
+          except InvalidVersion as exc:
+              raise SystemExit(
+                  f"::error::unparseable version ({exc}) — {DIST} metadata {dist.version!r}"
+              )
+          pinned = None
+          if len(declared) == 1:
+              clauses = list(declared[0].specifier)
+              if len(clauses) == 1 and clauses[0].operator == "==":
+                  try:
+                      pinned = Version(clauses[0].version)
+                  except InvalidVersion:
+                      pinned = None  # a wildcard pin is a drift, reported below
+          ok = (
+              pinned == shipped
+              and declared[0].name.replace("_", "-").lower() == "messagefoundry"
+              and not declared[0].extras
+              and declared[0].marker is None
+          )
+          if not ok:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires {[str(r) for r in declared]}, not exactly "
+                  f"['messagefoundry=={dist.version}'] — the toolkit is LOCKSTEP with the engine and "
+                  f"calls its internals (ADR 0201). Fix the dependencies table in "
+                  f"packaging/messagefoundry-toolkit/pyproject.toml and re-cut the tag."
+              )
+
+          print(
+              f"toolkit wheel installed from {origin}: {len(recorded)} {PKG}/ members, console "
+              f"script target shipped, requires messagefoundry{declared[0].specifier}, version "
+              f"{dist.version}",
+              file=sys.stderr,
+          )
+          print(dist.version)
+          PYSMOKE
+          )
+          echo "toolkit wheel version: $built"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            want="${GITHUB_REF_NAME#v}"
+            /tmp/toolkitsmoke/bin/python -I - "$built" "$want" <<'PYVER'
+          import sys
+          from packaging.version import InvalidVersion, Version
+
+          built, want = sys.argv[1], sys.argv[2]
+          try:
+              b, w = Version(built), Version(want)
+          except InvalidVersion as exc:
+              raise SystemExit(f"::error::unparseable version ({exc}) — built={built!r} tag={want!r}")
+          if b != w:
+              raise SystemExit(
+                  f"::error::toolkit wheel version {built} != tag {want} (normalised {b} != {w})"
+              )
+          print(f"toolkit version matches tag: {b}")
+          PYVER
+          fi
+
       - name: Stage a clean dist for PyPI (wheel + sdist only — no signature bundles)
         run: |
           # PyPI's uploader (twine) rejects non-distribution files, and the Sigstore step below signs
@@ -490,13 +655,14 @@ jobs:
           # (CISA VEX; NTIA Consumer Playbook). Source of truth: security/vex/messagefoundry.openvex.json.
           cp security/vex/messagefoundry.openvex.json messagefoundry-vex.openvex.json
 
-      - name: Score the SBOM quality (sbomqs — advisory, never blocks a release)
-        continue-on-error: true
+      - name: Install sbomqs (pinned in-repo; a pin failure BLOCKS the release)
+        # NO continue-on-error, on purpose: owner ruling 2026-09-30 (BACKLOG #1698). This step used to
+        # be one advisory step that downloaded, verified AND scored, so a pin mismatch -- the exact
+        # event the in-repo digest exists to catch -- ended as a green release with no warning. A
+        # substituted binary is a supply-chain event, not an SBOM-quality signal, so the verify and
+        # install half now fails the job. Only the SCORE below stays advisory (ADR 0149).
+        # tests/test_release_pipeline.py pins both halves of that split.
         run: |
-          # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
-          # SBOM completeness is visible in the release log. Advisory — SBOM quality is a signal, not a
-          # gate. ADR 0149.
-          #
           # PINNED IN-REPO, not against the asset's own checksums.txt (BACKLOG #1698). The security.yml
           # twin still verifies same-origin and that is adequate THERE. It is not adequate here, and the
           # difference is the job, not the tool: this step runs inside `id-token: write` — the identity
@@ -530,14 +696,25 @@ jobs:
           SBOMQS_SHA256=14fd58b89d4948265cce0fdb95d9b635ff667f352b5a9a05b3d13dbefa5d0195
           asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
           base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
-          curl -sSfL "${base}/${asset}" -o "${asset}"
+          # --retry covers a transient network error, which now blocks the release too. A pin
+          # MISMATCH is not a curl error, so it is never retried: the `sha256sum -c` below fails it.
+          curl -sSfL --retry 3 --retry-all-errors "${base}/${asset}" -o "${asset}"
           # Verify BY the canonical asset name: sha256sum -c reads "<digest>  <filename>" and checks
           # that file, so the name must match what curl wrote.
           echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
-          sbomqs score -b messagefoundry-sbom.cdx.json
-          sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
+
+      - name: Score the SBOM quality (sbomqs -- advisory, never blocks a release)
+        continue-on-error: true
+        run: |
+          # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
+          # SBOM completeness is visible in the release log. Advisory: SBOM quality is a signal, not a
+          # gate (ADR 0149). It calls the binary the BLOCKING step above verified, by the path it was
+          # installed at, so no other `sbomqs` earlier on PATH can stand in for it. This
+          # continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG #1698).
+          /usr/local/bin/sbomqs score -b messagefoundry-sbom.cdx.json
+          /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |
@@ -640,7 +817,7 @@ jobs:
             *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
             *)   pre_create="";             pre_edit="--prerelease=false" ;;
           esac
-          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore*
+          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore* toolkit-dist/*.whl
                    messagefoundry-sbom.cdx.json messagefoundry-sbom.cdx.json.sigstore*
                    messagefoundry-vex.openvex.json messagefoundry-vex.openvex.json.sigstore* )
           if gh release view "$tag" >/dev/null 2>&1; then
@@ -686,20 +863,43 @@ jobs:
         # tests/test_release_pipeline.py pins the gate itself as unconditional and free of
         # `continue-on-error`, which are the two ways the skipped-gate case could be made common.
         #
-        # BOTH gates are named here, not just the leak gate (BACKLOG #1838). They refuse different
+        # EVERY gate is named here, not just the leak gate (BACKLOG #1838), the toolkit gate included. They refuse different
         # things -- the leak gate asks where a member sits, the member gate asks what kind of file it
         # is -- so guarding on one and not the other uploads whatever the other one caught.
-        if: always() && steps.leak-gate.outcome != 'failure' && steps.member-gate.outcome != 'failure'
+        if: always() && steps.leak-gate.outcome != 'failure' && steps.member-gate.outcome != 'failure' && steps.toolkit-member-gate.outcome != 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-artifacts
           path: |
             dist/
+            toolkit-dist/
             messagefoundry-sbom.cdx.json
             messagefoundry-sbom.cdx.json.sigstore*
             messagefoundry-vex.openvex.json
             messagefoundry-vex.openvex.json.sigstore*
           if-no-files-found: ignore
+
+      # THE TOOLKIT UPLOADS FIRST (ADR 0201 section 1, owner-accepted 2026-09-29). Its first upload is
+      # what claims the `messagefoundry-toolkit` name, and the engine uploaded next names it, so the
+      # order is the control: if this step fails, the engine step below is skipped by its implicit
+      # success() and no engine naming an unclaimed name reaches PyPI.
+      #
+      # THIS BENDS THE "NOTHING FAILS AFTER AN IRREVERSIBLE UPLOAD" RULE STATED BELOW, deliberately. If
+      # the engine upload then fails, PyPI holds a toolkit whose engine pin cannot resolve yet: an
+      # uninstallable version, not an exposure, and a re-run finishes it. `skip-existing: true` is what
+      # keeps that re-run from dying here on "File already exists", the deadlock v0.3.1 recorded.
+      #
+      # The one-time owner prerequisite for this step is stated in this file's header, THIRD
+      # distribution. Warehouse creates the project when a token exchange matches that pending
+      # publisher, which the first exchange in this job can do; the upload is what the design relies
+      # on, not the pending publisher (ADR 0201, To resolve on acceptance, records the reading).
+      - name: Publish messagefoundry-toolkit to PyPI before the engine (Trusted Publishing / OIDC)
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: toolkit-dist/
+          skip-existing: true
+          attestations: true
 
       # LAST step on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so it runs
       # after build/smoke/sign/release — the step's `if` has an implicit success(), so any earlier
@@ -1239,7 +1439,7 @@ jobs:
 
           # THE LOCKSTEP PIN, CHECKED ON THE BUILT ARTIFACT (BACKLOG #1585). packaging/
           # messagefoundry-harness/pyproject.toml pins messagefoundry[harness]==<engine version>, and
-          # PEP 621 `dependencies` is STATIC, so a version bump is two edits. tests/test_packaging.py
+          # PEP 621 `dependencies` is STATIC, so a version bump is at least three edits (the toolkit pin too). tests/test_packaging.py
           # catches a drift, but NOTHING in this workflow runs that suite and a tag can be cut from a
           # commit the merge queue never gated. This is the last place the claim is checkable before
           # the PyPI upload burns the version forever, and the metadata is already open.
@@ -1288,6 +1488,17 @@ jobs:
               raise SystemExit(
                   f"::error::{DIST} {dist.version} declares {len(engine)} requirements on the engine, "
                   f"expected exactly one (BACKLOG #1585): {[str(req) for req in engine]}"
+              )
+          # NO ENVIRONMENT MARKER ON THE ENGINE REQUIREMENT (BACKLOG #1585). A pin spelled
+          # `messagefoundry[harness]==X; sys_platform == "linux"` is exact and passes every check
+          # below on this ubuntu runner, then installs NO engine on the Windows host the harness is
+          # for. Any marker is refused, not only a false one: a marker true here is still false
+          # somewhere a user installs. tests/test_packaging.py::_engine_pin refuses the same shape.
+          if engine[0].marker is not None:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires {engine[0]}, whose environment marker "
+                  f"leaves the engine uninstalled wherever it is false (BACKLOG #1585). Drop the "
+                  f"marker in packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
               )
           # THE PINNED VERSION IS COMPARED AS A PEP 440 VERSION, NOT AS A SPECIFIER STRING. `packaging`
           # preserves the raw spelling: str(Requirement("messagefoundry[harness]==0.3.0-rc1").specifier)
@@ -1341,6 +1552,14 @@ jobs:
           PYSMOKE
           )
           echo "harness wheel version: $built"
+          # THE INSTALL LEGS OF BACKLOG #1585, RUN OFFLINE ON THE BUILT WHEEL. Everything above reads
+          # the Requires-Dist this wheel declares; this asks pip what it DOES with it. The script
+          # builds metadata-only stub engine wheels in a temp dir and resolves this wheel against each
+          # with --no-index --dry-run --ignore-installed: an older and a newer engine must be REFUSED,
+          # and the engine at this wheel's own version must resolve. No index is contacted and nothing
+          # is installed, so it adds no network to a job holding id-token: write.
+          # tests/test_packaging.py runs the same script against the pyproject's real table in CI.
+          /tmp/harnesssmoke/bin/python -I scripts/release/harness_resolution_check.py harness-dist/*.whl
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
             /tmp/harnesssmoke/bin/python -I - "$built" "$want" <<'PYVER'

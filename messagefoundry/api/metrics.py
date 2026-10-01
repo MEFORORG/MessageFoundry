@@ -11,30 +11,32 @@ The hard rules this module enforces (BACKLOG #21):
   configuration identifiers and constants — never a message field value. We never read
   ``messages.raw`` / ``summary`` / ``control_id`` / ``message_type`` / any HL7 field here.
 * **A scrape adds zero event-loop blocking.** Every store read is ``await``ed inside
-  :func:`gather_snapshot` (the reads are already off-loop via the read pool). The
-  ``prometheus_client`` ``collect()`` runs *purely synchronously* over the in-memory
-  :class:`_Snapshot` gathered *before* it — no DB I/O, no ``sleep``, no sync sqlite.
+  :func:`gather_snapshot` (the reads are already off-loop via the read pool). The collector and
+  the renderer run *purely synchronously* over the in-memory :class:`_Snapshot` gathered *before*
+  them — no DB I/O, no ``sleep``, no sync sqlite.
 
 Counters here are process-lifetime (``since=engine.started_at``) and so reset on restart — the
 correct Prometheus counter contract. ``queue_depth`` / ``in_pipeline`` / ``oldest_pending_age``
 are gauges (current state).
+
+**The engine renders the text exposition itself.** It used ``prometheus_client`` for that until
+BACKLOG #2501; the renderer below reproduces that library's output byte for byte, and
+``tests/test_metrics_exposition.py`` holds it to golden files the library wrote. The library is
+a development dependency now, kept for that test and for its parser. The families here use a fixed
+set of legacy-valid metric and label names, so the renderer carries none of the library's name
+escaping; a test pins every name to the legacy character set.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import psutil
-from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
-from prometheus_client.core import (
-    CounterMetricFamily,
-    GaugeMetricFamily,
-    HistogramMetricFamily,
-)
 
 from messagefoundry import __version__
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics
@@ -130,8 +132,139 @@ DEFAULT_LATENCY_BUCKETS: tuple[float, ...] = (
     120.0,
     300.0,
 )
-METRICS_CONTENT_TYPE = CONTENT_TYPE_LATEST
+# The header prometheus_client 0.26.0 sent as CONTENT_TYPE_LATEST, kept byte-identical so a scraper
+# sees no change. Text format 1.0.0 differs from 0.0.4 only in allowing UTF-8 metric and label names,
+# and every name here is legacy ASCII, so the body is valid under either version.
+METRICS_CONTENT_TYPE = "text/plain; version=1.0.0; charset=utf-8"
 _RATE_WINDOW = 60.0  # seconds; window for connection_metrics' throughput aggregates
+
+_MetricType = Literal["counter", "gauge", "histogram"]
+
+
+@dataclass(frozen=True)
+class _Sample:
+    """One exposition line: the exposed sample name, its labels, and its value."""
+
+    name: str
+    labels: dict[str, str]
+    value: float
+
+
+class _Family:
+    """One metric family: the HELP and TYPE header plus its samples, in the order added.
+
+    ``name`` is the family name. For a counter it never ends ``_total``: that suffix is stripped here
+    and put back on every exposed sample and on the HELP and TYPE lines, which is how the exposition
+    names counters. A caller may pass the name with or without it.
+    """
+
+    __slots__ = ("_labelnames", "documentation", "name", "samples", "type")
+
+    def __init__(
+        self, name: str, documentation: str, typ: _MetricType, labels: Sequence[str] = ()
+    ) -> None:
+        if typ == "counter":
+            name = name.removesuffix("_total")
+        self.name = name
+        self.documentation = documentation
+        self.type: _MetricType = typ
+        self._labelnames = tuple(labels)
+        self.samples: list[_Sample] = []
+
+    @property
+    def exposed_name(self) -> str:
+        """The name on the HELP and TYPE lines."""
+        return f"{self.name}_total" if self.type == "counter" else self.name
+
+    def _labels(self, values: Sequence[str]) -> dict[str, str]:
+        # strict, where prometheus_client truncated silently: a label-count mismatch is a bug in
+        # the collector below, and every family it builds is rendered by the golden-file tests.
+        return dict(zip(self._labelnames, values, strict=True))
+
+    def add_metric(self, labels: Sequence[str], value: float) -> None:
+        """Add one counter or gauge sample."""
+        if self.type == "histogram":
+            raise TypeError(f"{self.name} is a histogram; use add_histogram")
+        self.samples.append(_Sample(self.exposed_name, self._labels(labels), value))
+
+    def add_histogram(
+        self, labels: Sequence[str], buckets: Sequence[tuple[str, float]], sum_value: float
+    ) -> None:
+        """Add one histogram: a ``_bucket`` line per ``le`` boundary, then ``_count`` and ``_sum``.
+
+        ``buckets`` are cumulative and end with ``+Inf``, whose value is also the count.
+        prometheus_client left out ``_count`` and ``_sum`` for a negative first boundary or a
+        ``None`` sum. Neither can reach here: the boundaries are the non-negative
+        :data:`DEFAULT_LATENCY_BUCKETS` and the sum is typed ``float``.
+        """
+        if self.type != "histogram":
+            raise TypeError(f"{self.name} is a {self.type}; use add_metric")
+        base = self._labels(labels)
+        for boundary, count in buckets:
+            self.samples.append(_Sample(f"{self.name}_bucket", {**base, "le": boundary}, count))
+        self.samples.append(_Sample(f"{self.name}_count", dict(base), buckets[-1][1]))
+        self.samples.append(_Sample(f"{self.name}_sum", dict(base), sum_value))
+
+
+def _gauge(name: str, documentation: str, labels: Sequence[str] = ()) -> _Family:
+    return _Family(name, documentation, "gauge", labels)
+
+
+def _counter(name: str, documentation: str, labels: Sequence[str] = ()) -> _Family:
+    return _Family(name, documentation, "counter", labels)
+
+
+def _format_value(value: float) -> str:
+    """A sample value as Go's ``strconv.FormatFloat(v, 'g', -1, 64)`` would write it.
+
+    The same algorithm as ``prometheus_client.utils.floatToGoString``: Python's shortest ``repr``,
+    except the special values and a positive number with more than six integer digits, which Go
+    writes in exponent form.
+    """
+    d = float(value)
+    if math.isnan(d):
+        return "NaN"
+    if math.isinf(d):
+        return "+Inf" if d > 0 else "-Inf"
+    s = repr(d)
+    dot = s.find(".")
+    if d > 0 and dot > 6:
+        mantissa = f"{s[0]}.{s[1:dot]}{s[dot + 1 :]}".rstrip("0.")
+        return f"{mantissa}e+{dot - 1:02d}"
+    return s
+
+
+def _escape_label_value(value: str) -> str:
+    """Backslash, newline and double quote, escaped in that order, as the format requires."""
+    return value.replace("\\", r"\\").replace("\n", r"\n").replace('"', r"\"")
+
+
+def _escape_help(text: str) -> str:
+    """Backslash and newline, escaped in that order. A HELP line leaves a double quote alone."""
+    return text.replace("\\", r"\\").replace("\n", r"\n")
+
+
+def _render_exposition(families: Iterable[_Family]) -> bytes:
+    """The Prometheus text exposition of ``families``, UTF-8 encoded.
+
+    Labels are written sorted by name, as prometheus_client wrote them, not in declaration order.
+    """
+    out: list[str] = []
+    for family in families:
+        name = family.exposed_name
+        out.append(f"# HELP {name} {_escape_help(family.documentation)}\n")
+        out.append(f"# TYPE {name} {family.type}\n")
+        for sample in family.samples:
+            labels = ""
+            if sample.labels:
+                pairs = ",".join(
+                    f'{key}="{_escape_label_value(value)}"'
+                    for key, value in sorted(sample.labels.items())
+                )
+                labels = f"{{{pairs}}}"
+            out.append(f"{sample.name}{labels} {_format_value(sample.value)}\n")
+    return "".join(out).encode("utf-8")
+
 
 # Host resource gauges (BACKLOG #74). psutil reads are microsecond-scale OS-counter reads, so they run
 # inline in gather_snapshot (off the pure-sync scrape path). cpu_percent(interval=None) is non-blocking
@@ -257,19 +390,20 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
 
 
 class _MetricsCollector:
-    """A ``prometheus_client`` custom collector that renders one :class:`_Snapshot`.
+    """Turns one :class:`_Snapshot` into the metric families :func:`_render_exposition` writes.
 
     :meth:`collect` is **pure-sync** — it only reads ``self._s``; it does no ``await``, no DB
-    access, and no other I/O. That keeps a scrape off the event loop and side-effect free.
+    access, and no other I/O. That keeps a scrape off the event loop and side-effect free. The
+    family ORDER it yields is the order on the wire, so a reorder changes the scrape bytes.
     """
 
     def __init__(self, snap: _Snapshot) -> None:
         self._s = snap
 
-    def collect(self) -> Iterable[Any]:
+    def collect(self) -> Iterable[_Family]:
         s = self._s
 
-        build = GaugeMetricFamily(
+        build = _gauge(
             "messagefoundry_build_info",
             "Build metadata; constant 1, version carried as a label.",
             labels=["version"],
@@ -280,27 +414,27 @@ class _MetricsCollector:
         # --- host resource gauges (BACKLOG #74) ------------------------------
         # Host/process aggregates, no PHI, no labels — absent when psutil couldn't read the counters.
         if s.host_cpu_percent is not None:
-            cpu = GaugeMetricFamily(
+            cpu = _gauge(
                 "messagefoundry_host_cpu_percent",
                 "Host-wide CPU utilization percent (0-100) since the previous scrape.",
             )
             cpu.add_metric([], s.host_cpu_percent)
             yield cpu
         if s.host_mem_used_bytes is not None and s.host_mem_total_bytes is not None:
-            mem_used = GaugeMetricFamily(
+            mem_used = _gauge(
                 "messagefoundry_host_memory_used_bytes",
                 "Host physical memory in use (total - available), bytes.",
             )
             mem_used.add_metric([], s.host_mem_used_bytes)
             yield mem_used
-            mem_total = GaugeMetricFamily(
+            mem_total = _gauge(
                 "messagefoundry_host_memory_total_bytes",
                 "Host total physical memory, bytes.",
             )
             mem_total.add_metric([], s.host_mem_total_bytes)
             yield mem_total
         if s.process_rss_bytes is not None:
-            rss = GaugeMetricFamily(
+            rss = _gauge(
                 "messagefoundry_process_resident_memory_bytes",
                 "Resident set size (RSS) of the engine process, bytes.",
             )
@@ -308,13 +442,13 @@ class _MetricsCollector:
             yield rss
 
         # --- inbound counters (per connection) -------------------------------
-        # CounterMetricFamily names omit the _total suffix; prometheus appends it on render.
-        received = CounterMetricFamily(
+        # Counter family names omit the _total suffix; _Family appends it to every exposed sample.
+        received = _counter(
             "messagefoundry_messages_received",
             "Messages received on an inbound connection (process lifetime).",
             labels=["connection"],
         )
-        errored = CounterMetricFamily(
+        errored = _counter(
             "messagefoundry_messages_errored",
             "Messages that failed intake/validation on an inbound connection (process lifetime).",
             labels=["connection"],
@@ -330,18 +464,18 @@ class _MetricsCollector:
         # rate(timeout)/rate(total) IS the proxy API's error budget, which is why `degraded` is a
         # distinct label value rather than folded into timeout.
         if s.sync_replies:
-            replies = CounterMetricFamily(
+            replies = _counter(
                 "messagefoundry_http_sync_replies_total",
                 "Synchronous captured-downstream replies resolved, by outcome (process lifetime).",
                 labels=["connection", "status"],
             )
-            wait = GaugeMetricFamily(
+            wait = _gauge(
                 "messagefoundry_http_sync_reply_wait_seconds",
                 "Mean time an HTTP turn blocked on a captured downstream reply (process lifetime). "
                 "Answers 'is this approaching reply_timeout?' before the pager does.",
                 labels=["connection"],
             )
-            waiters = GaugeMetricFamily(
+            waiters = _gauge(
                 "messagefoundry_http_sync_reply_waiters",
                 "HTTP turns currently blocked on a captured downstream reply.",
                 labels=["connection"],
@@ -357,22 +491,22 @@ class _MetricsCollector:
         yield errored
 
         # --- outbound counters + gauges (per connection/destination) ---------
-        deliveries = CounterMetricFamily(
+        deliveries = _counter(
             "messagefoundry_deliveries",
             "Messages delivered to an outbound connection (process lifetime).",
             labels=["connection", "destination"],
         )
-        deliveries_dead = CounterMetricFamily(
+        deliveries_dead = _counter(
             "messagefoundry_deliveries_dead",
             "Outbound deliveries that dead-lettered (process lifetime).",
             labels=["connection", "destination"],
         )
-        queue_depth = GaugeMetricFamily(
+        queue_depth = _gauge(
             "messagefoundry_queue_depth",
             "Current pending + inflight outbound rows for a destination.",
             labels=["connection", "destination"],
         )
-        oldest_pending_age = GaugeMetricFamily(
+        oldest_pending_age = _gauge(
             "messagefoundry_oldest_pending_age_seconds",
             "Age (seconds) of the oldest queued outbound row for a destination.",
             labels=["connection", "destination"],
@@ -391,7 +525,7 @@ class _MetricsCollector:
         yield oldest_pending_age
 
         # --- outbox status + whole-pipeline depth gauges ---------------------
-        outbox_status = GaugeMetricFamily(
+        outbox_status = _gauge(
             "messagefoundry_outbox_status",
             "Current count of outbound rows by status.",
             labels=["status"],
@@ -400,7 +534,7 @@ class _MetricsCollector:
             outbox_status.add_metric([status], float(count))
         yield outbox_status
 
-        in_pipeline = GaugeMetricFamily(
+        in_pipeline = _gauge(
             "messagefoundry_in_pipeline",
             "Current not-done rows across every stage (ingress + routed + outbound).",
         )
@@ -410,13 +544,13 @@ class _MetricsCollector:
         # --- DB throughput signals (BACKLOG #93) -----------------------------
         # Always-on A1 cost counters: physical commits + raw/payload body copies (process lifetime).
         # These are the store's write/commit-throughput signal (the DB work per message) — label-less.
-        committed = CounterMetricFamily(
+        committed = _counter(
             "messagefoundry_store_committed_txns",
             "Physical store transactions committed (process lifetime).",
         )
         committed.add_metric([], float(s.committed_txns))
         yield committed
-        body_copies = CounterMetricFamily(
+        body_copies = _counter(
             "messagefoundry_store_body_copies",
             "Raw/payload body strings durably written to the store (process lifetime).",
         )
@@ -424,7 +558,7 @@ class _MetricsCollector:
         yield body_copies
         # ADR 0157 C3 split-brain signal. A counter rather than a gauge because it only ever grows;
         # alert on rate(...) > 0, not on an absolute value.
-        fenced = CounterMetricFamily(
+        fenced = _counter(
             "messagefoundry_store_fenced_writes",
             "Terminal queue resolves rejected by the leader-epoch fence (process lifetime).",
         )
@@ -440,7 +574,7 @@ class _MetricsCollector:
         # allowlist. The reason string lives on /status and the console store panel instead.
         cp = s.claim_proc
         if cp is not None:
-            effective = GaugeMetricFamily(
+            effective = _gauge(
                 "messagefoundry_store_claim_proc_effective",
                 "1 when the ADR 0114 stored-procedure claim path passed its startup gate and is"
                 " active, 0 when it degraded to the shipped ad-hoc batch (claims still flow).",
@@ -450,7 +584,7 @@ class _MetricsCollector:
             # Which stored head form the deployed modules matched. "verbatim" means this server did
             # NOT rewrite the CREATE OR ALTER head — no engine measured to date does, so a fleet
             # reporting 1 here is a live counterexample worth knowing about, not a fault.
-            verbatim = GaugeMetricFamily(
+            verbatim = _gauge(
                 "messagefoundry_store_claim_proc_head_verbatim",
                 "1 when at least one deployed claim procedure's stored definition kept the CREATE"
                 " OR ALTER head verbatim (this server does not rewrite it), else 0.",
@@ -462,19 +596,19 @@ class _MetricsCollector:
         # no pool). [store].pool_size previously emitted NO saturation metric — these close that gap.
         pool = s.pool
         if pool is not None:
-            pool_max = GaugeMetricFamily(
+            pool_max = _gauge(
                 "messagefoundry_store_pool_max_connections",
                 "Configured maximum size of the store connection pool.",
             )
             pool_max.add_metric([], float(pool.max_size))
             yield pool_max
-            pool_size = GaugeMetricFamily(
+            pool_size = _gauge(
                 "messagefoundry_store_pool_open_connections",
                 "Connections currently open in the store pool.",
             )
             pool_size.add_metric([], float(pool.size))
             yield pool_size
-            pool_idle = GaugeMetricFamily(
+            pool_idle = _gauge(
                 "messagefoundry_store_pool_idle_connections",
                 "Currently-free (idle) connections in the store pool.",
             )
@@ -482,7 +616,7 @@ class _MetricsCollector:
             yield pool_idle
             # The explicit SATURATION signal: 1 when the pool has zero idle connections (every stage
             # worker waiting on it contends), 0 otherwise.
-            pool_saturated = GaugeMetricFamily(
+            pool_saturated = _gauge(
                 "messagefoundry_store_pool_saturated",
                 "1 when the store pool has zero idle connections (saturated), else 0.",
             )
@@ -497,13 +631,13 @@ class _MetricsCollector:
                 ("p99", aw.p99_ms),
                 ("max", aw.max_ms),
             ):
-                g = GaugeMetricFamily(
+                g = _gauge(
                     f"messagefoundry_store_pool_acquire_wait_{name}_seconds",
                     f"Store pool acquire() wait {name} (seconds) since process start.",
                 )
                 g.add_metric([], value_ms / 1000.0)
                 yield g
-            waits = CounterMetricFamily(
+            waits = _counter(
                 "messagefoundry_store_pool_acquire_waits",
                 "Store pool acquire() waits sampled (process lifetime).",
             )
@@ -511,9 +645,10 @@ class _MetricsCollector:
             yield waits
 
         # --- delivery-latency histogram (per connection/destination) ---------
-        latency = HistogramMetricFamily(
+        latency = _Family(
             "messagefoundry_delivery_latency_seconds",
             "Delivery latency (updated_at - created_at) over done outbound rows.",
+            "histogram",
             labels=["connection", "destination"],
         )
         for h in s.latency:
@@ -522,7 +657,7 @@ class _MetricsCollector:
                 for boundary, cum in zip(DEFAULT_LATENCY_BUCKETS, h.bucket_counts)  # noqa: B905
             ]
             buckets.append(("+Inf", float(h.count)))
-            latency.add_metric(
+            latency.add_histogram(
                 [h.channel_id, h.destination_name],
                 buckets=buckets,
                 sum_value=h.sum_seconds,
@@ -530,12 +665,14 @@ class _MetricsCollector:
         yield latency
 
 
+def _render_snapshot(snap: _Snapshot) -> bytes:
+    """The text exposition of one snapshot. Pure and synchronous: no I/O."""
+    return _render_exposition(_MetricsCollector(snap).collect())
+
+
 async def render_metrics(engine: Engine) -> bytes:
     """Gather a snapshot (off-loop) then render the Prometheus text exposition (pure sync)."""
-    snap = await gather_snapshot(engine)
-    registry = CollectorRegistry()
-    registry.register(_MetricsCollector(snap))
-    return generate_latest(registry)
+    return _render_snapshot(await gather_snapshot(engine))
 
 
 # --- optional OpenTelemetry seam (off by default) ---------------------------

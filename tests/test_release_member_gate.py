@@ -42,6 +42,7 @@ from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: 
 from forbidden_members import (  # noqa: E402
     FORBIDDEN_BASENAMES,
     FORBIDDEN_PATH_COMPONENTS,
+    RETIRED_ENGINE_PATHS,
     TEST_CONTENT_BASENAMES,
     TEST_CONTENT_PATH_COMPONENTS,
     TEST_TOOLING_DISTRIBUTIONS,
@@ -49,6 +50,7 @@ from forbidden_members import (  # noqa: E402
     distribution,
     forbidden,
     main,
+    split_violation,
 )
 
 #: hatchling names every sdist member ``<project>-<version>/...``. The fixtures carry it because the
@@ -450,6 +452,120 @@ def test_the_cli_reports_every_archive_not_just_the_first(
 
 
 # --------------------------------------------------------------------------------------------------
+# The third rule: the engine and toolkit split (ADR 0201 AC-6, BACKLOG #1192). Planted archives in
+# both the wheel and the sdist form, because the sdist's `<project>-<version>/` root is exactly what a
+# prefix match would miss.
+# --------------------------------------------------------------------------------------------------
+
+_ENGINE_WHEEL = "messagefoundry-0.4.0-py3-none-any.whl"
+_ENGINE_SDIST = "messagefoundry-0.4.0.tar.gz"
+_TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry/adr_analyze.py",  # the slice 2 retired path, wheel form
+        "messagefoundry-0.4.0/messagefoundry/adr_analyze.py",  # sdist form
+        "messagefoundry/ADR_Analyze.py",  # casefolded like every other rule
+        "messagefoundry\\adr_analyze.py",  # a backslash separator
+        "messagefoundry_toolkit/__init__.py",  # the toolkit package inside the engine
+        "messagefoundry-0.4.0/messagefoundry_toolkit/__main__.py",
+        "messagefoundry_toolkit.py",  # the import name as a top-level module
+        "messagefoundry-0.4.0.data/purelib/messagefoundry_toolkit.pth",
+    ],
+)
+def test_an_engine_archive_carrying_toolkit_code_is_refused(member: str) -> None:
+    assert split_violation(member, "messagefoundry") is not None
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry/__main__.py",
+        "messagefoundry/cli_common.py",
+        "messagefoundry-0.4.0/messagefoundry/config/impact.py",  # stays in the engine (ADR 0201)
+        "messagefoundry/tools/adr_analyze.py",  # not the retired run: a different parent
+        "adr_analyze.py",  # a run of one is not the two-component retired path
+    ],
+)
+def test_an_engine_archive_member_that_stays_is_allowed(member: str) -> None:
+    assert split_violation(member, "messagefoundry") is None
+
+
+def test_a_toolkit_archive_writing_into_the_engine_package_is_refused() -> None:
+    assert split_violation("messagefoundry/adr_analyze.py", "messagefoundry-toolkit") is not None
+    # PEP 427 installs every .data scheme outside the package: purelib and platlib into
+    # site-packages, scripts over the engine's own console script, data under sys.prefix.
+    for tail in (
+        "purelib/messagefoundry/x.py",
+        "platlib/messagefoundry/x.py",
+        "scripts/messagefoundry",
+        "data/lib/python3.14/site-packages/messagefoundry/x.py",
+    ):
+        member = f"messagefoundry_toolkit-0.4.0.data/{tail}"
+        assert split_violation(member, "messagefoundry-toolkit") is not None, member
+    assert (
+        split_violation("messagefoundry_toolkit/adr_analyze.py", "messagefoundry-toolkit") is None
+    )
+    # The rule is keyed on the distribution: the same member in the engine is the engine's own.
+    assert split_violation("messagefoundry/__init__.py", "messagefoundry") is None
+    # And a distribution the rule does not name is untouched by it.
+    assert split_violation("messagefoundry_toolkit/x.py", "messagefoundry-harness") is None
+
+
+def test_the_retired_paths_are_stored_casefolded() -> None:
+    """The same silent-disarm shape as the other rules: a non-casefolded entry never matches."""
+    assert RETIRED_ENGINE_PATHS, "the retired-path list is empty, so the rule retires nothing"
+    for run in RETIRED_ENGINE_PATHS:
+        assert all(part == part.casefold() for part in run), run
+    assert distribution(Path(_TOOLKIT_WHEEL)) == "messagefoundry-toolkit"
+
+
+def test_the_cli_refuses_engine_archives_carrying_a_retired_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdist = _write_sdist(
+        tmp_path / "dist" / _ENGINE_SDIST, (*_CLEAN_SDIST, "messagefoundry/adr_analyze.py")
+    )
+    wheel = _write_wheel(
+        tmp_path / "dist" / _ENGINE_WHEEL, (*_CLEAN_WHEEL, "messagefoundry_toolkit/__init__.py")
+    )
+    assert main([str(sdist), str(wheel)]) == 1
+    err = capsys.readouterr().err
+    assert "ships messagefoundry-0.3.0/messagefoundry/adr_analyze.py" in err
+    assert "ships messagefoundry_toolkit/__init__.py" in err
+
+
+def test_the_cli_refuses_a_toolkit_wheel_writing_into_the_engine(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wheel = _write_wheel(
+        tmp_path / "toolkit-dist" / _TOOLKIT_WHEEL,
+        ("messagefoundry_toolkit/__init__.py", "messagefoundry/generators/__init__.py"),
+    )
+    assert main([str(wheel)]) == 1
+    assert "ships messagefoundry/generators/__init__.py" in capsys.readouterr().err
+
+
+def test_the_cli_passes_a_clean_toolkit_wheel(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control for the two refusals above: the toolkit's own members pass every rule."""
+    wheel = _write_wheel(
+        tmp_path / "toolkit-dist" / _TOOLKIT_WHEEL,
+        (
+            "messagefoundry_toolkit/__init__.py",
+            "messagefoundry_toolkit/__main__.py",
+            "messagefoundry_toolkit/adr_analyze.py",
+            "messagefoundry_toolkit-0.4.0.dist-info/METADATA",
+        ),
+    )
+    assert main([str(wheel)]) == 0
+    assert "inspected 4 members" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------------------------------
 # The wiring. A gate no publishing job calls is the gap that was reported.
 # --------------------------------------------------------------------------------------------------
 
@@ -572,6 +688,26 @@ def test_no_step_hands_out_an_archive_the_member_gate_refused() -> None:
     )
 
 
+def test_the_toolkit_gate_keeps_its_id_and_the_upload_reads_it() -> None:
+    """The toolkit wheel rides the engine job (ADR 0201), so its gate needs its own id and the
+    job's dry-run upload, which now carries ``toolkit-dist/``, must refuse to hand out what that
+    gate refused. The generic guard above looks only for ``steps.member-gate.outcome``, which the
+    engine gate satisfies alone, so without this a renamed id or a dropped clause stays green."""
+    steps = _steps(_jobs()["release"])
+    gates = [s for s in steps if "toolkit-dist/" in str(s.get("run") or "")]
+    gates = [s for s in gates if _GATE_INVOCATION in str(s.get("run") or "")]
+    assert [s.get("id") for s in gates] == ["toolkit-member-gate"], gates
+    uploads = [
+        s
+        for s in steps
+        if "upload-artifact" in str(s.get("uses") or "")
+        and "toolkit-dist/" in str((s.get("with") or {}).get("path") or "")
+    ]
+    assert len(uploads) == 1, "the release job's dry-run upload no longer carries toolkit-dist/"
+    cond = str(uploads[0].get("if") or "")
+    assert "steps.toolkit-member-gate.outcome != 'failure'" in cond, cond
+
+
 def test_the_member_gate_step_keeps_the_id_that_guard_depends_on() -> None:
     """The guard above is a string reference. Renaming or dropping the id disarms it silently."""
     for jid, job in _publishing_jobs().items():
@@ -590,7 +726,8 @@ def test_each_job_gates_the_artifacts_it_actually_builds() -> None:
     reason, not about the leak.
     """
     expected = {
-        "release": ("dist/",),
+        # The toolkit wheel is built and published inside the engine job (ADR 0201).
+        "release": ("dist/", "toolkit-dist/"),
         "release-webconsole": ("webconsole-dist/",),
         "release-harness": ("harness-dist/",),
     }
@@ -684,6 +821,7 @@ def _sandbox(tmp_path: Path, *, gate_source: str | None = None) -> Path:
         root / "webconsole-dist" / "messagefoundry_webconsole-0.3.0-py3-none-any.whl",
         ("messagefoundry_webconsole/__init__.py",),
     )
+    _write_wheel(root / "dist" / "messagefoundry-0.3.0-py3-none-any.whl", _CLEAN_WHEEL)
     target = root / "scripts" / "release" / GATE.name
     if gate_source is None:
         shutil.copy2(GATE, target)
@@ -817,4 +955,46 @@ def test_the_test_content_control_fails_when_the_console_is_exempted(tmp_path: P
     proc = _run_control(tmp_path, root, _control_step_script(_TEST_CONTENT_STEP))
     out = _output(proc)
     assert proc.returncode != 0, f"the control passed with the console exempted:\n{out}"
+    assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
+
+
+# --------------------------------------------------------------------------------------------------
+# `ci.yml`'s retired-path control (ADR 0201 AC-6), RUN rather than read, for the same reason again.
+# --------------------------------------------------------------------------------------------------
+
+_RETIRED_PATH_STEP = "Retired-path control"
+
+
+def test_the_retired_path_control_passes_when_the_gate_refuses_the_moved_module(
+    tmp_path: Path,
+) -> None:
+    """ARM ONE. The real gate, an engine wheel under its real filename, the slice 2 retired path."""
+    proc = _run_control(tmp_path, _sandbox(tmp_path), _control_step_script(_RETIRED_PATH_STEP))
+    out = _output(proc)
+    assert proc.returncode == 0, (
+        explain_returncode(proc.returncode, "ci.yml's retired-path control") + "\n" + out
+    )
+    assert "ships messagefoundry/adr_analyze.py" in out, (
+        f"the gate never named the retired path, so the control passed without firing:\n{out}"
+    )
+
+
+def test_the_retired_path_control_fails_when_the_gate_accepts(tmp_path: Path) -> None:
+    """ARM TWO. A gate that accepts everything must red the control, and say why."""
+    root = _sandbox(tmp_path, gate_source=_ACCEPTING_GATE)
+    proc = _run_control(tmp_path, root, _control_step_script(_RETIRED_PATH_STEP))
+    out = _output(proc)
+    assert proc.returncode != 0, f"the control accepted a gate that shipped a moved module:\n{out}"
+    assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"
+
+
+def test_the_retired_path_control_fails_when_the_rule_retires_nothing(tmp_path: Path) -> None:
+    """ARM THREE. Emptying the retired-path list is the regression this control exists for."""
+    real = GATE.read_text(encoding="utf-8")
+    emptied = real.replace('    ("messagefoundry", "adr_analyze.py"),\n', "")
+    assert emptied != real, "the retired-path list is not spelled the way this mutation expects"
+    root = _sandbox(tmp_path, gate_source=emptied)
+    proc = _run_control(tmp_path, root, _control_step_script(_RETIRED_PATH_STEP))
+    out = _output(proc)
+    assert proc.returncode != 0, f"the control passed with no retired path listed:\n{out}"
     assert "ACCEPTED" in out, f"the control failed, but not for the reason it names:\n{out}"

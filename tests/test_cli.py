@@ -58,10 +58,13 @@ def test_top_level_help_encodes_on_legacy_windows_codepage(
     # console because of a U+2192 arrow in the adr-analyze subparser help. Render the help string
     # in-process and assert it survives a cp1252 encode -- reproduces the Windows-only crash on any
     # runner without touching the real terminal (argparse --help raises SystemExit after printing).
+    # adr-analyze has since moved to the toolkit command (ADR 0201 slice 2), whose own help has the
+    # twin of this test in tests/test_toolkit_cli.py; the engine's epilog still names it.
     with pytest.raises(SystemExit):
         main(["--help"])
     help_text = capsys.readouterr().out
-    assert "adr-analyze" in help_text, "top-level help did not render the subcommand list"
+    assert "supervise" in help_text, "top-level help did not render the subcommand list"
+    assert "messagefoundry-toolkit" in help_text, "top-level help lost the toolkit epilog"
     try:
         help_text.encode("cp1252")
     except UnicodeEncodeError as exc:

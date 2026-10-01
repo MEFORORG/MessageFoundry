@@ -223,6 +223,7 @@ METHOD_RULES: dict[str, str] = {
     "set_default_verify_paths": "tls_context",
     "set_ciphers": "tls_context",
     "set_ciphersuites": "tls_context",
+    "set_server_sigalgs": "tls_context",
     "set_ecdh_curve": "tls_context",
     "wrap_socket": "tls_context",
     "wrap_bio": "tls_context",

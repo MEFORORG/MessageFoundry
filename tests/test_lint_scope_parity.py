@@ -66,8 +66,9 @@ import pytest
 # importorskip fails SILENTLY GREEN, and this file is the only thing holding the ruff hook and the
 # ruff CI gate together, so if pytest ever drops that dependency the right outcome is a loud
 # collection error, not this file quietly vanishing from the run. (`yaml` is genuinely different:
-# PyYAML is declared by no first-party extra, reaching the lock transitively, so its guard CAN fire
-# -- and if it ever does, every assertion below stops running without going red. Watch for a SKIP.)
+# PyYAML is declared only by the `dev` extra, and a venv installed without that extra lacks it, so
+# its guard CAN fire -- and if it ever does, every assertion below stops running without going red.
+# Watch for a SKIP.)
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
