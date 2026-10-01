@@ -471,7 +471,7 @@ async def test_terminate_escalates_to_kill_after_grace() -> None:
     assert proc.terminated and proc.killed  # escalated to kill after the grace elapsed
 
 
-# --- the pre-flight: a config must load the way a shard will load it (vault BACKLOG #2587) -------
+# --- the pre-flight: a config must load the way an engine shard will load it (vault BACKLOG #2587) -------
 
 _SHARD_GRAPH = """
 from messagefoundry import inbound, outbound, router, handler, MLLP, Send
@@ -506,8 +506,8 @@ async def test_a_config_that_needs_the_working_directory_is_refused_before_any_s
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The config imports a helper that is importable only from the working directory. The
-    supervisor's own load finds it; a shard would not, and would be restarted for ever. So the
-    refusal has to come once, here, before a shard exists."""
+    supervisor's own load finds it; an engine shard would not, and would be restarted for ever. So the
+    refusal has to come once, here, before an engine shard exists."""
     config = _shard_config(tmp_path, _CWD_HELPER)
     (tmp_path / f"{_CWD_HELPER}.py").write_text('NAME = "IB_PREFLIGHT"\n', encoding="utf-8")
     monkeypatch.chdir(tmp_path)
@@ -527,6 +527,22 @@ async def test_a_config_that_needs_the_working_directory_is_refused_before_any_s
     assert built == []
     assert "`_`-prefixed" in caplog.text
     assert _CWD_HELPER in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_preflight_reports_the_exception_whatever_its_message_holds(
+    tmp_path: Path,
+) -> None:
+    """A message of several lines still arrives with the exception's name and its first line."""
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "graph.py").write_text(
+        'raise ValueError("the first line names the problem\\nthe second line")\n', encoding="utf-8"
+    )
+    refusal = await preflight_shard_config(str(config))
+    assert refusal is not None
+    assert "the first line names the problem the second line" in refusal
+    assert "`_`-prefixed" not in refusal  # not an import failure, so no advice about helpers
 
 
 @pytest.mark.asyncio

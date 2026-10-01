@@ -23,6 +23,7 @@ import ast
 import asyncio
 import functools
 import os
+import site
 import subprocess
 import sys
 from collections import Counter
@@ -33,7 +34,7 @@ from typing import Any
 import pytest
 
 import messagefoundry
-from messagefoundry import childenv
+from messagefoundry import _child_bootstrap, childenv
 from messagefoundry.config import settings
 from messagefoundry.config.environments import VALUE_ENV_PREFIX
 from messagefoundry.config.run_context import RunContext
@@ -405,8 +406,9 @@ def test_the_bootstrap_runs_a_module_with_its_arguments_and_without_the_working_
     tmp_path: Path,
 ) -> None:
     """Through a real interpreter, the way an engine shard starts: the module runs as ``__main__``,
-    its argument arrives, and a decoy package of the same name in the working directory does not
-    answer in place of this build."""
+    its argument arrives, and a decoy package of the same name does not answer in place of this
+    build. The decoy is in the working directory AND on an absolute ``PYTHONPATH`` entry, which the
+    interpreter searches ahead of everything the bootstrap can add."""
     decoy = tmp_path / "messagefoundry"
     decoy.mkdir()
     (decoy / "__init__.py").write_text("raise SystemExit('the decoy answered')\n", encoding="utf-8")
@@ -414,7 +416,7 @@ def test_the_bootstrap_runs_a_module_with_its_arguments_and_without_the_working_
     done = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
         [*childenv.python_child_argv("messagefoundry"), "--version"],
         cwd=tmp_path,
-        env=childenv.engine_environment(),
+        env=childenv.engine_environment({**os.environ, "PYTHONPATH": str(tmp_path)}),
         capture_output=True,
         text=True,
         timeout=120,
@@ -422,6 +424,34 @@ def test_the_bootstrap_runs_a_module_with_its_arguments_and_without_the_working_
     )
     assert done.returncode == 0, done.stderr
     assert f"package: {Path(messagefoundry.__file__).resolve().parent}" in done.stdout
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        # Not on the path: it goes after the standard library and ahead of site-packages.
+        (["zip", "stdlib", "site", "user-site"], ["zip", "stdlib", "ROOT", "site", "user-site"]),
+        # No site-packages on the path at all: last.
+        (["zip", "stdlib"], ["zip", "stdlib", "ROOT"]),
+        # Already there, which is the installed case: untouched.
+        (["zip", "stdlib", "site", "ROOT"], ["zip", "stdlib", "site", "ROOT"]),
+    ],
+)
+def test_where_the_bootstrap_puts_the_package_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: list[str], expected: list[str]
+) -> None:
+    """The placement itself. An editable install already has the directory on the path, so a real
+    child in this suite never takes the inserting branch."""
+    root = str(Path(messagefoundry.__file__).resolve().parent.parent)
+
+    def real(names: list[str]) -> list[str]:
+        return [root if name == "ROOT" else str(tmp_path / name) for name in names]
+
+    monkeypatch.setattr(site, "getsitepackages", lambda: real(["site"]))
+    monkeypatch.setattr(site, "getusersitepackages", lambda: real(["user-site"])[0])
+    monkeypatch.setattr(sys, "path", real(path))
+    _child_bootstrap._place_package_root()
+    assert sys.path == real(expected)
 
 
 # --- the static guard ---------------------------------------------------------------------------

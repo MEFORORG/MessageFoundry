@@ -1079,27 +1079,29 @@ def encode_bootfail(error: str) -> bytes:
     return encode_frame(header, blobs.items)
 
 
-def decode_boot_reply(body: bytes) -> tuple[bool, str, GraphShape | None]:
-    """``(ready, error, graph)``. ``error`` is type-checked to ``str`` BEFORE the parent interpolates
-    it, so a child-supplied object's ``__format__``/``__repr__`` is never invoked in the engine. The
-    graph is rebuilt from strings only, for the same reason; it is ``None`` on a ``bootfail``."""
+def decode_boot_reply(body: bytes) -> tuple[GraphShape | None, str]:
+    """``(graph, error)``: the worker's graph on ``ready``, or ``None`` and why on ``bootfail``.
+
+    ``error`` is type-checked to ``str`` BEFORE the parent interpolates it, so a child-supplied
+    object's ``__format__``/``__repr__`` is never invoked in the engine. The graph is rebuilt from
+    strings only, for the same reason."""
     header, reader, kind = _open(body, ("ready", "bootfail"))
-    if kind == "ready":
-        graph = _req_obj(header.get("graph"), "graph")
-        bindings: dict[str, str] = {}
-        for pair in _req_list(graph.get("bindings"), "graph bindings"):
-            if len(_req_list(pair, "graph binding")) != 2:
-                raise SandboxCodecError("sandbox graph binding must be a pair")
-            bindings[_req_str(pair[0], "graph binding")] = _req_str(pair[1], "graph binding")
-        shape = GraphShape(
-            bindings=bindings,
-            **{key: _dec_names(graph.get(key), f"graph {key}") for key in _SHAPE_SETS},
-        )
+    if kind == "bootfail":
+        error = reader.text(header.get("error"))
         reader.finish()
-        return True, "", shape
-    error = reader.text(header.get("error"))
+        return None, error
+    graph = _req_obj(header.get("graph"), "graph")
+    bindings: dict[str, str] = {}
+    for pair in _req_list(graph.get("bindings"), "graph bindings"):
+        if len(_req_list(pair, "graph binding")) != 2:
+            raise SandboxCodecError("sandbox graph binding must be a pair")
+        bindings[_req_str(pair[0], "graph binding")] = _req_str(pair[1], "graph binding")
+    shape = GraphShape(
+        bindings=bindings,
+        **{key: _dec_names(graph.get(key), f"graph {key}") for key in _SHAPE_SETS},
+    )
     reader.finish()
-    return False, error, None
+    return shape, ""
 
 
 def encode_request(

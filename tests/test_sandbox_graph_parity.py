@@ -79,7 +79,7 @@ def _dispatch(registry: Registry, config_dir: str, *passed: str, compare: bool =
         inbound="IB_PARITY",
         config_dir=config_dir,
         env=None,
-        graph=graph_shape(registry) if compare else None,
+        graph=(lambda: graph_shape(registry)) if compare else None,
     )
     try:
         deliveries, _, _, _ = transform_one(
@@ -108,7 +108,42 @@ def test_a_worker_whose_graph_differs_from_the_engines_is_refused(
     assert "IB_PARITY" in text
     assert "allowlist" in text
     assert "[sandbox].pass_environment" in text
-    assert "handlers" in text
+    assert "reload" in text
+    # What differs, and on which side: the engine has two handlers the worker never built.
+    assert "handlers (engine only: h_1, h_2)" in text
+
+
+def test_a_refused_worker_is_not_started_again_for_the_same_graph(
+    config_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mismatch cannot clear while the engine serves the same graph, so the next message is
+    refused without starting another interpreter. A new engine graph is tried afresh."""
+    monkeypatch.setenv(_VARIABLE, "3")
+    registry = load_config(config_dir)
+    serving = [graph_shape(registry)]
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
+        inbound="IB_PARITY",
+        config_dir=config_dir,
+        env=None,
+        graph=lambda: serving[0],
+    )
+    try:
+        with pytest.raises(SandboxError) as first:
+            session._spawn()
+        assert session._generation == 1
+        with pytest.raises(SandboxError) as second:
+            session._spawn()
+        assert session._generation == 1  # no second worker was started
+        assert str(second.value) == str(first.value)
+
+        # The engine now serves the one-handler graph the worker builds: tried again, and it starts.
+        monkeypatch.delenv(_VARIABLE)
+        serving[0] = graph_shape(load_config(config_dir))
+        session._spawn()
+        assert session._generation == 2
+    finally:
+        session.close()
 
 
 def test_the_same_graph_comes_up_when_the_variable_is_passed(
@@ -148,15 +183,21 @@ async def test_the_runner_hands_each_session_the_graph_it_is_serving(
         first = runner._sandbox_for("IB_PARITY")
         second = runner._sandbox_for("IB_OTHER")
         assert first is not None and second is not None
-        assert first._graph == graph_shape(registry)
-        assert first._graph is second._graph
+        assert first._graph is not None and second._graph is not None
+        assert first._graph() == graph_shape(registry)
+        assert first._graph() is second._graph()
 
+        # A session that outlives a registry swap, in either direction, compares with the registry
+        # being served when its worker starts, never with the one it was made under.
         monkeypatch.setenv(_VARIABLE, "1")
-        runner.registry = load_config(config_dir)
-        runner._sandbox_sessions.clear()  # what a reload does
-        after = runner._sandbox_for("IB_PARITY")
-        assert after is not None and after._graph == graph_shape(runner.registry)
-        assert after._graph != first._graph
+        swapped = load_config(config_dir)
+        runner.registry = swapped
+        assert first._graph() == graph_shape(swapped)
+        assert first._graph() != graph_shape(registry)
+
+        # Dropping the sessions, as a reload and a failed reload's rollback both do.
+        await runner._close_sandbox_sessions()
+        assert runner._sandbox_sessions == {}
     finally:
         await store.close()
 
@@ -192,7 +233,18 @@ def test_an_equal_shape_has_no_difference() -> None:
     ],
 )
 def test_each_part_of_the_shape_is_compared(changes: dict[str, object], expected: str) -> None:
-    assert graph_differences(_shape(), _shape(**changes)) == [expected]
+    (difference,) = graph_differences(_shape(), _shape(**changes))
+    assert difference.startswith(expected + " (")
+
+
+def test_a_difference_names_a_few_of_the_names_and_the_side_that_has_them() -> None:
+    worker = _shape(handlers=frozenset({"h", "w1", "w2", "w3", "w4"}), routers=frozenset())
+    assert graph_differences(_shape(), worker) == [
+        "routers (engine only: r)",
+        "handlers (worker only: w1, w2, w3 and 1 more)",
+    ]
+    rebound = _shape(bindings={"IB_A": "other"})
+    assert graph_differences(_shape(), rebound) == ["router bindings (of inbound: IB_A)"]
 
 
 def test_an_engine_shard_compares_only_the_bindings_it_holds() -> None:
@@ -203,8 +255,8 @@ def test_an_engine_shard_compares_only_the_bindings_it_holds() -> None:
 
 
 def test_the_shape_crosses_the_pipe_and_back() -> None:
-    ready, detail, shape = codec.decode_boot_reply(codec.encode_ready(_shape()))
-    assert (ready, detail, shape) == (True, "", _shape())
+    assert codec.decode_boot_reply(codec.encode_ready(_shape())) == (_shape(), "")
+    assert codec.decode_boot_reply(codec.encode_bootfail("why")) == (None, "why")
 
 
 def test_the_shape_of_a_loaded_graph(config_dir: str, monkeypatch: pytest.MonkeyPatch) -> None:

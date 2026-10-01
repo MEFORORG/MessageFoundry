@@ -176,14 +176,14 @@ PREFLIGHT_SECONDS = 120.0
 
 
 async def preflight_shard_config(config: str) -> str | None:
-    """Load ``config`` once in a child that has a shard's import path. ``None`` means it loaded;
-    otherwise the text says why a shard could not load it.
+    """Load ``config`` once in a child that has an engine shard's import path. ``None`` means it
+    loaded; otherwise the text says why an engine shard could not load it.
 
     The supervisor's own discovery loads the config in THIS process, where ``python -m`` put the
-    working directory on the import path. A shard does not search the working directory
+    working directory on the import path. An engine shard does not search the working directory
     (:func:`messagefoundry.childenv.python_child_argv`). So a config that imports a helper from
-    there loads here and fails in every shard, and a shard that fails is restarted. Loading it
-    under the shard's rule first makes that one refusal, before any shard exists."""
+    there loads here and fails in every engine shard, and one that fails is restarted. Loading it
+    under the engine shard's rule first makes that one refusal, before any of them exists."""
     process = await asyncio.create_subprocess_exec(
         *python_child_argv(_PREFLIGHT_MODULE),
         config,
@@ -197,8 +197,8 @@ async def preflight_shard_config(config: str) -> str | None:
         process.kill()
         await process.wait()
         return (
-            f"config {config!r} did not finish loading under a shard's import path within "
-            f"{PREFLIGHT_SECONDS:g}s; no shard was started"
+            f"config {config!r} did not finish loading under an engine shard's import path "
+            f"within {PREFLIGHT_SECONDS:g}s; no engine shard was started"
         )
     if process.returncode == 0:
         return None
@@ -207,11 +207,12 @@ async def preflight_shard_config(config: str) -> str | None:
     said = scrub_control_chars(lines[-1])[:300] if lines else f"exit {process.returncode}"
     refusal = (
         f"config {config!r} loads in the supervisor but not in an engine shard ({said}); "
-        "no shard was started."
+        "no engine shard was started."
     )
     if process.returncode == _config_preflight.EXIT_IMPORT:
         refusal += (
-            " A shard does not search the working directory for imports. A config helper must be "
+            " An engine shard does not search the working directory for imports. A config helper "
+            "must be "
             "a `_`-prefixed file beside the config, or an installed package."
         )
     return refusal
