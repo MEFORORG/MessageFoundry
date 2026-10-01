@@ -44,6 +44,7 @@ from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 from messagefoundry.transports.base import InboundHandler, SourceConnector
+from tests._pool_lend import LendsItself
 
 # host:pid:hex8 — the shared identity shape (== PostgresStore._owner).
 _NODE_ID_RE = re.compile(r"^.+:\d+:[0-9a-f]{8}$")
@@ -255,7 +256,7 @@ async def _members_via_helper(rows: _Rows) -> list[ClusterMember]:
 
 
 async def _members_via_db_coordinator(rows: _Rows) -> list[ClusterMember]:
-    class _Pool:
+    class _Pool(LendsItself):
         async def fetch(self, sql: str, *args: object) -> _Rows:
             assert "FROM nodes" in sql
             return rows

@@ -63,6 +63,7 @@ from messagefoundry.pipeline.cluster import (
     members_from_node_rows,
     rows_affected,
     stepdown_pause_seconds,
+    stop_tasks_within,
 )
 from messagefoundry.redaction import safe_exc
 
@@ -199,10 +200,9 @@ class SqlServerCoordinator:
         tasks = [t for t in (self._heartbeat_task, self._fence_task) if t is not None]
         self._heartbeat_task = None
         self._fence_task = None
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Bounded (BACKLOG #2523), as DbCoordinator.stop() is: the store quarantines a cancelled
+        # connection, but its pool release and a slow quarantine close are not bounded here.
+        await stop_tasks_within(tasks, self._stop_write_timeout, self.node_id)
         # Demote the cached gate FIRST (a concurrent is_leader() reader sees "not leader" at once), then
         # expire the lease row at the DB clock's now, so a standby need not wait out the TTL and still
         # waits its own acquire_delay (BACKLOG #1986; DbCoordinator.stop() says why). Deliberately

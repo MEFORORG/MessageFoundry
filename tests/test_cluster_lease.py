@@ -40,6 +40,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.cluster_sqlserver import _DB_NOW as _SQLSERVER_DB_NOW
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+from tests._pool_lend import LendsItself
 
 
 class _Clock:
@@ -114,7 +115,7 @@ class _FakeLeaseDB:
         return None if self.row is None else {"owner": self.row["owner"]}
 
 
-class _FakeLeasePool:
+class _FakeLeasePool(LendsItself):
     """One node's view of the pool over a shared :class:`_FakeLeaseDB`. Emulates the two statements the
     coordinator issues for the lease; ``fail=True`` makes every call raise to simulate this node being
     partitioned from (or the DB hung for) THIS node only — the other node's pool keeps working.
@@ -146,15 +147,10 @@ class _FakeLeasePool:
         # release-retry tests ask "was a second UPDATE sent at all", and a row that already reads
         # released cannot distinguish a re-sent write from a write that never happened twice.
         self.on_execute_args: Callable[[tuple[object, ...]], None] | None = None
-        # The per-statement timeout the claim was issued with (ADR 0157 Inc 0's clamp), as asyncpg
-        # would receive it. Recorded rather than only asserted so a test can pin the VALUE that
-        # reached the statement, not merely that some keyword arrived.
-        self.last_fetchrow_timeout: float | None = None
 
-    async def fetchrow(
-        self, sql: str, *args: object, timeout: float | None = None
-    ) -> dict[str, object] | None:
-        self.last_fetchrow_timeout = timeout
+    async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
+        # No per-statement timeout keyword: since BACKLOG #2523 the coordinator bounds the borrow
+        # instead, and LendsItself records that bound.
         if self.yield_in_fetchrow:
             await asyncio.sleep(0)  # the claim round trip is in flight; let another task run
         if self.fail:

@@ -25,7 +25,6 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from pathlib import Path
-from types import TracebackType
 
 import pytest
 
@@ -54,23 +53,8 @@ BACKENDS = pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
 
 
 class _PgStopPool(_FakeLeasePool):
-    """The Postgres stand-in plus the two things ``stop()`` needs from a pool: ``acquire`` (its writes
-    go through :func:`~messagefoundry.pipeline.cluster._execute_within`) and a ``nodes`` tombstone.
-    The lease statement still goes through the parent, which asserts its SQL text."""
-
-    def acquire(self, *, timeout: float | None = None) -> _PgStopPool:
-        return self
-
-    async def __aenter__(self) -> _PgStopPool:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        return None
+    """The Postgres stand-in plus the ``nodes`` tombstone ``stop()`` sends after the release. The
+    lease statement still goes through the parent, which asserts its SQL text."""
 
     async def execute(self, sql: str, *args: object) -> str:
         if sql.startswith("UPDATE nodes"):

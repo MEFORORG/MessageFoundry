@@ -142,8 +142,9 @@ class _PgAcquired:
 
 
 class _PgPool:
-    """One node's asyncpg-shaped view of the shared row. ``execute`` serves both ``pool.execute`` (the
-    stepdown's unbounded path) and ``con.execute`` (stop()'s path through ``acquire``)."""
+    """One node's asyncpg-shaped view of the shared row. It lends itself as the connection, so
+    ``con.execute`` and ``con.fetchrow`` land here; since BACKLOG #2523 every statement the
+    coordinator sends borrows through ``acquire``."""
 
     def __init__(self, lease: _LeaseRow) -> None:
         self._lease = lease
@@ -266,6 +267,8 @@ async def test_pg_stop_writes_go_through_a_bounded_acquire() -> None:
     pool = _PgPool(lease)
     a = _pg(pool, "A", _Clock(0.0))
     await _lead_then_self_fence(a)
+    # The claim borrowed too, at the renew clamp (BACKLOG #2523); only stop()'s two writes count here.
+    pool.acquire_timeouts.clear()
     await a.stop()
     assert pool.acquire_timeouts == [_BOUND, _BOUND]
 

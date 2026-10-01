@@ -59,6 +59,7 @@ from messagefoundry.pipeline.cluster import (
     fence_tick_seconds,
 )
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+from tests._pool_lend import LendsItself
 
 # A clustered node needs a server-DB store, so every [cluster] config below carries one.
 _PG = '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
@@ -386,8 +387,11 @@ class _Clock:
         return self.t
 
 
-class _RecordingPool:
+class _RecordingPool(LendsItself):
     """A lease pool that records the per-statement timeout and can advance either clock mid-flight.
+
+    Since BACKLOG #2523 the clamp reaches the statement as the timeout on its borrow, which
+    :class:`LendsItself` records; ``last_timeout`` reads it back.
 
     ``db_advance_before`` moves the DB clock to the instant the statement EXECUTES (which is where a
     real server stamps ``lease_expires_at``); ``mono_advance_after`` moves this node's monotonic clock
@@ -407,14 +411,14 @@ class _RecordingPool:
         self._mono = mono
         self._db_advance_before = db_advance_before
         self._mono_advance_after = mono_advance_after
-        self.last_timeout: float | None = None
         self.calls = 0
         self.lease_expires_at: float | None = None
 
-    async def fetchrow(
-        self, sql: str, *args: object, timeout: float | None = None
-    ) -> dict[str, object] | None:
-        self.last_timeout = timeout
+    @property
+    def last_timeout(self) -> float | None:
+        return self.last_acquire_timeout
+
+    async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
         self.calls += 1
         if self._db_advance_before is not None:
             self._db_clock.t = self._db_advance_before
@@ -586,10 +590,7 @@ async def test_a_failed_renew_leaves_the_baseline_where_it_was() -> None:
     advance the baseline, or a node whose DB is unreachable would refresh its own fence forever."""
 
     class _FailingPool(_RecordingPool):
-        async def fetchrow(
-            self, sql: str, *args: object, timeout: float | None = None
-        ) -> dict[str, object] | None:
-            self.last_timeout = timeout
+        async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
             raise TimeoutError("statement timeout")
 
     mono = _Clock(0.0)
