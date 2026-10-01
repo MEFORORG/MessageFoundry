@@ -221,49 +221,66 @@ def test_release_load_bearing_canaries_present() -> None:
     assert not missing, f"release.yml lost these load-bearing guards: {missing}"
 
 
-#: The Windows-resolved engine SBOM, built by the unprivileged `sbom-windows` job and shipped by the
-#: `release` job beside the Linux one (docs/SUPPLY-CHAIN.md, ADR 0149's 2026-09-30 amendment).
-_WINDOWS_SBOM = "messagefoundry-sbom-windows.cdx.json"
-_ENGINE_SBOMS = ("messagefoundry-sbom.cdx.json", _WINDOWS_SBOM)
+#: The two engine SBOMs, each built by its own unprivileged job and shipped by the `release` job:
+#: ``(job, runner, file)``. Two runners because the core lock's ``sys_platform`` markers resolve
+#: differently on win32 (docs/SUPPLY-CHAIN.md, ADR 0149's 2026-09-30 amendment).
+_SBOM_BUILD_JOBS = (
+    ("sbom-linux", "ubuntu-latest", "messagefoundry-sbom.cdx.json"),
+    ("sbom-windows", "windows-latest", "messagefoundry-sbom-windows.cdx.json"),
+)
+_ENGINE_SBOMS = tuple(f for _, _, f in _SBOM_BUILD_JOBS)
 
 
-def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one() -> None:
-    """The Windows SBOM must reach every sink the Linux SBOM reaches, and be built without the key.
+def _run_shell(step: dict) -> str:
+    """A step's executed shell, comments dropped, so a rationale comment naming a tool is not a call."""
+    return _executed_shell(str(step.get("run") or ""))
+
+
+@pytest.mark.parametrize(("job_name", "runner", "sbom"), _SBOM_BUILD_JOBS)
+def test_each_engine_sbom_is_built_unprivileged_and_handed_to_release(
+    job_name: str, runner: str, sbom: str
+) -> None:
+    """Each engine SBOM is built OUTSIDE the signing job, and only downloaded into it.
 
     Each assertion names a way it silently goes wrong:
 
-    - the job must run on a WINDOWS runner, because only a Windows interpreter resolves the core lock's
-      ``sys_platform`` markers as a Windows install does -- moved to Linux, it is a second Linux SBOM
-      with a Windows filename;
-    - it holds ``contents: read`` ONLY, so nothing it runs sits beside the signing identity;
+    - the job runs on ITS runner, because only that interpreter resolves the core lock's
+      ``sys_platform`` markers as an install there does -- the Windows job moved to Linux is a second
+      Linux SBOM with a Windows filename;
+    - it holds ``contents: read`` ONLY, so the release-tools install, the core-lock install and
+      ``cyclonedx_py environment`` never run beside the signing identity;
     - it runs exactly when ``release`` does: the same job ``if:``, and ``release`` needs it, so a
       release cannot proceed without the file or ship one from a skipped job;
-    - its upload refuses a missing file, rather than failing two jobs later at the download;
-    - the ``release`` job downloads it, and it is signed, SLSA-attested, attached to the GitHub
-      release and uploaded as a workflow artifact. Both engine SBOMs are held to those four sinks, so
-      neither can drop out of one while the other still reaches it.
+    - its upload refuses a missing file, rather than failing a job later at the download;
+    - the ``release`` job downloads it exactly once, and builds no SBOM itself. The last arm is what
+      the 2026-09-30 move exists for: a `cyclonedx_py` step back inside ``release`` puts package
+      installs beside the key again while every sink check below stays green.
     """
     jobs = _jobs()
-    win, rel = jobs.get("sbom-windows"), jobs.get("release")
-    assert win and rel, "release.yml lost its `sbom-windows` or `release` job"
+    build, rel = jobs.get(job_name), jobs.get("release")
+    assert build and rel, f"release.yml lost its `{job_name}` or `release` job"
 
-    assert win.get("runs-on") == "windows-latest", win.get("runs-on")
-    assert win.get("permissions") == {"contents": "read"}, win.get("permissions")
-    assert _despace(str(win.get("if"))) == _despace(str(rel.get("if"))), (
-        f"sbom-windows and release must share one job guard: {win.get('if')!r} vs {rel.get('if')!r}"
+    assert build.get("runs-on") == runner, build.get("runs-on")
+    assert build.get("permissions") == {"contents": "read"}, build.get("permissions")
+    assert _despace(str(build.get("if"))) == _despace(str(rel.get("if"))), (
+        f"{job_name} and release must share one job guard: {build.get('if')!r} vs {rel.get('if')!r}"
     )
     needs = rel.get("needs")
-    assert "sbom-windows" in ([needs] if isinstance(needs, str) else list(needs or [])), needs
+    assert job_name in ([needs] if isinstance(needs, str) else list(needs or [])), needs
 
+    built_here = [
+        st for st in build.get("steps") or [] if "cyclonedx_py environment" in _run_shell(st)
+    ]
+    assert len(built_here) == 1, f"{job_name} has {len(built_here)} SBOM build steps"
     uploads = [
         st
-        for st in win.get("steps") or []
+        for st in build.get("steps") or []
         if str(st.get("uses", "")).startswith("actions/upload-artifact@")
     ]
-    assert len(uploads) == 1, f"sbom-windows has {len(uploads)} artifact uploads"
+    assert len(uploads) == 1, f"{job_name} has {len(uploads)} artifact uploads"
     assert uploads[0]["with"].get("if-no-files-found") == "error", uploads[0]["with"]
     artifact = uploads[0]["with"]["name"]
-    assert uploads[0]["with"]["path"] == _WINDOWS_SBOM
+    assert uploads[0]["with"]["path"] == sbom
 
     steps = rel.get("steps") or []
     downloads = [
@@ -275,6 +292,18 @@ def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one()
     assert len(downloads) == 1, (
         f"release downloads the {artifact!r} artifact {len(downloads)} times"
     )
+    in_release = [st.get("name") for st in steps if "cyclonedx_py" in _run_shell(st)]
+    assert not in_release, (
+        f"release builds an SBOM itself again, beside its signing identity: {in_release}. Build it "
+        f"in an unprivileged job and download it (ADR 0149's 2026-09-30 amendment)."
+    )
+
+
+def test_both_engine_sboms_reach_every_sink() -> None:
+    """Both engine SBOMs are signed, SLSA-attested, attached to the GitHub release and uploaded as a
+    workflow artifact, each with its Sigstore bundle where it ships. Held together, so neither can drop
+    out of one sink while the other still reaches it."""
+    steps = _jobs()["release"].get("steps") or []
 
     def body(pred: Callable[[dict], bool]) -> str:
         hits = [st for st in steps if pred(st)]
