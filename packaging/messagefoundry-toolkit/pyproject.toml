@@ -63,7 +63,7 @@ dependencies = [
     # exact pin makes the engine's set the toolkit's. At least these, from an AST scan (ADR 0201
     # section 1): `hl7apy` (hl7schema, hl7structures, generators), `hl7` (anon/hl7.py) and
     # `defusedxml` (corepoint_import). A change to the engine's core set must be checked against them.
-    "messagefoundry==0.5.0",
+    "messagefoundry==0.5.1",
 ]
 
 [project.scripts]

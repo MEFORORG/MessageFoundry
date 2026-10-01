@@ -6,6 +6,141 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-10-01 — Early Access
+
+### Changed
+- **The service installer's NSSM download falls back to a mirror when `nssm.cc` fails.**
+  `install-service.ps1` tries `nssm.cc` first, then the Internet Archive's copy of the same
+  `nssm-2.24.zip`. Every download is still checked against the pinned archive SHA-256 before it is
+  opened, and the extracted `nssm.exe` against the binary pin, so a mirror serving other bytes is
+  skipped. With no source matching, the install stops and installs nothing. Allow
+  `web.archive.org` on 443 at install time if `nssm.cc` may be unreachable; see
+  [ANTIVIRUS-FIREWALL.md](docs/ANTIVIRUS-FIREWALL.md). (`BACKLOG #2504`)
+- **The `[vault]` extra now declares `requests>=2.32.2`.** Most of the Vault clients' send-time hop
+  checks run in a requests hook that requests first calls in 2.32.2. The extra used to leave
+  requests to hvac, which does not require that version. So an install resolved without the lock
+  could get an older requests, on which those checks would not run. The lock already pinned a newer
+  requests, so no pinned version moves. ([BACKLOG #2548](docs/BACKLOG.md))
+
+### Fixed
+- **Correction to the 0.4.0 note on the load reconcile: the stranding budget caused the connscale
+  red it names.** That note said the
+  `tests/test_connscale_smoke.py::test_no_loss_reconciles_at_every_step` failure
+  (`engine_read 15 < confirmed sent 18`) was the exact-shortfall arm, with a different cause such as
+  absent rows. Both arms failed, and the budget is why the shortfall arm did. 15 unconfirmed sends
+  of 18 were over the budget of 13, so the connscale reconcile excused none of them and judged all
+  18 as confirmed. The per-message intake audit on that run found no accept-ACKed send without a
+  row. A new test in `tests/test_harness_reconcile.py` pins the arithmetic. Test and comment changes
+  only; no engine behaviour changes. (`BACKLOG #1866`)
+- **The `messagefoundry-harness` wheel now ships `LICENSE` and `NOTICE`, and the web console's
+  copies are pinned to LF.** A web console wheel built from a fresh or renormalized Windows
+  checkout no longer carries CRLF license bytes that differ from the released Linux wheel. A
+  checkout made before the pin keeps CRLF in those two files until they are deleted and checked
+  out again. CI and each release job check that every separate wheel carries both files.
+  (`BACKLOG #2513`)
+- **The `messagefoundry-harness` wheel passes its release smoke again.** The release job installs
+  the harness wheel without its dependencies and imports `harness.__main__` to prove the wheel
+  carries its code. Two engine imports at the top of that module made the import fail, so the
+  v0.5.0 release published the engine and toolkit but not the harness. The imports now run inside
+  `main()`, and `tests/test_harness_entry_imports_no_engine.py` imports the entry module with only
+  the standard library available, so the next one fails in CI instead of at tag time.
+
+### Security
+- **BREAKING: `MEFOR_ALLOW_INSECURE_TLS` is honoured only where an instance posture is known.** A
+  weakened-TLS check that reads no posture used to fall back to the unclamped escape. On a first
+  deployment at the shipped `[security].enforcement = enforce`, that would have let a CLI command
+  that opens the store, or a reference sync, cross a weakened or cleartext hop. With no posture the
+  escape is now refused, whatever the dial says. `serve` always passes its posture, so a `warn`
+  instance keeps the escape there, and so do at least `provision-admin`, `store provision-schema` and
+  `check-privileges`. At least `admin-unlock`, `admin-set-notify-email`, `audit-verify`,
+  `audit-anchor`, `rekey-audit`, `rotate-key`, `backup`, `support-bundle` and `verify` pass none, so they refuse a weakened store even at `warn`. Give a dev store a verifying certificate.
+  ([SECURITY.md](docs/SECURITY.md), vault `BACKLOG #2354`)
+- **A `DatabaseRef` reference source with weakened TLS is refused at `messagefoundry check`, dry-run
+  and reload**, as well as at every sync. A sync now carries the engine's posture, so the escape is
+  clamped there as it is for `db_lookup`. A source whose `env()` values do not resolve at check time
+  is left to its sync, as before. (vault `BACKLOG #2354`)
+- **The documented `gh attestation verify` commands now name the release workflow and the tag.**
+  At least the install guides, the README and the CI gate `messagefoundry init` writes passed
+  `--repo` alone, which accepts an attestation from any workflow or ref in the repository. They
+  now add `--signer-workflow` and `--source-ref`. How tightly those flags pin depends on `gh`:
+  `--source-ref` needs `gh` 2.68.0 or later, and before 2.102.0 `gh` matches `--signer-workflow`
+  against only the start of the signing identity and compares `--source-ref` ignoring case. The
+  scaffolded gate refuses `gh` older than 2.68.0 and warns below 2.102.0. It rebuilds the tag from
+  the pinned wheel, so a pre-release wheel `0.5.0rc1` checks against tag `v0.5.0-rc1`. A config
+  repo scaffolded before this change keeps the old gate until its `check.yml` is updated by hand.
+  (`BACKLOG #2534`)
+- **An engine release tag must be spelled `vX.Y.Z` or `vX.Y.Z-aN`, `-bN` or `-rcN`.** The release
+  job refuses any other spelling before it builds anything, because a verifier rebuilds the tag
+  from the wheel's version and could not rebuild `v0.5.0-rc.1` or `v0.5.0-post1`. Every engine
+  tag to date is a plain `vX.Y.Z`. (`BACKLOG #2534`)
+- **The FILE source now archives or deletes only the file it read, and only into the archive
+  directory it opened.** The check before a move or delete compares the file's identity with the
+  handle that was read, so a file renamed over the name after the read is left for the next scan
+  rather than archived or deleted unread. `.processed` and `.error` are opened through no link for
+  every move, so one replaced by a link after start is refused and nothing is written through it.
+  On Windows the listing and the read no longer open a link at a drop's name, so a link to a UNC
+  path or a named pipe does not reach that server through them, and the move and delete act on the checked handle
+  rather than the name. On POSIX the copy the archive falls back to (the usual path where
+  `fs.protected_hardlinks` refuses a link) opens the name `O_NONBLOCK`, so a FIFO swapped in no
+  longer holds a worker thread. Hard links are still not refused; see the FILE section of
+  `docs/CONNECTIONS.md` for that and the other limits. ([BACKLOG #2535](docs/BACKLOG.md))
+- **The IDE's Live Debug now reveals real values one run at a time.** The old *Reveal Values*
+  toggle stayed on once clicked. Every later run then passed `--show-phi` and showed real values in
+  every module until the user turned it off. On a first deployment that toggle would have shown
+  message values from runs nobody asked to reveal. Now *Reveal Values for One Run* re-runs once with
+  real values shown, and turns Live Debug on first if it is off. While Live Debug is on, a click on
+  the **Values: Hidden** status-bar item does the same. The values go as soon as the next run, such
+  as the next save, starts. *Hide Revealed Values* hides them sooner, or cancels a reveal still
+  running. The command `messagefoundry.toggleRevealValues` is gone. (ASVS 14.2.6, vault
+  `BACKLOG #1187`)
+- **BREAKING: `[auth].ad_allow_insecure_ldap` is inert under `[security].enforcement = enforce`.**
+  It used to be honoured at any dial, so on a first deployment at the shipped `enforce` a plain
+  `ldap://` `ad_server` would have sent the service-account and user passwords in cleartext. That
+  config is now refused at load, and again when the authenticator is built. This matches the
+  `MEFOR_ALLOW_INSECURE_TLS` escape, which is already inert under `enforce`. A loopback `ldap://`
+  address is refused too, and so is a bare host name with no `ldaps://` scheme. Under `warn` the
+  opt-in still works: it logs a WARNING at startup, and `security_loosenings()`, the `serve` warning
+  and `GET /security/posture` name it. Use an `ldaps://` server.
+  ([SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md), vault `BACKLOG #2354`)
+- **The Vault clients refuse a proxy URL that carries credentials and is not `https://`.** An
+  `https://` Vault behind an `http://` proxy keeps its token inside the TLS tunnel. But requests
+  sends a `user:password@` from the proxy URL to the proxy itself, in cleartext. At least the KV
+  secret provider, the store key provider and the Transit cipher now refuse that proxy. The refusal
+  comes when the client is built, as the provider's own fail-closed error, and again before each
+  send. It covers the proxy variables in either case, `ALL_PROXY` and the Windows system proxy. The
+  text names no part of the proxy URL, and `[security].enforcement` does not relax it. An `https://`
+  proxy with credentials, and an `http://` proxy without them, are unchanged. See `[secrets]` in
+  [CONFIGURATION.md](docs/CONFIGURATION.md). ([BACKLOG #2547](docs/BACKLOG.md))
+- **A FHIR connection can opt back into the plain `PUT {base}/{ResourceType}/{id}` for `update` and
+  `if-match`, as a listed loosening.** The shipped transaction form keeps the resource id out of the
+  URL, but at least Epic and Oracle Health (Millennium) document no `transaction` interaction, so it
+  would fail against them. `FHIR(..., update_url_form="path")` sends the plain `PUT`, with an
+  `if-match` ETag in the `If-Match` header and the reply captured as the plain resource. The id must
+  match the FHIR id grammar and must not be only dots, or the message is dead-lettered unsent. The
+  default stays `"transaction"`. Setting `"path"` on a connection that is not an update is refused at
+  load. Each construction logs a WARNING naming the connection, and `messagefoundry check` adds a
+  `fhir-update-path-form` line naming every connection that sets it. See
+  [CONNECTIONS.md](docs/CONNECTIONS.md), "Vendor compatibility and the path-form opt-in", and
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (vault `BACKLOG #2550`, ASVS 14.2.1)
+- **The per-name connection routes no longer tell a channel-scoped caller which names exist.**
+  This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
+  `/test-credential`, `/start`, `/stop` and `/restart`. Such a caller now gets the same 403, body
+  and `auth.channel_denied` audit row in three cases. These are an inbound outside its scope, a
+  shared outbound, and a name that exists nowhere. Before, the first three routes answered 404 for
+  a name that exists nowhere. The control routes refused an outbound with a body of their own. So
+  on a first deployment a scoped user could have listed connection names by probing. A name in the
+  caller's own scope that exists nowhere still answers 404, as any unknown name does for an
+  unscoped caller. Names still show elsewhere, at least in `GET /metrics` and `GET /alerts/rules`,
+  and `POST /connections/{name}/flag` has no per-channel check (see `docs/SECURITY.md`).
+  ([BACKLOG #2551](docs/BACKLOG.md))
+- **A remote file upload no longer replaces a partner file written at its chosen name after the
+  listing.** With `overwrite` off, the default, the upload picks a free name from a listing, stores
+  a temp, then renames it. The rename now refuses a name taken since, and the upload moves on to
+  the next free name, a bounded number of times, then retries. SFTP publishes with the plain
+  `RENAME` instead of `posix-rename`. FTP is not atomic on a server whose `RNTO` replaces; the
+  remote file section of `docs/CONNECTIONS.md` says what holds where. `overwrite = true` still
+  replaces. ([BACKLOG #2553](docs/BACKLOG.md))
+
 ## [0.5.0] — 2026-10-01 — Early Access
 
 ### Added
@@ -4987,7 +5122,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...v0.3.2
