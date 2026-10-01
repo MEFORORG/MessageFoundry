@@ -2,21 +2,20 @@
 
 **This page lists what the engine exposes and points to the document that holds each fact.** It is
 for a site security team that runs an exposure-management program. Gartner calls that Continuous
-Threat Exposure Management. Its first stage is scoping, which asks what each product exposes. This
-page is the input to that stage for MessageFoundry.
+Threat Exposure Management. Its first stages are scoping and discovery: deciding what is in view,
+then finding what is exposed. This page feeds both for MessageFoundry.
 
 It is a map, so it restates as little as it can. If this page and a linked document disagree, the
 code decides.
 
 Three limits apply to the whole page:
 
-- **It describes the engine as shipped.** What a deployment would expose depends on its
-  configuration. [Read your own instance's lists](#read-your-own-instances-lists) says how to get
-  that.
-- **Its lists say "at least".** The full inventory of every interface is
+- It describes the engine as shipped. What a deployment would expose depends on its configuration.
+  [Read your own instance's lists](#read-your-own-instances-lists) says how to get that.
+- Its lists say "at least". The full inventory of every interface is
   [section 5 of ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md#5-communications-inventory-asvs-1311).
   A test guards that inventory against drift, and the section says what the test can see.
-- **Configuration is Python that runs inside the engine.** No allow-list on this page bounds what a
+- Configuration is Python that runs inside the engine. No allow-list on this page bounds what a
   Router or Handler module does. [DEPLOYMENT.md](DEPLOYMENT.md#egress-allow-lists) names the controls
   that do apply to that code.
 
@@ -47,9 +46,9 @@ These settings change the size of the operator surface:
 - Under `supervise`, each engine shard gets its own API port, counted up from `--base-port`. Count
   one operator socket per engine shard.
 
-[ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) has sample Windows Firewall rules
-for at least the MLLP, DICOM and X12 listeners and the operator API. It has no row for some
-listeners and hops on this page. For the TLS and peer controls on each listener, see the
+[ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) has a port table for at least the
+MLLP, DICOM and X12 listeners and the operator API, and a sample Windows Firewall rule for MLLP. It
+has no row for some listeners on this page. For the TLS and peer controls on each listener, see the
 [channel matrix](DEPLOYMENT.md#channel--tls-posture-matrix).
 
 ## Each outbound hop has its own limit on the target, and some have none
@@ -60,10 +59,10 @@ list means. The engine's own update check makes no network call: `[update_check]
 
 | Outbound hop | Setting that limits the target | An empty list means | Read more |
 |---|---|---|---|
-| Outbound Connections, the `db_lookup` and `fhir_lookup` reads, and database-poll and remote-file inbound Connections | The eight `[egress].allowed_*` lists | Refuse every destination of that type, once `[security].block_unlisted_outbound` is on | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
+| Outbound Connections, the `db_lookup` and `fhir_lookup` reads, and database-poll and remote-file inbound Connections | The `[egress].allowed_*` destination lists, one per transport | Refuse every destination of that type while `[security].block_unlisted_outbound` is on. Allow any destination of that type while it is set to false | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
 | SMART and OAuth2 token endpoints | `[egress].allowed_http` | The same | `_check_credential_token_url_egress` in `messagefoundry/pipeline/wiring_runner.py` |
 | Forward web proxy | `[egress].allowed_proxy` | Refuse a proxy address. The `default` proxy, which the operating system names, is exempt | [CONFIGURATION.md](CONFIGURATION.md#egress) |
-| AI assistance broker | `[ai].allowed_endpoints` | Refuse the endpoint | [AI.md](AI.md) |
+| AI assistance broker | `[ai].allowed_endpoints` | Refuse the endpoint | [CONFIGURATION.md](CONFIGURATION.md#ai--ai-coding-assistance-policy) |
 | OpenID Connect identity provider | `[auth].oidc_allowed_endpoints` | Refused at load while OpenID Connect is on | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Alert webhook and alert email | `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts` | Any host | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
 | Active Directory over LDAP | One target, `[auth].ad_server` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
@@ -72,28 +71,37 @@ list means. The engine's own update check makes no network call: `[update_check]
 | Syslog forwarding and the startup clock check | `[logging].forward_host` and `[logging].ntp_peer` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Backup to a network share | `[backup].destination` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 
-Three things this table does not show:
+The table leaves out at least these:
 
-- **An inbound File Connection is outside the `[egress]` lists.** `[egress].allowed_file_dirs` bounds
+- An inbound File Connection is outside the `[egress]` lists. `[egress].allowed_file_dirs` bounds
   File destinations only.
-- **With `auth = entra`, a database hop adds a second target.** The ODBC driver gets its own token,
-  and no MessageFoundry setting names where from.
-- **Kerberos sign-in and the browser leg of OpenID Connect** are in the infrastructure-hops table.
+- With `auth = entra`, a database hop adds a second target. The ODBC driver gets its own token, and
+  no MessageFoundry setting names where from.
+- Kerberos sign-in and the browser leg of OpenID Connect are in the infrastructure-hops table.
 
 Once `serve` is past the open-egress guard below, it turns `[security].block_unlisted_outbound` on
 if the operator left it unset.
 
-## Startup guards refuse an unsafe bind
+A host firewall is the layer under all of this. For the "No list" rows, the engine has no
+allow-list of its own. [ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) lists ports
+for some of these hops. It says to mirror each outbound firewall rule with its allow-list entry.
 
-`serve` checks the exposure before it opens a socket.
-[DEPLOYMENT.md](DEPLOYMENT.md#bind-guard-behavior-summary) is the source of record for each guard,
-its override and its exit code. A deploying site would meet at least these:
+## Two guards stop `serve`, and a third stops one listener
 
-| Guard | What it does | Read more |
+[DEPLOYMENT.md](DEPLOYMENT.md#bind-guard-behavior-summary) describes each guard and its override,
+and [Before you expose off-loopback](DEPLOYMENT.md#before-you-expose-off-loopback) is the checklist.
+A deploying site would meet at least these:
+
+| Guard | What it refuses | What happens |
 |---|---|---|
-| Operator bind | Refuses a non-loopback operator bind that has neither an operator certificate (`[api].tls_cert_file`) nor a declared TLS terminator | [Before you expose off-loopback](DEPLOYMENT.md#before-you-expose-off-loopback) |
-| Listener bind | Refuses a non-loopback MLLP, HTTP, DICOM, raw TCP or X12 listener that has no TLS. Raw TCP and X12 have no TLS to turn on. A Connection that sets `tls_hop_attested` with a reason crosses this guard, and the engine reports it as a loosening | [Bind-guard behavior](DEPLOYMENT.md#bind-guard-behavior-summary) |
-| Open egress | Under the default `[security].enforcement = enforce`, refuses to start while outbound egress is fully open: no destination list is populated and `[security].block_unlisted_outbound` is not set to true | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
+| Operator bind | A non-loopback operator bind that has neither an operator certificate (`[api].tls_cert_file`) nor a declared TLS terminator | `serve` exits with code 2 before it starts the web server |
+| Open egress | Under the default `[security].enforcement = enforce`, outbound egress that is fully open: no destination list is populated and `[security].block_unlisted_outbound` is not set to true | `serve` exits with code 2 |
+| Listener bind | A non-loopback MLLP, HTTP, DICOM, raw TCP or X12 listener that has no TLS. Raw TCP and X12 have no TLS to turn on | That listener does not bind, and its Connection shows as failed. The engine keeps running |
+
+So a running engine does not prove that every listener passed. The listener check runs when each
+inbound Connection starts, in `RegistryRunner` in `messagefoundry/pipeline/wiring_runner.py`. A
+Connection that sets `tls_hop_attested` with a reason crosses the listener guard, and the engine
+reports it as a loosening.
 
 **The operator socket serves TLS in every topology but one.** With no operator certificate, the
 engine mints a self-signed pair on first run and serves TLS with it. The exception is
@@ -102,13 +110,14 @@ and speaks plaintext to the declared proxy, so that hop is the site's to protect
 [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
 has the detail.
 
-**`[security].allowed_client_networks` is a second layer, and it does not limit who can reach the
-socket.** It answers a request with a 403 when the client address is outside the listed networks.
-It is empty by default, which means no restriction. Four limits apply:
+`[security].allowed_client_networks` is a second layer. It does not limit who can reach the socket.
+It answers a request with a 403 when the client address is outside the listed networks. It is empty
+by default, which means no restriction. At least these limits apply:
 
 - The check runs after the engine accepts the connection.
 - `/health` is exempt, and loopback is always allowed.
-- Behind a proxy the engine was not told about, or behind address translation, it does nothing.
+- Behind a proxy the engine was not told about, or behind address translation, every client shows
+  the same address. The list then passes all of them or none.
 - It does not cover the inbound Connection listeners. Each of those takes its own
   `source_ip_allowlist`.
 
@@ -134,9 +143,9 @@ No one command gives the whole answer. Each row below has a stated gap.
 |---|---|---|
 | What is listening on the host? | The operating system's socket list, such as `Get-NetTCPConnection -State Listen` on Windows | This is the direct answer. It does not say which Connection owns a socket |
 | Which Connections exist, and of what type? | `messagefoundry graph --config <config dir> --json` | It imports the config modules, so it runs their code. It prints each Connection's type and authored settings. It does not print the bind address, and an `env()` value shows as a placeholder |
-| What is a running engine serving? | `GET /connections` | Needs the `monitoring:read` permission. One row per endpoint, with its method. It fills the peer and port for MLLP and File rows only. It shows only what the caller's scope and the answering engine shard cover |
+| What is a running engine serving? | `GET /connections` | Needs the `monitoring:read` permission. One row per endpoint, with its method. It shows no bind address, and it fills a port for MLLP rows only. It shows only what the caller's scope and the answering engine shard cover |
 | Which protective switches are off on a running engine? | `GET /security/posture` | It reports the engine shard that answers |
-| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the authored file only. It leaves out a `serve --host` override and every per-Connection loosening. Its `loosenings_scope` field says so |
+| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the `[security]` table of the authored file only. It leaves out at least `MEFOR_SECURITY_*` environment overrides, a `serve --host` override and every per-Connection loosening. Its `loosenings_scope` field names some of these gaps |
 | Which Connections carry a loosening, across all engine shards? | `messagefoundry check --config <config dir>` | It also runs the config modules. It opens no store |
 
 ## `messagefoundry verify` does not measure exposure
@@ -148,15 +157,15 @@ checks that the federated sign-in settings hold together.
 
 It does not check at least these, read from `messagefoundry/verify/`:
 
-- **Firewall rules, or reach from another host.** The `host.ports` row is always MANUAL. It only
-  tests whether three ports are free on `127.0.0.1`.
-- **The ports your Connections bind.** Those three ports are the `--mllp-port` value (default
-  `2575`), a fixed `11112`, and `[api].port`. The row does not read your config directory.
-- **The operator bind and its TLS.** The `manual.tls` row is MANUAL. A person confirms it.
-- **Egress.** No row reads an `[egress]` list, and `verify` dials no partner. The self smoke is a dry
-  run with no network. The live smoke sends one message to the engine's own listener.
-- **Loosenings.** No row reads the loosening list. Use the posture read-out above.
-- **Known vulnerabilities.** `verify` reads no advisory feed and no software bill of materials.
+- Firewall rules, or reach from another host. The `host.ports` row is always MANUAL. It only tests
+  whether three ports are free on `127.0.0.1`.
+- The ports your Connections bind. Those three ports are the `--mllp-port` value (default `2575`), a
+  fixed `11112`, and `[api].port`. The row does not read your config directory.
+- The operator bind and its TLS. The `manual.tls` row is MANUAL. A person confirms it.
+- Egress. No row reads an `[egress]` list, and `verify` dials no partner. The self smoke is a dry run
+  with no network. The live smoke sends one message to the engine's own listener.
+- Loosenings. No row reads the loosening list. Use the posture read-out above.
+- Known vulnerabilities. `verify` reads no advisory feed and no software bill of materials.
 
 So a green run says nothing about exposure.
 [What a green run proves](testing/VERIFY.md#what-a-green-run-proves--and-what-it-doesnt) states the
