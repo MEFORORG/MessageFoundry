@@ -312,19 +312,23 @@ async def test_credential_test_route_authorizes_before_disclosing_config(engine:
             r_cred.status_code == r_mllp.status_code
         )  # indistinguishable to an unauthorized caller
         # In scope: authorization passes, so an authorized caller does get the (config-disclosing) 400
-        # for a File endpoint that has no alt credential — and a 404 for a truly unknown name.
+        # for a File endpoint that has no alt credential.
         assert (await c.post("/connections/IB_A/test-credential", headers=h)).status_code == 400
         # A name that exists nowhere is outside the scope too, so it gets the same 403 as the two
         # above rather than a 404 that would confirm it does not exist (BACKLOG #2551).
         assert (await c.post("/connections/IB_NOPE/test-credential", headers=h)).status_code == 403
 
 
-# The three routes that look a connection name up in the registry. Each must check the caller's
-# channel scope BEFORE the name's existence (BACKLOG #2551).
+# Routes that look a connection name up in the registry. Each must check the caller's channel
+# scope BEFORE the name's existence, and refuse a shared outbound with the body an unknown name
+# gets (BACKLOG #2551). Not a complete list: /flag and /purge have other shapes.
 _LOOKUP_ROUTES = (
     ("GET", "/connections/{}/metadata"),
     ("POST", "/connections/{}/test"),
     ("POST", "/connections/{}/test-credential"),
+    ("POST", "/connections/{}/start"),
+    ("POST", "/connections/{}/stop"),
+    ("POST", "/connections/{}/restart"),
 )
 
 
@@ -357,7 +361,17 @@ async def test_scoped_caller_cannot_tell_which_connection_names_exist(engine: En
     )
     reg.add_router("r", lambda m: [])
     engine.add_registry(reg)
-    service = await _service(engine)
+    # As _service, with the per-actor admin-write ceiling off: this test sends about thirty paced
+    # writes from one actor, and a 429 would hide the answer under test.
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            admin_write_rate_limit_enabled=False,
+            require_mfa=False,
+        ),
+    )
+    await service.initialize()
     scoped_uid = await _add(service, "op", Role.OPERATOR)
     # IB_GONE is in the scope and exists nowhere: the in-scope control below.
     await service.set_channel_scope(scoped_uid, ["IB_A", "IB_GONE"], actor="admin")
@@ -371,7 +385,7 @@ async def test_scoped_caller_cannot_tell_which_connection_names_exist(engine: En
             for name in ("IB_B", "OB_X", "IB_NOPE"):
                 status, body, audit = await _probe(c, engine, h, method, template.format(name))
                 # The denial row names the probed name, so compare actions across the three names.
-                assert ("auth.channel_denied", name) in audit, (template, name, audit)
+                assert ("auth.channel_denied", name) in audit, (template, name, status, body, audit)
                 answers[name] = (status, body, sorted(action for action, _ in audit))
             assert answers["IB_B"] == answers["OB_X"] == answers["IB_NOPE"], (template, answers)
             assert answers["IB_NOPE"][0] == 403, (template, answers)

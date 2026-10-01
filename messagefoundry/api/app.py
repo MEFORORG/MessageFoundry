@@ -2848,11 +2848,9 @@ def create_app(
             return {"name": name, "running": running}
         if rr is not None and want_out and name in rr.registry.outbound:
             # A shared outbound spans channels, so a channel-scoped user can't control one (mirrors purge).
+            # The refusal is the one an unknown name gets, so it names no outbound (BACKLOG #2551).
             if identity.allowed_channels is not None:
-                await _audit_channel_denied(engine, identity, name, client)
-                raise HTTPException(
-                    403, "channel-scoped users cannot control a shared outbound connection"
-                )
+                await _deny_connection(engine, identity, name, client)
             try:
                 if action == "start":
                     await rr.start_outbound(name)
