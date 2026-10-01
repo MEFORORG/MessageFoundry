@@ -630,3 +630,202 @@ def test_a_SAME_LINE_semicolon_compound_still_shadows_and_is_NOT_fixed_here(
     # rather than anything Remove-QuotedSpans does.
     unquoted = f"git -C {repo.primary.parent} clean -fd\ngit switch {repo.other}"
     assert run_gate(shell(unquoted, cwd=repo.wt), repo.repos) is None
+
+
+# ------------------------------------ the remedy names the mechanism that made the READER'S worktree
+#
+# BACKLOG #1038. Rule 3b's class A remedy printed the same sibling-making new.ps1 line to every reader,
+# so a session in a harness-made tree under .claude/worktrees was handed a sibling. Owner ruling
+# 2026-09-30: the remedy names the mechanism that made the READER'S OWN worktree -- the harness path
+# for a nested session, new.ps1 for a sibling. Manager decision, batch 184: always the PRIMARY's
+# new.ps1, with -Nested for a nested reader, so the tree lands at the harness path with full setup.
+#
+# "Nested" is decided against the TARGET repo's own `git worktree list`, so the wrong-repo and stale-
+# directory rows below are the arms a path-shape test got wrong in an earlier draft.
+
+_OCCUPANCY = _REPO_ROOT / "scripts" / "coord" / "occupancy.ps1"
+_GATE_SOURCE = _REPO_ROOT / "scripts" / "hooks" / "worktree_gate.ps1"
+_TOKENS_REL = Path("scripts/security/scan-tokens.local.txt")
+
+
+def _nested_reader(r: SimpleNamespace, leaf: str = "reader") -> Path:
+    """A harness-layout worktree REGISTERED under the target primary: the reader's own checkout."""
+    nested = r.primary / ".claude" / "worktrees" / leaf
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    git("worktree", "add", "-b", f"{leaf}-branch", str(nested), cwd=r.primary)
+    return nested
+
+
+def _deny_for_reader(r: SimpleNamespace, cwd: Path) -> str:
+    """The class A deny, aimed at the fixture's linked worktree by `-C`, from whatever seat `cwd` is."""
+    return assert_denied(run_gate(shell(f'git -C "{r.wt}" checkout {r.other}', cwd=cwd), r.repos))
+
+
+def _primary_new_ps1(r: SimpleNamespace, line: str) -> bool:
+    return f"'{r.primary}{os.sep}scripts{os.sep}worktree{os.sep}new.ps1'" in line.replace(
+        "\\", os.sep
+    )
+
+
+@pytest.mark.parametrize("subdir", ["", "scripts"])
+def test_a_NESTED_reader_gets_the_primarys_new_ps1_with_NESTED(
+    repo: SimpleNamespace, subdir: str
+) -> None:
+    """Red before the fix: no -Nested. The subdirectory row pins that a cwd below the reader's root
+    still finds that root."""
+    reader = _nested_reader(repo)
+    cwd = reader / subdir if subdir else reader
+    cwd.mkdir(parents=True, exist_ok=True)
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, cwd))
+    assert line.endswith(" -Nested"), line
+    assert _primary_new_ps1(repo, line), f"not the PRIMARY's new.ps1: {line}"
+
+
+def test_a_SIBLING_reader_gets_the_plain_form(repo: SimpleNamespace) -> None:
+    """The other half of the ruling, and the half a careless fix breaks."""
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, repo.wt))
+    assert "-Nested" not in line
+    assert _primary_new_ps1(repo, line), line
+
+
+def test_a_reader_in_ANOTHER_repos_nested_tree_gets_the_plain_form(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """A first draft keyed on the path shape and sent this reader to the OTHER repo's script, which
+    quietly forked a branch there. The other repo's tree is not in the target's worktree list."""
+    other = tmp_path / "Other"
+    git("init", "-b", "main", str(other))
+    git("config", "user.email", "t@example.com", cwd=other)
+    git("config", "user.name", "t", cwd=other)
+    (other / "o.txt").write_text("o\n", encoding="utf-8")
+    git("add", "-A", cwd=other)
+    git("commit", "-m", "o", cwd=other)
+    foreign = other / ".claude" / "worktrees" / "foreign"
+    foreign.parent.mkdir(parents=True)
+    git("worktree", "add", "-b", "foreign-branch", str(foreign), cwd=other)
+
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, foreign))
+    assert "-Nested" not in line, line
+    assert _primary_new_ps1(repo, line), line
+    assert str(other) not in line.replace("/", os.sep)
+
+
+def test_a_reader_in_a_STALE_directory_under_dot_claude_worktrees_gets_the_plain_form(
+    repo: SimpleNamespace,
+) -> None:
+    """A leftover directory git does not register is not a worktree, whatever its path looks like."""
+    stale = repo.primary / ".claude" / "worktrees" / "stale"
+    stale.mkdir(parents=True)
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, stale))
+    assert "-Nested" not in line, line
+    assert _primary_new_ps1(repo, line), line
+
+
+@_WINDOWS_ONLY
+def test_the_nested_remedy_RUNS_lands_at_the_harness_path_and_carries_the_token_list(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """Named is not enough (#1032): run the printed line and assert what it did.
+
+    The gate is asked first, from the same seat, because a remedy the gate itself refuses is the
+    unrunnable-remediation defect arriving through the guard rather than through the script.
+    """
+    reader = _nested_reader(repo)
+    # new.ps1 copies the token list INTO scripts/security/, which the real repository tracks and this
+    # fixture's branch does not, so the destination branch gets that directory first -- through a
+    # throwaway worktree, since the branch is checked out nowhere.
+    scratch = tmp_path / "seed-security-dir"
+    git("worktree", "add", str(scratch), repo.other, cwd=repo.primary)
+    (scratch / "scripts" / "security").mkdir(parents=True)
+    (scratch / "scripts" / "security" / "README").write_text("tracked\n", encoding="utf-8")
+    git("add", "-A", cwd=scratch)
+    git("commit", "-m", "security dir", cwd=scratch)
+    git("worktree", "remove", str(scratch), cwd=repo.primary)
+    tokens = repo.primary / _TOKENS_REL
+    tokens.parent.mkdir(parents=True, exist_ok=True)
+    tokens.write_text("synthetic-token\n", encoding="utf-8")
+
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, reader))
+    assert run_gate(shell(line, cwd=reader), repo.repos) is None, "the gate refuses its own remedy"
+    assert run_gate(shell(line, cwd=reader, tool="PowerShell"), repo.repos) is None
+
+    proc = _run_emitted(line, tmp_path)
+    assert proc.returncode == 0, f"the printed command FAILS:\n{line}\n{proc.stdout}{proc.stderr}"
+
+    made = repo.primary / ".claude" / "worktrees" / "claude-other-branch"
+    assert made.is_dir(), f"no worktree at {made}\n{proc.stdout}{proc.stderr}"
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(made),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == repo.other  # it REUSED the branch rather than forking a new one
+    # What a bare `git worktree add` would have skipped: without it the commit gate fails closed.
+    assert (made / _TOKENS_REL).read_text(encoding="utf-8") == "synthetic-token\n"
+
+
+def test_the_layouts_are_stated_ONCE_and_the_other_sites_link_to_it() -> None:
+    """The row exists because the same false premise was once written twice. A behavioural row cannot
+    see a restatement that happens to agree today, so this one is structural -- and only as strong as
+    its phrases: a restatement in new words passes it."""
+    gate = _GATE_SOURCE.read_text(encoding="utf-8")
+    anchor = "WHICH MECHANISM MADE THIS WORKTREE"
+    assert gate.count(f"# {anchor}, AND") == 1, "the canonical block must be headed exactly once"
+    assert "# At least two mechanisms make worktrees" in gate, "the list is a floor, not a census"
+    linkers = [
+        _OCCUPANCY,
+        _REPO_ROOT / "scripts" / "worktree" / "prune-merged.ps1",
+        _REPO_ROOT / "docs" / "SESSION-DRIFT-CONTROLS.md",
+    ]
+    for path in linkers:
+        assert anchor in path.read_text(encoding="utf-8"), f"{path.name} does not link to the block"
+    for phrase in ("makes SIBLINGS", "is what scripts/worktree/new.ps1 builds", "ASSERTS that"):
+        assert phrase not in gate, f"the gate restates {phrase!r} outside the canonical block"
+        assert phrase not in _OCCUPANCY.read_text(encoding="utf-8"), phrase
+
+
+def test_a_primary_new_ps1_WITHOUT_nested_gets_the_plain_form(repo: SimpleNamespace) -> None:
+    """The installed hook is decoupled from the checkout it names. A primary whose new.ps1 predates
+    -Nested would refuse the flag, so the gate must not print it there."""
+    old = repo.new_ps1.read_text(encoding="utf-8").replace("[switch]$Nested", "[switch]$Retired")
+    repo.new_ps1.write_text(old, encoding="utf-8")
+    reader = _nested_reader(repo)
+
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, reader))
+
+    assert "-Nested" not in line, line
+    assert _primary_new_ps1(repo, line), line
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["[switch]$Retired # [switch]$Nested", "<# [switch]$Nested #> [switch]$Retired"],
+    ids=["line_comment", "block_comment"],
+)
+def test_a_COMMENTED_OUT_nested_declaration_gets_the_plain_form(
+    repo: SimpleNamespace, spelling: str
+) -> None:
+    """Red before round three: a regex sniff matched the comment and printed a flag the script lacks.
+    The probe now asks PowerShell's parser for the param block."""
+    text = repo.new_ps1.read_text(encoding="utf-8").replace("[switch]$Nested", spelling)
+    repo.new_ps1.write_text(text, encoding="utf-8")
+    reader = _nested_reader(repo)
+
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, reader))
+
+    assert "-Nested" not in line, line
+
+
+def test_an_UNREADABLE_primary_new_ps1_gets_the_plain_form(repo: SimpleNamespace) -> None:
+    """Fails CLOSED. Red before round three: a read that threw under the gate's SilentlyContinue left
+    the flag set, so -Nested was printed unverified. A directory in the script's place cannot be read
+    as a file on any platform."""
+    repo.new_ps1.unlink()
+    repo.new_ps1.mkdir()
+    reader = _nested_reader(repo)
+
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, reader))
+
+    assert "-Nested" not in line, line

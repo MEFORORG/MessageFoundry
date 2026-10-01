@@ -67,11 +67,41 @@ $WorktreePath = Join-Path $Parent "$RepoName-$Name"
 
 if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
 
+# A DETACHED HEAD WHOSE COMMIT NO REF HOLDS is lost with the worktree: removal deletes the HEAD reflog
+# too, so nothing reaches it afterwards. -Force does not override it -- -Force means
+# "discard changes", nothing else. The shape is the vault remove.ps1's (vault PR 2125). Refs are read
+# with --glob=refs/*, not --all, which would add this worktree's own HEAD and so never find anything
+# at risk. Transient refs that do not keep a commit alive for long are excluded; each --exclude binds
+# to the --glob after it.
+& git -C $WorktreePath symbolic-ref -q HEAD *> $null
+if ($LASTEXITCODE -ne 0) {
+    $head = "$(& git -C $WorktreePath rev-parse --verify --quiet HEAD 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $head) {
+        throw "Could not read the detached HEAD of '$WorktreePath'. Nothing was removed."
+    }
+    $unheld = "$(& git -C $RepoRoot rev-list --count $head --not --exclude=refs/stash --exclude=refs/prefetch/* --exclude=refs/bisect/* --exclude=refs/rewritten/* --exclude=refs/original/* --glob=refs/* 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or $unheld -notmatch '^\d+$') {
+        throw "Could not tell whether the detached HEAD $head is held by a ref. Nothing was removed."
+    }
+    if ([int]$unheld -gt 0) {
+        Write-Host "Keep them first, for example:  git -C `"$RepoRoot`" branch <name> $head" -ForegroundColor Red
+        throw ("'$WorktreePath' is detached at $head, and $unheld commit(s) there are held by no ref. " +
+               "Removing it would leave them in no ref and no reflog. Nothing was removed.")
+    }
+}
+
 # Guard against losing UNCOMMITTED tracked work. Note this does NOT see committed-but-unpushed
 # commits -- `status --porcelain` is empty for a clean worktree holding them; -DeleteBranch's own
 # containment check below is what covers those. Untracked entries (??) -- the .venv, node_modules,
 # dev db -- are expected and don't block removal.
-$tracked = & git -C $WorktreePath status --porcelain | Where-Object { $_ -notmatch '^\?\?' }
+# The exit code is read BEFORE the filter: a git that cannot read this worktree (a corrupt index, say)
+# prints nothing, and nothing read as "no changes" here would hand `worktree remove --force` the very
+# edits this guard exists for. -Force does not override it (BACKLOG #1038).
+$status = @(& git -C $WorktreePath status --porcelain 2>$null)
+if ($LASTEXITCODE -ne 0) {
+    throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
+}
+$tracked = $status | Where-Object { $_ -notmatch '^\?\?' }
 if ($tracked -and -not $Force) {
     Write-Host ($tracked -join "`n")
     throw "Worktree has uncommitted tracked changes. Commit/push them, or re-run with -Force."

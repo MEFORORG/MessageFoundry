@@ -228,3 +228,74 @@ def test_the_advice_that_used_to_be_printed_still_throws_today(fx: Fixture) -> N
 
     assert not target.exists()
     assert str(target).replace("\\", "/") not in _registered(fx.primary)
+
+
+# --- BACKLOG #1038: a -Nested tree, made by new.ps1 itself, then torn down by its own advice -------
+#
+# A nested tree has no scripted teardown (remove.ps1's -Nested route was withdrawn), so the advice is
+# one plain `git worktree remove` line plus a sentence saying what git does and does not check.
+
+
+def _run_new_nested(fx: Fixture, name: str) -> subprocess.CompletedProcess[str]:
+    """Drive a COPY of new.ps1 living in the fixture, so it anchors there and never on this checkout."""
+    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
+        dst = fx.primary / rel
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(_REPO / rel, dst)
+    script = fx.primary / "scripts" / "worktree" / "new.ps1"
+    return _run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
+        + ["-Name", name, "-Nested", "-NoInstall"]
+    )
+
+
+def _printed_advice(stdout: str) -> list[str]:
+    return [ln.split("#   ", 1)[1] for ln in stdout.splitlines() if ln.startswith("  #   ")]
+
+
+def test_new_ps1_NESTED_lands_under_dot_claude_worktrees_and_its_own_advice_removes_it(
+    fx: Fixture,
+) -> None:
+    """Red before the fix: new.ps1 had no -Nested. The printed line is run as printed."""
+    made = _run_new_nested(fx, "probe")
+    assert made.returncode == 0, f"{made.stdout}\n{made.stderr}"
+    advice = _printed_advice(made.stdout)
+    assert len(advice) == 1, f"expected one printed cleanup command, got {advice}"
+    assert "remove.ps1" not in made.stdout, "a nested tree has no scripted teardown to name"
+    assert "--force" not in advice[0]
+    assert "nothing checks whether a session is still in it" in made.stdout
+
+    wt = fx.primary / ".claude" / "worktrees" / "probe"
+    assert wt.is_dir()
+    assert str(wt).replace("\\", "/") in _registered(fx.primary)
+    assert not (fx.primary.parent / "repo-probe").exists(), "it made a SIBLING instead"
+
+    proc = _run([t.strip('"') for t in shlex.split(advice[0], posix=False)])
+
+    assert proc.returncode == 0, f"advice failed: {advice[0]}\n{proc.stdout}\n{proc.stderr}"
+    assert not wt.exists(), f"advice ran but left the worktree behind: {advice[0]}"
+    assert str(wt).replace("\\", "/") not in _registered(fx.primary)
+
+
+def test_new_ps1_NESTED_from_a_LINKED_checkouts_copy_still_lands_under_the_main_worktree(
+    fx: Fixture,
+) -> None:
+    """A tree nested inside a linked checkout dies with it: removing that checkout with --force takes
+    the nested tree along and leaves it registered. So -Nested anchors on the MAIN worktree, which is
+    also where the harness puts its trees, whichever copy of new.ps1 runs."""
+    linked = fx.worktree(fx.primary.parent / "repo-linked", "linked")
+    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
+        dst = linked / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_REPO / rel, dst)
+
+    proc = _run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+        + [str(linked / "scripts" / "worktree" / "new.ps1"), "-Name", "fromlinked", "-Nested"]
+        + ["-NoInstall"]
+    )
+
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert (fx.primary / ".claude" / "worktrees" / "fromlinked").is_dir()
+    assert not (linked / ".claude" / "worktrees" / "fromlinked").exists()

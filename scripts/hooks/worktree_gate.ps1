@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.09.26.4"
+$GateVersion = "2026.09.30.2"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2462,6 +2462,105 @@ function Get-RootCommonDirCmp($Root) {
 }
 
 # ---------------------------------------------------------------------------------------------------
+# WHICH MECHANISM MADE THIS WORKTREE, AND WHICH ONE A REMEDY NAMES (BACKLOG #1038). This is the
+# canonical statement. scripts/coord/occupancy.ps1, scripts/worktree/prune-merged.ps1 and the rule 3d
+# comment below link here by this heading rather than restating it.
+#
+# At least two mechanisms make worktrees against one .git here, in two layouts, and both are live:
+#   * scripts/worktree/new.ps1 anchors on its OWN checkout. By default it makes a SIBLING of that
+#     checkout, <its parent>/<its leaf>-<Name>; from the primary that is <repo-parent>/<repo-name>-<Name>.
+#     spawn.ps1 calls it for that sibling form only. With -Nested it makes
+#     <main worktree>/.claude/worktrees/<Name>, whichever checkout's copy runs. Either way it copies the
+#     leak-gate token list, builds the .venv and holds the add lock. remove.ps1 tears down only
+#     the sibling; a nested tree has NO scripted teardown (see new.ps1's Show-NextSteps for why).
+#   * The Claude Code harness makes a NESTED one at <main worktree>/.claude/worktrees/<slug> --
+#     `claude --worktree`, and a subagent's `isolation: worktree`. MEASURED 2026-09-30 for the second:
+#     a subagent whose parent session sat in a nested tree still got its own tree under the MAIN
+#     worktree, not under its parent's. It copies the gitignored files .worktreeinclude lists, which a
+#     bare `git worktree add` does not.
+# Other populations exist besides these (a bare `git worktree add`, scratch worktrees under a temp
+# directory), so read the list as "at least". The same false premise, that new.ps1 made the nested
+# layout, was once written independently in this file and in occupancy.ps1 (#1032).
+#
+# OWNER RULING 2026-09-30: rule 3b's remedy names the mechanism that made the READER'S OWN worktree --
+# the harness path for a session in a nested .claude/worktrees tree, new.ps1 for a sibling. Manager
+# decision, batch 184: the remedy is ALWAYS the PRIMARY checkout's new.ps1 -- never the reader's copy,
+# which may be stale, mid-edit, or a public-fork branch's -- with -Nested added when the reader is
+# nested, so the new tree lands at the harness path with the full setup.
+#
+# "THE READER IS NESTED" MEANS: the session cwd lies inside a worktree that the TARGET repository's own
+# `git worktree list` registers, and that worktree is exactly <target primary>/.claude/worktrees/<x>.
+# Asked of the list the caller already holds, so it costs no subprocess. A cwd in ANOTHER repository's
+# nested tree, or in a directory under .claude/worktrees that git does not register, is not, and gets
+# the plain sibling form -- a first draft keyed on the path shape alone and handed both of those a
+# script from the wrong checkout.
+#
+# SCOPE: rule 3b class A's remedy only. Rule 3's "work in your own worktree" remedies still print the
+# plain form to every reader. A subagent reader under `isolation: worktree` cannot run either form
+# itself (its git is fenced to its own tree); it reports the line to its dispatcher instead.
+#
+# -Nested IS PRINTED ONLY WHEN THE PRIMARY'S new.ps1 DECLARES IT. The installed hook is decoupled from
+# the checkout it names, so an older new.ps1 there would refuse the flag; the plain form is printed then.
+#
+# THIS BRANCHES THE REMEDY TEXT ONLY. No allow or deny decision reads it. Both forms run the primary's
+# new.ps1; a misread costs a sibling where a nested tree was wanted, or the reverse.
+function Get-OwnWorktreeRemedy([string]$CwdRaw, [object[]]$List, [string]$MainWt, [string]$GovDisplay,
+                               [string]$Dest, [string]$DestSlug) {
+    $nested = $false
+    $cwdCmp = $(if ($CwdRaw) { Get-ComparablePath $CwdRaw } else { "" })
+    if ($cwdCmp -and $MainWt) {
+        # Longest registered worktree containing the cwd: the primary contains every nested tree, so
+        # the innermost match is the reader's own.
+        $best = ""
+        foreach ($ln in $List) {
+            if ("$ln" -notmatch '^worktree\s+(.+)$') { continue }
+            $wt = Get-ComparablePath $Matches[1]
+            if (-not $wt) { continue }
+            if (($cwdCmp -eq $wt -or $cwdCmp.StartsWith("$wt/", [System.StringComparison]::Ordinal)) -and
+                $wt.Length -gt $best.Length) { $best = $wt }
+        }
+        $prefix = "$MainWt/.claude/worktrees/"
+        $nested = $best.StartsWith($prefix, [System.StringComparison]::Ordinal) -and
+                  -not $best.Substring($prefix.Length).Contains('/')
+    }
+    # The PRIMARY, in the operator's own allowlist spelling. An allowlist entry that names a directory
+    # merely CONTAINING checkouts never reaches here: rule 3 treats every checkout under it as that root
+    # and denies first, which is why no main-worktree fallback is computed.
+    $root = $GovDisplay
+    # The installed hook is decoupled from the checkout it names: the primary's new.ps1 can predate
+    # -Nested, and printing the flag then hands the reader a command that dies at parameter binding --
+    # the #1032 defect. So the flag is printed only if that file declares it. One file read, deny path only.
+    # FAILS CLOSED: the flag is printed only on a positive answer from PowerShell's own parser, which
+    # reads the param block and so ignores a commented-out declaration. Any exception, a parse error,
+    # or a missing file means no -Nested.
+    if ($nested) {
+        $declared = $false
+        try {
+            $newPs1 = Join-Path (Join-Path (Join-Path $root 'scripts') 'worktree') 'new.ps1'
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($newPs1, [ref]$tokens, [ref]$parseErrors)
+            if ($ast -and $ast.ParamBlock -and @($parseErrors).Count -eq 0) {
+                $declared = @($ast.ParamBlock.Parameters |
+                        Where-Object { $_.Name.VariablePath.UserPath -eq 'Nested' }).Count -gt 0
+            }
+        }
+        catch { $declared = $false }
+        $nested = $declared
+    }
+    $newHintQ = Get-SafeForCommand $root -Suffix '\scripts\worktree\new.ps1'
+    if ($nested) {
+        return @"
+Your own worktree is nested under .claude/worktrees, where the Claude Code harness puts worktrees, so -Nested puts this one there too, with the token list and .venv a bare ``git worktree add`` would skip. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
+        pwsh -NoProfile -File $newHintQ -Branch $(Get-SafeForCommand $Dest) -Name $(Get-SafeForCommand $DestSlug) -Nested
+"@
+    }
+    @"
+-Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
+        pwsh -NoProfile -File $newHintQ -Branch $(Get-SafeForCommand $Dest) -Name $(Get-SafeForCommand $DestSlug)
+"@
+}
+
 # Rule 3b -- MOVING THE HEAD of a LINKED WORKTREE that belongs to some other session. Rule 3 below
 # protects only the shared PRIMARY; this protects every OTHER governed worktree from the move that
 # actually happened here: a session with no worktree of its own ran `git checkout <a-branch>` inside
@@ -2607,6 +2706,16 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         # worktree has checked out -- for which `new.ps1` would die with "already checked out at ...".
         # That is the unrunnable-remediation defect of #1032/#1035, so the bullet is omitted rather than
         # filled with a placeholder the reader would have to guess at.
+        #
+        # THE FIRST BULLET TEACHES A ROUTE, NOT A KEY (BACKLOG #1874 step 3, answered DO-NOT-BUILD).
+        # The item asked this class to key on occupancy evidence instead of cwd. An adversarial review
+        # found no safe signal. session_id is shared by a Manager and its subagents, and reused across
+        # launches. A creator stamp breaks when a Manager moves its own Builder's tree. So the logic
+        # keeps its cwd keying, and the text teaches a route this gate already allows.
+        # tests/test_worktree_gate.py runs every printed `git` line through the gate and requires ALLOW.
+        # The text names no stamp or record: anything a session could write, a session could forge.
+        # The route commands carry no -C. The object store is shared, so they work from any worktree of
+        # the repository, and an `isolation: worktree` agent may not aim git at another checkout.
         $selfTopQ = Get-SafeForCommand $selfTopRaw
         $verbMsg = Get-SafeForMessage $Verb
         $headMsg = Get-SafeForMessage $head
@@ -2619,8 +2728,32 @@ refuses this: its only worktree guard blocks a second CHECKOUT of a live branch,
 aimed at a worktree from outside never trips it. It is a worktree of $(Get-SafeForMessage $gov.Display).
 
 What to do instead:
-  * If this is YOUR work, do it in YOUR OWN worktree -- drop the `-C` (or the `cd`) that aims this command
-    at that directory, and run it where you are standing.
+  * To COMBINE branches -- a wave, a batch -- compose the result in git's object store, then give it a
+    NEW worktree. None of these moves any worktree's HEAD, so this gate allows every one, from any
+    worktree of this repository:
+      1. Fetch, then resolve every ref ONCE to a SHA. Use only those SHAs below: a ref read twice can
+         move between the reads, and the commit would then record parents that do not match its tree.
+        git fetch origin
+        git rev-parse origin/main origin/<branch>
+         The first SHA is <base>. Each branch's SHA is its <b>.
+      2. Per branch, merge in the object store and read the EXIT CODE:
+        git merge-tree --write-tree <base> <b>
+         Exit 0: <tree> is the first line of its output. Exit 1 with CONFLICT lines: leave that item
+         out of this wave, send it back to a Builder, and continue with the rest from the same <base>.
+         Any other failure (an unknown SHA, exit 128) is an error to fix, not a conflict.
+      3. Commit the tree. commit-tree runs no hooks, so the checks in step 4 stand in for them:
+        git commit-tree <tree> -p <base> -p <b> -m 'merge <branch>'
+         The SHA it prints is the next <base>. Repeat step 2 for each branch.
+      4. Make a worktree on the last commit, <tip>. Run ensure-venv.ps1 and the checks there, then push:
+        git worktree add --detach <new path> <tip>
+        git push origin <tip>:refs/heads/<batch>
+  * ONLY IF the directory you are standing in is YOUR OWN working tree: drop the `-C` (or the `cd`)
+    that aims this command at that directory, and run it where you stand. A subagent whose cwd is its
+    PARENT's worktree is NOT in that case, and running it there moves the parent's branch. Use the
+    route above, or report back to whoever dispatched you.
+  * If you dispatch Builder subagents, do it from YOUR OWN worktree (rule 2 refuses a dispatch from the
+    primary) and with ``isolation: worktree``. Each Builder's payload cwd is then its own tree, so a merge,
+    rebase or reset there is its own work and this rule allows it.
   * To READ that worktree's branch without touching one file of it, use the plumbing:
         git -C $selfTopQ show $(Get-SafeForCommand $head -Suffix ':<path>')
         git -C $selfTopQ diff $(Get-SafeForCommand $head -Prefix 'HEAD..')
@@ -2673,7 +2806,7 @@ What to do instead:
     # (all measured exit 0), and the destination scanner above trims quotes only at the ENDS, so an
     # interior one survives. The refname is ATTACKER-CHOSEN from a public fork: `gh pr checkout`,
     # `git checkout --track` and `git fetch origin <ref>:<ref>` all create refs/heads/<their-name>.
-    $newHintQ = Get-SafeForCommand $gov.Display -Suffix '\scripts\worktree\new.ps1'
+    $ownRemedy = Get-OwnWorktreeRemedy $CwdRaw $list $mainWt $gov.Display $dest $destSlug
     $selfTopQ = Get-SafeForCommand $selfTopRaw
     $destMsg  = Get-SafeForMessage $dest
     Write-Deny -Rule "3b" -Detail "git $Verb -> $selfTopRaw" -Reason @"
@@ -2689,8 +2822,7 @@ What to do instead:
     that branch, which is the protection you actually want. That refusal is a DEFAULT, not a guarantee:
     measured, `worktree add --force` (and `-f`) check the same branch out again and succeed, and
     `checkout --ignore-other-worktrees` switches. It stops the ACCIDENT, not a determined bypass. The
-    branch already EXISTS, so this REUSES it rather than forking. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
-        pwsh -NoProfile -File $newHintQ -Branch $(Get-SafeForCommand $dest) -Name $(Get-SafeForCommand $destSlug)
+    branch already EXISTS, so this REUSES it rather than forking. $ownRemedy
   * To READ '$destMsg' without touching any working tree, use the plumbing:
         git -C $selfTopQ show $(Get-SafeForCommand $dest -Suffix ':<path>')        git -C $selfTopQ diff $(Get-SafeForCommand $dest -Prefix 'HEAD..')
   * If you genuinely OWN this worktree and must switch it, do it from a PLAIN terminal -- the gate governs
@@ -3531,10 +3663,11 @@ What to do instead:
         # WHICH FAMILY IS THE VICTIM IN? The remedy has to be one that can actually reach it, and until
         # now neither of the two this rule named could (BACKLOG #1057):
         #
-        #   * `remove.ps1 -Name <dir>` resolves to <repo-parent>/<repo-leaf>-<dir>. new.ps1 ASSERTS that
-        #     shape after deriving it, so the <primary>-<name> sibling family is the only one it can
-        #     produce and the only one remove.ps1 can resolve; handed anything else it fails Test-Path
-        #     and throws "No such worktree".
+        #   * `remove.ps1 -Name <dir>` resolves only the <primary>-<dir> sibling; handed anything else it
+        #     fails Test-Path and throws "No such worktree". (Since BACKLOG #1038, `-Nested` also
+        #     resolves <primary>/.claude/worktrees/<dir>. This rule does not print it yet: the not-
+        #     sibling branch below names `git worktree remove`, which reaches every family. Which
+        #     mechanism makes which layout: the WHICH MECHANISM MADE THIS WORKTREE block above.)
         #   * `prune-merged.ps1` excludes anything with a `.claude/worktrees/` path segment OUTRIGHT --
         #     its own header says so, and -Name cannot reach them either. That exclusion is deliberate:
         #     those are the trees a live session gets relocated into.
@@ -3789,8 +3922,8 @@ $cleanupBullet
             # Test-Governed already applies. A linked worktree living UNDER the primary is not the
             # primary -- a git verb there swaps only its own tree -- but a path separator clears both
             # lookaheads above, so `<primary>/.claude/worktrees/<name>` matched and DENIED. That is
-            # exactly where the Claude Code harness puts a worktree (new.ps1 makes SIBLINGS at
-            # <repo-parent>\<repo-name>-<Name>; BOTH layouts are live here), so `cd <own worktree> &&
+            # exactly where the Claude Code harness puts a worktree (both layouts, and which mechanism
+            # makes each: the WHICH MECHANISM MADE THIS WORKTREE block above), so `cd <own worktree> &&
             # git rebase ...` -- the
             # most ordinary thing a session does -- was refused as if it were swapping the shared tree,
             # while the identical command with the path omitted was allowed: the block depended on how the
