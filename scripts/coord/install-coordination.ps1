@@ -36,8 +36,10 @@
       UserPromptSubmit                      -> scripts/hooks/announce-session.ps1    (tell the peers you exist, and what you intend)
       SessionStart, Stop                    -> scripts/hooks/mail-drain.ps1          (deliver session mail)
       Stop                                  -> scripts/hooks/seat-record.ps1         (record this seat's episode)
-      Stop (async rewake)                   -> scripts/hooks/mail-watch.ps1          (wake an idle session for urgent mail)
       Stop                                  -> scripts/hooks/wiki-write-prompt.ps1   (after real work, ask for one fleet wiki note)
+
+    RETIRED, STRIPPED ON EVERY RUN AND NEVER ADDED
+      Stop (async rewake)                   -> scripts/hooks/mail-watch.ps1          (the urgent mail tier; ADR 0161)
 
     Idempotent: re-running replaces our own entries and leaves every other hook untouched.
 
@@ -323,7 +325,12 @@ $WIRING = @(
     # ONE-SHOT, STATED RATHER THAN PAPERED OVER: the rewake belongs to the process Claude Code spawned
     # and is tracked by hook id, so the watcher cannot re-arm itself. Each Stop arms one. After a
     # delivery the session falls back to the drain until its next turn boundary.
-    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/mail-watch.ps1"; Timeout = 1200; Msg = "Watching for urgent mail"; Marker = $WAKE_MARKER; Shim = "wake"; Async = $true }
+    #
+    # RETIRED by owner ruling 2026-10-01 (BACKLOG #1215). The 2026-08-06 "NOT WIRED" decision in ADR 0161 stands, and
+    # that ADR records why. Retired means: the strip loop below still removes it from every root, -Status
+    # still reports it, and the install loop never adds it. KEEP THIS ROW. Strip and -Status walk only
+    # $WIRING, so deleting it would leave every copy already installed in place, and unreported.
+    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/mail-watch.ps1"; Timeout = 1200; Msg = "Watching for urgent mail"; Marker = $WAKE_MARKER; Shim = "wake"; Async = $true; Retired = $true }
 )
 
 # The unfiltered table, kept so a filter that matches nothing can tell the operator what DOES exist.
@@ -408,6 +415,17 @@ if ($Status) {
         Write-Host "  $p"
         foreach ($w in $WIRING) {
             $ours = @(@($s.hooks[$w.Event]) | Where-Object { $_ -and (Test-IsOurs $_ $w.Marker) })
+            if ($w.Retired) {
+                # A retired row still installed is the one state here that needs an action, so it says
+                # which. Absent is the correct state for it, and says so rather than reading MISSING.
+                if ($ours.Count -gt 0) {
+                    Write-Host ("    {0,-16} {1,-38} {2}" -f $w.Event, $w.Script, "RETIRED, STILL INSTALLED -- re-run the installer to strip it") -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host ("    {0,-16} {1,-38} {2}" -f $w.Event, $w.Script, "RETIRED, absent (correct)")
+                }
+                continue
+            }
             $state = if ($ours.Count -gt 0) { "INSTALLED" } else { "MISSING" }
             Write-Host ("    {0,-16} {1,-38} {2}" -f $w.Event, $w.Script, $state)
         }
@@ -435,6 +453,8 @@ foreach ($path in $SettingsPath) {
 
         if (-not $Uninstall) {
             foreach ($w in $WIRING) {
+                # A retired row was stripped above with the rest and is never added back.
+                if ($w.Retired) { continue }
                 $entry = [ordered]@{}
                 if ($w.Matcher) { $entry.matcher = $w.Matcher }
                 $entry.hooks = @(
@@ -488,7 +508,10 @@ Write-Host ""
 Write-Host ("Roots examined: {0}   succeeded: {1}   failed: {2}   as of {3}" -f `
         $SettingsPath.Count, ($SettingsPath.Count - $failed.Count), $failed.Count, [DateTime]::UtcNow.ToString('o'))
 if (-not $Uninstall) {
-    foreach ($w in $WIRING) { Write-Host ("  {0,-16} -> {1}" -f $w.Event, $w.Script) }
+    foreach ($w in $WIRING) {
+        if ($w.Retired) { Write-Host ("  {0,-16} -> {1}   RETIRED: stripped, not installed" -f $w.Event, $w.Script) }
+        else { Write-Host ("  {0,-16} -> {1}" -f $w.Event, $w.Script) }
+    }
     Write-Host ""
     Write-Host "  Takes effect in NEWLY STARTED sessions; existing ones keep the config they booted with."
     Write-Host "  A root listed above is a root whose settings FILE now carries the entry. That is not the"

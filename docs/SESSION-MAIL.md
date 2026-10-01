@@ -45,15 +45,18 @@ The coordination banner (`scripts/worktree/session-context.ps1`) is a *different
 `SessionStart` event and is deliberately still absent. **Install one tier at a time with
 `-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too.
 
-The urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) **is registered on
-`Stop` as well** -- measured 2026-08-17 by two independent instruments that agreed:
-`install-coordination.ps1 -Status` reported it INSTALLED in every root, and a direct read of each
-`settings.json` found the `mefor-wake` shim resolving `scripts/hooks/mail-watch.ps1`. **That reading
-predates `.claude-account-5`**, and the 2026-09-02 re-measurement covered the drain tag only, so run
-the status command above before treating the urgent tier as covering every root today. This line
-previously read "armed in code and registered nowhere, by decision", which was true when written on
-2026-08-06 and is not true now. It is recorded rather than silently overwritten because the direction
-of the drift is the instructive part: **a doc that understates what is armed is the safer of the two
+The urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) **is RETIRED**, by
+owner ruling of 2026-10-01: the 2026-08-06 NOT WIRED decision stands. ADR 0161 holds the record, in the
+RESOLVED note under its contradiction quote; it is not restated here. Its installer row is marked
+`Retired`, so the next run of `install-coordination.ps1` strips any installed copy and never adds one,
+and `-Status` names a copy that is still installed. Until a root has been re-run, the tier may still be
+registered there. Nothing relies on it either way: no seat may rely on a notice arriving (`CLAUDE.md`
+section 5).
+**CORRECTED 2026-10-01.** This paragraph used to say the tier *"is registered on `Stop` as well"*,
+measured 2026-08-17 in every root then installed. That was true from 2026-08-12, when it was wired
+without the decision, until the retirement. Before that, this line read "armed in code and registered
+nowhere, by decision", which was true when written on 2026-08-06. Both are recorded rather than silently
+overwritten because the direction of the drift is the instructive part: **a doc that understates what is armed is the safer of the two
 errors and therefore the one nobody goes looking for.** Its opposite -- a doc asserting a control is
 live when it is wired nowhere -- is live today for the coordination banner, in
 [`SESSION-DRIFT-CONTROLS.md`](SESSION-DRIFT-CONTROLS.md) and [`WORKTREES.md`](WORKTREES.md).
@@ -627,9 +630,12 @@ behaviour is conditional on the run being interactive.
 
 ### Decided 2026-08-06: NOT wired, and the rebuild path, so it is not rediscovered
 
-**The tier is not wired and is not in the installer's wiring table** -- turning it on needs a new row,
-not a command. That is deliberate. The default tier has not yet delivered mail in real use, so building
-a second tier to cut a latency nobody has measured would be optimising against a guess.
+**The tier is retired.** Its status, and why the installer keeps a `Retired` row for it, are stated
+once, near the top of this file and in ADR 0161's RESOLVED note. **CORRECTED 2026-10-01:** this
+paragraph used to say the tier *"is not wired and is not in the installer's wiring table"*, which was
+false from 2026-08-12, and that the default tier had not yet delivered mail in real use, which the
+receipts have since disproved. The decision stood on its other ground: nobody has measured the latency
+a second tier would cut.
 
 **If it is ever rebuilt, arm it on `UserPromptSubmit`, not `SessionStart`.** The phantom measurement
 makes this concrete, and it fixes both objections at once:
