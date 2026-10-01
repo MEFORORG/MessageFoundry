@@ -882,7 +882,8 @@ gates a merge**, and no seat has to clear one.
 ### A Builder runs the checks before it commits, because nobody downstream can ask it to
 
 - New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict,
-  over `messagefoundry` and, with `--explicit-package-bases`, `tests`), `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+  over the packages `ci.yml` checks: `messagefoundry`, `messagefoundry_webconsole`,
+  `messagefoundry_toolkit`), `mypy --explicit-package-bases tests`, then `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
 - **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
   Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
   points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
