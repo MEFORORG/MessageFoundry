@@ -379,8 +379,8 @@ def test_both_new_events_are_rule_targetable() -> None:
 
 
 def test_the_alert_keys_can_never_name_a_connection() -> None:
-    """BACKLOG #1898: a catch-all rule's control_action is dispatched at the event's key. A key that
-    could be a connection name could restart a real connection."""
+    """BACKLOG #1898: no control_action fires on these event types. The keys must also never
+    parse as a connection name, so neither can be a restart's default target."""
     assert not is_connection_name("approval:0123abcd")
     assert not is_connection_name("user:admin2")
 

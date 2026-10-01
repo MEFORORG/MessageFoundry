@@ -38,6 +38,7 @@ from typing import Any, Generic, Protocol, TypeVar
 
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
+    _ALERT_CONTROL_EVENT_TYPES,
     INSECURE_TLS_ESCAPE_ENV,
     AlertRule,
     AlertSeverity,
@@ -951,11 +952,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is unclaimed and near its
         # deadline. `user:<username>` stands in for "connection", so the throttle and the alert
         # instance key per account. Rules still match it: AlertRule.connection defaults to "*". So
-        # when a catch-all rule is the first match, its mute or transports=[] silences this reminder,
-        # and its control_action is dispatched at `user:<username>`, or, with control_target set, at
-        # that real connection, which it restarts. Scope such rules to real connection names or to
-        # one event_type. `reason` carries the deadline into the durable alert row. The payload is
-        # the ISO deadline and whole hours remaining only: never the password, no PHI.
+        # when a catch-all rule is the first match, its mute or transports=[] silences this reminder.
+        # No control_action fires on it: AlertRule refuses one on a non-connection event type, and
+        # _emit skips it (BACKLOG #1898). `reason` carries the deadline into the durable alert row.
+        # The payload is the ISO deadline and whole hours remaining only: never the password, no PHI.
         self._emit(
             {
                 "type": "initial_credential_expiring",
@@ -1272,8 +1272,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # BEFORE the transport-suppression return, so a rule may auto-remediate QUIETLY (transports=[]) or
         # alongside a page. Dispatched off-worker + never-raise (see _dispatch_control).
         if decision.control_action is not None:
-            target = decision.control_target or str(event["connection"])
-            self._dispatch_control(decision.control_action, target)
+            if event["type"] in _ALERT_CONTROL_EVENT_TYPES:
+                target = decision.control_target or str(event["connection"])
+                self._dispatch_control(decision.control_action, target)
+            else:
+                # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never reaches
+                # here. This covers only a rule built past that validator (model_construct). It checks
+                # the event TYPE and cannot see a stand-in raised under an allowed type (see the
+                # KNOWN GAPS on _ALERT_CONTROL_EVENT_TYPES).
+                log.warning(
+                    "alert control_action %s skipped: event type %r is not connection-scoped",
+                    decision.control_action,
+                    event["type"],
+                )
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance
         # was already recorded above (AC-3: a suspended alert stays open/counted/visible), and any #144
         # control action already dispatched; a still-active suspend window only mutes the transport enqueue.

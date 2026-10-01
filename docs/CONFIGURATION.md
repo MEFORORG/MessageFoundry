@@ -1167,13 +1167,11 @@ The engine raises it when a pause starts, and again every 300 seconds while the 
 does `queue_buildup`. That spacing is fixed. The notifier's throttle (`realert_seconds`, or a rule's
 `cooldown_seconds`) decides which of those raises pages, and escalation tiers and suspend windows
 count them. So a cooldown under 300 seconds does not page faster. A second pause soon after the first
-raises at once, but the throttle may hold its page; a later reminder in that pause sends it. A rule
-with a `control_action` fires it on every raise that the throttle passes, so a long pause repeats
-the action. With no `[alerts]` transport the engine raises no event; its own WARNING line records
-each pause. Its `connection` is
-`intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert. A rule's
-`control_action` sent to that name reaches no connection. A rule that sets `control_target` still
-restarts the connection it names.
+raises at once, but the throttle may hold its page; a later reminder in that pause sends it. With no
+`[alerts]` transport the engine raises no event; its own WARNING line records each pause. Its
+`connection` is `intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert.
+A rule cannot attach a `control_action` to `intake_paused`, because it is not a connection-scoped
+event (see `control_action` in the rule table below).
 
 The payload holds `reason` (`staged_depth` or `disk_floor`), `value`, `limit` and `store_kind`
 (`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`. For `staged_depth`, `value` and
@@ -1228,6 +1226,8 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 | `severity` | str | `warning` | `info` \| `warning` \| `critical` — tagged onto the event (webhook JSON + email subject) for downstream triage |
 | `transports` | list | _all_ | which transports fire: subset of `["webhook", "email"]`; **unset = all configured**; **`[]` = SUPPRESS** (drop silently) |
 | `cooldown_seconds` | num | _global_ | override `realert_seconds` for matching events (e.g. re-page a critical sooner) |
+| `control_action` | str | _unset_ | `restart_inbound` \| `restart_outbound` — restart a connection when the rule fires ([ADR 0128](adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md)). **Allowed only with a connection-scoped `event_type`** (BACKLOG #1898). The source of record is `_ALERT_CONTROL_EVENT_TYPES` in `messagefoundry/config/settings.py`; at the time of writing it holds `connection_stopped`, `connection_error`, `queue_buildup`, `message_stall`, `saturation` and `lane_stuck`. Config load refuses the action with `any` and with every other type. Those other types put a stand-in in `connection`, such as a bare username, `store` or a cert label. A restart aimed at a stand-in could hit an unrelated connection with the same name. With no `control_target`, the action aims at the event's own name, so pair `restart_outbound` with events from outbound connections and `restart_inbound` with events from inbound ones |
+| `control_target` | str | _the event's connection_ | the connection `control_action` restarts, when it is not the one that fired. Config load refuses a value that is not a connection name, and refuses it on a rule with no `control_action` |
 
 ```toml
 [alerts]
