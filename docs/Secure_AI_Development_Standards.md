@@ -294,7 +294,9 @@ When the AI suggests a dependency, **verify-before-add** it here (real, reputabl
 $env:QT_QPA_PLATFORM="offscreen"
 .venv\Scripts\ruff.exe check messagefoundry tests
 .venv\Scripts\ruff.exe format --check messagefoundry tests
-.venv\Scripts\mypy.exe messagefoundry
+.venv\Scripts\mypy.exe --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
+.venv\Scripts\mypy.exe --platform win32 messagefoundry messagefoundry_toolkit   # the two engine legs ci.yml runs
+.venv\Scripts\mypy.exe --explicit-package-bases tests
 .venv\Scripts\python.exe -m pytest -q
 python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-hook + CI + IDE
 ```
