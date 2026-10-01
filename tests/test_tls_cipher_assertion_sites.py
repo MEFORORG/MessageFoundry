@@ -529,12 +529,14 @@ def test_a_plaintext_ldap_bind_has_no_tls_context_to_assert(every_suite_looks_we
     proves the LDAPS test above is keyed on the scheme and not merely on the constructor running.
 
     ``ad_allow_insecure_ldap`` is required to reach this arm at all — ``AuthSettings`` refuses a
-    non-``ldaps://`` bind without it — so this also records that the cleartext-LDAP path is reachable
-    only behind that documented dev override.
+    non-``ldaps://`` bind without it — and so is the ``warn`` dial, because under ``enforce`` the
+    authenticator refuses the plain bind (vault BACKLOG #2354). So this also records that the
+    cleartext-LDAP path is reachable only behind that documented dev override.
     """
 
     auth = ldap_auth.LdapAuthenticator(
-        _ad_settings(ad_server="ldap://dc1.example.test:389", ad_allow_insecure_ldap=True)
+        _ad_settings(ad_server="ldap://dc1.example.test:389", ad_allow_insecure_ldap=True),
+        enforcing=False,
     )
     assert auth._server().tls is None
 

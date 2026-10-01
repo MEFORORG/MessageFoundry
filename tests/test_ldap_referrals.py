@@ -14,7 +14,8 @@ every byte it receives, so "not followed" is a count of connections it accepted,
 positive-control arm shows the same instrument does see the password when both guards are removed.
 
 The primary hop here is plain ``ldap://`` (``ad_allow_insecure_ldap``), because the property under
-test is whether ldap3 follows, and that does not depend on the primary's TLS.
+test is whether ldap3 follows, and that does not depend on the primary's TLS. That bind is refused
+under ``enforce`` (vault BACKLOG #2354), so these build the authenticator at ``enforcing=False``.
 
 PHI-free: synthetic directory names and passwords only.
 """
@@ -196,7 +197,7 @@ def test_a_referred_search_is_refused_and_the_referred_host_never_hears_from_the
     following, and the referred server accepts no connection at all."""
     primary, referred = dcs
     with pytest.raises(LdapError) as refused:
-        LdapAuthenticator(_settings(primary)).probe_principal("jsmith")
+        LdapAuthenticator(_settings(primary), enforcing=False).probe_principal("jsmith")
 
     assert primary.accepted == 1, "the primary was never asked, so nothing below is measured"
     assert referred.accepted == 0, "the engine followed the referral"
@@ -223,7 +224,7 @@ def test_each_guard_alone_still_stops_the_follow(
     primary, referred = dcs
     _revert(monkeypatch, connection=connection, server=server)
     with pytest.raises(LdapError):
-        LdapAuthenticator(_settings(primary)).probe_principal("jsmith")
+        LdapAuthenticator(_settings(primary), enforcing=False).probe_principal("jsmith")
     assert referred.accepted == 0
 
 
@@ -237,7 +238,7 @@ def test_with_both_guards_reverted_ldap3_carries_the_bind_password_to_the_referr
     server that cannot be reached rather than a referral that was not followed."""
     primary, referred = dcs
     _revert(monkeypatch, connection=True, server=True)
-    probe = LdapAuthenticator(_settings(primary)).probe_principal("jsmith")
+    probe = LdapAuthenticator(_settings(primary), enforcing=False).probe_principal("jsmith")
 
     assert referred.accepted == 1
     assert _BIND_PASSWORD.encode() in bytes(referred.received), (
@@ -263,7 +264,7 @@ async def test_a_referred_kerberos_sign_in_is_audited_as_a_login_error(
     settings = _settings(primary, kerberos_enabled=True)
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, settings, ldap=LdapAuthenticator(settings))
+        service = AuthService(store, settings, ldap=LdapAuthenticator(settings, enforcing=False))
         await service.initialize()
         out = await service.authenticate_kerberos(b"spnego-token")
 

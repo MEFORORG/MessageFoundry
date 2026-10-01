@@ -525,16 +525,34 @@ class LdapAuthenticator:
         # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
         # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
         # so current_hop_posture() would be None here; the posture must be passed explicitly or the
-        # clamp below would be inert. None (a direct/test/embedding construction) falls back to the
-        # unclamped escape — byte-identical to the pre-#329 bare read.
+        # escape below is refused. None (a direct/test/embedding construction) FAILS CLOSED: the escape
+        # is not permitted (vault BACKLOG #2354). CORRECTED: this read that None *"falls back to the
+        # unclamped escape -- byte-identical to the pre-#329 bare read"*; weakened_tls_escape_permitted
+        # stopped doing that in engine PR 1886.
         self._posture = posture
+        # Vault BACKLOG #2354: a plain ldap:// bind sends both passwords in cleartext. ServiceSettings
+        # refuses it at load under [security].enforcement = enforce; this repeats that refusal for a
+        # caller that hands over an AuthSettings alone, keyed on the same dial (`enforcing`, which
+        # defaults to enforce). Under warn, AuthSettings already required ad_allow_insecure_ldap.
+        if not self._ldaps:
+            if enforcing:
+                raise LdapError(
+                    "ad_server is a plain ldap:// address, and ad_allow_insecure_ldap is inert under "
+                    "[security].enforcement = enforce (the binds would send passwords in cleartext). "
+                    "Use an ldaps:// ad_server."
+                )
+            logger.warning(
+                "AD binds over plain ldap:// (ad_allow_insecure_ldap=true, honoured because "
+                "[security].enforcement = warn) -- the service-account and user passwords cross the "
+                "network in cleartext; do not use in production."
+            )
         # A disabled-cert-verification posture (ad_tls_verify=false over LDAPS) would make the service-
         # account and user binds MITM-able on first deployment, so it REFUSES at startup unless the
         # operator sets the explicit MEFOR_ALLOW_INSECURE_TLS dev escape (ASVS 12.3.2). #329 routes that
         # escape through the ADR-0092 clamp (weakened_tls_escape_permitted): under an enforcing-PHI
         # posture the escape is INERT, so it can never silence this refusal on such an instance — the
-        # blunt env var no longer buys verify-off there. With the escape permitted (non-enforcing/non-PHI
-        # or unstamped posture), we still warn loudly once at startup.
+        # blunt env var no longer buys verify-off there. With the escape permitted (a known, non-enforcing
+        # posture; an unstamped one now refuses), we still warn loudly once at startup.
         if self._ldaps and not settings.ad_tls_verify:
             if not weakened_tls_escape_permitted(self._posture):
                 raise LdapError(
