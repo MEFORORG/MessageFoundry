@@ -26,10 +26,10 @@ flowchart TB
   classDef cfg fill:#f1f8e9,stroke:#9e9d24,color:#1f2400;
 
   CONSOLE["messagefoundry-webconsole<br/>the operator web console, served at /ui<br/>its own version line"]:::opstool
-  TOOLKIT["messagefoundry-toolkit<br/>authoring and development commands<br/>the engine's version"]:::devtool
+  TOOLKIT["messagefoundry-toolkit<br/>authoring commands, moving out of the engine in stages<br/>the engine's version"]:::devtool
   HARNESS["messagefoundry-harness<br/>synthetic send, receive, load and failover testing<br/>the engine's version"]:::devtool
 
-  ENGINE["messagefoundry<br/>the engine, its API and the messagefoundry command<br/>the Windows tray, messagefoundry-tray"]:::core
+  ENGINE["messagefoundry<br/>the engine, its API and the messagefoundry command<br/>the Windows tray, messagefoundry-tray<br/>the authoring commands not yet moved"]:::core
 
   subgraph EXTRAS["Optional extras of the messagefoundry distribution"]
     XSTORE["Store backends<br/>sqlserver, postgres"]:::cfg
@@ -39,36 +39,37 @@ flowchart TB
     XTEST["Test and development<br/>harness, dev, fuzz"]:::cfg
   end
 
-  CONSOLE -->|"requires the engine, at a minimum version"| ENGINE
-  TOOLKIT -->|"requires the engine, at the same version"| ENGINE
-  HARNESS -->|"requires the engine, at the same version"| ENGINE
-  HARNESS -->|"requires the harness extra"| XTEST
+  CONSOLE -->|"declares the engine, and needs a matching release"| ENGINE
+  TOOLKIT -->|"declares the engine at its own version"| ENGINE
+  HARNESS -->|"declares the engine at its own version, with the harness extra"| ENGINE
   ENGINE -.->|"add only what a host needs"| EXTRAS
 ```
 
 **Legend.** The four boxes outside the extras group are distributions, each with its own wheel. A
-solid arrow is a declared dependency, so `pip` installs the target for you. The dotted arrow is
-your choice.
+solid arrow is a dependency the package declares. The dotted arrow is your choice. Install and
+verify the engine yourself first, as section 3 says. Do not let another package pull it in.
 
 | Job | Distribution | What it holds | Command |
 |---|---|---|---|
 | Run an engine instance | `messagefoundry` | The `messagefoundry` package: the engine, its API, the CLI and the Windows tray | `messagefoundry`, `messagefoundry-tray` |
 | Operate an instance from a browser | `messagefoundry-webconsole` | The `messagefoundry_webconsole` package. The engine mounts it in-process and serves it at `/ui` | none of its own |
-| Use the authoring and development commands | `messagefoundry-toolkit` | The `messagefoundry_toolkit` package | `messagefoundry-toolkit` |
+| Use an authoring command the engine no longer carries | `messagefoundry-toolkit` | The `messagefoundry_toolkit` package | `messagefoundry-toolkit` |
 | Send and receive synthetic test traffic | `messagefoundry-harness` | The `harness` package: MLLP send and receive, load and failover tools | `messagefoundry-harness` |
 
 Three facts about versions:
 
-- The toolkit and the harness pin the engine to their own version, so the three always move
-  together.
-- The web console has its own version line. It names a lowest engine version, and the engine
-  checks the pair when it mounts the console. Section 7 says which console release to install.
+- The toolkit and the harness each declare the engine at exactly their own version. Install all
+  three at one version, and upgrade them together.
+- The web console has its own version line. Its wheel declares a lowest engine version, but the
+  pair must also match. The engine checks the pair when it mounts the console and refuses a
+  mismatch. Section 7 names the console release to install.
 - Every distribution needs Python 3.14 or later.
 
-The toolkit holds the authoring commands that
 [ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)
-moves out of the engine wheel. Run `messagefoundry-toolkit --help` to list the ones your version
-holds.
+moves the authoring and development commands out of the engine wheel in stages. Until the last
+stage, most of them are still engine commands, such as `messagefoundry init` in section 4. Run
+`messagefoundry --help` and `messagefoundry-toolkit --help` to see which command holds what at your
+version.
 
 The extras, by group. `pyproject.toml` holds the live list.
 
@@ -81,7 +82,7 @@ The extras, by group. `pyproject.toml` holds the live list.
 | Message formats | `x12` | Strict X12 validation |
 | Message formats | `xml` | XML and SOAP access, schema validation and signatures |
 | Connectors, keys and sign-in | `sftp` | SFTP for the remote-file connector |
-| Connectors, keys and sign-in | `vault` | HashiCorp Vault key provider |
+| Connectors, keys and sign-in | `vault` | HashiCorp Vault client, for the Vault key provider and secret provider |
 | Connectors, keys and sign-in | `webauthn` | Browser passkeys for the web console |
 | Metrics export | `otel` | OpenTelemetry metrics export |
 | Test and development | `harness` | PySide6, for the test harness window |

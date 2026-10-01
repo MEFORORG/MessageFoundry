@@ -26,8 +26,8 @@
 
 This diagram answers one question: how would a change to Connections, Routers and Handlers reach
 production safely? A deploying site would keep one config repo and run one engine instance per
-environment. The same reviewed commit goes to every instance. Only the per-environment values
-differ.
+environment. The same reviewed commit goes to every instance. What differs per instance stays out
+of the graph: the environment's values, the instance's own `messagefoundry.toml`, and its secrets.
 
 ```mermaid
 flowchart TB
@@ -47,17 +47,18 @@ flowchart TB
   subgraph CHECK["messagefoundry check, run by the pull request CI"]
     VALIDATE["validate<br/>the graph loads and every name resolves"]:::devtool
     DRYRUN["dryrun<br/>each fixture routes without an error"]:::devtool
-    POSTURE["posture and build-check<br/>resolve the active environment, refuse what serve would refuse"]:::devtool
-    LINT["Config lints, plus ruff and mypy when enabled<br/>advisory"]:::devtool
+    POSTURE["posture, build-check and the other required checks<br/>resolve the active environment, refuse what serve would refuse"]:::devtool
+    LINT["Advisory checks<br/>config lints, plus ruff and mypy when enabled"]:::devtool
   end
 
   MERGED(["The reviewed commit merges to main"]):::ext
 
-  subgraph PROMOTE["Promote to one instance: Stage to Promote in the VS Code extension"]
-    LOCAL["1. Validate the config locally"]:::opstool
-    PREFLIGHT["2. Pre-flight on the target<br/>a dry-run reload resolves that environment's env() values"]:::opstool
-    CONFIRM["3. Confirm"]:::opstool
-    APPLY["4. Apply<br/>the engine swaps in the new graph in one step"]:::opstool
+  subgraph PROMOTE["Promote to one instance: the promote command in the VS Code extension"]
+    PLACE["Place the merged commit in that instance's config directory"]:::opstool
+    LOCAL["Stage<br/>validate the config locally"]:::opstool
+    TARGET["Target<br/>pick the environment and its engine instance"]:::opstool
+    PREFLIGHT["Pre-flight<br/>a dry-run reload resolves that environment's env() values"]:::opstool
+    APPLY["Confirm and apply<br/>the engine swaps in the new graph in one step"]:::opstool
   end
 
   subgraph INSTANCES["One engine instance per environment, all on the same commit"]
@@ -76,38 +77,45 @@ flowchart TB
   DRYRUN --> POSTURE
   POSTURE --> LINT
   LINT -->|"every required check passed"| MERGED
-  MERGED --> LOCAL
-  LOCAL --> PREFLIGHT
-  PREFLIGHT --> CONFIRM
-  CONFIRM --> APPLY
+  MERGED --> PLACE
+  PLACE --> LOCAL
+  LOCAL --> TARGET
+  TARGET --> PREFLIGHT
+  PREFLIGHT --> APPLY
   APPLY -->|"first"| DEV
-  DEV -->|"repeat the four steps"| STAGING
-  STAGING -->|"repeat the four steps"| PROD
+  DEV -->|"repeat the promote steps for staging"| STAGING
+  STAGING -->|"repeat the promote steps for prod"| PROD
   SECRETS -.-> DEV
   SECRETS -.-> STAGING
   SECRETS -.-> PROD
 ```
 
-**Legend.** Yellow-green boxes are files in the config repo. Teal boxes are the checks inside
-`messagefoundry check`. Blue boxes are the promote steps. Green boxes are engine instances. A dotted
-arrow is a value that never enters the repo.
+**Legend.** Each group's title says what its boxes are. The rounded box is an event. A dotted arrow
+is a value that never enters the repo. The check group shows at least the checks that matter to
+promotion. `run_checks` in [`checks.py`](../messagefoundry/checks.py) holds the full set, and says
+which ones block.
 
 What each stage would do for a site:
 
 1. **Author.** Routers and Handlers are Python. A Connection is Python too, or a `connections.toml`
    entry. Either form reads a per-environment value by key: `env("key")` in Python,
    `{ env = "key" }` in TOML. So one graph serves every environment.
-2. **Gate.** The pull request runs `messagefoundry check`. Sections 2 and 3 below say what each
-   check proves and which ones block.
+2. **Gate.** The pull request runs `messagefoundry check`. Sections 2 and 3 below describe the
+   workflow and the main checks.
 3. **Merge.** The site would protect `main`, so only a commit that passed the gate lands there.
-4. **Promote.** A remote instance reloads from its own `--config` directory, so the site first
-   places the merged commit there. The VS Code extension's promote command
-   (`messagefoundry.promote`, titled Stage to Promote) then asks that engine to reload it. The
+4. **Place the commit.** The promote command does not copy files to a remote engine. A remote
+   instance reloads from its own `--config` directory, so the site first places the merged commit
+   there. Skip this, and the engine reloads the config it already had. For an engine on the same
+   machine, the command sends the workspace's config path instead.
+5. **Promote.** The VS Code extension's promote command then asks that engine to reload. Its
+   command id is `messagefoundry.promote`. Type "Promote" in the Command Palette to find it. The
    pre-flight is a dry run: the engine resolves its own environment's values and swaps nothing. A
    value the target lacks fails here, before anything goes live. The gate resolves only the one
    environment its own settings name, so the pre-flight is where each target's values are checked.
-5. **Apply.** The reload needs the `config:deploy` permission, and the engine audits it. Where the
-   site turns on dual control for reloads, the engine holds the swap until a second user approves.
+6. **Apply.** The reload route needs the `config:deploy` permission and a recent step-up sign-in
+   ([SECURITY.md](SECURITY.md#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
+   The engine audits every reload and every dry run. Where the site turns on dual control for
+   reloads, the engine holds the swap until a second user approves.
 
 The engine's built-in environment names are `dev`, `staging` and `prod`. `messagefoundry init`
 writes `environments/dev.toml` and `environments/prod.toml`. A site that runs a staging instance

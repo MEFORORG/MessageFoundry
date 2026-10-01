@@ -28,7 +28,7 @@ flowchart TB
   subgraph CHECKS["Merge checks: ci.yml and security.yml"]
     TESTS["test legs on Linux and Windows Server<br/>ruff, mypy strict, pytest"]:::core
     LOCKS["Lock sync check<br/>uv lock --check, re-export each lock, git diff"]:::core
-    AUDIT["Install from the hashed lock<br/>pip-audit over each lock, new-dependency check"]:::core
+    AUDIT["Install from the hashed lock<br/>pip-audit over the all-extras lock and the tool locks<br/>new-dependency check"]:::core
     SAST["bandit, semgrep, gitleaks<br/>crypto inventory, forbidden-content scan"]:::core
   end
 
@@ -46,7 +46,7 @@ flowchart TB
     GATE["Leak gate and member gate<br/>wheel smoke test, version equals tag"]:::build
     TKIT["Build the toolkit wheel<br/>member gate, smoke test, lockstep pin"]:::build
     STAGE["Stage the copy for PyPI<br/>byte-compare it with the gated files"]:::build
-    SBOMIN["Fetch both SBOMs, stage the OpenVEX file<br/>install sbomqs by pinned digest, score both SBOMs"]:::build
+    SBOMIN["Fetch both SBOMs, stage the OpenVEX file<br/>install sbomqs by pinned digest, report each SBOM's quality score"]:::build
     SIGN["Sigstore keyless signing<br/>sdist, wheels, both SBOMs, VEX"]:::api
     SLSA["SLSA build provenance attestation"]:::api
     GHREL["Create the GitHub release<br/>artifacts with their Sigstore bundles"]:::build
@@ -95,9 +95,9 @@ flowchart TB
   WEB -.->|"publish"| PYPI
 ```
 
-**Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Green
-boxes are merge checks, purple boxes are release steps, and violet boxes sign or attest. A dotted
-arrow is a publish step that runs when its repository variable is set.
+**Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
+group's title names the workflow its boxes belong to. The two job boxes outside a group are in
+`release.yml` too. A dotted arrow is a publish step that runs when its repository variable is set.
 
 Four facts the labels leave out:
 
@@ -110,7 +110,8 @@ Four facts the labels leave out:
 - **One identity.** Signing, attestation and publishing all use the release job's GitHub OIDC
   identity. PyPI publishing is Trusted Publishing, with no API token.
 - **The order.** A PyPI upload cannot be replaced, so the two publish steps come last in the
-  release job. A step that fails before them stops the job. The toolkit uploads before the engine
+  release job. A blocking step that fails before them stops the job. The SBOM quality score reports
+  and does not block. The toolkit uploads before the engine
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
 
 ## What we publish, per release
