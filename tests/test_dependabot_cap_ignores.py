@@ -187,7 +187,7 @@ def _violations(pyproject: dict[str, Any], dependabot: dict[str, Any]) -> list[s
         want = f">={cap.ignore_from}"
         if cap.package in _EXEMPT:
             table, reason = _EXEMPT[cap.package]
-            if not cap.where.startswith(table):
+            if cap.where != table and not cap.where.startswith(f"{table}."):
                 problems.append(f"{label} is exempt only in {table}, and this cap is elsewhere")
             elif table == _GROUPS and not cap.exact_pin:
                 problems.append(f"{label} is exempt as a group `==` pin, but is not one")
@@ -319,6 +319,10 @@ def _to_update_types(_p: dict[str, Any], d: dict[str, Any]) -> None:
     entry["update-types"] = ["version-update:semver-major"]
 
 
+def _add_major_cap(p: dict[str, Any], _d: dict[str, Any]) -> None:
+    p["project"]["dependencies"].append("mefor-fake-major>=1.0,<3")
+
+
 def _lift_cap(p: dict[str, Any], _d: dict[str, Any]) -> None:
     deps = p["project"]["dependencies"]
     deps[deps.index(_FAKE_CAP)] = "mefor-fake-cap>=1.0"
@@ -332,6 +336,7 @@ _CAP_VERSIONS = "mefor-fake-cap", "versions"
     ("mutate", "expect"),
     [
         pytest.param(_drop_entry, "no uv ignore entry", id="entry-deleted"),
+        pytest.param(_add_major_cap, "no uv ignore entry", id="major-cap-without-entry"),
         pytest.param(_set_entry(*_CAP_VERSIONS, [">=2.6.0"]), _EXACT, id="gap-at-cap"),
         pytest.param(_set_entry(*_CAP_VERSIONS, [">=2.4.0"]), _EXACT, id="freezes"),
         pytest.param(
@@ -392,6 +397,13 @@ def test_the_checker_reds_on_a_mutated_config(mutate: _Mutation, expect: str) ->
         pytest.param(
             "mefor-gp", _GROUPS, ("group", "mefor-gp>=1,<2"), "is not one", id="group-cap-not-a-pin"
         ),
+        pytest.param(
+            "mefor-gp",
+            "[project.optional-dependencies].fake",
+            ("extra", "mefor-gp>=1,<2"),
+            "is exempt only in",
+            id="extra-name-prefix-is-not-the-table",
+        ),
     ],
 )
 def test_the_checker_reds_on_a_broken_exemption(
@@ -408,16 +420,18 @@ def test_the_checker_reds_on_a_broken_exemption(
         where, req = added
         if where == "group":
             pyproject["dependency-groups"]["mefor-fake"].append(req)
+        elif where == "extra":
+            pyproject["project"].setdefault("optional-dependencies", {})["fake-legacy"] = [req]
         else:
             pyproject["project"]["dependencies"].append(req)
     problems = _violations(pyproject, dependabot)
     assert any(expect in p for p in problems), f"no violation mentioning {expect!r}: {problems}"
 
 
-@pytest.mark.parametrize("name", sorted(set(_EXEMPT) - _GROUP_PINS))
+@pytest.mark.parametrize("name", ["hvac", "hatchling"])  # explicit, so dropping one reds here
 def test_a_named_exemption_must_not_have_an_entry(name: str) -> None:
     """Mutation arm for the must-not list, over the real named exemptions (hvac, hatchling)."""
     pyproject, dependabot = _fixture()
     _uv_entry(dependabot)["ignore"].append({"dependency-name": name, "versions": [">=999"]})
     problems = _violations(pyproject, dependabot)
-    assert any(f"{name}" in p and "yet has an ignore entry" in p for p in problems), problems
+    assert any(name in p and "yet has an ignore entry" in p for p in problems), problems
