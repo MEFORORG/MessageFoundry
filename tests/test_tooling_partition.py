@@ -117,7 +117,6 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # reads the real `git ls-files` scope -- which is the half that makes it engine-subject.
         "test_control_char_check.py",
         "test_crypto_inventory_scanner.py",
-        "test_dependency_boundaries.py",
         "test_ech_record_premise.py",
         # Same shape as control_char_check and licence_header_gate above, and listed for the same
         # reason: a repo-wide scanner over TRACKED SOURCE, which includes messagefoundry/**. An
@@ -128,7 +127,6 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # test_the_tracked_tree_is_clean and test_list_reports_scope_and_exits_clean read the real
         # `git ls-files` scope -- which is the half that makes it engine-subject.
         "test_escape_sequence_check.py",
-        "test_external_link_interstitial.py",
         # AST-scans messagefoundry/**/*.py for every `raise ... from None` and holds each site to a
         # reviewed list (BACKLOG #1796). A new site arrives as an ENGINE diff,
         # which does not trip the tooling path gate, so as tooling it would face nothing there.
@@ -141,12 +139,15 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # It loads scripts/release/forbidden_members.py by path; that is the RULE it reads, not its
         # subject.
         "test_packaged_tree_denylist.py",
-        "test_packaging.py",
         "test_release_pipeline.py",
         # Parses messagefoundry/store/{store.py,postgres.py,sqlserver.py} off disk without importing
         # them. What it guards is the erased-body predicate going missing from a replay statement,
         # which arrives as an ENGINE diff and does not trip the tooling path gate (BACKLOG #1560).
         "test_replay_erased_body_scope.py",
+        # Reads messagefoundry/** and messagefoundry_webconsole/** off disk and pins every HTTP
+        # response emitter of a known shape against a register (BACKLOG #1120). A new emitter
+        # arrives as an ENGINE diff, so as tooling it would face nothing on that change.
+        "test_response_emitter_inventory.py",
         # NOT engine source either, so this entry widens the list's stated rule and the claim is
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
@@ -157,15 +158,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # `-m 'not tooling'` on the engine legs AND unreached by the tooling job's path gate, so the
         # PR that added an unclassified dependency would face nothing, which is the one thing the
         # designation exists to prevent (BACKLOG #1189).
-        # Reads messagefoundry/** and messagefoundry_webconsole/** off disk and pins every HTTP
-        # response emitter of a known shape against a register (BACKLOG #1120). A new emitter
-        # arrives as an ENGINE diff, so as tooling it would face nothing on that change.
-        "test_response_emitter_inventory.py",
         "test_risky_component_designation.py",
         "test_sandbox_worker_logging.py",
         "test_scan_forbidden.py",
         "test_scan_tokens_source.py",
-        "test_seam_discovery.py",
         "test_security_static.py",
         # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled
         # out for review, as test_conftest_name_collision_guard.py and
@@ -462,6 +458,49 @@ def test_stay_list_holds_only_real_files() -> None:
     assert not missing, f"_STAYS_WITHOUT_IMPORTING names files that do not exist: {missing}"
 
 
+def _engine_importers(tests_dir: Path, stays: frozenset[str]) -> list[str]:
+    """The stay-list entries whose file imports the engine, over a NAMED directory.
+
+    Parameterised so the planted arm below can drive it over a tmp_path, the same reason
+    ``_assert_every_test_is_classified`` takes a directory. A name with no file is skipped here
+    because ``test_stay_list_holds_only_real_files`` already reports it.
+    """
+    return sorted(
+        n
+        for n in stays
+        if (tests_dir / n).is_file()
+        and _ENGINE_IMPORT.search((tests_dir / n).read_text(encoding="utf-8", errors="replace"))
+    )
+
+
+def test_stay_list_holds_no_engine_importer() -> None:
+    """An entry whose file imports the engine is dead, and a dead entry hides the next one.
+
+    ``_assert_every_test_is_classified`` reads the stay list only for files that import nothing, so
+    the classification gate never consults such an entry, and it states a false reason for review.
+    Its one remaining effect is through ``test_the_two_lists_are_disjoint``, and there it is
+    redundant: ``test_no_listed_test_imports_the_engine`` already refuses an engine importer in the
+    manifest. Five sat here unnoticed until BACKLOG #2517 measured them; this assertion keeps the
+    list to its stated rule.
+    """
+    dead = _engine_importers(_TESTS, _STAYS_WITHOUT_IMPORTING)
+    assert not dead, (
+        "these _STAYS_WITHOUT_IMPORTING entries import the engine, so the partition gate never "
+        f"consults them -- remove each entry, the import already keeps the file on the engine legs: "
+        f"{dead}"
+    )
+
+
+def test_the_engine_importer_check_fires_on_a_planted_entry(tmp_path: Path) -> None:
+    """Positive control: an armed check must name the importer and pass over the non-importer."""
+    (tmp_path / "test_reads_source.py").write_text("import pathlib\n", encoding="utf-8")
+    (tmp_path / "test_imports_engine.py").write_text(
+        "def test_x() -> None:\n    from messagefoundry.auth import service\n", encoding="utf-8"
+    )
+    stays = frozenset({"test_reads_source.py", "test_imports_engine.py"})
+    assert _engine_importers(tmp_path, stays) == ["test_imports_engine.py"]
+
+
 def test_the_two_lists_are_disjoint() -> None:
     """The stay list must have POWER over the manifest, not merely opinions about it.
 
@@ -473,6 +512,10 @@ def test_the_two_lists_are_disjoint() -> None:
     classifier nearly shipping. The one artifact naming the files that must not move had no way to stop
     them moving -- including this file, despite the comment above asserting it must run wherever the
     partition matters.
+
+    That measurement is history. ``test_dependency_boundaries.py`` imports the engine, so BACKLOG
+    #2517 took it off the stay list, and ``test_no_listed_test_imports_the_engine`` is what now
+    refuses it in the manifest. Repeating the mutation today reds that test, not this one.
 
     Disjointness is the whole guarantee: a name in both lists is a contradiction the author has to
     resolve, not a precedence rule to be quietly applied in the manifest's favour.
