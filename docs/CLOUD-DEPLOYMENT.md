@@ -228,23 +228,64 @@ cross a WAN to an on-prem EHR, and MLLP has no native TLS. The industry answer �
 recommended cloud path — is **hybrid**: terminate MLLP **near the EHR** and forward it over a **private
 encrypted link** to the cloud engine.
 
+### 5.1 MLLP ends at the edge relay, and the relay's store buffers the WAN
+
+This diagram shows where each hop ends and what holds the messages while the WAN link is down. The
+sender speaks MLLP only on the LAN, to an edge relay beside it. The relay forwards over the private
+link, and its staged message store holds the outbound rows while that link is down. In the cloud, an
+L4 load balancer passes the traffic to the one engine replica that holds the leader lease.
+
+**Legend.** A cylinder is a persisted message store. A solid arrow carries messages. A dotted arrow
+is a store write or read.
+
+```mermaid
+flowchart LR
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+
+  subgraph SITE["On-prem hospital network"]
+    SENDER(["EHR, lab or PACS<br/>sends HL7 v2"]):::ext
+    subgraph RELAY["Edge relay, the same engine image"]
+      RELAY_IN["Inbound MLLP()<br/>MLLP from the sender ends here"]:::core
+      RELAY_LOGIC["Router and Handler"]:::core
+      RELAY_OUT["Outbound MLLP() or Tcp()"]:::core
+      RELAY_STORE[("Staged message store<br/>the WAN buffer")]:::store
+    end
+  end
+
+  WAN_LINK["Private encrypted link<br/>site-to-site VPN, AWS Direct Connect<br/>or Azure ExpressRoute"]:::ext
+
+  subgraph CLOUD["Your cloud VPC"]
+    LB["L4 load balancer<br/>operator-built, section 3"]:::ext
+    subgraph HA["Cloud engine, active-passive HA, replicas 3"]
+      LEADER["Leader<br/>inbound listener open"]:::core
+      STANDBY["2 warm standbys<br/>listener port closed"]:::core
+    end
+    CLOUD_STORE[("Managed Postgres<br/>the one shared message store")]:::store
+  end
+
+  SENDER -->|"MLLP on the LAN"| RELAY_IN
+  RELAY_IN --> RELAY_LOGIC
+  RELAY_LOGIC --> RELAY_OUT
+  RELAY_IN -.->|"commit, then ACK"| RELAY_STORE
+  RELAY_OUT -.->|"rows wait and retry<br/>while the link is down"| RELAY_STORE
+  RELAY_OUT -->|"MLLP or TCP"| WAN_LINK
+  WAN_LINK --> LB
+  LB -->|"TCP-connect health check<br/>passes on the leader only"| LEADER
+  LEADER -.->|"commits each message"| CLOUD_STORE
+  STANDBY -.->|"same store, waits for the lease"| CLOUD_STORE
 ```
-  on-prem hospital network                      private encrypted link            your cloud VPC
-  ┌──────────────────────────┐                 (site-to-site VPN /              ┌───────────────────────┐
-  │  EHR / lab / PACS         │  MLLP (LAN)     AWS Direct Connect /            │  cloud engine (HA)     │
-  │  (sends HL7 v2)           │ ───────────▶    Azure ExpressRoute)            │  replicas: 3 + managed │
-  └──────────────────────────┘                                                 │  Postgres (this doc)   │
-            │                          ┌───────────────────────────────┐       └───────────┬───────────┘
-            └─ MLLP terminated here ──▶│  EDGE RELAY (same engine image)│ ──── outbound ───▶│
-               (inbound MLLP())        │  staged store = WAN BUFFER     │   MLLP/TCP over    │
-                                       │  inbound MLLP → outbound MLLP  │   the private link │
-                                       └───────────────────────────────┘                    │
-```
+
+A row that cannot deliver retries under the outbound Connection's retry policy. The default policy
+is finite: a row that uses up its attempts moves to the dead-letter queue, and an operator can replay
+it from there. [`CONNECTIONS.md`](CONNECTIONS.md), "Retry strategy", gives the numbers and how to
+change them.
 
 **The edge relay is the SAME engine image — no new code** (ADR 0047 ratification). It is just an
 on-prem MessageFoundry instance (the container image, or the Windows-service install) whose graph is:
 an **inbound `MLLP()`** that receives the EHR feed on the LAN → a Router/Handler → an **outbound `MLLP()`
-or `TCP()`** that forwards to the cloud engine over the private link. It reuses the existing **outbound
+or `Tcp()`** that forwards to the cloud engine over the private link. It reuses the existing **outbound
 MLLP/TCP connectors** verbatim.
 
 **Why the staged store is the selling point.** The relay's **at-least-once staged store** ([ADR
