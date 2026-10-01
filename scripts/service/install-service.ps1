@@ -531,17 +531,22 @@ function Save-PinnedNssm {
     $work = Join-Path $temp ("nssm-mefor-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $work | Out-Null
     try {
-        $zip = Join-Path $work "nssm-2.24.zip"
         $extract = Join-Path $work "extract"
         [Net.ServicePointManager]::SecurityProtocol =
             [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         $failures = @()
         $verified = $false
+        $attempt = 0
         foreach ($url in @(@($NssmUrl) + @($NssmMirrorUrls) | Where-Object { $_ })) {
-            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+            # A file of its own per source, so a rejected download that cannot be deleted is never
+            # mistaken for the next source's.
+            $attempt++
+            $zip = Join-Path $work "nssm-2.24-$attempt.zip"
             Write-Host "  trying $url"
             try {
-                Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+                # A timeout, so a source that hangs does not keep the mirrors from being tried.
+                # PowerShell 7 otherwise waits forever.
+                Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 60
                 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
             } catch {
                 $failures += "$url : $($_.Exception.Message)"
@@ -559,7 +564,7 @@ function Save-PinnedNssm {
             break
         }
         if (-not $verified) {
-            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+            # Every download is in $work, which the finally below deletes.
             throw ("NSSM download failed from every source, so nothing was installed. With no " +
                 "internet access, pass -NssmPath with the win64 nssm.exe from nssm-2.24.zip. " +
                 "Sources: " + ($failures -join " | "))

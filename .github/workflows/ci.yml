@@ -3718,14 +3718,22 @@ jobs:
       # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). On a cache hit the
       # installer checks the cached copy against the pin and copies it into $env:SMOKE_NSSM_DIR; on
       # a miss it downloads the pinned release, from nssm.cc or a mirror, and checks that instead.
+      # The hash compare below only keeps a bad cache entry from failing every run until someone
+      # deletes it: such an entry is ignored and the download runs. The installer's check is the
+      # control, and it checks whichever copy it is given.
       - name: Install the service
         shell: powershell
         env:
           NSSM_CACHE_HIT: ${{ steps.nssm-cache.outputs.cache-hit }}
+          NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
         run: |
           $exe = (Get-Command messagefoundry).Source
           $cached = @{}
-          if ($env:NSSM_CACHE_HIT -eq 'true') { $cached['NssmPath'] = $env:SMOKE_NSSM_CACHED_EXE }
+          if ($env:NSSM_CACHE_HIT -eq 'true') {
+            $hit = $env:SMOKE_NSSM_CACHED_EXE
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $hit).Hash -eq $env:NSSM_PIN) { $cached['NssmPath'] = $hit }
+            else { Write-Warning "The cached copy does not match the pin; ignoring it and downloading." }
+          }
           # Run as the 'prod' environment (ADR 0017: `serve` requires an explicit active environment;
           # install-service.ps1 -Environment threads it into the service command + resolves
           # environments/prod.toml). INFO not DEBUG: `serve` refuses DEBUG in prod (Gate #1 — DEBUG can
@@ -3824,18 +3832,28 @@ jobs:
             "MEFOR_VALUE_REGISTRY_USER=smoke-user" `
             "MEFOR_VALUE_REGISTRY_PASSWORD=smoke-pass"
 
-      # BACKLOG #2504: cache the copy the installer just checked, right after the install so a later
-      # failing step cannot stop it being saved. Not from the merge queue: a cache saved there is
-      # scoped to that run's temporary queue ref, which no later run can read. The nightly run on
-      # main saves it, and every queue run can read what main saved.
+      # BACKLOG #2504: cache the copy the installer checked. !cancelled(), so a failure later in the
+      # install step (the cert, the key, the service settings) does not stop it being saved; the
+      # copy is saved only when it is there and matches the pin. Not from the merge queue: a cache
+      # saved there is scoped to that run's temporary queue ref, which no later run can read. The
+      # nightly run on main saves it, and every queue run can read what main saved.
       - name: Stage the checked NSSM for the cache
-        if: steps.nssm-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        id: nssm-stage
+        if: ${{ !cancelled() && steps.nssm-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group' }}
+        env:
+          NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
         run: |
+          $checked = "$env:SMOKE_NSSM_DIR\nssm.exe"
+          if (-not (Test-Path -LiteralPath $checked)) { Write-Host "No checked copy to cache."; exit 0 }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $checked).Hash -ne $env:NSSM_PIN) {
+            Write-Warning "The installed copy does not match the pin; not caching it."; exit 0
+          }
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $env:SMOKE_NSSM_CACHED_EXE) | Out-Null
-          Copy-Item -LiteralPath "$env:SMOKE_NSSM_DIR\nssm.exe" -Destination $env:SMOKE_NSSM_CACHED_EXE -Force
+          Copy-Item -LiteralPath $checked -Destination $env:SMOKE_NSSM_CACHED_EXE -Force
+          "staged=true" >> $env:GITHUB_OUTPUT
 
       - name: Save the pinned NSSM to the cache
-        if: steps.nssm-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: ${{ !cancelled() && steps.nssm-stage.outputs.staged == 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SMOKE_NSSM_CACHED_EXE }}

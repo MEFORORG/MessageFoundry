@@ -175,9 +175,11 @@ _STUBS = """
   $webFiles = @{}
   $webErrors = @{}
   $webCalls = [Collections.Generic.List[string]]::new()
+  $webTimeouts = [Collections.Generic.List[string]]::new()
   function Invoke-WebRequest {
-    param($Uri, $OutFile, [switch]$UseBasicParsing)
+    param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec)
     $webCalls.Add("$Uri")
+    $webTimeouts.Add("$TimeoutSec")
     if ($webErrors.ContainsKey("$Uri")) { throw $webErrors["$Uri"] }
     if (-not $webFiles.ContainsKey("$Uri")) { throw 'NETWORK TOUCHED' }
     Copy-Item -LiteralPath $webFiles["$Uri"] -Destination $OutFile -Force
@@ -234,10 +236,11 @@ _CASES = r"""
   # that on every host.
   $savedTemp = $env:TEMP; $savedTmp = $env:TMP
   $env:TEMP = $null; $env:TMP = $null
-  $webCalls.Clear()
+  $webCalls.Clear(); $webTimeouts.Clear()
   Invoke-Case 'install-path-bad' 'path-bad' {
     Resolve-Nssm -NssmDir (Join-Path $root 'home-path-bad') }
   $res['install-path-bad-calls'] = @($webCalls)
+  $res['install-path-bad-timeouts'] = @($webTimeouts)
   $env:TEMP = $savedTemp; $env:TMP = $savedTmp
   # --- install-service.ps1 Save-PinnedNssm: the primary, then each mirror (#2504). Stand-in URLs and
   # a stand-in archive pin, so each case says exactly which source serves what.
@@ -631,6 +634,12 @@ def test_the_real_sources_are_https_with_nssm_cc_first_and_a_mirror_elsewhere(
     )
     # With the network refused, every real source was asked, in order, and each failure warned.
     assert report["install-path-bad-calls"] == sources, report["install-path-bad-calls"]
+    # Each with a timeout: PowerShell 7 otherwise waits forever on a source that hangs, and the
+    # mirrors are never reached.
+    timeouts = report["install-path-bad-timeouts"]
+    assert len(timeouts) == len(sources) and all(
+        str(s).isdigit() and int(s) > 0 for s in timeouts
+    ), f"a download has no timeout: {timeouts}"
     case = _case(report, "install-path-bad")
     for url in sources:
         assert url in str(case["error"]), f"the final refusal does not name {url}: {case['error']}"
@@ -1170,8 +1179,10 @@ def test_the_service_smoke_caches_nssm_only_through_the_installers_check() -> No
     """A warm cache spares the smoke the NSSM download, and nssm.cc with it (#2504).
 
     The cached file reaches the service only as ``-NssmPath``, which the installer refuses unless it
-    matches the pin. The key is the pin, read from the installer, so a new pin is a new key. The copy
-    saved is the one the installer checked, and a merge-queue run saves nothing it could not share.
+    matches the pin, and is handed over only after the step itself compared it, so a bad entry falls
+    back to the download. The key is the pin, read from the installer, so a new pin is a new key. The
+    copy saved is the one the installer checked, compared to the pin again, and a merge-queue run
+    saves nothing it could not share.
     """
     job = _jobs("ci.yml").get(_SMOKE_JOB)
     assert job, f"CONTROL FAILED: ci.yml has no {_SMOKE_JOB} job"
@@ -1209,22 +1220,33 @@ def test_the_service_smoke_caches_nssm_only_through_the_installers_check() -> No
         assert "restore-keys" not in with_, "a partial key match would restore some other binary"
     assert steps[restore]["with"]["key"] == steps[save]["with"]["key"]
 
-    # The install hands the cached file over only as -NssmPath, so the installer checks it.
-    run = str(steps[install]["run"])
-    assert f"$cached['NssmPath'] = $env:{_CACHED_VAR}" in run, run
+    # The install hands the cached file over only as -NssmPath, so the installer checks it, and
+    # only once it has matched the pin, so a bad entry falls back to the download.
+    install_step = steps[install]
+    run = str(install_step["run"])
+    assert f"$hit = $env:{_CACHED_VAR}" in run, run
+    assert "$cached['NssmPath'] = $hit" in run, run
+    assert "-eq $env:NSSM_PIN" in run, "a cache hit is used without comparing it to the pin"
     assert "@cached" in run, "the install does not pass the cached copy on"
     assert sum(_CACHED_VAR in line for line in run.splitlines()) == 1, (
         f"the install step uses {_CACHED_VAR} other than as -NssmPath"
     )
+    pin_ref = "steps.nssm-pin.outputs.pin"
+    assert pin_ref in str((install_step.get("env") or {}).get("NSSM_PIN")), install_step.get("env")
 
-    # What is saved is a copy of the nssm.exe the installer checked, and only off the queue.
+    # What is saved is a copy of the nssm.exe the installer checked, only when it matches the pin,
+    # and only off the queue.
     stage = [
         s
         for s in steps[install + 1 : save]
         if _CHECKED_PATH in str(s.get("run", "")) and _CACHED_VAR in str(s.get("run", ""))
     ]
     assert len(stage) == 1, f"no step copies the checked nssm.exe into the cache path: {names}"
-    for step in (stage[0], steps[save]):
-        condition = str(step.get("if", ""))
-        assert "cache-hit != 'true'" in condition, condition
-        assert "github.event_name != 'merge_group'" in condition, condition
+    staging = stage[0]
+    condition = str(staging.get("if", ""))
+    for needed in ("!cancelled()", "cache-hit != 'true'", "github.event_name != 'merge_group'"):
+        assert needed in condition, f"the staging step's condition lacks {needed}: {condition}"
+    assert "-ne $env:NSSM_PIN" in str(staging["run"]), "the staged copy is not compared to the pin"
+    assert pin_ref in str((staging.get("env") or {}).get("NSSM_PIN")), staging.get("env")
+    save_if = str(steps[save].get("if", ""))
+    assert f"steps.{staging.get('id')}.outputs.staged == 'true'" in save_if, save_if

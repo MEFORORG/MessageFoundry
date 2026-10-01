@@ -148,7 +148,7 @@ def test_integrity_branch_is_fail_closed() -> None:
         "the computed hash must be compared against the pinned $NssmSha256"
     )
 
-    # Isolate the mismatch block and prove it is a hard throw, not a warn.
+    # Isolate the mismatch block and prove it leaves the download unused: skip it, or throw.
     m = re.search(
         r"if\s*\(\s*\$hash\s*-ne\s*\$NssmSha256\s*\)\s*\{(?P<body>.*?)\}",
         text,
@@ -156,7 +156,7 @@ def test_integrity_branch_is_fail_closed() -> None:
     )
     assert m is not None, "the '$hash -ne $NssmSha256' mismatch block is missing"
     body = m.group("body")
-    assert re.search(r"\b(continue|throw)\b", body), (
+    assert re.search(r"^\s*(continue|throw)\b", body, re.MULTILINE), (
         "an integrity mismatch must skip the source or throw; it must not fall through to use it"
     )
     assert "$verified" not in body, "an integrity mismatch must never mark the download verified"
