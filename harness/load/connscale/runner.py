@@ -2010,9 +2010,9 @@ def _empty_claims_per_msg(total_per_s: float, achieved_read_per_s: float) -> flo
     picking a wider number from the failures on hand is how the 0.25 came to be trusted in the first
     place. THE SAMPLES NOW EXIST, and they retired the band rather than widening it: the vs-N SLO on
     this metric is gone, ``_empty_claims_base_reading_slo`` replaced it with a strictly-positive
-    base-count sign test, and nothing in CI now grades this ratio against a threshold. The ratio is
-    still computed and RECORDED on every run, so BACKLOG #1415 can arm the predicted herd floor from a
-    distribution instead of from excursions.
+    base-count sign test, and no vs-N band grades this ratio. The ratio is still computed and
+    RECORDED on every run. BACKLOG #1415 armed the predicted herd floor from that distribution, on
+    the base reading only and only on the legs ``slo.empty_claims_herd_floor_legs`` names.
 
     Do not re-open the hold from the rows above. A sample selected on having excursioned cannot
     measure the distribution it excursioned from -- which is exactly why the harvest was run.
@@ -2281,7 +2281,86 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
         out.append(_monotonic_slo("fd_count_monotonic", records, lambda r: r.fd_count_peak))
     if slo.empty_claims_base_reading:
         out.append(_empty_claims_base_reading_slo(profile, records))
+    if slo.empty_claims_herd_floor_legs:
+        out.append(_empty_claims_herd_floor_slo(profile, records, current_leg()))
     return out
+
+
+#: The CI leg a run is on, as ``<matrix os>-py<python version>`` -- the same suffix the readings
+#: artifact carries, so a harvest cell and an armed leg are spelled one way. ci.yml's
+#: ``Tests (pytest)`` step exports it; nothing else does, so a local run, the py3.15 canary and the
+#: coverage job read no leg and are never graded.
+CONNSCALE_LEG_ENV = "MEFOR_CONNSCALE_LEG"
+
+
+def current_leg() -> str | None:
+    """The leg this process runs on, or ``None`` when no CI step named one."""
+    return os.environ.get(CONNSCALE_LEG_ENV, "").strip() or None
+
+
+def herd_floor_armed(profile: ConnScaleProfile, leg: str | None = None) -> bool:
+    """True when ``profile`` arms the predicted herd floor on ``leg`` (default: this process's)."""
+    leg = current_leg() if leg is None else leg
+    return leg is not None and leg in profile.slo.empty_claims_herd_floor_legs
+
+
+def _empty_claims_herd_floor_slo(
+    profile: ConnScaleProfile, records: list[ConnScaleRecord], leg: str | None
+) -> SloCheck:
+    """The predicted herd floor, ARMED on the legs whose own harvest cleared BACKLOG #1415's rule.
+
+    ASSERTED, where armed: every ``per_lane`` lane's base reading is at or above the floor its own
+    configuration predicts (:func:`predict_herd_levels`, the geometric mean of the herd-present and
+    herd-gone levels). That grades MORE than the sign test above: a reading at the herd-gone level
+    is positive, so the sign test passes it, and it is below this floor, so this check does not.
+
+    WHY ONLY SOME LEGS. #1415's rule is applied per ``(leg, lane)`` cell and the margin it demands
+    held on some legs and not others. The cell table, the rule's four clauses evaluated per cell,
+    and the readings behind them are in ``harness/load/profiles/README.md`` (section dated
+    2026-10-01). On a leg the profile does not name, the floor stays recorded and not graded, and
+    this check says so in words with ``ok=True``.
+
+    ZERO GRADED LANES ON AN ARMED LEG REPORTS ``ok=True`` too, for the reason the sign test gives;
+    the smoke test carries the run-level bound that some lane was graded.
+    """
+    expectation = "each per_lane base reading at or above its predicted herd floor"
+    armed = profile.slo.empty_claims_herd_floor_legs
+    if leg is None or leg not in armed:
+        return SloCheck(
+            "empty_claims_herd_floor",
+            expectation,
+            f"NOT GRADED -- recorded only: this run's leg is {leg or 'unset (not a CI test leg)'}, "
+            f"and the floor is armed only on {list(armed)} (BACKLOG #1415)",
+            True,
+        )
+    readings = herd_floor_readings(
+        records, lambda r: r.empty_claims_per_msg, base_count=min(profile.counts)
+    )
+    graded = [r for r in readings if r.ok is not None]
+    below = [r for r in graded if r.ok is False]
+    if below:
+        observed = "; ".join(
+            f"{r.label}@N={r.count}: {r.value} below the predicted floor "
+            f"{r.prediction.floor:.4g} (herd-gone level {r.prediction.idle:.4g})"
+            for r in below
+            if r.prediction is not None
+        )
+        return SloCheck("empty_claims_herd_floor", expectation, observed, False)
+    if not graded:
+        reasons = "; ".join(f"{r.label}: {r.not_graded}" for r in readings) or "no lanes"
+        return SloCheck(
+            "empty_claims_herd_floor",
+            expectation,
+            f"NOT GRADED -- 0 of {len(readings)} lane(s) produced a base reading on armed leg "
+            f"{leg} ({reasons})",
+            True,
+        )
+    return SloCheck(
+        "empty_claims_herd_floor",
+        expectation,
+        f"above the floor on {len(graded)} of {len(readings)} lane(s), leg {leg}",
+        True,
+    )
 
 
 def _empty_claims_base_reading_slo(
@@ -2302,12 +2381,13 @@ def _empty_claims_base_reading_slo(
     ``not (0.0 < 0.0)`` is true -- and it cannot flake on level noise, because it is a sign test rather
     than a threshold.
 
-    NOT ASSERTED: the predicted herd floor. ``herd_floor_readings`` computes it and both emitters
-    RECORD it on every run, pass or fail, but no verdict here rides on it. Its own pre-landing check
-    failed: on run 33448760672, a push to ``main`` whose ``test (windows-2022, py3.14)`` job PASSED,
-    the base reading was 13.12 against a floor of 15.30. Gating on it would have reddened a green leg,
-    which is the defect this item exists to remove. Enabling it once its own distribution is harvested
-    is BACKLOG #1415.
+    NOT ASSERTED HERE: the predicted herd floor. ``herd_floor_readings`` computes it and both
+    emitters RECORD it on every run, pass or fail. Its own pre-landing check failed: on run
+    33448760672, a push to ``main`` whose ``test (windows-2022, py3.14)`` job PASSED, the base
+    reading was 13.12 against a floor of 15.30. BACKLOG #1415 then harvested its distribution per
+    ``(leg, lane)`` and armed it only where its rule held, in a SEPARATE check,
+    :func:`_empty_claims_herd_floor_slo`, keyed on ``slo.empty_claims_herd_floor_legs``. On every
+    other leg the floor is still recorded only.
 
     NOT ASSERTED EITHER: the vs-N slope, in any form. Nothing in CI now claims the curve rises. That
     is a real loss and BACKLOG #1211 names it as one.

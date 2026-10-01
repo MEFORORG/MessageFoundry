@@ -124,6 +124,7 @@ _SLO_KEYS = frozenset(
         "max_drain_seconds",
         "fd_monotonic",
         "empty_claims_base_reading",
+        "empty_claims_herd_floor_legs",
     }
 )
 
@@ -143,9 +144,14 @@ class ConnScaleSlo:
     # `empty_claims_base_reading` is NOT a slope -- it asserts that each per_lane lane produced a
     # STRICTLY POSITIVE empty-claims-per-message reading at the BASE connection count. The vs-N form it
     # replaced asserted a rise the healthy population does not have. The harvest that measured that is
-    # recorded ONCE, in BACKLOG #1211, and is deliberately not restated here. The predicted herd floor
-    # that would restore a real expectation is computed and recorded on every run but is NOT enforced,
-    # pending BACKLOG #1415.
+    # recorded ONCE, in BACKLOG #1211, and is deliberately not restated here.
+    #
+    # `empty_claims_herd_floor_legs` ARMS THE PREDICTED HERD FLOOR, AND ONLY ON THE CI LEGS IT NAMES
+    # (BACKLOG #1415). A leg is `<matrix os>-py<python version>`, as ci.yml's `Tests (pytest)` step
+    # exports it in MEFOR_CONNSCALE_LEG; on any other leg, and on every local run, the floor stays
+    # recorded and not graded. A leg is named only once its own harvest cleared #1415's arming rule
+    # at THIS profile's base count and rates; the floor's evidence is per leg, so it is never pooled.
+    # Empty is the default and means recorded-only everywhere.
     #
     # `empty_claims_base_reading` GRADES ONLY `per_lane` LANES: the herd prediction behind it assumes
     # one worker set per lane per stage, which a pooled dispatcher does not satisfy. So a profile that
@@ -153,6 +159,7 @@ class ConnScaleSlo:
     # check that grades nothing and passes every time.
     fd_monotonic: bool = False
     empty_claims_base_reading: bool = False
+    empty_claims_herd_floor_legs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -403,6 +410,32 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
             f"would grade zero lanes and pass on every run; add {PER_LANE!r} to claim_modes, or set "
             f"empty_claims_base_reading = false"
         )
+    # The armed herd floor reads the same per_lane base readings, so the same gate-that-cannot-fail
+    # argument applies to it (BACKLOG #1415).
+    if profile.slo.empty_claims_herd_floor_legs and PER_LANE not in profile.claim_modes:
+        raise ConnScaleProfileError(
+            f"{where}: slo.empty_claims_herd_floor_legs needs {PER_LANE!r} in claim_modes -- the "
+            f"floor grades only per_lane lanes, so with claim_modes={list(profile.claim_modes)} it "
+            f"would grade zero lanes and pass on every run"
+        )
+
+
+def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
+    """Parse ``empty_claims_herd_floor_legs``: absent -> ``()``; else a list of non-empty strings."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConnScaleProfileError(f"{where}: 'empty_claims_herd_floor_legs' must be a list")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ConnScaleProfileError(
+                f"{where}: every 'empty_claims_herd_floor_legs' entry must be a non-empty string "
+                f"naming a CI leg as '<os>-py<version>', got {item!r}"
+            )
+        if item.strip() not in out:
+            out.append(item.strip())
+    return tuple(out)
 
 
 def _claim_modes_from(raw: Any, where: str) -> tuple[str, ...]:
@@ -498,6 +531,7 @@ def _slo_from(raw: Any, where: str) -> ConnScaleSlo:
         max_drain_seconds=_opt_float_or_none(raw, "max_drain_seconds", where, minimum=0.0),
         fd_monotonic=_opt_bool(raw, "fd_monotonic", where, default=False),
         empty_claims_base_reading=_opt_bool(raw, "empty_claims_base_reading", where, default=False),
+        empty_claims_herd_floor_legs=_legs_from(raw.get("empty_claims_herd_floor_legs"), where),
     )
 
 
