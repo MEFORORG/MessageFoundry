@@ -2730,6 +2730,110 @@ def test_round_three_shapes_unbind_the_input(statement: str) -> None:
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(
+            _role_line(
+                _span("keyword", "ItemClear") + " " + _span("variable", "ADT"),
+            ),
+            id="variable-span-without-a-dollar",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "ItemClear")
+                + " "
+                + _span("input-handle", "%ADT")
+                + _span("path", "/*")
+            ),
+            id="field-write-to-a-whole-tree-path",
+        ),
+        pytest.param(
+            '<Line Data="ItemClear %ADT/*"/>', id="markup-free-field-write-to-a-whole-tree"
+        ),
+        pytest.param(_create("％ADT", _ADT_A04), id="fullwidth-percent"),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgLog")
+                + " "
+                + _span("other-handle", "%NEW")
+                + " "
+                + _span("detail", "into ADT")
+            ),
+            id="msglog-with-a-detail-span",
+        ),
+        pytest.param(
+            _create("%OUT", _ADT_A04, " " + _span("variable", "ADT")),
+            id="msgcreate-with-a-trailing-handle",
+        ),
+        pytest.param('<Line Data=" ">MsgTreeCopy %NEW/ to %ADT/</Line>', id="blank-data-and-text"),
+        pytest.param(
+            '<Line Data="MsgLog %P">MsgTreeCopy %NEW/ to %ADT/</Line>', id="data-and-text"
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgSend")
+                + " "
+                + _span("other-handle", "%NEW")
+                + " to connection "
+                + _span("literal", '"OB_X"')
+                + " reply into "
+                + _span("input-handle", "%ADT")
+            ),
+            id="send-with-a-second-handle",
+        ),
+        pytest.param(
+            '<Foreach Data="ForEach %ADT in %BATCH"><List>' + _MSGLOG_P + "</List></Foreach>",
+            id="foreach-binding-a-handle",
+        ),
+        pytest.param(
+            '<Call Comment=\'ActionListCall "Sub"\' Returning="%ADT"><Actions>'
+            + _MSGLOG_P
+            + "</Actions></Call>",
+            id="call-line-in-a-comment",
+        ),
+        pytest.param(
+            _role_line(
+                _span("keyword", "MsgCreate")
+                + " "
+                + _span("other-handle", "%NEW")
+                + _ADT_A04
+                + " "
+                + _span("action-list-call-custom", "from template X")
+            )
+            + _role_send("other-handle", "%NEW", "OB_NEW"),
+            id="unread-msgcreate-never-binds",
+        ),
+    ],
+)
+def test_round_four_shapes_unbind_the_input(statement: str) -> None:
+    """Code review round 2 of the unread-statement rule: each of these sent msg, or a message the
+    export never built, after Corepoint could have replaced it. Now each send raises."""
+    body = _handler_body(_handler_source(_WRITE_INPUT + statement + _SEND_INPUT))
+    assert 'Send("OB_IN"' not in body
+    assert 'Send("OB_NEW"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
+
+
+def test_a_line_that_may_not_be_disabled_votes_on_the_input() -> None:
+    """A ``Disabled="2"`` line may have run, so its input-handle name makes the input ambiguous,
+    and even a send BEFORE it raises."""
+    maybe = _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%OTHER")).replace(
+        "<Line ", '<Line Disabled="2" ', 1
+    )
+    body = _handler_body(_handler_source(_WRITE_INPUT + _SEND_INPUT + maybe))
+    assert 'Send("OB_IN"' not in body
+
+
+def test_a_self_copy_keeps_its_clone() -> None:
+    """Reading the source before the destination's spellings are unbound keeps a copy onto itself
+    a clone, rather than a false refusal."""
+    again = _root_copy("other-handle", "%OUT", "other-handle", "%OUT")
+    body = _handler_body(_handler_source(_CLONE_OUT + again + _SEND_OUT))
+    assert "out_msg = out_msg.copy()" in body
+    assert '    sends.append(Send("OB_OUT", out_msg))' in body
+
+
 def test_a_call_carrying_a_control_verb_keeps_its_construct() -> None:
     """A ``<Call>`` whose verb is ``If`` still renders under the dead placeholder, so nothing in it
     runs unconditionally, and markers around it leave every handle unknown."""

@@ -854,13 +854,14 @@ def _input_handle(action_list: Element) -> tuple[str, bool]:
     # Role markup anywhere, a called list included, counts: it only ever makes a markup-free write
     # decline rather than land on msg.
     marked = False
-    for elem in _live_elements(action_list):
+    for elem, unsure in _live_elements(action_list):
         data = _attr(elem, "Data")
         tokens = parse_roles(data) if data else ()
         marked = marked or bool(tokens)
         names = {t.text for t in tokens if t.source_class == "input-handle"}
         inside = id(elem) in called
-        (called_inputs if inside else inputs).update(names)
+        # A line that may or may not have run votes like a called list: never supplies the input.
+        (called_inputs if inside or unsure else inputs).update(names)
         tag = _local(elem.tag)
         verb = _statement_verb(tokens, _split_verb(strip_markup(data))[0])
         if not inside and (tag.lower() == "call" or _statement_kind(tag, verb) == "call"):
@@ -869,20 +870,24 @@ def _input_handle(action_list: Element) -> tuple[str, bool]:
     return one, marked
 
 
-def _live_elements(action_list: Element) -> list[Element]:
-    """Every element under ``action_list`` in document order, less each ``@Disabled`` subtree.
+def _live_elements(action_list: Element) -> list[tuple[Element, bool]]:
+    """Every element under ``action_list`` in document order, less each surely ``@Disabled``
+    subtree, each with whether it sits under a ``@Disabled`` value that may mean enabled.
 
     A ``<List>``/``<Actions>`` wrapper is walked even when it carries ``@Disabled``, because
     :func:`_parse_list` flattens it and renders its statements live; the scan must see the same
-    statements the render emits."""
-    live: list[Element] = []
-    stack = list(reversed(list(action_list)))
+    statements the render emits. A value outside :data:`_DISABLED_SURE` may have run, so its
+    subtree is walked too and flagged."""
+    live: list[tuple[Element, bool]] = []
+    stack = [(child, False) for child in reversed(list(action_list))]
     while stack:
-        elem = stack.pop()
+        elem, unsure = stack.pop()
         if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:
-            continue
-        live.append(elem)
-        stack.extend(reversed(list(elem)))
+            if _attr(elem, "Disabled").strip().lower() in _DISABLED_SURE:
+                continue
+            unsure = True
+        live.append((elem, unsure))
+        stack.extend((child, unsure) for child in reversed(list(elem)))
     return live
 
 
@@ -1503,36 +1508,69 @@ _DISABLED_SURE = frozenset({"1", "true", "yes"})
 _INERT_LINE_ATTRIBUTES = frozenset({"comment", "disabled"})
 
 
-def _unreadable(elem: Element, kind: str | None, verb: str, statement: str) -> str:
-    """Why the flow cannot trust what ``elem`` may write, or ``""``.
+# Attributes a ``<Call>`` may carry while its line is all the import needs to read.
+_INERT_CALL_ATTRIBUTES = frozenset({"data", "comment", "disabled"})
+# Words a send may carry besides its verb and operands.
+_SEND_WORDS = frozenset({"to", "connection"})
+
+
+def _unreadable(elem: Element) -> tuple[str, str]:
+    """``(why, verb)``: why the flow cannot trust what ``elem`` may write, or ``""``.
 
     Each of these may write a handle the flow never sees, so the parse brackets the element's steps
     with markers that leave every handle unknown, before and after (see :func:`_parse_statement`)."""
     tag = _local(elem.tag).lower()
+    data = _attr(elem, "Data")
+    statement = strip_markup(data)
+    roles = parse_roles(data)
+    flat_verb, tokens = _split_verb(statement)
+    verb = _statement_verb(roles, flat_verb)
+    kind = _statement_kind(tag, verb)
     if _is_disabled(elem):
         if _attr(elem, "Disabled").strip().lower() in _DISABLED_SURE:
-            return ""
-        return "its @Disabled value may mean enabled, so it may have run"
-    if tag == "call" and kind != "call":
-        return f"a <Call> carrying {_comment_text(verb, 40) or 'no verb'}, not ActionListCall"
-    if kind not in (None, "block", "call") and verb:
-        first = statement.split()[:1]
-        if [w.lower() for w in first] != [verb.lower()]:
-            return "its verb is not its first word"
-    if tag == "line" and not _attr(elem, "Data"):
+            return "", verb
+        return "its @Disabled value may mean enabled, so it may have run", verb
+    if tag == "line":
+        if (elem.text or "").strip():
+            return "it carries a statement outside @Data", verb
         extra = any(_local(k).lower() not in _INERT_LINE_ATTRIBUTES for k in elem.attrib)
-        if extra or (elem.text or "").strip():
-            return "its statement is not in @Data"
-    return ""
+        if not statement and extra:
+            return "its statement is not in @Data", verb
+    if tag == "call":
+        if kind != "call":
+            return (
+                f"a <Call> carrying {_comment_text(verb, 40) or 'no verb'}, not ActionListCall",
+                verb,
+            )
+        if any(_local(k).lower() not in _INERT_CALL_ATTRIBUTES for k in elem.attrib):
+            return "a <Call> carrying an attribute this import does not read", verb
+    if kind in (None, "block", "call") or not verb:
+        return "", verb
+    if [w.lower() for w in statement.split()[:1]] != [verb.lower()]:
+        return "its verb is not its first word", verb
+    # One reading only: a handle span holding a space would otherwise count as two handles.
+    operands = _operands_from_roles(roles) if roles else _flat_operands(tokens)
+    named = {h for h in map(_whole_tree, operands) if h}
+    if kind == "send":
+        words = {w.lower() for w in _statement_words(roles, verb)}
+        bare = not roles and any(
+            _string_literal(t) is None
+            and _option(t) is None
+            and not t.startswith(("%", "$"))
+            and t.lower() not in _SEND_WORDS
+            for t in tokens
+        )
+        if len(named) > 1 or not words <= _SEND_WORDS or bare:
+            return "the send names more than one message, or carries a word it may write by", verb
+    elif kind in _NESTING_KINDS and named:
+        return "the construct names a whole message, which it may bind", verb
+    return "", verb
 
 
 def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
     """Parse one statement element, bracketed by markers when the flow cannot trust it."""
     steps = _parse_one(elem, in_control, depth)
-    data = _attr(elem, "Data")
-    statement = strip_markup(data)
-    verb = _statement_verb(parse_roles(data), _split_verb(statement)[0])
-    why = _unreadable(elem, _statement_kind(_local(elem.tag), verb), verb, statement)
+    why, verb = _unreadable(elem)
     if not why:
         return steps
     marker = Control("unknown", _local(elem.tag), why, deferred=_Deferred(verb, ()))
@@ -1663,6 +1701,10 @@ def _parse_one(elem: Element, in_control: bool, depth: int = 0) -> list[Step]:
         # A ``<Block>`` is a section LABEL, not an action, and a ``<Call>``'s target list is inlined:
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
         # :meth:`_Flow._call` decides what a call leaves unknown, and never from what its line names.
+        if kind == "call" and not statement:
+            # The @Comment is prose, never a call line (see _PLAIN_CALL): kept beside it instead.
+            remark: list[Step] = [Control("block", "Comment", note)] if note else []
+            return [*remark, Control(kind, source, tag, body=tuple(body))]
         return [Control(kind, source, statement or note or tag, body=tuple(body))]
 
     inner, branches = _split_branches(body)
@@ -1954,7 +1996,7 @@ def _handle_key(handle: str) -> str:
     compatibility forms are normalised, and upper-casing first also joins letters such as a dotless
     ``i`` that a case fold alone keeps apart. Only unbinding reads this key; how a local is NAMED
     does not."""
-    name = unicodedata.normalize("NFKC", handle.strip().lstrip("%").rstrip("/"))
+    name = unicodedata.normalize("NFKC", handle).strip().lstrip("%").rstrip("/")
     return unicodedata.normalize("NFKC", name.upper().casefold())
 
 
@@ -2018,21 +2060,43 @@ def _unread(step: Control) -> bool:
 def _fits(verb: str, operands: tuple[Operand, ...], deferred: _Deferred) -> bool:
     """Whether ``operands`` take the one shape the flow reads for ``verb``: a plain clone, a
     ``MsgCreate`` whose first operand is the whole tree it builds, a ``MsgLog`` of one whole tree,
-    or a field write whose destination is a path into a named handle or a ``$variable``, which is
-    not a message handle. Any other shape, a whole-tree
+    or a field write whose destination is an HL7 field path into a named handle or a ``$variable``,
+    which is not a message handle. Any other shape, a whole-tree
     path the flow does not read as one (``%ADT/*``) included, may overwrite a tree it cannot see."""
     if verb == "msgtreecopy":
         return bool(_clone_target(deferred))
     if verb == "msgcreate":
-        return bool(operands) and bool(_whole_tree(operands[0]))
+        if not operands or not _whole_tree(operands[0]):
+            return False
+        # Markup-free, the bare-token check already holds the rest to quoted literals.
+        return deferred.flat is not None or not _create_skeleton(deferred)[1]
     if verb == "msglog":
-        return len(operands) == 1 and bool(_whole_tree(operands[0]))
+        return not deferred.qualified and len(operands) == 1 and bool(_whole_tree(operands[0]))
     arity = 1 if verb == "itemclear" else 2
     if len(operands) != arity:
         return False
-    destination = operands[-1]
-    return destination.kind == "variable" or (
-        destination.kind == "path" and bool(destination.handle)
+    # The role grammar writes ``<source> to <destination>``; the markup-free one puts an
+    # ItemAppend's target first.
+    at = 0 if deferred.flat is not None and verb == "itemappend" else arity - 1
+    if not _field_operand(operands[at]):
+        return False
+    return all(
+        _field_operand(o)
+        or (o.kind == "literal" and (o.quoted or _string_literal(o.text) is not None))
+        for i, o in enumerate(operands)
+        if i != at
+    )
+
+
+def _field_operand(operand: Operand) -> bool:
+    """Whether ``operand`` is an HL7 field path into a named handle, or a ``$variable``, which is
+    not a message handle."""
+    if operand.kind == "variable":
+        return operand.text.startswith("$")
+    return (
+        operand.kind == "path"
+        and bool(operand.handle)
+        and _corepoint_path(operand.text) is not None
     )
 
 
@@ -2339,14 +2403,13 @@ class _Flow:
     def _statement(self, step: Control, deferred: _Deferred, env: _Env) -> Step:
         """Settle one transform statement: a field write, a clone, a ``MsgCreate``, or a marker."""
         verb, operands = deferred.verb, deferred.operands
-        if _unread(step):
-            _forget_all(env)
+        unread = _unread(step)
         if deferred.flat is not None:
             result = self._flat_write(deferred.flat, deferred, env)
-        elif _clone_target(deferred):
+        elif _clone_target(deferred) and not unread:
             return self._tree_copy(step, operands, env)
         elif verb.lower() == "msgcreate" and operands and _whole_tree(operands[0]):
-            return self._create(step, deferred, env)
+            return self._create(step, deferred, env, unread=unread)
         else:
             mapped = _map_roles(
                 verb,
@@ -2360,6 +2423,16 @@ class _Flow:
             )
             result = mapped if mapped is not None else _decline(verb, operands, env)
         _forget(env, deferred)
+        if unread:
+            # Settled against what held before it, so a decline still names its own cause; then
+            # nothing is vouched for, and nothing it might have written is emitted.
+            _forget_all(env)
+            if isinstance(result, Action):
+                result = UnmappedAction(
+                    result.source_class,
+                    "the statement carries something this import does not read, so it may write "
+                    f"more than this; intended target {_written_path(result)}",
+                )
         return self._skeleton_guard(result)
 
     def _skeleton_guard(self, result: Step) -> Step:
@@ -2431,6 +2504,7 @@ class _Flow:
     def _tree_copy(self, step: Control, operands: tuple[Operand, ...], env: _Env) -> Step:
         source, dest = _whole_tree(operands[0]), _whole_tree(operands[1])
         verb = step.source_verb
+        held = env.get(source) if source else None
         env.unbind_key(dest)  # every spelling of its case, the input's included
         if _handle_key(dest) == _handle_key(self._input):
             # Rebinding msg would leave every later write and send of the input addressing a
@@ -2440,11 +2514,11 @@ class _Flow:
                 "overwrites the input handle; msg stays the message that arrived, so the input is "
                 "unknown from here on",
             )
-        if source and source in env:
-            expression = f"{env[source]}.copy()"
+        if held is not None:
+            expression = f"{held}.copy()"
             local = self._local(dest)
             env.bind(dest, local)
-            if env[source] in self._created:
+            if held in self._created:
                 self._created.add(local)  # a copy of a skeleton is still only a skeleton
             return Control("clone", verb, step.detail, args=(local, expression))
         what = (
@@ -2456,14 +2530,18 @@ class _Flow:
             verb, f"copies {what} over {_comment_text(dest, 60)}, which is unknown from here on"
         )
 
-    def _create(self, step: Control, deferred: _Deferred, env: _Env) -> Step:
+    def _create(self, step: Control, deferred: _Deferred, env: _Env, *, unread: bool) -> Step:
         handle = _whole_tree(deferred.operands[0])
         _forget(env, deferred)  # every handle it names, not only the one it builds
         name = _comment_text(handle, 60)
+        if unread:
+            _forget_all(env)
         if _handle_key(handle) == _handle_key(self._input):
             why = "a new message in the input handle would replace msg, the message that arrived"
         else:
             skeleton, why = _create_skeleton(deferred)
+            if unread and not why:
+                why = "the statement carries something this import does not read"
             if not why:
                 local = self._local(handle)
                 env.bind(handle, local)

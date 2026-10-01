@@ -248,8 +248,9 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   `ItemAppend`, `MsgTreeCopy`, `MsgCreate`, `MsgLog`; `MsgSend` is a send), that verb is the
   statement's first word, every other word is one that verb may carry, no span falls out of both
   readings (`block`, `pass`, `custom`), and its operands take the verb's one read shape: a plain
-  clone, a `MsgCreate` whose first operand is the whole tree it builds, a `MsgLog` of one whole
-  tree, or a field write into a path of a named handle or a `$variable`. A markup-free statement
+  clone, a `MsgCreate` whose skeleton the import can build, an unqualified `MsgLog` of one whole
+  tree, or a field write whose target is an HL7 field path of a named handle or a `$variable`, with
+  every other operand a field, a `$variable` or a quoted literal. A markup-free statement
   must also spell every handle with a `%`, because a bare word may be a handle no operand reading
   sees (`MsgCreate ADT as ...`). **Any other statement leaves every handle unknown, the input
   included (Manager decision, #313 step 2).** That covers at least an unread verb (`MsgLoad`,
@@ -258,11 +259,15 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   whole-tree path not spelled `/` (`%ADT/*`).
 - Markers that leave every handle unknown bracket, before and after, at least: a `<Call>` whose
   `@Data` verb is not `ActionListCall` (it keeps its own construct, so an `If` stays under its
-  placeholder and a `MsgSend` still raises, never filters), a control or send whose verb is not its
-  first word, a step whose `@Disabled` value is not `1`, `true` or `yes`, and a `<Line>` whose
-  statement is not in `@Data`. Every element this module does not model leaves every handle
-  unknown. An element carrying two attributes that fold to one name with different values is
-  refused outright.
+  placeholder and a `MsgSend` still raises, never filters), a `<Call>` carrying an attribute other
+  than `Data`, `Comment` or `Disabled`, a control or send whose verb is not its first word, a send
+  naming more than one message or carrying a word other than `to` and `connection`, a construct
+  whose own line names a whole message (`ForEach %ADT in %BATCH`), a step whose `@Disabled` value is
+  not `1`, `true` or `yes`, and a `<Line>` carrying a statement outside `@Data`. Such a step's
+  `input-handle` names may make the input ambiguous but never supply it. A `<Call>` with no `@Data`
+  never reads its `@Comment` as its call line. An unread statement never binds a local and never
+  maps a write. Every element this module does not model leaves every handle unknown. An element
+  carrying two attributes that fold to one name with different values is refused outright.
 - A statement the flow does read may still overwrite every handle it names as a whole tree, in
   either reading of its markup, such as a `MsgCreate` whose handle is not its first operand. Each
   such handle is unknown afterwards. Only `MsgSend` and `MsgLog` are read-only. That read-only list
@@ -314,7 +319,9 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   unmodelled element leaves every handle unknown. Nothing either binds is trusted after it.
 - **Still open.** A `<Block>`, `<Foreach>`, `<If>`, `<Loop>`, `<Try>` or `<Case>` whose `@Data` is
   itself a writing statement (`<Block Data="MsgTreeCopy ...">`) is read as a label or a condition,
-  so nothing is unbound. Telling a statement from a label's prose is open work.
+  so nothing is unbound. Telling a statement from a label's prose is open work. Each marker also
+  counts as one more unmapped step and renders as an unmodelled element, so the summary overstates
+  unmapped work for a bracketed step.
 
 **Markup-free `MsgSend` (gap 2).** A send with no role markup is judged by the handle its first
 operand names (`%NAME` or `%NAME/`). If that handle holds a known message, the send delivers it.
