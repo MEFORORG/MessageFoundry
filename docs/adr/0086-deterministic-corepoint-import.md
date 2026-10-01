@@ -199,6 +199,71 @@ At least these gaps remain:
 
 Building the other tree, and the flow the scan cannot see, is step 2 of #313.
 
+**(b‴) AMENDMENT 2026-09-30 — each handle becomes a Python local, settled in statement order
+(BACKLOG #313, step 2).** The owner ruled on 2026-09-26 for an importer-only fix: no engine change and
+no change to ADR 0001. A Handler can already build and send a second `Message`
+(`samples/config/IB_RADIOLOGY_SR.py` does). This step closes both gaps (b″) names.
+
+The importer now parses the whole step tree first. Then it walks the tree in the order the generated
+Python runs, tracking which local each Corepoint handle holds at each point:
+
+| Corepoint statement | Generated Python | Condition |
+|---|---|---|
+| the input handle | `msg` | exactly one distinct `input-handle` in the list |
+| `MsgTreeCopy <src>/ to <dst>/` | `<dst>_msg = <src local>.copy()` | `<src>` holds a known message here |
+| `MsgCreate <handle> "ADT^A04" "2.5.1"` | `<handle>_msg = Message.parse("MSH\|^~\\&\|...")` | exactly one type and one version, nothing else |
+| `ItemCopy`/`ItemClear`/`ItemAppend` on `<handle>/path` | `set_field(<local>, ...)` | the (b′) rules, against that handle's local |
+| `MsgSend <handle>` | `sends.append(Send(dest, <local>))` | `<handle>` holds a known message here |
+
+Each local name comes from the handle, folded to ASCII and suffixed `_msg`. It stays fixed for the
+whole handler, so a handle bound again inside a branch rebinds the same variable.
+
+**The `MsgCreate` skeleton.** The importer builds it through the `Message` API at import time and
+emits the encoded result as one literal. It holds the default encoding characters (`|^~\&`), the
+message type in MSH-9 and the version in MSH-12, and nothing else. Every other header field is
+whatever the action-list writes. The export must name the type in caret form (`ADT^A04`, with an
+optional structure) and the version as `2.x` or `2.x.y`, each exactly once, with no other operand.
+An underscore form such as `ADT_A04` is refused, because HL7 also spells a message structure that way.
+Anything else renders a TODO marker and `raise NotImplementedError(...)` at the `MsgCreate`, because
+a message whose header the importer cannot build would be guessed. The `MsgCreate` grammar is not yet
+validated against an export, so this rule was written from the HL7 shapes alone.
+
+**Flow rules.** These keep the step 1 raise wherever they cannot say what a handle holds:
+
+- A handle bound only inside a branch is unknown after the branch ends. This holds even when every
+  branch binds it, because every condition is a dead placeholder until a human writes it.
+- A handle that any path overwrites with something unknown is unknown after the join.
+- Inside a loop body, and in a `Catch`, a handle the body may overwrite is unknown throughout.
+- The input handle is never rebound. A whole-tree write into it makes it unknown from that point.
+- A whole-tree write by a verb the importer does not read (`MsgLoad`, among others) makes that handle
+  unknown too. Only `MsgSend` and `MsgLog` are treated as read-only. That list is kept small on
+  purpose: a missing verb costs a raise, while a wrongly listed one would deliver the wrong message.
+- A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
+  its whole-tree writes. Nothing it binds is trusted after it.
+
+**Markup-free `MsgSend` (gap 2).** A send with no role markup is judged by the handle its first
+operand names (`%NAME` or `%NAME/`). If that handle holds a known message, the send delivers it.
+Otherwise it raises, as a role-parsed send does. This was the Manager's decision in the #313 step 2
+brief. It changes the synthetic fixture: its `MsgSend $out [OB_ACME_ADT]` names a `$variable`, so it
+now raises where it used to send `msg`. The fixture's import summary moves from 21 mapped and 8
+unmapped to 20 and 9. A markup-free whole-tree write (`MsgTreeCopy %A %B`) also makes its
+destination unknown, though the markup-free layer still maps field writes without handles.
+
+**What the Steps lens shows.** `set_field(out_msg, ...)` projects as an `action` row that looks the
+same as `set_field(msg, ...)`. The row carries no field naming the message it writes. A send row lists
+only its outbound, not the message it sends. The `.copy()` and `Message.parse(...)` lines are plain
+`code` rows. A lens edit splices bytes, so it keeps the receiver it does not show. The module still
+round-trips with no whole-file refusal, which AC-4 requires. The lens semantics were left alone here;
+showing the receiver is a follow-up for ADR 0076/0089.
+
+At least these still refuse or stay out of scope:
+
+- A `$variable` operand, and `MsgLoad`, keep their TODO markers. Neither is modelled.
+- A partial `MsgTreeCopy` (a sub-node into another tree) stays a TODO marker.
+- A field write inside a branch or loop is still declined, as (b′) says. A clone or a send there
+  renders in place.
+- A list with two or more distinct `input-handle` names still refuses every send of the input.
+
 ### (c) Unmapped actions are never silently dropped (count-and-log)
 
 An action whose `class` has no v1 mapping emits, **in place**, an
