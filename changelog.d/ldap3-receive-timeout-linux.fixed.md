@@ -1,0 +1,7 @@
+- **AD sign-in no longer fails on Linux over the receive timeout.** The engine passed
+  `[auth].ad_receive_timeout`, a float, straight to ldap3. On every non-Windows host ldap3 packs
+  that value as an integer, so each AD socket open would have raised `struct.error` before any
+  byte reached the domain controller. On a first Linux deployment, AD sign-in would have failed
+  for every user. Windows was not affected. The engine now passes ldap3 the timeout rounded up to
+  whole seconds, so it is never shorter than configured and never 0, which ldap3 reads as no
+  timeout.
