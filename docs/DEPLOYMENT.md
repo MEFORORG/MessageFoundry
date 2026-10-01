@@ -26,7 +26,7 @@ frame is one case. A cylinder is the message store.
 
 ### Single node
 
-This picture answers what runs on the one server and what crosses the network. The engine runs as
+This picture answers what runs on the one server and names its main network hops. The engine runs as
 the Windows service `MessageFoundry`, which NSSM starts with `messagefoundry serve`
 ([`SERVICE.md`](SERVICE.md)). The API and the web console at `/ui` live in that same process and
 bind `127.0.0.1` port `8765` by default. The message store is a local SQLite file by default.
@@ -41,6 +41,7 @@ flowchart LR
 
   T1UP(["Sending partner system"]):::ext
   T1DOWN(["Receiving partner system"]):::ext
+  T1LOG(["Syslog or SIEM collector<br/>on another host"]):::ext
 
   subgraph T1HOST["Engine host: one Windows server"]
     T1BROWSER["Operator browser<br/>web console at /ui"]:::opstool
@@ -54,25 +55,31 @@ flowchart LR
   T1ENGINE -->|"local file<br/>no network hop"| T1STORE
   T1UP -.->|"MLLP with tls = true<br/>encrypted"| T1ENGINE
   T1ENGINE -.->|"MLLP with tls = true<br/>encrypted"| T1DOWN
+  T1ENGINE -.->|"syslog over TLS<br/>encrypted, collector certificate verified"| T1LOG
 ```
 
 The browser hop uses the engine's own certificate.
-[Who terminates TLS for the API](#who-terminates-tls-for-the-api) says which one.
+[Who terminates TLS for the API](#who-terminates-tls-for-the-api) says which one. The web console is
+the separate `messagefoundry-webconsole` package. Without it the engine serves the JSON API alone.
 
 The partner arrows show MLLP with `tls = true` set on the connection. That is a per-connection
-setting, not the default. Inbound listeners also bind `127.0.0.1` by default, and
-`[inbound].bind_host` moves every inbound listener on the instance at once. Partner systems may use
+setting, not the default, and inbound listeners bind `127.0.0.1` by default. Partner systems may use
 other connection types. The [channel matrix](#channel--tls-posture-matrix) gives the TLS posture and
-the bind refusals per type, and [Before you expose off-loopback](#before-you-expose-off-loopback)
+the bind refusals per type. [Revocation-guard behavior](#revocation-guard-behavior) says which TLS
+hops also need a revocation setting. [Before you expose off-loopback](#before-you-expose-off-loopback)
 has the steps.
+
+The log arrow is there because the shipped posture requires it: `serve` starts only with log
+forwarding over verified TLS to a collector on another host
+([`SERVICE.md`](SERVICE.md#configure-off-box-log-forwarding-before-the-first-start)). The picture
+does not draw every outbound hop. [On-premises by default](#on-premises-by-default) names the others.
 
 ### Message store on a remote server database
 
 This picture answers where the message store lives when it is not the local SQLite file.
 `[store].backend` selects `sqlserver` or `postgres`, and the engine dials the database on another
-host. A deployment uses one backend, not both. By default each hop is encrypted
-(`[store].encrypt = true`) and the server certificate is verified
-(`[store].trust_server_certificate = false`).
+host. A deployment uses one backend, not both. By default the hop is encrypted and the server
+certificate is verified.
 
 ```mermaid
 flowchart LR
@@ -83,16 +90,11 @@ flowchart LR
     T2ENGINE["Engine: messagefoundry serve"]:::core
   end
 
-  subgraph T2SSHOST["Database host when backend = sqlserver"]
-    T2SS[("Message store<br/>SQL Server")]:::store
+  subgraph T2DBHOST["Database host"]
+    T2DB[("Message store<br/>SQL Server or PostgreSQL")]:::store
   end
 
-  subgraph T2PGHOST["Database host when backend = postgres"]
-    T2PG[("Message store<br/>PostgreSQL")]:::store
-  end
-
-  T2ENGINE -.->|"ODBC Driver 18 with Encrypt=yes<br/>encrypted, server certificate verified"| T2SS
-  T2ENGINE -.->|"asyncpg over TLS<br/>encrypted, server certificate and host name verified"| T2PG
+  T2ENGINE -.->|"SQL Server: ODBC Driver 18 with Encrypt=yes<br/>PostgreSQL: asyncpg over TLS<br/>encrypted, server certificate verified"| T2DB
 ```
 
 The API, the web console and the partner hops match the single-node picture. The setup steps and
@@ -137,9 +139,9 @@ In the second case the engine mints nothing, and the proxy-to-engine hop is plai
 `[api].tls_cert_file` is also set. The site secures that hop, and `serve` refuses to start until the
 operator acknowledges it.
 
-Both cases carry more startup checks once the bind leaves loopback.
-[Before you expose off-loopback](#before-you-expose-off-loopback) has them, and its step 1 names the
-acknowledgement key. The container section below calls these two cases Topology A and Topology B.
+Both cases carry more startup checks, and a declared proxy triggers some of them even on a loopback
+bind. [Before you expose off-loopback](#before-you-expose-off-loopback) has them, and its step 1
+names the acknowledgement key.
 
 ### Web console from another machine
 
@@ -168,9 +170,8 @@ flowchart LR
 
 This picture shows the engine serving TLS itself on an operator certificate. The engine refuses to
 serve `/ui` off loopback on only its self-signed pair. A certificate alone does not start an exposed
-engine: [`REMOTE-CONSOLE.md`](REMOTE-CONSOLE.md) section 1 has the settings and the further startup
-checks. A site that fronts the console with a reverse proxy would use the second case in the picture
-above.
+engine: [`REMOTE-CONSOLE.md`](REMOTE-CONSOLE.md) has the settings and the further startup checks. A
+site that fronts the console with a reverse proxy would use the second case in the picture above.
 
 ---
 
