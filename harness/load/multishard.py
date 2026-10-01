@@ -96,8 +96,11 @@ class EngineAttribution:
     inbound_rows: int  # number of inbound (source) connection rows this engine reports
     foreign_rows: int  # inbound rows whose name does NOT carry this engine's tag (a steal ⇒ > 0)
     reads: int  # Σ inbound read across this engine's own rows
-    #: The engine's OWN reason for each lane it reports as not-listening, verbatim from `/connections`
+    #: The engine's OWN reason for each lane it reports as not-listening, from `/connections`
     #: (`error`, which the API sets from `inbound_failed()`/`outbound_failed()` per ADR 0031).
+    #: The API masks `error` until a per-connection reveal (BACKLOG #2443), so a reason reads `****`
+    #: past the harness's reveal cap or after a refused reveal, and `(reason withheld)` when the
+    #: caller may not see the field at all. Neither is engine text.
     #:
     #: CARRIED BECAUSE `reads == 0` CANNOT DIAGNOSE ITSELF WITHOUT IT, and the engine already knows.
     #: `inbound_rows` and `foreign_rows` are CONFIG-derived, not traffic-derived -- the API appends a
@@ -765,8 +768,10 @@ def _reveal_failed_reasons(client: EngineClient, rows: list[ConnectionRow]) -> d
 
     ``/connections`` masks ``error`` as ``****`` until a per-connection reveal (BACKLOG #2443), and
     a reason that reads ``****`` cannot explain a ``reads == 0`` run. So each failed lane is
-    revealed by its own request. A lane past the cap, or a reveal the engine refuses, keeps the
-    masked value: that still says the lane failed, which is the half the diagnosis needs most."""
+    revealed by its own request. A lane past the cap, or one after a refused reveal, gets no
+    entry here, and the caller falls back to the row's own ``error`` (``****``, or null for a
+    caller without that permission). That still says the lane failed, which is the half the
+    diagnosis needs most."""
     from messagefoundry.apiclient import ApiError
 
     names = [r.channel_id for r in rows if r.read is not None and _lane_failed(r)]
@@ -775,7 +780,9 @@ def _reveal_failed_reasons(client: EngineClient, rows: list[ConnectionRow]) -> d
         try:
             shown = client.connections(reveal=name)
         except ApiError:
-            continue
+            # A refusal (no messages:view_summary, out of scope) or a spent PHI budget answers
+            # every later reveal the same way, and each would leave one more audit row.
+            break
         reason = next(
             (r.error for r in shown if r.read is not None and r.channel_id == name and r.error),
             None,

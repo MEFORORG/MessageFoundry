@@ -467,9 +467,6 @@ _log = logging.getLogger(__name__)
 #: The two monitoring rows whose ``reason`` is masked until a per-item reveal (BACKLOG #2443).
 _ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
 
-#: The reveal set of every connections-dashboard row the request did not name (BACKLOG #2443).
-_NO_REVEAL: frozenset[str] = frozenset()
-
 
 def _matched_route_path(request: Request) -> str | None:
     """The matched route's path TEMPLATE (``/connections/{name}/events``), or ``None``.
@@ -2427,17 +2424,17 @@ def create_app(
         that name; it needs ``messages:view_summary``, charges the PHI-read budget, and is audited
         as ``connection_error_reveal``. The ``status`` word and the ``errored`` count stay
         readable, so an operator can still tell that a connection failed."""
-        await _admit_reveal(request, identity, reveal)
         # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
-        # outside the caller's scope is refused and audited, not answered as "revealed nothing".
-        # A scoped caller is refused every outbound name, since an outbound spans channels.
-        if reveal is not None and not identity.can_access_channel(reveal):
-            await _audit_channel_denied(engine, identity, reveal, client_ip(request))
-            raise HTTPException(403, "not authorized for this connection")
+        # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
+        # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
+        # behind a 429. A scoped caller's dashboard carries no outbound rows at all.
+        if reveal is not None:
+            await _control_guard(engine, identity, reveal, client_ip(request))
+        await _admit_reveal(request, identity, reveal)
         out = await _dashboard_rows(engine, identity, reveal=reveal)
         if reveal is not None:
-            # The audit records what the response carried, not what was asked for: a name that is
-            # off this caller's page, or has no error, is recorded as revealing nothing.
+            # The audit records what the response carried, not what was asked for: an in-scope
+            # name with no row on the dashboard, or no error, is recorded as revealing nothing.
             shown = [r for r in out if _row_conn(r) == reveal]
             directions = sorted({r.direction for r in shown if r.error})
             await engine.store.record_audit(
@@ -2469,13 +2466,15 @@ def create_app(
         """The dashboard rows, channel-scoped, with ``error`` gated and masked on every row and
         lifted on the rows of the ONE connection ``reveal`` names (BACKLOG #2443). The caller has
         already passed :func:`_admit_reveal` for any ``reveal``; the stats socket passes none."""
-        # Built once, not per row: the stats socket runs this every second for every open dashboard.
-        lift = revealable(ConnectionRow, summary=False, error_text=True)
         rows = await _connection_rows(engine, identity)
+        if reveal is None:  # the stats socket, every second, and every bare load
+            return [redact_unauthorized(r, identity) for r in rows]
+        lift = revealable(ConnectionRow, summary=False, error_text=True)
         return [
-            redact_unauthorized(
-                r, identity, revealed=lift if _row_conn(r) == reveal else _NO_REVEAL
-            )
+            redact_unauthorized(r, identity, revealed=lift)
+            if _row_conn(r) == reveal
+            # Every row the request did not name stays masked.
+            else redact_unauthorized(r, identity)
             for r in rows
         ]
 

@@ -98,7 +98,10 @@ async def _add(
         roles=[role.value],
         actor="test",
     )
-    await service.set_channel_scope(user_id, scope or [ALL_CHANNELS], actor="test")
+    # ``is not None``, not ``or``: an empty scope denies every channel (BACKLOG #1152).
+    await service.set_channel_scope(
+        user_id, scope if scope is not None else [ALL_CHANNELS], actor="test"
+    )
     user = await service.store.get_user(user_id)
     assert user is not None and user.password_hash is not None
     await service.store.set_password(
@@ -319,9 +322,27 @@ async def dash(tmp_path: Path) -> AsyncIterator[Engine]:
 
     eng = await Engine.create(tmp_path / "dash.db", poll_interval=0.02)
     try:
+        from messagefoundry.config.models import ConnectorType
+        from messagefoundry.config.wiring import (
+            ConnectionSpec,
+            build_inbound_connection,
+            env,
+        )
+
         reg = Registry()
         reg.add_outbound(_broken_outbound("OB_A"))
         reg.add_outbound(_broken_outbound("OB_B"))
+        # A failed INBOUND too, so a channel-scoped caller has one in-scope connection to reveal.
+        reg.add_inbound(
+            build_inbound_connection(
+                "IB_MINE",
+                ConnectionSpec(
+                    ConnectorType.FILE, {"directory": env("IB_MINE_dir"), "pattern": "*.hl7"}
+                ),
+                router="r",
+            )
+        )
+        reg.add_router("r", lambda m: [])
         eng.add_registry(reg)
         await eng.start()  # degraded on both outbounds; does NOT raise (ADR 0031)
         yield eng
@@ -437,18 +458,28 @@ async def test_a_scoped_caller_revealing_a_connection_outside_its_scope_is_refus
     dash: Engine,
 ) -> None:
     """As on ``GET /connections/{name}/events``: an out-of-scope name is a channel denial, refused
-    and audited as one, never answered as a reveal of nothing. An outbound spans channels, so a
-    scoped caller is refused every outbound name. The bare load is the control: it still answers."""
+    and audited as one, never answered as a reveal of nothing. The control is the same caller's
+    reveal of its OWN failed inbound, which succeeds, so the guard is not refusing every scoped
+    reveal."""
+    rr = dash.registry_runner
+    assert rr is not None
+    stored = rr.inbound_failed("IB_MINE")
+    assert stored, "the fixture's inbound did not fail, so the control arm has nothing to reveal"
     service = await _service(dash)
     await _add(service, "scoped", Role.OPERATOR, scope=["IB_MINE"])
     async with _client(dash, service) as c:
         h = await _login(c, "scoped")
-        assert (await c.get("/connections", headers=h)).status_code == 200
         refused = await c.get("/connections", params={"reveal": "OB_A"}, headers=h)
         assert refused.status_code == 403
+        own = await c.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
+        assert own.status_code == 200
+        (mine,) = [r for r in own.json() if r["role"] == "source"]
+        assert mine["channel_id"] == "IB_MINE" and mine["error"] == stored
     audits = [dict(a) for a in await dash.store.list_audit(limit=200)]
     assert [a["channel_id"] for a in audits if a["action"] == "auth.channel_denied"] == ["OB_A"]
-    assert await _reveal_audits(dash, "connection_error_reveal") == []
+    assert [a["reveal"] for a in await _reveal_audits(dash, "connection_error_reveal")] == [
+        "IB_MINE"
+    ]
 
 
 async def test_the_stats_socket_pushes_the_dashboard_rows_masked(dash: Engine) -> None:
@@ -527,3 +558,59 @@ def test_the_multishard_attribution_finds_a_failed_lane_by_status_and_reveals_it
     reasons = _reveal_failed_reasons(cast(Any, _Client()), masked)
     assert reasons == {"IB_E0_A": "bind refused on port 2575"}
     assert calls == ["IB_E0_A"]
+
+
+@pytest.mark.parametrize("may_reveal", [True, False])
+def test_the_multishard_attribution_keeps_a_failed_lane_whose_error_is_withheld(
+    monkeypatch: pytest.MonkeyPatch, may_reveal: bool
+) -> None:
+    """End to end through ``_attribute_engines_sync``. A caller without ``messages:view_summary``
+    sees ``error`` null and has its reveal refused; the failed lane must still be reported, with a
+    placeholder, and the refusal must stop further reveals. A caller that may reveal gets the
+    engine's reason. The running lane is the control in both arms: it is never reported."""
+    import messagefoundry.apiclient as apiclient
+    from harness.load.multishard import _attribute_engines_sync
+
+    calls: list[str | None] = []
+
+    class _Client:
+        def __init__(self, url: str, *, cacert: object = None) -> None:
+            del url, cacert
+
+        def connections(self, *, reveal: str | None = None) -> list[ConnectionRow]:
+            calls.append(reveal)
+            if reveal is not None and not may_reveal:
+                raise apiclient.ApiError("forbidden", status=403)
+            error = "****" if may_reveal else None
+            rows = [
+                _source_row("IB_E0_A", "failed", error),
+                _source_row("IB_E0_B", "failed", error),
+                _source_row("IB_E0_C", "running", None),
+            ]
+            if reveal is not None:
+                rows = [
+                    _source_row(r.channel_id, r.status, f"bind refused for {r.channel_id}")
+                    if r.channel_id == reveal
+                    else r
+                    for r in rows
+                ]
+            return rows
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(apiclient, "EngineClient", _Client)
+    node = cast(Any, type("Node", (), {"url": "https://n", "cacert": None, "node_id": "n0"})())
+    (attribution,) = _attribute_engines_sync([node])
+    if may_reveal:
+        assert attribution.failed_lanes == (
+            "IB_E0_A in: bind refused for IB_E0_A",
+            "IB_E0_B in: bind refused for IB_E0_B",
+        )
+        assert calls == [None, "IB_E0_A", "IB_E0_B"]
+    else:
+        assert attribution.failed_lanes == (
+            "IB_E0_A in: (reason withheld)",
+            "IB_E0_B in: (reason withheld)",
+        )
+        assert calls == [None, "IB_E0_A"]  # the first refusal stops the rest
