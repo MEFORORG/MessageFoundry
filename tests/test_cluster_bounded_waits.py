@@ -29,6 +29,7 @@ from messagefoundry.pipeline.cluster import (
     DbCoordinator,
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
+    paused_read_budget_seconds,
 )
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
@@ -153,14 +154,19 @@ class _AsyncpgPool:
             return await con.fetchrow(sql, *args)
 
 
+class _StoreSettings:
+    def __init__(self, command_timeout: float) -> None:
+        self.command_timeout = command_timeout
+
+
 class _SqlStore:
     """The SQL Server store's ``_fetchone``/``_execute``. Its cancel unwinds at once: the real store
     quarantines the cancelled connection without waiting on a running statement."""
 
-    _settings = None
-
-    def __init__(self, server: _Server) -> None:
+    def __init__(self, server: _Server, command_timeout: float | None = None) -> None:
         self._server = server
+        # The store's [store].command_timeout, which the coordinator reads for the paused owner read.
+        self._settings = None if command_timeout is None else _StoreSettings(command_timeout)
 
     async def _fetchone(self, sql: str, params: tuple[object, ...]) -> object:
         return await self._server.run(sql, str(params[1]) if len(params) > 1 else "")
@@ -198,9 +204,11 @@ def _pg(server: _Server, node: str = "A", **kw: float) -> tuple[DbCoordinator, _
     return coord, pool
 
 
-def _ss(server: _Server, node: str = "A") -> SqlServerCoordinator:
+def _ss(
+    server: _Server, node: str = "A", command_timeout: float | None = None
+) -> SqlServerCoordinator:
     return SqlServerCoordinator(
-        _SqlStore(server),
+        _SqlStore(server, command_timeout),
         node,
         heartbeat_seconds=10.0,
         leader_lease_ttl_seconds=_TTL,
@@ -383,3 +391,70 @@ async def test_a_lock_timeout_is_still_the_answer_when_the_tick_outlasts_the_fen
     server.answer.set()  # the server answers at last, and the tick renews
     await _timed(tick)
     assert a.is_leader() is True
+
+
+# --- the paused tick's owner read (BACKLOG #2540) ----------------------------------------------
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_a_stalled_paused_read_still_lets_a_retried_stepdown_in(
+    backend: str, server: _Server
+) -> None:
+    """The case the item names. A stepdown's write did not return, so the node is paused and owes
+    the write. Its next tick sends the pause's owner read under the leadership lock, and the store
+    stalls. The operator retries the stepdown, which waits for that lock only up to the fence.
+
+    Each backend's statement timeout is set LONGER than the fence, as SQL Server's 30 s default is
+    against the 20 s fence, so only the paused read's own bound can let the retry in.
+
+    MUTATION ARMS, measured: on Postgres send the read at the renew clamp, and on SQL Server drop
+    its ``asyncio.timeout``; each retry then answers StepdownLockTimeout, the 503."""
+    if backend == "postgres":
+        coord: DbCoordinator | SqlServerCoordinator = _pg(server, renew=_GUARD)[0]
+    else:
+        coord = _ss(server, command_timeout=_GUARD)
+    await coord._maintain_leadership()
+    assert coord.is_leader() is True
+
+    server.fail.add(_RELEASE_SQL)
+    with pytest.raises(StepdownReleaseUnconfirmed):
+        await coord.step_down_leadership(sibling_acquire_delay_seconds=0.0)
+    server.fail.clear()
+    assert coord._lease_release_owed is True and coord._no_claim_until > 0.0
+
+    server.hang.add(_OWNER_SQL)
+    tick = asyncio.create_task(coord._maintain_leadership())
+    await asyncio.wait_for(server.hung.wait(), _GUARD)
+
+    elapsed, outcome = await _timed(coord.step_down_leadership(sibling_acquire_delay_seconds=0.0))
+
+    assert elapsed < _FENCE, f"{backend}: the retry waited {elapsed:.2f}s for the lock"
+    assert outcome.lease_released is True and coord._lease_release_owed is False, backend
+    with pytest.raises(TimeoutError):
+        await tick  # the stalled read failed at its bound; the loop logs it and the pause holds
+    assert coord.is_leader() is False
+
+
+def test_the_paused_read_budget_stays_under_the_fence() -> None:
+    # The shipped SQL Server case: a 30 s command timeout against a 20 s fence.
+    assert paused_read_budget_seconds(20.0, 30.0) == 15.0
+    # A shorter statement timeout wins, as the Postgres renew clamp's 4.5 s does.
+    assert paused_read_budget_seconds(20.0, 4.5) == 4.5
+    # [store].command_timeout = 0 means "no limit", and the fence share alone applies.
+    assert paused_read_budget_seconds(20.0, 0.0) == 15.0
+    assert paused_read_budget_seconds(20.0, None) == 15.0
+    for fence in (0.5, 5.0, 20.0, 120.0):
+        for statement in (None, 0.0, 1.0, fence, 10 * fence):
+            assert paused_read_budget_seconds(fence, statement) < fence
+
+
+def test_each_coordinator_derives_the_budget_from_its_own_statement_timeout() -> None:
+    server = _Server()
+    pg, _pool = _pg(server, fence=20.0, renew=4.5)
+    assert pg._paused_read_timeout == 4.5 / 2  # _call_within costs at most twice its timeout
+    ss = SqlServerCoordinator(
+        _SqlStore(server, 30.0), "B", leader_fence_timeout_seconds=20.0, run_schema_ddl=False
+    )
+    assert ss._paused_read_budget == 15.0  # the shipped [store].command_timeout and fence
+    # A store stand-in with no settings gets the fence share alone.
+    assert _ss(server)._paused_read_budget == paused_read_budget_seconds(_FENCE, None)

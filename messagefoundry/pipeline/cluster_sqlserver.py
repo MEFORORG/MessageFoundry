@@ -61,6 +61,7 @@ from messagefoundry.pipeline.cluster import (
     default_node_id,
     lease_release_unconfirmed,
     members_from_node_rows,
+    paused_read_budget_seconds,
     rows_affected,
     stepdown_pause_seconds,
     stop_tasks_within,
@@ -133,6 +134,13 @@ class SqlServerCoordinator:
         # widening it is a multi-site enumeration — the exact defect class this avoids).
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
+        # BACKLOG #2540: the whole-call budget for the paused tick's owner read, from the store's
+        # own statement timeout (duck-typed; a stand-in without one gets the fence share alone).
+        command_timeout = getattr(getattr(store, "_settings", None), "command_timeout", None)
+        self._paused_read_budget = paused_read_budget_seconds(
+            leader_fence_timeout_seconds,
+            float(command_timeout) if isinstance(command_timeout, (int, float)) else None,
+        )
         # Small relative to the fence timeout so a fence fires promptly (well before the lease TTL).
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
         # Leader-preference (ADR 0096): `acquire_delay` handicaps ONLY take-over of an EXPIRED lease (added
@@ -473,9 +481,13 @@ class SqlServerCoordinator:
             # expired lease instead of this node renewing it straight back via the un-delayed t.owner = me
             # branch, and lift the pause once the row names another node (BACKLOG #1986). Mirrors
             # DbCoordinator._claim_or_renew_lease — read its comment there.
-            current = await self._store._fetchone(
-                "SELECT owner FROM leader_lease WHERE lease_key = ?", (self._lease_key,)
-            )
+            # BACKLOG #2540: bounded strictly under the fence, because this read holds the lock a
+            # retried stepdown waits on, and [store].command_timeout (30 s by default) is longer
+            # than the 20 s fence. See paused_read_budget_seconds.
+            async with asyncio.timeout(self._paused_read_budget):
+                current = await self._store._fetchone(
+                    "SELECT owner FROM leader_lease WHERE lease_key = ?", (self._lease_key,)
+                )
             if current is not None and current["owner"] != self.node_id:
                 self._no_claim_until = 0.0
             return False

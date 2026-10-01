@@ -496,6 +496,20 @@ such a call is refused with `412` unless you send `force`. Give every node the s
 `heartbeat_seconds`: the pause is counted in the drained node's own heartbeats, so a sibling with a
 longer one can miss it. A clean stop needs no pause, because a stopped node does not claim.
 
+**A slow store during the pause does not block a retried stepdown.** While paused, each tick reads
+who owns the lease, and it reads while holding the lock a stepdown waits on. A stepdown waits for
+that lock only up to `leader_fence_timeout_seconds`, and the retry after a `release-unconfirmed` is
+the call most likely to arrive then. So the read gets its own limit: the smaller of the store's
+statement timeout and three quarters of the fence timeout. At the shipped settings that is 15
+seconds on SQL Server, where `[store].command_timeout` (30) is longer than the fence (20), and the
+4.5 second renew timeout on Postgres. A read that misses the limit fails, the node logs it and stays
+paused, and the stepdown gets the lock in time ([BACKLOG #2540](BACKLOG.md)).
+
+We chose that limit over two other designs. Moving the read into the claim statement would break
+the retry of an unconfirmed release, which relies on a claim that finds no row to clear the owed
+write ([BACKLOG #1508](BACKLOG.md)). Moving the read outside the lock would let it race a stepdown
+running at the same time.
+
 **A node that has already self-fenced can be drained.** It has given up leadership in memory but still
 owns a live lease row, which `GET /cluster/nodes` shows as `lease_owner`. A stepdown there expires that
 row and answers `200` with `was_leader: false, lease_released: true`, so a standby can take the lease

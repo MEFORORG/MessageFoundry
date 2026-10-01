@@ -581,6 +581,43 @@ def stepdown_pause_seconds(
     return 2.0 * heartbeat_seconds + max(0.0, delay)
 
 
+#: The share of the fence timeout a paused tick's owner read may hold the leadership lock
+#: (BACKLOG #2540). Picked, not derived: the remaining quarter is the margin for the read's own
+#: unwind and for a stepdown that queued a moment after the tick took the lock.
+_PAUSED_READ_FENCE_SHARE = 0.75
+
+
+def paused_read_budget_seconds(
+    fence_timeout_seconds: float, statement_timeout_seconds: float | None
+) -> float:
+    """The whole-call budget for the owner read a tick sends while the stepdown pause holds
+    (BACKLOG #2540). Shared by both coordinators for the reason :func:`stepdown_pause_seconds` is.
+
+    **Why the read needs its own bound.** The read runs under :attr:`DbCoordinator._leadership_lock`,
+    and a stepdown waits for that lock for at most ``leader_fence_timeout_seconds``. During the pause
+    the expected next call IS a stepdown: a retry after ``release-unconfirmed``. On SQL Server the
+    read inherited ``[store].command_timeout`` (30 s by default, none at 0), longer than the 20 s
+    fence, so a read stalled on a slow store held the lock past it and the retry answered
+    ``503 lock-timeout``. On Postgres the renew clamp bounded it, but the clamp is validated against
+    the detection margin, not the fence, and a long TTL lets it exceed the fence.
+
+    **The decision, recorded in docs/CLUSTERING.md under the stepdown pause:** the read keeps
+    its place inside the lock and gets a per-statement bound of ``min(statement timeout, 75 percent
+    of the fence)``. A missing or zero statement timeout means "no limit", so the fence share alone
+    applies. Two other shapes were rejected. Folding the pause into the claim statement breaks the
+    BACKLOG #1508 retry, which clears the owed release write when the claim returns no row. Moving
+    the read outside the lock races a concurrent stepdown.
+
+    The caller must spend this as a WHOLE-CALL budget, the driver's unwind included. Postgres
+    passes half of it to :func:`_call_within`, which costs at most twice its timeout. SQL Server
+    wraps the store call in ``asyncio.timeout``; the store quarantines a cancelled connection
+    without waiting on a running statement, so that unwind is short."""
+    share = _PAUSED_READ_FENCE_SHARE * fence_timeout_seconds
+    if statement_timeout_seconds is None or not statement_timeout_seconds > 0:
+        return share
+    return min(statement_timeout_seconds, share)
+
+
 def demote_stop_budget(
     *, lease_ttl_seconds: float, fence_timeout_seconds: float
 ) -> tuple[float, float]:
@@ -1004,6 +1041,12 @@ class DbCoordinator:
         # the acquire and asyncpg's release included (_call), so it overrides the pool's
         # command_timeout everywhere but the start-up DDL.
         self._renew_timeout = lease_renew_timeout_seconds
+        # BACKLOG #2540: the paused tick's owner read, as the per-call timeout _call_within takes.
+        # Half the budget, because that helper costs at most twice its timeout.
+        self._paused_read_timeout = (
+            paused_read_budget_seconds(leader_fence_timeout_seconds, lease_renew_timeout_seconds)
+            / 2.0
+        )
         # The fence watchdog polls this often; small relative to the fence timeout so a fence fires
         # promptly (well before the lease TTL). Pure in-memory check — no DB.
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
@@ -1548,8 +1591,17 @@ class DbCoordinator:
             # each paused tick to one round trip under the lock, and the next tick's fence baseline
             # is taken before its own claim, as _maintain_leadership expects. The cost is up to one
             # heartbeat before this node may take over a crashed successor.
-            row = await self._call(
-                "fetchrow", "SELECT owner FROM leader_lease WHERE lease_key = $1", self._lease_key
+            #
+            # BACKLOG #2540: this read holds _leadership_lock, and a retried stepdown waits for that
+            # lock only up to the fence timeout, so the read is bounded under it; see
+            # paused_read_budget_seconds. A read that misses the bound raises, the loop logs it, and
+            # the pause stays armed, which is the conservative direction.
+            row = await _call_within(
+                self._pool,
+                self._paused_read_timeout,
+                "fetchrow",
+                "SELECT owner FROM leader_lease WHERE lease_key = $1",
+                self._lease_key,
             )
             if row is not None and row["owner"] != self.node_id:
                 self._no_claim_until = 0.0
