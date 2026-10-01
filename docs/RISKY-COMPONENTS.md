@@ -15,20 +15,20 @@ uses dated public data.
 
 The set assessed is the **core runtime closure**: every distribution a default engine install
 carries, transitive dependencies included, with no optional extras and no development toolchain.
-That is **35 distributions**, recorded in
+That is **34 distributions**, recorded in
 [`security/runtime-closure-core.txt`](../security/runtime-closure-core.txt).
 
 **Which denominator you pick changes the answer by about half, so it is stated rather than implied:**
 
 | Denominator | Count | Why not this one |
 |---|---|---|
-| Names in `pyproject.toml`, core only | 20 | Misses everything transitive, which is a large share of what runs. |
-| Names in `pyproject.toml`, core plus every extra | 46 | Still direct-only, and mixes in extras nobody enabled. |
-| **Core runtime closure** | **35** | **Used for the tiers below.** What a default install actually executes. |
-| **`sqlserver` runtime closure** | **37** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
+| Names in `pyproject.toml`, core only | 19 | Misses everything transitive, which is a large share of what runs. |
+| Names in `pyproject.toml`, core plus every extra | 45 | Still direct-only, and mixes in extras nobody enabled. |
+| **Core runtime closure** | **34** | **Used for the tiers below.** What a default install actually executes. |
+| **`sqlserver` runtime closure** | **36** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
 | `requirements.lock` | A superset | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
-One extra is assessed as well. The `sqlserver` runtime closure is **37 distributions**, recorded in
+One extra is assessed as well. The `sqlserver` runtime closure is **36 distributions**, recorded in
 [`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt). It has its
 own section below, which classifies only the names the extra adds to the core closure.
 
@@ -53,7 +53,7 @@ Native compiled code is treated as an aggravating factor within a tier, not a ti
 memory-safety fault in a compiled parser is not the same class of event as a logic bug in a pure
 Python one, and the tables below say which components carry it.
 
-**Twenty-four of thirty-five are designated, and the proportion is the finding.** This is an
+**Twenty-three of thirty-four are designated, and the proportion is the finding.** This is an
 integration engine: its job is parsing clinical traffic from partners it does not control and
 terminating network protocols. Most of its runtime closure is therefore in one of those two paths by
 construction. A short list here would be a less honest document, not a safer engine.
@@ -62,12 +62,13 @@ construction. A short list here would be a less honest document, not a safer eng
 
 These see bytes chosen by a sending system. Everything in
 [`DANGEROUS-FUNCTIONALITY.md`](DANGEROUS-FUNCTIONALITY.md) section 7 about deliberate parser
-tolerance applies to the first two.
+tolerance applies to the engine's own tolerant HL7 parser (ADR 0054), which is engine code and
+not a component. `hl7apy` reads the same input. The tolerant parser was the `hl7` component
+(python-hl7) until it was retired.
 
 | Component | Why | Native |
 |---|---|---|
-| `hl7` | python-hl7, the tolerant parser on the message hot path | no |
-| `hl7apy` | strict HL7 validation, opt-in per connection, same input | no |
+| `hl7apy` | strict HL7 validation, opt-in per connection, on inbound HL7 | no |
 | `pydantic` | validates untrusted request and config input | no |
 | `pydantic-core` | the engine underneath it, compiled | **yes** |
 
@@ -130,7 +131,7 @@ looked at.
 | `annotated-doc`, `annotated-types`, `typing-extensions`, `typing-inspection` | typing shims, no runtime input handling |
 | `tzdata` | timezone tables |
 
-That is 11, and 24 plus 11 is 35. The arithmetic is stated so a reader can check the set is closed
+That is 11, and 23 plus 11 is 34. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
 
 ## The `sqlserver` extra
@@ -151,7 +152,7 @@ tables.
 
 None. Both names the extra adds are designated.
 
-So 2 plus 0 is 2, and 35 plus 2 is 37.
+So 2 plus 0 is 2, and 34 plus 2 is 36.
 
 ### The ODBC driver is designated too, and the guard cannot see it
 
@@ -203,7 +204,7 @@ The readings, their sources and their windows are recorded in
 
 ### What is read, and the test for each example
 
-All 37 distributions in the `sqlserver` closure are read: the 35 in the core closure and the 2 the
+All 36 distributions in the `sqlserver` closure are read: the 34 in the core closure and the 2 the
 extra adds. That is the whole assessed set, not only the designated part. A library can be risky on
 these examples even where the tiers did not designate it.
 
@@ -225,15 +226,14 @@ can judge them.
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.
 
-**Risky on at least one example: 11 of 37. On maintenance: 3. On support: 0. On vulnerability
-history: 8. Not risky on any: 26. 11 plus 26 is 37.**
+**Risky on at least one example: 10 of 36. On maintenance: 2. On support: 0. On vulnerability
+history: 8. Not risky on any: 26. 10 plus 26 is 36.**
 
 ### Poorly maintained
 
 | Component | Newest release | Designated above |
 |---|---|---|
 | `aioodbc` | 2023-10-28 | yes, the `sqlserver` extra |
-| `hl7` | 2022-03-31 | yes, tier 1 |
 | `hl7apy` | 2024-03-13 | yes, tier 1 |
 
 ### Unsupported or end of life
@@ -253,7 +253,7 @@ None on the snapshot date.
 | `pyasn1` | 5 | 2026-07-14 | yes, tier 2 |
 | `starlette` | 5 | 2026-06-15 | yes, tier 3 |
 
-On the snapshot date OSV listed no advisory against any pinned version, in any of the 37. The table
+On the snapshot date OSV listed no advisory against any pinned version, in any of the 36. The table
 above counts past advisories only.
 
 Every advisory in the window carries a rating from one of the two sources.
@@ -276,7 +276,7 @@ Every advisory in the window carries a rating from one of the two sources.
 The tiers stay the designation. This reading does not move a component into or out of them. Where
 the two agree is where to look first.
 
-9 designated components are also risky on an ASVS example:
+8 designated components are also risky on an ASVS example:
 
 | Component | Designated above | Risky on |
 |---|---|---|
@@ -284,7 +284,6 @@ the two agree is where to look first.
 | `certifi` | tier 2 | vulnerability history |
 | `cryptography` | tier 2 | vulnerability history |
 | `h11` | tier 3 | vulnerability history |
-| `hl7` | tier 1 | maintenance |
 | `hl7apy` | tier 1 | maintenance |
 | `httpx` | tier 3 | vulnerability history |
 | `pyasn1` | tier 2 | vulnerability history |

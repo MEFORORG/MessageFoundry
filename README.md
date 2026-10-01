@@ -15,7 +15,7 @@ messages across many formats (HL7 v2, JSON, XML/SOAP, X12, database records) and
 guided tooling or extend it in Python; it runs on SQLite, PostgreSQL, or SQL Server with
 authentication, RBAC, audit logging, and encryption-at-rest built in.
 
-> Python import package: `messagefoundry`. Built with **hl7apy** + **python-hl7** (HL7 parsing/
+> Python import package: `messagefoundry`. Built with its own tolerant HL7 parser + **hl7apy** (HL7 parsing/
 > validation), **FastAPI** (engine API + the same-origin `/ui` web console), and **PySide6** (the
 > standalone test harness).
 
@@ -43,7 +43,7 @@ renders on GitHub and in the VS Code preview). The prose source of truth is
 - **Reliable by default.** A durable, transactional pipeline gives at-least-once delivery,
   automatic retries, replay, and dead-lettering — no separate message broker to run.
 - **Async core.** asyncio with per-connection workers for listeners, pollers, retries.
-- **Tolerant parsing first.** `python-hl7` for fast routing/peek; `hl7apy` for deep,
+- **Tolerant parsing first.** A built-in tolerant parser for fast routing/peek; `hl7apy` for deep,
   version-aware validation and profiles on demand (real-world HL7 is often non-conformant).
 - **Configure visually or in code.** Author connections and routes with guided wizards, or in
   Python (`inbound`/`outbound`/`@router`/`@handler`) for full control — always version-controlled.

@@ -472,26 +472,48 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
 
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
-    would otherwise arrive at the connector exactly as a list item written directly does. A list
-    that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
-    offenders: list[str] = []
+    would otherwise arrive at the connector exactly as a list item written directly does.
+
+    A default that is ITSELF a reference, in either spelling, is refused whole rather than followed.
+    :func:`resolve_env_settings` resolves one link only, so that inner reference is never resolved.
+    Wherever the outer key is unset, the connector gets the inner reference object instead of a list.
+    It gets it even when the environment sets the inner key. At least ``proxy_no_proxy`` then reads
+    as an empty list, and every host silently goes through the proxy. So the fallback link never
+    works, and there is no clean version of it to let through. Refusing at the first link also means
+    nothing walks a marker that is its own default. The ``connections.toml`` type check refuses this
+    shape first for at least the list settings it models, since it wants an array and finds a table.
+    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
+    items: list[str] = []
+    chains: list[str] = []
     for name, value in settings.items():
         label = name
         if isinstance(value, EnvRef):
             label, value = f"{name} env() default", value.default
+            if _is_nested_envref(value):
+                chains.append(name)
+                continue
         if isinstance(value, list | tuple | set | frozenset):
-            offenders += [
+            items += [
                 f"{label} item {index}"
                 for index, item in enumerate(value)
                 if _contains_envref(item)
             ]
-    if offenders:
-        raise WiringError(
-            f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
-            "not env-resolved, so it would reach the connector as its repr with any default= inside "
-            "it. Write the items as static values, or let one env() reference stand for the whole "
-            "setting."
+    problems: list[str] = []
+    if items:
+        problems.append(
+            f"{', '.join(items)} may not be an env() reference - nested settings are not "
+            "env-resolved, so it would reach the connector unresolved, where a str() of it carries "
+            "any default= inside it. Write the items as static values, or let one env() reference "
+            "stand for the whole setting."
         )
+    if chains:
+        problems.append(
+            f"{', '.join(chains)} env() default may not itself be an env() reference - only one "
+            "link is resolved, so wherever the outer key is unset the connector gets the inner "
+            "reference, not a list. Give the outer env() a static list default instead."
+        )
+    if problems:
+        raise WiringError(f"{factory} " + f" {factory} ".join(problems))
 
 
 def parse_env_setting(value: Any) -> Any:

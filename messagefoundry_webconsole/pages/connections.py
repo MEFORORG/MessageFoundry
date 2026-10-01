@@ -17,7 +17,7 @@ from urllib.parse import quote
 from messagefoundry.api.models import ConnectionEventInfo, ConnectionRow
 
 from .._html import Markup, el, page, rows_table, text
-from ._common import _num, _secs, _seg
+from ._common import _num, _reveal_cell, _secs, _seg
 from .approvals import approvals_link
 
 __all__ = [
@@ -370,11 +370,17 @@ def dashboard(rows: list[ConnectionRow], *, unprovisioned: bool = False) -> Mark
     )
 
 
-def connection_details(row: ConnectionRow, events: list[ConnectionEventInfo]) -> Markup:
+def connection_details(
+    row: ConnectionRow, events: list[ConnectionEventInfo], *, revealed: int | None = None
+) -> Markup:
     """Read-only detail view for one connection (#4a): transport/status, live stats, and recent
     connection/transport events, composed from existing monitoring handlers. Not PHI-free: the row's
     ``error`` and each event's ``reason`` are scrubbed free text that ``docs/PHI.md`` section 2 gives
-    a protection level."""
+    a protection level.
+
+    Each event's reason arrives masked, or null without ``messages:view_summary`` (BACKLOG #2443).
+    ``revealed`` is the one event whose reason this request asked for whole; every other masked
+    reason links to its own reveal on this page."""
     peer = row.peer or "—"
     if row.port:
         peer = f"{peer}:{row.port}"
@@ -403,9 +409,22 @@ def connection_details(row: ConnectionRow, events: list[ConnectionEventInfo]) ->
         adjustable=False,
     )
     if events:
+        reveal_base = f"/ui/connection/{_seg(row.name)}/events"
         events_tbl: Markup = rows_table(
             ["When", "Kind", "Dir", "Peer", "Reason"],
-            [[_ts(e.ts), e.kind, e.direction, e.peer_host or "—", e.reason or "—"] for e in events],
+            [
+                [
+                    _ts(e.ts),
+                    e.kind,
+                    e.direction,
+                    e.peer_host or "—",
+                    _reveal_cell(
+                        e.reason, f"{reveal_base}/{e.id}/reason", revealed=e.id == revealed
+                    )
+                    or "—",
+                ]
+                for e in events
+            ],
             adjustable=False,
         )
     else:

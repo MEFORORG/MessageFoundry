@@ -1145,7 +1145,7 @@ def _normalize_dist(name: str) -> str:
 @functools.cache
 def _shipped_dep_import_roots() -> frozenset[str]:
     """Top-level import names of MessageFoundry's declared distribution dependencies, so a Handler
-    importing a shipped dep (e.g. ``hl7``, or a lazily-imported optional-extra dep like ``pydicom``)
+    importing a shipped dep (e.g. ``tomlkit``, or a lazily-imported optional-extra dep like ``pydicom``)
     is not mistaken for an operator-added package. **Install-independent:** an installed dep maps to
     its real import name(s); a declared-but-uninstalled dep falls back to a best-effort guess from the
     dist name, so vetting does not drift with which extras happen to be installed on the box running

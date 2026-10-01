@@ -536,29 +536,6 @@
       }
     },
     {
-      "name": "hl7",
-      "pinned": "0.4.5",
-      "in_core": true,
-      "latest_version": "0.4.5",
-      "newest_upload": "2022-03-31",
-      "releases_in_maintenance_window": 0,
-      "development_status": [
-        "Development Status :: 3 - Alpha"
-      ],
-      "project_status": "active",
-      "pinned_yanked": false,
-      "requires_python_latest": "",
-      "advisories": [],
-      "advisories_dropped": [],
-      "advisories_unresolved": [],
-      "advisories_affecting_pin": [],
-      "risky": {
-        "maintenance": true,
-        "support": false,
-        "advisory_history": false
-      }
-    },
-    {
       "name": "hl7apy",
       "pinned": "1.3.5",
       "in_core": true,

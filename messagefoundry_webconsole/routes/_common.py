@@ -135,6 +135,8 @@ UI_BODY_FILTER_RULES: Final[dict[str, dict[str, FilterRule]]] = {
         "control_id": CONTROL_ID_RULE,
     },
     "/ui/events": {"connection": CONNECTION_RULE, "kind": EVENT_KIND_RULE},
+    # BACKLOG #2443: the per-event reveal carries the event page's two filters back to it.
+    "/ui/events/{event_id}/reason": {"connection": CONNECTION_RULE, "kind": EVENT_KIND_RULE},
 }
 
 

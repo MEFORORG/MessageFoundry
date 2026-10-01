@@ -278,7 +278,7 @@ this follows:
 **The HL7 parser is deliberately tolerant, and that is not a defect to fix.** Real clinical traffic
 is not conformant. A sending system that has worked for fifteen years will send a segment no
 specification allows, and refusing it drops patient data on the floor. So the fast path
-(`parsing/peek.py`, python-hl7) accepts what it is given, and strict validation (`parsing/validate.py`,
+(`parsing/peek.py`, the built-in parser of ADR 0054) accepts what it is given, and strict validation (`parsing/validate.py`,
 hl7apy) is opt-in per connection.
 
 **Nobody should reach a passing security grade by making the parser strict.** That would trade a
@@ -372,14 +372,13 @@ The scan leaves some parsing out on purpose, and it has limits:
 | The intake path | Every received body. `pipeline/wiring_runner.py` is the shared ingress code. It hands each body to the decode and size guards, and an HL7 body to the peek, then to the parsers below. The live router and transform workers call the routing and transform core in `pipeline/dryrun.py` (`route_only`, `transform_one`), which hands each body to the parser for its content type. | `pipeline/wiring_runner.py`, `pipeline/dryrun.py` |
 | Dry-run fixtures | The sample and batch files a dry run reads, such as the `--messages` files of `messagefoundry dryrun`. A fixture may be captured traffic. `read_fixture` reads each file, and `split_messages` hands a batch file to `parsing/split.py` to split. The scan's match in this module is different: a JSON decode of a value it encoded a moment before. | `pipeline/dryrun.py` |
 | A stored message body, when retention strips its documents | The body a sender delivered, decrypted from the store. Each backend's retention pass hands it to `parsing/binary.py`, in the hand-read table below, to strip its embedded documents. The scan's matches here are different: JSON the engine wrote itself. | `store/store.py`, `store/postgres.py`, `store/sqlserver.py` |
-| HL7 v2 | An inbound connection. Strict validation is opt-in. | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
+| HL7 v2 | An inbound connection. Strict validation is opt-in. The tolerant parser is hand-written, so it is in the hand-read table below. | `parsing/message.py`, `parsing/validate.py` |
 | MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
 | JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
 | XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply. `_vendor/defusedxml/` is the vendored defusedxml copy the stdlib-parser sites parse through. | `parsing/message.py`, `parsing/xml/`, `_vendor/defusedxml/common.py`, `_vendor/defusedxml/ElementTree.py`, `transports/soap.py` |
 | X12 | An inbound whose content type is `x12` | `parsing/x12/` |
 | DICOM | An inbound DICOM association or payload | `parsing/dicom/`, `transports/dicom.py` |
 | A JSON payload for a database outbound | What a Handler built from a message | `transports/database.py` |
-| Captured traffic | The messages the de-identification tools read | `anon/hl7.py` |
 | An SVG attachment inside a stored message | A sender, through the message. It is read when the attachment is downloaded. | `api/svg_sanitize.py` |
 | An uploaded file | The body of `POST /uploads`, or of `POST /ui/uploaded-logs/upload`, which the same handler serves. `api/multipart.py` is a hand-written `multipart/form-data` parser (ADR 0134), and its own comment calls each part's header block attacker-supplied. The route needs the files-upload permission and step-up authentication. | `api/app.py`, `api/multipart.py`, `uploads.py` |
 | A reference sync's file source | A file another system exports. `pipeline/reference_sync.py` re-reads it on a schedule and hands it to the code-set loader, and a dry run's reference preview in `pipeline/dryrun.py` does too. The same loader reads the code sets in the config directory, which are operator input. | `config/code_sets.py` |
@@ -404,13 +403,14 @@ The scan leaves some parsing out on purpose, and it has limits:
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
-| It parses no input. It builds messages, reads `hl7apy`'s own schema tables or quiets a library logger. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `phi_log_silencer.py` |
+| It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py` |
 
 **Hand-written parsers the patterns cannot see.**
 
 | What it parses | Modules |
 |---|---|
 | MLLP and TCP frames, before any other code sees the bytes | `framing.py`, `mllpcodec.py` |
+| HL7 v2, in the engine's own tolerant parser (ADR 0054). It reads every inbound HL7 body, and the de-identification tools read captured traffic through it. | `parsing/_builtin_hl7.py`, `parsing/peek.py`, `anon/hl7.py` |
 | HL7 batch files, split into messages | `parsing/split.py` |
 | The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
 | An inbound text body, decoded with its connection's declared character set and checked for NUL bytes and size, before the HL7 peek or a Router sees it. A binary body is only size-checked and base64-carried. | `pipeline/ingress_guards.py` |

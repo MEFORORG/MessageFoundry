@@ -230,6 +230,6 @@ See [docs/PHI.md](docs/PHI.md).
 
 ## Conventions
 
-Use the **Connection / Router / Handler** vocabulary, parse on the python-hl7 hot path (hl7apy for
+Use the **Connection / Router / Handler** vocabulary, parse on the built-in tolerant hot path (hl7apy for
 opt-in strict validation), keep the engine free of GUI/web-framework imports, and never manipulate
 HL7 with raw string slicing. See the architecture and security docs under [docs/](docs/).

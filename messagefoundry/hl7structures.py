@@ -164,34 +164,26 @@ def _fixture(segment: str) -> str:
 
 
 def _path_verified(fixture: str, path: str) -> bool:
-    """Whether ``path`` round-trips on BOTH parser backends: ``set(path, SENTINEL) -> encode() -> read
-    back == SENTINEL`` on the built-in AND python-hl7 backends, and the two encodings agree byte-for-byte
-    (a dormant parser-parity regression guard — NOT the round-trip proof, which is the read-back)."""
-    from messagefoundry.parsing._backend import backend
+    """Whether ``path`` round-trips: ``set(path, SENTINEL) -> encode() -> read back == SENTINEL``.
+
+    This also compared the built-in and python-hl7 encodings until python-hl7 was retired; parser
+    parity is now held by ``tests/test_builtin_hl7_parity.py`` against a frozen oracle."""
     from messagefoundry.parsing.message import Message
 
-    encodings: list[str] = []
-    for builtin in (True, False):
-        with backend(builtin=builtin):
-            try:
-                msg = Message.parse(fixture)
-                msg.set(path, SENTINEL)
-                encoded = msg.encode()
-                read_back = Message.parse(encoded).field(path)
-            except (KeyError, ValueError):
-                return False  # padding limits / an unsettable path -> unverified (degrades to free-text)
-        if read_back != SENTINEL:
-            return False
-        encodings.append(encoded)
-    return encodings[0] == encodings[1]
+    try:
+        msg = Message.parse(fixture)
+        msg.set(path, SENTINEL)
+        read_back = Message.parse(msg.encode()).field(path)
+    except (KeyError, ValueError):
+        return False  # padding limits / an unsettable path -> unverified (degrades to free-text)
+    return read_back == SENTINEL
 
 
 def verified_paths() -> dict[str, dict[str, list[int] | list[str]]]:
     """Segment-keyed round-trip-verified paths for the picker's P3 badge — ``{seg: {"fields":[…],
     "components":["f.c",…]}}``. Verification is per-segment (independent of the enclosing structure), so a
-    path proven once is proven for every structure. **Build-time** by design: the ``backend()`` switch
-    flips a module-global read per-parse, so running this inside the async engine would corrupt concurrent
-    parses — here it runs single-threaded (~<1 s over the whole schema). MSH-1/MSH-2 (the encoding-character
+    path proven once is proven for every structure. **Build-time** by design: it runs single-threaded
+    (~<1 s over the whole schema) when the artifact is regenerated. MSH-1/MSH-2 (the encoding-character
     fields) are structurally excluded — they are never value targets."""
     from messagefoundry.hl7schema import hl7_schema
 

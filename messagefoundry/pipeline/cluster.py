@@ -61,10 +61,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import socket
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 from uuid import uuid4
@@ -217,26 +218,110 @@ def members_from_node_rows(
     ]
 
 
-def has_promotable_sibling(members: Iterable[ClusterMember], node_id: str) -> bool:
+def has_promotable_sibling(members: Sequence[ClusterMember], node_id: str) -> bool:
     """Whether some node other than ``node_id`` could take the lease if ``node_id`` stepped down.
 
     The check behind the stepdown's no-promotable-sibling refusal (BACKLOG #1509), and the value its
     ``new_leader_eligible`` reports. A member counts when it is another node, ``active`` (not a
-    clean-shutdown ``left`` tombstone), ``promotable`` (ADR 0096) and ``fresh``. No window is chosen
-    here: ``fresh`` is the rule :meth:`ClusterCoordinator.cluster_members` already applied.
+    clean-shutdown ``left`` tombstone), ``promotable`` (ADR 0096), ``fresh``, and has a finite
+    ``acquire_delay_seconds``. No window is chosen here: ``fresh`` is the rule
+    :meth:`ClusterCoordinator.cluster_members` already applied.
 
-    **A point-in-time read, not a promise.** A sibling that dies after the read still counted.
-    ``acquire_delay_seconds`` is not weighed, and does not need to be: the release zeroes the lease
-    expiry, which cancels the handicap against a released lease (see :func:`stepdown_pause_seconds`,
-    BACKLOG #1507)."""
-    return any(
-        m.node_id != node_id and m.status == "active" and m.promotable and m.fresh for m in members
+    **A point-in-time read, not a promise.** A sibling that dies after the read still counted. A
+    finite delay is not weighed here: a delayed sibling can still take the lease, only later. How
+    much later is what :func:`longest_promotable_sibling_delay` reads, from the same set of members,
+    so the stepdown pause can wait for it (BACKLOG #1986)."""
+    return any(True for _ in _promotable_siblings(members, node_id))
+
+
+def longest_promotable_sibling_delay(members: Sequence[ClusterMember], node_id: str) -> float:
+    """The largest ``acquire_delay_seconds`` among the siblings :func:`has_promotable_sibling`
+    counts, or ``0.0`` when there are none. The stepdown adds it to its claim pause
+    (:func:`stepdown_pause_seconds`, BACKLOG #1986).
+
+    Why the LONGEST and not the shortest. The release now stamps the lease expiry with the DB's own
+    time, so each sibling may claim only once its own delay has passed on the DB clock (ADR 0096,
+    AC-2). The drained node's reclaim goes through the renew arm, which has no delay term. So the
+    pause must outlast every delay that could still be waiting, or the drained node takes its own
+    lease back from a sibling that was one tick away. The shortest would do only while the preferred
+    sibling stays alive. Same point-in-time caveat as :func:`has_promotable_sibling`."""
+    return max(
+        (m.acquire_delay_seconds for m in _promotable_siblings(members, node_id)), default=0.0
+    )
+
+
+def _promotable_siblings(members: Sequence[ClusterMember], node_id: str) -> Iterator[ClusterMember]:
+    """The one predicate both functions above apply, so they cannot count different sets. Both take
+    a ``Sequence``, not an ``Iterable``: the endpoint calls them on one object in turn, and a one-shot
+    iterator would be part-consumed by the first.
+
+    A sibling with a non-finite delay is not counted. Its take-over predicate (expiry + delay < now)
+    can never hold, so it cannot take the lease, and counting its delay would make the stepdown pause
+    endless. The settings validator rejects only a negative delay. A huge finite delay has the same
+    effect and is not caught here; that is the validator's to bound."""
+    return (
+        m
+        for m in members
+        if m.node_id != node_id
+        and m.status == "active"
+        and m.promotable
+        and m.fresh
+        and math.isfinite(m.acquire_delay_seconds)
     )
 
 
 _DEMOTE_BUDGET_FRACTION = 0.5
 _DEMOTE_BUDGET_FLOOR = 1.0
 _DEMOTE_BUDGET_CEILING = 10.0
+
+#: The default bound on each write ``stop()`` sends: the lease release and the ``left`` tombstone
+#: (BACKLOG #1987). Shared by both coordinators for the reason :func:`stepdown_pause_seconds` is.
+#: Picked, not derived. ``Engine.stop()`` stops the coordinator last, after the graph teardown has
+#: spent its own share of NSSM's ``AppStopMethodConsole`` budget in
+#: ``scripts/service/install-service.ps1``, so this keeps the coordinator's share small. It does not
+#: and cannot guarantee that the whole shutdown fits that budget.
+#:
+#: **The bound is not the whole cost of a write that misses it.** An ``asyncio.timeout`` covers the
+#: acquire and the statement, and then the cancellation has to unwind through the driver:
+#:
+#: * Postgres: asyncpg's shielded pool release waits for the server to acknowledge the cancel, for as
+#:   long as the acquire's own timeout, and then terminates the connection. :func:`_execute_within`
+#:   passes the bound to that acquire, so a write costs at most twice the bound. Through a bare
+#:   ``pool.execute`` the acquire timeout is None and that wait has no limit.
+#: * SQL Server: the store quarantines the cancelled connection and may wait up to its
+#:   ``_DIRTY_CLOSE_TIMEOUT`` for the close. Its pool release after that is not bounded here.
+#:
+#: ``stop()`` skips the tombstone once the release spent its whole bound, so a hung pool pays that
+#: cost once. A write that misses the bound costs nothing the shutdown did not already accept: the
+#: lease row ages out at its TTL, which is what a failed release always meant. The bound applies to a
+#: healthy leader's release too, so a release slower than the bound now falls back to that TTL, where
+#: it used to hold the shutdown open until it committed.
+STOP_WRITE_TIMEOUT_SECONDS = 2.0
+
+
+async def _execute_within(pool: Any, timeout: float, sql: str, *args: Any) -> Any:
+    """Run one asyncpg write with a hard bound on the whole call, the driver's unwind included.
+
+    Why not ``asyncio.timeout(t)`` around ``pool.execute``: that ``execute`` acquires with no
+    timeout, and asyncpg 0.31.0's pool release, which is shielded from the cancel, waits for a
+    cancelled statement's server acknowledgement for as long as that acquire timeout. None means no
+    limit at all. Passing ``timeout`` to ``acquire`` gives the release the same budget, after which
+    asyncpg terminates the connection. So this costs at most twice ``timeout``.
+
+    A failure AFTER the statement returned is the connection's return to the pool failing, so the
+    write has committed and its status is returned rather than lost. Reporting that write as failed
+    would leave a release owed that is not, and send the next reader looking for a hang."""
+    status: Any = None
+    try:
+        async with asyncio.timeout(timeout), pool.acquire(timeout=timeout) as con:
+            status = await con.execute(sql, *args)
+    except Exception as exc:
+        if status is None:
+            raise
+        log.debug(
+            "cluster: a bounded write committed, then its pool release failed: %s", safe_exc(exc)
+        )
+    return status
 
 
 class StepdownOutcome(NamedTuple):
@@ -383,27 +468,34 @@ def fence_tick_seconds(fence_timeout_seconds: float) -> float:
     return max(0.05, min(1.0, fence_timeout_seconds / 5.0))
 
 
-def stepdown_pause_seconds(heartbeat_seconds: float) -> float:
+def stepdown_pause_seconds(
+    heartbeat_seconds: float, sibling_acquire_delay_seconds: float = 0.0
+) -> float:
     """How long a node declines to claim after a VOLUNTARY stepdown (ADR 0056 slice 1).
 
     Module-level, and shared by both coordinators, for the reason :func:`fence_tick_seconds` is: it is
     pure arithmetic on a constructor argument with no backend in it, and a per-class copy is a
     safety-relevant timing constant that two files can retune independently with nothing failing.
 
-    Two heartbeats, and read that as a floor rather than a guarantee. A sibling's acquire runs once per
-    ``heartbeat_seconds`` at an unrelated phase, so a full interval can elapse before it even looks at
-    the expired lease and a second gives it one whole interval in which to look.
+    Two heartbeats past the longest promotable sibling's ADR 0096 ``acquire_delay_seconds``, and read
+    that as a floor rather than a guarantee. A sibling's acquire runs once per ``heartbeat_seconds`` at
+    an unrelated phase, so a full interval can elapse before it even looks at the expired lease and a
+    second gives it one whole interval in which to look.
 
-    **A sibling's ADR 0096 ``acquire_delay_seconds`` does not lengthen that wait, so this function
-    does not need to read it (BACKLOG #1507).** The release writes ``lease_expires_at = 0``, the
-    epoch, not "now". The take-over predicate adds the delay to that stored expiry, so it asks whether
-    ``0 + delay`` is before the DB clock, an epoch count in the billions. That holds for any delay a
-    setting could carry, so a handicapped sibling takes a RELEASED lease on its first tick, exactly as
-    an unhandicapped one does. The handicap still weighs against a lease that expired on its own,
-    which is the case it exists for. Two limits remain, and neither is the handicap. The pause is
-    measured in THIS node's heartbeat, so a sibling configured with a longer one can miss the window.
-    And if the release write did not commit, the row keeps its real expiry and the handicap applies;
-    that path answers ``503 release-unconfirmed``, not ``200``.
+    **The delay term is what keeps leader preference from reopening BACKLOG #1507 (BACKLOG #1986).**
+    The release writes the DB clock's current time as the lease expiry, so a planned handover honours
+    preference the way a crash failover does: each sibling may take the lease only once its own delay
+    has passed on the DB clock. The drained node's reclaim goes through the renew arm, which carries no
+    delay term. So without this term a drained node whose siblings are all delayed past two heartbeats
+    takes its own lease back when the pause ends, which is the defect #1507 described. The caller
+    passes :func:`longest_promotable_sibling_delay`; the default ``0.0`` is the no-sibling case, where
+    only the two heartbeats apply. A negative or non-finite value counts as zero, so it can neither
+    shorten the pause below two heartbeats nor make it endless. The pause can end early; the pause
+    lift in :meth:`DbCoordinator._claim_or_renew_lease` says when.
+
+    Two limits remain. The pause is measured in THIS node's heartbeat and monotonic clock, so a
+    sibling configured with a longer heartbeat can miss the window. And the sibling delays are the
+    ones the membership read saw, so a sibling that joins afterwards is not waited for.
 
     **This pause covers the ticks that come AFTER the release. It does not order the release against a
     tick already in flight** — :attr:`DbCoordinator._leadership_lock` does that, and the two are not
@@ -413,7 +505,8 @@ def stepdown_pause_seconds(heartbeat_seconds: float) -> float:
     Deliberately short rather than lease-length: the cost of the pause is that a cluster with no other
     promotable node is leaderless for it, which is the operator's own request but should not linger.
     """
-    return 2.0 * heartbeat_seconds
+    delay = sibling_acquire_delay_seconds if math.isfinite(sibling_acquire_delay_seconds) else 0.0
+    return 2.0 * heartbeat_seconds + max(0.0, delay)
 
 
 def demote_stop_budget(
@@ -567,10 +660,18 @@ class ClusterCoordinator(Protocol):
         leader with no lease/expiry."""
         ...
 
-    async def step_down_leadership(self) -> StepdownOutcome:
+    async def step_down_leadership(
+        self, *, sibling_acquire_delay_seconds: float = 0.0
+    ) -> StepdownOutcome:
         """Voluntarily release this node's leadership lease and **keep running** as a standby — the
         planned-failover / maintenance-drain control plane behind ``POST /cluster/stepdown``
         (ADR 0056, slice 1).
+
+        ``sibling_acquire_delay_seconds`` lengthens this node's claim pause so every promotable
+        sibling's ADR 0096 delay can run out before this node may reclaim (BACKLOG #1986). The
+        endpoint passes :func:`longest_promotable_sibling_delay` over the membership read it has
+        already taken. The default ``0.0`` gives the bare two-heartbeat pause, which is right only
+        when no delayed sibling exists; see :func:`stepdown_pause_seconds`.
 
         Returns a :class:`StepdownOutcome` ``(was_leader, released_at, lease_released)``: whether this
         node held the in-memory leadership gate at the moment the release ran, the epoch-seconds instant
@@ -708,7 +809,9 @@ class NullCoordinator:
         # expiry so /cluster/nodes is byte-identical in shape to a real cluster's.
         return (self.node_id, None)
 
-    async def step_down_leadership(self) -> StepdownOutcome:
+    async def step_down_leadership(
+        self, *, sibling_acquire_delay_seconds: float = 0.0
+    ) -> StepdownOutcome:
         # Single-node: there is no lease to release and no standby to promote, so this releases
         # nothing and reports so. Unreachable through the API — POST /cluster/stepdown refuses a
         # single-node caller with 400 before it touches the coordinator (ADR 0056) — but a truthful
@@ -782,6 +885,7 @@ class DbCoordinator:
         monotonic: Callable[[], float] = time.monotonic,
         alert_sink: AlertSink | None = None,
         run_schema_ddl: bool = True,
+        stop_write_timeout_seconds: float = STOP_WRITE_TIMEOUT_SECONDS,
     ) -> None:
         self._pool = pool
         self.node_id = node_id
@@ -836,7 +940,8 @@ class DbCoordinator:
         self._promotable = promotable
         # ADR 0056 slice 1: monotonic instant before which this node declines to claim or renew, set by
         # step_down_leadership() so a voluntarily-drained node does not immediately re-arm itself via the
-        # renew branch. 0.0 = no pause, which is every path but a stepdown.
+        # renew branch. 0.0 = no pause. Only a stepdown sets it, and only _claim_or_renew_lease clears
+        # it early, once the row names another node (BACKLOG #1986).
         self._no_claim_until: float = 0.0
         # ADR 0056 slice 1: a lease-expiring write did not return, so this node may still own a live
         # lease row it has already stopped claiming in memory. _release_leadership ARMS it before the
@@ -859,6 +964,9 @@ class DbCoordinator:
         # DB hang, and it only ever demotes), and stop() releases without it so a shutdown is never
         # blocked behind an in-flight stepdown waiting on a hung pool.
         self._leadership_lock = asyncio.Lock()
+        # BACKLOG #1987: the bound on each of stop()'s two writes; STOP_WRITE_TIMEOUT_SECONDS says what
+        # a write that misses it still costs.
+        self._stop_write_timeout = stop_write_timeout_seconds
         # Monotonic clock for the fence (injectable for deterministic tests). Distinct from the DB clock
         # the lease uses: the fence measures a node-local elapsed duration (free of INTER-NODE skew —
         # that is the property being bought), the lease compares against the DB's own clock_timestamp().
@@ -921,7 +1029,8 @@ class DbCoordinator:
         """Release leadership, cancel both background tasks, and mark this node left. Idempotent and
         safe even if :meth:`start` raised before the tasks existed (then there's nothing to tear down).
         Ordered so the tasks are stopped BEFORE the lease is released, so a still-running tick can't
-        re-acquire after we release."""
+        re-acquire after we release. The tombstone is skipped when the release spent its whole bound
+        (BACKLOG #1987), so a stopped node's row can then read ``active`` until it goes stale."""
         self._stop.set()
         tasks = [t for t in (self._heartbeat_task, self._fence_task) if t is not None]
         self._heartbeat_task = None
@@ -932,8 +1041,14 @@ class DbCoordinator:
             # Absorb the cancellation (and any error a loop stored) so stop() never raises.
             await asyncio.gather(*tasks, return_exceptions=True)
         # Drop leadership: demote the cached gate FIRST so any concurrent is_leader() reader sees "not
-        # leader" the instant we begin releasing, then expire the lease row so a standby can take over
-        # immediately on a clean shutdown (best-effort — a failed release just lets the lease age out).
+        # leader" the instant we begin releasing, then expire the lease row so a standby need not wait
+        # out the TTL on a clean shutdown (best-effort — a failed release just lets the lease age out).
+        # The release stamps the DB clock's now, so each standby still waits its own acquire_delay and
+        # a preferred one wins (BACKLOG #1986). Nothing more is needed here: a stopped node cannot
+        # reclaim through the undelayed renew arm, because its maintenance task is gone. A restart
+        # normally gets a new node_id (host:pid:random), so it waits like any sibling. Only a pinned
+        # [cluster].node_id lets a restart inside that window renew the row that still names it, and
+        # that is no two-leader risk: the renew arm matches only because no other node took the row.
         # Deliberately NOT under _leadership_lock. The gather above retired the maintenance loop, but
         # NOT step_down_leadership(), which runs from an API handler this method never sees — so a
         # shutdown concurrent with a stepdown is genuinely unserialized here. That is the trade taken
@@ -942,7 +1057,33 @@ class DbCoordinator:
         # _is_leader False and issues the same owner-scoped expiring UPDATE, which is idempotent), so
         # no interleaving of the two can leave this node reporting leader. The maintenance tick was the
         # dangerous competitor precisely because it can promote.
-        await self._release_leadership()
+        #
+        # BACKLOG #1987: the release is FORCED, so a node sends it whatever its gate reads. A
+        # self-fenced node is the case the item names: the fence clears the gate on this node's clock
+        # while the row stays live on the DB clock, so a release gated on the gate sent nothing and a
+        # standby waited out the TTL. Forced unconditionally rather than on may_own_lease_row(),
+        # because the gather above can cancel a claim the server had already committed, before the
+        # tick recorded it, and nothing in memory can see that. The write is owner-scoped, so on a
+        # node that owns no row it matches nothing. The forced write was once tried here and reverted
+        # because it had no per-call bound, and a self-fenced node's pool is the one most likely to
+        # hang. The bound is the fix; what a write that misses it still costs is on
+        # STOP_WRITE_TIMEOUT_SECONDS. It bounds these two writes only: the gather above waits on a
+        # cancelled heartbeat task with no bound of its own.
+        started = time.monotonic()
+        _, _, wrote, _ = await self._release_leadership(
+            force_write=True, timeout=self._stop_write_timeout
+        )
+        if not wrote and time.monotonic() - started >= self._stop_write_timeout:
+            # The release spent its whole bound, so the pool is not answering. The tombstone would
+            # spend another on the same pool for a row the freshness filter in cluster_members()
+            # already handles. A release that failed FAST says nothing about the pool, so the
+            # tombstone still goes out then.
+            log.warning(
+                "cluster: node %s not marked left: the lease release did not return within %.1fs",
+                self.node_id,
+                self._stop_write_timeout,
+            )
+            return
         # Mark the row left rather than DELETE it: keeping a 'left' tombstone gives an operator a
         # visible "this node shut down cleanly" signal (vs a crashed node whose row goes stale), which
         # Step 4's election/diagnostics will distinguish. The row is re-activated by the next start().
@@ -950,7 +1091,10 @@ class DbCoordinator:
             # Also clear is_leader so a clean shutdown immediately stops reporting this node as leader
             # (Step 7). A hard crash skips this UPDATE and leaves the flag stale — the freshness filter in
             # cluster_members() handles that case by AND-ing the flag with a live last_seen.
-            await self._pool.execute(
+            # Bounded for the same reason as the release (#1987).
+            await _execute_within(
+                self._pool,
+                self._stop_write_timeout,
                 "UPDATE nodes SET status=$1, last_seen=$2, is_leader=FALSE WHERE node_id=$3",
                 "left",
                 time.time(),
@@ -1292,8 +1436,28 @@ class DbCoordinator:
         if self._monotonic() < self._no_claim_until:
             # JUST STEPPED DOWN (ADR 0056 slice 1): decline for a bounded window so a sibling wins the
             # expired lease instead of us renewing it straight back. Same shape as the check above —
-            # touch no DB row, report not-held — and strictly stricter than the base predicate, so it
+            # write no DB row, report not-held — and strictly stricter than the base predicate, so it
             # can only delay a claim, never advance one.
+            #
+            # THE PAUSE LIFT (BACKLOG #1986), the one place it is described. The pause guards one arm:
+            # the undelayed `owner = me` renew of the row this node released. Once a read shows the row
+            # naming another node, that arm cannot match, so the pause is lifted. Without the lift, a
+            # pause that includes the longest sibling delay would also bar this node from taking over
+            # a successor that crashed inside it. After the lift only the ordinary predicate runs,
+            # under this node's own delay; only this node's own claim could make the row name it again.
+            #
+            # A missing row keeps the pause: the INSERT arm has no delay term, so lifting there would
+            # let this node jump every delayed sibling. The lift tick sends no claim either. That keeps
+            # each paused tick to one round trip under the lock, and the next tick's fence baseline
+            # is taken before its own claim, as _maintain_leadership expects. The cost is up to one
+            # heartbeat before this node may take over a crashed successor.
+            row = await self._pool.fetchrow(
+                "SELECT owner FROM leader_lease WHERE lease_key = $1",
+                self._lease_key,
+                timeout=self._renew_timeout,
+            )
+            if row is not None and row["owner"] != self.node_id:
+                self._no_claim_until = 0.0
             return False
         row = await self._pool.fetchrow(
             "INSERT INTO leader_lease (lease_key, owner, lease_expires_at, leader_epoch) "
@@ -1378,7 +1542,9 @@ class DbCoordinator:
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
 
-    async def step_down_leadership(self) -> StepdownOutcome:
+    async def step_down_leadership(
+        self, *, sibling_acquire_delay_seconds: float = 0.0
+    ) -> StepdownOutcome:
         """Release leadership and stay up as a standby (ADR 0056 slice 1). See the Protocol method.
 
         It calls the same :meth:`_release_leadership` ``stop()`` does, but **the ordering inside that
@@ -1397,8 +1563,9 @@ class DbCoordinator:
           ``_graph_reconcile_interval`` poll (ADR 0157 Inc 5). Every other True->False transition
           (``_maintain_leadership``, ``_check_fence``) fires it; a stepdown the node SURVIVES would
           otherwise be the one demotion the engine learns about late.
-        * **Pause our own claim** for :func:`stepdown_pause_seconds`. Without it the stepdown is a
-          coin flip: :meth:`_release_leadership` expires ``lease_expires_at`` but leaves ``owner``
+        * **Pause our own claim** for :func:`stepdown_pause_seconds`, which since BACKLOG #1986
+          includes ``sibling_acquire_delay_seconds`` so a delayed sibling's handicap can run out
+          first. Without the pause the stepdown is a coin flip: :meth:`_release_leadership` expires ``lease_expires_at`` but leaves ``owner``
           naming us, so the renew branch (``owner = me``, which carries no expiry test) matches on our
           very next maintenance tick and hands leadership straight back — a drained node re-arming
           itself while the endpoint reported 200. The pause is a strictly STRICTER claim predicate on
@@ -1447,6 +1614,7 @@ class DbCoordinator:
         :meth:`may_own_lease_row`, and the pause and the demotion edge follow the row as well as the
         gate. A node that has seen a sibling take its lease sends nothing and answers ``409``.
         """
+        pause = stepdown_pause_seconds(self._heartbeat_seconds, sibling_acquire_delay_seconds)
         await acquire_leadership_lock(self._leadership_lock, self._fence_timeout, self.node_id)
         try:
             # Arm the claim pause BEFORE the release's await, not after it. Cancelling the request task
@@ -1469,9 +1637,7 @@ class DbCoordinator:
                 # The retry needs this as much as the first call does: the release expires
                 # `lease_expires_at` but leaves `owner` naming us, so a successful retry with no pause
                 # re-arms this node through the unfenced `owner = me` branch on its very next tick.
-                self._no_claim_until = self._monotonic() + stepdown_pause_seconds(
-                    self._heartbeat_seconds
-                )
+                self._no_claim_until = self._monotonic() + pause
             was_leader, released_at, wrote, lease_released = await self._release_leadership(
                 force_write=arming
             )
@@ -1488,8 +1654,8 @@ class DbCoordinator:
                 # acquire() carries no timeout and `[store].command_timeout` (30s by default) is the
                 # only ceiling on the statement, already longer than the 20s pause at the shipped
                 # heartbeat. The window that matters starts when the row becomes takeable, which is the
-                # commit, not the call: measuring from before it would hand a sibling (2 * heartbeat -
-                # write duration), which can reach zero, and the drained node's own queued tick — which
+                # commit, not the call: measuring from before it would hand a sibling (the pause - write
+                # duration), which can reach zero, and the drained node's own queued tick — which
                 # waits on this lock for the whole call — would then fall straight through the pause
                 # gate and renew itself back in through the unfenced `owner = me` branch, milliseconds
                 # after the endpoint answered 200.
@@ -1497,10 +1663,7 @@ class DbCoordinator:
                 # max(), not a replacement: the pause may only ever move LATER. A real monotonic clock
                 # makes the second value the larger one by construction, but an injected or coarse
                 # clock must not be able to SHORTEN a pause this call already promised.
-                self._no_claim_until = max(
-                    self._no_claim_until,
-                    self._monotonic() + stepdown_pause_seconds(self._heartbeat_seconds),
-                )
+                self._no_claim_until = max(self._no_claim_until, self._monotonic() + pause)
             # A row release counts as a demotion edge too (BACKLOG #1508). In the self-fence window
             # the watchdog already fired it; firing again only re-sets the engine's wake event.
             if outcome.drained:
@@ -1533,10 +1696,11 @@ class DbCoordinator:
         return self._is_leader or self._lease_release_owed or self._last_renew_ok is not None
 
     async def _release_leadership(
-        self, *, force_write: bool = False
+        self, *, force_write: bool = False, timeout: float | None = None
     ) -> tuple[bool, float | None, bool, bool]:
         """Clean release: demote the cached gate first (so a concurrent is_leader() reader never sees a
-        stale True), then expire our lease row so a standby can acquire immediately. Safe to call when
+        stale True), then expire our lease row at the DB clock's now, so a standby need not wait out
+        the TTL and still waits its own ``acquire_delay_seconds`` (BACKLOG #1986). Safe to call when
         never elected (the UPDATE simply matches no owned row).
 
         Returns ``(was_leader, released_at, wrote, lease_released)`` — whether this node held
@@ -1560,10 +1724,15 @@ class DbCoordinator:
         count at all — see :class:`StepdownReleaseUnconfirmed`.
 
         ``force_write`` sends the ``UPDATE`` even when this node's in-memory gate already reads False.
-        Only :meth:`step_down_leadership` passes it, on :meth:`may_own_lease_row`. :meth:`stop` never
-        does: it is best-effort by design, and a self-fenced node's pool is the one most likely to
-        hang a shutdown on a write with no per-call bound. So a self-fenced node that is STOPPED still
-        leaves its row to age out; that gap is outside BACKLOG #1508, which is the stepdown."""
+        :meth:`step_down_leadership` passes it on :meth:`may_own_lease_row` (BACKLOG #1508), and
+        :meth:`stop` passes it always (BACKLOG #1987), so a self-fenced node releases its row on both.
+
+        ``timeout`` bounds the write through :func:`_execute_within`. Only :meth:`stop` passes it. A
+        self-fenced node's pool is the one most likely to hang, and a stop must not wait on it; a
+        write that misses the bound is a failed write (``wrote=False``, the release still owed) and
+        the row ages out at its TTL. **A stepdown passes none, so its write is still unbounded.** Its
+        request deadline is an ``asyncio.timeout`` around the handler, which does not bound an asyncpg
+        write for the reason :func:`_execute_within` gives; that gap is outside BACKLOG #1987."""
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
@@ -1589,13 +1758,27 @@ class DbCoordinator:
         # step_down_leadership's own docstring documents as unbounded.
         self._lease_release_owed = True
         try:
-            # Expire the lease (set it to the epoch) only if we still own it, so a standby's next
-            # acquire tick takes over at once instead of waiting out the full TTL.
-            status = await self._pool.execute(
-                "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = $1 AND owner = $2",
-                self._lease_key,
-                self.node_id,
+            # Expire the lease only if we still own it, so a standby need not wait out the full TTL.
+            # The expiry is the DB clock's NOW, not the epoch (BACKLOG #1986): the take-over
+            # predicate adds each sibling's acquire_delay to it, so a preferred (delay 0) sibling
+            # takes over on its next tick and a delayed one waits its delay, as ADR 0096 AC-2 asks
+            # of a crash failover. clock_timestamp(), not now(), because the predicate reads
+            # clock_timestamp(): now() is the transaction start, which would be a different clock.
+            # LEAST, so a release only ever moves the expiry EARLIER: a self-fenced node's row may
+            # already have aged out, and stamping it with now would restart every sibling's delay.
+            # A bounded write raises TimeoutError at its bound, which the arm below catches like any
+            # other failure.
+            release_sql = (
+                "UPDATE leader_lease SET lease_expires_at = "
+                "LEAST(lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())) "
+                "WHERE lease_key = $1 AND owner = $2"
             )
+            if timeout is None:
+                status = await self._pool.execute(release_sql, self._lease_key, self.node_id)
+            else:
+                status = await _execute_within(
+                    self._pool, timeout, release_sql, self._lease_key, self.node_id
+                )
         except Exception as exc:  # the pool may already be closing on shutdown — log, don't raise
             log.warning(
                 "cluster: node %s failed to release the leadership lease (it will expire on its "

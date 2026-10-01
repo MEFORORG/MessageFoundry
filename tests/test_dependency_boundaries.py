@@ -1145,7 +1145,6 @@ _PARSING_MAY_REACH = (
     "messagefoundry.parsing",
     "messagefoundry.content_type",
     "messagefoundry.controlchars",
-    "messagefoundry.phi_log_silencer",
     # `parsing/fhir` takes `json_loads_or_refusal` from here (BACKLOG #2048). Stdlib-only, and the
     # static walk below holds it to that.
     "messagefoundry.redaction",

@@ -34,7 +34,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import hl7
 import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes
@@ -43,7 +42,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
 
-import messagefoundry.parsing._backend as _hl7_backend
+import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.api import app as api_app
 from messagefoundry.api.models import ChannelInfo
 from messagefoundry.apiclient.client import ApiError, _decode
@@ -166,7 +165,7 @@ def test_an_undecodable_body_keeps_no_body_on_the_chain() -> None:
 def test_a_parse_refusal_keeps_what_the_parser_quoted_off_the_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """python-hl7's own error sits under ``HL7PeekError``, and it can quote the body it failed on."""
+    """A parser's own error can sit under ``HL7PeekError`` and quote the body it failed on."""
 
     class _Refusing:
         @staticmethod
@@ -665,40 +664,39 @@ def test_raw_message_json_still_parses() -> None:
 #
 # One rule (BACKLOG #2085): an HL7PeekError's text is content-free by construction, and every listener
 # renders it through the same redaction for the stored reason and the AR text. Peek.parse used to
-# interpolate python-hl7's error, whose text is not vetted. The guards before hl7.parse make its known
-# quoting shapes unreachable, so the stand-in below is a SYNTHETIC unvetted error, not a measured
-# python-hl7 shape: it raises the text python-hl7's batch parser uses, over the planted segment.
+# interpolate python-hl7's error, whose text is not vetted. python-hl7 is retired; the refusal that
+# replaced its fallback is a fault inside the built-in parse, whose text is not vetted either. The
+# stand-in below is a SYNTHETIC fault that quotes the planted segment, the worst case for a refusal.
 
 _SEGMENT = f"PID|1||{_PLANTED}^^^MRN||DOE^JANE"
 
 
-def _python_hl7_quoting_the_body(text: str) -> object:
-    raise hl7.ParseException(f"Segment received before message header {_SEGMENT}")
+def _parser_fault_quoting_the_body(text: str) -> object:
+    raise RuntimeError(f"Segment received before message header {_SEGMENT}")
 
 
 @pytest.fixture
-def python_hl7_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Route Peek.parse down its python-hl7 arm, which then refuses while quoting the body."""
-    monkeypatch.setattr(_hl7_backend, "USE_BUILTIN", False)
-    monkeypatch.setattr(hl7, "parse", _python_hl7_quoting_the_body)  # peek reads hl7.parse per call
+def parser_faults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the built-in parse fault while quoting the body."""
+    monkeypatch.setattr(_builtin_hl7, "parse", _parser_fault_quoting_the_body)
 
 
 def test_the_stand_in_quotes_the_body() -> None:
     """Control: the stand-in's own text does hold the planted value, so a clean reading is clean."""
-    with pytest.raises(hl7.ParseException) as caught:
-        _python_hl7_quoting_the_body(_ADT)
+    with pytest.raises(RuntimeError) as caught:
+        _parser_fault_quoting_the_body(_ADT)
     assert _PLANTED in str(caught.value)
 
 
-@pytest.mark.usefixtures("python_hl7_refuses")
-def test_a_python_hl7_refusal_names_only_the_parser_class() -> None:
+@pytest.mark.usefixtures("parser_faults")
+def test_a_parser_fault_refusal_names_only_the_error_class() -> None:
     with pytest.raises(HL7PeekError) as caught:
         Peek.parse(_ADT)
-    assert str(caught.value) == "could not parse HL7 message (ParseException)"
+    assert str(caught.value) == "could not parse HL7 message (RuntimeError)"
     _assert_bare(caught.value)
 
 
-@pytest.mark.usefixtures("python_hl7_refuses")
+@pytest.mark.usefixtures("parser_faults")
 async def test_the_mllp_ar_ack_and_reason_carry_no_body(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "engine.db")
     try:
@@ -709,20 +707,20 @@ async def test_the_mllp_ar_ack_and_reason_carry_no_body(tmp_path: Path) -> None:
     finally:
         await store.close()
     assert ack is not None and "MSA|AR" in ack
-    assert "MSA|AR||could not parse HL7 message (ParseException)" in ack  # no class prefix
+    assert "MSA|AR||could not parse HL7 message (RuntimeError)" in ack  # no class prefix
     [row] = rows
     assert row["status"] == MessageStatus.ERROR.value
-    assert row["error"] == "parse error: HL7PeekError: could not parse HL7 message (ParseException)"
+    assert row["error"] == "parse error: HL7PeekError: could not parse HL7 message (RuntimeError)"
     # The ACK echoes the sender's own MSH, never the PID the refusal is about.
     assert _PLANTED not in ack and _PLANTED not in row["error"]
 
 
-@pytest.mark.usefixtures("python_hl7_refuses")
+@pytest.mark.usefixtures("parser_faults")
 def test_the_resubmission_reason_carries_no_body() -> None:
     with pytest.raises(IngressGuardError) as caught:
         admit_resubmitted_body(_ADT, _inbound())
     assert caught.value.reason == (
-        "parse error: HL7PeekError: could not parse HL7 message (ParseException)"
+        "parse error: HL7PeekError: could not parse HL7 message (RuntimeError)"
     )
     _assert_bare(caught.value)
 

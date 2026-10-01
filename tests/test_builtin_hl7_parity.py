@@ -1,227 +1,51 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Byte-PARITY suite for the built-ins HL7 parser (ADR 0054).
+"""Byte-PARITY suite for the built-in HL7 parser (ADR 0054), against a frozen python-hl7 oracle.
 
-This is the parity guarantee that makes ``_builtin_hl7`` a safe drop-in for ``python-hl7`` on the
-tolerant peek tier. For a broad corpus (every ``samples/messages/**/*.hl7`` plus synthetic ADT/ORU/ORM
-output from :mod:`messagefoundry.generators`) it asserts the **built-ins backend** and the
-**python-hl7 backend** return *byte-identical* results for:
+The built-in parser replaced python-hl7 as a behaviour-identical drop-in. This suite used to run both
+backends side by side. python-hl7 has since been retired, so its answers were recorded once, over the
+same corpus, into ``tests/golden/python_hl7_oracle.json``. The suite now holds the built-in parser to
+that record. The corpus covers every ``samples/messages/**/*.hl7`` message, synthetic ADT/ORU/ORM from
+:mod:`messagefoundry.generators`, and hand-built adversarial messages. For each it checks:
 
 * every :class:`~messagefoundry.parsing.peek.Peek` routing property + ``routing()`` + ``segments()``;
-* :meth:`Peek.field` over a generated set of field paths (whole-field, component, subcomponent,
-  out-of-range, MSH-1/MSH-2, repetition fields);
-* :class:`~messagefoundry.parsing.message.Message` read → mutate
-  (``set`` / ``add_repetition`` / ``add_segment`` / ``delete_segments`` / group ops) → ``encode()``
-  round-trips.
+* :meth:`Peek.field` and :meth:`Message.field` over a fixed battery of paths (whole-field, component,
+  subcomponent, out-of-range, MSH-1/MSH-2, repetition fields);
+* :meth:`Message.repetitions`, a plain ``encode()``, and ``encode()`` after each named mutation.
 
-The two backends are toggled with :func:`messagefoundry.parsing._backend.backend` (read per-parse, so a
-single process drives both). The suite **measures** parity — it does **not** fix the parser; a divergence
-is reported as a failure carrying ``(input, accessor, expected-python-hl7, got-builtins)``.
+The record carries its own inputs, so a changed sample file or generator cannot silently re-aim it.
+Nothing can regenerate it, by design: the ADR 0054 amendment explains why and what that costs. A
+value ``{"raises": T}`` in the record means python-hl7 raised an exception of type ``T``; the built-in
+must raise the same type.
 
-It also carries the named AC-1..AC-7 tests from ADR 0054 (``test_builtin_parity_over_corpus``,
-``test_whole_field_vs_component_semantics``, ``test_tolerant_and_no_msh``, ``test_custom_encoding_chars``,
-``test_encode_roundtrip_parity``, ``test_strict_path_unchanged``, plus the AC-6 cp314t scaling stub).
+It also carries the named AC tests from ADR 0054 that do not need an oracle.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 from typing import Any
 
-import hl7
 import pytest
 
-import messagefoundry.parsing._backend as _backend
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.generators import _core, all_types  # noqa: F401 — registers the generators
 from messagefoundry.parsing import HL7PeekError, normalize, validate
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SAMPLES = REPO_ROOT / "samples" / "messages"
-
+ORACLE = Path(__file__).resolve().parent / "golden" / "python_hl7_oracle.json"
 
 # ---------------------------------------------------------------------------
-# Backend toggling
+# The battery the oracle was recorded over. The record also stores these lists, and
+# test_battery_matches_the_record pins the two together, so a path added here without an oracle
+# answer fails loudly instead of being skipped.
 # ---------------------------------------------------------------------------
 
-
-def _under_backend(builtin: bool, fn: Callable[[], Any]) -> Any:
-    """Run ``fn`` with the parser backend forced to built-ins (``True``) or python-hl7 (``False``)."""
-    with _backend.backend(builtin=builtin):
-        return fn()
-
-
-def _both(fn: Callable[[], Any]) -> tuple[Any, Any]:
-    """Run ``fn`` under each backend, capturing a raised exception as a value for comparison.
-
-    Returns ``(python_hl7_result, builtins_result)``; an exception is returned (not raised) so the
-    caller can assert both backends agree on *raising* (same type) as well as on values. The result
-    is typed ``Any``; the call sites build their thunks via the ``_peek_field``/``_msg_field``/… closure
-    factories (rather than default-arg lambdas) so mypy can type them.
-    """
-
-    def _capture(builtin: bool) -> Any:
-        try:
-            return _under_backend(builtin, fn)
-        except Exception as exc:  # noqa: BLE001 — parity over the raise path too
-            return exc
-
-    return _capture(False), _capture(True)
-
-
-def _eq(expected: Any, got: Any) -> bool:
-    """Parity equality: values compare ``==``; exceptions compare by **type** (message text differs)."""
-    if isinstance(expected, Exception) or isinstance(got, Exception):
-        return type(expected) is type(got)
-    return bool(expected == got)
-
-
-def _peek_field(msg: str, path: str) -> Callable[[], Any]:
-    """A no-arg thunk reading ``Peek.parse(msg).field(path)`` — avoids default-arg lambdas (mypy)."""
-    return lambda: Peek.parse(msg).field(path)
-
-
-def _msg_field(msg: str, path: str) -> Callable[[], Any]:
-    return lambda: Message.parse(msg).field(path)
-
-
-def _msg_reps(msg: str, path: str) -> Callable[[], Any]:
-    return lambda: Message.parse(msg).repetitions(path)
-
-
-def _peek_prop(msg: str, prop: str) -> Callable[[], Any]:
-    return lambda: getattr(Peek.parse(msg), prop)
-
-
-# ---------------------------------------------------------------------------
-# Corpus
-# ---------------------------------------------------------------------------
-
-
-def _split_messages(raw: str) -> list[str]:
-    """Split a (possibly batch) HL7 file into individual ``\\r``-delimited messages on MSH boundaries."""
-    norm = normalize(raw)
-    lines = norm.split("\r")
-    messages: list[str] = []
-    current: list[str] = []
-    for line in lines:
-        if line.startswith("MSH") and current:
-            messages.append("\r".join(current) + "\r")
-            current = [line]
-        else:
-            current.append(line)
-    tail = [ln for ln in current if ln.strip()]
-    if tail:
-        messages.append("\r".join(tail) + "\r")
-    return [m for m in messages if m.strip()]
-
-
-def _sample_corpus() -> list[tuple[str, str]]:
-    """``(label, message)`` for every individual message under ``samples/messages/**/*.hl7``.
-
-    Batch files (multiple MSH) are split into their constituent messages so each parity unit is one
-    message; the whole-file form is also kept (label ``…[file]``) to exercise the multi-MSH parse.
-    """
-    out: list[tuple[str, str]] = []
-    for path in sorted(SAMPLES.rglob("*.hl7")):
-        raw = path.read_text(encoding="utf-8")
-        rel = path.relative_to(REPO_ROOT).as_posix()
-        parts = _split_messages(raw)
-        if len(parts) > 1:
-            out.append((f"{rel}[file]", normalize(raw)))
-            for i, msg in enumerate(parts, start=1):
-                out.append((f"{rel}[msg{i}]", msg))
-        elif parts:
-            out.append((rel, parts[0]))
-    return out
-
-
-# Synthetic generator coverage: ADT/ORU/ORM across several triggers — repetitions (PID-3 lists,
-# repeating OBX/IN1/DG1), components, subcomponents, escapes, empty fields, multi-segment groups.
-_SYNTH_PLAN: list[tuple[str, str, int]] = [
-    ("ADT", "A01", 1),  # full PID/PV1/NK1/AL1/DG1/IN1 — repetitions + components
-    ("ADT", "A01", 2),
-    ("ADT", "A02", 1),
-    ("ADT", "A03", 1),
-    ("ADT", "A04", 1),
-    ("ADT", "A08", 1),
-    ("ADT", "A40", 1),  # merge — extra PID block
-    ("ORU", "R01", 1),  # OBR/OBX observation groups
-    ("ORU", "R01", 2),
-    ("ORU", "R30", 1),
-    ("ORM", "O01", 1),  # ORC/OBR order groups
-    ("ORM", "O01", 2),
-]
-
-
-def _synthetic_corpus() -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for code, trigger, index in _SYNTH_PLAN:
-        if code not in _core.message_codes():
-            continue
-        if trigger not in _core.triggers_for(code):
-            continue
-        msg = _core.generate_message(code, trigger, index)
-        out.append((f"gen:{code}^{trigger}#{index}", normalize(msg)))
-    return out
-
-
-# Hand-built adversarial messages: escapes, custom encoding chars, empty fields/segments, missing CR.
-_ESCAPED = (
-    "MSH|^~\\&|APP|FAC|RCV|RFAC|20260101||ADT^A01^ADT_A01|C1|P|2.5.1\r"
-    "EVN|A01|20260101\r"
-    "PID|1||111^^^A~222^^^B||O\\S\\Brien^Se\\T\\an^\\F\\mid||19700101|M|||"
-    "1\\X0A\\Main^^City^ST^00000\r"
-    "PV1|1|I\r"
-)
-_CUSTOM_SEPS = (
-    "MSH#@$%^|APP#FAC#RCV#RFAC#20260101##ADT@A01#C2#P#2.5.1\r"
-    "PID#1##333@@@A||O$S$Brien@Sean#@#19800101#F\r"
-)
-_EMPTY_FIELDS = (
-    "MSH|^~\\&|||||20260101||ADT^A01|C3|P|2.5.1\r"
-    "EVN\r"
-    "PID|1||||||\r"
-    "\r"  # blank segment
-    "PV1|1\r"
-)
-# A line that STARTS with the field separator has id "" on the built-ins but is not an empty line, so
-# python-hl7's segments() scan reads it without raising. The built-ins used to raise on it anyway
-# (BACKLOG #1594); this entry pins the two backends together on Peek, Message and every mutation.
-_LEADING_FIELD_SEP = (
-    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|C5|P|2.5.1\r|stray\rPID|1||444^^^A||DOE^JO\rPV1|1|I\r"
-)
-_NO_TRAILING_CR = (
-    "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|C4|P|2.5.1\rOBR|1\rOBX|1|NM|GLU^Glucose^LN|1|99|mg/dL"
-)
-
-_ADVERSARIAL: list[tuple[str, str]] = [
-    ("adv:escapes", normalize(_ESCAPED)),
-    ("adv:custom-seps", normalize(_CUSTOM_SEPS)),
-    ("adv:empty-fields", normalize(_EMPTY_FIELDS)),
-    ("adv:leading-field-sep", normalize(_LEADING_FIELD_SEP)),
-    ("adv:no-trailing-cr", normalize(_NO_TRAILING_CR)),
-]
-
-
-def _corpus() -> list[tuple[str, str]]:
-    return _sample_corpus() + _synthetic_corpus() + _ADVERSARIAL
-
-
-CORPUS = _corpus()
-CORPUS_IDS = [label for label, _ in CORPUS]
-
-
-# ---------------------------------------------------------------------------
-# Field-path generation
-# ---------------------------------------------------------------------------
-
-# A fixed battery of paths that exercise whole-field / component / subcomponent / out-of-range /
-# MSH-offset / repetition access across the segment ids the corpus actually uses.
 _PROBE_PATHS: list[str] = [
     # MSH offset + routing
     "MSH-1",
@@ -310,84 +134,267 @@ _PROBE_PATHS: list[str] = [
     "ZZZ-1.1",
 ]
 
+REPETITION_PATHS: tuple[str, ...] = ("PID-3", "PID-3.1", "PID-5", "OBX-3", "IN1-3")
 
-# ---------------------------------------------------------------------------
-# AC-1 — Peek/field parity over the corpus
-# ---------------------------------------------------------------------------
+_PEEK_PROPERTIES: tuple[str, ...] = (
+    "message_code",
+    "trigger_event",
+    "message_structure",
+    "message_type",
+    "control_id",
+    "version",
+    "sending_app",
+    "sending_facility",
+    "receiving_app",
+    "receiving_facility",
+    "timestamp",
+)
+
+#: AC-4's non-standard encoding characters: field ``#``, component ``@``, repetition ``$``,
+#: subcomponent ``%``, escape ``^``.
+AC4_MESSAGE = normalize(
+    "MSH#@$%^#APP#FAC#RCV#RFAC#20260101##ADT@A01#C9#P#2.5.1\r"
+    "PID#1##333@@@A$444@@@B##O^S^Brien@Sean#@#19800101#F\r"
+)
+AC4_PATHS: tuple[str, ...] = (
+    "MSH-1",
+    "MSH-2",
+    "MSH-9",
+    "MSH-9.1",
+    "MSH-9.2",
+    "MSH-10",
+    "PID-3",
+    "PID-3.1",
+    "PID-5",
+    "PID-5.1",
+    "PID-5.2",
+    "PID-8",
+)
+
+#: Odd segment lines held in a parse tree, for the whole-field-set blank-segment case (BACKLOG #1594).
+BLANK_SEGMENT_LINES: tuple[tuple[str, str], ...] = (
+    ("empty-line", ""),
+    ("leading-field-sep", "|stray"),
+    ("space", " "),
+)
 
 
-def _peek_property_names() -> list[str]:
+def _ignore(_value: object) -> None:
+    return None
+
+
+def _group_ops(m: Message) -> None:
+    """Exercise SegmentGroup: append within the first OBR group, then rebuild its body."""
+    groups = m.groups("OBR")
+    if not groups:
+        return  # no order groups in this message: the op is a no-op, as it was for the oracle
+    g = groups[0]
+    g.append_segment("NTE|1|group-note")
+    g.rebuild(["OBX|1|NM|GLU^Glucose^LN|1|99|mg/dL", "NTE|1|rebuilt"])
+
+
+def _mutation_ops() -> list[tuple[str, Callable[[Message], None]]]:
+    """Named mutations applied to a fresh ``Message``; a missing target raises, and that is recorded."""
     return [
-        "message_code",
-        "trigger_event",
-        "message_structure",
-        "message_type",
-        "control_id",
-        "version",
-        "sending_app",
-        "sending_facility",
-        "receiving_app",
-        "receiving_facility",
-        "timestamp",
+        ("set-whole-field", lambda m: m.set("MSH-3", "NEWAPP")),
+        ("set-component", lambda m: m.set("PID-5.1", "O'Brien")),
+        ("set-component-escaping", lambda m: m.set("PID-5.1", "A^B&C|D")),
+        ("set-subcomponent", lambda m: m.set("PID-3.1.1", "XYZ")),
+        ("set-occurrence", lambda m: m.set("OBX-5", "EDITED", occurrence=1)),
+        ("set-msh10", lambda m: m.set("MSH-10", "NEWCTRL")),
+        ("add-repetition", lambda m: m.add_repetition("PID-3", "999^^^Z")),
+        ("add-segment-append", lambda m: m.add_segment("ZAL|1|extra^data")),
+        ("add-segment-index", lambda m: m.add_segment("NTE|1|note", index=1)),
+        ("delete-segments", lambda m: _ignore(m.delete_segments("OBX"))),
+        ("delete-evn", lambda m: _ignore(m.delete_segments("EVN"))),
+        ("group-ops", _group_ops),
     ]
 
 
-def _peek_divergences(label: str, msg: str) -> list[str]:
-    """Every (accessor, expected, got) divergence between the two backends for one message."""
+# ---------------------------------------------------------------------------
+# The oracle
+# ---------------------------------------------------------------------------
+
+
+@cache
+def _oracle() -> dict[str, Any]:
+    record: dict[str, Any] = json.loads(ORACLE.read_text(encoding="utf-8"))
+    return record
+
+
+def _cases() -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = _oracle()["cases"]
+    return cases
+
+
+def _got(fn: Callable[[], Any]) -> Any:
+    """``fn``'s result, with a raised exception reduced to the record's ``{"raises": type}`` shape."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 — the raise path is part of the contract
+        return {"raises": type(exc).__name__}
+
+
+#: Where the built-in parser deliberately answers differently from the frozen python-hl7 record,
+#: keyed by (case label, accessor) and mapped to (the record's answer, the answer now required).
+#: Upstream python-hl7 issue 84: its ``unescape`` dropped an escape no second escape character
+#: closed, so ``SMITH\`` read as ``SMITH``. The built-in parser keeps it as data (``_builtin_hl7.
+#: unescape``). The record is left as python-hl7 answered; each divergence is named here instead, and
+#: the old answer is checked too, so a regenerated or edited record cannot move under this table.
+DELIBERATE_DIVERGENCES: dict[tuple[str, str], tuple[Any, Any]] = {
+    ("adv:trailing-escape", f"{surface}.field({path!r})"): (old, new)
+    for surface in ("Peek", "Message")
+    for path, old, new in (
+        ("PID-5.1", "SMITH", "SMITH\\"),
+        ("PID-5.1.1", "SMITH", "SMITH\\"),
+        ("PID-5.2", "JO", "JO\\E"),
+    )
+}
+
+
+def _check(
+    failures: list[str], label: str, accessor: str, want: Any, fn: Callable[[], Any]
+) -> None:
+    divergence = DELIBERATE_DIVERGENCES.get((label, accessor))
+    if divergence is not None:
+        recorded, want = divergence
+        assert _oracle_has(label, accessor, recorded), f"[{label}] {accessor}: record moved"
+    got = _got(fn)
+    if got != want:
+        failures.append(f"[{label}] {accessor}: expected={want!r} builtins={got!r}")
+
+
+def _oracle_has(label: str, accessor: str, value: Any) -> bool:
+    """Whether the frozen record answers ``accessor`` on case ``label`` with ``value``."""
+    case = next(c for c in _cases() if c["label"] == label)
+    surface, _, rest = accessor.partition(".field(")
+    path = rest.rstrip(")").strip("'")
+    key = "peek_field" if surface == "Peek" else "message_field"
+    return bool(case[key][path] == value)
+
+
+def test_every_deliberate_divergence_is_exercised() -> None:
+    """A divergence entry that names no real case and accessor would silently excuse nothing."""
+    for label, accessor in DELIBERATE_DIVERGENCES:
+        recorded, _new = DELIBERATE_DIVERGENCES[(label, accessor)]
+        assert _oracle_has(label, accessor, recorded), (label, accessor)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("SMITH\\", "SMITH\\"),  # a lone trailing escape character is data (issue 84)
+        ("JO\\E", "JO\\E"),  # an unterminated run is kept whole
+        ("A\\.in5", "A\\.in5"),  # an unterminated counted escape expands nothing
+        ("O\\S\\Brien", "O^Brien"),  # a terminated escape still unescapes
+        ("x\\E\\", "x\\"),  # an escaped escape character still reads as one
+        ("a\\Z9\\b", "ab"),  # an unmappable, terminated sequence is still dropped
+    ],
+)
+def test_unterminated_escape_is_kept_as_data(value: str, expected: str) -> None:
+    assert _builtin_hl7.unescape(value, ("|", "^", "~", "&", "\\")) == expected
+
+
+def _peek_field(msg: str, path: str) -> Callable[[], Any]:
+    return lambda: Peek.parse(msg).field(path)
+
+
+def _msg_field(msg: str, path: str) -> Callable[[], Any]:
+    return lambda: Message.parse(msg).field(path)
+
+
+def _msg_reps(msg: str, path: str) -> Callable[[], Any]:
+    return lambda: Message.parse(msg).repetitions(path)
+
+
+def _peek_prop(msg: str, prop: str) -> Callable[[], Any]:
+    return lambda: getattr(Peek.parse(msg), prop)
+
+
+def _encode_after(msg: str, op: Callable[[Message], None]) -> Callable[[], str]:
+    def run() -> str:
+        m = Message.parse(msg)
+        op(m)
+        return m.encode()
+
+    return run
+
+
+# ---------------------------------------------------------------------------
+# The record is whole and aimed at this battery
+# ---------------------------------------------------------------------------
+
+
+def test_battery_matches_the_record() -> None:
+    """The paths and ops evaluated here are exactly the ones the oracle answered."""
+    record = _oracle()
+    assert record["probe_paths"] == _PROBE_PATHS
+    assert record["repetition_paths"] == list(REPETITION_PATHS)
+    assert record["mutation_ops"] == [name for name, _ in _mutation_ops()]
+    for case in _cases():
+        assert set(case["peek_props"]) == set(_PEEK_PROPERTIES), case["label"]
+        assert list(case["peek_field"]) == _PROBE_PATHS, case["label"]
+        assert list(case["message_field"]) == _PROBE_PATHS, case["label"]
+        assert list(case["repetitions"]) == list(REPETITION_PATHS), case["label"]
+        assert list(case["mutations"]) == record["mutation_ops"], case["label"]
+
+
+def test_corpus_is_populated() -> None:
+    """Guards an empty parametrization passing vacuously, and names the three corpus families."""
+    labels = [case["label"] for case in _cases()]
+    assert len(labels) >= 15, f"parity corpus unexpectedly small: {len(labels)}"
+    joined = " ".join(labels)
+    assert "samples/messages" in joined
+    assert "gen:" in joined
+    assert "adv:" in joined
+    assert len(set(labels)) == len(labels), "duplicate corpus labels"
+
+
+def test_the_oracle_is_not_all_one_answer() -> None:
+    """A record of nothing but ``None`` would pass every comparison against a broken parser."""
+    values = [v for case in _cases() for v in case["peek_field"].values()]
+    assert sum(isinstance(v, str) for v in values) > 500
+    assert sum(v is None for v in values) > 100
+    assert any(isinstance(v, dict) for case in _cases() for v in case["mutations"].values())
+
+
+# ---------------------------------------------------------------------------
+# AC-1 / AC-5 — Peek, Message and mutate→encode parity over the corpus
+# ---------------------------------------------------------------------------
+
+
+def _case_ids() -> list[str]:
+    return [case["label"] for case in _cases()]
+
+
+@pytest.mark.parametrize("index", range(len(_cases())), ids=_case_ids())
+def test_builtin_parity_over_corpus(index: int) -> None:
+    """AC-1 — every Peek property + ``Peek.field``/``Message.field`` path matches the oracle."""
+    case = _cases()[index]
+    label, msg = case["label"], case["input"]
     failures: list[str] = []
-
-    # Routing properties.
-    for prop in _peek_property_names():
-        expected, got = _both(_peek_prop(msg, prop))
-        if not _eq(expected, got):
-            failures.append(f"[{label}] Peek.{prop}: python-hl7={expected!r} builtins={got!r}")
-
-    # routing() dict + segments() list.
-    exp_routing, got_routing = _both(lambda: Peek.parse(msg).routing())
-    if not _eq(exp_routing, got_routing):
-        failures.append(
-            f"[{label}] Peek.routing(): python-hl7={exp_routing!r} builtins={got_routing!r}"
-        )
-    exp_segs, got_segs = _both(lambda: Peek.parse(msg).segments())
-    if not _eq(exp_segs, got_segs):
-        failures.append(f"[{label}] Peek.segments(): python-hl7={exp_segs!r} builtins={got_segs!r}")
-
-    # Peek.field over the probe battery.
-    for path in _PROBE_PATHS:
-        expected, got = _both(_peek_field(msg, path))
-        if not _eq(expected, got):
-            failures.append(
-                f"[{label}] Peek.field({path!r}): python-hl7={expected!r} builtins={got!r}"
-            )
-
-    # Message.field parity (it has its own extract path distinct from Peek's).
-    for path in _PROBE_PATHS:
-        expected, got = _both(_msg_field(msg, path))
-        if not _eq(expected, got):
-            failures.append(
-                f"[{label}] Message.field({path!r}): python-hl7={expected!r} builtins={got!r}"
-            )
-
-    # Message.repetitions parity for the repeating fields.
-    for path in ("PID-3", "PID-3.1", "PID-5", "OBX-3", "IN1-3"):
-        expected, got = _both(_msg_reps(msg, path))
-        if not _eq(expected, got):
-            failures.append(
-                f"[{label}] Message.repetitions({path!r}): python-hl7={expected!r} builtins={got!r}"
-            )
-
-    # encode() round-trip (no mutation) parity.
-    expected, got = _both(lambda: Message.parse(msg).encode())
-    if not _eq(expected, got):
-        failures.append(f"[{label}] Message.encode(): python-hl7={expected!r} builtins={got!r}")
-
-    return failures
+    for prop, want in case["peek_props"].items():
+        _check(failures, label, f"Peek.{prop}", want, _peek_prop(msg, prop))
+    _check(failures, label, "Peek.routing()", case["routing"], lambda: Peek.parse(msg).routing())
+    _check(failures, label, "Peek.segments()", case["segments"], lambda: Peek.parse(msg).segments())
+    for path, want in case["peek_field"].items():
+        _check(failures, label, f"Peek.field({path!r})", want, _peek_field(msg, path))
+    for path, want in case["message_field"].items():
+        _check(failures, label, f"Message.field({path!r})", want, _msg_field(msg, path))
+    for path, want in case["repetitions"].items():
+        _check(failures, label, f"Message.repetitions({path!r})", want, _msg_reps(msg, path))
+    _check(failures, label, "Message.encode()", case["encode"], lambda: Message.parse(msg).encode())
+    assert not failures, "\n".join(failures)
 
 
-@pytest.mark.parametrize(("label", "msg"), CORPUS, ids=CORPUS_IDS)
-def test_builtin_parity_over_corpus(label: str, msg: str) -> None:
-    """AC-1 — every Peek property + ``Peek.field``/``Message.field`` path is bit-identical across backends."""
-    failures = _peek_divergences(label, msg)
+@pytest.mark.parametrize("index", range(len(_cases())), ids=_case_ids())
+def test_encode_roundtrip_parity(index: int) -> None:
+    """AC-5 — read → mutate (set/add_repetition/add_segment/delete/group) → encode matches the oracle."""
+    case = _cases()[index]
+    ops = dict(_mutation_ops())
+    failures: list[str] = []
+    for name, want in case["mutations"].items():
+        _check(failures, case["label"], f"op={name}", want, _encode_after(case["input"], ops[name]))
     assert not failures, "\n".join(failures)
 
 
@@ -412,19 +419,17 @@ def test_whole_field_vs_component_semantics() -> None:
         ("PID-5.1", "DOE"),
         ("PID-5.2", "JANE"),
     ]
-    failures: list[str] = []
-    for path, want in cases:
-        expected, got = _both(_peek_field(msg, path))
-        # both backends must agree AND match the documented value
-        if not _eq(expected, got):
-            failures.append(f"Peek.field({path!r}): python-hl7={expected!r} builtins={got!r}")
-        if got != want:
-            failures.append(f"Peek.field({path!r}): builtins={got!r} expected-doc={want!r}")
+    peek = Peek.parse(msg)
+    failures = [
+        f"Peek.field({path!r}): got={peek.field(path)!r} expected-doc={want!r}"
+        for path, want in cases
+        if peek.field(path) != want
+    ]
     assert not failures, "\n".join(failures)
 
 
 # ---------------------------------------------------------------------------
-# AC-3 — tolerant parse + no-MSH/empty error parity
+# AC-3 — tolerant parse + no-MSH/empty error
 # ---------------------------------------------------------------------------
 
 
@@ -440,55 +445,47 @@ def test_whole_field_vs_component_semantics() -> None:
     ids=["empty", "blank", "blank-cr", "no-msh", "garbage"],
 )
 def test_tolerant_and_no_msh(bad: str) -> None:
-    """AC-3 — empty/no-MSH/unparseable raises ``HL7PeekError`` on both backends; odd-but-parseable parses."""
-    exp, got = _both(lambda: Peek.parse(bad))
-    assert isinstance(exp, HL7PeekError), f"python-hl7 should raise HL7PeekError, got {exp!r}"
-    assert isinstance(got, HL7PeekError), f"builtins should raise HL7PeekError, got {got!r}"
+    """AC-3 — empty/no-MSH/unparseable raises ``HL7PeekError``; odd-but-parseable parses."""
+    with pytest.raises(HL7PeekError):
+        Peek.parse(bad)
 
-    # Odd-but-structurally-parseable: inconsistent field counts, extra separators, missing CR — both parse.
+    # Odd-but-structurally-parseable: inconsistent field counts, extra separators, missing CR.
     odd = normalize("MSH|^~\\&|A|B||||ADT^A01|M|P|2.5.1\rPID|1|||||extra|||sep||||~~~\rOBX|1|NM")
-    exp_ok, got_ok = _both(lambda: Peek.parse(odd).message_type)
-    assert not isinstance(exp_ok, Exception), f"python-hl7 raised on odd-but-parseable: {exp_ok!r}"
-    assert not isinstance(got_ok, Exception), f"builtins raised on odd-but-parseable: {got_ok!r}"
-    assert _eq(exp_ok, got_ok), f"odd message_type: python-hl7={exp_ok!r} builtins={got_ok!r}"
+    peek = Peek.parse(odd)
+    assert peek.message_type == "M"  # MSH-8 holds ADT^A01 here: the sender skipped a field
+    assert peek.segments() == ["MSH", "PID", "OBX"]
 
 
 @pytest.mark.parametrize(
-    ("label", "line", "raises"),
-    [
-        ("empty-line", "", True),
-        ("leading-field-sep", "|stray", False),
-        ("space", " ", False),
-    ],
-    ids=["empty-line", "leading-field-sep", "space"],
+    ("label", "line"), BLANK_SEGMENT_LINES, ids=[x for x, _ in BLANK_SEGMENT_LINES]
 )
 @pytest.mark.parametrize("touch_first", [False, True], ids=["lazy", "split"])
 def test_whole_field_set_over_a_tree_held_blank_segment(
-    label: str, line: str, raises: bool, touch_first: bool
+    label: str, line: str, touch_first: bool
 ) -> None:
-    """The built-ins' blank-segment raise still matches python-hl7 exactly (BACKLOG #1594).
+    """The built-in's blank-segment raise still matches python-hl7 exactly (BACKLOG #1594).
 
-    ``Message.parse`` and ``Peek.parse`` now drop empty lines, so the corpus no longer reaches
-    ``raise_if_blank_segment_scan`` with one. A ``Message`` built straight from a backend's parse
-    tree still can. Only a truly empty line raises on a whole-field set; a line that merely starts
-    with the field separator does not. ``touch_first`` reads the odd segment first, so the built-ins
-    have split it and the scan takes its post-split branch rather than the lazy one.
+    ``Message.parse`` and ``Peek.parse`` drop empty lines, so the corpus no longer reaches
+    ``raise_if_blank_segment_scan`` with one. A ``Message`` built straight from a parse tree still
+    can. Only a truly empty line raises on a whole-field set; a line that merely starts with the field
+    separator does not. ``touch_first`` splits the odd segment first, so the scan takes its post-split
+    branch rather than the lazy one.
     """
     text = f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|C6|P|2.5.1\r{line}\rPID|1||444\r"
 
-    def run(builtin: bool) -> str:
-        msg = Message(_builtin_hl7.parse(text) if builtin else hl7.parse(text))
+    def run() -> str:
+        msg = Message(_builtin_hl7.parse(text))
         if touch_first:
             msg.field("PID-3", occurrence=1)
             msg.repetitions("MSH-9")
-            if builtin:
-                _builtin_hl7._ensure_split(msg._m, 1)
+            _builtin_hl7._ensure_split(msg._m, 1)
         msg.set("MSH-10", "EDITED")
         return msg.encode()
 
-    expected, got = _both(lambda: run(_backend.use_builtin()))
-    assert _eq(expected, got), f"[{label}] python-hl7={expected!r} builtins={got!r}"
-    assert isinstance(got, IndexError) is raises, f"[{label}] builtins={got!r}"
+    key = f"{label}/{'split' if touch_first else 'lazy'}"
+    want = _oracle()["blank_segment_set"][key]
+    assert _got(run) == want, f"[{key}] python-hl7={want!r}"
+    assert (want == {"raises": "IndexError"}) is (label == "empty-line")
 
 
 # ---------------------------------------------------------------------------
@@ -497,128 +494,42 @@ def test_whole_field_set_over_a_tree_held_blank_segment(
 
 
 def test_custom_encoding_chars() -> None:
-    """AC-4 — separators are read from MSH-1/MSH-2 (non-standard ``#@$%^``), never hardcoded; parity holds."""
-    # field=#, component=@, repetition=$, subcomponent=%, escape=^
-    msg = normalize(
-        "MSH#@$%^#APP#FAC#RCV#RFAC#20260101##ADT@A01#C9#P#2.5.1\r"
-        "PID#1##333@@@A$444@@@B##O^S^Brien@Sean#@#19800101#F\r"
-    )
-    paths = [
-        "MSH-1",
-        "MSH-2",
-        "MSH-9",
-        "MSH-9.1",
-        "MSH-9.2",
-        "MSH-10",
-        "PID-3",
-        "PID-3.1",
-        "PID-5",
-        "PID-5.1",
-        "PID-5.2",
-        "PID-8",
-    ]
+    """AC-4 — separators are read from MSH-1/MSH-2 (non-standard ``#@$%^``), never hardcoded."""
+    record = _oracle()["custom_encoding_chars"]
+    assert record["input"] == AC4_MESSAGE
     failures: list[str] = []
-    for path in paths:
-        expected, got = _both(_peek_field(msg, path))
-        if not _eq(expected, got):
-            failures.append(f"Peek.field({path!r}): python-hl7={expected!r} builtins={got!r}")
-        expected_m, got_m = _both(_msg_field(msg, path))
-        if not _eq(expected_m, got_m):
-            failures.append(
-                f"Message.field({path!r}): python-hl7={expected_m!r} builtins={got_m!r}"
-            )
-    # Sanity: the custom separators actually parsed (MSH-1 is '#', MSH-2 is the enc chars).
-    f_sep, _ = _both(lambda: Peek.parse(msg).field("MSH-1"))
-    assert f_sep == "#", f"custom field separator not read from MSH-1: {f_sep!r}"
+    for path in AC4_PATHS:
+        _check(
+            failures,
+            "ac4",
+            f"Peek.field({path!r})",
+            record["peek_field"][path],
+            _peek_field(AC4_MESSAGE, path),
+        )
+        _check(
+            failures,
+            "ac4",
+            f"Message.field({path!r})",
+            record["message_field"][path],
+            _msg_field(AC4_MESSAGE, path),
+        )
+    assert Peek.parse(AC4_MESSAGE).field("MSH-1") == "#"
     assert not failures, "\n".join(failures)
 
 
 # ---------------------------------------------------------------------------
-# AC-5 — mutate → encode round-trip parity
+# AC-7 — strict path unchanged (hl7apy)
 # ---------------------------------------------------------------------------
 
 
-def _mutation_ops() -> list[tuple[str, Callable[[Message], None]]]:
-    """Named mutations applied identically to a fresh ``Message`` on each backend (defensive: a missing
-    target segment raises identically on both, captured by ``_both``)."""
-    return [
-        ("set-whole-field", lambda m: m.set("MSH-3", "NEWAPP")),
-        ("set-component", lambda m: m.set("PID-5.1", "O'Brien")),
-        ("set-component-escaping", lambda m: m.set("PID-5.1", "A^B&C|D")),
-        ("set-subcomponent", lambda m: m.set("PID-3.1.1", "XYZ")),
-        ("set-occurrence", lambda m: m.set("OBX-5", "EDITED", occurrence=1)),
-        ("set-msh10", lambda m: m.set("MSH-10", "NEWCTRL")),
-        ("add-repetition", lambda m: m.add_repetition("PID-3", "999^^^Z")),
-        ("add-segment-append", lambda m: m.add_segment("ZAL|1|extra^data")),
-        ("add-segment-index", lambda m: m.add_segment("NTE|1|note", index=1)),
-        ("delete-segments", lambda m: _ignore(m.delete_segments("OBX"))),
-        ("delete-evn", lambda m: _ignore(m.delete_segments("EVN"))),
-        ("group-ops", _group_ops),
-    ]
-
-
-def _ignore(_value: object) -> None:
-    return None
-
-
-def _group_ops(m: Message) -> None:
-    """Exercise SegmentGroup: append within the first OBR group, then rebuild its body."""
-    groups = m.groups("OBR")
-    if not groups:
-        # No order groups in this message — make the op a no-op (parity must still hold: both skip).
-        return
-    g = groups[0]
-    g.append_segment("NTE|1|group-note")
-    g.rebuild(["OBX|1|NM|GLU^Glucose^LN|1|99|mg/dL", "NTE|1|rebuilt"])
-
-
-def _encode_after(msg: str, op: Callable[[Message], None], builtin: bool) -> str | Exception:
-    def run() -> str:
-        m = Message.parse(msg)
-        op(m)
-        return m.encode()
-
-    try:
-        result: str = _under_backend(builtin, run)
-        return result
-    except Exception as exc:  # noqa: BLE001 — capture raise-path for parity
-        return exc
-
-
-# A focused corpus for the (heavier) mutate→encode matrix: the samples + the synthetic set.
-_MUTATE_CORPUS = _sample_corpus() + _synthetic_corpus() + _ADVERSARIAL
-_MUTATE_IDS = [label for label, _ in _MUTATE_CORPUS]
-
-
-@pytest.mark.parametrize(("label", "msg"), _MUTATE_CORPUS, ids=_MUTATE_IDS)
-def test_encode_roundtrip_parity(label: str, msg: str) -> None:
-    """AC-5 — read → mutate (set/add_repetition/add_segment/delete/group) → encode is byte-identical."""
-    failures: list[str] = []
-    for op_name, op in _mutation_ops():
-        expected = _encode_after(msg, op, builtin=False)
-        got = _encode_after(msg, op, builtin=True)
-        if not _eq(expected, got):
-            failures.append(f"[{label}] op={op_name}: python-hl7={expected!r} builtins={got!r}")
-    assert not failures, "\n".join(failures)
-
-
-# ---------------------------------------------------------------------------
-# AC-7 — strict path unchanged (hl7apy, backend-independent)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("builtin", [False, True], ids=["python-hl7", "builtins"])
-def test_strict_path_unchanged(builtin: bool) -> None:
-    """AC-7 — ``validate()`` builds an hl7apy tree and is unaffected by the tolerant-tier backend flag."""
+def test_strict_path_unchanged() -> None:
+    """AC-7 — ``validate()`` builds an hl7apy tree, independent of the tolerant tier."""
     msg = _core.generate_message("ADT", "A01", 1)
-    with _backend.backend(builtin=builtin):
-        result = validate(msg, expected_version="2.5.1")
-    assert result.ok, f"strict validation failed under builtin={builtin}: {result.errors}"
+    result = validate(msg, expected_version="2.5.1")
+    assert result.ok, f"strict validation failed: {result.errors}"
     assert bool(result) == result.ok  # frozen ValidationResult.__bool__ == ok
     assert result.version == "2.5.1"
-    # A version mismatch is still reported (cross-check unaffected by the flag).
-    with _backend.backend(builtin=builtin):
-        mismatch = validate(msg, expected_version="2.3")
+    mismatch = validate(msg, expected_version="2.3")
     assert not mismatch.ok
     assert mismatch.errors
 
@@ -645,23 +556,7 @@ def _is_freethreaded() -> bool:
 def test_freethread_scaling() -> None:  # pragma: no cover - cp314t-only stub
     """AC-6 — ≥6× multi-core / ~14× single-thread on cp314t (WS3/ADR 0052 harness).
 
-    This is a placeholder gate: the authoritative scaling re-measure is the ADR 0053 spike harness on
-    the 265KF box (``…\\Temp\\mefor-ft``). Here we only assert the build is genuinely free-threaded so a
-    future run can hang the throughput numbers off this node; the full benchmark lives outside the unit
-    suite (``tests/test_benchmark_parser.py`` per the ADR).
+    A placeholder gate: the authoritative scaling re-measure is the ADR 0053 spike harness on the
+    bench box. Here we only assert the build is genuinely free-threaded.
     """
     assert _is_freethreaded()
-
-
-# ---------------------------------------------------------------------------
-# Sanity: the corpus is non-trivial (guards an empty parametrization passing vacuously)
-# ---------------------------------------------------------------------------
-
-
-def test_corpus_is_populated() -> None:
-    assert len(CORPUS) >= 15, f"parity corpus unexpectedly small: {len(CORPUS)}"
-    # at least one sample, one synthetic, one adversarial
-    labels = " ".join(CORPUS_IDS)
-    assert "samples/messages" in labels
-    assert "gen:" in labels
-    assert "adv:" in labels

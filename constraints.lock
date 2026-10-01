@@ -79,8 +79,6 @@ h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-hl7==0.4.5
-    # via messagefoundry
 hl7apy==1.3.5
     # via messagefoundry
 httpcore==1.0.9

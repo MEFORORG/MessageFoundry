@@ -680,7 +680,7 @@ _BODY_HOLDING = frozenset(
         "JSONDecodeError",  # .doc is the whole input
         "IncompleteReadError",  # .partial is every byte read before the stream ended
         "ValidationError",  # pydantic quotes each failing input value in its errors
-        "HL7PeekError",  # carried python-hl7's text about the body until #2085
+        "HL7PeekError",  # carried python-hl7's text about the body until #2085; python-hl7 is retired
         "TOMLDecodeError",  # .doc is the whole document on Python 3.14 (measured)
     }
 )

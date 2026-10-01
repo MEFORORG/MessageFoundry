@@ -28,8 +28,30 @@ from ._common import (
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L1a: read-only monitoring pages (alerts + event log). Reuses the monitoring JSON handlers
     (no step-up) — ADR 0065, BACKLOG #75 phase 1. Not PHI-free: both pages show a scrubbed free-text
-    ``reason`` that ``docs/PHI.md`` section 2 gives a protection level."""
+    ``reason`` that ``docs/PHI.md`` section 2 gives a protection level. That reason arrives masked,
+    or null without ``messages:view_summary``, and each page has a per-item reveal route (BACKLOG
+    #2443): the route is the act, as ``UI_MESSAGE_REVEALS`` makes it for a message's error text."""
     core = deps.core
+
+    async def _alerts_page(
+        request: Request, engine: Any, identity: Identity, *, reveal: int | None
+    ) -> HTMLResponse:
+        # Active instances need monitoring:diagnose, rules need monitoring:read — the page
+        # requires BOTH (fail-closed), then calls the handlers directly (their own gates are
+        # skipped, so require_ui re-asserts the permissions the same way the other /ui routes do).
+        # Pass every param explicitly: calling the handler directly (not via Depends) leaves
+        # its Query(...) defaults unresolved, so limit must be a real int here.
+        instances = await core.list_active_alerts(
+            request=request,
+            engine=engine,
+            identity=identity,
+            limit=ACTIVE_ALERTS_LIMIT,
+            reveal=reveal,
+        )
+        config = await core.alerts_rules(request, _user=identity)
+        return HTMLResponse(
+            pages.alerts(instances, config, limit=ACTIVE_ALERTS_LIMIT, revealed=reveal)
+        )
 
     @app.get("/ui/alerts", response_class=HTMLResponse)
     async def ui_alerts(
@@ -39,16 +61,28 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             require_ui(Permission.MONITORING_READ, Permission.MONITORING_DIAGNOSE)
         ),
     ) -> HTMLResponse:
-        # Active instances need monitoring:diagnose, rules need monitoring:read — the page
-        # requires BOTH (fail-closed), then calls the handlers directly (their own gates are
-        # skipped, so require_ui re-asserts the permissions the same way the other /ui routes do).
-        # Pass every param explicitly: calling the handler directly (not via Depends) leaves
-        # its Query(...) defaults unresolved, so limit must be a real int here.
-        instances = await core.list_active_alerts(
-            engine=engine, identity=identity, limit=ACTIVE_ALERTS_LIMIT
-        )
-        config = await core.alerts_rules(request, _user=identity)
-        return HTMLResponse(pages.alerts(instances, config, limit=ACTIVE_ALERTS_LIMIT))
+        return await _alerts_page(request, engine, identity, reveal=None)
+
+    # The per-alert reveal (BACKLOG #2443, ASVS 14.2.6, owner ruling R12). The page's "Reveal" link
+    # beside a masked reason lands here, so the request is the act: it returns that one alert's
+    # reason whole, the engine audits it as ``alert_reveal``, and the next bare load is masked
+    # again. It asserts messages:view_summary, which unlocks the reason, and phi=True, because it
+    # is a PHI read that the in-process handler call does not charge for itself.
+    @app.get("/ui/alerts/{alert_id}/reason", response_class=HTMLResponse)
+    async def ui_alert_reason(
+        alert_id: int,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(
+            require_ui(
+                Permission.MONITORING_READ,
+                Permission.MONITORING_DIAGNOSE,
+                Permission.MESSAGES_VIEW_SUMMARY,
+                phi=True,
+            )
+        ),
+    ) -> HTMLResponse:
+        return await _alerts_page(request, engine, identity, reveal=alert_id)
 
     @app.get("/ui/events", response_class=HTMLResponse)
     async def ui_events(
@@ -62,13 +96,46 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         connection: str | None = Query(None, max_length=256),
         kind: str | None = Query(None, max_length=64),
     ) -> HTMLResponse:
+        return await _events_page(
+            request, engine, identity, connection=connection, kind=kind, reveal=None
+        )
+
+    # The per-event reveal (BACKLOG #2443), on the terms ui_alert_reason gives. It carries the
+    # page's two filters, checked by the same rules, so the operator lands back on the list they
+    # were reading.
+    @app.get("/ui/events/{event_id}/reason", response_class=HTMLResponse)
+    async def ui_event_reason(
+        event_id: int,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(
+            require_ui(Permission.MONITORING_READ, Permission.MESSAGES_VIEW_SUMMARY, phi=True)
+        ),
+        connection: str | None = Query(None, max_length=256),
+        kind: str | None = Query(None, max_length=64),
+    ) -> HTMLResponse:
+        return await _events_page(
+            request, engine, identity, connection=connection, kind=kind, reveal=event_id
+        )
+
+    async def _events_page(
+        request: Request,
+        engine: Any,
+        identity: Identity,
+        *,
+        connection: str | None,
+        kind: str | None,
+        reveal: int | None,
+    ) -> HTMLResponse:
         # L6b (#75 parity): expose the JSON handler's event-kind filter (a single kind from
         # the fixed dropdown → a one-element kinds list; blank/unknown = no filter).
         # BACKLOG #1740: both filters, against the rules GET /events declares for the same two
         # items -- judged on what ARRIVED, not on the for_echo'd copy below, which has had its
         # control characters stripped and would therefore pass a rule the raw value fails.
+        # Each route checks against its OWN row, so the declared table says what each one enforces.
+        route = "/ui/events" if reveal is None else "/ui/events/{event_id}/reason"
         refusal = check_filters(
-            UI_BODY_FILTER_RULES["/ui/events"], {"connection": connection, "kind": kind}
+            UI_BODY_FILTER_RULES[route], {"connection": connection, "kind": kind}
         )
         conn, evt_kind = for_echo(connection), for_echo(kind)
         if refusal is not None:
@@ -89,8 +156,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             since=None,
             limit=100,
             request=request,
+            reveal=reveal,
         )
-        return HTMLResponse(pages.events(rows, connection=conn, kind=evt_kind))
+        return HTMLResponse(pages.events(rows, connection=conn, kind=evt_kind, revealed=reveal))
 
     async def _flow_data(request: Request, engine: Any, identity: Identity) -> tuple[Any, Any]:
         """Fetch the two read-only monitoring:read sources for the Flow & trends page (BACKLOG #76):

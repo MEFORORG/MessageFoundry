@@ -105,7 +105,7 @@ as opaque bytes. This **exceeds** both incumbents (neither Mirth nor Corepoint s
 
 ## 4. Codec — `messagefoundry.parsing.dicom`
 
-A pure, side-effect-free, console-importable library (zero engine imports), mirroring the python-hl7 / hl7apy
+A pure, side-effect-free, console-importable library (zero engine imports), mirroring the HL7 v2 tolerant parser / hl7apy
 two-tier split:
 
 - **`DicomPeek`** — the tolerant **routing** peek (a cheap shallow tag read: SOP class, modality,
