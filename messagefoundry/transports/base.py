@@ -137,7 +137,12 @@ def cap_setting[NumT: (int, float)](value: Any, convert: Callable[[Any], NumT]) 
 
 
 def positive_cap[NumT: (int, float)](
-    value: Any, convert: Callable[[Any], NumT], *, knob: str, transport: str
+    value: Any,
+    convert: Callable[[Any], NumT],
+    *,
+    knob: str,
+    transport: str,
+    off_hint: str = "use None or 0 to disable it",
 ) -> NumT | None:
     """:func:`cap_setting`, then refuse at build whatever is left that is not above zero (BACKLOG #1872).
 
@@ -148,7 +153,11 @@ def positive_cap[NumT: (int, float)](
     running and accepts nothing. Written ``not cap > 0`` rather than ``cap <= 0`` so a NaN float cap is
     refused too: every comparison with NaN is false, so ``cap_setting`` cannot read it as off either.
     A value the conversion itself rejects (NaN or ``"1e3"`` on an ``int`` cap, or text that is not a
-    number) is re-raised naming the setting, so every refusal says which key to fix."""
+    number) is re-raised naming the setting, so every refusal says which key to fix.
+
+    ``off_hint`` ends the not-above-zero refusal. The default tells the operator how to turn the cap
+    off. A caller where ``None``/``0`` does NOT turn it off passes its own text, so the refusal does not
+    point at an off switch that does not exist (the DICOM SCP's ``max_object_bytes``, BACKLOG #2103)."""
     try:
         cap = cap_setting(value, convert)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -156,9 +165,7 @@ def positive_cap[NumT: (int, float)](
             f"{transport} {knob}={value!r} is not a valid {convert.__name__} value"
         ) from exc
     if cap is not None and not cap > 0:
-        raise ValueError(
-            f"{transport} {knob}={value!r} must be above zero (use None or 0 to disable it)"
-        )
+        raise ValueError(f"{transport} {knob}={value!r} must be above zero ({off_hint})")
     return cap
 
 

@@ -73,8 +73,14 @@ section reference.
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].admin_new_ip_step_up` | `true` (*conditional* — a loosening only while auth is on) |
-| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0`, or a window of `0` or less turns a limit off) |
-| | `[auth].lockout_minutes`, `lockout_threshold` | `15` / `5` (*conditional* — a loosening only while auth is on; minutes of `0` or less means no lock ever holds, and a threshold above `100` exceeds NIST SP 800-63B) |
+| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
+| | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (*conditional* — a loosening only while auth is on; minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
+| | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above `120`, or a window below `60` s) |
+| | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
+| | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — a loosening only while auth is on, and the second only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
+| | `[auth].max_sessions_per_user` | `5` (*conditional* — a loosening only while auth is on; `0` or less means unlimited, and so is named, as is any cap above `5`) |
+| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while auth and OIDC are on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
+| | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
@@ -83,11 +89,13 @@ section reference.
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 
-**At least seventeen of these do not live in `[security]`.** `[store].aad_bind`,
+**At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
-`[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, `[auth].lockout_minutes`,
-`[auth].lockout_threshold`,
-`[secret_rotation].enforce_store_key_expiry` and
+`[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
+keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
+`[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
+`[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
+`[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies` and
 `[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed and reported here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
@@ -541,25 +549,29 @@ This section is kept rather than deleted, because the claim it used to make is t
   `auth.login_new_ip` rows the sign-in signal still writes. That signal has no switch.
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
 
-### `[auth].login_rate_limit_enabled = false`, or a zeroed limit — sign-in attempts go unpaced
+### `[auth].login_rate_limit_enabled = false`, or a limit looser than its default — sign-in attempts go less paced
 > **Conditional** on sign-in, like `admin_new_ip_step_up`: with `[security].require_sign_in = false` there
-> is no sign-in to limit. Each of these values turns a limit off, and each is reported under its own key
+> is no sign-in to limit. Each of these values is reported under its own key
 > ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). The owner ruled on 2026-09-27 that a silent weakening here
 > keeps ASVS 6.1.1 at partial.
 >
-> | Value | What stops |
+> | Value | What loosens |
 > |---|---|
 > | `login_rate_limit_enabled = false` | Both sign-in limits, per address and across all clients, and the per-user limit on credential ceremonies. None is built. |
-> | `login_rate_limit_window_seconds` of `0` or less | The same three. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
-> | `login_rate_limit_per_ip = 0` | The per-address sign-in limit, and the per-user ceremony limit, which reads the same number. |
-> | `login_rate_limit_global = 0` | The all-clients sign-in limit. |
+> | `login_rate_limit_window_seconds` of `0` or less | The same three are off. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
+> | `login_rate_limit_window_seconds` below `60` | The same three admit their counts once per that window instead of once per minute. A tiny window, such as `1e-6`, admits nearly every attempt. |
+> | `login_rate_limit_per_ip = 0`, or above `10` | The per-address sign-in limit, and the per-user ceremony limit, which reads the same number. `0` turns both off. |
+> | `login_rate_limit_global = 0`, or above `60` | The all-clients sign-in limit. `0` turns it off. |
 >
 > The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
 > second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the
-> limiter off, a zeroed count or window changes nothing, so only `login_rate_limit_enabled` is named. A
-> **negative** count, or a window that is not a number or is `+inf`, refuses *more* attempts, not fewer,
-> so it is not reported. **A weak but non-zero value is not reported either**: a huge count or a tiny
-> window paces almost nothing, and there is no published cutoff to judge it by.
+> limiter off, a count or window changes nothing, so only `login_rate_limit_enabled` is named, and a
+> window of `0` or less likewise stands in for its counts. A short window is not named when every count
+> it paces is `0`, since it then paces nothing; each zeroed count is named instead. **The cutoff is the shipped default, not a
+> judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
+> reported like an off value, with text that says *looser than the default of* rather than *off*. A
+> value at or stricter than the default is not reported. That includes a **negative** count, and a
+> window that is not a number or is `+inf`, each of which refuses *more* attempts, not fewer.
 - **What you lose:** a password spray across many usernames never trips one account's lockout, and these
   limits are what slow it. With the per-address limit off, one client may try as fast as the all-clients
   limit allows. With the all-clients limit off, a spray spread across many addresses grows with the number
@@ -568,25 +580,36 @@ This section is kept rather than deleted, because the claim it used to make is t
   counts toward it), and a second factor at the console's sign-in step is guessed at no set rate.
 - **When acceptable:** load testing on a host no untrusted client can reach. A reverse proxy or web
   application firewall in front of the engine can replace the per-address and all-clients limits, but it
-  cannot replace the per-user ceremony limit, which keys on the signed-in user. Prefer **raising** a limit
-  to turning it off.
+  cannot replace the per-user ceremony limit, which keys on the signed-in user. A modest raise for a
+  site whose operators share one address behind NAT is the usual case; it is still named, so the
+  posture review sees it. Prefer **raising** a limit to turning it off.
 - **Compensating controls:** front the API with a proxy or WAF limiter, restrict the sign-in surface with
   `[security].allowed_client_networks`, keep `lockout_minutes` above `0`, and watch the
   `auth.login_failed` audit rows.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
-### `[auth].lockout_minutes = 0` (or less), or a `lockout_threshold` above 100 — the account lock stops protecting
-> **Conditional** on sign-in, as above ([BACKLOG #1131](BACKLOG.md)). At `lockout_minutes` of `0` or less a
-> lock is still set at `lockout_threshold` failures, but it ends the moment it is set, on the sign-in and
-> the second-step counter alike. No `lockout_threshold` is read as off, since `0` or less locks on the
-> *first* failure. A large one never arms in practice, though, so a threshold above the **100**
-> consecutive failures that NIST SP 800-63B allows (SP 800-63B-4 section 3.2.2, and rev. 3 section
-> 5.2.2 before it) is reported as well.
+### `[auth].lockout_minutes`, `lockout_threshold` or `lockout_max_minutes` looser than its default — the account lock protects less
+> **Conditional** on sign-in, as above ([BACKLOG #1131](BACKLOG.md)). Each key is named when it is looser
+> than its shipped default, and each says whether it is off or only looser.
+>
+> | Value | What loosens |
+> |---|---|
+> | `lockout_minutes` of `0` or less | No lock holds. A lock is still set at `lockout_threshold` failures, but it ends the moment it is set, on the sign-in and the second-step counter alike. |
+> | `lockout_minutes` below `15` | Each lock is shorter, so a run of wrong guesses resumes sooner. |
+> | `lockout_threshold` above `5` | More wrong guesses are checked before a lock is set. Above the **100** consecutive failures NIST SP 800-63B allows (SP 800-63B-4 section 3.2.2, rev. 3 section 5.2.2), the text says so: a threshold that large never arms in practice. |
+> | `lockout_max_minutes` below `1440` | An escalating lock ([ADR 0197](adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)) stops doubling sooner. Equal to `lockout_minutes`, escalation is off, and the text says so. |
+>
+> No `lockout_threshold` is read as off, since `0` or less locks on the *first* failure, which is
+> stricter. With no lock holding, the ceiling changes nothing, so it is not named beside a
+> `lockout_minutes` of `0` or less. A ceiling at `1440` or above is not named even when it equals
+> `lockout_minutes`, because every lock then lasts at least as long as the default's longest.
 - **What you lose:** at `lockout_minutes` of `0` or less, a run of wrong guesses at one account's password
   or second factor is never refused by a lock. The failures are still counted and audited. Each session is
   still revoked after `lockout_threshold` failed re-proofs, because that cap does not read
-  `lockout_minutes`. Above a threshold of 100, that many wrong guesses are checked before any lock is set,
-  and a session may fail that many re-proofs before it is revoked.
+  `lockout_minutes`. A shorter lock shortens the wait between runs of guesses, and a lower ceiling
+  shortens the longest lock that repeated runs can reach. A higher
+  threshold lets that many wrong guesses through before any lock is set, and a session may fail that many
+  re-proofs before it is revoked.
 - **When acceptable:** rarely. A site whose own sign-in front end already locks accounts may prefer the
   engine not to set a second lock that a stranger could trigger on purpose. Under
   [ADR 0197](adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
@@ -594,7 +617,98 @@ This section is kept rather than deleted, because the claim it used to make is t
   engine-generated credential arms no sign-in lock at all, so check whether that answers the concern first.
 - **Compensating controls:** keep the sign-in limits on, enroll every account in MFA, and review
   `auth.login_failed` and `auth.mfa_failed` rows.
-- **Reversible:** yes, immediately — restore `15` and `5` (or delete the lines) and restart.
+- **Reversible:** yes, immediately — restore `15`, `5` and `1440` (or delete the lines) and restart.
+
+### `[auth].phi_read_rate_limit_*` looser than its default — PHI reads go less paced
+> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.1). Named: `phi_read_rate_limit_enabled
+> = false`; a `phi_read_rate_limit_window_seconds` of `0` or less (off) or below `60` s (looser); a
+> `phi_read_rate_limit_per_actor` of `0` (off) or above `120` (looser). The same parts rule applies as for
+> sign-in: with the limiter off, or its window at `0` or less, its count is not named again.
+> `phi_read_rate_limit_global` ships **off** (`0`), so no value of it is looser than the default and it is
+> never named.
+- **What you lose:** the per-account pace on the PHI-read routes and console views
+  ([SECURITY.md](SECURITY.md) lists them). A stolen session, or a script with a real one, reads message
+  bodies and dead letters faster, up to as fast as the engine answers. Every PHI read is still audited.
+- **When acceptable:** a bulk export or migration run by one known account, on a host no untrusted
+  client can reach. Prefer a modest raise to turning it off, and put it back afterwards.
+- **Compensating controls:** keep sessions short, restrict the operator surface with
+  `[security].allowed_client_networks`, and review the PHI-access audit rows.
+- **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
+
+### `[auth].admin_write_*` looser than its default — state-changing admin actions go less paced
+> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2). Named:
+> `admin_write_rate_limit_enabled = false`; an `admin_write_rate_limit_window_seconds` below `15` s; an
+> `admin_write_rate_limit_per_actor` of `0` (off) or above `12`; an `admin_write_min_interval_seconds` of
+> `0` (off) or below `0.15` s. The window cannot be `0` or less (the load refuses it), but a tiny one,
+> such as `1e-6`, loads and admits nearly every write, and the gap must then be shorter still. With the
+> limiter off, its parts are not named again.
+- **What you lose:** the per-actor pace on purge, replay, config deploy and reload, and every other non-GET
+  sensitive action. Both the count and the minimum gap are provisional human-timing floors; see
+  [SECURITY.md](SECURITY.md). Looser values let a script holding a session spend them faster than a
+  person could. Step-up and RBAC still apply to each action.
+- **When acceptable:** a scripted maintenance run by a known account. Prefer a modest raise to turning it
+  off, and put it back afterwards.
+- **Compensating controls:** keep `require_action_step_up` on, keep `[auth].step_up_max_age_seconds`
+  short, and review the admin-action audit rows.
+- **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
+
+### `[auth].mfa_verify_min_elapsed_seconds` or `oidc_callback_min_elapsed_seconds` below `1.0` s — a second step may come at machine speed
+> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2), and the callback floor only while
+> `[auth].oidc_enabled` is on. These are the BACKLOG #2301 time floors, beside
+> `admin_write_min_interval_seconds` above. Each refuses an action that comes sooner than the floor and
+> skips the check at `0`, so a floor below its default of `1.0` s is named as looser and `0` as off. A
+> higher floor refuses more and is not named.
+- **What you lose:** the MFA floor refuses a code or passkey that completes an MFA-pending session too
+  soon after sign-in. It applies to any account with a factor, whether or not `require_mfa` is on. The
+  callback floor refuses a federated step-up, or a sign-in whose `auth_time` falls inside the flow, that
+  returns too soon after it started. Below the default, a script holding a password, or driving a flow,
+  may finish the second step faster than a person could read the prompt and answer it. The floors bound
+  only the first moments after sign-in; they do not pace guessing after that.
+- **When acceptable:** rarely; the floors cost a person nothing at the default. An automated test
+  harness on a host no untrusted client can reach is the usual case.
+- **Compensating controls:** keep the sign-in limits and the lockout at their defaults, and review the
+  audit rows with `reason=too_early` (under `auth.mfa_failed`, `auth.webauthn_failed`,
+  `auth.login_failed` and `auth.reauth`).
+- **Reversible:** yes, immediately — restore `1.0` (or delete the line) and restart.
+
+### `[auth].max_sessions_per_user` of `0` or above `5` — more live sessions per user
+> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` or less means unlimited, so it
+> is named as off; any cap above `5` is named as looser.
+- **What you lose:** a new sign-in beyond the cap revokes the user's oldest live session. With a higher
+  cap, or none, a stolen or forgotten session stays live beside the owner's for longer.
+- **When acceptable:** an account used from more devices or console instances than five, where each is
+  known.
+- **Compensating controls:** keep the idle and absolute session limits short, and revoke sessions on
+  offboarding.
+- **Reversible:** yes, immediately — restore `5` (or delete the line) and restart.
+
+### `[auth].oidc_flow_cache_max` above `512` — more pending federated sign-ins held in memory
+> **Conditional** on sign-in and on `[auth].oidc_enabled`, since the cache is built only with federation on
+> ([BACKLOG #1131](BACKLOG.md)). The cache refuses a new flow once it holds this many, so a cap of `0` or
+> less refuses **every** federated sign-in. That is stricter, not looser, and it is not named. A cap above
+> `512` is named. A very large one, such as `1e9`, removes the engine-wide bound in practice.
+- **What you lose:** each abandoned login start holds a slot until its time-to-live ends. A higher cap lets
+  a flood of starts hold more memory before new ones are refused; the per-address cap still bounds one
+  address.
+- **When acceptable:** a large site where many people start a federated sign-in within one flow lifetime.
+- **Compensating controls:** keep `[auth].oidc_flow_ttl_seconds` short, and front the sign-in routes with
+  a proxy limiter.
+- **Reversible:** yes, immediately — restore `512` (or delete the line) and restart.
+
+### `[api].trusted_proxies` covering every address, such as `0.0.0.0/0` or `::/0` — every peer may set its own source address
+> **Not conditional on sign-in** ([BACKLOG #1131](BACKLOG.md)): a forged source address poisons the audit
+> trail either way. The load refuses `*` for this reason, but an entry of `0.0.0.0/0` or `::/0` loads and
+> does the same thing for its address family, so it is named instead. So are ranges whose union covers a
+> whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The check parses each
+> entry the way uvicorn does, strictly. An entry with host bits set, such as `10.1.2.3/0`, loads here but
+> becomes a literal in uvicorn that matches no peer, so it is not this loosening.
+- **What you lose:** uvicorn trusts `X-Forwarded-For` from every peer the entries cover, so any client can
+  declare its own source address. That poisons the audit source address, the per-address sign-in limit and
+  the new-client-IP step-up signal. With `[security].allowed_client_networks` set, the load already
+  refuses any range wider than one host.
+- **When acceptable:** never in production. List the reverse proxy's exact address instead.
+- **Compensating controls:** none replace it; fix the entry.
+- **Reversible:** yes, immediately — list the proxy's own address and restart.
 
 ### `[api].plaintext_upstream_hop_acknowledged = true` — a plaintext proxy-to-engine hop, taken on by the site
 > **Conditional**, like `allowed_client_networks`. It is reported **only** while `[api].tls_terminated_upstream`
@@ -910,7 +1024,9 @@ Appendix D. The **OWASP ASVS 5.0 chapters** (V6 Authentication, V7 Session Manag
 Cryptography, V12 Secure Communication, V13 Configuration, V14 Data Protection, V16 Security Logging) are
 verified against the [ASVS v5.0.0](https://github.com/OWASP/ASVS/tree/v5.0.0) primary source and match the
 project's own ASVS-5.0 L3 drive-to-pass mappings (BACKLOG #242–246); **exact ASVS sub-requirement IDs are
-carried from that drive-to-pass, not re-derived here.**
+carried from that drive-to-pass, not re-derived here.** The V2 rows (Validation and Business Logic) were
+added with BACKLOG #1131 and carry the 2.4.1 / 2.4.2 citations the limiters' own settings make; that
+chapter was not part of the verification above.
 
 | `[security]` switch(es) | OWASP ASVS v5.0 | NIST SP 800-53r5 | HIPAA §164.312 |
 |---|---|---|---|
@@ -931,7 +1047,11 @@ carried from that drive-to-pass, not re-derived here.**
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
-| `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
+| `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold`, `[auth].lockout_max_minutes` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
+| `[auth].phi_read_rate_limit_*`, `[auth].admin_write_*`, `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds` (PHI-read and admin-write pacing, second-step time floors) | V2 Validation and Business Logic (anti-automation, 2.4.1 / 2.4.2) | **SC-5** Denial-of-Service Protection | §164.312(a)(1) Access Control |
+| `[auth].max_sessions_per_user` (concurrent-session cap) | V7 Session Management (7.1.2) | **AC-10** Concurrent Session Control | §164.312(a)(1) Access Control |
+| `[auth].oidc_flow_cache_max` (pending federated sign-in bound) | V2 Validation and Business Logic (anti-automation) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
+| `[api].trusted_proxies` (trust-every-peer forwarded header) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `tls_allow_expired` (per-connection expiry-only relaxation) | V12 Secure Communication | **SC-8(1)** Cryptographic Protection · **SC-12** Cryptographic Key Establishment and Management | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
@@ -949,7 +1069,7 @@ carried from that drive-to-pass, not re-derived here.**
 ### Sources
 
 - [OWASP Application Security Verification Standard v5.0.0](https://github.com/OWASP/ASVS/tree/v5.0.0) — chapter structure.
-- [NIST SP 800-53 Rev. 5, Security and Privacy Controls](https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final) — control catalog (SC-7, SC-8, SC-28, SC-13, IA-2, AC-12, AC-4, AU-2, AU-3, SI-12, RA-2, AC-6, AC-7).
+- [NIST SP 800-53 Rev. 5, Security and Privacy Controls](https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final) — control catalog (SC-7, SC-8, SC-28, SC-13, IA-2, AC-12, AC-4, AU-2, AU-3, SI-12, RA-2, AC-6, AC-7, AC-10, SC-5).
 - [NIST SP 800-63B-4, Digital Identity Guidelines: Authentication and Authenticator Management](https://pages.nist.gov/800-63-4/sp800-63b.html) — section 3.2.2 (section 5.2.2 in the superseded rev. 3), the ceiling of 100 consecutive failed attempts that `[auth].lockout_threshold` is checked against.
 - [NIST SP 800-66 Rev. 2, Implementing the HIPAA Security Rule](https://csrc.nist.gov/pubs/sp/800/66/r2/final) — Appendix D HIPAA → 800-53r5 crosswalk.
 - [45 CFR §164.312 — Technical safeguards](https://www.hhs.gov/hipaa/for-professionals/security/index.html) (HHS).

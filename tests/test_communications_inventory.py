@@ -424,7 +424,7 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
         ("[store].connect_timeout", _default(StoreSettings, "connect_timeout"), "config.settings"),
         # ...and the connector tier is pinned to its OWN constant, so the two cannot be conflated.
         (
-            "`connect_timeout` 15 s (DSN **login** timeout only)",
+            "`connect_timeout` 15 s (**login** timeout only, SQL Server preset)",
             int(inspect.signature(wiring.Database).parameters["connect_timeout"].default),
             "config.wiring.Database",
         ),

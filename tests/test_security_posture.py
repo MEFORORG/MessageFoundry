@@ -78,11 +78,13 @@ _BLOCKING_SECURITY_JOBS = frozenset(
     }
 )
 
-# ADVISORY by design: these MUST keep continue-on-error. Both are cron/dispatch-only, so promoting one
+# ADVISORY by design: these MUST keep continue-on-error. All three are cron/dispatch-only, so promoting one
 # without also removing its `if:` would wedge every PR (see security.yml's own notes on trivy).
 # WHERE the flag sits differs: `sbom` carries it on the job, `trivy` on its one scan step, and a job
 # listed in _STEP_ADVISORY_JOBS below is graded there instead of by the job-level rule.
-_ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
+# `sbom-windows` is `sbom`'s Windows twin (the engine SBOM resolved on win32, ADR 0149's 2026-09-30
+# amendment) and carries the flag on the job, the same way.
+_ADVISORY_SECURITY_JOBS = frozenset({"sbom", "sbom-windows", "trivy"})
 
 # ADVISORY BY PLACEMENT: hard-failing, but NOT in branch protection. This is a third posture the file
 # previously could not express, and it is not new to the repo -- `dast.yml` already ships it and
@@ -93,7 +95,7 @@ _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
 # _ADVISORY_SECURITY_JOBS: these jobs MUST NOT carry continue-on-error. A job that can never report on
 # a PR cannot be required, but that is a reason to keep it out of branch protection -- not a reason to
 # discard its findings.
-_ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
+_ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit", "cla-action-audit"})
 
 # SUPERSEDED: hard-failing, reporting on EVERY pull request, and deliberately NOT required -- because a
 # required COMPOSITE now runs the same scan. Added 2026-09-16, when the owner removed these seven

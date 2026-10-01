@@ -160,11 +160,12 @@ def test_rule_fields_parity_with_model() -> None:
 def test_rule_fields_parity_guard_is_falsifiable() -> None:
     # Demonstrate the guard actually bites: drop a field from the tuple and set-equality with the model
     # breaks — the exact drift (a model field absent from the writer whitelist) the guard is there to
-    # catch. mute/content_label/escalate/schedule were the real drift this lane closed.
+    # catch. mute/escalate/schedule were the real drift this lane closed (a fourth, content_label, was
+    # removed from the model with ADR 0133 D3 by BACKLOG #1504).
     drifted = set(_RULE_FIELDS) - {"schedule"}
     assert drifted != set(AlertRule.model_fields)
-    for field in ("mute", "content_label", "escalate", "schedule"):
-        assert field in set(_RULE_FIELDS)  # the four keys #81/#143 added to the model, once dropped
+    for field in ("mute", "escalate", "schedule"):
+        assert field in set(_RULE_FIELDS)  # keys #81/#143 added to the model, once dropped
 
 
 def test_add_rejects_unknown_key_direct(tmp_path: Path) -> None:
@@ -190,7 +191,7 @@ def test_cli_add_rejects_unknown_key(tmp_path: Path, capsys: pytest.CaptureFixtu
 def test_add_writes_and_round_trips_newly_whitelisted_fields(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # #240 root fix: mute/content_label/escalate/schedule were in AlertRule but NOT _RULE_FIELDS, so
+    # #240 root fix: mute/escalate/schedule were in AlertRule but NOT _RULE_FIELDS, so
     # the writer silently dropped them. Now they must survive a GUI save round-trip through the real
     # engine load path (proving they are no longer stripped before the validate callback runs).
     svc = _svc(tmp_path)
@@ -198,7 +199,7 @@ def test_add_writes_and_round_trips_newly_whitelisted_fields(
     # against the transports this instance actually configures (a rule naming an unconfigured transport
     # refuses the engine at startup, so writing one from the editor is refused here rather than at the
     # next boot). Seed a real email transport — all THREE of host/from/to — so this test keeps testing
-    # what it is for: that mute/content_label/escalate/schedule survive the save round-trip.
+    # what it is for: that mute/escalate/schedule survive the save round-trip.
     svc.write_text(
         textwrap.dedent("""\
             [alerts]
@@ -209,9 +210,8 @@ def test_add_writes_and_round_trips_newly_whitelisted_fields(
         encoding="utf-8",
     )
     rule = {
-        "event_type": "content_match",
+        "event_type": "connection_stopped",
         "mute": True,
-        "content_label": "sepsis",
         "escalate": [{"after_count": 3, "severity": "critical", "transports": ["email"]}],
         "schedule": {
             "windows": [
@@ -226,7 +226,6 @@ def test_add_writes_and_round_trips_newly_whitelisted_fields(
     assert len(loaded) == 1
     r = loaded[0]
     assert r.mute is True
-    assert r.content_label == "sepsis"
     assert len(r.escalate) == 1 and r.escalate[0].after_count == 3
     assert r.schedule is not None and len(r.schedule.windows) == 1
 

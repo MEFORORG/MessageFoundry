@@ -12,17 +12,21 @@ can shape. None of it is a defect. All of it is worth knowing about before you d
 
 ## What this page covers
 
-Four things:
+Five things:
 
 1. **The engine wheel** -- the `messagefoundry` distribution itself.
 2. **The deployment path the project documents** -- the container image in `docker/`, and the
    Windows service scripts in `scripts/service/` (section 8).
 3. **The VS Code extension** in `ide/` (section 9, and its parsers in section 7).
 4. **The web console**, `messagefoundry_webconsole`, which the engine serves at `/ui` (section 10).
+5. **The toolkit**, `messagefoundry_toolkit`, shipped as the `messagefoundry-toolkit` distribution.
+   It holds the authoring commands that ADR 0201 moved out of the engine wheel, such as
+   `adr-analyze`. The scans in sections 4, 5 and 7 read it with the engine.
 
 The 2026-08-22 owner ruling on scope named the first two, and its purpose was to bring the
-deployment path in. It says nothing about the extension or the web console. Both ship to the same
-operators, so this page covers them too.
+deployment path in. It says nothing about the other three. The extension and the web console ship
+to the same operators, and the toolkit ships beside the engine at the same version. So this page
+covers all three.
 
 It does not cover your Routers and Handlers. Those are yours, and section 1 explains why that
 matters more than anything else here.
@@ -288,16 +292,21 @@ real clinical requirement for a paper control.
   cap can be disabled per connection, which is the operator's choice to make.
 - XML hardening in `parsing/xml/harden.py` against external-entity and entity-expansion attacks,
   with the lxml posture recorded in ADR 0015 and ADR 0122.
+- defusedxml's refusal of entity declarations, and of DTDs where the call site asks for that, at
+  the `xml.etree` parse sites: at least `RawMessage.xml()`, the Corepoint import and the SVG
+  sanitizer. It comes from a copy vendored in `_vendor/defusedxml/`. The SOAP gate in
+  `transports/soap.py` hardens its own `xml.sax` parser instead.
 - A pinned pydicom floor in ADR 0025 that excludes a known path-traversal issue.
 - Directory-listing names from a remote share checked as single safe path components before they
   are joined, so a partner cannot return a traversal sequence.
 
-**How the parser list is found.** A test reads the code, so the list comes from the tree rather
-than from memory. You can re-run the same scan over `messagefoundry/` and
+**How the parser list is found.** A test reads the code, so the list comes from the tree, not
+from memory. You can re-run the same scan over `messagefoundry/`, `messagefoundry_toolkit/` and
 `messagefoundry_webconsole/`. A module is a parse site when its syntax tree holds at least one of
 these:
 
-1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml`, `xml`,
+1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml` (or the
+   engine's vendored copy, `messagefoundry._vendor.defusedxml`), `xml`,
    `xmlschema`, `signxml`, `pydicom`, `pynetdicom`, `pyx12`, `fhir.resources`, `fhirpathpy`,
    `cbor2`, `webauthn`, `spnego` (the module the pyspnego package installs), `csv`,
    `email.parser`, `email.feedparser`, `pickle`, `marshal` or `shelve`.
@@ -366,7 +375,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | HL7 v2 | An inbound connection. Strict validation is opt-in. | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
 | MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
 | JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
-| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply | `parsing/message.py`, `parsing/xml/`, `transports/soap.py` |
+| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply. `_vendor/defusedxml/` is the vendored defusedxml copy the stdlib-parser sites parse through. | `parsing/message.py`, `parsing/xml/`, `_vendor/defusedxml/common.py`, `_vendor/defusedxml/ElementTree.py`, `transports/soap.py` |
 | X12 | An inbound whose content type is `x12` | `parsing/x12/` |
 | DICOM | An inbound DICOM association or payload | `parsing/dicom/`, `transports/dicom.py` |
 | A JSON payload for a database outbound | What a Handler built from a message | `transports/database.py` |
@@ -408,6 +417,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
 | The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
+| Decision records, for `messagefoundry-toolkit adr-analyze`. It reads each `[0-9]*.md` file at the top of the `--adr-dir` folder, `docs/adr` by default. Regular expressions pick out each record's status, acceptance criteria and open items. For each `tests/`, `fixtures/`, `samples/` or `harness/` path a criterion names, it checks whether that path exists under `--repo-root`. Nothing bounds a record's size, and a linked path may climb out of that root with `..`. So a record is only as trusted as its author. | `messagefoundry_toolkit/adr_analyze.py` |
 
 The first two tables rest on a judgement about where each input comes from, and the test cannot
 check that judgement. Re-read a row when its module changes what it reads.

@@ -63,6 +63,8 @@ from messagefoundry.config.settings import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import open_store, sqlite_settings
 from messagefoundry.store.privilege import (
+    AUDIT_APPEND_ONLY_TABLES,
+    SQLSERVER_AUDIT_WRITE_PRIVILEGES,
     SQLSERVER_DOCUMENTED_DATABASE_ROLES,
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
@@ -70,6 +72,7 @@ from messagefoundry.store.privilege import (
     PostgresRoleFacts,
     StorePrivilegeError,
     StorePrivilegeReport,
+    audit_write_alias,
     postgres_excess,
     run_store_privilege_preflight,
     sqlserver_excess,
@@ -638,6 +641,10 @@ def _probe_row(
         "default_schema": "dbo",
         "alter_schema": 0,
     }
+    # Owner ruling R16: the append-only audit tables, none of their row-changing rights held.
+    for table in AUDIT_APPEND_ONLY_TABLES:
+        for privilege in SQLSERVER_AUDIT_WRITE_PRIVILEGES:
+            row[audit_write_alias(table, privilege)] = 0
     for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
         row[f"srv_{i}"] = None if name in unread else int(name in server_roles)
     for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES):
@@ -853,6 +860,55 @@ async def test_no_row_at_all_is_still_unobservable(monkeypatch: pytest.MonkeyPat
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
     assert "returned no row" in report.detail
+
+
+# Owner ruling R16 (ASVS 16.4.2): the runtime login holds INSERT and SELECT only on the audit tables.
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [(None, ("DELETE on table audit_chain_meta",)), (SchemaManagement.AUTO, ())],
+    ids=["external", "auto"],
+)
+async def test_sqlserver_probe_names_an_audit_table_delete_under_external(
+    monkeypatch: pytest.MonkeyPatch, mode: SchemaManagement | None, expected: tuple[str, ...]
+) -> None:
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
+    row[audit_write_alias("audit_chain_meta", "DELETE")] = 1
+    store = _sqlserver_probe(monkeypatch, row, schema_management=mode)
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == expected
+
+
+@pytest.mark.parametrize(
+    ("mode", "roles", "status"),
+    [
+        (None, ("db_datareader", "db_datawriter"), StorePrivilegeStatus.UNOBSERVABLE),
+        (SchemaManagement.AUTO, ("db_datareader", "db_datawriter"), StorePrivilegeStatus.OBSERVED),
+        (None, ("db_datareader", "db_datawriter", "db_ddladmin"), StorePrivilegeStatus.OBSERVED),
+    ],
+    ids=["external", "auto", "external-already-over-granted"],
+)
+async def test_sqlserver_audit_table_grant_read_as_null_is_unread_only_where_it_decides(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: SchemaManagement | None,
+    roles: tuple[str, ...],
+    status: StorePrivilegeStatus,
+) -> None:
+    """A NULL means the login cannot resolve the table. External counts the audit grants, so there the
+    read is incomplete; auto does not count them, so the same NULL leaves its read whole. A login
+    already over-granted on what WAS read stays OBSERVED, so the start still refuses under enforce:
+    an unread audit grant must never soften a refusal into a warning."""
+    row = _probe_row(database_roles=roles)
+    row[audit_write_alias("audit_log", "UPDATE")] = None
+    store = _sqlserver_probe(monkeypatch, row, schema_management=mode)
+    report = await store.probe_principal_privileges()
+    assert report.status is status
+    if mode is None:
+        assert "UPDATE on table audit_log" in report.detail
+    if "db_ddladmin" in roles:
+        assert "database role db_ddladmin" in report.excess
 
 
 # --- the durable record -----------------------------------------------------------------------

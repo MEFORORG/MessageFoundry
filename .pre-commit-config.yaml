@@ -322,9 +322,12 @@ repos:
   #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper (literal test creds)
   #   ide/                    — TypeScript; no Python to scan
   #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+  #   messagefoundry/_vendor/defusedxml — upstream bytes pinned by tests/test_vendored_defusedxml.py,
+  #                             so a `# nosec` cannot be added. Its findings are its own stdlib XML
+  #                             imports, which are what it hardens; see the README in that directory.
   - repo: https://github.com/PyCQA/bandit
     rev: 1.9.4
     hooks:
       - id: bandit
         args: ["--skip", "B101,B110,B404,B608"]
-        exclude: ^(tests/|harness/|samples/|ide/|docs/benchmarks/results/|packaging/messagefoundry-webconsole/tests/)
+        exclude: ^(tests/|harness/|samples/|ide/|docs/benchmarks/results/|packaging/messagefoundry-webconsole/tests/|messagefoundry/_vendor/defusedxml/)
