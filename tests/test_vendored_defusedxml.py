@@ -147,9 +147,10 @@ def test_every_vendored_package_is_in_the_finalized_sbom(tmp_path: Path) -> None
     """A copy under messagefoundry/_vendor that the SBOM omits fails here.
 
     The tree is enumerated by NAME, not by the helper's own package test, so a single vendored module
-    the helper cannot see as a package cannot pass both.
+    the helper cannot see as a package cannot pass both. Only the helper's named extras are skipped.
     """
-    vendored = sorted(Path(p.name).stem for p in VENDOR.parent.iterdir() if p.name[:2] != "__")
+    extras = sbom_finalize._VENDOR_DIR_EXTRAS
+    vendored = sorted(Path(p.name).stem for p in VENDOR.parent.iterdir() if p.name not in extras)
     assert "defusedxml" in vendored, f"the enumeration found {vendored}; it has gone blind"
     listed = {
         prop["value"]
@@ -181,7 +182,7 @@ def test_the_sbom_component_carries_the_upstream_record(tmp_path: Path) -> None:
         for c in _finalized_sbom(tmp_path)["components"]
         if str(c.get("bom-ref")).startswith(sbom_finalize.VENDORED_REF_PREFIX)
     ]
-    assert (c["name"], c["version"]) == ("defusedxml", VENDORED_VERSION)
+    assert (c["type"], c["name"], c["version"]) == ("library", "defusedxml", VENDORED_VERSION)
     assert c["purl"] == f"pkg:pypi/defusedxml@{VENDORED_VERSION}"
     assert c["licenses"] == [{"license": {"id": "PSF-2.0"}}]
     assert "hashes" not in c and "components" not in c

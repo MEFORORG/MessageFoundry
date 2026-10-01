@@ -586,6 +586,9 @@ jobs:
         # continue-on-error: sbomqs is advisory HERE, so a download/checksum/parse hiccup must never skip
         # the SBOM-artifact upload below (the actual deliverable). This no longer matches release.yml:
         # there the install and pin check BLOCK and only the score is advisory (BACKLOG #1698).
+        # if: always(), like the IDE generator above: a failed Python SBOM must not leave the IDE one
+        # unscored (BACKLOG #2521).
+        if: always()
         continue-on-error: true
         run: |
           # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA

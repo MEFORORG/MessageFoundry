@@ -2820,15 +2820,19 @@ def _run_score_step(tmp_path: Path, body: str, fail: str) -> tuple[int, list[str
     return rc, log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
 
 
-#: Each workflow's two-SBOM score step: how to find it, then the SBOM scored first and second.
+#: Each workflow's two-SBOM score step: how to find it, the binary it must call, then the SBOM scored
+#: first and second. The release calls the binary its BLOCKING install verified, by absolute path, so
+#: no other `sbomqs` earlier on PATH can stand in for it.
 _SCORE_STEPS = {
     "release": (
         lambda: _release_step(_jobs()["release"], "sbomqs score"),
+        "/usr/local/bin/sbomqs",
         "messagefoundry-sbom.cdx.json",
         "messagefoundry-sbom-windows.cdx.json",
     ),
     "security": (
         lambda: _release_step(_security_jobs()["sbom"], "sbomqs score"),
+        "sbomqs",
         "sbom-python.cdx.json",
         "sbom-ide.cdx.json",
     ),
@@ -2854,8 +2858,10 @@ def test_a_failing_sbomqs_score_does_not_skip_the_other_sbom(
     step before the second SBOM was scored, and ``continue-on-error`` hid it. Each step must score
     both whatever either does, and still end non-zero when one failed, so the run shows it.
     """
-    find, first, second = _SCORE_STEPS[workflow]
+    find, binary, first, second = _SCORE_STEPS[workflow]
     body = str(find()["run"])
+    for sbom in (first, second):
+        assert re.search(rf"(?m)^\s*{re.escape(binary)} score -b {re.escape(sbom)}\b", body), sbom
     if pre_fix:
         assert " || rc=1" in body, "the pre-fix mutation's anchor is gone from the live step"
         body = body.replace(" || rc=1", "")

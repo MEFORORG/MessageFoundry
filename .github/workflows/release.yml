@@ -140,7 +140,7 @@ jobs:
           # `error`, not `ignore`: the `release` job needs this file, and a missing one must fail HERE
           # with the cause named rather than at a download step two jobs later.
           if-no-files-found: error
-          # A hand-off, not the record: the signed copy on the GitHub release is (BACKLOG #2521). After a
+          # A hand-off: the signed copy on the GitHub release is the record (BACKLOG #2521). After a
           # day, re-run ALL jobs; re-running `release` alone fails at its download step, by name.
           retention-days: 1
 

@@ -63,7 +63,8 @@ from pathlib import Path
 from typing import Any
 
 # metadata.lifecycles is a CycloneDX 1.5+ field; injecting it into an older-spec BOM would be invalid.
-_LIFECYCLE_SPECS = {"1.5", "1.6", "1.7"}
+# Compared as numbers within major version 1 (see _spec_1x_at_least), so 1.8 qualifies and 2.0 does not.
+_LIFECYCLE_MINOR = 5
 # CycloneDX lifecycle phase enum (1.5+). "build" is the phase these SBOMs are produced in.
 _PHASES = {"design", "pre-build", "build", "post-build", "operations", "discovery", "decommission"}
 # The metadata.properties name --record-sys-platform writes. Namespaced to this project: the `cdx:`
@@ -88,9 +89,9 @@ _FILE_ROW = re.compile(r"^\| `([^`]+)` \| [^|]+ \| `([0-9a-f]{64})` \|$", re.M)
 # What may sit directly under the vendor directory beside the package directories. Anything else, such
 # as a single vendored module, fails the run rather than being left out of the SBOM.
 _VENDOR_DIR_EXTRAS = frozenset({"__init__.py", "__pycache__", "README.md"})
-# A single SPDX licence id. Anything else (`MIT OR Apache-2.0`) is an expression, which CycloneDX
-# carries in its own field: license.id must be one id.
-_SPDX_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]*")
+# A single SPDX licence id. Anything else (`MIT OR Apache-2.0`, `LicenseRef-x`) goes in CycloneDX's
+# `expression` field: license.id must be one id from the SPDX list. This does not check the list.
+_SPDX_ID = re.compile(r"(?!LicenseRef-|DocumentRef-)[A-Za-z0-9][A-Za-z0-9.+-]*")
 
 
 class VendoredRecordError(ValueError):
@@ -114,16 +115,21 @@ def _vendored_component(package: Path) -> dict[str, Any]:
         text = readme.read_text(encoding="utf-8")
     except OSError as exc:
         raise VendoredRecordError(f"{package} has no readable README.md: {exc}") from exc
-    found = {key: m.groups() for key, p in _README_FIELDS.items() if (m := p.search(text))}
-    missing = [key for key in _README_FIELDS if key not in found]
+    hits = {key: [m.groups() for m in p.finditer(text)] for key, p in _README_FIELDS.items()}
+    missing = [key for key, rows in hits.items() if not rows]
     files = _FILE_ROW.findall(text)
     if not files:
         missing.append("per-file upstream SHA-256 rows")
     if missing:
         raise VendoredRecordError(f"{readme} does not record: {', '.join(missing)}")
+    # A second row is a stale one left beside its replacement, and the first match is not
+    # necessarily the true one, so refuse rather than guess.
     names = [file_name for file_name, _ in files]
-    if repeated := sorted({n for n in names if names.count(n) > 1}):
+    repeated = [key for key, rows in hits.items() if len(rows) > 1]
+    repeated += sorted({n for n in names if names.count(n) > 1})
+    if repeated:
         raise VendoredRecordError(f"{readme} records {', '.join(repeated)} more than once")
+    found = {key: rows[0] for key, rows in hits.items()}
     name, version = found["upstream"]
     (licence,) = found["licence"]
     module = _module_path(package)
@@ -186,7 +192,11 @@ def vendored_components(vendor_dir: Path) -> list[dict[str, Any]]:
         raise VendoredRecordError(
             f"no vendored package (a directory with __init__.py) in {vendor_dir}"
         )
-    return [_vendored_component(p) for p in entries]
+    components = [_vendored_component(p) for p in entries]
+    refs = [c["bom-ref"] for c in components]
+    if repeated := sorted({r for r in refs if refs.count(r) > 1}):
+        raise VendoredRecordError(f"two vendored packages record the same release: {repeated}")
+    return components
 
 
 def _add_vendored(doc: dict[str, Any], vendored: list[dict[str, Any]], root_ref: object) -> None:
@@ -218,13 +228,16 @@ def _add_vendored(doc: dict[str, Any], vendored: list[dict[str, Any]], root_ref:
             deps.append(root)
         prior = root.get("dependsOn")
         root["dependsOn"] = [*(prior if isinstance(prior, list) else []), *refs]
-    doc["dependencies"] = [*deps, *({"ref": r} for r in refs)]
+        deps += [{"ref": r} for r in refs]
+    if deps or "dependencies" in doc:
+        doc["dependencies"] = deps
 
 
-def _spec_at_least(spec: str, floor: tuple[int, int]) -> bool:
-    """Whether a ``major.minor`` specVersion is at or above ``floor``, compared as numbers."""
-    m = re.fullmatch(r"(\d+)\.(\d+)", spec)
-    return m is not None and (int(m[1]), int(m[2])) >= floor
+def _spec_1x_at_least(spec: str, minor: int) -> bool:
+    """Whether specVersion is ``1.<n>`` with ``n >= minor``, compared as numbers. A 2.x spec does not
+    qualify: a new major version may move the fields this writes."""
+    m = re.fullmatch(r"1\.(\d+)", spec)
+    return m is not None and int(m[1]) >= minor
 
 
 def _read_version(path: Path) -> str | None:
@@ -274,7 +287,8 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="Add one component per vendored package directly under DIR (e.g. "
         "messagefoundry/_vendor), read from each package's README.md. Fails if a package's "
-        "README does not record everything the component needs.",
+        "README does not record everything the component needs, or if anything else under DIR "
+        "is not a package directory.",
     )
     args = ap.parse_args(argv)
 
@@ -293,10 +307,9 @@ def main(argv: list[str] | None = None) -> int:
         fatal.append("specVersion is missing")
     vendored: list[dict[str, Any]] = []
     if args.vendored_from is not None:
-        # Every field it writes is in the CycloneDX 1.4 schema: properties arrived in 1.3. Compared as
-        # numbers, so a later spec passes rather than tripping an allowlist of known versions.
-        if not _spec_at_least(spec, (1, 4)):
-            fatal.append(f"--vendored-from needs CycloneDX 1.4 or later, and this BOM is {spec!r}")
+        # Every field it writes is in the CycloneDX 1.4 schema: properties arrived in 1.3.
+        if not _spec_1x_at_least(spec, 4):
+            fatal.append(f"--vendored-from needs CycloneDX 1.4 to 1.x, and this BOM is {spec!r}")
         else:
             try:
                 vendored = vendored_components(args.vendored_from)
@@ -315,12 +328,13 @@ def main(argv: list[str] | None = None) -> int:
         doc["metadata"] = metadata
 
     # --- (1) declare the lifecycle / generation context (CISA "Build" type) -------------------------
-    if spec in _LIFECYCLE_SPECS:
+    if _spec_1x_at_least(spec, _LIFECYCLE_MINOR):
         if not metadata.get("lifecycles"):
             metadata["lifecycles"] = [{"phase": args.phase}]
     else:
         print(
-            f"::warning::sbom_finalize: specVersion {spec} predates metadata.lifecycles (1.5+); "
+            f"::warning::sbom_finalize: specVersion {spec} is not 1.5 to 1.x, where "
+            "metadata.lifecycles is defined; "
             "skipping lifecycle injection",
             file=sys.stderr,
         )

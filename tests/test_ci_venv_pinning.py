@@ -335,6 +335,8 @@ _WIN_PY = f'"{_WIN}/Scripts/python.exe"'
             False,
             True,
         ),
+        # A quote closing unrelated text is not a quoted pip.
+        (_WIN, f'echo "{_WIN} needs no pip" install x', False, False),
         # The control: a line naming the venv that installs nothing must match neither.
         (_WIN, f"python -m cyclonedx_py environment {_WIN_PY} \\", False, False),
     ],
@@ -378,9 +380,10 @@ _PIP_VALUE_FLAGS = (
     "--resume-retries",
 )
 # `pip`, `pip3.14`, and a quoted `".../Scripts/pip.exe"` (BACKLOG #2521): a spelling this misses is an
-# install no pin rule ever sees.
+# install no pin rule ever sees. The closing quote counts only after a path, so `echo "upgrade pip"
+# install` stays text.
 _PIP_INSTALL = re.compile(
-    r"\bpip[\d.]*(?:\.exe)?\"?\s+(?:(?:(?:"
+    r"(?:(?<=/)pip[\d.]*(?:\.exe)?\"?|\bpip[\d.]*(?:\.exe)?)\s+(?:(?:(?:"
     + "|".join(re.escape(f) for f in _PIP_VALUE_FLAGS)
     + r")\s+\S+|-\S+)\s+)*install\b"
 )

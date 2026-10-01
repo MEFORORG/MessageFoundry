@@ -298,12 +298,23 @@ def test_an_empty_or_missing_vendor_dir_fails(tmp_path: Path):
     assert sbom_finalize.main([str(p), "--vendored-from", str(tmp_path / "absent")]) == 1
 
 
-@pytest.mark.parametrize(("spec", "rc"), [("1.3", 1), ("1.4", 0), ("1.8", 0), ("2.10", 0)])
-def test_vendoring_needs_cyclonedx_1_4_compared_as_numbers(tmp_path: Path, spec: str, rc: int):
-    """Every field --vendored-from writes is in the 1.4 schema. A LATER spec must pass: an allowlist
-    of known versions would fail a release the day the generator moved to one it had not seen."""
+@pytest.mark.parametrize(("spec", "rc"), [("1.3", 1), ("1.4", 0), ("1.8", 0), ("2.0", 1)])
+def test_vendoring_needs_cyclonedx_1_4_to_1_x_compared_as_numbers(
+    tmp_path: Path, spec: str, rc: int
+):
+    """Every field --vendored-from writes is in the 1.4 schema. A LATER 1.x must pass: an allowlist of
+    known versions would fail a release the day the generator moved to one it had not seen. A 2.x may
+    move those fields, so it fails closed."""
     p = _write_bom(tmp_path, specVersion=spec)
     assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == rc
+
+
+@pytest.mark.parametrize(("spec", "lifecycles"), [("1.4", None), ("1.8", [{"phase": "build"}])])
+def test_the_lifecycle_gate_compares_numbers_too(tmp_path: Path, spec: str, lifecycles: object):
+    """The lifecycle gate once was an allowlist, so a 1.8 BOM silently lost its CISA Build type."""
+    p = _write_bom(tmp_path, specVersion=spec)
+    assert sbom_finalize.main([str(p)]) == 0
+    assert _read(p)["metadata"].get("lifecycles") == lifecycles
 
 
 def test_a_single_vendored_module_fails_the_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
@@ -315,12 +326,32 @@ def test_a_single_vendored_module_fails_the_run(tmp_path: Path, capsys: pytest.C
     assert "six.py" in capsys.readouterr().err
 
 
-def test_a_file_recorded_twice_fails_the_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    """Two rows for one file would give two file entries the same name and only one digest true."""
-    row = next(ln for ln in _GOOD_README.splitlines() if ln.startswith("| `common.py`"))
+@pytest.mark.parametrize(
+    ("row_start", "needle"),
+    [
+        ("| `common.py`", "common.py more than once"),
+        ("| Upstream version |", "upstream more than once"),
+    ],
+    ids=["file-row", "version-row"],
+)
+def test_a_row_recorded_twice_fails_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], row_start: str, needle: str
+):
+    """A second row is usually a stale one left beside its replacement. The first match is not
+    necessarily the true one, so the run refuses rather than recording a stale version or digest."""
+    row = next(ln for ln in _GOOD_README.splitlines() if ln.startswith(row_start))
     vendor = _fake_vendor(tmp_path, _GOOD_README.replace(row, f"{row}\n{row}"))
     assert sbom_finalize.main([str(_write_bom(tmp_path)), "--vendored-from", str(vendor)]) == 1
-    assert "common.py more than once" in capsys.readouterr().err
+    assert needle in capsys.readouterr().err
+
+
+def test_two_packages_recording_one_release_fail_the_run(tmp_path: Path):
+    """They would share one bom-ref, which CycloneDX requires to be unique."""
+    vendor = _fake_vendor(tmp_path, _GOOD_README)
+    (vendor / "twin").mkdir()
+    (vendor / "twin" / "__init__.py").write_text("", encoding="utf-8")
+    (vendor / "twin" / "README.md").write_text(_GOOD_README, encoding="utf-8")
+    assert sbom_finalize.main([str(_write_bom(tmp_path)), "--vendored-from", str(vendor)]) == 1
 
 
 @pytest.mark.parametrize(
@@ -328,10 +359,12 @@ def test_a_file_recorded_twice_fails_the_run(tmp_path: Path, capsys: pytest.Capt
     [
         ("PSF-2.0", {"license": {"id": "PSF-2.0"}}),
         ("MIT OR Apache-2.0", {"expression": "MIT OR Apache-2.0"}),
+        ("LicenseRef-Vendor", {"expression": "LicenseRef-Vendor"}),
     ],
 )
 def test_an_spdx_expression_is_carried_as_an_expression(tmp_path: Path, spdx: str, licence: dict):
-    """CycloneDX's license.id holds one SPDX id; a compound licence belongs in ``expression``."""
+    """CycloneDX's license.id holds one id from the SPDX list; a compound licence or a
+    ``LicenseRef-`` belongs in ``expression``."""
     vendor = _fake_vendor(tmp_path, _GOOD_README.replace("SPDX `PSF-2.0`", f"SPDX `{spdx}`"))
     p = _write_bom(tmp_path)
     assert sbom_finalize.main([str(p), "--vendored-from", str(vendor)]) == 0

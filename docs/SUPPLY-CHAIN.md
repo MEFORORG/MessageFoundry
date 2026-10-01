@@ -166,7 +166,7 @@ have not, the document says nothing about that CVE and your scanner's finding st
   Continuously vuln-scanned by **Trivy** (with our VEX applied).
 
 Every generated SBOM declares `metadata.lifecycles = [{phase: build}]` (CISA "Build" SBOM Type). Both
-engine SBOMs and the npm extension SBOM are quality-scored by **sbomqs** on each `security.yml` run,
+engine SBOMs and the npm extension SBOM are quality-scored by **sbomqs** on each scheduled or manual `security.yml` run,
 and a release scores both engine SBOMs. `security.yml` scores the Windows engine SBOM on its Windows
 runner with the Windows build of sbomqs; a release scores it with the Linux build. The container-image
 SBOM is retained unscored (artifact `sbom-container-image`). Run `sbomqs score -b` against it on demand. Our format choice
