@@ -1531,14 +1531,20 @@ with no page.
 - **A directory grant.** An account that gets Administrator because the *directory* added it to a
   group already mapped to Administrator raises no `administrator_granted` alert. The API's
   user-administration routes raise that alert, and a directory change does not pass through them.
-  The engine does see the grant, at the account's next sign-in. It writes an
-  `auth.ad_roles_resynced` audit row with the old and new roles. Where a notifier is configured,
-  it also sends a roles-changed notice to that account's own notification address. Neither is an
-  alert. An account that holds a live session when the directory changes is seen sooner, by the
-  [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
-  while it is on, which is the default. It revokes the session and raises `ad_session_revoked`
-  with reason `roles_changed`, which does not name the role. An account with no live session
-  raises no alert at all, so watch membership of the mapped group in the directory itself.
+  The engine does see the grant, in one of two places. Neither names the role in an alert.
+  - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
+    with the old and new roles. It also sends a best-effort roles-changed notice to that
+    account's own notification address, when the account has one and security notices are set
+    up. It raises no alert.
+  - **Sooner, when the account holds a live session.** A pass of the
+    [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
+    that completes stores the new roles and revokes the session. It writes
+    `auth.ad_session_revoked` with the new roles, sends the same notice, and raises
+    `ad_session_revoked` with reason `roles_changed`. The next sign-in then writes no
+    `auth.ad_roles_resynced` row. That section lists when a pass revokes or alerts nothing.
+
+  So an account with no live session raises no alert at all. Watch membership of the mapped group
+  in the directory itself.
   **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
 
 The check also flags some releases that changed nothing. A login that rehashes a password after an
@@ -3589,15 +3595,19 @@ inherited from another caller. It is surfaced on `GET /audit` and in the `audit:
 > rather than merely lossy. `audit_log.client` is the per-action address and is the one to trust.
 
 **Tamper-evidence (AUDIT-INTEGRITY).** Each `audit_log` row carries a `row_hash` that chains the
-previous row's hash with this row's content, so deleting, editing, or reordering any row is
-detectable. On a keyed chain the digest is HMAC-SHA-256 under a key derived from the store key, so
-someone who can write rows but does not hold the key cannot recompute it. Under
-`cipher_provider = "vault_transit"` the MAC is computed inside Transit instead. On a keyless chain
-the digest is plain SHA-256, which anyone who can write the table can recompute. A store that has a
-key can still hold a keyless chain:
-[ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, says when
-a chain is keyed. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
-surviving row was edited or reordered. **A scheduled job reads the exit code and nothing else, so
+previous row's hash with this row's content, so a deleted, edited or reordered row no longer fits
+the chain. What that proves depends on the key. On a keyed row the digest is HMAC-SHA-256 under a
+key derived from the store key. Someone who can write rows but does not hold the key cannot
+recompute it. Under `cipher_provider = "vault_transit"` the MAC is computed inside Transit instead.
+On a keyless row the digest is plain SHA-256, which anyone who can write the table can recompute.
+So a keyless chain shows corruption or a careless edit, not a rewrite by someone who can write the
+table. A store that has a key can still hold a keyless chain, or one keyed only from a later row
+on. [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, says
+which rows are keyed. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless digest
+only, and it said any such change is detectable without that condition. Verify the chain with
+`messagefoundry audit-verify` — exit 0 means at least that no surviving row was edited or
+reordered by someone who could not recompute the chain.
+**A scheduled job reads the exit code and nothing else, so
 these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
 path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an
 absent path, a zero-byte file, a file carrying no `audit_log` table, and a path that is not a SQLite
