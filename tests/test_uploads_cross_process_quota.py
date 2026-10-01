@@ -53,7 +53,7 @@ def _shard_result(
     *,
     db_path: Path,
     uploads_dir: Path,
-    key: bytes,
+    key: str,
     barrier: threading.Barrier,
     filename: str,
     body: bytes,

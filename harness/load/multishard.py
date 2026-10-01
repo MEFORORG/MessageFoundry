@@ -42,6 +42,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.report import NoLoss
@@ -58,6 +59,10 @@ from harness.load.failover import EngineNode, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+
+if TYPE_CHECKING:
+    from messagefoundry.api.models import ConnectionRow
+    from messagefoundry.apiclient import EngineClient
 
 _CONFIG_DIR = "harness/config/connscale"
 _STOP_GRACE = 5.0
@@ -91,8 +96,11 @@ class EngineAttribution:
     inbound_rows: int  # number of inbound (source) connection rows this engine reports
     foreign_rows: int  # inbound rows whose name does NOT carry this engine's tag (a steal ⇒ > 0)
     reads: int  # Σ inbound read across this engine's own rows
-    #: The engine's OWN reason for each lane it reports as not-listening, verbatim from `/connections`
+    #: The engine's OWN reason for each lane it reports as not-listening, from `/connections`
     #: (`error`, which the API sets from `inbound_failed()`/`outbound_failed()` per ADR 0031).
+    #: The API masks `error` until a per-connection reveal (BACKLOG #2443), so a reason reads `****`
+    #: past the harness's reveal cap or after a refused reveal, and `(reason withheld)` when the
+    #: caller may not see the field at all. Neither is engine text.
     #:
     #: CARRIED BECAUSE `reads == 0` CANNOT DIAGNOSE ITSELF WITHOUT IT, and the engine already knows.
     #: `inbound_rows` and `foreign_rows` are CONFIG-derived, not traffic-derived -- the API appends a
@@ -705,6 +713,7 @@ def _attribute_engines_sync(
             client = EngineClient(node.url, cacert=node.cacert)
             try:
                 rows = client.connections()
+                reasons = _reveal_failed_reasons(client, rows)
             finally:
                 client.close()
         except ApiError:
@@ -729,11 +738,57 @@ def _attribute_engines_sync(
             # guaranteed and a default would only ever mask a RENAME -- after which this would report
             # "no failed lanes" forever, silently, on exactly the runs it exists to explain. A
             # diagnostic field that fails closed to "nothing to report" is worse than no field.
-            if row.error:
-                failed.append(f"{row.name}: {row.error}")
+            # Detection also reads `status`, because `error` is null for a caller without
+            # messages:view_summary (BACKLOG #2443) and the failure must not vanish with it.
+            if _lane_failed(row):
+                reason = reasons.get(row.channel_id) or row.error or "(reason withheld)"
+                failed.append(f"{row.name}: {reason}")
         out.append(
             EngineAttribution(node.node_id, tag, inbound_rows, foreign_rows, reads, tuple(failed))
         )
+    return out
+
+
+#: How many failed lanes per engine get their reason revealed. Each reveal is one audited PHI read
+#: that spends the per-actor budget, so a run with every lane down must not spend it all here.
+_REVEAL_FAILED_CAP = 5
+
+#: The dashboard statuses that mean "this lane is not listening, and the engine knows why".
+_NOT_LISTENING = frozenset({"failed", "filtered"})
+
+
+def _lane_failed(row: ConnectionRow) -> bool:
+    """True for an inbound lane the engine reports as not listening. Keyed on ``status`` as well as
+    ``error``: ``error`` is null for a caller without ``messages:view_summary`` (BACKLOG #2443)."""
+    return row.status in _NOT_LISTENING or bool(row.error)
+
+
+def _reveal_failed_reasons(client: EngineClient, rows: list[ConnectionRow]) -> dict[str, str]:
+    """The whole failure reason for up to :data:`_REVEAL_FAILED_CAP` failed inbound lanes.
+
+    ``/connections`` masks ``error`` as ``****`` until a per-connection reveal (BACKLOG #2443), and
+    a reason that reads ``****`` cannot explain a ``reads == 0`` run. So each failed lane is
+    revealed by its own request. A lane past the cap, or one after a refused reveal, gets no
+    entry here, and the caller falls back to the row's own ``error`` (``****``, or null for a
+    caller without that permission). That still says the lane failed, which is the half the
+    diagnosis needs most."""
+    from messagefoundry.apiclient import ApiError
+
+    names = [r.channel_id for r in rows if r.read is not None and _lane_failed(r)]
+    out: dict[str, str] = {}
+    for name in names[:_REVEAL_FAILED_CAP]:
+        try:
+            shown = client.connections(reveal=name)
+        except ApiError:
+            # A refusal (no messages:view_summary, out of scope) or a spent PHI budget answers
+            # every later reveal the same way, and each would leave one more audit row.
+            break
+        reason = next(
+            (r.error for r in shown if r.read is not None and r.channel_id == name and r.error),
+            None,
+        )
+        if reason is not None:
+            out[name] = reason
     return out
 
 

@@ -26,9 +26,10 @@ makes that impossible in the ways a test mechanically can:
    on a fresh ``ServiceSettings()`` (same mechanism as ``tests/test_cloud_phi_hipaa_doc_drift.py``).
 5. **Numeric parity** — every default and constant the doc quotes is asserted against the **live**
    value by import, so a code-side change fails CI naming the doc row it invalidates.
-6. **Shell-site invariant** — the set of modules under ``messagefoundry/`` that execute through a
-   shell or an elevation verb must stay exactly the curated pair the 15.1.5 table documents. A new
-   one fails with "add a Dangerous functionality row".
+6. **Shell-site invariant** — the set of modules under ``messagefoundry/`` and
+   ``messagefoundry_toolkit/`` that execute through a shell or an elevation verb must stay exactly
+   the curated pair the 15.1.5 table documents. A new one fails with "add a Dangerous functionality
+   row". The process-start inventory reads the same two roots.
 
 What this guard structurally cannot do is discover *tomorrow's* surface: an enumerative table pins
 today's rows only (15.1.4 exhibited exactly that failure mode when pydicom/signxml landed later). The
@@ -62,12 +63,16 @@ import os
 import re
 import tokenize
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PKG = _ROOT / "messagefoundry"
+_TOOLKIT = _ROOT / "messagefoundry_toolkit"
+_TOOLKIT_PREFIX = f"{_TOOLKIT.name}/"
 
 #: Point this at a copy of the document (e.g. the vault working tree) to enforce the content half
 #: from a checkout that does not carry it.
@@ -523,8 +528,29 @@ def _key_resolves(section: str, key: str) -> bool:
     return any(f == key or f.startswith(key + "_") for f in fields)
 
 
-def _package_py_files() -> list[Path]:
-    return sorted(p for p in _PKG.rglob("*.py") if p.is_file())
+@functools.cache
+def _scanned_py_files() -> Mapping[str, Path]:
+    """Every module the site scans read, keyed as the 15.1.5 registries name it. Cached, so the
+    mapping is read-only: two test modules share the one instance.
+
+    The engine, and the toolkit that ADR 0201 split out of it (BACKLOG #2517): a process start that
+    moves into ``messagefoundry_toolkit/`` must not leave the inventory. Engine keys carry no prefix
+    and toolkit keys carry their package name, so the two ``__main__.py`` files stay distinct.
+    ``tests/test_dangerous_functionality_doc.py`` reads its inventories through this too, so the two
+    files cannot disagree on which roots are scanned or how they are keyed.
+    """
+    return MappingProxyType(
+        {
+            prefix + path.relative_to(root).as_posix(): path
+            for root, prefix in ((_PKG, ""), (_TOOLKIT, _TOOLKIT_PREFIX))
+            for path in sorted(root.rglob("*.py"))
+            if path.is_file()
+        }
+    )
+
+
+def _scanned_code() -> dict[str, str]:
+    return {key: _code_text(path) for key, path in _scanned_py_files().items()}
 
 
 # --- 1. structure -------------------------------------------------------------------------------
@@ -1051,6 +1077,11 @@ def test_hl7_batch_split_is_still_unbounded_in_message_count() -> None:
 # --- 6. shell-execution-site invariant -----------------------------------------------------------
 
 
+def _shell_sites(code: dict[str, str]) -> set[str]:
+    """The keys of ``code`` (module key to code-only text) that carry a shell or elevation token."""
+    return {key for key, text in code.items() if any(token in text for token in _SHELL_TOKENS)}
+
+
 def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
     """Locks the corrected 15.1.5 claim: shell/elevation execution lives ONLY where documented.
 
@@ -1059,15 +1090,12 @@ def test_shell_execution_sites_are_exactly_the_documented_set() -> None:
     launches an elevated ``cmd.exe``/``powershell.exe``. The doc now names both as deliberate
     exceptions with their own guards; a NEW shell site anywhere else must add a row.
     """
-    found: set[str] = set()
-    for path in _package_py_files():
-        text = _code_text(path)
-        if any(token in text for token in _SHELL_TOKENS):
-            found.add(path.relative_to(_PKG).as_posix())
+    found = _shell_sites(_scanned_code())
     expected = set(_ALLOWED_SHELL_SITES)
     unexpected = sorted(found - expected)
     assert not unexpected, (
-        "a new shell-execution / elevation site landed in messagefoundry/ — add a "
+        "a new shell-execution / elevation site landed in messagefoundry/ or "
+        "messagefoundry_toolkit/ — add a "
         f"'Dangerous functionality' row to THREAT-MODEL.md (ASVS 15.1.5) for: {unexpected}"
     )
     vanished = sorted(expected - found)
@@ -1150,7 +1178,8 @@ def test_shared_anchor_row_pinning_detects_a_planted_deletion(
 
 # --- 15.1.5: the "complete subprocess inventory" claim, made falsifiable ------------------------
 
-#: Every module under ``messagefoundry/`` that spawns a process, and why the 15.1.5 table admits it.
+#: Every module under ``messagefoundry/`` or ``messagefoundry_toolkit/`` (keyed with that prefix) that
+#: spawns a process, and why the 15.1.5 table admits it. The toolkit has none today.
 #: The doc claims this set is COMPLETE; ``tray/branding.py`` shipped undocumented under that claim
 #: because the only guard scanned for SHELL tokens, and a list-form ``Popen`` carries none.
 _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
@@ -1186,12 +1215,9 @@ _SUBPROCESS_RE = re.compile(
 )
 
 
-def _subprocess_sites() -> set[str]:
-    return {
-        path.relative_to(_PKG).as_posix()
-        for path in sorted(_PKG.rglob("*.py"))
-        if _SUBPROCESS_RE.search(_code_text(path))
-    }
+def _subprocess_sites(code: dict[str, str]) -> set[str]:
+    """The keys of ``code`` (module key to code-only text) that start a process."""
+    return {key for key, text in code.items() if _SUBPROCESS_RE.search(text)}
 
 
 def test_site_scans_ignore_mentions() -> None:
@@ -1222,7 +1248,7 @@ def test_subprocess_sites_are_exactly_the_documented_set() -> None:
     ``tray/branding.py::relaunch_branded`` is — shipped with the suite green next to a doc sentence
     claiming the inventory was complete.
     """
-    live = _subprocess_sites()
+    live = _subprocess_sites(_scanned_code())
     known = set(_ALLOWED_SUBPROCESS_SITES)
     assert live == known, (
         f"the subprocess-site set changed: {sorted(live ^ known)}. Add a Dangerous functionality row "
@@ -1234,6 +1260,28 @@ def test_subprocess_sites_are_exactly_the_documented_set() -> None:
     assert not undocumented, (
         f"subprocess site(s) not named anywhere in the 15.1.5 section: {undocumented}"
     )
+
+
+def test_the_site_scans_read_the_toolkit() -> None:
+    """The toolkit starts no process today, so a scan that skipped it would pass the same way.
+
+    So the toolkit must be read, keyed apart from the engine, and a process start or shell token
+    planted in it must reach both inventories (BACKLOG #2517). The plant goes into the toolkit's
+    own ``__main__.py`` key: under engine-relative keys it would land on the engine's file instead.
+    """
+    files = _scanned_py_files()
+    toolkit = [key for key in files if key.startswith(_TOOLKIT_PREFIX)]
+    assert len(toolkit) >= 2, f"the toolkit is not scanned: {toolkit}"
+    main_keys = ("__main__.py", f"{_TOOLKIT_PREFIX}__main__.py")
+    assert all(key in files for key in main_keys), "the two __main__.py files share one key"
+    assert files[main_keys[0]] != files[main_keys[1]]
+    code = _scanned_code()
+    planted_key = main_keys[1]
+    planted = {**code, planted_key: code[planted_key] + "\nsubprocess.run(argv, shell=True)\n"}
+    assert planted_key in _subprocess_sites(planted)  # and so outside _ALLOWED_SUBPROCESS_SITES
+    assert planted_key in _shell_sites(planted)
+    # Control: unplanted, the toolkit holds neither kind of site, which is why the plant is needed.
+    assert planted_key not in _subprocess_sites(code) | _shell_sites(code)
 
 
 # --- 15.1.3: the relative links the sections cite must resolve ---------------------------------

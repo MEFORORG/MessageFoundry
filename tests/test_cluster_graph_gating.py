@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from typing import Any
 
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.cluster import NullCoordinator
@@ -321,7 +322,7 @@ async def test_active_passive_recovers_inflight_on_promotion(tmp_path: Path) -> 
     calls: list[int] = []
     orig = eng.store.reset_stale_inflight
 
-    async def _spy(*a: object, **k: object) -> int:
+    async def _spy(*a: Any, **k: Any) -> int:
         calls.append(1)
         return await orig(*a, **k)
 

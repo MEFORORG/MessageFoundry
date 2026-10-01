@@ -37,6 +37,7 @@ from messagefoundry.config.models import ContentType, OrderingMode, RetryPolicy
 from messagefoundry.config.settings import DeliverySettings
 from messagefoundry.config.wiring import (
     Http,
+    InboundConnection,
     Registry,
     Rest,
     WiringError,
@@ -122,6 +123,7 @@ async def test_a_long_outage_burns_the_cap_on_the_head_not_the_backlog(store: Me
     ]
 
     t = 0.0
+    assert retry.max_attempts is not None
     for _ in range(retry.max_attempts):
         head = await store.claim_next_fifo("d1", now=t)
         assert head is not None, f"the FIFO head was not claimable at t={t}"
@@ -159,7 +161,9 @@ async def test_a_dead_lettered_row_stays_replayable(store: MessageStore) -> None
         t += 10
 
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DEAD.value
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
     assert len(await store.list_dead(channel_id="c1")) == 1  # visible to the operator
 
     assert await store.replay_dead(channel_id="c1", now=t) == 1
@@ -168,12 +172,14 @@ async def test_a_dead_lettered_row_stays_replayable(store: MessageStore) -> None
     assert row["status"] == OutboxStatus.PENDING.value
     assert row["attempts"] == 0  # a full budget again, not a row wedged at the cap
     assert row["last_error"] is None
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     # Claimable again — the strongest form of "replayable" is that a worker can actually take it.
     assert await store.claim_next_fifo("d1", now=t) is not None
 
 
-def _sync_reply_graph() -> tuple[Registry, object]:
+def _sync_reply_graph() -> tuple[Registry, InboundConnection]:
     """A ``reply_from`` graph that declares NO retry policy — the shape whose effective cap comes
     entirely from ``[delivery]``, which is what the startup refusal reads."""
     reg = Registry()

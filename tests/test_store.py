@@ -10,6 +10,7 @@ import contextlib
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -31,16 +32,22 @@ async def store(tmp_path):
 
 async def test_open_uses_wal_and_normal_synchronous(store: MessageStore) -> None:
     cur = await store._db.execute("PRAGMA journal_mode")
-    assert str((await cur.fetchone())[0]).lower() == "wal"
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert str(fetched_row[0]).lower() == "wal"
     cur = await store._db.execute("PRAGMA synchronous")
-    assert (await cur.fetchone())[0] == 1  # NORMAL — crash-safe under WAL, faster than FULL
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row[0] == 1  # NORMAL — crash-safe under WAL, faster than FULL
 
 
 async def test_open_honors_full_synchronous(tmp_path) -> None:
     s = await MessageStore.open(tmp_path / "full.db", synchronous="FULL")
     try:
         cur = await s._db.execute("PRAGMA synchronous")
-        assert (await cur.fetchone())[0] == 2  # FULL
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row[0] == 2  # FULL
     finally:
         await s.close()
 
@@ -70,7 +77,6 @@ _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="icacls DACL 
 
 def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     """Capture the icacls argv _secure_file would run (no real icacls), as the user 'minter'."""
-    import messagefoundry.store.store as store_mod
 
     captured: list[list[str]] = []
 
@@ -80,9 +86,13 @@ def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         stdout = ""
 
     monkeypatch.setenv("USERNAME", "minter")
-    monkeypatch.setattr(
-        store_mod.subprocess, "run", lambda argv, **kw: (captured.append(argv), _R())[1]
-    )
+
+    def _run(argv: list[str], **kw: object) -> _R:
+        captured.append(argv)
+        return _R()
+
+    # The same module object store.py calls run() on.
+    monkeypatch.setattr(subprocess, "run", _run)
     return captured
 
 
@@ -219,6 +229,7 @@ async def test_enqueue_creates_message_and_outbox_rows(store: MessageStore) -> N
         now=100.0,
     )
     msg = await store.get_message(mid)
+    assert msg is not None
     # enqueue_message (the direct/legacy write) routes straight to outbound rows → ROUTED. The staged
     # live path uses enqueue_ingress (RECEIVED) then handoff (ROUTED) — see test_staged_pipeline.
     assert msg["status"] == MessageStatus.ROUTED.value
@@ -233,7 +244,9 @@ async def test_enqueue_creates_message_and_outbox_rows(store: MessageStore) -> N
 async def test_enqueue_with_no_delivery_is_unrouted(store: MessageStore) -> None:
     # Accepted but matched no destination: logged (UNROUTED), preserved, but no outbox rows.
     mid = await store.enqueue_message(channel_id="c1", raw="x", deliveries=[], now=100.0)
-    assert (await store.get_message(mid))["status"] == MessageStatus.UNROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.UNROUTED.value
     assert len(await store.outbox_for(mid)) == 0
 
 
@@ -241,13 +254,16 @@ async def test_record_received_logs_filtered_and_error(store: MessageStore) -> N
     fid = await store.record_received(
         channel_id="c1", raw="x", status=MessageStatus.FILTERED, control_id="F1", now=100.0
     )
-    assert (await store.get_message(fid))["status"] == MessageStatus.FILTERED.value
+    fetched = await store.get_message(fid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.FILTERED.value
     assert len(await store.outbox_for(fid)) == 0
 
     eid = await store.record_received(
         channel_id="c1", raw="bad", status=MessageStatus.ERROR, error="parse error: boom", now=100.0
     )
     emsg = await store.get_message(eid)
+    assert emsg is not None
     assert emsg["status"] == MessageStatus.ERROR.value
     assert emsg["error"] == "parse error: boom"
 
@@ -276,7 +292,9 @@ async def test_disposition_text_is_phi_scrubbed_at_the_store_layer(store: Messag
     eid = await store.record_received(
         channel_id="c1", raw="MSH|x", status=MessageStatus.ERROR, error=f"bad value {phi}", now=0.0
     )
-    assert "DOE^JANE" not in ((await store.get_message(eid))["error"] or "")
+    fetched = await store.get_message(eid)
+    assert fetched is not None
+    assert "DOE^JANE" not in (fetched["error"] or "")
     # record_received also mirrors the error into a message_events.detail row — scrubbed there too.
     assert all("DOE^JANE" not in (e["detail"] or "") for e in await store.events_for(eid))
 
@@ -302,7 +320,9 @@ async def test_mark_done_finalizes_message(store: MessageStore) -> None:
     item = (await store.claim_ready(now=100.0))[0]
     await store.mark_done(item.id, now=101.0)
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_failure_reschedules_with_backoff(store: MessageStore) -> None:
@@ -337,7 +357,9 @@ async def test_exhausting_retries_dead_letters_and_errors_message(store: Message
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.DEAD.value
     assert row["attempts"] == retry.max_attempts
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 async def test_explicit_none_max_attempts_retries_forever(store: MessageStore) -> None:
@@ -368,7 +390,9 @@ async def test_dead_letter_now_fails_fast_without_consuming_a_retry(store: Messa
     assert row["status"] == OutboxStatus.DEAD.value
     assert row["attempts"] == 1  # claim incremented it; dead_letter_now must not bump it again
     assert row["last_error"] == "negative ACK (MSA-1=AR)"
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
     assert len(await store.list_dead(channel_id="c1")) == 1
 
 
@@ -410,9 +434,11 @@ async def test_dead_letter_missing_destinations(store: MessageStore) -> None:
     assert rows["OB_GONE"]["status"] == OutboxStatus.DEAD.value
     assert "destination removed" in rows["OB_GONE"]["last_error"]
     assert rows["OB_KEEP"]["status"] == OutboxStatus.PENDING.value  # untouched
-    assert (await store.get_message(mid))[
-        "status"
-    ] == MessageStatus.ROUTED.value  # KEEP still live (routed, awaiting delivery)
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert (
+        fetched["status"] == MessageStatus.ROUTED.value
+    )  # KEEP still live (routed, awaiting delivery)
 
 
 async def test_dead_letter_missing_destinations_finalizes_when_all_gone(
@@ -423,7 +449,9 @@ async def test_dead_letter_missing_destinations_finalizes_when_all_gone(
     )
     assert await store.dead_letter_missing_destinations(set(), now=5.0) == 1
     # the sole delivery is dead -> the message finalizes to ERROR, not stranded at RECEIVED
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 async def test_dead_letter_missing_destinations_noop_when_present(store: MessageStore) -> None:
@@ -444,7 +472,9 @@ async def test_replay_requeues_dead_not_done(store: MessageStore) -> None:
     done_item, dead_item = items[0], items[1]
     await store.mark_done(done_item.id, now=1.0)
     await store.mark_failed(dead_item.id, "boom", retry, now=1.0)  # exhausts -> dead
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
     requeued = await store.replay(mid, now=2.0)
     assert requeued == 1  # only the DEAD row — the DONE row is left alone (not re-delivered)
@@ -453,7 +483,9 @@ async def test_replay_requeues_dead_not_done(store: MessageStore) -> None:
     assert by_id[dead_item.id]["status"] == OutboxStatus.PENDING.value
     assert by_id[dead_item.id]["attempts"] == 0
     # The re-queued OUTBOUND row → the message is routed-again, awaiting delivery (ROUTED).
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 async def test_replay_resends_fully_delivered_message(store: MessageStore) -> None:
@@ -462,12 +494,16 @@ async def test_replay_resends_fully_delivered_message(store: MessageStore) -> No
     mid = await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=0.0)
     item = (await store.claim_ready(now=0.0))[0]
     await store.mark_done(item.id, now=1.0)
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
     requeued = await store.replay(mid, now=2.0)
     assert requeued == 1
     row = (await store.outbox_for(mid))[0]
     assert row["status"] == OutboxStatus.PENDING.value and row["attempts"] == 0
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 async def _dead_delivery(
@@ -502,7 +538,9 @@ async def test_list_dead_excludes_done_and_pending(store: MessageStore) -> None:
     await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=0.0)
     assert await store.count_dead() == 0
     assert list(await store.list_dead()) == []
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_replay_dead_requeues_only_dead_rows(store: MessageStore) -> None:
@@ -513,14 +551,18 @@ async def test_replay_dead_requeues_only_dead_rows(store: MessageStore) -> None:
     dead_item = (await store.claim_ready(now=0.0, destination_name="d2"))[0]
     await store.mark_done(done_item.id, now=1.0)
     await store.mark_failed(dead_item.id, "boom", RetryPolicy(max_attempts=1), now=1.0)
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
     requeued = await store.replay_dead(now=2.0)
     assert requeued == 1  # only the dead delivery, not the delivered one
     rows = {r["destination_name"]: r for r in await store.outbox_for(mid)}
     assert rows["d1"]["status"] == OutboxStatus.DONE.value  # untouched
     assert rows["d2"]["status"] == OutboxStatus.PENDING.value and rows["d2"]["attempts"] == 0
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     assert await store.count_dead() == 0
     assert any(e["event"] == "replayed" for e in await store.events_for(mid))
 
@@ -554,7 +596,9 @@ async def test_replay_dead_rolls_back_on_partial_failure(
     assert await store.count_dead() == 1
     # ...and the shared connection is left usable (no dangling open transaction).
     mid = await store.enqueue_message(channel_id="c2", raw="x", deliveries=[("d2", "p")], now=6.0)
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 async def test_multiple_destinations_finalize_independently(store: MessageStore) -> None:
@@ -564,9 +608,13 @@ async def test_multiple_destinations_finalize_independently(store: MessageStore)
     items = await store.claim_ready(limit=10, now=0.0)
     await store.mark_done(items[0].id, now=1.0)
     # One done, one still pending -> message not finalized yet (stays ROUTED).
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     await store.mark_done(items[1].id, now=2.0)
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_stats_reports_queue_depth(store: MessageStore) -> None:
@@ -603,7 +651,9 @@ async def test_cancel_queued_all_soft_cancels_and_finalizes(store: MessageStore)
     assert n == 1
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.CANCELLED.value
     # All deliveries terminal and none dead -> message finalizes as processed (not error).
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
     assert any(e["event"] == "cancelled" for e in await store.events_for(mid))
 
 
@@ -903,7 +953,9 @@ async def test_claim_skips_and_completes_already_delivered_head_no_resend(
     assert rows[0]["status"] == OutboxStatus.DONE.value  # completed in place, not re-delivered
     # Exactly one ledger row still (the skip-and-complete does NOT add a second).
     assert len(await _ledger_rows(store)) == 1
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_crash_re_run_before_commit_is_a_noop_replay(store: MessageStore) -> None:
@@ -1047,7 +1099,7 @@ def _watch_aiosqlite_connects(
     real_connect = aiosqlite.connect
     opened: list[aiosqlite.Connection] = []
 
-    def spy_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def spy_connect(*args, **kwargs):
         # `connect` builds the Connection (and its Thread) synchronously and returns it awaitable,
         # so the worker is watchable before a single statement has run on it.
         conn = real_connect(*args, **kwargs)
@@ -1090,7 +1142,7 @@ def _park_workers_inside_the_close_window(
     original = loop.call_soon_threadsafe
     parked: list[str] = []
 
-    def call_soon_threadsafe(callback, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def call_soon_threadsafe(callback, *args, **kwargs):
         handle = original(callback, *args, **kwargs)
         worker = threading.current_thread()
         # The length guard is load-bearing, not defensive: this shadows the method on the LOOP, so
@@ -1100,14 +1152,14 @@ def _park_workers_inside_the_close_window(
             time.sleep(_WORKER_PARK_SECONDS)
         return handle
 
-    loop.call_soon_threadsafe = call_soon_threadsafe  # type: ignore[method-assign]
+    loop.call_soon_threadsafe = call_soon_threadsafe  # type: ignore[method-assign, assignment]
     try:
         yield parked
     finally:
         # `del` rather than reassigning `original`: the loop is session-scoped and shared with every
         # other test, so drop the instance attribute and let the class method show through again
         # instead of leaving a permanent shadow behind on it.
-        del loop.call_soon_threadsafe  # type: ignore[method-assign]
+        del loop.call_soon_threadsafe
 
 
 async def test_close_waits_for_every_aiosqlite_worker_thread(tmp_path) -> None:

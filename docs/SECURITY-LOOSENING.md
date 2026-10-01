@@ -385,7 +385,9 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   refusal on `MEFOR_ALLOW_INSECURE_TLS` read through the **clamped**
   `weakened_tls_escape_permitted_here()`, which reads the construction-time hop posture. The alerts
   notifier is built in the API lifespan, **outside** `build_check_registry`'s `active_hop_posture` scope,
-  where that clamp degrades to the *unclamped* escape and would provide no refusal at all. So this cell
+  where that clamp reads no posture. It used to degrade to the *unclamped* escape there and provide no
+  refusal at all; since vault BACKLOG #2354 a missing posture fails closed instead, which would refuse
+  the hop with no way across. Either way the clamp cannot express an acknowledgment, so this cell
   gets an explicit `[security]` acknowledgment instead — the first verify-off hop governed that way.
 - **Still refused:** nothing here relaxes the connectors. This switch reaches the `[alerts]` cell only.
 
@@ -412,7 +414,9 @@ is refused, so an opt-out does nothing and is not reported.
 ### `enforcement = warn` — warn instead of refuse on the PHI serve-gate floor
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
-  (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again. This reproduces the
+  (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again, but only where the
+  code knows this posture. A check that reads no posture refuses the escape whatever the dial says
+  (vault BACKLOG #2354): at least the CLI commands that open the store without one. This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
   off-box bind, open-egress, and single-factor-admin-at-exposure refusals downgrade to loud audited warnings,
   and an explicitly-zeroed PHI retention window warns rather than refusing. (The 30-day auto-bound of an
@@ -803,7 +807,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **It is always reported, though not always logged:** at least the inbound bind gates and the
   raw-TCP/MLLP hop guard log a suppressed enforcing refusal at WARNING with the reason. The OAuth2 and
   SMART token-endpoint seams and the database weakened-TLS line do not put the reason on it, and a
-  `DatabaseRef` sync logs nothing. The complete record is the two reports. `messagefoundry check` prints a
+  `DatabaseRef` source writes that same line. The complete record is the two reports. `messagefoundry check` prints a
   `tls-hop-attested` line listing the **whole** attested set, and `GET /security/posture` carries a
   `tls_hop_attested` loosening naming every attesting declaration of each kind above. Each gate and
   both reports read the attestation from the same place, so a hop cannot be crossed on an attestation

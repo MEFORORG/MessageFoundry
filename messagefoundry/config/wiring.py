@@ -696,9 +696,11 @@ def DatabaseRef(
     The engine runs ``statement`` (a read-only ``SELECT``/proc) on the set's refresh cadence and builds
     the snapshot from the rows: ``key_column`` is the lookup key; ``value_column`` (if given) is that
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
-    shape). Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
-    ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
-    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
+    shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
+    refused at ``messagefoundry check`` and at every sync unless ``tls_hop_attested`` below is
+    set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at ``[security].enforcement = warn``. The
+    dial-out is gated by the **fail-closed** ``[egress].allowed_db`` allowlist, exactly like a
+    DATABASE poll source — point the engine only at allowed hosts.
 
     ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
     the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
@@ -1542,6 +1544,8 @@ def MLLP(
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
     max_frame_seconds: float | None = 60.0,  # cap one frame's life, start byte to end byte
+    max_inflight_frames: int
+    | None = 32,  # inbound: cap frames in the pre-ACK handling path at once, per listener
     # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
     # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
     # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
@@ -1589,8 +1593,7 @@ def MLLP(
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
-    """An MLLP endpoint. Inbound uses port plus the resource caps max_connections,
-    max_connections_per_host, receive_timeout, max_frame_seconds and max_frame_bytes (the bind
+    """An MLLP endpoint. Inbound uses port plus the inbound resource caps described below (the bind
     interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
     applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
@@ -1602,11 +1605,13 @@ def MLLP(
     hosts. ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte
     received**, so ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its
     end byte — that is what reaches a peer trickling a byte at a time, which is never idle.
-    ``max_frame_bytes`` (16 MiB) bounds the same frame's size. Each is disabled by ``None``/``0``.
+    ``max_frame_bytes`` (16 MiB) bounds the same frame's size. ``max_inflight_frames`` (32, inbound
+    only) bounds how many complete frames the listener hands to its handler at once; a frame over
+    it waits for a slot and is never refused. Each is disabled by ``None``/``0``.
 
-    What the two #1725 caps do NOT cover, and when to change one, is stated **once** on
-    ``DEFAULT_MAX_CONNECTIONS_PER_HOST`` and ``DEFAULT_MAX_FRAME_SECONDS`` in
-    ``messagefoundry.transports.mllp`` — including the two cases an operator is most likely to meet:
+    What the #1725 caps do NOT cover, and when to change one, is stated **once** on
+    ``DEFAULT_MAX_CONNECTIONS_PER_HOST``, ``DEFAULT_MAX_FRAME_SECONDS`` and
+    ``DEFAULT_MAX_INFLIGHT_FRAMES`` in ``messagefoundry.transports.mllp`` — including the two cases an operator is most likely to meet:
     a listener behind a source-NAT proxy, and a feed carrying large embedded documents. Read those rather than a summary here; ``docs/CONNECTIONS.md`` carries the same two in
     operator form.
 
@@ -1733,6 +1738,7 @@ def MLLP(
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
             "max_frame_seconds": max_frame_seconds,
+            "max_inflight_frames": max_inflight_frames,
             "max_messages_per_second": max_messages_per_second,
             "message_burst": message_burst,
             "connect_timeout": connect_timeout,
@@ -2623,7 +2629,7 @@ def FHIR(
     format: Literal["json"] = "json",  # "json" (MVP); "xml" is deferred (ADR 0022 Options #5)
     interaction: Literal[
         "create", "update", "transaction", "batch"
-    ] = "create",  # "create" (POST) | "update" (PUT) | "transaction" | "batch" (Bundle POST)
+    ] = "create",  # "create" (POST) | "update" (PUT in a transaction) | "transaction" | "batch"
     conditional: Literal["if-none-exist", "conditional-update", "if-match"]
     | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
     conditional_query: str
@@ -2661,14 +2667,17 @@ def FHIR(
     """A FHIR REST endpoint (**outbound destination only** — the inbound FHIR server facade is ADR 0023).
     The Handler produces a FHIR-JSON resource (or transaction/batch ``Bundle``) body; this delivers it to
     the FHIR service ``url`` (the **base**, e.g. ``https://host/fhir``) using the FHIR HTTP interaction:
-    ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``PUT {base}/{ResourceType}/{id}``,
-    ``transaction``/``batch`` → ``POST {base}`` with the Bundle. ``application/fhir+json`` media type
-    (JSON-only MVP). The three opt-in conditional knobs are the idempotency/concurrency levers:
-    ``if-none-exist`` (conditional create, ``If-None-Exist`` header), ``conditional-update`` (search-based
-    ``PUT`` with ``conditional_query`` in the URL), ``if-match`` (version-aware ``PUT`` whose ``If-Match``
-    ETag is derived from the resource's ``meta.versionId``). A 2xx is delivered; 5xx / a transient
-    OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter. Redirects are refused
-    and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
+    ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``POST {base}`` with a one-entry
+    ``transaction`` Bundle whose entry is ``PUT {ResourceType}/{id}`` (so the message-derived id never
+    appears in the request URL; vault BACKLOG #1965), ``transaction``/``batch`` → ``POST {base}`` with the
+    Bundle. ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
+    idempotency/concurrency levers: ``if-none-exist`` (conditional create, ``If-None-Exist`` header),
+    ``conditional-update`` (search-based ``PUT`` with ``conditional_query`` in the URL), ``if-match``
+    (version-aware update, sent like ``update``, whose ETag is derived from the resource's
+    ``meta.versionId`` and carried in the entry's ``request.ifMatch``). An ``update`` or ``if-match``
+    connection needs a server that supports the ``transaction`` interaction. A 2xx is delivered;
+    5xx / a transient OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter.
+    Redirects are refused and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
     (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022.
 

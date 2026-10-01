@@ -20,10 +20,9 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import AckAfter
+from messagefoundry.config.models import AckAfter, ConnectorType
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     Registry,
     WiringError,
     inbound,
@@ -53,13 +52,14 @@ async def test_enqueue_ingress_creates_message_and_ingress_row(store: MessageSto
         channel_id="IB", raw=RAW, control_id="MSG1", message_type="ADT^A01"
     )
     msg = await store.get_message(mid)
+    assert msg is not None
     assert msg["status"] == MessageStatus.RECEIVED.value  # the ACK-on-receipt disposition
     assert msg["raw"] == RAW and msg["control_id"] == "MSG1"
     # Exactly one ingress queue row, no outbound rows yet (routing hasn't happened).
     cur = await store._db.execute(
         "SELECT stage, status, destination_name FROM queue WHERE message_id=?", (mid,)
     )
-    rows = await cur.fetchall()
+    rows = list(await cur.fetchall())
     assert len(rows) == 1
     assert rows[0]["stage"] == Stage.INGRESS.value
     assert rows[0]["status"] == OutboxStatus.PENDING.value
@@ -83,7 +83,9 @@ async def test_handoff_produces_outbound_rows_and_completes_ingress(store: Messa
         disposition=MessageStatus.ROUTED,
     )
     assert ok is True
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     # Ingress row consumed; two outbound rows now pending.
     assert await _claim_ingress(store, "IB") is None
     ob = {r["destination_name"]: r for r in await store.outbox_for(mid)}
@@ -106,7 +108,9 @@ async def test_handoff_no_deliveries_sets_disposition_and_no_outbound(
         deliveries=[],
         disposition=disposition,
     )
-    assert (await store.get_message(mid))["status"] == disposition.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == disposition.value
     assert await store.outbox_for(mid) == []
 
 
@@ -179,8 +183,11 @@ async def test_routed_message_finalizes_processed_after_delivery(store: MessageS
         disposition=MessageStatus.ROUTED,
     )
     out = await store.claim_next_fifo("OB_A")
+    assert out is not None
     await store.mark_done(out.id)
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_filtered_message_not_flipped_to_processed(store: MessageStore) -> None:
@@ -197,7 +204,9 @@ async def test_filtered_message_not_flipped_to_processed(store: MessageStore) ->
     # Directly poke the finalizer (as a stray call would) — disposition must be preserved.
     await store._maybe_finalize_message(mid, now=1.0)
     await store._db.commit()
-    assert (await store.get_message(mid))["status"] == MessageStatus.FILTERED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.FILTERED.value
 
 
 async def test_dead_ingress_row_finalizes_message_error(store: MessageStore) -> None:
@@ -205,7 +214,9 @@ async def test_dead_ingress_row_finalizes_message_error(store: MessageStore) -> 
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
     item = await _claim_ingress(store, "IB")
     await store.dead_letter_now(item.id, "router/handler error: boom")
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 async def test_replay_of_a_message_with_no_queue_rows_changes_nothing(store: MessageStore) -> None:
@@ -235,7 +246,9 @@ async def test_replay_of_a_message_with_no_queue_rows_changes_nothing(store: Mes
     assert await store.outbox_for(mid) == []  # the input class, asserted rather than assumed
 
     assert await store.replay(mid) == 0
-    assert (await store.get_message(mid))["status"] == MessageStatus.FILTERED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.FILTERED.value
     assert "replayed" not in [e["event"] for e in await store.events_for(mid)]
 
     # Control: a message that DOES have a row still replays, so the zero above is about this input.
@@ -288,7 +301,9 @@ async def test_dead_letter_missing_destinations_ignores_ingress_rows(store: Mess
         set(), now=5.0
     )  # no valid outbounds at all
     assert killed == 0  # the ingress row is untouched
-    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
     item = await _claim_ingress(store, "IB")
     assert item is not None  # still claimable — not dead-lettered
 
@@ -446,7 +461,9 @@ async def test_route_handoff_produces_routed_rows_and_completes_ingress(
         disposition=MessageStatus.ROUTED,
     )
     assert ok is True
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     assert await _claim_ingress(store, "IB") is None  # ingress consumed
     # One routed row per handler, in handler-list order (rowid), each carrying handler_name; no outbound.
     cur = await store._db.execute(
@@ -548,9 +565,13 @@ async def test_route_handoff_no_handlers_sets_unrouted(store: MessageStore) -> N
         handlers=[],
         disposition=MessageStatus.UNROUTED,
     )
-    assert (await store.get_message(mid))["status"] == MessageStatus.UNROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.UNROUTED.value
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue WHERE message_id=?", (mid,))
-    assert (await cur.fetchone())["n"] == 0  # ingress consumed, no routed rows
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # ingress consumed, no routed rows
 
 
 async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Path) -> None:
@@ -586,19 +607,24 @@ async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Pa
 
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, control_id="MSG1")
     # The ACK-on-receipt state: durably RECEIVED before the router ever runs (inbound counts intact).
-    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
 
     item = await _claim_ingress(store, "IB")
     assert item is not None
     await RegistryRunner(reg, store)._process_ingress_item("IB", item)
 
     msg = await store.get_message(mid)
+    assert msg is not None
     assert msg["status"] == MessageStatus.UNROUTED.value  # the §4 ruling — not FILTERED
     assert msg["raw"] == RAW  # the raw is preserved for the operator
     # Terminal: the ingress row was consumed in the handoff and no routed row was ever created — the
     # 2 transactions per declining handler are simply never spent (ADR 0051's 2H term).
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue WHERE message_id=?", (mid,))
-    assert (await cur.fetchone())["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
     # Listable + logged (never accepted-and-dropped), and the disposition is a real logged event.
     assert mid in {m["id"] for m in await store.list_messages(status=MessageStatus.UNROUTED.value)}
     assert "unrouted" in [e["event"] for e in await store.events_for(mid)]
@@ -606,7 +632,9 @@ async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Pa
     # The finalizer cannot relabel it: FILTERED is reachable ONLY through a prior ROUTED stamp, and
     # this message was never stamped ROUTED. Re-driving the finalizer must leave UNROUTED standing.
     await store._maybe_finalize_message(mid, time.time())
-    assert (await store.get_message(mid))["status"] == MessageStatus.UNROUTED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.UNROUTED.value
 
 
 async def test_route_handoff_idempotent_against_restart(store: MessageStore) -> None:
@@ -632,7 +660,9 @@ async def test_route_handoff_idempotent_against_restart(store: MessageStore) -> 
         "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.ROUTED.value),
     )
-    assert (await cur.fetchone())["n"] == 1
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 1
 
 
 async def test_route_handoff_atomic_rolls_back_leaving_ingress_recoverable(
@@ -658,7 +688,9 @@ async def test_route_handoff_atomic_rolls_back_leaving_ingress_recoverable(
         "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage=?",
         (mid, Stage.ROUTED.value),
     )
-    assert (await cur.fetchone())["n"] == 0  # no routed rows leaked
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # no routed rows leaked
     monkeypatch.undo()
     assert await store.reset_stale_inflight(stage=Stage.INGRESS.value) == 1
     again = await _claim_ingress(store, "IB")
@@ -678,9 +710,9 @@ async def test_transform_handoff_produces_outbound_and_consumes_routed(store: Me
     assert ok is True
     assert await _claim_routed(store, "IB") is None  # routed consumed
     assert {r["destination_name"] for r in await store.outbox_for(mid)} == {"OB_A", "OB_B"}
-    assert (await store.get_message(mid))[
-        "status"
-    ] == MessageStatus.ROUTED.value  # outbound pending
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value  # outbound pending
     assert [e["event"] for e in await store.events_for(mid)] == [
         "received",
         "routed",
@@ -709,19 +741,25 @@ async def test_single_handler_filters_collapses_to_filtered(store: MessageStore)
     # One handler, zero deliveries → the last routed row is consumed and nothing delivered → FILTERED.
     mid = await _route(store, "IB", ["h"], MessageStatus.ROUTED)
     await _transform(store, "IB", [])  # handler filtered everything
-    assert (await store.get_message(mid))["status"] == MessageStatus.FILTERED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.FILTERED.value
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue WHERE message_id=?", (mid,))
-    assert (await cur.fetchone())["n"] == 0  # no rows linger
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # no rows linger
 
 
 async def test_two_handlers_both_filter_collapses_to_filtered(store: MessageStore) -> None:
     mid = await _route(store, "IB", ["h1", "h2"], MessageStatus.ROUTED)
     await _transform(store, "IB", [])  # h1 filters
-    assert (await store.get_message(mid))[
-        "status"
-    ] == MessageStatus.ROUTED.value  # h2 still pending
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value  # h2 still pending
     await _transform(store, "IB", [])  # h2 filters → now FILTERED
-    assert (await store.get_message(mid))["status"] == MessageStatus.FILTERED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.FILTERED.value
 
 
 async def test_two_handlers_one_delivers_one_filters_processed_after_delivery(
@@ -729,17 +767,19 @@ async def test_two_handlers_one_delivers_one_filters_processed_after_delivery(
 ) -> None:
     mid = await _route(store, "IB", ["h1", "h2"], MessageStatus.ROUTED)
     await _transform(store, "IB", [("OB_A", "p")])  # h1 delivers
-    assert (await store.get_message(mid))[
-        "status"
-    ] == MessageStatus.ROUTED.value  # h2 still pending
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value  # h2 still pending
     await _transform(store, "IB", [])  # h2 filters
-    assert (await store.get_message(mid))[
-        "status"
-    ] == MessageStatus.ROUTED.value  # OB_A still pending
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value  # OB_A still pending
     out = await store.claim_next_fifo("OB_A")
     assert out is not None
     await store.mark_done(out.id)
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_finalizer_not_premature_with_pending_routed_sibling(store: MessageStore) -> None:
@@ -750,12 +790,16 @@ async def test_finalizer_not_premature_with_pending_routed_sibling(store: Messag
     out = await store.claim_next_fifo("OB_A")
     assert out is not None
     await store.mark_done(out.id)  # OB_A delivered, but H2 routed row still pending
-    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value  # NOT processed
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value  # NOT processed
     await _transform(store, "IB", [("OB_B", "p")])  # h2 → OB_B
     out2 = await store.claim_next_fifo("OB_B")
     assert out2 is not None
     await store.mark_done(out2.id)
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_dead_routed_with_delivered_sibling_is_error(store: MessageStore) -> None:
@@ -769,7 +813,9 @@ async def test_dead_routed_with_delivered_sibling_is_error(store: MessageStore) 
     h2 = await _claim_routed(store, "IB")
     assert h2 is not None
     await store.dead_letter_now(h2.id, "transform error")  # h2 fails
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 async def test_single_dead_routed_row_is_error(store: MessageStore) -> None:
@@ -777,7 +823,9 @@ async def test_single_dead_routed_row_is_error(store: MessageStore) -> None:
     item = await _claim_routed(store, "IB")
     assert item is not None
     await store.dead_letter_now(item.id, "transform error")
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 # --- per-stage recovery + missing-handler sweep + replay ---------------------
@@ -803,7 +851,9 @@ async def test_dead_letter_missing_handlers_kills_orphan_routed_rows(store: Mess
     mid = await _route(store, "IB", ["gone"], MessageStatus.ROUTED)  # handler no longer registered
     killed = await store.dead_letter_missing_handlers({"present"})
     assert killed == 1
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
     # A routed row for a still-present handler is untouched; ingress/outbound rows ignored entirely.
     await _route(store, "IB", ["present"], MessageStatus.ROUTED)
     await store.enqueue_ingress(channel_id="IB", raw=RAW)  # an ingress row (NULL handler_name)
@@ -830,11 +880,15 @@ async def test_dead_letter_missing_inbounds_kills_orphan_ingress_and_routed_rows
     # The existing sweeps are blind to the inbound column. This is the gap, asserted.
     assert await store.dead_letter_missing_destinations({"OB_A"}) == 0
     assert await store.dead_letter_missing_handlers({"h"}) == 0
-    assert (await store.get_message(ingress_only))["status"] == MessageStatus.RECEIVED.value
+    fetched = await store.get_message(ingress_only)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
 
     assert await store.dead_letter_missing_inbounds({"other_in"}, now=5.0) == 2
     for mid in (ingress_only, routed):
-        assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+        fetched = await store.get_message(mid)
+        assert fetched is not None
+        assert fetched["status"] == MessageStatus.ERROR.value
         dead = [e for e in await store.events_for(mid) if e["event"] == "dead"]
         assert len(dead) == 1 and dead[0]["detail"] == "inbound removed from registry"
     # Nothing pending left on either orphan lane.
@@ -857,8 +911,12 @@ async def test_dead_letter_missing_inbounds_spares_live_lanes_and_outbound_rows(
         channel_id="gone_in", raw=RAW, deliveries=[("OB_A", "p")]
     )
     assert await store.dead_letter_missing_inbounds({"IB"}) == 0
-    assert (await store.get_message(live))["status"] == MessageStatus.RECEIVED.value
-    assert (await store.get_message(outbound))["status"] == MessageStatus.ROUTED.value
+    fetched = await store.get_message(live)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
+    fetched = await store.get_message(outbound)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
     assert (await store.pending_depth("OB_A", stage=Stage.OUTBOUND.value))[0] == 1
     assert await _claim_ingress(store, "IB") is not None  # the live lane still claims
 
@@ -923,7 +981,9 @@ async def test_dead_letter_missing_inbounds_ingress_orphan_replays(store: Messag
     out = await store.claim_next_fifo("OB_A")
     assert out is not None
     await store.mark_done(out.id)
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_dead_letter_missing_inbounds_routed_orphan_replays(store: MessageStore) -> None:
@@ -943,7 +1003,9 @@ async def test_dead_letter_missing_inbounds_routed_orphan_replays(store: Message
     out = await store.claim_next_fifo("OB_A")
     assert out is not None
     await store.mark_done(out.id)
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_replay_dead_routed_row_does_not_repend_delivered_sibling(
@@ -959,14 +1021,18 @@ async def test_replay_dead_routed_row_does_not_repend_delivered_sibling(
     h2 = await _claim_routed(store, "IB")
     assert h2 is not None
     await store.dead_letter_now(h2.id, "transform error")  # h2 routed dead → message ERROR
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
     assert await store.replay(mid) == 1  # only the dead routed row re-pended
     # The delivered outbound row stays DONE (not re-pended → not re-delivered).
     ob = {r["destination_name"]: r["status"] for r in await store.outbox_for(mid)}
     assert ob == {"OB_A": OutboxStatus.DONE.value}
     # Back in the route/transform path (a routed row pending again).
-    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
     assert await _claim_routed(store, "IB") is not None
 
 
@@ -1129,9 +1195,13 @@ async def test_replay_of_ingress_dead_message_requeues_at_ingress(store: Message
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
     item = await _claim_ingress(store, "IB")
     await store.dead_letter_now(item.id, "router/handler error")
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
     assert await store.replay(mid) == 1
-    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.RECEIVED.value
     assert await _claim_ingress(store, "IB") is not None  # ingress row re-queued, reclaimable
 
 
@@ -1143,7 +1213,9 @@ async def test_replay_dead_ignores_ingress_rows(store: MessageStore) -> None:
     await store.dead_letter_now(item.id, "router/handler error")
     assert await store.count_dead() == 0  # the dead ingress row is not in the DLQ view
     assert await store.replay_dead() == 0  # ...and bulk replay leaves it alone
-    assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ERROR.value
 
 
 async def test_engine_refuses_backend_without_ingest_stage(tmp_path: Path) -> None:

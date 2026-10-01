@@ -155,7 +155,8 @@ def test_an_empty_choice_group_is_reported() -> None:
 
 
 def test_hl7apy_still_has_the_bug_so_the_shim_is_still_on() -> None:
-    """Goes red on the first hl7apy release that fixes issue 151. Then delete the shim.
+    """Goes red on the first hl7apy release that fixes issue 151. Then delete the shim, but keep
+    ``is_choice_group`` and ``_SEQUENCES_LABELLED_CHOICE``: the generator uses them.
 
     The shim switches itself off on such a release, since :func:`_choice_fix_needed` asks
     hl7apy rather than its version number. The code it leaves behind is dead, and this test is

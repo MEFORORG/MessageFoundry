@@ -168,13 +168,13 @@ async def test_the_reproof_budget_survives_rotation(engine: Engine) -> None:
     session a fresh budget of password guesses (BACKLOG #1138).
     """
     service, token = await _service_and_token(engine)
-    service._reproof_session_failures[hash_token(token)] = (4, 1.0)
+    service._reproof_session_failures[hash_token(token)] = (4, 1.0, "u-reproof")
 
     rotated = await service._rotate_session_token(token)
     assert rotated is not None
 
     assert hash_token(token) not in service._reproof_session_failures
-    assert service._reproof_session_failures.get(hash_token(rotated)) == (4, 1.0)
+    assert service._reproof_session_failures.get(hash_token(rotated)) == (4, 1.0, "u-reproof")
 
 
 def test_rekey_carries_the_ceremony_deadline_rather_than_refreshing_it() -> None:

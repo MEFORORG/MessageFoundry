@@ -2829,8 +2829,11 @@ async def open_store(
 
     ``posture`` (#200, ADR 0092) is the deriving instance's :class:`HopPosture`, threaded into the
     server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
-    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
-    no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
+    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` reads
+    the ambient posture, and with none the escape is NOT permitted (vault BACKLOG #2354). CORRECTED:
+    this read *"``None`` ... leaves it unclamped, byte-identical to pre-#200"*. So a CLI command that
+    opens a weakened store needs an instance at ``[security].enforcement = warn`` AND a posture; the
+    commands that pass none refuse a weakened store whatever the dial says.
 
     ``keyless_chain_refusal`` (BACKLOG #1916) is the at-rest opt-out's verdict for this caller: the
     setting that refuses running keyless, or ``None`` when the audited opt-out applies. A service

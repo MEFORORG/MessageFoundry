@@ -238,15 +238,14 @@ def test_every_offender_is_named_and_the_static_headers_beside_them_are_not() ->
     -- a guard narrowed to the FIRST offending entry, or widened to the whole table, passes every
     single-entry case in this file.
     """
+    # Values outside Rest's declared dict[str, str], on purpose: they are what the guard refuses.
+    headers: dict[str, Any] = {
+        "X-Partner-Trace": "probe-1",
+        "X-Partner-Key": messagefoundry.env("partner_key", default=SENTINEL),
+        "X-Partner-Alt": {"env": "partner_alt", "default": SENTINEL},
+    }
     with pytest.raises(WiringError) as excinfo:
-        messagefoundry.Rest(
-            url="https://example.invalid/x",
-            headers={
-                "X-Partner-Trace": "probe-1",
-                "X-Partner-Key": messagefoundry.env("partner_key", default=SENTINEL),
-                "X-Partner-Alt": {"env": "partner_alt", "default": SENTINEL},
-            },
-        )
+        messagefoundry.Rest(url="https://example.invalid/x", headers=headers)
     message = str(excinfo.value)
     assert "X-Partner-Key" in message, message
     assert "X-Partner-Alt" in message, message
@@ -322,7 +321,7 @@ def test_a_reference_one_level_DEEPER_in_a_header_value_is_refused_too(label: st
     ``[{'env': 'partner_key', 'default': ...}]``, ``{'a': {'env': ..., 'default': ...}}`` and
     ``[EnvRef(key=..., default=...)]``. The guard's own premise applies unchanged one level down.
     """
-    deep: dict[str, Any] = {
+    shapes: dict[str, dict[str, Any]] = {
         "marker in a list": {"X-Partner-Key": [{"env": "partner_key", "default": SENTINEL}]},
         "marker in a sub-table": {
             "X-Partner-Key": {"a": {"env": "partner_key", "default": SENTINEL}}
@@ -333,7 +332,8 @@ def test_a_reference_one_level_DEEPER_in_a_header_value_is_refused_too(label: st
         "marker in a nested key": {
             "X-Partner-Key": {messagefoundry.env("partner_key", default=SENTINEL): "v"}
         },
-    }[label]
+    }
+    deep = shapes[label]
     with pytest.raises(WiringError) as excinfo:
         messagefoundry.Rest(url="https://example.invalid/x", headers=deep)
     assert "X-Partner-Key" in str(excinfo.value), str(excinfo.value)
@@ -347,10 +347,9 @@ def test_ordinary_nested_structure_under_a_header_value_is_left_alone() -> None:
     author's business, and a guard that refused all of it would be refusing configuration with a
     message about a reference nobody wrote.
     """
-    spec = messagefoundry.Rest(
-        url="https://example.invalid/x",
-        headers={"X-Odd": {"a": ["b", {"c": "d"}]}},
-    )
+    # A value outside the declared dict[str, str], on purpose: nesting alone must not be refused.
+    odd: dict[str, Any] = {"X-Odd": {"a": ["b", {"c": "d"}]}}
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers=odd)
     assert spec.settings["headers"]["X-Odd"] == {"a": ["b", {"c": "d"}]}
 
 
@@ -392,7 +391,8 @@ def test_a_dict_that_only_looks_like_an_env_ref_is_left_alone() -> None:
     would refuse ordinary configuration with a message about a reference the author never wrote."""
     lookalike = {"env": "partner_key", "not_an_envref_key": 1}
     assert parse_env_setting(lookalike) == lookalike
-    spec = messagefoundry.Rest(url="https://example.invalid/x", headers={"X-Odd": lookalike})
+    headers: dict[str, Any] = {"X-Odd": lookalike}  # outside dict[str, str] on purpose
+    spec = messagefoundry.Rest(url="https://example.invalid/x", headers=headers)
     assert spec.settings["headers"]["X-Odd"] == lookalike
 
 

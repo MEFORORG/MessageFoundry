@@ -344,11 +344,13 @@ def test_filling_boundary_is_strictly_above_the_bar() -> None:
     assert at_bar.ceiling is False
 
     just_over = _fill_step(16.0, first_p50=10.0, second_p50=10.0 * bar + 0.1)
+    assert just_over.fill_ratio is not None
     assert just_over.fill_ratio > bar
     assert just_over.filling is True
     assert just_over.ceiling is True
 
     just_under = _fill_step(16.0, first_p50=10.0, second_p50=10.0 * bar - 0.1)
+    assert just_under.fill_ratio is not None
     assert just_under.fill_ratio < bar
     assert just_under.filling is False
     assert just_under.ceiling is False

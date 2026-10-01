@@ -168,10 +168,13 @@ def test_a_cross_filesystem_source_is_published_by_link_from_the_staged_copy(
     real_open = os.open
     exclusive_opens: list[str] = []
 
-    def link_only_within_out(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+    def link_only_within_out(
+        src: str | os.PathLike[str], dst: str | os.PathLike[str], **kw: bool
+    ) -> None:
+        # **kw: POSIX passes follow_symlinks=False (BACKLOG #2507).
         if Path(src).parent != out_dir:
             raise OSError(errno.EXDEV, "Invalid cross-device link")
-        real_link(src, dst)
+        real_link(src, dst, **kw)
 
     def spy(path: str | os.PathLike[str], flags: int, *a: object, **k: object) -> int:
         if flags & os.O_EXCL and not str(path).endswith(".part"):

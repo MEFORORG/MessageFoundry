@@ -37,6 +37,7 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.keywrap import KeyWrapRefused
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
@@ -968,6 +969,7 @@ def test_plain_ftp_with_credentials_refused_without_escape(
 
 
 def test_plain_ftp_with_credentials_allowed_with_escape(
+    escape_at_warn: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
@@ -1015,7 +1017,7 @@ def test_ftps_insecure_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_ftps_insecure_allowed_with_escape(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
@@ -1198,7 +1200,9 @@ def test_sftp_unknown_host_key_refused_without_escape(monkeypatch: pytest.Monkey
     assert ei.value.permanent is True  # a rejected host key is a permanent security stop
 
 
-def test_sftp_unknown_host_key_accepted_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sftp_unknown_host_key_accepted_with_escape(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: _FakeParamiko)
     client = _SftpClient({"host": "h", "port": 22, "remote_dir": "/in"})
@@ -1361,9 +1365,9 @@ def test_fake_paramiko_algorithm_lists_match_the_installed_library() -> None:
     ``_preferred_macs`` and ``_preferred_ciphers``. A copy can go stale, and a stale copy would let
     those tests stay green while the real library proposed something nobody had graded.
 
-    This test SKIPS where the ``[sftp]`` extra is not installed, which is the default: the extra is
-    not in the dev install and CI's test legs do not add it. A skip is reported as a skip and not as
-    a pass, which is the honest reading -- the comparison did not happen, so it claims nothing.
+    This test SKIPS where the ``[sftp]`` extra is not installed. Where it must run is
+    ``tests/test_sftp_extra_on_ci_leg.py``'s to say. A skip is reported as a skip and not as a pass, which is the honest reading -- the comparison did
+    not happen, so it claims nothing.
     """
     try:
         import paramiko
@@ -1410,7 +1414,7 @@ def test_sftp_proposes_no_ctr_or_aes128_cipher(monkeypatch: pytest.MonkeyPatch) 
 # a CONTROL: a stock paramiko client, with no deny list, that DOES negotiate against the same server.
 # Without that control a refusal could just as well be a broken test server.
 #
-# They SKIP where paramiko is absent, which is the default dev install and CI's test legs, the same
+# They SKIP where paramiko is absent (see tests/test_sftp_extra_on_ci_leg.py for where it is not), the same
 # as `test_fake_paramiko_algorithm_lists_match_the_installed_library` above.
 
 
@@ -1490,7 +1494,8 @@ def _connector_handshake(
 ) -> str:
     """Run the production ``_SftpClient._connect`` against a server offering ``ciphers``.
 
-    Returns the cipher it negotiated, or raises what paramiko raised.
+    Returns the cipher it negotiated. A refused handshake raises the connector's ``_RemoteError``,
+    with paramiko's exception as its ``__cause__``.
     """
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     monkeypatch.setattr(remotefile, "_import_paramiko", lambda: paramiko)
@@ -1566,8 +1571,11 @@ def test_sftp_real_handshake_refuses_ctr_only_and_aes128_only_servers(
     # CONTROL: a stock client negotiates with this very server, so the refusal below is the deny
     # list's doing and not a server that cannot handshake at all.
     assert _stock_handshake(paramiko, offered, tmp_path / "control") in offered
-    with pytest.raises(paramiko.SSHException, match="(?i)cipher"):
+    # The connector wraps paramiko's refusal in a permanent _RemoteError; the cause is paramiko's.
+    with pytest.raises(_RemoteError, match="(?i)cipher") as caught:
         _connector_handshake(paramiko, offered, tmp_path, monkeypatch)
+    assert isinstance(caught.value.__cause__, paramiko.SSHException)
+    assert caught.value.permanent and not caught.value.credential_fault
 
 
 # === egress allowlist ([egress].allowed_remote) ==============================
@@ -2027,7 +2035,7 @@ def test_disabled_algorithms_uses_plural_keys_and_this_test_runs_without_paramik
 def test_the_pinned_key_names_match_the_installed_paramiko() -> None:
     """Check the literals above against the real library when it is importable.
 
-    Skips honestly where the ``[sftp]`` extra is absent -- which is most environments here -- rather
+    Skips honestly where the ``[sftp]`` extra is absent rather
     than asserting a comparison it did not make. The test above is the one that always runs.
     """
     paramiko = pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
@@ -2154,8 +2162,10 @@ def test_sftp_real_handshake_still_needs_an_etm_mac_beside_gcm(
     ciphers = ("aes256-gcm@openssh.com",)
     encrypt_and_mac = ("hmac-sha2-256", "hmac-sha2-512")
     assert _stock_handshake(paramiko, ciphers, tmp_path / "control", encrypt_and_mac) == ciphers[0]
-    with pytest.raises(paramiko.SSHException, match="(?i)macs"):
+    with pytest.raises(_RemoteError, match="(?i)macs") as caught:
         _connector_handshake(paramiko, ciphers, tmp_path, monkeypatch, encrypt_and_mac)
+    assert isinstance(caught.value.__cause__, paramiko.SSHException)
+    assert caught.value.permanent and not caught.value.credential_fault
 
 
 # --- BACKLOG #2083: only a refused credential is a credential fault ---------------------------------
@@ -2499,9 +2509,13 @@ def _config_fault_dest(
         _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
     else:
         _scripted_plain_ftp(monkeypatch, refuse_at=refuse_at, reply=reply)
-    return build_destination(
-        _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over)
-    )
+    # A credentialed plain-ftp hop needs the escape on a warn posture (vault BACKLOG #2354). FTPS
+    # needs no escape, so it keeps the default (unstamped) posture.
+    posture = HopPosture(enforcing=False) if kind == "plain" else None
+    with active_hop_posture(posture):
+        return build_destination(
+            _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over)
+        )
 
 
 @pytest.mark.parametrize(("kind", "refuse_at", "reply"), _CONFIG_FAULTS)

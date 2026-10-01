@@ -152,8 +152,8 @@ class AiBroker:
         # escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
         # instance the blunt env var can never re-permit the key on the wire. The broker is built out of
         # the connector-construction gate (the create_app ai_chat route), so the posture is threaded
-        # explicitly; None (a direct/test construction) falls back to the unclamped escape — byte-
-        # identical to the pre-#329 bare read.
+        # explicitly; None (a direct/test construction) fails closed since vault BACKLOG #2354 (it
+        # used to fall back to the unclamped escape).
         if scheme == "http" and not weakened_tls_escape_permitted(posture):
             raise AiBrokerError(
                 "[ai].endpoint over cleartext http would expose the api_key; refused unless "
@@ -293,8 +293,8 @@ def ai_broker_from_settings(ai: AiSettings, *, posture: HopPosture | None = None
 
     ``posture`` (#329) is the derived instance hop posture, threaded from the create_app ai_chat route so
     the broker's cleartext-http credential refusal is clamped on an enforcing-PHI instance (the escape
-    can no longer put the ``api_key`` on the wire there). ``None`` = the unclamped escape, byte-identical
-    to before."""
+    can no longer put the ``api_key`` on the wire there). ``None`` refuses the escape (vault BACKLOG
+    #2354); it used to mean the unclamped escape."""
     return AiBroker(
         endpoint=ai.endpoint or "",
         api_key=ai.api_key or "",

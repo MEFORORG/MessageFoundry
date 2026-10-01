@@ -27,6 +27,11 @@ description = "Authoring and development tooling for MessageFoundry, kept out of
 readme = "README.md"
 requires-python = ">=3.14"
 license = "AGPL-3.0-or-later"
+# Ship the license + NOTICE in the wheel (PEP 639), mirroring the engine and the web console. They are
+# COPIES in this directory, not `../../LICENSE`: hatchling accepts a parent path and writes it into the
+# wheel verbatim, as `dist-info/licenses/../../LICENSE` (measured 2026-09-30), which escapes dist-info.
+# tests/test_packaging.py pins the LICENSE copy byte-identical to the root one.
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "MessageFoundry Foundation, LLC and contributors" }]
 keywords = ["hl7", "healthcare", "integration", "authoring", "development", "tooling"]
 classifiers = [
@@ -58,7 +63,7 @@ dependencies = [
     # exact pin makes the engine's set the toolkit's. At least these, from an AST scan (ADR 0201
     # section 1): `hl7apy` (hl7schema, hl7structures, generators), `hl7` (anon/hl7.py) and
     # `defusedxml` (corepoint_import). A change to the engine's core set must be checked against them.
-    "messagefoundry==0.4.0",
+    "messagefoundry==0.5.0",
 ]
 
 [project.scripts]

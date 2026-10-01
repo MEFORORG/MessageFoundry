@@ -71,9 +71,11 @@
     every surface (the Desktop app's own session tooling lists just what it spawned). The match is
     purely path-based, so the launching surface is irrelevant to it.
 
-    NESTED WORKTREES. `EnterWorktree` puts worktrees at <checkout>/.claude/worktrees/<slug> (new.ps1
-    makes SIBLINGS, <repo-parent>/<repo-name>-<Name>), so
-    a worktree can live INSIDE another one. Get-WorktreeOccupancy attributes a session to the LONGEST
+    NESTED WORKTREES. At least two mechanisms make worktrees here, in two layouts, and the nested
+    layout puts a worktree under the checkout that made it. Which mechanism makes which layout is
+    stated ONCE, in the "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1
+    (BACKLOG #1038); read it there rather than restating it here. What matters to this file is only
+    that a worktree can live INSIDE another one. Get-WorktreeOccupancy attributes a session to the LONGEST
     matching worktree, which is right for a roster (report the innermost checkout) and wrong for a
     destructive caller: a session in the nested tree does not then veto its ANCESTOR, whose --force
     removal deletes the nested tree with it. Get-WorktreeOccupants -IncludeNested folds descendants in
@@ -201,7 +203,8 @@ function Get-OwningGitCommonDir([string]$Path) {
 #     name prefix -- an unrelated clone, or a plain folder -- fails it and is left alone. presence.ps1
 #     is already pinned against that prefix trap for attribution; this must not reintroduce it.
 #   * THE DIRECTORY IS GONE. Nothing on disk can say whose it was, so the only evidence left is the
-#     name, and `<primary>-<slug>` is what scripts/worktree/new.ps1 builds. A cwd under that naming
+#     name, and `<primary>-<slug>` is the sibling name (the "WHICH MECHANISM MADE THIS WORKTREE"
+#     block of scripts/hooks/worktree_gate.ps1 says which mechanism builds it). A cwd under that naming
 #     which no longer exists is a worktree of this repo that was removed from under a session. The name
 #     test is admitted ONLY on this branch, never on a path that exists.
 #

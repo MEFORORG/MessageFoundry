@@ -61,8 +61,8 @@ class _FakeTokenResp:
     def __enter__(self) -> _FakeTokenResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _RecordingOpener:
@@ -426,7 +426,7 @@ def test_rest_oauth2_bearer_on_the_wire() -> None:
         def invalidate(self) -> None:
             pass
 
-    dest._token_provider = _P()  # type: ignore[assignment]
+    dest._token_provider = _P()
 
     class _Resp:
         headers: dict[str, str] = {}
@@ -438,8 +438,8 @@ def test_rest_oauth2_bearer_on_the_wire() -> None:
         def __enter__(self) -> _Resp:
             return self
 
-        def __exit__(self, *a: object) -> bool:
-            return False
+        def __exit__(self, *a: object) -> None:
+            return None
 
     seen: dict[str, str] = {}
 
@@ -509,7 +509,8 @@ def test_digest_handler_built_and_folded_into_opener() -> None:
     spec = with_http_digest(Rest(url=URL), user="u", password="p")
     dest = _rest_from(spec.settings)
     # The per-connection opener carries a digest handler (never the shared _NO_REDIRECT_OPENER).
-    assert any(isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in dest._opener.handlers)
+    handlers = dest._opener.handlers  # type: ignore[attr-defined]  # typeshed omits it
+    assert any(isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in handlers)
 
 
 def test_digest_handler_from_settings_off_by_default() -> None:
@@ -537,9 +538,8 @@ def test_digest_cleartext_refused(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_default_no_auth_is_byte_identical() -> None:
     dest = _rest_from(Rest(url=URL).settings)
     assert dest._token_provider is None
-    assert not any(
-        isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in dest._opener.handlers
-    )
+    handlers = dest._opener.handlers  # type: ignore[attr-defined]  # typeshed omits it
+    assert not any(isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in handlers)
 
 
 def test_bearer_and_digest_mutually_exclusive() -> None:

@@ -1260,9 +1260,11 @@ def test_no_file_imports_the_upstream_defusedxml_package() -> None:
 
     So an import of it works only where that extra happens to be installed. Everything in these
     roots parses through the vendored copy instead."""
+    files = _py_files(*_XML_ROOTS)
+    assert files, f"no python files under {_XML_ROOTS}; the walk would pass over nothing"
     offenders = sorted(
         path.relative_to(_REPO).as_posix()
-        for path in _py_files(*_XML_ROOTS)
+        for path in files
         if "defusedxml" in (text := path.read_text(encoding="utf-8"))
         and "defusedxml" in _xml_parser_imports(text, _package_of(path))
     )
@@ -1301,6 +1303,10 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # than chasing the one the engine mints -- see crypto_inventory_check.py's INVENTORY entry for
     # the same file, which this duplicates.
     "harness/load/tlsmat.py": frozenset({"ssl"}),
+    # Vault BACKLOG #2354: two rigs pass an explicit warn HopPosture when they open a server store
+    # against a self-signed dev container. A value type only; see the INVENTORY rows they duplicate.
+    "harness/load/connscale/runner.py": frozenset({"messagefoundry.config.tls_policy"}),
+    "harness/load/shardcert.py": frozenset({"messagefoundry.config.tls_policy"}),
     "tee/__main__.py": frozenset({"ssl"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),
     "tee/mefor_api.py": frozenset({"ssl"}),

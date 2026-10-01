@@ -259,6 +259,7 @@ async def test_a_returned_reply_records_reply_returned_without_any_body() -> Non
     assert len(store.events) == 1
     message_id, event, destination, detail = store.events[0]
     assert (message_id, event, destination) == ("m1", "reply_returned", DEST)
+    assert detail is not None
     assert "seq=1" in detail and "outcome=reply" in detail and "waited_ms=" in detail
     # The PHI property: names, counts and timings only — never a fragment of the partner's body.
     for leak in ("mrn", "100", BODY):
@@ -286,6 +287,7 @@ async def test_a_timeout_records_reply_timeout_with_its_fallback() -> None:
     assert len(store.events) == 1
     _, event, destination, detail = store.events[0]
     assert (event, destination) == ("reply_timeout", DEST)
+    assert detail is not None
     assert "fallback=504" in detail, "an operator reading this needs to know what the caller got"
     assert "waited_ms=" in detail
 

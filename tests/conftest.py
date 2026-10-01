@@ -28,6 +28,7 @@ import pytest
 from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
+from tests._root_logging import root_logging_restored
 
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
@@ -201,6 +202,47 @@ def _allow_insecure_config_source_in_tests() -> Iterator[None]:
             os.environ.pop(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, None)
         else:
             os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = prev
+
+
+#: The env gates that put a session against a live server-DB container. CI sets one of them together
+#: with ``MEFOR_ALLOW_INSECURE_TLS`` because the container serves a self-signed certificate.
+_SERVER_DB_GATES = ("MEFOR_TEST_SQLSERVER", "MEFOR_TEST_POSTGRES")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _warn_posture_for_the_server_db_legs() -> Iterator[None]:
+    """Stamp a NON-enforcing hop posture for a session run against a live server-DB container.
+
+    Vault BACKLOG #2354 made a weakened-TLS check with no posture fail closed: ``MEFOR_ALLOW_INSECURE_TLS``
+    is honoured only where a ``[security].enforcement = warn`` posture is known. The CI store legs
+    connect to a container with a self-signed certificate (``trust_server_certificate=true``) and
+    open stores directly, with no ``serve`` to derive a posture. This is the explicit posture those
+    legs need, stated once here rather than at every call site. It is session-scoped so a
+    module-scoped store fixture sees it too, and it fires only when BOTH the escape and a server-DB
+    gate are set, so an ordinary local run keeps the fail-closed default. A test that passes its own
+    posture, or opens its own ``active_hop_posture`` scope, still wins. Subprocess children do not
+    inherit a contextvar, so each child source passes the posture itself."""
+    from messagefoundry.config.settings import insecure_tls_allowed
+    from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+
+    if not (insecure_tls_allowed() and any(os.environ.get(g) for g in _SERVER_DB_GATES)):
+        yield
+        return
+    with active_hop_posture(HopPosture(enforcing=False)):
+        yield
+
+
+@pytest.fixture
+def escape_at_warn(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``MEFOR_ALLOW_INSECURE_TLS`` set on a known ``[security].enforcement = warn`` posture, the only
+    shape in which the escape is honoured since vault BACKLOG #2354. For a test of what the escape
+    PERMITS: the escape alone, with no posture, is now refused."""
+    from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
+    from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with active_hop_posture(HopPosture(enforcing=False)):
+        yield
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -400,33 +442,14 @@ def _restore_process_logging() -> Iterator[None]:
     ``audit-verify``/``audit-anchor`` stdout tests in ``tests/test_store_schema.py`` fails on
     ``origin/main`` without this, and passes with it.
 
-    The restore is whole: handlers, root level and active guard, as the four module-level copies in
-    test_logging.py, test_log_spool.py, test_checks.py and test_log_write_guard.py already did for
-    their own modules. pytest re-uses its capture handler instances across phases, so re-adding the
-    snapshot re-adds live handlers, not stale ones. A handler the test added is closed, which releases
-    a forwarder's thread and socket or a log file. A stream handler's close leaves its stream open.
-    """
-    from messagefoundry.logging_guard import active_guard, set_active_guard
+    BACKLOG #2093 widened the restore to filters, because a leaked ``RedactionFilter`` rewrites the
+    record ``caplog`` later reads. ``tests/_root_logging.py`` is the one place that says what is
+    restored, why, and what is not covered.
 
-    root = logging.getLogger()
-    saved = list(root.handlers)
-    saved_set = set(saved)
-    level = root.level
-    guard = active_guard()
-    try:
+    A module fixture with this same name REPLACES this one for that module. Do not add one.
+    """
+    with root_logging_restored():
         yield
-    finally:
-        added = [h for h in root.handlers if h not in saved_set]
-        root.handlers[:] = saved
-        root.setLevel(level)
-        set_active_guard(guard)
-        for handler in added:
-            try:
-                handler.close()
-            except Exception:  # noqa: BLE001 - one bad close must not strand the rest
-                logging.getLogger(__name__).debug(
-                    "closing a leaked log handler failed", exc_info=True
-                )
 
 
 @pytest.fixture(scope="session", autouse=True)

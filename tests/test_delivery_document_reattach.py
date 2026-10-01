@@ -32,10 +32,9 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import BatchConfig, ContentType, RetryPolicy
+from messagefoundry.config.models import BatchConfig, ConnectorType, ContentType, RetryPolicy
 from messagefoundry.config.wiring import (
     ConnectionSpec,
-    ConnectorType,
     InboundConnection,
     OutboundConnection,
     Registry,
@@ -59,7 +58,7 @@ DEST2 = "OB_EPIC_2"
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "reattach.db")
     yield s
     await s.close()
@@ -99,7 +98,7 @@ def _obx5_5(hl7: str) -> str | None:
     return Message.parse(hl7).field("OBX-5.5")
 
 
-async def _until(pred, *, timeout: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(pred, *, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if await pred():
@@ -400,7 +399,7 @@ _SYNTHETIC_PDF = b"%PDF-1.4\n" + bytes(range(256)) * 40 + b"\n%%EOF"  # syntheti
 
 
 def _reg_shape_b(inbox: Path) -> Registry:
-    def _handler(msg):  # type: ignore[no-untyped-def]
+    def _handler(msg):
         if not msg.is_binary:  # pragma: no cover - guarded by the router
             return None
         pdf = msg.raw_bytes

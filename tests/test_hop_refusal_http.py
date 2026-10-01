@@ -34,6 +34,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.base import DestinationConnector
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import (
     InsecureHopGuard,
@@ -77,7 +78,7 @@ def _build(
     accepted: bool = False,
     revocation_attested: bool = False,
     **over: Any,
-) -> object:
+) -> DestinationConnector:
     ctype, factory, url = spec
     settings = factory(url=url, **over).settings
     return build_destination(
@@ -537,8 +538,8 @@ class _Resp:
     def __enter__(self) -> _Resp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _Opener:

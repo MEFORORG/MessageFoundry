@@ -89,7 +89,7 @@ def test_lanes_default_one_is_byte_identical(monkeypatch: pytest.MonkeyPatch) ->
     assert set(reg.inbound) == {"IB_S_a", "IB_S_b"}  # no _L suffix
     assert set(reg.routers) == {"route_a", "route_b"}
     assert "H_a_00" in reg.handlers and "H_a_01" in reg.handlers  # no _L suffix
-    ports = sorted(c.spec.settings.get("port") for c in reg.inbound.values())
+    ports = sorted(c.spec.settings["port"] for c in reg.inbound.values())
     assert ports == [3600, 3601]  # base + i
 
 
@@ -109,7 +109,7 @@ def test_lanes_per_shard_multiplies_chains(monkeypatch: pytest.MonkeyPatch) -> N
 def test_lanes_ports_contiguous_and_non_overlapping(monkeypatch: pytest.MonkeyPatch) -> None:
     _shard_env(monkeypatch, shards="a,b", lanes=3, dests=2)
     reg = load_config(_CONFIG_DIR)
-    ports = sorted(c.spec.settings.get("port") for c in reg.inbound.values())
+    ports = sorted(c.spec.settings["port"] for c in reg.inbound.values())
     # 2 shards x 3 lanes = 6 contiguous ports from the base, none overlapping.
     assert ports == list(range(3600, 3606))
     assert len(ports) == len(set(ports))
@@ -251,7 +251,7 @@ def test_non_delivering_handler_reads_the_message(monkeypatch: pytest.MonkeyPatc
     reads: list[str] = []
 
     class _SpyMessage(Message):
-        def __getitem__(self, key: str) -> str:
+        def __getitem__(self, key: str) -> str | None:
             reads.append(key)
             return super().__getitem__(key)
 

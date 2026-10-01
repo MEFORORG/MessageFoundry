@@ -461,7 +461,7 @@ def test_unreadable_or_non_select_head_rejected(stmt: str) -> None:
     ],
 )
 def test_read_only_statements_still_admitted(stmt: str) -> None:
-    assert database._require_read_only(stmt) is None
+    database._require_read_only(stmt)  # admitted: returns rather than raising
 
 
 def test_lookup_dsn_is_read_only() -> None:
@@ -524,13 +524,13 @@ def test_check_lookup_allowed_unrestricted_when_empty() -> None:
 
 def test_dry_run_raises_when_handler_calls_db_lookup() -> None:
     reg = Registry()
-    reg.add_router("r", lambda msg: ["h"])  # type: ignore[no-untyped-def, arg-type]
+    reg.add_router("r", lambda msg: ["h"])
 
     def handler(msg: Any) -> None:
         db_lookup("clarity", "SELECT npi FROM p WHERE mrn = :mrn", {"mrn": msg["PID-3.1"]})
         return None
 
-    reg.add_handler("h", handler)  # type: ignore[arg-type]
+    reg.add_handler("h", handler)
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=2575), router="r"))
     raw = "MSH|^~\\&|S|F|R|F|20260614||ADT^A01|1|P|2.5\rPID|1||M1^^^MR\r"
     result = dryrun.dry_run(reg, raw, inbound="IB")
@@ -574,7 +574,7 @@ async def test_audit_query_runs_via_autocommit_readonly_pool(
 
     async def spy_make_pool(
         dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
-    ):  # type: ignore[no-untyped-def]
+    ):
         seen["autocommit"] = autocommit
         return real_pool
 

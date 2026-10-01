@@ -10,10 +10,10 @@ import io
 import zlib
 
 from pydicom.dataset import Dataset, FileMetaDataset
-from pydicom.uid import DeflatedExplicitVRLittleEndian, ExplicitVRLittleEndian, generate_uid
+from pydicom.uid import UID, DeflatedExplicitVRLittleEndian, ExplicitVRLittleEndian, generate_uid
 
 #: Basic Text SR storage SOP Class UID (an SR class DicomPeek.is_structured_report recognises).
-BASIC_TEXT_SR = "1.2.840.10008.5.1.4.1.1.88.11"
+BASIC_TEXT_SR = UID("1.2.840.10008.5.1.4.1.1.88.11")
 
 
 def make_sr_part10(

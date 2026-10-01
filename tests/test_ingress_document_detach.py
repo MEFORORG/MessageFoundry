@@ -243,7 +243,9 @@ async def test_detach_downgrades_mislabelled_mime_to_octet_stream(store: Message
         attaches[0]["content_type"] == "application/octet-stream"
     )  # downgraded (magic contradicts)
     # The handle in the persisted skeleton carries the downgraded type too, and the bytes round-trip.
-    _, ct = parse_doc_ref(Message.parse((await _messages(store))[0]["raw"]).field("OBX-5.5"))
+    ref = Message.parse((await _messages(store))[0]["raw"]).field("OBX-5.5")
+    assert ref is not None
+    _, ct = parse_doc_ref(ref)
     assert ct == "application/octet-stream"
     assert await _read_attachment(store, attaches[0]["id"]) == b64  # verbatim bytes unchanged
 
@@ -309,7 +311,7 @@ async def test_strict_downgraded_to_header_only_over_threshold(
     # Over the streaming threshold, whole-body hl7apy validation is NOT invoked (header-only downgrade).
     calls: list[str] = []
 
-    def _boom(text, *, expected_version=None):  # type: ignore[no-untyped-def]
+    def _boom(text, *, expected_version=None):
         calls.append(text)
         raise AssertionError("whole-body validate must not run over the streaming threshold")
 
@@ -337,7 +339,7 @@ async def test_strict_still_runs_below_threshold(store: MessageStore, monkeypatc
         ok = True
         errors: list[str] = []
 
-    def _spy(text, *, expected_version=None):  # type: ignore[no-untyped-def]
+    def _spy(text, *, expected_version=None):
         called.append(text)
         return _Result()
 
@@ -389,7 +391,9 @@ async def test_identical_documents_dedup_no_double_write(store: MessageStore) ->
     assert len(attaches) == 1  # one physical copy
     assert attaches[0]["refcount"] == 2  # both skeletons reference it
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM attachment_chunk")
-    assert dict(await cur.fetchone())["n"] == len(list(chunk_b64(b64)))  # chunks written once
+    row = await cur.fetchone()
+    assert row is not None
+    assert dict(row)["n"] == len(list(chunk_b64(b64)))  # chunks written once
 
 
 async def test_crash_before_skeleton_commit_orphan_reclaimed_and_rerun_dedups(

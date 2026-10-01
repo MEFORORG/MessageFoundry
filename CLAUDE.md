@@ -881,8 +881,10 @@ gates a merge**, and no seat has to clear one.
 
 ### A Builder runs the checks before it commits, because nobody downstream can ask it to
 
-- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict,
-  over `messagefoundry` and, with `--explicit-package-bases`, `tests`), `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+- New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict),
+  in the three legs `ci.yml` runs: `mypy --platform linux messagefoundry messagefoundry_webconsole
+  messagefoundry_toolkit --exclude 'messagefoundry/tray/'`, `mypy --platform win32 messagefoundry
+  messagefoundry_toolkit` and `mypy --explicit-package-bases tests`. Then `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
 - **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
   Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
   points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
@@ -952,7 +954,7 @@ QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM=
 # format / lint / types
 ruff format .
 ruff check .
-mypy messagefoundry
+mypy messagefoundry messagefoundry_webconsole messagefoundry_toolkit   # the packages ci.yml checks
 mypy --explicit-package-bases tests   # BACKLOG #1799; the profile and its exemptions: pyproject.toml
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui

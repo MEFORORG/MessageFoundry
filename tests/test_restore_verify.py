@@ -21,6 +21,7 @@ import tarfile
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline import dr_backup
@@ -138,7 +139,7 @@ async def test_verify_accepts_a_retired_key_after_rotation(tmp_path) -> None:
 
 
 def _reseal_with_mutated_manifest(
-    archive_path: str, key: bytes, out_path: Path, mutate: Callable[[dict[str, object]], None]
+    archive_path: str, key: bytes, out_path: Path, mutate: Callable[[dict[str, Any]], None]
 ) -> None:
     """Decrypt ``archive_path`` under ``key``, apply ``mutate`` to its parsed ``manifest.json`` in
     place, then re-encrypt the resulting tar to ``out_path`` under the SAME key. Every other member
@@ -199,8 +200,8 @@ async def test_verify_fails_when_the_manifest_row_counts_disagree_with_the_snaps
     store, archive, ss = await _backup(tmp_path, key_b64)
     key = base64.b64decode(key_b64)
 
-    def _bump_messages_count(manifest: dict[str, object]) -> None:
-        counts = dict(manifest["row_counts"])  # type: ignore[arg-type]
+    def _bump_messages_count(manifest: dict[str, Any]) -> None:
+        counts = dict(manifest["row_counts"])
         counts["messages"] = counts.get("messages", 0) + 1
         manifest["row_counts"] = counts
 
@@ -230,8 +231,8 @@ async def test_verify_passes_when_an_older_manifest_records_only_a_subset_of_tab
     store, archive, ss = await _backup(tmp_path, key_b64)
     key = base64.b64decode(key_b64)
 
-    def _shrink_to_the_old_four_tables(manifest: dict[str, object]) -> None:
-        counts = dict(manifest["row_counts"])  # type: ignore[arg-type]
+    def _shrink_to_the_old_four_tables(manifest: dict[str, Any]) -> None:
+        counts = dict(manifest["row_counts"])
         old_style = {
             table: counts[table]
             for table in ("messages", "queue", "message_events", "audit_log")
@@ -259,8 +260,8 @@ async def test_verify_fails_when_the_manifest_expects_a_table_the_snapshot_does_
     store, archive, ss = await _backup(tmp_path, key_b64)
     key = base64.b64decode(key_b64)
 
-    def _add_a_phantom_table(manifest: dict[str, object]) -> None:
-        counts = dict(manifest["row_counts"])  # type: ignore[arg-type]
+    def _add_a_phantom_table(manifest: dict[str, Any]) -> None:
+        counts = dict(manifest["row_counts"])
         counts["a_table_this_snapshot_does_not_have"] = 3
         manifest["row_counts"] = counts
 
@@ -831,7 +832,7 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
     monkeypatch.setattr(dr_backup, "_remove_tree", lambda path: False)
     real_open = open
 
-    def open_refusing_writes(file, mode="r", *args, **kwargs):  # type: ignore[no-untyped-def]
+    def open_refusing_writes(file, mode="r", *args, **kwargs):
         if mode == "r+b":
             raise PermissionError(13, "synthetic sharing violation", str(file))
         return real_open(file, mode, *args, **kwargs)
@@ -910,7 +911,7 @@ def test_a_directory_that_cannot_be_listed_is_not_reported_empty(tmp_path, monke
     staging.mkdir()
     (staging / "extracted_store.db").write_bytes(b"synthetic")
 
-    def walk_refusing(top, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
+    def walk_refusing(top, onerror=None, **kwargs):
         assert onerror is not None
         onerror(PermissionError(13, "synthetic listing refusal", str(top)))
         return iter(())

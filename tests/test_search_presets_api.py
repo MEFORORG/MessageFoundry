@@ -17,6 +17,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -247,6 +248,7 @@ async def test_malformed_stored_criteria_are_still_a_400(engine: Engine, stored:
         )
         assert r.status_code == 200, r.text
         pid = r.json()["id"]
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
         await engine.store._db.execute(
             "UPDATE search_presets SET criteria=? WHERE id=?", (stored, pid)
         )
@@ -308,6 +310,7 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         # alice leaves.
         alice = await service.store.get_user_by_username("alice")
         assert alice is not None
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw reads need _db
         # Capture the row FIRST. BACKLOG #1233 makes delete_user purge it, and this test needs it
         # back afterwards -- see the two-controls note below.
         raw = await engine.store._db.execute(

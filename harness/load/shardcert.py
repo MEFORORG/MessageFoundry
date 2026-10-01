@@ -1150,13 +1150,15 @@ async def _reset_store(env: Mapping[str, str]) -> None:
     import os
 
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.store.sqlserver import SqlServerStore
 
     # The TLS-escape guard (insecure_tls_allowed) reads os.environ DIRECTLY, so the parent-process
     # store open needs the escape + creds in os.environ, not just the load_settings `environ=` arg.
     with _env_scope(dict(env)):
         settings = load_settings(environ=os.environ).store
-        store = await SqlServerStore.open(settings)
+        # The escape needs a known warn posture (vault BACKLOG #2354); this rig is a dev container.
+        store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
     try:
         async with store._pool.acquire() as conn:
             cur = await conn.cursor()
@@ -1255,11 +1257,13 @@ async def _queue_breakdown(env: Mapping[str, str]) -> QueueBreakdown:
     import os
 
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.store.sqlserver import SqlServerStore
 
     with _env_scope(dict(env)):  # escape reads os.environ directly — see _reset_store
         settings = load_settings(environ=os.environ).store
-        store = await SqlServerStore.open(settings)
+        # The escape needs a known warn posture (vault BACKLOG #2354); this rig is a dev container.
+        store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
     try:
         async with store._pool.acquire() as conn:
             cur = await conn.cursor()

@@ -330,7 +330,7 @@ def _digest_proxy_opener(
         proxy_password="pw",
         proxy_auth_type="digest",
     )
-    return dest._opener  # type: ignore[attr-defined,no-any-return]
+    return dest._opener  # type: ignore[attr-defined]
 
 
 def _open_through_digest_proxy(
@@ -338,7 +338,7 @@ def _open_through_digest_proxy(
 ) -> urllib.response.addinfourl:
     """Send one request through a REST destination's per-connection opener to ``proxy``."""
     opener = _digest_proxy_opener(monkeypatch, proxy.url)
-    return opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)  # type: ignore[no-any-return]
+    return opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)
 
 
 @pytest.mark.parametrize(

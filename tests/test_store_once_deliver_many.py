@@ -79,7 +79,9 @@ async def _outbound_rows(store: MessageStore, mid: str) -> list[dict]:
 
 async def _shared_count(store: MessageStore) -> int:
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM shared_body")
-    return int((await cur.fetchone())["n"])
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    return int(fetched_row["n"])
 
 
 # --- dedup: identical body across N destinations is stored ONCE -------------------------------------
@@ -99,7 +101,9 @@ async def test_identical_body_to_many_destinations_stored_once(store: MessageSto
     # Exactly one shared body, refcount == fan-out.
     assert await _shared_count(store) == 1
     cur = await store._db.execute("SELECT refcount FROM shared_body")
-    assert int((await cur.fetchone())["refcount"]) == len(dests)
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert int(fetched_row["refcount"]) == len(dests)
 
 
 async def test_singleton_body_stays_inline(store: MessageStore) -> None:
@@ -174,7 +178,9 @@ async def test_shared_body_encrypted_at_rest(enc_store: MessageStore) -> None:
     await _route_one(enc_store, "IB")
     await _transform(enc_store, "IB", [("OB_A", BODY), ("OB_B", BODY)])
     cur = await enc_store._db.execute("SELECT body FROM shared_body")
-    stored = (await cur.fetchone())["body"]
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    stored = fetched_row["body"]
     assert stored.startswith(MARKER_PREFIX)  # the single copy is ciphertext, not plaintext
     assert BODY not in stored
     # And it still dereferences back to plaintext on delivery.
@@ -254,7 +260,9 @@ async def test_partial_dead_letter_keeps_shared_body(store: MessageStore) -> Non
     await store.purge_dead_letters(older_than=10_000.0, now=10_000.0)
     assert await _shared_count(store) == 1  # OB_B still references it
     cur = await store._db.execute("SELECT refcount FROM shared_body")
-    assert int((await cur.fetchone())["refcount"]) == 1
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert int(fetched_row["refcount"]) == 1
     # The delivered OB_B row still dereferences correctly until its own message-body purge.
     rows = await store.outbox_payloads_for(mid)
     ob_b = next(r for r in rows if r["destination_name"] == "OB_B")

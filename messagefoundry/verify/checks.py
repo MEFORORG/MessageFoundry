@@ -339,7 +339,8 @@ def check_lockable_accounts(store: StoreSettings, auth: AuthSettings) -> CheckRe
         return CheckResult(rid, title, Status.SKIP, f"no SQLite store at {absent} yet")
 
     # The service-free census: no AuthService, so no trust-anchor preflight and no directory client
-    # is built for a read-only question, and the [security].enforcement dial does not matter here.
+    # is built for a read-only question. The store opens with no posture, so a weakened-TLS store
+    # refuses here whatever [security].enforcement says (vault BACKLOG #2354).
     from messagefoundry.auth.service import (
         CensusNeedsTheStoreKey,
         LockableAccountCensus,

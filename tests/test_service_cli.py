@@ -7,6 +7,8 @@ to messagefoundry.service. No real service is touched."""
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -25,8 +27,8 @@ def test_service_status_dispatch(
         returncode = 0
         stdout = "        STATE              : 4  RUNNING"
 
-    monkeypatch.setattr(svc.sys, "platform", "win32")
-    monkeypatch.setattr(svc.subprocess, "run", lambda *a, **k: _Result())
+    monkeypatch.setattr(sys, "platform", "win32")  # the same module object service.py reads
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
 
     rc = main(["service", "status", "--name", "MessageFoundry"])
     assert rc == 0
@@ -35,9 +37,12 @@ def test_service_status_dispatch(
 
 def test_service_start_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        svc, "control_service", lambda action, name: calls.append((action, name)) or True
-    )
+
+    def _control(action: str, name: str) -> bool:
+        calls.append((action, name))
+        return True
+
+    monkeypatch.setattr(svc, "control_service", _control)
 
     assert main(["service", "start", "--name", "MyEngine"]) == 0
     assert calls == [("start", "MyEngine")]
@@ -57,9 +62,12 @@ def test_service_install_requires_env(capsys: pytest.CaptureFixture[str]) -> Non
 def test_service_install_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     installs: list[tuple[str, str]] = []
     monkeypatch.setattr(svc, "install_script_path", lambda: Path("install-service.ps1"))
-    monkeypatch.setattr(
-        svc, "install_service", lambda script, env: installs.append((script, env)) or True
-    )
+
+    def _install(script: str, env: str) -> bool:
+        installs.append((script, env))
+        return True
+
+    monkeypatch.setattr(svc, "install_service", _install)
 
     assert main(["service", "install", "--env", "dev"]) == 0
     assert installs == [("install-service.ps1", "dev")]
