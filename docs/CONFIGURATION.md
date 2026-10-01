@@ -1041,7 +1041,7 @@ transport's list is set, an outbound of that transport not on it is **refused at
 >
 > | `[egress]` / `[security]` as configured | What `serve` does |
 > |---|---|
-> | **none of the six *counted* lists** set (see the WARNING below), `block_unlisted_outbound` left unset | **exits 2** — *"outbound egress is UNRESTRICTED … refusing to start"*. A PHI instance with no egress config does **not** start — **and neither does one whose only list is `allowed_smtp` or `allowed_direct`**. |
+> | **none of the six *counted* lists** set (see "Only SIX of the eight lists" below), `block_unlisted_outbound` left unset | **exits 2** — *"outbound egress is UNRESTRICTED … refusing to start"*. A PHI instance with no egress config does **not** start — **and neither does one whose only list is `allowed_smtp` or `allowed_direct`**. |
 > | none of the six set, `block_unlisted_outbound = false` | **exits 2** — same gate; the explicit opt-out does not buy a fully-open PHI instance. |
 > | **≥1 of the six *counted* lists** set (see below), `block_unlisted_outbound` left unset | starts, and **flips deny-by-default ON** (an `info:` line on stderr): every transport whose own list is **empty** now refuses **every** destination of that type. This is the case that bites — a partially-configured instance does not allow-any the transports you didn't list. |
 > | `block_unlisted_outbound = true` | starts, deny-by-default — enumerate every permitted destination. |
@@ -1072,7 +1072,7 @@ transport's list is set, an outbound of that transport not on it is **refused at
 | `allowed_http` | list | `[]` | allowed HTTP destination hosts; each entry is `host` (any port) or `host:port` (ADR 0003). **Covers the whole HTTP family, not just REST/SOAP:** `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` (STOW-RS), the read-only `fhir_lookup` / `FhirLookup(...)` (ADR 0043), **and** the SMART / OAuth2 **token endpoints** — a token endpoint is a second egress host and is checked against this same list, so list it too. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
 | `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry is `host` (any port) or `host:port` (ADR 0003). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
 | `allowed_remote` | list | `[]` | allowed RemoteFile (SFTP/FTP/FTPS) hosts — gates the connector in **both** directions (source poll + destination upload); each entry is `host` (any port) or `host:port`. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_REMOTE` |
-| `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry is `host` (any port) or `host:port`. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. **Does NOT count toward the open-egress startup gate** (see the WARNING above the key table) — setting only this on a PHI instance still exits 2. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
+| `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry is `host` (any port) or `host:port`. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. **Does NOT count toward the open-egress startup gate** (see "Only SIX of the eight lists" above the key table) — setting only this on a PHI instance still exits 2. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
 | `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry is `host` (any port) or `host:port`. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. **Does NOT count toward the open-egress startup gate** either — a Direct-only PHI instance needs `[security].block_unlisted_outbound = true` to start. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
 | `proxy_url` | str | _unset_ | site-wide **default forward/egress web proxy** for the HTTP family — REST/SOAP/FHIR/`fhir_lookup`/DICOMweb plus the OAuth2/SMART token endpoints ([ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md)). A connection that sets no per-connection `proxy` inherits this; a per-connection value overrides it. Unset (default) = no site-wide proxy (byte-identical — only per-connection proxies apply). `"default"` selects the OS default web proxy (`getproxies()`); an `http(s)://` address names an explicit one. **Proxy credentials stay per-connection** (secrets via `env()`), never a global TOML value. Via env: `MEFOR_EGRESS_PROXY_URL` |
 | `proxy_no_proxy` | list | `[]` | the site-wide `NO_PROXY`-style **bypass list** inherited by a connection that sets no per-connection `proxy_no_proxy`. Each entry is a host, `.suffix`, `*.suffix` or `*`. Via env: comma-separated `MEFOR_EGRESS_PROXY_NO_PROXY` |
@@ -1081,7 +1081,7 @@ transport's list is set, an outbound of that transport not on it is **refused at
 
 > **Fully-open egress is a startup REFUSAL, not a warning** (see the table above).
 > With none of the six **counted** allowlists set (`allowed_smtp`/`allowed_direct` do not count —
-> see the WARNING above), `serve` **exits 2** on **every** instance — all three built-in env names, not
+> see "Only SIX of the eight lists" above), `serve` **exits 2** on **every** instance — all three built-in env names, not
 > just `prod`/`staging` — under `[security].enforcement = enforce`, the default; it downgrades to a
 > stderr warning only under `enforcement = warn`, which is now the only dial that moves it. Lock it down with
 > the per-transport lists above and/or **`[security].block_unlisted_outbound = true`** — note that key
@@ -1957,7 +1957,7 @@ previously said three blocks and four refusing gates; the retention gate stopped
 unset window when the 30-day auto-bound moved to both enforcement dials. The gates a stock PHI
 instance meets, and what satisfies each:
 **keyless PHI** → `MEFOR_STORE_ENCRYPTION_KEY` in the environment; **open egress** → at least one
-*counted* `[egress]` list (see the [`[egress]`](#egress) WARNING — `allowed_smtp` alone does not count);
+*counted* `[egress]` list (see "Only SIX of the eight lists" under [`[egress]`](#egress) — `allowed_smtp` alone does not count);
 **unbounded retention** → nothing you must configure to boot: `serve` defaults each *unset* PHI
 window to 30 days rather than refusing, and only an **explicit** `0` is refused (see
 [`[retention]`](#retention)) — set `[security].delete_message_bodies_after_days` and
