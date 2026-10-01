@@ -1654,7 +1654,8 @@ def test_a_send_before_its_clone_fails_loudly(tmp_path: Path) -> None:
 
 def test_a_clone_on_one_branch_is_unbound_after_the_join(tmp_path: Path) -> None:
     """A clone made inside a branch delivers there, but after the join the handle may hold nothing,
-    so a send of it refuses. Bound before the branch, the same send delivers (the control arm)."""
+    so a send of it refuses. Bound before a branch that does not touch it, the same send delivers
+    (the control arm)."""
     branch = (
         '<If Data="If (a)"><List>'
         + _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
@@ -1669,10 +1670,24 @@ def test_a_clone_on_one_branch_is_unbound_after_the_join(tmp_path: Path) -> None
     with pytest.raises(NotImplementedError, match="MsgSend to OB_AFTER"):
         _run_handler(tmp_path, body)
 
-    control = _root_copy("input-handle", "%ADT", "other-handle", "%OUT") + body
+    untouched = '<If Data="If (a)"><List>' + _role_send("other-handle", "%OUT", "OB_IN_BRANCH")
+    control = (
+        _CLONE_OUT + untouched + "</List></If>" + _role_send("other-handle", "%OUT", "OB_AFTER")
+    )
     control_src = _handler_body(_handler_source(control))
     assert '    sends.append(Send("OB_AFTER", out_msg))' in control_src
     assert "raise NotImplementedError" not in control_src
+
+
+def test_a_handle_rebound_inside_a_branch_is_unbound_after_the_join() -> None:
+    """Bound before the branch AND rebound inside it, the handle may hold either tree after the
+    join. Its local keeps one name for the whole handler, so a join that compared local names read
+    the rebind as no change and sent ``out_msg`` after it (the differential guard's finding on
+    d26545d6f, PR 1900)."""
+    rebuilt = '<If Data="If (a)"><List>' + _create("%OUT", _ADT_A04) + "</List></If>"
+    body = _handler_body(_handler_source(_CLONE_OUT + rebuilt + _SEND_OUT))
+    assert 'Send("OB_OUT"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
 
 
 def test_a_clone_on_every_branch_is_still_unbound_after_the_join() -> None:
@@ -3510,3 +3525,114 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
     assert "\nos.system(" not in src
     assert 'set_field(msg, "MSH-6", "A\\nimport os")' in src  # escaped, inert literal
     ast.parse(src)  # still one well-formed module — no literal or comment breakout
+
+
+# --- the d26545d6f HIGH on PR 1900, and the shapes the differential guard found with it ----------
+# tests/test_corepoint_import_differential.py runs these shapes and about 2,900 more against step 1;
+# these name the HIGH's four shapes so a reader sees them without the guard's machinery.
+
+_NEW_SENT = _create("%NEW", _ADT_A04) + _role_send("other-handle", "%NEW", "OB_NEW")
+
+
+def _line_with(data: str, body: str) -> str:
+    return _role_line(data).replace("/>", f"><List>{body}</List></Line>")
+
+
+_IF_ADT_EXISTS = _span("keyword", "If") + " " + _span("input-handle", "%ADT") + " exists"
+
+
+@pytest.mark.parametrize(
+    "export",
+    [
+        pytest.param(
+            "<If>"
+            + _line_with(_IF_ADT_EXISTS, _MSGLOG_P)
+            + _line_with("Else", _NEW_SENT)
+            + "</If>",
+            id="if-names-a-handle-then-else",
+        ),
+        pytest.param(
+            '<If><Line Data="If $X = &quot;1&quot;"><List>'
+            + _MSGLOG_P
+            + "</List></Line>"
+            + _line_with(
+                _span("keyword", "ElseIf") + " " + _span("input-handle", "%ADT") + " exists",
+                _NEW_SENT,
+            )
+            + "</If>",
+            id="elseif-names-a-handle",
+        ),
+        pytest.param(
+            '<Try><Line Data="Try"><List>'
+            + _MSGLOG_P
+            + "</List></Line>"
+            + _line_with(
+                _span("keyword", "Catch") + " into " + _span("other-handle", "%ERR"), _NEW_SENT
+            )
+            + "</Try>",
+            id="catch-names-a-handle",
+        ),
+        pytest.param(
+            '<If Data="If %ADT exists"><List>'
+            + _MSGLOG_P
+            + "</List></If>"
+            + _line_with("Else", _NEW_SENT),
+            id="sibling-if-names-a-handle-then-else",
+        ),
+    ],
+)
+def test_a_branch_whose_construct_names_a_handle_stays_a_branch(export: str) -> None:
+    """The Lander's HIGH on d26545d6f: markers around an If, ElseIf or Catch that names a whole
+    message hid the branch from its construct, so the branch rendered with no enclosing construct
+    and its body ran for every message. The line now carries the reason instead, and stays in its
+    chain."""
+    body = _handler_body(_handler_source(export))
+    assert '\n    sends.append(Send("OB_NEW"' not in body  # never at the handler's own level
+    assert "with no enclosing construct" not in body
+    assert "elif False:" in body or "    except Exception:" in body
+
+
+def test_a_send_where_the_scope_was_lost_raises_unless_step1_sent_msg() -> None:
+    """A branch marker with no construct inlines what follows it, which Corepoint may never have
+    run. A send there of a message the list built raises; a send of msg stays as step 1 had it."""
+    lost = '<Block Data="Section"><List>' + _ELSE + _NEW_SENT + _SEND_INPUT + "</List></Block>"
+    body = _handler_body(_handler_source(_WRITE_INPUT + lost))
+    assert 'Send("OB_NEW"' not in body
+    assert "where the import lost the export's scope" in body
+    assert '    sends.append(Send("OB_IN", msg))' in body
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param('<Line Data="ForEach OUT in %SRC/OBX">', id="foreach-no-percent"),
+        pytest.param(
+            "<Line Data=\"&lt;span class='keyword'&gt;ForEach&lt;/span&gt; "
+            "&lt;span class='handle'&gt;%OUT&lt;/span&gt;\">",
+            id="foreach-unlisted-span-class",
+        ),
+        pytest.param('<Line Data="Catch into OUT">', id="catch-no-percent"),
+    ],
+)
+def test_a_foreach_or_catch_naming_a_handle_in_any_spelling_unbinds_it(line: str) -> None:
+    """A ForEach or Catch may bind the handle it names. A spelling neither reading sees made the
+    flow keep the clone, so a send of it went out after the construct had rebound it. The line is
+    now judged word by word: anything it cannot classify may be a handle."""
+    clone = _root_copy("input-handle", "%ADT", "other-handle", "OUT")
+    send = _role_send("other-handle", "OUT", "OB_OUT")
+    construct = line + "<List>" + _MSGLOG_P + "</List></Line>"
+    if "Catch" in line:
+        construct = '<Try><Line Data="Try"><List>' + _MSGLOG_P + "</List></Line>" + construct
+        construct += "</Try>"
+    body = _handler_body(_handler_source(clone + construct + send))
+    assert 'Send("OB_OUT"' not in body
+    control = _handler_body(_handler_source(clone + send))
+    assert '    sends.append(Send("OB_OUT", out_msg))' in control
+
+
+def test_a_foreach_over_a_path_with_a_variable_still_reads() -> None:
+    """The control for the word rule: ``ForEach %ADT/OBX $obx`` names a path into a handle and a
+    variable, neither a whole tree, so a clone made before it is still sent after it."""
+    loop = '<Foreach Data="ForEach %ADT/OBX $obx"><List>' + _MSGLOG_P + "</List></Foreach>"
+    body = _handler_body(_handler_source(_CLONE_OUT + loop + _SEND_OUT))
+    assert '    sends.append(Send("OB_OUT", out_msg))' in body
