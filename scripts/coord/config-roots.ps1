@@ -374,7 +374,8 @@ function Get-WiredStateDir {
         reportable state (the collector then chooses at run time), and folding it into "wired" is how
         it would go silent.
 
-        TWO SHAPES, BOTH ACCEPTED, AND THE LEGACY ONE IS STILL ON DISK RIGHT NOW. The installer emits a
+        AT LEAST TWO SHAPES, ALL ACCEPTED, AND THE LEGACY ONE IS STILL ON DISK RIGHT NOW. (A third,
+        single-quoted, is named at its pattern below.) The installer emits a
         shell-agnostic command -- `pwsh ... -File "<collector>" -StateDir "<state>"` -- because a
         statusLine entry has no `shell` key and bash cannot parse PowerShell source. Roots wired before
         that change carry the PowerShell-only `$d = '<state>'` form and keep it until somebody re-runs
@@ -389,6 +390,12 @@ function Get-WiredStateDir {
     # `-StateDir $d`, which this pattern rejects for want of the opening quote, and the current command
     # contains no `$d =` assignment at all.
     $m = [regex]::Match($Command, '-StateDir\s+"([^"]*)"')
+    if ($m.Success) { return $m.Groups[1].Value }
+    # A THIRD SHAPE, SINGLE-QUOTED, AND IT IS THE ONE THAT PUBLISHES ON THIS BOX (BACKLOG #1459).
+    # `pwsh -NoProfile -File '<collector>' -StateDir '<state>'` is valid in both shells and is what
+    # the account roots that DO publish carry. Unmatched, every one of them read as WIRED_LEGACY --
+    # "carries no -StateDir" -- about a command that visibly carries one.
+    $m = [regex]::Match($Command, "-StateDir\s+'([^']*)'")
     if ($m.Success) { return $m.Groups[1].Value }
     $m = [regex]::Match($Command, "\`$d = '((?:[^']|'')*)'")
     if (-not $m.Success) { return $null }
@@ -409,7 +416,35 @@ function Get-WiredCollectorPath {
     if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
     $m = [regex]::Match($Command, '-File\s+"([^"]*)"')
     if ($m.Success) { return $m.Groups[1].Value }
+    $m = [regex]::Match($Command, "-File\s+'([^']*)'")
+    if ($m.Success) { return $m.Groups[1].Value }
     $m = [regex]::Match($Command, "\`$s = '((?:[^']|'')*)'")
     if (-not $m.Success) { return $null }
     return ($m.Groups[1].Value -replace "''", "'")
+}
+
+function Test-IsPowerShellSourceStatusLine {
+    <#
+    .SYNOPSIS
+        Is this wired statusLine command PowerShell SOURCE, which bash cannot run? (BACKLOG #1459)
+    .DESCRIPTION
+        A statusLine entry has no `shell` key, so Claude Code runs it under bash (Git Bash on
+        Windows). The installer used to emit PowerShell source -- `$s = '...'; if (Test-Path ...) {
+        ... }` -- and bash dies at the `{` before pwsh ever starts. Such a root publishes NOTHING,
+        forever, from every session.
+
+        THE READER USED TO CALL THAT ROOT HEALTHY. Get-WiredStateDir reads the `$d = '...'` path
+        out of it, the path matches, and the diagnosis came back WIRED_HERE with the remedy "start
+        a new session and wait" -- advice that cannot work. Measured 2026-09-30 on a live account
+        root: `bash -n` over its command returned 2, "syntax error near unexpected token `{'".
+
+        WHAT IT MATCHES: a line that opens with a PowerShell assignment, `$name = ...`. That is how
+        the old installer's command opens (the `$s = '...'` shape Get-WiredCollectorPath also reads),
+        and bash never reads it as an assignment, because a bash assignment names its variable
+        without a `$`. It recognises that emitted shape and is not a PowerShell parser: a hand-written
+        command in some other PowerShell form still reads as whatever the path arms make of it.
+    #>
+    param([string]$Command)
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
+    return [regex]::IsMatch($Command, '(?m)^\s*\$[A-Za-z_]\w*\s*=')
 }
