@@ -10,9 +10,12 @@ THE CONTRACT, both directions:
 
 * Every upper bound in ``[build-system].requires``, ``[project.dependencies]``,
   ``[project.optional-dependencies]`` and ``[dependency-groups]`` (``<``, ``~=``, ``==``, or an
-  ``==X.*`` wildcard) has a uv-ecosystem ``ignore`` entry whose range is exactly ``>=`` the
-  version ``_cap_of`` derives. Or the package is in ``_EXEMPT`` below, in the table it names, with
-  its reason.
+  ``==X.*`` wildcard) at MINOR level or lower has a uv-ecosystem ``ignore`` entry whose range is
+  exactly ``>=`` the version ``_cap_of`` derives. Or the package is in ``_EXEMPT`` below, in the
+  table it names, with its reason.
+* A MAJOR-level cap (one whose derived version is ``N.0.0`` with ``N`` above zero, such as ``<4``)
+  is exempt by class, per the class rule in dependabot.yml. An entry for one is a legal opt-in, and
+  is then held to the same exact range.
 * Every uv ``ignore`` entry names a package that pyproject.toml caps. dependabot.yml says to lift a
   cap and delete its entry in the same PR; this is what makes that rule fail when skipped. It is
   also this test's positive control: a parser that found no caps would red on every real entry, so
@@ -62,10 +65,6 @@ _GROUP_PIN_REASON = (
 #: ``[dependency-groups]`` must also be an exact ``==`` pin. Read each reason where it points.
 _EXEMPT: dict[str, tuple[str, str]] = {
     **dict.fromkeys(_GROUP_PINS, (_GROUPS, _GROUP_PIN_REASON)),
-    "hvac": (
-        "[project.optional-dependencies].vault",
-        "pyproject.toml's comment above the [vault] extra says why hvac's cap is not mirrored",
-    ),
     "hatchling": (
         "[build-system].requires",
         "pyproject.toml's [build-system] comment expects Dependabot to bump this pin",
@@ -81,6 +80,14 @@ class Cap(NamedTuple):
     spec: str
     exact_pin: bool
     ignore_from: Version
+
+
+def _is_major_level(start: Version) -> bool:
+    """Whether an ignore range from ``start`` would hold back only new majors: 4 yes, 0.50 no.
+
+    A ``0.x`` bump counts as a minor, as Dependabot reads it by version position.
+    """
+    return start.major > 0 and not any(start.release[1:]) and not start.is_prerelease
 
 
 def _is_pin(spec: Specifier) -> bool:
@@ -189,6 +196,8 @@ def _violations(pyproject: dict[str, Any], dependabot: dict[str, Any]) -> list[s
                 problems.append(f"{label} is exempt ({reason}) yet has an ignore entry")
             continue
         entries = ignores.get(cap.package)
+        if not entries and _is_major_level(cap.ignore_from):
+            continue  # exempt by class; dependabot.yml's class rule says why
         if not entries:
             problems.append(
                 f"{label} has no uv ignore entry in {_DEPENDABOT.name}; add one with "
@@ -230,6 +239,21 @@ def test_every_cap_has_an_ignore_entry_or_a_stated_exemption() -> None:
 
 
 @pytest.mark.parametrize(
+    ("start", "major"),
+    [
+        ("4", True),
+        ("4.0.0", True),
+        ("0.50", False),
+        ("3.1", False),
+        ("1.0.1", False),
+        ("4.0.0rc1", False),
+    ],
+)
+def test_major_level(start: str, major: bool) -> None:
+    assert _is_major_level(Version(start)) is major
+
+
+@pytest.mark.parametrize(
     ("spec", "start"),
     [
         ("<0.50", "0.50"),
@@ -251,6 +275,7 @@ def test_cap_arithmetic(spec: str, start: str | None) -> None:
 # so a legitimate cap lift in pyproject.toml cannot crash an arm.
 _FAKE_CAP = "mefor-fake-cap>=1.0,<2.5"
 _FAKE_PIN = "mefor-fake-pin==3.2.1"
+_FAKE_MAJOR = "mefor-fake-major>=1.0,<3"  # exempt by class, so the fixture gives it no entry
 
 
 def _fake_entry(dependabot: dict[str, Any], name: str) -> dict[str, Any]:
@@ -260,7 +285,7 @@ def _fake_entry(dependabot: dict[str, Any], name: str) -> dict[str, Any]:
 def _fixture() -> tuple[dict[str, Any], dict[str, Any]]:
     """Copies of the real files, plus the two made-up caps with correct entries."""
     pyproject, dependabot = copy.deepcopy(_load())
-    pyproject["project"]["dependencies"].append(_FAKE_CAP)
+    pyproject["project"]["dependencies"] += [_FAKE_CAP, _FAKE_MAJOR]
     pyproject.setdefault("dependency-groups", {})["mefor-fake"] = [_FAKE_PIN]
     _uv_entry(dependabot).setdefault("ignore", []).extend(
         [
@@ -271,13 +296,27 @@ def _fixture() -> tuple[dict[str, Any], dict[str, Any]]:
     return pyproject, dependabot
 
 
-def test_the_mutation_fixture_is_clean() -> None:
-    """Control: the arms below are discriminating only if the unbroken fixture passes."""
-    problems = _violations(*_fixture())
-    assert not problems, "\n".join(problems)
-
-
 _Mutation = Callable[[dict[str, Any], dict[str, Any]], None]
+
+
+def _major_entry(rng: str) -> _Mutation:
+    def mutate(_p: dict[str, Any], d: dict[str, Any]) -> None:
+        _uv_entry(d)["ignore"].append({"dependency-name": "mefor-fake-major", "versions": [rng]})
+
+    return mutate
+
+
+@pytest.mark.parametrize(
+    "mutate", [None, _major_entry(">=3.0.0")], ids=["unbroken", "major-cap-opt-in-entry"]
+)
+def test_the_mutation_fixture_is_clean(mutate: _Mutation | None) -> None:
+    """Control: the arms below discriminate only if the unbroken fixture passes. The fixture holds a
+    major cap with no entry, and an opt-in exact entry for it must stay legal."""
+    pyproject, dependabot = _fixture()
+    if mutate:
+        mutate(pyproject, dependabot)
+    problems = _violations(pyproject, dependabot)
+    assert not problems, "\n".join(problems)
 
 
 def _drop_entry(_p: dict[str, Any], d: dict[str, Any]) -> None:
@@ -328,6 +367,7 @@ _CAP_VERSIONS = "mefor-fake-cap", "versions"
             _set_entry("mefor-fake-pin", "versions", [">=3.2.0"]), _EXACT, id="blocks-pin"
         ),
         pytest.param(_set_entry("mefor-fake-pin", "versions", [">=4.0.0"]), _EXACT, id="pin-gap"),
+        pytest.param(_major_entry(">=2.0.0"), _EXACT, id="major-opt-in-not-exact"),
         pytest.param(_to_update_types, "update-types", id="update-types"),
         pytest.param(_lift_cap, "does not cap", id="stale-entry"),
         pytest.param(
