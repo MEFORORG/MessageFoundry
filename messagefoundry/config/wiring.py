@@ -1424,11 +1424,17 @@ def _mask_url_userinfo(value: object) -> object:
     if not isinstance(value, str) or "@" not in value or "//" not in value:
         return value
     scheme, _, rest = value.partition("//")
-    userinfo, at, hostpart = rest.rpartition("@")
+    # The authority ends at the first "/", "?" or "#". Splitting the whole rest at its last "@" read
+    # an "@" in a query (``?email=a@b.com``) as the userinfo end and rendered the wrong host.
+    end = min(
+        (i for i in (rest.find("/"), rest.find("?"), rest.find("#")) if i >= 0), default=len(rest)
+    )
+    authority, tail = rest[:end], rest[end:]
+    userinfo, at, hostpart = authority.rpartition("@")
     if not at or ":" not in userinfo:
         return value  # no userinfo, or a user with no password -- nothing secret to remove
     user, _, _pw = userinfo.partition(":")
-    return f"{scheme}//{user}:***@{hostpart}"
+    return f"{scheme}//{user}:***@{hostpart}{tail}"
 
 
 def _redact_header_name(name: object) -> str:
@@ -1483,7 +1489,11 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(value, EnvRef):
             ref: dict[str, Any] = {"env": value.key}
             if value.default is not _UNSET and not is_secret:
-                ref["default"] = value.default
+                default = value.default
+                if isinstance(default, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
+                    # A URL default gets the same two masks as a literal URL below (ASVS 14.2.1).
+                    default = _mask_url_userinfo(mask_credential_query(default))
+                ref["default"] = default
             out[name] = ref
         elif is_secret:
             out[name] = "***"
@@ -5056,8 +5066,8 @@ def _peer_label(settings: Mapping[str, Any]) -> str:
 
 
 def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every OUTBOUND connection that declares ``tls_allow_expired``, as ``(name, peer)`` (#129 /
-    ADR 0094, surfaced by #333).
+    """Every connection that declares ``tls_allow_expired``, as ``(name, peer)`` (#129 / ADR 0094,
+    surfaced by #333): every outbound, and the inbound REMOTEFILE pollers.
 
     The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader, so
     ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
@@ -5069,6 +5079,9 @@ def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
 
     **Inbound too.** ``Ftp()`` is a source factory as well, and a REMOTEFILE poller dials out over
     FTPS through the same context, which honours the flag. Inbound names are prefixed ``inbound:``.
+    Only that inbound type is walked: an MLLP or HTTP listener verifies a client, and its context
+    never reads the flag. Like the outbound arm, this lists what is DECLARED, so a plain-FTP poller
+    or an outbound with TLS off that sets the flag is listed though nothing is relaxed there.
     CORRECTED (ASVS 12.3.2 re-read review, 2026-10-01): this read *"Outbound only, and that is a fact
     about the graph ... no inbound factory takes it"*, which was false for that poller, so an expired
     certificate it accepted was logged at construction and listed nowhere. ``FhirLookup`` exposes
@@ -5083,7 +5096,7 @@ def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
     out.extend(
         (inbound_record_name(ic.name), _peer_label(ic.spec.settings))
         for ic in registry.inbound.values()
-        if ic.spec.settings.get("tls_allow_expired")
+        if ic.spec.type is ConnectorType.REMOTEFILE and ic.spec.settings.get("tls_allow_expired")
     )
     return sorted(out)
 

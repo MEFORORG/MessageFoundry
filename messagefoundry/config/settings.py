@@ -6719,8 +6719,9 @@ def security_loosenings(
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
     ``tls_allow_expired`` (#129 / ADR 0094), ``hostname_unchecked_hops`` declares
-    ``tls_check_hostname=false`` (ASVS 12.3.2), ``query_credential_hops`` is an outbound whose literal
-    ``url`` carries a credential-like query parameter (ASVS 14.2.1), ``unverified_db_hops`` is a
+    ``tls_check_hostname=false`` (ASVS 12.3.2), ``query_credential_hops`` is an outbound or
+    ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
+    ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment), and
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24), and
@@ -6728,8 +6729,9 @@ def security_loosenings(
     plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
-    connections; ``expiry_relaxed_hops``; ``hostname_unchecked_hops``, which walks inbound as well as
-    outbound; ``query_credential_hops``; ``unverified_generic_db_hops``, which walks inbound as well as
+    connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
+    ``hostname_unchecked_hops``, which walks inbound as well as outbound; ``query_credential_hops``,
+    which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``). A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a

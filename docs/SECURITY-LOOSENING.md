@@ -85,7 +85,7 @@ section reference.
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
-| | `tls_allow_expired` | `false` on all six outbound connectors that take it (*connection-scoped*) |
+| | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
 | | `tls_check_hostname` | `true` on every connection whose TLS context reads it (*connection-scoped*; `false` is the loosening) |
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
@@ -845,8 +845,10 @@ This section is kept rather than deleted, because the claim it used to make is t
 
 ### `tls_allow_expired = true` on a connection — an expired certificate accepted indefinitely
 > **Connection-scoped**, like `cleartext_accepted` above: a parameter on one outbound connection —
-> `MLLP`, `Rest`, `Soap`, `FHIR`, `DICOM` C-STORE SCU or `Ftp` (FTPS) — and therefore also a
-> `connections.toml` `[settings]` key. `FhirLookup` does not take it, and no inbound does.
+> `MLLP`, `Rest`, `Soap`, `FHIR`, `DICOM` C-STORE SCU or `Ftp` (FTPS) — and on an `Ftp` (FTPS) inbound
+> poller, which dials out through the same context. It is therefore also a `connections.toml`
+> `[settings]` key. `FhirLookup` does not take it. CORRECTED 2026-10-01: this said no inbound takes it,
+> which was false for that poller.
 > [ADR 0094](adr/0094-granular-expiry-only-tls-relaxation.md).
 - **What you lose:** the certificate **validity-period** check on that hop, and nothing else. An expired
   server certificate is accepted **indefinitely** — the relaxation has no end date, and nothing removes
@@ -862,9 +864,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   for otherwise is the blunt switch.
 - **When acceptable:** a short bridge while a partner renews a lapsed certificate. It should be
   transitional, and the *only* thing that makes it transitional is you — see the last bullet.
-- **Compensating controls:** none that the engine applies. The hop is still encrypted and still
-  authenticated to the named host, so the residual risk is a certificate whose issuer no longer stands
-  behind it.
+- **Compensating controls:** none that the engine applies. The hop is still encrypted, and it is
+  still authenticated to the named host unless the same connection sets `tls_check_hostname = false`.
+  Where it is, the residual risk is a certificate whose issuer no longer stands behind it. Where it is
+  not, any expired certificate from the trust anchor is accepted, whatever host it names.
 - **It is never silent:** a WARN at each construction naming the host; a `tls-allow-expired` line in
   `messagefoundry check` naming every declaring connection and its peer; and a `tls_allow_expired` entry
   in `security_loosenings()`, and so in `GET /security/posture` on a running engine. **Not** the

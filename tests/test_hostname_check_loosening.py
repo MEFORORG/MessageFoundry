@@ -326,6 +326,15 @@ def test_expiry_reader_lists_an_inbound_ftps_poller() -> None:
             router="r",
         )
     )
+    reg.add_inbound(  # control: a listener whose context never reads the flag
+        build_inbound_connection(
+            "IB_MLLP",
+            ConnectionSpec(
+                type=ConnectorType.MLLP, settings={"port": 6661, "tls_allow_expired": True}
+            ),
+            router="r",
+        )
+    )
     assert [name for name, _ in expiry_relaxed_hops(reg)] == ["inbound:IB_FTPS"]
 
 

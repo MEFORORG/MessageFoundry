@@ -74,8 +74,12 @@ def test_detector_leaves_benign_parameters_alone(url: str) -> None:
             ["accessToken", "clientSecret"],
         ),
         ("https://p.example.invalid/x?apiKey=a&authToken=b", ["apiKey", "authToken"]),
+        # Acronym-prefixed Title-case segments (review round 2).
+        ("https://p.example.invalid/x?SASToken=a&HMACSignature=b", ["HMACSignature", "SASToken"]),
         # Control: a lower-case run is not a camelCase boundary, and all-capitals is not split.
         ("https://p.example.invalid/x?turkey=a&MONKEY=b&hotkeys=c", []),
+        # Control: pagination cursors, sort keys and public keys end in a credential word only.
+        ("https://p.example.invalid/x?pageToken=a&next_page_token=b&sortKey=c&publicKey=d", []),
     ],
 )
 def test_detector_reads_camel_case_tails(url: str, expected: list[str]) -> None:
@@ -87,6 +91,47 @@ def test_detector_escapes_a_control_character_in_a_decoded_name() -> None:
     [name] = credential_query_params("https://p.example.invalid/x?x%0Afake_token=1")
     assert "\n" not in name and name.isprintable()
     assert "fake_token" in name  # still named, escaped rather than dropped
+
+
+def test_a_decoded_name_cannot_forge_a_second_entry() -> None:
+    """A printable name can still carry ``); `` that reads as the end of one ``check`` entry."""
+    [name] = credential_query_params("https://p.example.invalid/x?a%29%3B%20OB_EVIL%20%28api_key=1")
+    assert name.startswith("'") and name.endswith("'")  # quoted by repr, so it reads as one name
+
+
+def test_redacted_settings_masks_an_env_default_url_and_other_url_keys() -> None:
+    """The env() DEFAULT and a URL-suffixed key other than ``url`` reach /metadata too."""
+    from messagefoundry.config.wiring import env, redacted_settings
+
+    shown = redacted_settings(
+        {
+            "url": env("MEFOR_URL", default="https://u:pw@p.example.invalid/x?key=SYNTHETIC-7"),
+            "smart_token_url": "https://t.example.invalid/token?client_secret=SYNTHETIC-8",
+        }
+    )
+    assert shown["url"]["default"] == "https://u:***@p.example.invalid/x?key=***"
+    assert shown["smart_token_url"] == "https://t.example.invalid/token?client_secret=***"
+
+
+def test_userinfo_mask_ignores_an_at_sign_in_the_query() -> None:
+    """``_mask_url_userinfo`` split at the LAST ``@`` in the URL, so an ``@`` in a query was read as
+    the end of a userinfo and the view showed the wrong host."""
+    from messagefoundry.config.wiring import redacted_settings
+
+    url = "https://h.example.invalid:8443/x?email=a@b.example.invalid&key=SYNTHETIC-9"
+    assert (
+        redacted_settings({"url": url})["url"]
+        == "https://h.example.invalid:8443/x?email=a@b.example.invalid&key=***"
+    )
+
+
+def test_mask_and_detector_agree_on_where_the_query_is() -> None:
+    """A ``?`` after the ``#`` is fragment, not query, for both."""
+    from messagefoundry.secretscrub import mask_credential_query
+
+    url = "https://p.example.invalid/x#frag?key=S"
+    assert credential_query_params(url) == []
+    assert mask_credential_query(url) == url
 
 
 def test_redacted_settings_masks_the_query_value_and_keeps_the_rest() -> None:

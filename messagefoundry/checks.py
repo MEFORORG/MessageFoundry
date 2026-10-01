@@ -2014,7 +2014,8 @@ def _check_hop_attested(config_dir: str | Path) -> CheckResult:
 
 
 def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
-    """Surface every outbound that declares ``tls_allow_expired`` (#129 / ADR 0094), with its peer.
+    """Surface every connection that declares ``tls_allow_expired`` (#129 / ADR 0094), with its peer:
+    every outbound, and the inbound REMOTEFILE pollers (``config.wiring.expiry_relaxed_hops``).
 
     The sibling of :func:`_check_cleartext_accepted`, built for the same reason (#333): the relaxation
     was reported by a construction-time WARN and by nothing else, so an operator who set a two-week
@@ -2061,10 +2062,11 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
     if not both:
         still = "chain, hostname and key usage are still verified"
     else:
-        # "May": the reader counts an env() value it cannot read. "The others" only when there are.
+        # "The others" only when there are some.
         still = (
-            "chain and key usage are still verified; the hostname may NOT be on "
-            f"{', '.join(both)}, which also declare tls_check_hostname=false or set it by env()"
+            "chain and key usage are still verified; the hostname is NOT on "
+            f"{', '.join(both)}, which also set tls_check_hostname=false (an env() value is "
+            "counted as false, because it cannot be read before it resolves)"
         )
         if len(both) < len(relaxed):
             still += ", and is on the others"

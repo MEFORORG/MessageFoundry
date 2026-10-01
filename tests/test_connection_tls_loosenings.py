@@ -218,7 +218,7 @@ def test_check_expiry_line_stops_claiming_the_hostname_where_it_is_off(tmp_path:
     report = run_checks(_write_config(tmp_path, module=_HOSTNAME_MODULE), run_lint=False)
     detail = _result(report, "tls-allow-expired").detail
     assert "chain, hostname and key usage are still verified" not in detail
-    assert "the hostname may NOT be on OB_BOTH" in detail
+    assert "the hostname is NOT on OB_BOTH" in detail
     assert "and is on the others" in detail  # OB_EXPIRED is the other, and it checks the name
 
 
