@@ -13,8 +13,9 @@ On 3.15.0b3 the lists take the CLI from 273 modules to about 186 and the tray's 
 
 Each probe runs in a FRESH interpreter, because the pytest process has already imported most of
 the engine. The CLI probe runs the package through runpy, as `python -m messagefoundry` does, so
-`messagefoundry.__main__` is never in `sys.modules`. The tray probe imports the entry module, which
-is what the first process pays before `main()` re-execs as the branded child.
+`messagefoundry.__main__` is never in `sys.modules`, and it keeps the CLI's exit code, so a refused
+argument fails the probe. The tray probe imports the entry module and `tray.branding`, which is
+what the first process loads before `main()` re-execs as the branded child.
 
 The control arm runs the same probe with every import forced eager: natively on 3.14, and through
 `sys.set_lazy_imports_filter` on 3.15. It asserts the deferred modules DO load there, so a
@@ -25,6 +26,7 @@ module no longer loads even eagerly, its lazy entry is dead: remove it from both
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +92,7 @@ _PROBES = {
                 "messagefoundry.secretscrub",
                 "messagefoundry.tray",
                 "messagefoundry.tray.__main__",
+                "messagefoundry.tray.branding",
                 "messagefoundry.tray.config",
                 "messagefoundry.tray.logscrub",
             }
@@ -109,20 +112,26 @@ try:
         runpy.run_module("messagefoundry", run_name="__main__")
     else:
         import messagefoundry.tray.__main__
-except SystemExit:
-    pass
+        import messagefoundry.tray.branding  # main() imports it before the re-exec
+    code = 0
+except SystemExit as exc:
+    code = exc.code
 finally:
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(sorted(sys.modules), fh)
+sys.exit(code)
 """
 
 
 def _loaded(tmp_path: Path, probe: _Probe, *, mode: str) -> set[str]:
     out = tmp_path / "modules.json"
+    # PYTHON_LAZY_IMPORTS would override the lists in both arms, so the probe never inherits it.
+    env = {k: v for k, v in os.environ.items() if k != "PYTHON_LAZY_IMPORTS"}
     proc = subprocess.run(
         [sys.executable, "-c", _PROBE_CODE, str(out), mode, probe.kind, *probe.args],
         capture_output=True,
         text=True,
+        env=env,
         # Under the suite's 60 s pytest-timeout, so a hung probe still reports its stderr.
         timeout=50,
     )
