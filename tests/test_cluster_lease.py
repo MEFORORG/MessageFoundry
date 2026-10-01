@@ -619,7 +619,9 @@ async def test_step_down_returns_the_release_and_expires_the_lease() -> None:
     assert a.is_leader() is True
 
     before = time.time()
-    was_leader, released_at, lease_released = await a.step_down_leadership()
+    was_leader, released_at, lease_released = await a.step_down_leadership(
+        sibling_acquire_delay_seconds=0.0
+    )
     after = time.time()
 
     assert was_leader is True and lease_released is True
@@ -638,7 +640,7 @@ async def test_step_down_on_a_non_leader_releases_nothing() -> None:
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
     await a._maintain_leadership()  # A leads
 
-    assert await b.step_down_leadership() == (False, None, False)
+    assert await b.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, False)
     assert a.is_leader() is True
     assert db.row is not None and db.row["owner"] == "A"
     assert db.row["lease_expires_at"] == 30.0  # untouched
@@ -657,7 +659,7 @@ async def test_step_down_pauses_this_node_so_a_standby_wins_the_expired_lease() 
     b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", heartbeat=10.0)
     await a._maintain_leadership()
 
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert a._no_claim_until == 20.0  # two heartbeats on the injected monotonic clock
 
     # A's own next tick, inside the window: it declines rather than renewing itself back in.
@@ -688,7 +690,7 @@ async def test_without_the_pause_the_drained_node_renews_itself_back_in() -> Non
     mono_a = _Clock(0.0)
     a = _coord(_FakeLeasePool(db), mono_a, node="A", heartbeat=10.0)
     await a._maintain_leadership()
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
 
     a._no_claim_until = 0.0  # the pause removed
     db_clock.t = mono_a.t = 10.0
@@ -726,7 +728,7 @@ async def test_a_slow_release_write_is_not_spent_out_of_the_claim_pause() -> Non
         mono.t = db_clock.t = 25.0
 
     pool.on_execute = _slow_write
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
 
     assert a._no_claim_until == 45.0, "the release write was spent out of the claim pause"
 
@@ -753,12 +755,12 @@ async def test_step_down_fires_the_demotion_edge_and_leaves_the_node_running() -
     a.set_on_demote(lambda: fired.append(1))
     await a._maintain_leadership()
 
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert fired == [1]
     assert a._stop.is_set() is False  # still running; the maintenance loop keeps heartbeating
 
     # A second stepdown on the now-demoted node releases nothing and fires nothing more.
-    assert await a.step_down_leadership() == (False, None, False)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, False)
     assert fired == [1]
 
 
@@ -787,7 +789,9 @@ async def test_a_tick_inside_the_release_window_cannot_re_promote_the_drained_no
     assert a.is_leader() is True
 
     pool_a.yield_in_execute = True  # the release suspends mid-UPDATE, as a real pool does
-    await asyncio.gather(a.step_down_leadership(), a._maintain_leadership())
+    await asyncio.gather(
+        a.step_down_leadership(sibling_acquire_delay_seconds=0.0), a._maintain_leadership()
+    )
 
     assert a.is_leader() is False, "a tick in the release window re-promoted the drained node"
     assert db.row is not None and db.row["lease_expires_at"] == 0.0  # the release still won the row
@@ -816,7 +820,9 @@ async def test_a_claim_already_in_flight_cannot_re_promote_after_the_release() -
     assert a.is_leader() is True
 
     pool_a.yield_in_fetchrow = True  # the claim is in flight when the stepdown arrives
-    await asyncio.gather(a._maintain_leadership(), a.step_down_leadership())
+    await asyncio.gather(
+        a._maintain_leadership(), a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
+    )
 
     assert a.is_leader() is False, "an in-flight claim re-promoted the drained node"
     assert db.row is not None and db.row["lease_expires_at"] == 0.0, (
@@ -849,7 +855,7 @@ async def test_a_failed_release_write_reports_failure_instead_of_a_drain() -> No
 
     pool.fail = True
     with pytest.raises(StepdownReleaseUnconfirmed):
-        await a.step_down_leadership()
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
 
     # The conservative half still holds: this node stops CALLING itself leader either way, and the
     # pause is armed, because a lost response to a committed UPDATE is indistinguishable from an
@@ -884,7 +890,7 @@ async def test_a_retry_re_sends_the_write_the_first_stepdown_could_not_confirm()
 
     pool.fail = True
     with pytest.raises(StepdownReleaseUnconfirmed):
-        await a.step_down_leadership()
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert db.row is not None and db.row["lease_expires_at"] == 30.0  # live, and ours
 
     # THE MEASUREMENT. Count the release statements the pool sees, so "the retry re-sent it" is read
@@ -893,7 +899,7 @@ async def test_a_retry_re_sends_the_write_the_first_stepdown_could_not_confirm()
     releases: list[tuple[object, ...]] = []
     pool.fail = False
     pool.on_execute_args = releases.append
-    assert await a.step_down_leadership() == (False, None, True)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, True)
     assert len(releases) == 1, "the retry did not re-send the release write"
     assert db.row["lease_expires_at"] == 0.0, "the retry did not expire the lease it still owned"
 
@@ -936,13 +942,13 @@ async def test_the_retry_arms_a_fresh_pause_measured_from_the_retrys_own_clock()
 
     pool.fail = True
     with pytest.raises(StepdownReleaseUnconfirmed):
-        await a.step_down_leadership()
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert a._no_claim_until == 20.0  # armed by the first call, on a clock still at 0.0
 
     # PAST that first pause, which is the step no other retry test takes.
     mono.t = db_clock.t = 100.0
     pool.fail = False
-    assert await a.step_down_leadership() == (False, None, True)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, True)
 
     assert a._no_claim_until == 120.0, "the retry did not re-arm the claim pause"
     await a._maintain_leadership()
@@ -967,9 +973,9 @@ async def test_a_retry_that_fails_again_refuses_rather_than_answering_not_the_le
 
     pool.fail = True
     with pytest.raises(StepdownReleaseUnconfirmed):
-        await a.step_down_leadership()
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     with pytest.raises(StepdownReleaseUnconfirmed):
-        await a.step_down_leadership()
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert db.row is not None and db.row["lease_expires_at"] == 30.0
 
 
@@ -1001,7 +1007,9 @@ async def test_a_cancelled_release_still_owes_the_write_so_the_retry_re_sends_it
     pool.hang_in_execute = (
         asyncio.Event()
     )  # never set: the write suspends until the task is cancelled
-    await _cancel_once_suspended(asyncio.create_task(a.step_down_leadership()))
+    await _cancel_once_suspended(
+        asyncio.create_task(a.step_down_leadership(sibling_acquire_delay_seconds=0.0))
+    )
 
     # The in-memory demotion happened (it precedes the write) and the row never moved, which is exactly
     # the state the owed flag exists to record.
@@ -1013,7 +1021,7 @@ async def test_a_cancelled_release_still_owes_the_write_so_the_retry_re_sends_it
     releases: list[tuple[object, ...]] = []
     pool.hang_in_execute = None
     pool.on_execute_args = releases.append
-    assert await a.step_down_leadership() == (False, None, True)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, True)
     assert len(releases) == 1, "the retry after a cancelled release sent no write"
     assert db.row["lease_expires_at"] == 0.0, "the retry did not expire the lease it still owned"
     assert a._lease_release_owed is False, "a write that returned must clear the owed flag"
@@ -1061,7 +1069,9 @@ async def test_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
 
     releases: list[tuple[object, ...]] = []
     pool.on_execute_args = releases.append
-    was_leader, released_at, lease_released = await a.step_down_leadership()
+    was_leader, released_at, lease_released = await a.step_down_leadership(
+        sibling_acquire_delay_seconds=0.0
+    )
 
     # Both facts, each true of its own question: the gate was already clear, the row was not.
     assert (was_leader, released_at, lease_released) == (False, None, True)
@@ -1104,7 +1114,7 @@ async def test_a_stepdown_on_a_node_whose_lease_a_sibling_took_changes_nothing()
 
     releases: list[tuple[object, ...]] = []
     pool.on_execute_args = releases.append
-    assert await a.step_down_leadership() == (False, None, False)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, False)
     assert releases == [], "a follower that saw a sibling take its lease still wrote"
     assert a._no_claim_until == 0.0 and a._lease_release_owed is False
     assert db.row is not None and db.row["owner"] == "B" and db.row["lease_expires_at"] == 61.0
@@ -1124,7 +1134,7 @@ async def test_a_stepdown_whose_write_matches_nothing_takes_its_pause_back() -> 
     mono.t = 20.1
     a._check_fence()  # self-fenced; its DB has not answered since
     db.row = {"owner": "B", "lease_expires_at": 60.0, "leader_epoch": 2}  # B took it, unseen by A
-    assert await a.step_down_leadership() == (False, None, False)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, False)
     assert a._no_claim_until == 0.0, "a stepdown that released nothing left a claim pause behind"
 
 
@@ -1143,7 +1153,7 @@ async def test_a_follower_that_saw_a_sibling_take_its_lease_owes_nothing() -> No
     await a._maintain_leadership()
     pool.fail = True
     with pytest.raises(StepdownReleaseUnconfirmed):
-        await a.step_down_leadership()
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     db_clock.t = 31.0
     await b._maintain_leadership()  # B takes the lease that aged out
     pool.fail = False
@@ -1151,7 +1161,7 @@ async def test_a_follower_that_saw_a_sibling_take_its_lease_owes_nothing() -> No
     await a._maintain_leadership()
     assert a._lease_release_owed is False, "an owed write outlived a sibling's takeover"
     pool.fail = True  # the store is still flaky: a write here would answer 503
-    assert await a.step_down_leadership() == (False, None, False)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, False)
     assert a._no_claim_until == 20.0, "the 409 re-armed a pause on a follower"
 
 
@@ -1168,7 +1178,7 @@ async def test_a_stepdown_on_a_node_that_never_led_sends_nothing_and_arms_no_pau
 
     releases: list[tuple[object, ...]] = []
     b_pool.on_execute_args = releases.append
-    assert await b.step_down_leadership() == (False, None, False)
+    assert await b.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, False)
     assert releases == [], "a stepdown on a node that owes no release still wrote to the lease row"
     assert b._no_claim_until == 0.0, "an innocent standby was handicapped by someone else's mistake"
     assert a.is_leader() is True
@@ -1188,7 +1198,7 @@ async def test_the_release_demotes_before_it_writes() -> None:
 
     seen: list[bool] = []
     pool.on_execute = lambda: seen.append(a.is_leader())
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert seen == [False], "a reader inside the release window saw the node still reporting leader"
 
 
@@ -1204,7 +1214,7 @@ async def test_a_cancelled_stepdown_still_arms_the_claim_pause() -> None:
     await a._maintain_leadership()
 
     pool.yield_in_execute = True  # suspend inside the release, then cancel there
-    task = asyncio.ensure_future(a.step_down_leadership())
+    task = asyncio.ensure_future(a.step_down_leadership(sibling_acquire_delay_seconds=0.0))
     await asyncio.sleep(0)  # let the task reach the suspension point
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1232,7 +1242,7 @@ async def test_the_lock_wait_is_bounded_and_refuses_rather_than_demoting() -> No
     await a._leadership_lock.acquire()  # stand in for a tick suspended mid-round-trip
     try:
         with pytest.raises(StepdownLockTimeout) as caught:
-            await a.step_down_leadership()
+            await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     finally:
         a._leadership_lock.release()
 
@@ -1266,7 +1276,7 @@ async def test_a_stepdown_refused_by_the_lock_can_come_from_a_node_that_leads_no
     await b._leadership_lock.acquire()
     try:
         with pytest.raises(StepdownLockTimeout) as caught:
-            await b.step_down_leadership()
+            await b.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     finally:
         b._leadership_lock.release()
 
@@ -1364,7 +1374,9 @@ async def test_sqlserver_step_down_is_serialized_against_an_in_flight_claim() ->
     assert a.is_leader() is True
 
     store.yield_in_fetchone = True  # the claim is in flight when the stepdown arrives
-    await asyncio.gather(a._maintain_leadership(), a.step_down_leadership())
+    await asyncio.gather(
+        a._maintain_leadership(), a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
+    )
 
     assert a.is_leader() is False, "an in-flight claim re-promoted the drained node"
     assert db.row is not None and db.row["lease_expires_at"] == 0.0
@@ -1389,7 +1401,9 @@ async def test_sqlserver_a_tick_inside_the_release_window_cannot_re_promote() ->
     assert a.is_leader() is True
 
     store.yield_in_execute = True  # the release suspends mid-UPDATE, as a real driver does
-    await asyncio.gather(a.step_down_leadership(), a._maintain_leadership())
+    await asyncio.gather(
+        a.step_down_leadership(sibling_acquire_delay_seconds=0.0), a._maintain_leadership()
+    )
 
     assert a.is_leader() is False, "a tick in the release window re-promoted the drained node"
     assert db.row is not None and db.row["lease_expires_at"] == 0.0
@@ -1412,7 +1426,7 @@ async def test_sqlserver_release_demotes_before_it_writes_and_reports_a_failed_w
 
     seen: list[bool] = []
     store.on_execute = lambda: seen.append(a.is_leader())
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert seen == [False], "a reader inside the release window saw the node still reporting leader"
 
     # And a partitioned release refuses instead of reporting the drain it did not achieve.
@@ -1421,14 +1435,14 @@ async def test_sqlserver_release_demotes_before_it_writes_and_reports_a_failed_w
     assert a.is_leader() is True
     store.fail = True
     with pytest.raises(StepdownReleaseUnconfirmed):
-        await a.step_down_leadership()
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert a.is_leader() is False
 
     # And the twin's half of the retry: the forced re-send lands on this backend too, so the operator
     # the refusal tells to retry gets the same outcome on SQL Server as on Postgres.
     store.fail = False
     assert db.row is not None and db.row["lease_expires_at"] != 0.0
-    assert await a.step_down_leadership() == (False, None, True)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, True)
     assert db.row["lease_expires_at"] == 0.0, (
         "the SQL Server retry did not re-send the release write"
     )
@@ -1451,14 +1465,16 @@ async def test_sqlserver_cancelled_release_still_owes_the_write() -> None:
     assert a.is_leader() is True
 
     store.hang_in_execute = asyncio.Event()  # never set
-    await _cancel_once_suspended(asyncio.create_task(a.step_down_leadership()))
+    await _cancel_once_suspended(
+        asyncio.create_task(a.step_down_leadership(sibling_acquire_delay_seconds=0.0))
+    )
 
     assert a.is_leader() is False
     assert db.row is not None and db.row["lease_expires_at"] == 30.0, "the cancelled write landed"
     assert a._lease_release_owed is True, "a cancelled write left nothing owed"
 
     store.hang_in_execute = None
-    assert await a.step_down_leadership() == (False, None, True)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, True)
     assert db.row["lease_expires_at"] == 0.0, "the retry after a cancelled release sent no write"
     assert a._lease_release_owed is False
 
@@ -1483,7 +1499,7 @@ async def test_sqlserver_a_slow_release_write_is_not_spent_out_of_the_claim_paus
         mono.t = db_clock.t = 25.0  # 25 simulated seconds INSIDE the write
 
     store.on_execute = _slow_write
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
 
     assert a._no_claim_until == 45.0, "the release write was spent out of the claim pause"
     await a._maintain_leadership()
@@ -1513,12 +1529,12 @@ async def test_sqlserver_the_retry_arms_a_fresh_pause_from_its_own_clock() -> No
 
     store.fail = True
     with pytest.raises(StepdownReleaseUnconfirmed):
-        await a.step_down_leadership()
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     assert a._no_claim_until == 20.0
 
     mono.t = db_clock.t = 100.0  # past the first call's pause
     store.fail = False
-    assert await a.step_down_leadership() == (False, None, True)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, True)
 
     assert a._no_claim_until == 120.0, "the retry did not re-arm the claim pause"
     await a._maintain_leadership()
@@ -1541,7 +1557,7 @@ async def test_sqlserver_a_self_fenced_node_is_drained_and_says_so_truthfully() 
     assert db.row is not None and db.row["lease_expires_at"] == 30.0  # still live and ours
     assert a.may_own_lease_row() is True  # BACKLOG #1988: published as owns_lease_row
 
-    assert await a.step_down_leadership() == (False, None, True)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, True)
     assert db.row is not None and db.row["lease_expires_at"] == 0.0
     assert a._no_claim_until == pytest.approx(20.1 + 20.0)
     assert a.may_own_lease_row() is False
@@ -1560,4 +1576,4 @@ async def test_sqlserver_a_claim_that_sees_another_owner_clears_what_the_stepdow
     await b._maintain_leadership()
     await a._maintain_leadership()
     assert a._last_renew_ok is None and a._lease_release_owed is False
-    assert await a.step_down_leadership() == (False, None, False)
+    assert await a.step_down_leadership(sibling_acquire_delay_seconds=0.0) == (False, None, False)

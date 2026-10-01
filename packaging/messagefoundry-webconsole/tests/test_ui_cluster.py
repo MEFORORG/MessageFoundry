@@ -513,7 +513,7 @@ class _Coordinator(NullCoordinator):
         return ("node-a", 1_700_000_030.0) if self._clustered else (self.node_id, None)
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         self.step_down_calls += 1
         if self._raises is not None:

@@ -257,8 +257,9 @@ def _promotable_siblings(members: Sequence[ClusterMember], node_id: str) -> Iter
 
     A sibling with a non-finite delay is not counted. Its take-over predicate (expiry + delay < now)
     can never hold, so it cannot take the lease, and counting its delay would make the stepdown pause
-    endless. The settings validator rejects only a negative delay. A huge finite delay has the same
-    effect and is not caught here; that is the validator's to bound."""
+    endless. Since BACKLOG #2539 the settings validator accepts only 0 to 3600 s, so a configured
+    node cannot publish a non-finite or huge delay. This filter stays for a ``nodes`` row written
+    some other way."""
     return (
         m
         for m in members
@@ -770,7 +771,7 @@ class ClusterCoordinator(Protocol):
         ...
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         """Voluntarily release this node's leadership lease and **keep running** as a standby — the
         planned-failover / maintenance-drain control plane behind ``POST /cluster/stepdown``
@@ -779,8 +780,10 @@ class ClusterCoordinator(Protocol):
         ``sibling_acquire_delay_seconds`` lengthens this node's claim pause so every promotable
         sibling's ADR 0096 delay can run out before this node may reclaim (BACKLOG #1986). The
         endpoint passes :func:`longest_promotable_sibling_delay` over the membership read it has
-        already taken. The default ``0.0`` gives the bare two-heartbeat pause, which is right only
-        when no delayed sibling exists; see :func:`stepdown_pause_seconds`.
+        already taken. ``0.0`` gives the bare two-heartbeat pause, which is right only when no
+        delayed sibling exists; see :func:`stepdown_pause_seconds`. **It is required, with no
+        default (BACKLOG #2539)**: a default of ``0.0`` let a caller that forgot it fall back to the
+        bare pause silently, which is the BACKLOG #1507 reclaim this argument exists to prevent.
 
         Returns a :class:`StepdownOutcome` ``(was_leader, released_at, lease_released)``: whether this
         node held the in-memory leadership gate at the moment the release ran, the epoch-seconds instant
@@ -919,7 +922,7 @@ class NullCoordinator:
         return (self.node_id, None)
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         # Single-node: there is no lease to release and no standby to promote, so this releases
         # nothing and reports so. Unreachable through the API — POST /cluster/stepdown refuses a
@@ -1690,7 +1693,7 @@ class DbCoordinator:
             self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         """Release leadership and stay up as a standby (ADR 0056 slice 1). See the Protocol method.
 

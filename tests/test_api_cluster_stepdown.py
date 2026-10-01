@@ -138,7 +138,7 @@ class _StandinCoordinator(NullCoordinator):
         return self._members
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         self.calls.append("step_down_leadership")
         if self._raises is not None:

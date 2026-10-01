@@ -22,15 +22,19 @@ tell the fix from the defect.
 
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from messagefoundry.pipeline.cluster import (
+    ClusterCoordinator,
     ClusterMember,
     DbCoordinator,
+    NullCoordinator,
     StepdownOutcome,
     has_promotable_sibling,
     longest_promotable_sibling_delay,
@@ -185,7 +189,7 @@ async def test_without_the_delay_term_the_drained_node_reclaims(backend: str) ->
     delayed = cluster.node("D", delay=60.0)
     await _lead(a)
 
-    await a.step_down_leadership()
+    await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
     cluster.advance(2 * _HEARTBEAT + 1.0)
     await delayed._maintain_leadership()
     await a._maintain_leadership()
@@ -362,7 +366,7 @@ class _RecordingCoordinator(_StandinCoordinator):
         self.sibling_delays: list[float] = []
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         self.sibling_delays.append(sibling_acquire_delay_seconds)
         return await super().step_down_leadership(
@@ -386,3 +390,22 @@ async def test_the_endpoint_passes_the_longest_promotable_sibling_delay(tmp_path
         r = await c.post("/cluster/stepdown", headers=_auth(boss))
         assert r.status_code == 200, r.text
     assert coord.sibling_delays == [45.0]
+
+
+@pytest.mark.parametrize(
+    "cls", [ClusterCoordinator, NullCoordinator, DbCoordinator, SqlServerCoordinator]
+)
+def test_the_sibling_delay_is_a_required_argument(cls: type[Any]) -> None:
+    # BACKLOG #2539. With a 0.0 default, a caller that forgot the argument got the bare
+    # two-heartbeat pause with nothing failing, and that is the BACKLOG #1507 reclaim the argument
+    # exists to stop. Pinned on the Protocol and every coordinator, so a default added back to any
+    # one of them fails here.
+    param = inspect.signature(cls.step_down_leadership).parameters["sibling_acquire_delay_seconds"]
+    assert param.default is inspect.Parameter.empty, cls.__name__
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY, cls.__name__
+
+
+async def test_a_call_without_the_sibling_delay_is_refused() -> None:
+    # The behaviour the signature check above stands for, on the one coordinator that needs no DB.
+    with pytest.raises(TypeError, match="sibling_acquire_delay_seconds"):
+        await NullCoordinator().step_down_leadership()  # type: ignore[call-arg]

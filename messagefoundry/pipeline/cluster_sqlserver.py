@@ -553,7 +553,7 @@ class SqlServerCoordinator:
             self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def step_down_leadership(
-        self, *, sibling_acquire_delay_seconds: float = 0.0
+        self, *, sibling_acquire_delay_seconds: float
     ) -> StepdownOutcome:
         """Release leadership and stay up as a standby (ADR 0056 slice 1). Mirrors
         :meth:`~messagefoundry.pipeline.cluster.DbCoordinator.step_down_leadership` — read its

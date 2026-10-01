@@ -65,7 +65,7 @@ leader_fence_timeout_seconds  = 20.0  # a leader that can't renew within this se
 #   EXPIRED lease (handicap). A preferred site keeps 0.0; a warm remote-DR node sets a positive value so
 #   a preferred node wins the routine take-over race. NEVER delays a renewal by the current leader, and
 #   only ever makes a node claim LATER — so it can't open a two-leader window. Governs take-over of an
-#   EXPIRED lease only; the very first election on an empty table is a plain race.
+#   EXPIRED lease only; the very first election on an empty table is a plain race. 0 to 3600.
 acquire_delay_seconds = 0.0
 # promotable: false = this node may NEVER become leader (never inserts/takes-over/renews the lease); a
 #   node that somehow already leads steps down cleanly on its next tick. Use it for a warm, passive DR
@@ -394,7 +394,7 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
   reports for each node as `fresh`. If it
   finds none, stepping down would leave no node able to take the lease, so it refuses and changes
   nothing. That covers a clustered install running one node, and one whose only sibling is
-  `promotable = false`, has stopped heartbeating, or has an infinite `acquire_delay_seconds`. The check is a snapshot: a sibling that dies just
+  `promotable = false` or has stopped heartbeating. The check is a snapshot: a sibling that dies just
   after it still counted.
 - **`force` drains the node anyway, and waives nothing else.** Send `{"force": true}` to step down the
   last promotable node on purpose. It does not turn a `400` or a `409` into a success. **It does not keep
