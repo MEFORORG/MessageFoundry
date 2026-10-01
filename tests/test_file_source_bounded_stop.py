@@ -18,6 +18,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -95,11 +96,11 @@ async def test_stop_never_cancels_a_hand_off_in_progress(
     source = _source(inbox)
     real_move = source._move
 
-    def slow_move(path: Path, dest_dir: Path) -> bool:
+    def slow_move(path: Path, dest_dir: Path, *rest: Any) -> bool:
         # Longer than the 0.25 s window before stop() next looks, so a stop() that skips the grace
         # restart cancels the poll task mid-move.
         time.sleep(0.5)
-        return real_move(path, dest_dir)
+        return real_move(path, dest_dir, *rest)
 
     monkeypatch.setattr(source, "_move", slow_move)
     in_handler = asyncio.Event()

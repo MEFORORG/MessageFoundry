@@ -241,10 +241,13 @@ pure-Python equivalent:
 - Log path check: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether View Log's
   drive letter is a mapped network drive, so it can refuse one before opening the file
 - Process and job control: `pipeline/sandbox.py`
-- Drop-folder confinement: `transports/file.py`, which on Windows asks `kernel32`'s
-  `GetFinalPathNameByHandleW` where the file it opened really is, so the FILE source refuses a drop
-  reached through a link or junction out of its watch folder (BACKLOG #2507). POSIX needs no
-  `ctypes` for this; it opens each path part with `O_NOFOLLOW`
+- Drop-folder confinement: `transports/file.py`, which on Windows calls `kernel32`'s `CreateFileW`
+  with `FILE_FLAG_OPEN_REPARSE_POINT`, so it opens each path part as itself rather than through a
+  link or junction, `GetFileInformationByHandleEx` to refuse a part that is one, and
+  `GetFinalPathNameByHandleW` to confirm where the file it opened really is (BACKLOG #2507, #2535).
+  It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
+  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
+  with `O_NOFOLLOW` and acts relative to the opened directory
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`

@@ -141,12 +141,16 @@ def test_a_failed_archive_claim_on_a_bumped_name_logs_no_partner_name(
     inbox.mkdir()
     dropped = inbox / f"{_MRN}_ADT.hl7"
     dropped.write_bytes(b"PAYLOAD")
+    # The archive directory must exist so the injected claim failure is what the move reports: the
+    # move opens its archive directory before it claims (BACKLOG #2535), and on POSIX a missing one
+    # fails that open first, with an errno and no name, so the claim arm would never run.
+    (tmp_path / "processed").mkdir()
     bumped = str(tmp_path / "processed" / f"{_MRN}_ADT-1.hl7")
 
-    def claim_fails(_tmp: Path, _target: Path, **_k: object) -> Path:
+    def claim_fails(*_a: object) -> bool:
         raise PermissionError(errno.EACCES, "Permission denied", "tmpab12.part", None, bumped)
 
-    monkeypatch.setattr(file_mod, "_claim_unique", claim_fails)
+    monkeypatch.setattr(file_mod, "_archive", claim_fails)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
         source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(inbox)}))

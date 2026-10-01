@@ -235,7 +235,7 @@ async def test_file_stuck_files_do_not_charge_the_ceiling(
     (inbox / "b_good2.hl7").write_text(_ADT.format(n=4), encoding="utf-8")
     real_read = file_mod._read_confined
 
-    def read_bytes(path: Path, *rest: Any) -> bytes:
+    def read_bytes(path: Path, *rest: Any) -> tuple[bytes, tuple[int, int]]:
         if path.name.startswith("a_locked"):
             raise OSError("locked by another process")
         return real_read(path, *rest)
