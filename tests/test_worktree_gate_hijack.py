@@ -784,3 +784,16 @@ def test_the_layouts_are_stated_ONCE_and_the_other_sites_link_to_it() -> None:
     for phrase in ("makes SIBLINGS", "is what scripts/worktree/new.ps1 builds", "ASSERTS that"):
         assert phrase not in gate, f"the gate restates {phrase!r} outside the canonical block"
         assert phrase not in _OCCUPANCY.read_text(encoding="utf-8"), phrase
+
+
+def test_a_primary_new_ps1_WITHOUT_nested_gets_the_plain_form(repo: SimpleNamespace) -> None:
+    """The installed hook is decoupled from the checkout it names. A primary whose new.ps1 predates
+    -Nested would refuse the flag, so the gate must not print it there."""
+    old = repo.new_ps1.read_text(encoding="utf-8").replace("[switch]$Nested", "[switch]$Retired")
+    repo.new_ps1.write_text(old, encoding="utf-8")
+    reader = _nested_reader(repo)
+
+    line = _emitted_new_ps1_line(_deny_for_reader(repo, reader))
+
+    assert "-Nested" not in line, line
+    assert _primary_new_ps1(repo, line), line

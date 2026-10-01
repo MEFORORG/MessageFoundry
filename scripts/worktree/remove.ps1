@@ -5,8 +5,8 @@
     Remove a git worktree created by new.ps1 (and optionally its branch).
 
 .DESCRIPTION
-    Removes the sibling worktree directory <repo>-<Name>, or with -Nested <repo>\.claude\worktrees\<Name>
-    (what `new.ps1 -Nested` makes). Refuses if the worktree has uncommitted
+    Removes the sibling worktree directory <repo>-<Name>, or with -Nested
+    <main worktree>\.claude\worktrees\<Name> (what `new.ps1 -Nested` makes). Refuses if the worktree has uncommitted
     *tracked* changes (so you don't lose work) unless -Force; the untracked .venv / node_modules are
     expected and removed automatically.
 
@@ -54,8 +54,8 @@ param(
     # path invocation from ANY cwd resolve the checkout that owns the worktree. Tests point it at a
     # fixture so the real logic is what gets exercised.
     [string]$RepoRoot,
-    # Remove <RepoRoot>\.claude\worktrees\<Name> instead of the <repo>-<Name> sibling: the teardown for
-    # `new.ps1 -Nested` (BACKLOG #1038). Every guard below applies unchanged.
+    # Remove <main worktree>\.claude\worktrees\<Name> instead of the <repo>-<Name> sibling: the teardown
+    # for `new.ps1 -Nested` (BACKLOG #1038). Every guard below applies, plus two of its own.
     [switch]$Nested
 )
 
@@ -66,7 +66,31 @@ elseif (-not (Test-Path -LiteralPath $RepoRoot)) { throw "RepoRoot does not exis
 else { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path }
 
 if ($Nested) {
-    $WorktreePath = Join-Path (Join-Path (Join-Path $RepoRoot ".claude") "worktrees") $Name
+    # Under the MAIN worktree, where new.ps1 -Nested puts it. Live harness and subagent sessions sit in
+    # this directory too, so -Nested adds two refusals the sibling path does not need (BACKLOG #1038):
+    #   * the path must be a worktree git REGISTERS. A leftover directory here is not one, and every
+    #     `git -C` below would then answer for the enclosing main worktree instead;
+    #   * untracked, not-ignored files refuse removal unless -Force. They are a Builder's new files not
+    #     yet added, and `worktree remove --force` would destroy them.
+    # It does NOT consult session occupancy; see prune-merged.ps1 for the fence that does.
+    if ($Name -match '\A\.+\z') { throw "-Name may not be only dots under -Nested: '$Name'" }
+    # @() around the WHOLE pipeline: one worktree yields one string, and indexing a string gives a char.
+    $wtLines = @(@(& git -C $RepoRoot worktree list --porcelain 2>$null) | Where-Object { $_ -like 'worktree *' })
+    if (-not $wtLines) { throw "cannot list the worktrees of $RepoRoot" }
+    $MainRoot = [System.IO.Path]::GetFullPath($wtLines[0].Substring('worktree '.Length))
+    $WorktreePath = Join-Path (Join-Path (Join-Path $MainRoot ".claude") "worktrees") $Name
+    $norm = { param($p) ([System.IO.Path]::GetFullPath($p) -replace '\\', '/').TrimEnd('/').ToLowerInvariant() }
+    $registered = @($wtLines | ForEach-Object { & $norm $_.Substring('worktree '.Length) })
+    if ((Test-Path $WorktreePath) -and $registered -notcontains (& $norm $WorktreePath)) {
+        throw "Not a registered worktree (a leftover directory?): $WorktreePath"
+    }
+    if ((Test-Path $WorktreePath) -and -not $Force) {
+        $untracked = @(& git -C $WorktreePath ls-files --others --exclude-standard 2>$null)
+        if ($untracked.Count -gt 0) {
+            throw ("Worktree has $($untracked.Count) untracked file(s) that are not ignored, e.g. " +
+                   "'$($untracked[0])'. Add or delete them, or re-run with -Force.")
+        }
+    }
 }
 else {
     $Parent = Split-Path $RepoRoot -Parent

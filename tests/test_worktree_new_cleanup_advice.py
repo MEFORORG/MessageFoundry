@@ -283,3 +283,26 @@ def test_new_ps1_NESTED_lands_under_dot_claude_worktrees_and_its_own_advice_remo
         assert proc.returncode == 0, f"advice failed: {line}\n{proc.stdout}\n{proc.stderr}"
         assert not wt.exists(), f"advice ran but left the worktree behind: {line}"
         assert str(wt).replace("\\", "/") not in _registered(fx.primary)
+
+
+def test_new_ps1_NESTED_from_a_LINKED_checkouts_copy_still_lands_under_the_main_worktree(
+    fx: Fixture,
+) -> None:
+    """A tree nested inside a linked checkout dies with it: removing that checkout with --force takes
+    the nested tree along and leaves it registered. So -Nested anchors on the MAIN worktree, which is
+    also where the harness puts its trees, whichever copy of new.ps1 runs."""
+    linked = fx.worktree(fx.primary.parent / "repo-linked", "linked")
+    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
+        dst = linked / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_REPO / rel, dst)
+
+    proc = _run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+        + [str(linked / "scripts" / "worktree" / "new.ps1"), "-Name", "fromlinked", "-Nested"]
+        + ["-NoInstall"]
+    )
+
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert (fx.primary / ".claude" / "worktrees" / "fromlinked").is_dir()
+    assert not (linked / ".claude" / "worktrees" / "fromlinked").exists()

@@ -7,7 +7,7 @@
 .DESCRIPTION
     Two parallel efforts (e.g. two Claude Code chats) can't safely build in the same working tree --
     one's branch switch / edits clobber the other. This adds a git worktree as a SIBLING directory
-    (<repo>-<Name>), or with -Nested at <repo>\.claude\worktrees\<Name>, on its own branch, then bootstraps that worktree's own Python virtualenv so its
+    (<repo>-<Name>), or with -Nested at <main worktree>\.claude\worktrees\<Name>, on its own branch, then bootstraps that worktree's own Python virtualenv so its
     tests/tools run against its own checkout. The worktree shares the same .git/history/remote, so
     the normal branch -> PR -> merge flow is unchanged.
 
@@ -30,7 +30,7 @@
     .\new.ps1 -Name sqltuning -Base feature/sql-tuning -Sqlserver -Ide
     .\new.ps1 -Name quicklook -NoInstall
     .\new.ps1 -Name my-task -Branch claude/my-task    # reuse a namespaced branch ('/' is not legal in -Name)
-    .\new.ps1 -Name my-task -Nested                   # at <repo>\.claude\worktrees\my-task instead
+    .\new.ps1 -Name my-task -Nested                   # at <main worktree>\.claude\worktrees\my-task instead
 #>
 [CmdletBinding()]
 param(
@@ -57,7 +57,7 @@ param(
     [switch]$Sqlserver,   # also install the [sqlserver] extra
     [switch]$Ide,         # also run `npm install` for the VS Code extension
     [switch]$NoInstall,   # create the worktree only; skip the venv bootstrap
-    # Create the worktree NESTED, at <this checkout>\.claude\worktrees\<Name> -- the layout the Claude
+    # Create the worktree NESTED, at <main worktree>\.claude\worktrees\<Name> -- the layout the Claude
     # Code harness uses -- instead of the <repo>-<Name> sibling. Same branch handling, token list, venv
     # and add lock either way. The worktree gate's rule 3b prints it for a reader whose own worktree is
     # nested (BACKLOG #1038); which mechanism makes which layout is stated once, in the "WHICH
@@ -85,8 +85,15 @@ if ($LASTEXITCODE -ne 0) { throw "-Branch is not a valid git branch name: '$Bran
 # Repo root is two levels up from scripts\worktree\.
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if ($Nested) {
-    # Nested: the parent is this checkout's .claude\worktrees, which the repository gitignores.
-    $Parent = Join-Path (Join-Path $RepoRoot ".claude") "worktrees"
+    # Nested: under the MAIN worktree's .claude\worktrees, which the repository gitignores -- where the
+    # harness puts its trees, and never inside a linked checkout, whose removal would take a tree nested
+    # in it along (prune-merged.ps1 refuses that shape for the same reason).
+    if ($Name -match '\A\.+\z') { throw "-Name may not be only dots under -Nested: '$Name'" }
+    $mainLine = @(& git -C $RepoRoot worktree list --porcelain 2>$null) |
+        Where-Object { $_ -like 'worktree *' } | Select-Object -First 1
+    if (-not $mainLine) { throw "cannot find the main worktree of $RepoRoot" }
+    $MainRoot = [System.IO.Path]::GetFullPath($mainLine.Substring('worktree '.Length))
+    $Parent = Join-Path (Join-Path $MainRoot ".claude") "worktrees"
     $WorktreePath = Join-Path $Parent $Name
 }
 else {

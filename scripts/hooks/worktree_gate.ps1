@@ -2467,14 +2467,17 @@ function Get-RootCommonDirCmp($Root) {
 # comment below link here by this heading rather than restating it.
 #
 # At least two mechanisms make worktrees against one .git here, in two layouts, and both are live:
-#   * scripts/worktree/new.ps1 (and spawn.ps1, which calls it) anchors on its OWN checkout. By default
-#     it makes a SIBLING of that checkout, <its parent>/<its leaf>-<Name>; from the primary that is
-#     <repo-parent>/<repo-name>-<Name>. With -Nested it makes <that checkout>/.claude/worktrees/<Name>.
-#     Either way it copies the leak-gate token list, builds the .venv and holds the add lock.
-#     remove.ps1 tears down either one, with -Nested for the second.
-#   * The Claude Code harness makes a NESTED one under the checkout it was started from, at
-#     <checkout>/.claude/worktrees/<slug> -- `claude --worktree`, and a subagent's `isolation: worktree`.
-#     It copies the gitignored files .worktreeinclude lists, which a bare `git worktree add` does not.
+#   * scripts/worktree/new.ps1 anchors on its OWN checkout. By default it makes a SIBLING of that
+#     checkout, <its parent>/<its leaf>-<Name>; from the primary that is <repo-parent>/<repo-name>-<Name>.
+#     spawn.ps1 calls it for that sibling form only. With -Nested it makes
+#     <main worktree>/.claude/worktrees/<Name>, whichever checkout's copy runs. Either way it copies the
+#     leak-gate token list, builds the .venv and holds the add lock. remove.ps1 tears down either one,
+#     with -Nested for the second.
+#   * The Claude Code harness makes a NESTED one at <main worktree>/.claude/worktrees/<slug> --
+#     `claude --worktree`, and a subagent's `isolation: worktree`. MEASURED 2026-09-30 for the second:
+#     a subagent whose parent session sat in a nested tree still got its own tree under the MAIN
+#     worktree, not under its parent's. It copies the gitignored files .worktreeinclude lists, which a
+#     bare `git worktree add` does not.
 # Other populations exist besides these (a bare `git worktree add`, scratch worktrees under a temp
 # directory), so read the list as "at least". The same false premise, that new.ps1 made the nested
 # layout, was once written independently in this file and in occupancy.ps1 (#1032).
@@ -2493,7 +2496,11 @@ function Get-RootCommonDirCmp($Root) {
 # script from the wrong checkout.
 #
 # SCOPE: rule 3b class A's remedy only. Rule 3's "work in your own worktree" remedies still print the
-# plain form to every reader.
+# plain form to every reader. A subagent reader under `isolation: worktree` cannot run either form
+# itself (its git is fenced to its own tree); it reports the line to its dispatcher instead.
+#
+# -Nested IS PRINTED ONLY WHEN THE PRIMARY'S new.ps1 DECLARES IT. The installed hook is decoupled from
+# the checkout it names, so an older new.ps1 there would refuse the flag; the plain form is printed then.
 #
 # THIS BRANCHES THE REMEDY TEXT ONLY. No allow or deny decision reads it. Both forms run the primary's
 # new.ps1; a misread costs a sibling where a nested tree was wanted, or the reverse.
@@ -2516,7 +2523,19 @@ function Get-OwnWorktreeRemedy([string]$CwdRaw, [object[]]$List, [string]$MainWt
         $nested = $best.StartsWith($prefix, [System.StringComparison]::Ordinal) -and
                   -not $best.Substring($prefix.Length).Contains('/')
     }
-    $newHintQ = Get-SafeForCommand $GovDisplay -Suffix '\scripts\worktree\new.ps1'
+    # The PRIMARY, in the operator's own allowlist spelling. An allowlist entry that names a directory
+    # merely CONTAINING checkouts never reaches here: rule 3 treats every checkout under it as that root
+    # and denies first, which is why no main-worktree fallback is computed.
+    $root = $GovDisplay
+    # The installed hook is decoupled from the checkout it names: the primary's new.ps1 can predate
+    # -Nested, and printing the flag then hands the reader a command that dies at parameter binding --
+    # the #1032 defect. So the flag is printed only if that file declares it. One file read, deny path only.
+    if ($nested) {
+        $newPs1 = Join-Path (Join-Path (Join-Path $root 'scripts') 'worktree') 'new.ps1'
+        $nested = (Test-Path -LiteralPath $newPs1) -and
+                  ([System.IO.File]::ReadAllText($newPs1) -match '\[switch\]\$Nested\b')
+    }
+    $newHintQ = Get-SafeForCommand $root -Suffix '\scripts\worktree\new.ps1'
     if ($nested) {
         return @"
 Your own worktree is nested under .claude/worktrees, where the Claude Code harness puts worktrees, so -Nested puts this one there too, with the token list and .venv a bare ``git worktree add`` would skip. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':

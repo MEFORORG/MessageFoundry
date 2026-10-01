@@ -309,12 +309,55 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
 
 
 def _add_nested(fx: Fixture, name: str) -> Path:
+    """A registered nested tree with an IGNORED .venv, as the real repository's .gitignore makes it."""
+    exclude = Path(_git(fx.primary, "rev-parse", "--git-path", "info/exclude").strip())
+    if not exclude.is_absolute():
+        exclude = fx.primary / exclude
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    if ".venv/" not in (exclude.read_text(encoding="utf-8") if exclude.exists() else ""):
+        with exclude.open("a", encoding="utf-8") as f:
+            f.write("\n.venv/\n")
     path = fx.primary / ".claude" / "worktrees" / name
     path.parent.mkdir(parents=True, exist_ok=True)
     _git(fx.primary, "worktree", "add", "-q", "-b", name, str(path))
     (path / ".venv").mkdir()
-    (path / ".venv" / "marker.txt").write_text("untracked", encoding="utf-8")
+    (path / ".venv" / "marker.txt").write_text("ignored", encoding="utf-8")
     return path
+
+
+def test_nested_refuses_an_untracked_file_unless_forced(fx: Fixture) -> None:
+    """A Builder's new file not yet added is the work `worktree remove --force` would destroy."""
+    wt = _add_nested(fx, "draft")
+    (wt / "new_test.py").write_text("x = 1\n", encoding="utf-8")
+
+    refused = run(fx, "-Name", "draft", "-Nested")
+    assert refused.returncode != 0
+    assert "untracked" in refused.stderr
+    assert wt.exists() and fx.is_registered(wt)
+
+    forced = run(fx, "-Name", "draft", "-Nested", "-Force")
+    assert forced.returncode == 0, forced.stderr
+    assert not wt.exists()
+
+
+def test_nested_refuses_a_directory_git_does_not_register(fx: Fixture) -> None:
+    """Inside the main worktree, every `git -C` on a leftover directory answers for the MAIN one."""
+    ghost = fx.primary / ".claude" / "worktrees" / "ghost"
+    ghost.mkdir(parents=True)
+
+    proc = run(fx, "-Name", "ghost", "-Nested", "-Force")
+
+    assert proc.returncode != 0
+    assert "Not a registered worktree" in proc.stderr
+    assert ghost.exists()
+
+
+@pytest.mark.parametrize("name", [".", "..", "..."])
+def test_nested_refuses_a_name_that_is_only_dots(fx: Fixture, name: str) -> None:
+    """Under -Nested the name is a whole path component, so `..` would name the .claude directory."""
+    proc = run(fx, "-Name", name, "-Nested", "-Force")
+    assert proc.returncode != 0
+    assert "only dots" in proc.stderr
 
 
 def test_nested_removes_a_tree_under_dot_claude_worktrees(fx: Fixture) -> None:
