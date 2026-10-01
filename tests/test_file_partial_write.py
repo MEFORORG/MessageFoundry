@@ -34,6 +34,7 @@ from _phi_log_capture import (
 )
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.transports import file as file_mod
 from messagefoundry.transports import remotefile
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.remotefile import _FtpClient, _SftpClient
@@ -147,15 +148,15 @@ async def test_a_file_that_grows_during_the_read_is_not_emitted(
     inbox.mkdir()
     drop = inbox / name
     drop.write_bytes(_HEAD)
-    real_read = Path.read_bytes
+    real_read = file_mod._read_confined
 
-    def read_then_partner_writes(self: Path) -> bytes:
-        data = real_read(self)
-        if self.name == name:
-            _append_tail(self)  # the partner's next write lands as the read finishes
+    def read_then_partner_writes(path: Path, *rest: Any) -> bytes:
+        data = real_read(path, *rest)
+        if path.name == name:
+            _append_tail(path)  # the partner's next write lands as the read finishes
         return data
 
-    monkeypatch.setattr(Path, "read_bytes", read_then_partner_writes)
+    monkeypatch.setattr(file_mod, "_read_confined", read_then_partner_writes)
     src = _local(inbox)
     handler = _Recorder()
     src._handler = handler
@@ -180,15 +181,15 @@ async def test_a_same_length_rewrite_during_the_read_is_caught_by_the_mtime(
     inbox.mkdir()
     drop = inbox / "a.hl7"
     drop.write_bytes(_WHOLE)
-    real_read = Path.read_bytes
+    real_read = file_mod._read_confined
 
-    def read_then_partner_rewrites(self: Path) -> bytes:
-        data = real_read(self)
-        st = self.stat()
-        os.utime(self, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+    def read_then_partner_rewrites(path: Path, *rest: Any) -> bytes:
+        data = real_read(path, *rest)
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
         return data
 
-    monkeypatch.setattr(Path, "read_bytes", read_then_partner_rewrites)
+    monkeypatch.setattr(file_mod, "_read_confined", read_then_partner_rewrites)
     src = _local(inbox)
     handler = _Recorder()
     src._handler = handler

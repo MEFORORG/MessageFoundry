@@ -61,6 +61,10 @@ def test_no_route_ends_in_a_slash_and_no_mount_redirects() -> None:
     # The flag makes "/x/" stop answering at "/x", and it does not reach a mounted sub-app, whose own
     # router redirects by default. Either would reopen the gap the flag closes, so pin both here.
     app = create_app(serve_ui=True)
+    # More routes than the API alone has proves the walk below reaches the console's routes too,
+    # not an empty table or one the console never joined.
+    api_only = len(create_app().routes)
+    assert len(app.routes) > api_only, f"walked {len(app.routes)} route(s), API alone {api_only}"
     slash_routes = [
         path
         for route in app.routes

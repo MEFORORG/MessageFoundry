@@ -64,8 +64,11 @@ def test_the_detector_on_planted_sources(source: str, fires: bool) -> None:
 
 def test_every_text_mode_subprocess_call_names_its_encoding() -> None:
     files = sorted(p for d in _SCANNED for p in d.rglob("*.py"))
-    assert len(files) > 50, f"scanned only {len(files)} files under {_SCANNED}; the glob is wrong"
     sources = {p: p.read_text(encoding="utf-8") for p in files}
+    # Counted on what the offender walk below iterates, so the floor guards that walk directly.
+    assert len(sources) > 50, (
+        f"scanned only {len(sources)} files under {_SCANNED}; the glob is wrong"
+    )
     offenders = [
         f"{p.relative_to(_ROOT).as_posix()}:{line}"
         for p, src in sources.items()

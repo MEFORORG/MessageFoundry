@@ -1,0 +1,109 @@
+# The nightly run of the bounded mutation list over the named invariant tests (BACKLOG #1746,
+# limb 5). The list is `scripts/ci/invariant_mutations.toml`; the runner is
+# `scripts/ci/invariant_mutations.py`, and its docstring is the source of record for how a row is
+# scored and what each exit code means. This file only schedules it.
+#
+# ADVISORY, AND THAT IS STRUCTURAL. It runs on a nightly cron and on manual dispatch, never on
+# `pull_request`, `push` or `merge_group`, so it produces no pull-request check at all. Required, a
+# context that never reports on a pull request would wedge every one. Its job `name:` is listed in
+# `_MUST_NOT_BE_REQUIRED` in tests/test_required_contexts.py, which reds if the CHECKED-IN
+# `.github/required-contexts.txt` ever names it. That test cannot see branch protection on the
+# server; the scheduled `Required workflow state` reconcile is what compares the two.
+#
+# WHY NIGHTLY AND NOT PER PULL REQUEST. The runner edits the checkout and re-runs each row's tests
+# three times, about ten minutes in all. Whether a break survives is a property of the tests, which
+# drift slowly, and not of any one diff. A per-PR run would spend a queue slot on a result the diff
+# almost never changes.
+#
+# THERE IS NO `continue-on-error` AND NO `|| true`, ON PURPOSE. The job is allowed to go red, because
+# red is the only way a surviving mutation or a run that could not judge can be told apart from a
+# clean run. The triggers already guarantee a red here blocks nothing.
+# tests/test_invariant_mutations.py pins at least that, the triggers, the step timeout and the watch.
+#
+# A SCHEDULED RED REPORTS THROUGH nightly-notice.yml, which watches this workflow by its `name:`
+# below and opens one issue per watched workflow. A manual run's red shows only in the Actions tab.
+# It acts only on a run that concluded `failure`, and a
+# job-level timeout concludes `cancelled`, which it ignores. So the run step carries its OWN
+# `timeout-minutes`, under the job's: a step killed by its own timeout concludes `failure` (see
+# scripts/ci/step_margin.py), and a hung nightly still opens an issue.
+#
+# NO `concurrency:` BLOCK, on purpose. Each run edits a checkout only its own runner holds, so two
+# runs cannot harm each other, and a group would let a queued dispatch cancel a pending scheduled
+# run -- a cancelled run reports nothing.
+#
+# IT EDITS THE LIVE CHECKOUT, which is safe on a fresh runner and nowhere shared. The log carries at
+# least mutation ids, file paths, pytest node ids, skip reasons and exception text. It does not carry
+# a failing test's own output, so a red row is reproduced locally with `--only <id>`.
+# The tests it runs use synthetic HL7, which is why none of that is PHI. Keep it that way.
+name: Invariant mutations
+
+on:
+  schedule:
+    # Nightly, at a minute no other workflow here uses.
+    - cron: "53 4 * * *"
+  workflow_dispatch:
+
+# Deny-by-default at the workflow level; the one job grants only what it needs.
+permissions: {}
+
+jobs:
+  mutations:
+    name: invariant mutations (nightly)
+    runs-on: ubuntu-latest
+    # A backstop over the run step's own timeout plus checkout and install. It should never fire:
+    # the step timeout below fires first, and concludes `failure` where this one would not.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install the engine and the test toolchain
+        run: |
+          set -euo pipefail
+          # `--constraint constraints.lock` is mandatory on every install in this repository, for the
+          # DEP-1 reason ci.yml records. `[dev]` alone: no row's tests need an extra today. A row
+          # whose tests need a missing one skips, and the runner scores a skip as ERROR, so the gap
+          # reds this job rather than passing quietly.
+          uv pip install --system --constraint constraints.lock -e ".[dev]"
+      - name: Run the mutation list
+        # The runner takes about ten minutes. Thirty gives a healthy run three times its length and
+        # still kills a hung child well inside the job's cap.
+        timeout-minutes: 30
+        env:
+          # Unbuffered, so the log streams row by row and a killed run still shows the rows it
+          # finished. The runner prints a row's line when the row ends, so the row that hung is the
+          # first one in the list that is missing.
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          # With pipefail the pipeline's status is python's, because tee exits 0. The runner's
+          # docstring says what each exit code means.
+          python scripts/ci/invariant_mutations.py 2>&1 | tee "${RUNNER_TEMP}/invariant-mutations.log"
+      # A separate step so the summary is written on every path, including the run step's own timeout,
+      # which kills that step's shell before it could write anything. A run that finished ends with a
+      # `# ran N mutation(s)` line; a summary without one is a run that did not finish.
+      - name: Write the run summary
+        if: always()
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/invariant-mutations.log"
+          {
+            echo "## Invariant mutations"
+            echo ""
+            if [ -f "$log" ]; then
+              echo '```'
+              cat "$log"
+              echo '```'
+            else
+              echo "No runner log: the run step never started. Read the step that failed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
