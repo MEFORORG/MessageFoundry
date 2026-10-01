@@ -22,6 +22,7 @@ from messagefoundry.api.models import (
     AlertInstanceInfo,
     CapturedResponseInfo,
     ConnectionEventInfo,
+    ConnectionRow,
     DeadLetterRow,
     EventInfo,
     MessageDetail,
@@ -350,11 +351,19 @@ def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> No
         r"revealed=revealable\(type\(i\), summary=False, error_text=i\.id == reveal\)", source
     )
     assert len(per_item) == 1, f"expected the one per-item reason reveal site, found {per_item}"
+    # BACKLOG #2443 step 4 added the connections dashboard's per-connection reveal, pinned the same
+    # way: it lifts ConnectionRow's error-text set on the rows of the one name the request gives.
+    per_conn = re.findall(
+        r"return revealable\(ConnectionRow, summary=False, error_text=_row_conn\(row\) == reveal\)",
+        source,
+    )
+    assert len(per_conn) == 1, f"expected the one per-connection reveal set, found {per_conn}"
+    assert source.count("revealed=lifted(r)") == 1, "the per-connection set has one call site"
     # Every other reveal site reads one of those sets, and together they cover all three models.
     sites = [
         s
         for s in re.findall(r"revealed=([^\n,]+?)(?=[,)\n])", source)
-        if not s.startswith("revealable(type(i")
+        if not s.startswith(("revealable(type(i", "lifted("))
     ]
     models = [m.group(1) for m in (re.fullmatch(r"reveal\[(\w+)\]", s) for s in sites) if m]
     assert len(models) == len(sites), (
@@ -398,6 +407,7 @@ def test_error_text_masking_is_keyed_by_model_and_catches_no_other_surface() -> 
         DeadLetterRow: frozenset({"last_error"}),
         ConnectionEventInfo: frozenset({"reason"}),
         AlertInstanceInfo: frozenset({"reason"}),
+        ConnectionRow: frozenset({"error"}),
     }
     holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
     assert redact_unauthorized(_summary(), holder).error == "****"

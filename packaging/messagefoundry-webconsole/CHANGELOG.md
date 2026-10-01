@@ -101,6 +101,11 @@ under Changed says why engine 0.4.0 does not work with this console.
   sees no reason and no link, but still sees each event's kind and each alert's type and state.
   Needs an engine whose `list_connection_events` and `list_active_alerts` accept `reveal`, and
   whose `list_active_alerts` takes `request`. The seam digest does not record those keywords.
+- **The dashboard passes `request` to the engine's connections handler** (`BACKLOG #2443`, step 4).
+  The engine now masks each connection's start-failure `error` until a per-connection reveal, and
+  its `list_connections` takes `request`. The console renders no `error` text, so nothing on the
+  page changes. Needs an engine whose `list_connections` takes `request`; the seam digest does not
+  record that parameter.
 - **The engine UI seam moved because the seam gate now covers the `auth.service` names this console
   imports** (`BACKLOG #2015`). Seam discovery used to read only `AuthService` from
   `messagefoundry.auth.service`. It now reads every name the console imports from there, such as

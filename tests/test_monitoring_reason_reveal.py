@@ -8,6 +8,9 @@ on ``messages:view_summary`` and masked for a holder until a per-item ``reveal=<
 tests pin both halves over the real JSON routes, with a control arm for each: the reveal must
 return the stored text (so a mask test cannot pass on a fixture with nothing to hide), and a
 reveal of one item must leave its sibling masked (so a reveal cannot pass by unmasking everything).
+
+Step 4 of the item adds ``ConnectionRow.error`` on ``GET /connections``, why a connection failed to
+start, revealed per connection name with ``reveal=<name>``. The same two control arms apply.
 """
 
 from __future__ import annotations
@@ -284,3 +287,141 @@ def test_an_alert_reason_is_null_for_a_diagnose_holder_without_view_summary() ->
     holder = _as(Permission.MONITORING_DIAGNOSE, Permission.MESSAGES_VIEW_SUMMARY)
     assert redact_unauthorized(info, holder).reason == "****"
     assert redact_unauthorized(info, holder, revealed=frozenset({"reason"})).reason == _ALERT
+
+
+# --- BACKLOG #2443 step 4: the connections dashboard's ``error`` ----------------------------------
+#
+# ``ConnectionRow.error`` says why a connection failed to start: ``safe_exc()`` text, on a route that
+# needs only ``monitoring:read``. Two outbounds that cannot build give two failed rows, so a reveal
+# of one has a sibling that must stay masked.
+
+
+def _broken_outbound(name: str) -> Any:
+    """An outbound whose ``env()`` cannot resolve, so it fails to build (ADR 0031)."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, build_outbound_connection, env
+
+    return build_outbound_connection(
+        name,
+        ConnectionSpec(
+            ConnectorType.FILE, {"directory": env(f"{name}_dir"), "filename": "{MSH-10}.hl7"}
+        ),
+    )
+
+
+@pytest.fixture
+async def dash(tmp_path: Path) -> AsyncIterator[Engine]:
+    from messagefoundry.config.wiring import Registry
+
+    eng = await Engine.create(tmp_path / "dash.db", poll_interval=0.02)
+    reg = Registry()
+    reg.add_outbound(_broken_outbound("OB_A"))
+    reg.add_outbound(_broken_outbound("OB_B"))
+    eng.add_registry(reg)
+    await eng.start()  # degraded on both outbounds; does NOT raise (ADR 0031)
+    yield eng
+    await eng.stop()
+
+
+def _failed_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The destination rows, keyed by outbound name rather than by the masked error."""
+    return {r["destination"]: r for r in rows if r["role"] == "destination"}
+
+
+async def test_a_holder_gets_the_connection_error_masked_until_one_audited_reveal(
+    dash: Engine,
+) -> None:
+    rr = dash.registry_runner
+    assert rr is not None
+    stored = rr.outbound_failed("OB_A")
+    assert stored, "the fixture's outbound did not fail, so there is nothing to mask"
+    service = await _service(dash)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(dash, service) as c:
+        h = await _login(c, "op")
+        bare = _failed_rows((await c.get("/connections", headers=h)).json())
+        assert bare["OB_A"]["error"] == "****" and bare["OB_B"]["error"] == "****"
+        assert bare["OB_A"]["status"] == "failed"  # THAT it failed is never masked
+
+        shown = _failed_rows(
+            (await c.get("/connections", params={"reveal": "OB_A"}, headers=h)).json()
+        )
+        # The control arm: the reveal returns the engine's own reason, so the mask hid something.
+        assert shown["OB_A"]["error"] == stored
+        # And it is per connection: the sibling stays masked.
+        assert shown["OB_B"]["error"] == "****"
+
+        # A reveal is an act, not a status: the next bare load is masked again.
+        again = _failed_rows((await c.get("/connections", headers=h)).json())
+        assert again["OB_A"]["error"] == "****"
+    assert await _reveal_audits(dash, "connection_error_reveal") == [
+        {
+            "actor": "op",
+            "channel": "OB_A",
+            "reveal": "OB_A",
+            "connection": "OB_A",
+            "directions": ["out"],
+            "revealed": ["error"],
+        }
+    ]
+
+
+@pytest.mark.parametrize("role", [Role.VIEWER, Role.DEPLOYMENT, Role.CODING, Role.AUDITOR])
+async def test_a_monitoring_only_role_gets_no_connection_error_but_sees_the_failure(
+    dash: Engine, role: Role
+) -> None:
+    service = await _service(dash)
+    await _add(service, "mon", role)
+    async with _client(dash, service) as c:
+        h = await _login(c, "mon")
+        rows = _failed_rows((await c.get("/connections", headers=h)).json())
+        assert rows["OB_A"]["error"] is None and rows["OB_B"]["error"] is None
+        assert rows["OB_A"]["status"] == "failed"
+        refused = await c.get("/connections", params={"reveal": "OB_A"}, headers=h)
+        assert refused.status_code == 403
+    assert await _reveal_audits(dash, "connection_error_reveal") == []
+    denials = [
+        json.loads(dict(a)["detail"])
+        for a in await dash.store.list_audit(limit=200)
+        if dict(a)["action"] == "auth.permission_denied" and dict(a)["actor"] == "mon"
+    ]
+    assert {"path": "/connections", "permission": "messages:view_summary"} in denials
+
+
+async def test_a_connection_reveal_charges_the_phi_read_budget_and_a_bare_load_does_not(
+    dash: Engine,
+) -> None:
+    service = await _service(dash, phi_read_rate_limit_per_actor=1)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(dash, service) as c:
+        h = await _login(c, "op")
+        for _ in range(3):
+            assert (await c.get("/connections", headers=h)).status_code == 200
+        ok = await c.get("/connections", params={"reveal": "OB_A"}, headers=h)
+        assert ok.status_code == 200
+        throttled = await c.get("/connections", params={"reveal": "OB_A"}, headers=h)
+        assert throttled.status_code == 429
+
+
+async def test_a_reveal_of_a_name_not_on_the_dashboard_is_audited_as_revealing_nothing(
+    dash: Engine,
+) -> None:
+    """The audit records what the response carried, not what was asked for."""
+    service = await _service(dash)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(dash, service) as c:
+        h = await _login(c, "op")
+        rows = _failed_rows(
+            (await c.get("/connections", params={"reveal": "OB_NOPE"}, headers=h)).json()
+        )
+        assert rows["OB_A"]["error"] == "****" and rows["OB_B"]["error"] == "****"
+    assert await _reveal_audits(dash, "connection_error_reveal") == [
+        {
+            "actor": "op",
+            "channel": None,
+            "reveal": "OB_NOPE",
+            "connection": None,
+            "directions": [],
+            "revealed": [],
+        }
+    ]

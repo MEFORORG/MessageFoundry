@@ -162,7 +162,12 @@ is `safe_exc()` text. The runner stores it through the `connection_stopped` aler
 copy is `alert_instance.reason`. **Both fields are rated PL-2, the level of `alert_instance.reason`.**
 The rating is on the FIELD, not only on the start-failure string. So both routes are served
 `Cache-Control: no-store`. `tests/test_no_store_phi_coverage.py` binds each field to
-`alert_instance.reason` and reads the level out of that column's row above.
+`alert_instance.reason` and reads the level out of that column's row above. Both routes need only
+`monitoring:read`, which is not a PHI permission. So `ConnectionRow.error` is gated on
+`messages:view_summary` (BACKLOG #2443, owner ruling R12): null without it, a fixed `****` with it,
+and whole only on the audited `reveal=<connection name>` act on `GET /connections`.
+`ConnectionMetadata.error` is **not yet gated**, so it still returns the same string whole to any
+`monitoring:read` holder; [SECURITY.md](SECURITY.md) "Field-level authorization" says why.
 
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
 pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written

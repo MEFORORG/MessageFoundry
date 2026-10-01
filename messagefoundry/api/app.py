@@ -2407,9 +2407,69 @@ def create_app(
 
     @app.get("/connections", response_model=list[ConnectionRow])
     async def list_connections(
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
+        # calls this handler in-process, and a call that leaves it out must get None.
+        reveal: Annotated[ConnectionName | None, Query()] = None,
     ) -> list[ConnectionRow]:
+        """The per-endpoint connections dashboard: one source row per inbound and one destination
+        row per traffic edge or degraded outbound.
+
+        Not PHI-free: ``error`` is live free text that ``docs/PHI.md`` section 2 rates. The route
+        is gated by ``monitoring:read``, so ``error`` is gated separately on
+        ``messages:view_summary``: null without it, the fixed mask with it (BACKLOG #2443).
+        ``reveal`` names ONE connection whose error this response returns whole, on every row of
+        that name; it needs ``messages:view_summary``, charges the PHI-read budget, and is audited
+        as ``connection_error_reveal``. The ``status`` word and the ``errored`` count stay
+        readable, so an operator can still tell that a connection failed."""
+        await _admit_reveal(request, identity, reveal)
+        out = await _dashboard_rows(engine, identity, reveal=reveal)
+        if reveal is not None:
+            # The audit records what the response carried, not what was asked for: a name that is
+            # off this caller's page, or has no error, is recorded as revealing nothing.
+            shown = [r for r in out if _row_conn(r) == reveal]
+            directions = sorted({r.direction for r in shown if r.error})
+            await engine.store.record_audit(
+                "connection_error_reveal",
+                actor=identity.username,
+                # The connection, so the row sits beside that channel's other audit rows.
+                channel_id=reveal if shown else None,
+                detail=json.dumps(
+                    {
+                        "reveal": reveal,
+                        "connection": reveal if shown else None,
+                        "directions": directions,
+                        "revealed": ["error"] if directions else [],
+                    }
+                ),
+                client=client_ip(request),
+            )
+        return out
+
+    def _row_conn(row: ConnectionRow) -> str:
+        """The raw connection name a dashboard row stands for: the outbound name on a destination
+        row, the inbound name on a source row. A name can be both an inbound and an outbound, so a
+        reveal of it lifts the error on the rows of both."""
+        return row.destination if row.role == "destination" and row.destination else row.channel_id
+
+    async def _dashboard_rows(
+        engine: Engine, identity: Identity, *, reveal: str | None = None
+    ) -> list[ConnectionRow]:
+        """The dashboard rows, channel-scoped, with ``error`` gated and masked on every row and
+        lifted on the rows of the ONE connection ``reveal`` names (BACKLOG #2443). The caller has
+        already passed :func:`_admit_reveal` for any ``reveal``; the stats socket passes none."""
+
+        def lifted(row: ConnectionRow) -> frozenset[str]:
+            return revealable(ConnectionRow, summary=False, error_text=_row_conn(row) == reveal)
+
+        rows = await _connection_rows(engine, identity)
+        return [redact_unauthorized(r, identity, revealed=lifted(r)) for r in rows]
+
+    async def _connection_rows(engine: Engine, identity: Identity) -> list[ConnectionRow]:
+        """The UNREDACTED dashboard rows, already channel-scoped. Only :func:`_dashboard_rows`
+        calls it, and it redacts every row before any caller sees one."""
         now = time.time()
         # Per-channel RBAC: a channel-scoped caller sees only the source rows of their own inbound
         # connections; shared-outbound (destination/degraded) rows are suppressed entirely, since an
@@ -3131,12 +3191,14 @@ def create_app(
             reason=e.reason,
         )
 
-    async def _admit_reveal(request: Request, identity: Identity, reveal: int | None) -> None:
+    async def _admit_reveal(request: Request, identity: Identity, reveal: int | str | None) -> None:
         """The gate a ``reveal`` request adds on top of its list route's ``monitoring:*`` gate.
 
         Called at ADMISSION, before the route reads the store, as ``require_phi_read`` would be.
-        A reveal hands out one reason whole, which is ``messages:view_summary`` data (BACKLOG
-        #2443), so a caller without it is refused, and the refusal is audited as
+        A reveal hands out one reason or one connection's error whole, which is
+        ``messages:view_summary`` data (BACKLOG #2443). ``reveal`` is an event or alert id, or a
+        connection name on ``GET /connections``. A caller without that permission is refused,
+        and the refusal is audited as
         ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
         also a PHI read: it takes the serve-hop refusal and the per-actor PHI budget. The web
         console's reveal routes already charged both through ``require_ui(..., phi=True)`` before
@@ -3153,7 +3215,7 @@ def create_app(
                     request.url.path,
                     client=client_ip(request),
                 )
-            raise HTTPException(403, "revealing a reason needs messages:view_summary")
+            raise HTTPException(403, "a reveal needs messages:view_summary")
         if not (_matched_route_path(request) or "").startswith("/ui/"):
             enforce_phi_read_hop(request)
             enforce_phi_read_pacing(request, identity)
@@ -6955,7 +7017,9 @@ def create_app(
                 if history is not None:
                     history.record(time.time(), outbox_by_status)
                 if ui_connections_render is not None:
-                    rows = await list_connections(engine=engine_obj, identity=current)
+                    # Redacted like GET /connections, with no reveal: the console renders no
+                    # error text, and a push is not an act (BACKLOG #2443).
+                    rows = await _dashboard_rows(engine_obj, current)
                     frame["connections_html"] = str(ui_connections_render(rows))
                 await websocket.send_json(frame)
                 await asyncio.sleep(1.0)

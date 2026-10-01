@@ -42,6 +42,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.report import NoLoss
@@ -58,6 +59,10 @@ from harness.load.failover import EngineNode, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+
+if TYPE_CHECKING:
+    from messagefoundry.api.models import ConnectionRow
+    from messagefoundry.apiclient import EngineClient
 
 _CONFIG_DIR = "harness/config/connscale"
 _STOP_GRACE = 5.0
@@ -705,6 +710,7 @@ def _attribute_engines_sync(
             client = EngineClient(node.url, cacert=node.cacert)
             try:
                 rows = client.connections()
+                reasons = _reveal_failed_reasons(client, rows)
             finally:
                 client.close()
         except ApiError:
@@ -730,10 +736,40 @@ def _attribute_engines_sync(
             # "no failed lanes" forever, silently, on exactly the runs it exists to explain. A
             # diagnostic field that fails closed to "nothing to report" is worse than no field.
             if row.error:
-                failed.append(f"{row.name}: {row.error}")
+                failed.append(f"{row.name}: {reasons.get(row.channel_id, row.error)}")
         out.append(
             EngineAttribution(node.node_id, tag, inbound_rows, foreign_rows, reads, tuple(failed))
         )
+    return out
+
+
+#: How many failed lanes per engine get their reason revealed. Each reveal is one audited PHI read
+#: that spends the per-actor budget, so a run with every lane down must not spend it all here.
+_REVEAL_FAILED_CAP = 5
+
+
+def _reveal_failed_reasons(client: EngineClient, rows: list[ConnectionRow]) -> dict[str, str]:
+    """The whole failure reason for up to :data:`_REVEAL_FAILED_CAP` failed inbound lanes.
+
+    ``/connections`` masks ``error`` as ``****`` until a per-connection reveal (BACKLOG #2443), and
+    a reason that reads ``****`` cannot explain a ``reads == 0`` run. So each failed lane is
+    revealed by its own request. A lane past the cap, or a reveal the engine refuses, keeps the
+    masked value: that still says the lane failed, which is the half the diagnosis needs most."""
+    from messagefoundry.apiclient import ApiError
+
+    names = [r.channel_id for r in rows if r.read is not None and r.error]
+    out: dict[str, str] = {}
+    for name in names[:_REVEAL_FAILED_CAP]:
+        try:
+            shown = client.connections(reveal=name)
+        except ApiError:
+            continue
+        reason = next(
+            (r.error for r in shown if r.read is not None and r.channel_id == name and r.error),
+            None,
+        )
+        if reason is not None:
+            out[name] = reason
     return out
 
 

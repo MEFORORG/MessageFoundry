@@ -36,6 +36,7 @@ from messagefoundry.api.models import (
     AlertInstanceInfo,
     CapturedResponseInfo,
     ConnectionEventInfo,
+    ConnectionRow,
     DeadLetterRow,
     EventInfo,
     MessageDetail,
@@ -98,6 +99,13 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     AlertInstanceInfo: {
         "reason": Permission.MESSAGES_VIEW_SUMMARY,
     },
+    # The connections dashboard row (BACKLOG #2443, step 4). ``GET /connections`` needs only
+    # ``monitoring:read``, and ``error`` is why a connection failed to start: the same ``safe_exc``
+    # text whose stored copy is an alert reason. ``ConnectionMetadata.error`` carries the same
+    # string and is NOT mapped yet; see that model's comment.
+    ConnectionRow: {
+        "error": Permission.MESSAGES_VIEW_SUMMARY,
+    },
 }
 
 #: Properties whose *authorized* value is still display-masked until a reveal act (ASVS 14.2.6).
@@ -147,6 +155,9 @@ ERROR_TEXT_MASKED_UNTIL_REVEALED: Mapping[type[BaseModel], frozenset[str]] = Map
         # id on its list route, one audited request per event or alert.
         ConnectionEventInfo: frozenset({"reason"}),
         AlertInstanceInfo: frozenset({"reason"}),
+        # BACKLOG #2443 step 4: why a connection failed to start or was DR-parked. Revealed by the
+        # ``reveal=<connection name>`` act on ``GET /connections``, one audited request per name.
+        ConnectionRow: frozenset({"error"}),
     }
 )
 

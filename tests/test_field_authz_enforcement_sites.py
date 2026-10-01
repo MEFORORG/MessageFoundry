@@ -3,7 +3,7 @@
 """End-to-end pin for every field-level redaction site (ASVS 8.1.2).
 
 ``docs/SECURITY.md`` states that the same disposition text gates on ``messages:view_summary`` on
-**every** surface that returns it, and names nine. The map-level guards
+**every** surface that returns it, and names ten. The map-level guards
 (``tests/test_field_authz.py``, ``tests/test_security_doc_drift.py``) prove the POLICY is complete and
 documented; they cannot prove it is APPLIED — a future PHI-bearing route that forgets the
 ``redact_unauthorized`` call passes all of them, because ``redact_unauthorized`` fails **open**.
@@ -38,7 +38,9 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.wiring import ConnectionSpec, Registry, build_outbound_connection, env
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
 from tests._admin_account import create_local_user_chosen
@@ -69,6 +71,9 @@ _SURFACES: tuple[tuple[str, str], ...] = (
     ("/events", "viewer"),
     ("/connections/IB_SEED/events", "viewer"),
     ("/alerts/active", "diagonly"),
+    # BACKLOG #2443 step 4: the connections dashboard. Its route needs only monitoring:read, so a
+    # failed connection's error is gated on its own; the seed starts one outbound that cannot build.
+    ("/connections", "viewer"),
 )
 
 #: Every property the doc's read table gates, flattened — what must be null for a caller without
@@ -229,6 +234,20 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
             severity="critical",
             reason="delivery failed for MRN9001",
         )
+        # BACKLOG #2443 step 4: an outbound whose env() cannot resolve fails to build (ADR 0031), so
+        # GET /connections carries a standalone "failed" row with a non-null error.
+        reg = Registry()
+        reg.add_outbound(
+            build_outbound_connection(
+                "OB_BROKEN",
+                ConnectionSpec(
+                    ConnectorType.FILE,
+                    {"directory": env("missing_dir"), "filename": "{MSH-10}.hl7"},
+                ),
+            )
+        )
+        engine.add_registry(reg)
+        await engine.start()
 
         # Layered search is OWNER-scoped, so every caller needs a preset of their own. The owner key
         # is the immutable Identity.user_id, never the reassignable username (BACKLOG #1225), so the

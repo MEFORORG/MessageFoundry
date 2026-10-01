@@ -594,11 +594,16 @@ class ConfigProvenance(BaseModel):
     drift: bool = False  # the on-disk config now differs from what was loaded
 
 
-class ConnectionRow(BaseModel):
+class ConnectionRow(PhiGatedModel):
     """One endpoint (a channel's source, or one of its destinations) for the connections
     dashboard. Fields are role-dependent: source rows carry read/inbound-errored/idle and the
     listen peer/port; destination rows carry queue/written/dead/backlog/delivered-age and the
     remote peer/port. Unused fields are None so the UI can render blanks.
+
+    Not PHI-free. ``error`` is live free text that ``docs/PHI.md`` section 2 rates, and the route
+    needs only ``monitoring:read``. So ``error`` is gated on ``messages:view_summary`` and masked
+    until a per-connection reveal (BACKLOG #2443); every other field, the ``errored`` count and
+    the ``status`` word included, stays readable under ``monitoring:read``.
 
     On a count, ``0`` means "measured as zero" and ``None`` means "not measured on this row". ``None``
     never stands in for a zero (BACKLOG #1817). A count is ``None`` in at least these cases: the field
@@ -608,6 +613,8 @@ class ConnectionRow(BaseModel):
     ``idle_seconds`` or ``delivered_age_seconds``, and on one ``backlog_seconds`` is ``0.0`` beside a
     measured zero and ``None`` beside ``None`` counts. On an edge row, ``backlog_seconds`` ``None``
     means queued with nothing draining, which can be a stall."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"error"})
 
     role: str  # "source" | "destination"
     channel_id: str
@@ -637,7 +644,8 @@ class ConnectionRow(BaseModel):
     paused: bool = False
     # Set when status == "failed" (why it failed to start, ADR 0031) or "filtered" (why the DR
     # run-profile parked it, #61 ADR 0048). Live free text that docs/PHI.md section 2 rates, which is
-    # why GET /connections is served no-store (BACKLOG #1185).
+    # why GET /connections is served no-store (BACKLOG #1185). Gated and masked (BACKLOG #2443):
+    # null without messages:view_summary, "****" with it, whole only on the reveal=<name> act.
     error: str | None = None
     # Destination-only, sharded deployments only (ADR 0073): the engine shard that owns claiming/
     # delivery for this outbound lane. None when unsharded (every lane is local) or for source rows.
@@ -1496,7 +1504,10 @@ class ConnectionMetadata(BaseModel):
     settings: dict[str, Any]  # secret-scrubbed view
     simulated: bool | None = None  # outbound only; True = egress-suppressed shadow lane (#15)
     # Why this connection failed to start (ADR 0031) or was DR-parked (ADR 0048). Rated in
-    # docs/PHI.md section 2 (BACKLOG #1185).
+    # docs/PHI.md section 2 (BACKLOG #1185). NOT yet gated or masked, unlike ConnectionRow.error
+    # (BACKLOG #2443): this model cannot simply become a PhiGatedModel, because the gate's shared
+    # serializer covers every field named ``metadata`` and types it ``str | None``, and this
+    # ``metadata`` is a dict.
     error: str | None = None
 
 

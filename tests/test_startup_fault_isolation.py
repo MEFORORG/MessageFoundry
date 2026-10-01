@@ -130,17 +130,18 @@ def _env_broken_outbound(
 _VIEWER_PW = "a-strong-test-passphrase"
 
 
-async def _provision_viewer(service: AuthService) -> None:
-    """Create the viewer the two API tests below log in as, scoped to the whole estate."""
+async def _provision_viewer(service: AuthService, username: str = "vw", role: str = "") -> None:
+    """Create the viewer the two API tests below log in as, scoped to the whole estate. ``role``
+    overrides the Viewer role, for the operator that reveals a masked error (BACKLOG #2443)."""
     from messagefoundry.auth import Role
 
     uid = await create_local_user_chosen(
         service,
-        username="vw",
+        username=username,
         password=_VIEWER_PW,
         display_name=None,
         email=None,
-        roles=[Role.VIEWER.value],
+        roles=[role or Role.VIEWER.value],
         actor="test",
     )
     # BACKLOG #1152: an unset channel scope now DENIES. Grant the estate explicitly so this fixture
@@ -154,10 +155,10 @@ async def _provision_viewer(service: AuthService) -> None:
     )
 
 
-async def _viewer_headers(client: httpx.AsyncClient) -> dict[str, str]:
+async def _viewer_headers(client: httpx.AsyncClient, username: str = "vw") -> dict[str, str]:
     """Log the provisioned viewer in over the ASGI transport and return its bearer header."""
     r = await client.post(
-        "/auth/login", json={"username": "vw", "password": _VIEWER_PW, "provider": "local"}
+        "/auth/login", json={"username": username, "password": _VIEWER_PW, "provider": "local"}
     )
     return {"Authorization": f"Bearer {r.json()['token']}"}
 
@@ -460,6 +461,7 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
         await _provision_viewer(service)
+        await _provision_viewer(service, "op", "operator")
         await engine.start()  # degraded — does NOT raise (ADR 0031)
         assert engine.registry_runner is not None
         assert "bad_out" in engine.registry_runner.degraded_outbound()
@@ -468,10 +470,16 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             headers = await _viewer_headers(c)
             rows = (await c.get("/connections", headers=headers)).json()
+            # The reason is gated on messages:view_summary (BACKLOG #2443), which a Viewer lacks, so
+            # an operator reveals it to show it is still there.
+            op = await _viewer_headers(c, "op")
+            shown = (await c.get("/connections", params={"reveal": "bad_out"}, headers=op)).json()
         failed = [row for row in rows if row["status"] == "failed" and "bad_out" in row["name"]]
         assert failed, f"no failed bad_out row in {rows}"
         assert failed[0]["direction"] == "out"
-        assert "out_dir" in (failed[0]["error"] or "")
+        assert failed[0]["error"] is None
+        revealed = [row for row in shown if row["status"] == "failed" and "bad_out" in row["name"]]
+        assert "out_dir" in (revealed[0]["error"] or "")
     finally:
         await engine.stop()
 
@@ -531,12 +539,16 @@ async def test_connections_api_does_not_report_a_healthy_inbound_as_failed(tmp_p
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
-        await _provision_viewer(service)
+        await _provision_viewer(service, "op", "operator")
         await engine.start()  # degraded on the outbound half — does NOT raise (ADR 0031)
         transport = httpx.ASGITransport(app=create_app(engine, auth=service))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            headers = await _viewer_headers(c)
-            rows = (await c.get("/connections", headers=headers)).json()
+            headers = await _viewer_headers(c, "op")
+            # The error is masked until a reveal (BACKLOG #2443). Revealing SHARED lifts the rows of
+            # both halves of the name, so a reason on the inbound row would show here too.
+            rows = (
+                await c.get("/connections", params={"reveal": "SHARED"}, headers=headers)
+            ).json()
             graph = (await c.get("/graph/edges", headers=headers)).json()
             engine_info = (await c.get("/status", headers=headers)).json()["engine"]
         sources = [row for row in rows if row["direction"] == "in"]
