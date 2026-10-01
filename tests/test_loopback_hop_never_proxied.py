@@ -339,10 +339,30 @@ def test_the_public_bypass_predicate_agrees_with_the_transport() -> None:
     assert rest.proxy_bypasses_host("127.0.0.1", None)
     assert rest.proxy_bypasses_host("localhost", ["intranet.invalid"])
     assert rest.proxy_bypasses_host("::1", None)
-    # Brackets and a port are read as the bypass list reads them.
+    # A bracketed literal and a port are read too, alone and together. Nothing else is trimmed.
     assert rest.proxy_bypasses_host("[::1]", None)
     assert rest.proxy_bypasses_host("127.0.0.1:8080", None)
+    assert rest.proxy_bypasses_host("[::1]:8080", None)
     assert not rest.proxy_bypasses_host("partner.invalid:8080", None)
+    assert not rest.proxy_bypasses_host("[2001:db8::1]:8080", None)
+    assert not rest.proxy_bypasses_host("localhost ", None)
+
+
+def test_the_static_credential_report_lists_no_proxy_hop_for_a_loopback_target() -> None:
+    """The report follows the transport: a proxy credential the engine never sends is not a hop."""
+    from messagefoundry.config.static_credentials import _proxy_hop
+
+    settings = {
+        "proxy_url": "http://proxy.partner.invalid:3128",
+        "proxy_user": "pu",
+        "proxy_password": "pw",
+    }
+    assert _proxy_hop("OB", settings, None, targets=["http://127.0.0.1:18080/x"]) is None
+    # CONTROL: one off-box target among them, and the hop is reported.
+    hop = _proxy_hop(
+        "OB", settings, None, targets=["http://127.0.0.1:18080/x", "https://partner.invalid/x"]
+    )
+    assert hop is not None and hop.name == "proxy:OB"
     assert not rest.proxy_bypasses_host("partner.invalid", None)
     assert not rest.proxy_bypasses_host("", None)
     assert not rest.proxy_bypasses_host(None, None)

@@ -76,9 +76,9 @@ PROXY = "http://proxy.example.com:3128"
 LOOPBACK_PROXY = "http://127.0.0.1:3128"  # a local auth proxy (cntlm) — allowed under any posture
 HTTPS_DEST = "https://api.example.com/ingest"
 # Off-box on purpose. A loopback destination is never proxied (vault BACKLOG #2579), so a test of the
-# proxy path needs a destination the proxy would carry. Nothing resolves this name: the proxy is the
-# only host these tests dial.
-HTTP_DEST = "http://api.example.com/x"
+# proxy path needs a destination the proxy would carry. A reserved name that never resolves: the
+# proxy is the only host these tests dial, and a regression that dialled direct would fail fast.
+HTTP_DEST = "http://api.partner.invalid/x"
 
 _FACTORY = {
     ConnectorType.REST: Rest,
@@ -572,29 +572,31 @@ def test_intranet_bypass() -> None:
 
 
 def test_intranet_bypass_ipv6() -> None:
-    """A ``::1`` / ``2001:db8::1`` bypass entry matches its IPv6 destination — ``urlsplit().hostname``
-    returns the UNBRACKETED, port-less literal, so the match must not truncate at the first colon."""
-    # ::1 bypasses an https://[::1]:8443/ destination (no proxy handler, no credential).
+    """A ``2001:db8::1`` bypass entry matches its IPv6 destination — ``urlsplit().hostname``
+    returns the UNBRACKETED, port-less literal, so the match must not truncate at the first colon.
+
+    The destination is off-box on purpose. ``::1`` is loopback, which goes direct with no list
+    entry (vault BACKLOG #2579), so it would pass here whatever the bypass list did."""
+    # 2001:db8::1 bypasses an https://[2001:db8::1]:8443/ destination (no proxy handler, no credential).
     dest = _build(
         ConnectorType.REST,
-        "https://[::1]:8443/x",
+        "https://[2001:db8::1]:8443/x",
         proxy=LOOPBACK_PROXY,
         proxy_user="pu",
         proxy_password="pw",
-        proxy_no_proxy=["::1"],
+        proxy_no_proxy=["2001:db8::1"],
     )
     assert dest._opener is _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
     assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
-    # A DIFFERENT IPv6 host is NOT bypassed → still proxied (the truncation bug would have bypassed it,
-    # since "2001:db8::2".split(":")[0] == "2001" would never equal the "::1" entry either — but the
-    # positive case above is what the old code broke; assert the negative to pin correctness both ways).
+    # A DIFFERENT IPv6 host is NOT bypassed → still proxied. The positive case above is what the
+    # truncation bug broke; assert the negative to pin correctness both ways.
     dest2 = _build(
         ConnectorType.REST,
         "https://[2001:db8::2]:8443/x",
         proxy=LOOPBACK_PROXY,
         proxy_user="pu",
         proxy_password="pw",
-        proxy_no_proxy=["::1"],
+        proxy_no_proxy=["2001:db8::1"],
     )
     assert dest2._opener is not _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
     assert "Proxy-Authorization" in dest2._headers  # type: ignore[attr-defined]

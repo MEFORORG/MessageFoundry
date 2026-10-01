@@ -1171,9 +1171,16 @@ def _proxy_bypasses(host: str, bypass: tuple[str, ...]) -> bool:
 def _is_loopback_target(host: str) -> bool:
     """Whether a proxy target is a loopback host, which is dialled direct whatever proxy is
     configured (vault BACKLOG #2579, see ``bounded_read.LoopbackDirectProxyHandler``). It needs no
-    ``proxy_no_proxy`` entry and cannot be switched off. Brackets and a port are stripped first, as
-    :func:`_proxy_bypasses` strips them, so both read one host the same way."""
-    return is_never_proxied_host(_strip_proxy_host_port(host))
+    ``proxy_no_proxy`` entry and cannot be switched off.
+
+    Every engine caller passes ``urlsplit(url).hostname``, which has no brackets and no port. A
+    bracketed IPv6 literal and a ``host:port`` are read too, so a caller that passes one gets the
+    answer the opener acts on. Nothing else is trimmed: the predicate reads the rest as given."""
+    if host.startswith("["):
+        host = host[1:].partition("]")[0]
+    elif host.count(":") == 1:
+        host = host.partition(":")[0]
+    return is_never_proxied_host(host)
 
 
 #: The one Digest algorithm this engine answers a challenge with, on the origin 401 path

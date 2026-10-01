@@ -673,8 +673,8 @@ def is_never_proxied_host(host: str | None) -> bool:
     """Whether a hop to ``host`` is on the box, so no web proxy may carry it (vault BACKLOG #2579).
 
     The cleartext-hop guards' own predicate,
-    :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host`, with no rule added: all of
-    ``127.0.0.0/8``, ``::1`` and the name ``localhost``, with no DNS lookup. Why it matters is on
+    :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host`, with no rule added and no DNS
+    lookup. Which hosts that is, is stated there. Why it matters is on
     :class:`LoopbackDirectProxyHandler`.
 
     Pass the host as ``urlsplit(url).hostname`` gives it, which is how the guards read it. A missing
@@ -741,7 +741,8 @@ def build_strict_opener(
     A plain ``ProxyHandler``, class or instance, becomes a :class:`LoopbackDirectProxyHandler` with
     the same proxies (vault BACKLOG #2579). Where the caller supplies none, one is added that reads
     the environment, as ``build_opener`` would add its own. So every opener built here dials a
-    loopback host direct. Any other ``ProxyHandler`` subclass is refused with :class:`TypeError`.
+    loopback host direct. A ``ProxyHandler`` subclass that does not derive from the loopback-direct
+    handler is refused with :class:`TypeError`.
     To build an opener that uses no proxy at all, pass ``ProxyHandler({})``.
     """
     built: list[urllib.request.BaseHandler | type[urllib.request.BaseHandler]] = []

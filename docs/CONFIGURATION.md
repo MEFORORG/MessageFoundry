@@ -1105,17 +1105,17 @@ transport's list is set, an outbound of that transport not on it is **refused at
 >
 > **An on-box hop is dialled direct, never through a web proxy** (vault BACKLOG #2579). The loopback
 > allowance rests on the hop staying on the box, and a proxy in the path would carry it off the box.
-> So a request to a loopback host (`127.0.0.0/8`, `::1` or the name `localhost`, decided without DNS)
+> So a request to a loopback host (at least `127.0.0.0/8`, `::1` and the name `localhost`; decided without DNS)
 > goes straight to that host. That holds for a proxy from `HTTP_PROXY` / `HTTPS_PROXY`, the
 > operating system's own proxy settings, `[egress].proxy_url` and a per-connection `proxy` alike, and
 > no `NO_PROXY` entry is needed. A proxy setting that a loopback destination makes inert is logged at
-> INFO when the connection is built. An off-box hop still uses the proxy.
+> INFO when the connection is built, and the static-credential report lists no proxy credential for
+> a connection whose every target is loopback. An off-box hop still uses the proxy.
 >
 > **This is a rule of the engine's own `urllib` openers**: at least the HTTP family and its token
-> endpoints, the alert webhook, the OIDC legs and the AI broker. Other clients are outside it, at
-> least these. The Vault clients refuse a loopback `http://` Vault behind a proxy rather than bypass
-> it (see `[secrets]`). The operator API client and the `tee` tool follow the environment proxy as
-> their libraries do, a loopback engine address included.
+> endpoints, the alert webhook, the OIDC legs and the AI broker. A client built on another HTTP
+> library is outside it. Of those, the Vault clients refuse a loopback `http://` Vault behind a proxy
+> rather than bypass it (see `[secrets]`).
 >
 > **`tls_hop_attested` is a per-connection declaration, set with `tls_hop_attested_reason`** (owner
 > ruling 2026-09-24). It is a keyword on `inbound()` / `outbound()` / `FhirLookup()` /
