@@ -167,24 +167,29 @@ as its own `messagefoundry-webconsole` wheel.
 **Verify the release before you install.** MessageFoundry ships one signed wheel to many PHI-bearing
 instances, so verify the artifact's provenance *before* installing — pinning a version (or a hash) proves
 you got a *fixed* file, not that it is the one MessageFoundry built. Every release carries **SLSA build
-provenance** and a **Sigstore signature**; check both with the **GitHub CLI** (`gh` ≥ 2.49), and
+provenance** and a **Sigstore signature**; check both with the **GitHub CLI** (`gh` 2.68.0 or later
+is required, and 2.102.0 or later is recommended, because older `gh` gives a weaker pin), and
 optionally `sigstore` (`pip install sigstore`). Install **only** the file that passes:
 
 ```powershell
-$V = "0.5.0"   # the exact version you intend to install
+$V = "0.5.0"   # the exact version you intend to install, as its wheel spells it
+# Its tag's spelling. A pre-release wheel says 0.5.0rc1, while its tag is v0.5.0-rc1.
+$TagVersion = $V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2'
 
 # Download the wheel + its Sigstore bundle from that release's assets
-gh release download "v$V" --repo MEFORORG/MessageFoundry `
+gh release download "v$TagVersion" --repo MEFORORG/MessageFoundry `
   --pattern "messagefoundry-$V-*.whl" --pattern "messagefoundry-$V-*.whl.sigstore*"
 if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit $LASTEXITCODE)" }
 
 # Verify SLSA build provenance:  artifact -> source commit -> builder workflow
-gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry
+gh attestation verify "messagefoundry-$V-py3-none-any.whl" --repo MEFORORG/MessageFoundry `
+  --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml `
+  --source-ref "refs/tags/v$TagVersion"
 if ($LASTEXITCODE -ne 0) { throw "gh attestation verify FAILED (exit $LASTEXITCODE) — do not install this file" }
 
 # (defense in depth) Verify the Sigstore signature pins the release workflow identity
 python -m sigstore verify identity "messagefoundry-$V-py3-none-any.whl" `
-  --cert-identity "https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v$V" `
+  --cert-identity "https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v$TagVersion" `
   --cert-oidc-issuer "https://token.actions.githubusercontent.com"
 if ($LASTEXITCODE -ne 0) { throw "sigstore identity verification FAILED (exit $LASTEXITCODE) — do not install this file" }
 
@@ -206,8 +211,10 @@ attestation verify` that one file, then `pip install` that same resolved file pa
 silently pick a different file than the one you verified. See
 [INSTALL-GUIDE.md §3](INSTALL-GUIDE.md#verify-the-release-before-you-install-supply-chain-integrity)
 for the exact script, exit-code checks included. A registry/mirror substitution or a relabelled file
-**fails** the check. (The `--cert-identity` ref must match the tag you install — e.g.
-`refs/tags/v0.1.0-rc1` for a pre-release.)
+**fails** the check. Keep `--signer-workflow` and `--source-ref`: with `--repo` alone, the check
+accepts an attestation from any workflow in the repository, on any ref. The `--source-ref` and
+`--cert-identity` refs must match the tag you install, which `v$TagVersion` gives: a pre-release wheel
+says `0.5.0rc1`, while its tag says `v0.5.0-rc1`.
 
 For a **reproducible pinned** deploy, generate a hash-locked requirements file scoped to the extras you
 actually run and install it with `--require-hashes`. The scaffolded config repo (`messagefoundry init`,

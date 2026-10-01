@@ -914,13 +914,16 @@ def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> 
 _TOOLKIT_PYPROJECT = _REPO / "packaging" / "messagefoundry-toolkit" / "pyproject.toml"
 
 
-def _toolkit_project() -> dict[str, Any]:
-    """The toolkit pyproject's ``[project]`` table, parsed fresh on each call (a small file), so a
-    test that mutates it cannot change what a later test reads."""
-    project: dict[str, Any] = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))[
-        "project"
-    ]
+def _project(distribution: str) -> dict[str, Any]:
+    """``packaging/<distribution>/pyproject.toml``'s ``[project]`` table, parsed fresh on each call
+    (a small file), so a test that mutates it cannot change what a later test reads."""
+    pyproject = _REPO / "packaging" / distribution / "pyproject.toml"
+    project: dict[str, Any] = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
     return project
+
+
+def _toolkit_project() -> dict[str, Any]:
+    return _project(_TOOLKIT_PYPROJECT.parent.name)
 
 
 def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
@@ -950,20 +953,46 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     assert len(deps) == 1, f"the toolkit declares more than the engine pin: {deps}"
 
 
-def test_the_toolkit_wheel_ships_the_license_and_notice() -> None:
-    """BACKLOG #1192: the toolkit wheel carried no LICENSE or NOTICE, unlike the engine and console.
+#: Every separate distribution under packaging/, derived so a new one is covered on arrival.
+_SEPARATE_DISTRIBUTIONS = sorted(p.parent.name for p in _REPO.glob("packaging/*/pyproject.toml"))
 
-    It declares both as PEP 639 ``license-files`` from its own directory, and its LICENSE is a copy
-    of the root one, so this pins the copy byte-identical: a license text edited in one place only
-    would ship two different licenses under one project name.
+
+def test_the_separate_distributions_are_all_found() -> None:
+    """Liveness for the parametrize below: an empty glob would run it zero times and pass."""
+    assert {"messagefoundry-toolkit", "messagefoundry-webconsole", "messagefoundry-harness"} <= set(
+        _SEPARATE_DISTRIBUTIONS
+    ), _SEPARATE_DISTRIBUTIONS
+
+
+@pytest.mark.parametrize("distribution", _SEPARATE_DISTRIBUTIONS)
+def test_each_separate_wheel_ships_the_license_and_notice(distribution: str) -> None:
+    """The toolkit (BACKLOG #1192) and harness (BACKLOG #2513) wheels carried no LICENSE or NOTICE.
+
+    Each separate distribution declares both as PEP 639 ``license-files`` from its own directory,
+    and its LICENSE is a copy of the root one, so this pins each copy byte-identical: a license text
+    edited in one place only would ship two different licenses under one project name. On a Windows
+    checkout the compare also fails if a copy lost its ``eol=lf`` pin, as the console's had.
     """
-    toolkit_dir = _TOOLKIT_PYPROJECT.parent
-    declared = _toolkit_project().get("license-files")
+    project_dir = _REPO / "packaging" / distribution
+    declared = _project(distribution).get("license-files")
     assert declared == ["LICENSE", "NOTICE"], declared
     # LICENSE needs no is_file() check: the byte compare below raises if it is missing.
-    assert (toolkit_dir / "NOTICE").is_file(), f"NOTICE is declared but missing from {toolkit_dir}"
-    assert (toolkit_dir / "LICENSE").read_bytes() == (_REPO / "LICENSE").read_bytes(), (
-        "packaging/messagefoundry-toolkit/LICENSE differs from the root LICENSE"
+    # A NOTICE copied from a sibling would name the wrong distribution, so the first line must name
+    # this one, and the license it states must be the project's.
+    notice = (project_dir / "NOTICE").read_text(encoding="utf-8")
+    assert notice.startswith(f"{distribution} ("), f"{distribution} NOTICE opens {notice[:80]!r}"
+    assert "AGPL-3.0-or-later" in notice, f"{distribution} NOTICE does not state the license"
+    license_bytes = (project_dir / "LICENSE").read_bytes()
+    if b"\r\n" in license_bytes and b"\r\n" not in (_REPO / "LICENSE").read_bytes():
+        # A Windows checkout made before the eol=lf pin (BACKLOG #2513) keeps CRLF here while
+        # `git status` stays clean, so name the cure rather than leave it looking like an edit.
+        pytest.fail(
+            f"packaging/{distribution}/LICENSE has CRLF line endings in this checkout: it predates "
+            f"the eol=lf pin. Delete packaging/{distribution}/LICENSE and NOTICE, then run "
+            f"`git checkout -- packaging/{distribution}/LICENSE packaging/{distribution}/NOTICE`."
+        )
+    assert license_bytes == (_REPO / "LICENSE").read_bytes(), (
+        f"packaging/{distribution}/LICENSE differs from the root LICENSE"
     )
 
 

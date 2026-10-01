@@ -5,14 +5,20 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
+from _bash_resolver import explain_returncode, probe_env, require_bash
+from packaging.version import Version
 
 from messagefoundry import __version__
 from messagefoundry.__main__ import main
 from messagefoundry.api.tls import _generated_pair
 from messagefoundry.scaffold import scaffold
+from scripts.release.tag_spelling import allowed
 
 _EXPECTED = {
     "README.md",
@@ -80,10 +86,8 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # WP-BL3-07: a fail-closed engine-provenance verify gate runs before the check job, skippable via a
     # repo variable for indexes that strip attestations; the check job gates on it (never on verify failure)
     assert "verify-engine:" in ci
-    assert (
-        "gh attestation verify dist-verify/messagefoundry-*.whl --repo MEFORORG/MessageFoundry"
-        in ci
-    )
+    # The verify step's command (BACKLOG #2534) is executed, not read, by
+    # test_the_scaffolded_verify_step_pins_the_release_workflow_and_tag.
     # The scaffolded gate must name the repo that BUILDS the release — attestations are minted by the
     # public repo's release workflow, so a private-vault slug here verifies against something no
     # adopter can read. Pin the negative too: the retired slug must never creep back in.
@@ -107,6 +111,154 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     assert "--index-url" in readme and "PIP_CONSTRAINT" in readme
     assert "--require-hashes" in readme
     assert "--generate-hashes" in readme or "uv export" in readme
+
+
+_VERIFY_STEP = "Verify SLSA build provenance before install"
+_RELEASE_WORKFLOW = "MEFORORG/MessageFoundry/.github/workflows/release.yml"
+
+
+@pytest.fixture(scope="module")
+def verify_step(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path]:
+    """The generated verify step written to disk, and a bash that can run it, found once per module."""
+    root = tmp_path_factory.mktemp("verify-step")
+    repo = root / "repo"
+    scaffold(repo)
+    ci = yaml.safe_load((repo / ".github" / "workflows" / "check.yml").read_text(encoding="utf-8"))
+    [step] = [s for s in ci["jobs"]["verify-engine"]["steps"] if s.get("name") == _VERIFY_STEP]
+    script = root / "verify.sh"
+    # Bytes, so Windows does not turn each newline into CRLF, which bash would read as part of a line.
+    script.write_bytes(str(step["run"]).encode("utf-8"))
+    return require_bash(root), script
+
+
+#: A ``gh`` that answers ``--version`` with ``$FAKE_GH_VERSION`` and records any other call's argv.
+_GH_STUB = (
+    b"#!/usr/bin/env bash\n"
+    b'if [ "$1" = "--version" ]; then echo "gh version $FAKE_GH_VERSION (2026-09-30)"; exit 0; fi\n'
+    b'printf "%s\\n" "$@" > "$GH_LOG"\n'
+)
+
+
+def _run_verify_step(
+    verify_step: tuple[str, Path],
+    tmp_path: Path,
+    wheels: list[str],
+    gh_version: str = "2.102.0",
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run the step with ``wheels`` in dist-verify/ and a ``gh`` on PATH that records its argv."""
+    bash, script = verify_step
+    work = tmp_path / "work"
+    (work / "dist-verify").mkdir(parents=True)
+    for wheel in wheels:
+        (work / "dist-verify" / wheel).write_bytes(b"not a real wheel")
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    stub.write_bytes(_GH_STUB)
+    stub.chmod(0o755)
+    log = tmp_path / "gh.log"
+    env = probe_env(Path(bash), dict(os.environ))
+    env["PATH"] = f"{stub_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}"
+    env["GH_LOG"] = log.as_posix()
+    env["FAKE_GH_VERSION"] = gh_version
+    proc = subprocess.run(
+        [bash, "-e", script.as_posix()],
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return proc, log
+
+
+@pytest.mark.parametrize(
+    "tag", ["v0.4.0", "v1.10.0", "v0.5.0-a1", "v0.5.0-b2", "v0.5.0-rc1", "v2.0.0-rc10"]
+)
+def test_the_scaffolded_verify_step_rebuilds_the_release_tag(
+    verify_step: tuple[str, Path], tmp_path: Path, tag: str
+) -> None:
+    """BACKLOG #2534: the gate names the release workflow and the exact tag the wheel came from.
+
+    Each tag here is one the release accepts (scripts/release/tag_spelling.py), and its wheel says
+    the version as PEP 440 normalises it, which is what the release's own version gate requires.
+    So the step must turn that wheel back into this tag: a final, an alpha, a beta and two rcs.
+    """
+    assert allowed(tag), f"{tag} is not a tag the release accepts, so this row tests nothing real"
+    wheel = f"messagefoundry-{Version(tag[1:])}-py3-none-any.whl"
+    proc, log = _run_verify_step(verify_step, tmp_path, [wheel])
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f"{explain_returncode(proc.returncode)}\n{output}"
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "attestation",
+        "verify",
+        f"dist-verify/{wheel}",
+        "--repo",
+        "MEFORORG/MessageFoundry",
+        "--signer-workflow",
+        _RELEASE_WORKFLOW,
+        "--source-ref",
+        f"refs/tags/{tag}",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("wheels", "message"),
+    [
+        ([], "expected one engine wheel"),
+        (
+            ["messagefoundry-0.4.0-py3-none-any.whl", "messagefoundry-0.4.1-py3-none-any.whl"],
+            "expected one engine wheel",
+        ),
+        # No release tag spells these, so the step refuses rather than guess one.
+        (["messagefoundry-0.4.0.post1-py3-none-any.whl"], "has no release tag spelling"),
+        (["messagefoundry-0.5.0.dev1-py3-none-any.whl"], "has no release tag spelling"),
+    ],
+    ids=["no-wheel", "two-wheels", "post-release", "dev-release"],
+)
+def test_the_scaffolded_verify_step_refuses_what_it_cannot_verify(
+    verify_step: tuple[str, Path], tmp_path: Path, wheels: list[str], message: str
+) -> None:
+    """The refusals require that ``gh`` never ran, so no other file can be verified instead."""
+    proc, log = _run_verify_step(verify_step, tmp_path, wheels)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, f"{explain_returncode(proc.returncode)}\n{output}"
+    assert message in output, output
+    assert not log.exists(), f"gh ran although the step should have refused: {log.read_text()}"
+
+
+_WEAK_PIN = "gives a weaker pin"
+
+
+@pytest.mark.parametrize(
+    ("gh_version", "verifies", "warns"),
+    [
+        ("2.67.0", False, False),  # no --source-ref at all: refuse
+        ("2.68.0", True, True),  # the floor: verify, but warn the pin is weaker
+        ("2.101.9", True, True),
+        ("2.102.0", True, False),  # signer-workflow and source-ref matched exactly
+        ("3.0.0", True, False),
+    ],
+)
+def test_the_scaffolded_verify_step_checks_the_gh_version(
+    verify_step: tuple[str, Path], tmp_path: Path, gh_version: str, verifies: bool, warns: bool
+) -> None:
+    """Below gh 2.68.0 the step refuses; below 2.102.0 it verifies and warns (BACKLOG #2534).
+
+    The rows on each side of both thresholds are each other's control.
+    """
+    proc, log = _run_verify_step(
+        verify_step, tmp_path, ["messagefoundry-0.4.0-py3-none-any.whl"], gh_version
+    )
+    output = proc.stdout + proc.stderr
+    if not verifies:
+        assert proc.returncode == 1, f"{explain_returncode(proc.returncode)}\n{output}"
+        assert "needs gh 2.68.0 or later" in output, output
+        assert not log.exists(), f"gh verify ran on a gh with no --source-ref: {log.read_text()}"
+        return
+    assert proc.returncode == 0, f"{explain_returncode(proc.returncode)}\n{output}"
+    assert log.read_text(encoding="utf-8").splitlines()[:2] == ["attestation", "verify"]
+    assert (_WEAK_PIN in output) is warns, output
 
 
 def test_scaffold_refuses_nonempty_without_force(tmp_path: Path) -> None:

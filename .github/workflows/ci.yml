@@ -4191,12 +4191,13 @@ jobs:
           python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
           python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
 
-      - name: The toolkit wheel carries its LICENSE and NOTICE
+      - name: Each separate wheel carries its LICENSE and NOTICE
         run: |
-          # BACKLOG #1192. tests/test_packaging.py checks the declaration and the source files; only a
-          # real build shows where hatchling puts them. The same script runs in release.yml's
-          # toolkit gate; tests/test_wheel_license_files.py covers what it refuses.
-          python scripts/release/wheel_license_files.py 'toolkit-dist/*.whl'
+          # BACKLOG #1192 (toolkit) and #2513 (harness, web console). tests/test_packaging.py checks
+          # the declarations and the source files; only a real build shows where hatchling puts them.
+          # The same script runs in each wheel's release.yml gate; tests/test_wheel_license_files.py
+          # covers what it refuses.
+          python scripts/release/wheel_license_files.py 'harness-dist/*.whl' 'webconsole-dist/*.whl' 'toolkit-dist/*.whl'
 
       - name: Positive control -- the gate must REFUSE a poisoned copy
         run: |

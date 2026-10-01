@@ -170,7 +170,41 @@ jobs:
       - name: Verify SLSA build provenance before install
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify dist-verify/messagefoundry-*.whl --repo MEFORORG/MessageFoundry
+        run: |
+          # --signer-workflow and --source-ref narrow the check to the engine's release workflow, run
+          # on the tag for this exact version. With --repo alone, an attestation from any workflow or
+          # ref in that repository would pass. The tag follows the pin in requirements.txt, so a bump
+          # needs no edit here.
+          set -euo pipefail
+          shopt -s nullglob
+          # gh before 2.68.0 has no --source-ref. Before 2.102.0 it matches --signer-workflow against
+          # only the start of the signing identity and compares --source-ref ignoring case, so the
+          # pin is weaker; that warns rather than fails, since a hosted runner may not have 2.102 yet.
+          gh_line=$(gh --version)
+          gh_re='^gh version ([0-9]+)[.]([0-9]+)[.]'
+          if [[ ! "$gh_line" =~ $gh_re ]]; then
+            echo "::error::could not read a gh version from: $gh_line"; exit 1
+          fi
+          gh_at="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          gh_rank=$(( BASH_REMATCH[1] * 1000 + BASH_REMATCH[2] ))
+          if (( gh_rank < 2068 )); then
+            echo "::error::gh $gh_at has no --source-ref; this check needs gh 2.68.0 or later"; exit 1
+          fi
+          if (( gh_rank < 2102 )); then
+            echo "::warning::gh $gh_at gives a weaker pin: it matches --signer-workflow against only the start of the signing identity and compares --source-ref ignoring case. Use gh 2.102.0 or later."
+          fi
+          wheels=(dist-verify/messagefoundry-*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected one engine wheel in dist-verify/, found ${#wheels[@]}"; exit 1
+          fi
+          # The wheel spells a pre-release as PEP 440 does (0.5.0rc1); its tag is v0.5.0-rc1. The
+          # engine release refuses any other tag spelling, so this rebuild is exact.
+          version=$(basename "${wheels[0]}" | cut -d- -f2)
+          if [[ ! "$version" =~ ^([0-9]+[.][0-9]+[.][0-9]+)((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::engine wheel version $version has no release tag spelling"; exit 1
+          fi
+          tag_version="${BASH_REMATCH[1]}${BASH_REMATCH[2]:+-${BASH_REMATCH[2]}}"
+          gh attestation verify "${wheels[0]}" --repo MEFORORG/MessageFoundry --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref "refs/tags/v$tag_version"
 
   check:
     needs: verify-engine
@@ -307,7 +341,9 @@ messagefoundry serve --config config --env dev
 `.github/workflows/check.yml` **verifies the pinned engine wheel's build provenance before installing it**
 (`gh attestation verify` against the MessageFoundry release attestation), so a registry/mirror swap of the
 engine fails CI instead of shipping silently — pinning a version proves *which bytes*, not *who built
-them*. The gate is **fail-closed by default**. If your package index strips attestations (some private
+them*. The check names the release workflow and the tag for your pinned version, and needs `gh` 2.68.0
+or later on the runner; below 2.102.0 it warns that `gh` pins less strictly. The gate is
+**fail-closed by default**. If your package index strips attestations (some private
 mirrors do), set the repository variable **`MEFOR_VERIFY_ENGINE=off`** (Settings → Secrets and variables →
 Actions → Variables) to skip it; the `check` job still runs. See the engine's INSTALL-GUIDE for the
 matching manual verify-before-install recipe.

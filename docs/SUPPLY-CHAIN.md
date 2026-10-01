@@ -112,6 +112,10 @@ gh attestation verify messagefoundry-<version>.tar.gz --repo MEFORORG/MessageFou
   --source-ref refs/tags/v<version>
 ```
 
+`--source-ref` needs `gh` 2.68.0 or later. Use 2.102.0 or later: before it, `gh` matches
+`--signer-workflow` against only the start of the signing identity, and compares `--source-ref`
+ignoring case, so the two flags pin less than they say.
+
 Keep the last two flags. With `--repo` alone, the command accepts an attestation from any workflow
 in the repository, on any ref, and at least one attestation exists that no release wrote.
 

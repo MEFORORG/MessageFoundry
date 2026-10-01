@@ -270,11 +270,21 @@ jobs:
         with:
           python-version: "3.14"
 
+      # BACKLOG #2534. The trigger above accepts any `vX.Y.Z-*` tag, and the version gate compares
+      # PEP 440 versions, so `v0.5.0-rc.1` would release a wheel saying 0.5.0rc1. A verifier holds
+      # only that wheel and must name the tag in `gh attestation verify --source-ref`, and the
+      # scaffolded CI gate rebuilds it from the wheel's version. That needs one spelling per
+      # version, so this refuses every other spelling first, before anything is built or signed.
+      - name: The tag is spelled vX.Y.Z or vX.Y.Z-(a|b|rc)N
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        run: python scripts/release/tag_spelling.py "$GITHUB_REF_NAME"
+
       # BACKLOG #2080. Unreleased changelog entries live as fragments under changelog.d/ until the
       # release pull request runs `changelog_fragments.py assemble`. The release notes below are read
       # from CHANGELOG.md alone, so a fragment still in the tree at the tag would be missing from them.
       # READ-ONLY: this step refuses; it never assembles or commits, because a job holding publish
-      # credentials must not write to the repository. It runs first, before anything is built. It
+      # credentials must not write to the repository. It runs right after the tag-spelling check
+      # above (BACKLOG #2534), before anything is built. It
       # binds EVERY engine tag, a `-rc` pre-release included, since each publishes notes from
       # CHANGELOG.md; changelog.d/README.md gives the release order.
       - name: Changelog fragments assembled (none left behind at the tag)
@@ -939,14 +949,19 @@ jobs:
       # builder workflow identity, transparency-logged via the OIDC identity above. This is the
       # GitHub-native artifact attestation for the GitHub release assets, COMPLEMENTING the PyPI-side
       # PEP 740 attestations emitted by the publish step below (dist-pub/ is a byte-identical copy, so
-      # the digests match either source). Verify a downloaded artifact with:
-      #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry
+      # the digests match either source). Verify a downloaded artifact with (BACKLOG #2534):
+      #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry \
+      #     --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml \
+      #     --source-ref refs/tags/v<version>
+      # Keep the last two flags, and write <version> in the tag's spelling: 0.5.0-rc1, not the
+      # wheel's 0.5.0rc1, so the ref reads refs/tags/v0.5.0-rc1.
       #
       # THE GUARD HAS TWO PARTS, AND EACH ANSWERS A DIFFERENT QUESTION.
       #
       # 1. The event-and-ref pair, the same one every publish step below carries (BACKLOG #1805). The
-      #    verify command above does NOT check the ref or the workflow: it accepts an attestation
-      #    signed by any workflow in this repository, from any ref. So an attestation a dispatch wrote
+      #    verify command with `--repo` alone does NOT check the ref or the workflow: it accepts an
+      #    attestation signed by any workflow in this repository, from any ref, and a verifier may
+      #    drop the two flags above. So an attestation a dispatch wrote
       #    for an unreviewed branch would verify exactly like a release's. This step used to run on
       #    the dispatch dry-run too, to validate the attestation path before a tag. The pair gives
       #    that up on purpose; a tag push is now the only run that reaches this step. At least one
@@ -1163,7 +1178,10 @@ jobs:
         # a BARE always() there, so a refused wheel was uploaded as a downloadable artifact
         # regardless -- the engine job's leak gate already had this guard and these did not.
         id: member-gate
-        run: python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+        run: |
+          python scripts/release/forbidden_members.py 'webconsole-dist/*.whl'
+          # And the wheel's own dist-info carries LICENSE and NOTICE (BACKLOG #2513).
+          python scripts/release/wheel_license_files.py 'webconsole-dist/*.whl'
 
       - name: Smoke-check the console wheel (clean venv, install, then the console's OWN __version__ == tag)
         run: |
@@ -1528,7 +1546,10 @@ jobs:
         # a BARE always() there, so a refused wheel was uploaded as a downloadable artifact
         # regardless -- the engine job's leak gate already had this guard and these did not.
         id: member-gate
-        run: python scripts/release/forbidden_members.py 'harness-dist/*.whl'
+        run: |
+          python scripts/release/forbidden_members.py 'harness-dist/*.whl'
+          # And the wheel's own dist-info carries LICENSE and NOTICE (BACKLOG #2513).
+          python scripts/release/wheel_license_files.py 'harness-dist/*.whl'
 
       - name: Smoke-check the harness wheel (clean venv, install, import, version == engine == tag)
         run: |

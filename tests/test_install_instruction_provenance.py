@@ -28,6 +28,7 @@ Two properties, both derived from source rather than hardcoded:
 from __future__ import annotations
 
 import re
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -586,4 +587,147 @@ def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_pr
     assert "cover the ENGINE release files and the TOOLKIT wheel" in readme, (
         "README must say which artifacts the signing covers, because it does not cover all of them: "
         f"unsigned publish jobs are {sorted(unsigned)}"
+    )
+
+
+_TOOL = "gh attestation verify"
+
+#: A command ends where its line ends, unless the line ends with a PowerShell backtick or a shell
+#: backslash that continues it. Only text OUTSIDE an inline code span can continue, so the backtick
+#: that closes `` `gh attestation verify ...` `` in prose never joins the next line.
+_CONTINUATION = ("`", "\\")
+
+#: `--repo` or `--owner` names where the attestation must come from; gh refuses a verify with neither.
+_SCOPE = re.compile(r"--(?:repo|owner)\b")
+
+#: The release workflow, and a source ref that names a release tag: it must start `refs/tags/v`,
+#: with a literal `v`, so a variable can supply only the version (`v$TagVersion`, `v$tag_version`).
+_SIGNER_WORKFLOW = re.compile(
+    r"--signer-workflow\s+MEFORORG/MessageFoundry/\.github/workflows/release\.yml\b"
+)
+_SOURCE_REF = re.compile(r"""--source-ref\s+["']?refs/tags/v""")
+
+
+def _commands_in(lines: list[str]) -> list[tuple[int, str]]:
+    """Each ``gh attestation verify`` COMMAND in ``lines``, as ``(line number, command text)``.
+
+    A mention inside an inline code span is the span's text and nothing more. A mention outside one
+    runs to the end of its line plus every continuation line, with a leading ``#`` comment marker
+    stripped from each, as release.yml's comment writes it.
+
+    A command names the artifact first and carries at least one ``--`` flag. Anything else is a
+    mention of the tool: the prose "`gh attestation verify` checks", a flag named in prose such as
+    "`gh attestation verify --source-ref`", or the PowerShell blocks' error message
+    "gh attestation verify FAILED". gh refuses a verify with no flag at all.
+    """
+    found: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        at = line.find(_TOOL)
+        while at != -1:
+            in_span = line.count("`", 0, at) % 2 == 1
+            if in_span:
+                close = line.find("`", at)
+                text = line[at:] if close == -1 else line[at:close]
+            else:
+                parts = [line[at:]]
+                end = i
+                while parts[-1].rstrip().endswith(_CONTINUATION) and end + 1 < len(lines):
+                    end += 1
+                    parts.append(lines[end].strip().lstrip("#").strip())
+                text = " ".join(part.rstrip().rstrip("`\\").rstrip() for part in parts)
+            args = text[len(_TOOL) :].split()
+            if args and not args[0].startswith("-") and any(a.startswith("--") for a in args):
+                found.append((i + 1, text))
+            at = line.find(_TOOL, at + len(_TOOL))
+    return found
+
+
+def _verify_commands() -> list[tuple[str, int, str]]:
+    """Every tracked ``gh attestation verify`` command, as ``(path, line, command)``.
+
+    ``git grep`` narrows the walk to the few files naming the tool. Released history is left out,
+    because it records what shipped then, and so are tests, which quote commands as data.
+    """
+    hits = subprocess.run(
+        [
+            "git",
+            "grep",
+            "-l",
+            "-z",
+            "-I",
+            _TOOL,
+            "--",
+            ".",
+            ":!CHANGELOG.md",
+            ":!changelog.d",
+            ":!tests",
+        ],
+        cwd=_ROOT,
+        capture_output=True,
+        check=True,
+    ).stdout.decode("utf-8")
+    return [
+        (rel, line, text)
+        for rel in filter(None, hits.split("\0"))
+        for line, text in _commands_in((_ROOT / rel).read_text(encoding="utf-8").splitlines())
+    ]
+
+
+def _lacks_a_pin(command: str) -> bool:
+    return not (
+        _SCOPE.search(command) and _SIGNER_WORKFLOW.search(command) and _SOURCE_REF.search(command)
+    )
+
+
+def test_the_command_parser_tells_a_command_from_a_mention() -> None:
+    """Controls for the sweep below, over text written here.
+
+    A prose mention followed by a line full of flags is not a command, because the closing backtick
+    of an inline span is not a continuation. An ``--owner`` command and a ``--repo`` one are both
+    commands, and each is judged on its own flags.
+    """
+    lines = [
+        "Run `gh attestation verify` before you install. `",
+        "  --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref refs/tags/v1.0.0",
+        'throw "gh attestation verify FAILED (exit 1)"',
+        "gh attestation verify x.whl --owner MEFORORG `",
+        "  --source-ref refs/tags/v1.0.0",
+        "# gh attestation verify x.whl --repo MEFORORG/MessageFoundry \\",
+        "#   --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml \\",
+        "#   --source-ref refs/tags/v<version>",
+        "Use `gh attestation verify x.whl --repo MEFORORG/MessageFoundry` here.",
+        "The `gh attestation verify --source-ref` flag names the tag.",
+        "gh attestation verify x.whl --repo MEFORORG/MessageFoundry --signer-workflow "
+        'MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref "refs/tags/$Tag"',
+    ]
+    commands = _commands_in(lines)
+    assert [line for line, _ in commands] == [4, 6, 9, 11], commands
+    verdicts = [_lacks_a_pin(text) for _, text in commands]
+    # --owner but no --signer-workflow; complete; inline --repo alone; a ref with no literal v.
+    assert verdicts == [True, False, True, True], commands
+
+
+def test_every_attestation_verify_command_pins_the_release_workflow_and_ref() -> None:
+    """BACKLOG #2534: ``--repo`` or ``--owner`` alone accepts an attestation from any workflow on
+    any ref, so every verify command an operator or the scaffolded CI gate would run must also
+    carry ``--signer-workflow`` naming the release workflow and a ``--source-ref`` naming a tag."""
+    commands = _verify_commands()
+    files = {rel for rel, _, _ in commands}
+    # POSITIVE CONTROL: the sweep finds the sites #2534 named, so a silent match is not a pass.
+    expected = {
+        "README.md",
+        "docs/INSTALL-GUIDE.md",
+        "docs/EARLY-ADOPTER-GUIDE.md",
+        "docs/MENTAL-MODEL.md",
+        "docs/SUPPLY-CHAIN.md",
+        ".github/workflows/release.yml",
+        "messagefoundry/scaffold.py",
+    }
+    assert expected <= files, f"the sweep missed {sorted(expected - files)}; found {sorted(files)}"
+    # Eight commands across those seven files: INSTALL-GUIDE.md carries two.
+    assert len(commands) >= 8, commands
+    missing = [f"{rel}:{line}" for rel, line, command in commands if _lacks_a_pin(command)]
+    assert not missing, (
+        "these verify commands lack --repo or --owner, --signer-workflow naming the release "
+        f"workflow, or a --source-ref naming a tag: {missing}"
     )
