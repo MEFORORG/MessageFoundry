@@ -143,13 +143,14 @@ def test_a_failed_archive_claim_on_a_bumped_name_logs_no_partner_name(
     dropped.write_bytes(b"PAYLOAD")
     bumped = str(tmp_path / "processed" / f"{_MRN}_ADT-1.hl7")
 
-    def claim_fails(_tmp: Path, _target: Path) -> Path:
+    def claim_fails(_tmp: Path, _target: Path, **_k: object) -> Path:
         raise PermissionError(errno.EACCES, "Permission denied", "tmpab12.part", None, bumped)
 
     monkeypatch.setattr(file_mod, "_claim_unique", claim_fails)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
-        assert FileSource._move(dropped, tmp_path / "processed") is False
+        source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(inbox)}))
+        assert source._move(dropped, tmp_path / "processed") is False
 
     lines = [r.getMessage() for r in caplog.records if "could not move" in r.getMessage()]
     assert lines and "Permission denied" in lines[0], lines

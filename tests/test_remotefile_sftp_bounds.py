@@ -18,6 +18,7 @@ about the socket the connector makes, not about the transfer semantics that file
 from __future__ import annotations
 
 import contextlib
+import errno
 import socket
 import threading
 import time
@@ -493,7 +494,7 @@ def test_real_paramiko_silent_session_open_is_bounded(
     never answers the channel open, never answers the ``sftp`` subsystem request, or accepts that
     request and never sends the SFTP VERSION packet. This is what checks the stub model above.
 
-    SKIPS where the ``[sftp]`` extra is not installed, which is the default here and in CI; a skip
+    SKIPS where the ``[sftp]`` extra is not installed (tests/test_sftp_extra_on_ci_leg.py); a skip
     claims nothing. The operation runs on a daemon thread joined with a ceiling, so a regression
     fails this test instead of hanging the run.
     """
@@ -1183,6 +1184,58 @@ def test_a_slow_upload_that_keeps_moving_completes(monkeypatch: pytest.MonkeyPat
     assert ssh.close_calls == 1, f"closed {ssh.close_calls} times; only _op should close it"
 
 
+#: Refused sends in a row, inside one ``write_all`` call, that the test reads as parked. At the
+#: socket's 0.1 s timeout this is two seconds of refusal. A ``write_all`` that gave up after fewer
+#: retries fails the test. Any finite count is only a sample: the watchdog relies on no limit at all
+#: (``remotefile._WriteWatchdog`` states the paramiko fact).
+_REFUSALS_PARKED = 20
+
+#: The test thread's wait for a park, in seconds. A literal, not a multiple of ``_PARKED_AFTER``:
+#: it plus the join (``_PARKED_AFTER``) must stay under the 60 s pytest-timeout, so a regression
+#: fails on this test's own message rather than on a killed worker.
+_PARK_WAIT = 20.0
+
+
+class _RefusalCountingSocket:
+    """A real socket that counts the sends it refuses in a row, and says when enough have.
+
+    Sampling the byte count on a clock cannot tell a full buffer from a slow one. On a loaded
+    Windows runner the count sat still for half a second, then moved on by megabytes. A
+    sleep-and-compare test read that as a stall, then as a writer that gave up (PR 1828, BACKLOG
+    #2084). The socket knows better. It counts the refusals ``write_all`` retries: a timeout, or an
+    ``OSError`` carrying ``EAGAIN``. A send that succeeds resets the run, and so does
+    :meth:`call_returned`, so every run lies inside one ``write_all`` call. Only the writer thread
+    touches the counter; the test thread waits on the event."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._in_a_row = 0
+        self.parked = threading.Event()
+
+    def send(self, data: bytes) -> int:
+        try:
+            sent = self._sock.send(data)
+        except OSError as exc:
+            if isinstance(exc, TimeoutError) or exc.errno == errno.EAGAIN:
+                self._in_a_row += 1
+                if self._in_a_row >= _REFUSALS_PARKED:
+                    self.parked.set()
+            raise
+        self._in_a_row = 0
+        return sent
+
+    def call_returned(self) -> None:
+        """The writer calls this after each ``write_all`` returns. A call that gave up quietly,
+        returning after a few refusals, then cannot add its refusals to the next call's run."""
+        self._in_a_row = 0
+
+    def recv(self, size: int) -> bytes:
+        return self._sock.recv(size)
+
+    def close(self) -> None:
+        self._sock.close()
+
+
 def test_real_paramiko_write_all_spins_until_the_packetizer_is_closed() -> None:
     """The paramiko fact the watchdog rests on, checked against the real library.
 
@@ -1190,6 +1243,21 @@ def test_real_paramiko_write_all_spins_until_the_packetizer_is_closed() -> None:
     socket buffers fill: the writer stops making progress and does not return. Closing the
     packetizer, which ``Transport.close`` does, ends it with ``EOFError``. The writes are 32 KiB
     packets, as an upload's are; one huge send can be taken whole by a Windows loopback socket.
+
+    The stall is read from the socket, not from a clock. :class:`_RefusalCountingSocket` sets its
+    event after :data:`_REFUSALS_PARKED` refused sends in a row. Those all fall inside one
+    ``write_all`` call, because a call that returns has made a send succeed. If a Windows loopback
+    socket grows its buffer and takes more data before the run is complete, the run starts over.
+    Once the event is set the test closes the packetizer at once.
+
+    Red mutations, each run against the installed paramiko and reverted:
+
+    1. ``write_all`` raises ``EOFError`` after five timed-out sends. Reds on "gave up on its own".
+    2. ``write_all`` returns quietly after five timed-out sends. Reds on "no run of 20 refused
+       sends inside one write_all call".
+    3. ``write_all`` ignores the closed packetizer and retries the closed socket's send error.
+       Reds on "closing the packetizer did not end write_all".
+
     SKIPS where the ``[sftp]`` extra is not installed; a skip claims nothing."""
     pytest.importorskip("paramiko", reason="the [sftp] extra is not installed")
     from paramiko.packet import Packetizer
@@ -1197,16 +1265,18 @@ def test_real_paramiko_write_all_spins_until_the_packetizer_is_closed() -> None:
     ours, peer = socket.socketpair()
     try:
         ours.settimeout(0.1)  # what paramiko's Transport sets on its socket
-        packetizer = Packetizer(ours)
+        counting = _RefusalCountingSocket(ours)
+        packetizer = Packetizer(counting)
         outcome: list[BaseException | None] = []
         sent = [0]
-        ceiling = 512 * 1024 * 1024  # far past any socket buffer; reaching it fails the test
+        byte_limit = 512 * 1024 * 1024  # far past any socket buffer; reaching it fails the test
 
         def _write() -> None:
             try:
                 packet = b"\0" * 32768
-                while sent[0] < ceiling:
+                while sent[0] < byte_limit:
                     packetizer.write_all(packet)
+                    counting.call_returned()
                     sent[0] += len(packet)
                 outcome.append(None)
             except BaseException as exc:  # recorded for the assertions below
@@ -1214,18 +1284,19 @@ def test_real_paramiko_write_all_spins_until_the_packetizer_is_closed() -> None:
 
         writer = threading.Thread(target=_write, daemon=True)
         writer.start()
-        stalled_at = -1
-        deadline = time.monotonic() + _PARKED_AFTER
-        while time.monotonic() < deadline and writer.is_alive():
-            before = sent[0]
-            time.sleep(0.5)
-            if sent[0] == before:
-                stalled_at = before
+        # Ends when the event fires or the writer ends. A pass never reaches the deadline.
+        deadline = time.monotonic() + _PARK_WAIT
+        while not counting.parked.wait(0.2):
+            if not writer.is_alive() or time.monotonic() >= deadline:
                 break
-        assert writer.is_alive(), f"write_all returned against a peer that never reads: {outcome}"
-        assert stalled_at >= 0, "the writer never stopped making progress"
-        time.sleep(0.5)
-        assert writer.is_alive() and sent[0] == stalled_at, "write_all gave up on its own"
+        assert writer.is_alive(), (
+            f"the writer ended before write_all parked: {outcome} after {sent[0]} bytes. "
+            "An exception means write_all gave up on its own; None means the socket never filled"
+        )
+        assert counting.parked.is_set(), (
+            f"no run of {_REFUSALS_PARKED} refused sends inside one write_all call in "
+            f"{_PARK_WAIT:g}s; {sent[0]} bytes sent"
+        )
         packetizer.close()
         writer.join(_PARKED_AFTER)
         assert not writer.is_alive(), "closing the packetizer did not end write_all"
