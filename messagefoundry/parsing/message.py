@@ -2,11 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A mutable HL7 v2 message — read and set fields by path, then re-encode.
 
-Wraps a ``python-hl7`` parse. Field paths use the same ``SEG-F[.C[.S]]`` syntax as
-:class:`~messagefoundry.parsing.peek.Peek` and the declarative transforms. Components and
-subcomponents are rebuilt at the *string* level (split on the message's own separators, modify,
-re-join, assign the whole field) — which avoids a python-hl7 quirk where assigning to a component
-of a not-yet-componentized field raises.
+Wraps a parse by the built-in parser (:mod:`messagefoundry.parsing._builtin_hl7`, ADR 0054). Field
+paths use the same ``SEG-F[.C[.S]]`` syntax as :class:`~messagefoundry.parsing.peek.Peek` and the
+declarative transforms. Components and subcomponents are rebuilt at the *string* level (split on the
+message's own separators, modify, re-join, assign the whole field).
 
 By default a read/write addresses the **first** segment of an id and (for a component) the **first**
 repetition of a field — the common case. Real-world feeds also need to **iterate field repetitions** (PID-3 identifier lists, repeating OBX/IN1) and
@@ -24,22 +23,18 @@ from __future__ import annotations
 
 import copy
 import json
-import logging
 import re
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import hl7
-
-import messagefoundry.parsing._backend as _backend
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 import messagefoundry.parsing.binary as _binary
 from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
 from messagefoundry.parsing.peek import (
-    HL7PeekError,
     drop_blank_segments,
     enforce_expansion_budget,
     normalize,
+    parse_or_refuse,
     parse_path,
 )
 from messagefoundry.timezone import (
@@ -48,8 +43,6 @@ from messagefoundry.timezone import (
     age_from_dob,
     length_of_stay,
 )
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # the SegmentGroup view imports Message back; keep the cycle out of runtime
     from xml.etree.ElementTree import (  # nosec B405 — type-only import; all XML parsing goes through defusedxml
@@ -70,13 +63,8 @@ class Message:
     #: Symmetry with :class:`RawMessage` — a Router/Handler can branch on ``msg.content_type``.
     content_type = "hl7v2"
 
-    def __init__(self, message: hl7.Message | _builtin_hl7.ParsedMessage) -> None:
-        # ``message`` is either a legacy python-hl7 ``hl7.Message`` or a built-ins
-        # ``ParsedMessage`` dict (ADR 0054). All mutate/read helpers dispatch on ``_builtin``.
-        # Stored as ``Any`` because the python-hl7 path indexes/mutates it dynamically (no stubs);
-        # the built-ins path narrows it back via :meth:`_pm`.
-        self._m: Any = message
-        self._builtin: bool = isinstance(message, dict)
+    def __init__(self, message: _builtin_hl7.ParsedMessage) -> None:
+        self._m: _builtin_hl7.ParsedMessage = message
         # Copy-on-write flag (ADR 0104): True while this message shares its backing tree with a
         # :meth:`copy` snapshot/clone. A mutator calls :meth:`_ensure_owned` first, which deepcopies the
         # tree the first time either side is mutated — so a snapshot that is never further changed (the
@@ -87,36 +75,22 @@ class Message:
     def parse(cls, raw: str | bytes) -> Message:
         """Parse ``raw`` (line endings normalized to ``\\r``) into a mutable message.
 
-        Uses the built-ins parser (ADR 0054) when ``_backend.USE_BUILTIN`` is on (the default); an
-        unexpected internal built-ins fault falls back to python-hl7 and is logged (Phase-1 fallback
-        guard), so a connection is never crashed by a parser bug — the proven path takes over.
+        Raises :class:`~messagefoundry.parsing.peek.HL7PeekError` when:
 
-        Raises :class:`~messagefoundry.parsing.peek.HL7PeekError` when the message's HL7 escapes
-        could expand past the aggregate budget (ASVS 1.3.3) — the same check, on the same normalized
-        text, that :meth:`Peek.parse` runs, so the two surfaces can never disagree about a body.
+        * the text does not start with an ``MSH``, ``FHS`` or ``BHS`` segment;
+        * the message's HL7 escapes could expand past the aggregate budget (ASVS 1.3.3) — the same
+          check, on the same normalized text, that :meth:`Peek.parse` runs, so the two surfaces can
+          never disagree about a body; or
+        * the parser itself faults. That is a parser bug, not a property of the message. It is
+          refused and logged by exception type only, so the message takes the ``ERROR`` path of
+          whoever called this and is never accepted and dropped (ADR 0054 amendment).
         """
         norm = normalize(raw)
         enforce_expansion_budget(norm)
-        # Empty segment lines go before either backend parses, exactly as in Peek.parse (BACKLOG
-        # #1594). Kept, one would make every whole-field set raise IndexError on both backends, so a
-        # blank-line feed the listener ACKed would then fail in every Handler that edits it.
-        norm = drop_blank_segments(norm)
-        if _backend.use_builtin():
-            try:
-                return cls(_builtin_hl7.parse(norm))
-            except hl7.ParseException:
-                # The no-MSH-leading rejection is the built-ins parser deliberately matching
-                # python-hl7's contract (not an internal fault), so re-raise it as-is rather than
-                # falling back — the python-hl7 path would only raise the identical error again.
-                raise
-            except HL7PeekError:
-                # Likewise a contract error: never fall back to python-hl7's unbounded unescape.
-                raise
-            except Exception:  # noqa: BLE001 — fallback guard: any unexpected built-ins error
-                logger.warning(
-                    "built-ins HL7 parse failed; falling back to python-hl7", exc_info=True
-                )
-        return cls(hl7.parse(norm))
+        # Empty segment lines go before the parse, exactly as in Peek.parse (BACKLOG #1594). Kept, one
+        # would make every whole-field set raise IndexError, so a blank-line feed the listener ACKed
+        # would then fail in every Handler that edits it.
+        return cls(parse_or_refuse(drop_blank_segments(norm)))
 
     # --- read ----------------------------------------------------------------
 
@@ -141,7 +115,7 @@ class Message:
             raise ValueError("repetition is 1-based (>= 1)")
         seg, fld, comp, sub = parse_path(path)
         text = self._raw_field(seg, fld, occurrence)
-        _field_sep, comp_sep, rep_sep, _esc, sub_sep = self._encoding_chars()
+        _field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._encoding_chars()
         if comp is None:
             if repetition is None:
                 return text or None  # whole field: every repetition (review H-9)
@@ -154,7 +128,7 @@ class Message:
         rep_index = 1 if repetition is None else repetition
         if rep_index > len(reps):
             return None
-        return self._extract(reps[rep_index - 1], comp, sub, comp_sep, sub_sep)
+        return self._extract(reps[rep_index - 1], comp, sub)
 
     def __getitem__(self, path: str) -> str | None:
         return self.field(path)
@@ -173,16 +147,14 @@ class Message:
         text = self._raw_field(seg, fld, occurrence)
         if not text:
             return []
-        _field_sep, comp_sep, rep_sep, _esc, sub_sep = self._encoding_chars()
+        _field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._encoding_chars()
         if comp is None:
             return [rep or None for rep in text.split(rep_sep)]
-        return [self._extract(rep, comp, sub, comp_sep, sub_sep) for rep in text.split(rep_sep)]
+        return [self._extract(rep, comp, sub) for rep in text.split(rep_sep)]
 
     def count_segments(self, segment_id: str) -> int:
         """How many segments of ``segment_id`` the message has (0 if none)."""
-        if self._builtin:
-            return sum(1 for sid in _builtin_hl7.segment_ids(self._m) if sid == segment_id)
-        return sum(1 for seg in self._m if str(seg[0]) == segment_id)
+        return sum(1 for sid in _builtin_hl7.segment_ids(self._m) if sid == segment_id)
 
     @property
     def message_code(self) -> str | None:
@@ -202,9 +174,7 @@ class Message:
 
     def segments(self) -> list[str]:
         """Ordered segment ids, e.g. ``["MSH", "EVN", "PID"]``."""
-        if self._builtin:
-            return _builtin_hl7.segment_ids(self._m)
-        return [str(seg[0]) for seg in self._m]
+        return _builtin_hl7.segment_ids(self._m)
 
     # --- derived HL7 timestamp values ---------------------------------------
     #
@@ -426,23 +396,10 @@ class Message:
         if len(tokens) == 1:
             tokens.append("")
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
-        if self._builtin:
-            seg_count = len(_builtin_hl7.segment_ids(self._m))
-            if index is not None and (index < 1 or index > seg_count):
-                raise ValueError(
-                    f"index {index} out of range (1..{seg_count}); index 1 is after MSH"
-                )
-            _builtin_hl7.add_segment_line(self._m, segment_id, tokens, index)
-            return
-        new_segment = self._m.create_segment([self._m.create_field([tok]) for tok in tokens])
-        if index is None:
-            self._m.append(new_segment)
-            return
-        if index < 1 or index > len(self._m):
-            raise ValueError(
-                f"index {index} out of range (1..{len(self._m)}); index 1 is after MSH"
-            )
-        self._m.insert(index, new_segment)
+        seg_count = len(_builtin_hl7.segment_ids(self._m))
+        if index is not None and (index < 1 or index > seg_count):
+            raise ValueError(f"index {index} out of range (1..{seg_count}); index 1 is after MSH")
+        _builtin_hl7.add_segment_line(self._m, segment_id, tokens, index)
 
     def delete_segments(self, segment_id: str) -> int:
         """Remove every segment with ``segment_id`` and return how many were removed.
@@ -454,16 +411,10 @@ class Message:
             raise ValueError("refusing to delete the MSH segment")
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         removed = 0
-        if self._builtin:
-            ids = _builtin_hl7.segment_ids(self._m)
-            for i in range(len(ids) - 1, -1, -1):  # back-to-front keeps indices valid
-                if ids[i] == segment_id:
-                    _builtin_hl7.delete_segment_at(self._m, i)
-                    removed += 1
-            return removed
-        for i in range(len(self._m) - 1, -1, -1):  # back-to-front keeps indices valid
-            if str(self._m[i][0]) == segment_id:
-                del self._m[i]
+        ids = _builtin_hl7.segment_ids(self._m)
+        for i in range(len(ids) - 1, -1, -1):  # back-to-front keeps indices valid
+            if ids[i] == segment_id:
+                _builtin_hl7.delete_segment_at(self._m, i)
                 removed += 1
         return removed
 
@@ -476,19 +427,12 @@ class Message:
         :meth:`delete_segments` can't target one order's segments. Deleting MSH (position 0) is
         refused so the header always survives. Raises ``ValueError`` on an out-of-range position."""
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
-        if self._builtin:
-            seg_count = len(_builtin_hl7.segment_ids(self._m))
-            if position < 1 or position >= seg_count:
-                raise ValueError(
-                    f"position {position} out of range (1..{seg_count - 1}); position 1 is after MSH"
-                )
-            _builtin_hl7.delete_segment_at(self._m, position)
-            return
-        if position < 1 or position >= len(self._m):
+        seg_count = len(_builtin_hl7.segment_ids(self._m))
+        if position < 1 or position >= seg_count:
             raise ValueError(
-                f"position {position} out of range (1..{len(self._m) - 1}); position 1 is after MSH"
+                f"position {position} out of range (1..{seg_count - 1}); position 1 is after MSH"
             )
-        del self._m[position]
+        _builtin_hl7.delete_segment_at(self._m, position)
 
     # --- group-scoped structural view ----------------------------------------
 
@@ -508,9 +452,7 @@ class Message:
 
     def encode(self) -> str:
         """Serialize back to a ``\\r``-delimited HL7 string."""
-        if self._builtin:
-            return _builtin_hl7.encode(self._m)
-        return str(self._m)
+        return _builtin_hl7.encode(self._m)
 
     def encode_raw_separators(self) -> str:
         """Serialize like :meth:`encode`, but emit the four reserved HL7 **structural** separators as RAW
@@ -523,25 +465,16 @@ class Message:
         no structural escapes the output is byte-identical to :meth:`encode`; when it does, the output is
         deliberately **non-conformant** (that is the point). See
         :func:`messagefoundry.parsing._builtin_hl7.encode_raw_separators`."""
-        if self._builtin:
-            return _builtin_hl7.encode_raw_separators(self._m)
-        # python-hl7 fallback backend (a rare parser-bug fallback): route through the single built-ins
-        # codec by re-parsing this message's own (clean, well-formed) re-encoded form — the built-ins
-        # parse is byte-parity with python-hl7, so the round-trip is faithful.
-        return _builtin_hl7.encode_raw_separators(_builtin_hl7.parse(normalize(str(self._m))))
+        return _builtin_hl7.encode_raw_separators(self._m)
 
     def copy(self) -> Message:
         """An independent, mutable **structural clone** of this message's current in-memory state
         (ADR 0104) — the primitive behind copy-on-Send and the explicit ``msg.copy()`` sugar.
 
         Deep-clones the backing parse tree and wraps it in a fresh :class:`Message`. Deliberately **not**
-        ``Message.parse(self.encode())``: (1) :meth:`parse` uses the default (built-ins) backend whenever
-        :func:`~messagefoundry.parsing._backend.use_builtin` is on, so a source parsed via the python-hl7
-        **fallback** would silently *switch backends* on clone; (2) an encode→parse round-trip would make
-        clone fidelity depend on that round-trip being byte-stable. ``copy.deepcopy`` clones whichever
-        container ``self._m`` is (the built-ins ``dict`` model or an ``hl7.Message``) faithfully, and
-        :meth:`__init__` re-derives ``self._builtin`` from the *clone*, so the clone keeps the source's own
-        backend with no branch here. Pure: no clock/RNG/I/O, and the ingress raw is never touched. Note it
+        ``Message.parse(self.encode())``: an encode→parse round-trip would make clone fidelity depend on
+        that round-trip being byte-stable, and would drop state such as a blank segment held in a tree
+        built without :meth:`parse`. Pure: no clock/RNG/I/O, and the ingress raw is never touched. Note it
         does **not** re-run the hl7apy strict tier — a clone of a strict-validated inbound is not
         re-validated (by design).
 
@@ -570,82 +503,31 @@ class Message:
     def _raw_field(self, seg: str, fld: int, occurrence: int = 1) -> str:
         """Raw field text (``""`` if the segment/field/occurrence is absent) — for component
         rebuilds. ``occurrence`` (1-based) picks which segment of that id."""
-        if self._builtin:
-            return _builtin_hl7.raw_field(self._m, seg, fld, occurrence)
-        segment = self._segment_obj(seg, occurrence)
-        if segment is None:
-            return ""
-        try:
-            return str(segment[fld])
-        except (KeyError, IndexError):
-            return ""
+        return _builtin_hl7.raw_field(self._m, seg, fld, occurrence)
 
     def _segment_present(self, segment_id: str, occurrence: int = 1) -> bool:
-        """Whether the ``occurrence``-th (1-based) segment with ``segment_id`` exists — backend-
-        agnostic presence check used by the write/repetition guards."""
-        if self._builtin:
-            seen = 0
-            for sid in _builtin_hl7.segment_ids(self._m):
-                if sid == segment_id:
-                    seen += 1
-                    if seen == occurrence:
-                        return True
-            return False
-        return self._segment_obj(segment_id, occurrence) is not None
-
-    def _segment_obj(self, segment_id: str, occurrence: int = 1) -> Any:
-        """The ``occurrence``-th (1-based) segment object with ``segment_id``, or None if absent.
-
-        python-hl7 backend only — the built-ins backend has no per-segment object (presence is
-        checked via :meth:`_segment_present`)."""
+        """Whether the ``occurrence``-th (1-based) segment with ``segment_id`` exists — the presence
+        check used by the write/repetition guards."""
         seen = 0
-        for segment in self._m:
-            if str(segment[0]) == segment_id:
+        for sid in _builtin_hl7.segment_ids(self._m):
+            if sid == segment_id:
                 seen += 1
                 if seen == occurrence:
-                    return segment
-        return None
+                    return True
+        return False
 
     def _assign_field(self, seg: str, fld: int, occurrence: int, raw_value: str) -> None:
         """Write the whole raw field text at ``seg``/``fld`` for the given segment ``occurrence``.
 
-        Occurrence 1 uses python-hl7's accessor, which auto-extends the field list; a later
-        occurrence is written on its segment object directly, padding empty fields up to ``fld``
-        first (a bare index assignment past the end raises). The string content (components,
-        repetitions) round-trips verbatim and re-parses into structure either way."""
+        The field is stored verbatim and the field list auto-extends, for any occurrence. The string
+        content (components, repetitions) re-parses into structure on the next read."""
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
-        if self._builtin:
-            # The built-ins backend stores the raw field verbatim and auto-extends the field list,
-            # for any occurrence, mirroring python-hl7's auto-extend on assignment.
-            _builtin_hl7.set_field(self._m, seg, fld, raw_value, occurrence)
-            return
-        if occurrence == 1:
-            self._m[f"{seg}.F{fld}"] = raw_value
-            return
-        segment = self._segment_obj(seg, occurrence)
-        if segment is None:  # pragma: no cover - callers check first
-            raise KeyError(f"cannot set absent segment {seg!r} occurrence {occurrence}")
-        while len(segment) <= fld:
-            segment.append(self._m.create_field([""]))
-        segment[fld] = self._m.create_field([raw_value])
+        _builtin_hl7.set_field(self._m, seg, fld, raw_value, occurrence)
 
-    def _extract(
-        self, rep_text: str, comp: int, sub: int | None, comp_sep: str, sub_sep: str
-    ) -> str | None:
+    def _extract(self, rep_text: str, comp: int, sub: int | None) -> str | None:
         """The component/subcomponent value within a single repetition's text, unescaped, or None
-        if that part is absent."""
-        if self._builtin:
-            # Built-ins ``extract_part`` is the same string-level split with byte-parity unescape,
-            # reading the message's own separators (in built-ins order: field, comp, rep, sub, esc).
-            return _builtin_hl7.extract_part(rep_text, comp, sub, _builtin_hl7.separators(self._m))
-        comps = rep_text.split(comp_sep)
-        if comp > len(comps):
-            return None
-        value = comps[comp - 1]
-        if sub is None:
-            return self._m.unescape(value) or None
-        subs = value.split(sub_sep)
-        return (self._m.unescape(subs[sub - 1]) or None) if sub <= len(subs) else None
+        if that part is absent. Reads the message's own separators."""
+        return _builtin_hl7.extract_part(rep_text, comp, sub, _builtin_hl7.separators(self._m))
 
     def _encoding_chars(self) -> tuple[str, str, str, str, str]:
         """The message's ``(field, component, repetition, escape, subcomponent)`` delimiters, read
@@ -653,8 +535,8 @@ class Message:
 
         Derived from the actual encoding characters, not hardcoded defaults — so a custom-delimiter
         message isn't split on the wrong characters. Raises ``ValueError`` if they can't be determined
-        rather than guess (XFORM-2/3). ``self._m.unescape`` uses the same MSH-2-derived characters, so
-        write-escaping and read-unescaping stay consistent."""
+        rather than guess (XFORM-2/3). The read-side unescape uses the same MSH-2-derived characters,
+        so write-escaping and read-unescaping stay consistent."""
         field_sep = self._raw_field("MSH", 1)  # MSH-1 is the field separator itself
         enc = self._raw_field("MSH", 2)  # e.g. "^~\&": component, repetition, escape, subcomponent
         if len(field_sep) != 1 or len(enc) < 4:
@@ -668,8 +550,8 @@ class Message:
         """Escape ONLY the structural delimiters (and the escape char) so a leaf value carries them
         as data, not new structure. Every other character — including code points above U+00FF
         (CJK/Cyrillic/Greek names) — passes through untouched and round-trips via ``unescape``;
-        python-hl7's own ``escape()`` instead hex-encodes those as byte pairs that ``unescape()``
-        then mis-decodes, silently corrupting them (review M-13)."""
+        python-hl7's ``escape()``, used before the built-in parser, hex-encoded those as byte pairs
+        that ``unescape()`` then mis-decoded, silently corrupting them (review M-13)."""
         out = value.replace(esc, f"{esc}E{esc}")  # the escape char first, so we don't double-escape
         out = out.replace(field_sep, f"{esc}F{esc}")
         out = out.replace(comp_sep, f"{esc}S{esc}")
@@ -685,10 +567,25 @@ def emit_raw_separators(payload: str) -> str:
     The deliberate per-outbound escape-hatch for a partner that cannot decode HL7 escapes. ``payload`` is
     parsed with its OWN separators (read from MSH-1/MSH-2, never assumed ``|^~\\&``) and re-joined via the
     parsed model — never by string-slicing the raw. A body with no structural escapes round-trips
-    **byte-identically** to a normal encode. Raises :class:`hl7.ParseException` if ``payload`` has no
-    leading ``MSH``/``BHS``/``FHS`` (not parseable HL7), so a caller can fail the delivery loud rather than
-    ship a corrupted frame."""
+    **byte-identically** to a normal encode. Raises :class:`~messagefoundry.parsing.peek.HL7PeekError`
+    if ``payload`` has no leading ``MSH``/``BHS``/``FHS`` (not parseable HL7), so a caller can fail the
+    delivery loud rather than ship a corrupted frame."""
     return Message.parse(payload).encode_raw_separators()
+
+
+def reencode_with_separators(payload: str, target: tuple[str, str, str, str, str]) -> str:
+    """Re-serialize an HL7 v2 ``payload`` with a different set of delimiters (an outbound's MSH
+    encoding-character override).
+
+    ``target`` is ``(field, component, repetition, subcomponent, escape)``. ``payload`` is parsed with
+    its OWN separators (read from MSH-1/MSH-2) and re-joined via the parsed model, never by
+    string-slicing the raw; see :func:`messagefoundry.parsing._builtin_hl7.encode_with_separators`.
+    The text is parsed as it is, so a blank segment line survives the rewrite.
+
+    Raises :class:`~messagefoundry.parsing._builtin_hl7.HL7ParseError` (a ``ValueError``) with no
+    leading ``MSH``/``BHS``/``FHS``, ``ValueError`` when the header's own separators repeat, and
+    ``IndexError`` on a header too short to read them."""
+    return _builtin_hl7.encode_with_separators(_builtin_hl7.parse(normalize(payload)), target)
 
 
 def snapshot_payload(payload: Message | RawMessage | str) -> Message | RawMessage | str:

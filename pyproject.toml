@@ -90,7 +90,6 @@ classifiers = [
 ]
 dependencies = [
     "hl7apy>=1.3",          # version-aware validation + profiles
-    "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing
     "pydantic>=2.6",        # channel config models / validation
     "aiosqlite>=0.20",      # async SQLite for the message store/queue
     "fastapi>=0.137.1",     # localhost engine API

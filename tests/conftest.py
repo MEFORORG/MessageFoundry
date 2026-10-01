@@ -244,10 +244,8 @@ def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
 #   - "tee.relay": fixed name in tee/relay.py — the relay behind the historically-flaky test_tee_relay.
 #   - "uvicorn": covers uvicorn / uvicorn.error / uvicorn.access (the server-side emits).
 # Deliberately excluded (evidence-backed, not oversight): starlette registers no dedicated app logger;
-# the harness monitor uses print()/Qt, not stdlib logging; python-hl7's loggers are getLogger(__file__)-
-# named (absolute paths, unreachable via getLogger("hl7")) and are a synchronous parse-path concern
-# already silenced to CRITICAL by logging_setup.silence_phi_prone_dependency_loggers — none is a
-# teardown-window background emitter.
+# the harness monitor uses print()/Qt, not stdlib logging — neither is a teardown-window background
+# emitter. (python-hl7's getLogger(__file__)-named loggers were listed here; the dependency is retired.)
 _QUIESCE_TARGETS: tuple[str, ...] = (
     "asyncio",
     "aiosqlite",

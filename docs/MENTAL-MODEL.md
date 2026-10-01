@@ -12,7 +12,7 @@ What sets it apart: **you can set it up visually** — guided wizards scaffold c
 
 > **The pitch in one line:** *The best of the legacy interface engines — their proven reliability, deep connector catalogs, and battle-tested handling of HL7 v2 plus JSON, X12, and other formats — with none of the lock-in: configuration you own and version-control (set up with guided wizards or in Python), a durable, broker-free queue (SQLite by default, or Postgres/SQL Server), and auth, RBAC, audit, and encryption-at-rest built in rather than bolted on.*
 
-**Stack:** python-hl7 (tolerant parsing) + hl7apy (strict validation), FastAPI/uvicorn (localhost engine API), SQLite/aiosqlite (message store; Postgres & SQL Server also supported), a browser web console (`/ui`, `messagefoundry_webconsole`) as the operator UI, and PySide6 (the standalone test harness). Python 3.14+, asyncio core.
+**Stack:** a built-in tolerant HL7 parser (ADR 0054) + hl7apy (strict validation), FastAPI/uvicorn (localhost engine API), SQLite/aiosqlite (message store; Postgres & SQL Server also supported), a browser web console (`/ui`, `messagefoundry_webconsole`) as the operator UI, and PySide6 (the standalone test harness). Python 3.14+, asyncio core.
 
 ## 2. The core model: a graph of four building blocks
 
@@ -213,7 +213,7 @@ ACK vs NAK timing: decode/parse/strict-validate failures **NAK synchronously** a
 
 ## 7. Parsing: two tiers, payload-agnostic
 
-- **Tolerant peek (hot path).** python-hl7 does fast, forgiving field peeks for routing/filtering. Real-world HL7 is frequently non-conformant, so the hot path tolerates it.
+- **Tolerant peek (hot path).** The built-in parser does fast, forgiving field peeks for routing/filtering. Real-world HL7 is frequently non-conformant, so the hot path tolerates it.
 
 - **Strict validation (opt-in, slow path).** hl7apy does version-aware validation, enabled per inbound (validation.strict). Don’t route everything through the hl7apy object model.
 
@@ -301,7 +301,7 @@ This engine carries PHI, so security is built, not bolted on:
 | config/ | Connector models (models.py) + code-first wiring (wiring.py) + service settings (settings.py). |
 | pipeline/ | engine.py (Engine), wiring_runner.py (RegistryRunner), dryrun.py. |
 | transports/ | Connector registry (base.py) + mllp.py, file.py, … — the pluggable connections. |
-| parsing/ | peek.py (python-hl7 hot path), tree.py, validate.py (hl7apy strict), x12/ codec. Pure library. |
+| parsing/ | peek.py + _builtin_hl7.py (tolerant hot path), tree.py, validate.py (hl7apy strict), x12/ codec. Pure library. |
 | store/ | Store protocol + open_store factory; SQLite WAL store; Postgres; SQL Server. |
 | auth/ | Authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, totp. |
 | api/ | FastAPI app + models + auth — the engine's only external surface (serves the `/ui` web console same-origin). |
@@ -476,7 +476,7 @@ The runtime core is around twenty packages; everything past it is an **opt-in ex
 
 | **Group** | **Packages** | **What for** |
 |----|----|----|
-| **Core runtime** | hl7apy, python-hl7, pydantic, aiosqlite, fastapi, starlette, uvicorn, httptools, websockets, uvloop (not on Windows), argon2-cffi, cryptography, ldap3, pyspnego, tomlkit, tzdata, psutil, httpx, truststore | HL7 validate/parse, config models, the SQLite store, the API (Starlette carries its own explicit floor), password hashing + AES-256-GCM PHI-at-rest, AD/Kerberos auth, TOML writing, tz data, host gauges for the Prometheus /metrics surface (the engine renders the exposition itself), and the shared HTTP client (apiclient, tray, harness monitor, ASGI test client) with OS-trust-store verification. Always installed. Hardened XML parsing is not a dependency: it is a vendored copy of defusedxml 0.7.1 in `messagefoundry/_vendor/defusedxml/`. |
+| **Core runtime** | hl7apy, pydantic, aiosqlite, fastapi, starlette, uvicorn, httptools, websockets, uvloop (not on Windows), argon2-cffi, cryptography, ldap3, pyspnego, tomlkit, tzdata, psutil, httpx, truststore | HL7 validate/parse, config models, the SQLite store, the API (Starlette carries its own explicit floor), password hashing + AES-256-GCM PHI-at-rest, AD/Kerberos auth, TOML writing, tz data, host gauges for the Prometheus /metrics surface (the engine renders the exposition itself), and the shared HTTP client (apiclient, tray, harness monitor, ASGI test client) with OS-trust-store verification. Always installed. Hardened XML parsing is not a dependency: it is a vendored copy of defusedxml 0.7.1 in `messagefoundry/_vendor/defusedxml/`. |
 | \[harness\] | PySide6 | The standalone PySide6 test harness GUI. (Was `[console]` before the desktop console was retired — BACKLOG #103; its HTTP client, httpx + truststore, moved to the core runtime.) |
 | \[postgres\] | asyncpg | PostgreSQL store backend (no OS dependency; ships compiled wheels). |
 | \[sqlserver\] | aioodbc *+ OS ODBC Driver 18* | SQL Server store backend (the ODBC driver installs at the OS level, not via pip). |

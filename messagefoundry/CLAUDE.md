@@ -4,8 +4,9 @@ Moved verbatim from the root `CLAUDE.md` §8. A nested `CLAUDE.md` loads when Cl
 under this directory, so these conventions reach engine work without costing context in the docs,
 scripts and coordination sessions that never touch `messagefoundry/`. Nothing changed in the move.
 
-- **Two-tier parsing, by design:** **python-hl7** does fast, tolerant field *peek* on the hot
-  path (routing/filtering); **hl7apy** does version-aware validation, **opt-in per inbound
+- **Two-tier parsing, by design:** the **built-in tolerant parser** (`parsing/_builtin_hl7.py`,
+  ADR 0054; it replaced python-hl7) does fast, tolerant field *peek* on the hot path
+  (routing/filtering); **hl7apy** does version-aware validation, **opt-in per inbound
   connection** (`validation.strict`) — it's the slow path, kept off routing. Don't route
   everything through the hl7apy object model.
 - **Ingress is payload-agnostic** ([ADR 0004](../docs/adr/0004-payload-agnostic-ingress.md)). An inbound's

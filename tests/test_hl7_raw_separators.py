@@ -13,7 +13,6 @@ _dest_config), and the connector applying it on a real loopback socket. SYNTHETI
 
 from __future__ import annotations
 
-import hl7
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
@@ -24,6 +23,7 @@ from messagefoundry.parsing._builtin_hl7 import (
     unescape_separators,
 )
 from messagefoundry.parsing.message import Message, emit_raw_separators
+from messagefoundry.parsing.peek import HL7PeekError
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource, build_ack
 
@@ -157,7 +157,7 @@ def test_message_encode_raw_separators_method() -> None:
 
 @pytest.mark.parametrize("garbage", ["not hl7 at all", "", "PID|1|2"])
 def test_emit_raw_separators_rejects_unparseable_payload(garbage: str) -> None:
-    with pytest.raises(hl7.HL7Exception):
+    with pytest.raises(HL7PeekError):
         emit_raw_separators(garbage)
 
 
@@ -276,8 +276,8 @@ async def test_send_with_flag_fails_loud_on_non_hl7() -> None:
 
 @pytest.mark.parametrize("truncated", ["MSH\rPID|1", "MSH|\rPID|1", "MSH"])
 async def test_send_with_flag_maps_a_truncated_header_to_a_delivery_error(truncated: str) -> None:
-    # BACKLOG #1601's sibling: these headers raise AssertionError or IndexError inside python-hl7
-    # or the built-in parser, which the send() catch used to miss. The port is closed, so a
+    # BACKLOG #1601's sibling: these headers raised AssertionError or IndexError inside the parsers,
+    # which the send() catch used to miss. The built-in parser now refuses them as HL7ParseError. The port is closed, so a
     # DeliveryError naming the emit proves the failure came before any I/O.
     dest = MLLPDestination(
         Destination(
