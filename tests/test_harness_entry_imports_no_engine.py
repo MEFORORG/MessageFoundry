@@ -34,6 +34,11 @@ _PROBE = textwrap.dedent(
     import importlib.abc
     import sys
 
+    # -I ignores PYTHONUTF8/PYTHONIOENCODING, so a Windows pipe is cp1252 and a path it cannot
+    # encode would fail the print below for a reason unrelated to the probe. The parent decodes UTF-8.
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
     root, target = sys.argv[1], sys.argv[2]
     ALLOWED = set(sys.stdlib_module_names) | {"harness"}
     # Whatever site and .pth files loaded at startup (an editable-install finder, say) is not the
@@ -78,8 +83,10 @@ def _probe(target: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-I", "-c", _PROBE, str(_ROOT), target],
         capture_output=True,
-        text=True,
-        timeout=60,
+        encoding="utf-8",
+        errors="replace",
+        # Below the CI legs' 60s per-test timeout, so this error, not pytest-timeout's, reports a hang.
+        timeout=45,
         check=False,
     )
 
