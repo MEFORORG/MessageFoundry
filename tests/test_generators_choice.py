@@ -33,15 +33,21 @@ def _spec(*buildable: str) -> _core.MessageSpec:
 
 
 # The generator writes v2.5.1 only (MSH-12), so that is the version strict validation checks.
-# A few seeds, because the optional PD1/PV2 around the order vary with the seed.
-@pytest.mark.parametrize("index", range(1, 6))
-def test_generated_orm_o01_has_one_order_detail_and_is_strictly_valid(index: int) -> None:
-    msg = _core.generate_message("ORM", "O01", index)
+# A few indices under two seeds, because the optional PD1/PV2 around the order vary with both.
+@pytest.mark.parametrize("seed", [_core.DEFAULT_SEED, "another-seed"])
+@pytest.mark.parametrize("index", range(1, 4))
+def test_generated_orm_o01_has_one_order_detail_and_is_strictly_valid(
+    index: int, seed: str
+) -> None:
+    msg = _core.generate_message("ORM", "O01", index, seed=seed)
     peek = Peek.parse(msg)
     assert peek.version == "2.5.1"
     names = peek.segments()
     assert names[-2:] == ["ORC", "OBR"], names
     assert [n for n in names if n in _ORDER_ALTERNATIVES] == ["OBR"], names
+    # HL7 says OBR-2 and OBR-3 are identical to the order's ORC-2 and ORC-3.
+    assert peek.field("OBR-2") == peek.field("ORC-2")
+    assert peek.field("OBR-3") == peek.field("ORC-3")
     ok, errors = _core.gate("ORM", msg, "ORM_O01")
     assert ok, errors
 

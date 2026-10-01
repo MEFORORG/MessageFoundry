@@ -116,6 +116,8 @@ def _choice_fix_needed() -> bool:
     release that accepts the valid probe only by no longer checking choice groups at all, and
     for one that merges PR 152 as written and so rejects the labelled-choice probe.
     ``tests/test_validate_choice_groups.py`` goes red on a fixed release, so the shim gets deleted.
+    Keep :func:`is_choice_group` and ``_SEQUENCES_LABELLED_CHOICE`` when it is: the generator
+    uses them.
     """
     from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import HL7apyException
@@ -150,7 +152,13 @@ def _choice_fix_needed() -> bool:
 _rewrite_failures: set[tuple[str, str | None]] = set()
 
 
-def _is_choice(name: str, ref: _Reference) -> bool:
+def is_choice_group(name: str, ref: _Reference) -> bool:
+    """True if hl7apy table entry ``ref`` for group ``name`` is a real "exactly one of" choice.
+
+    The synthetic-message generator uses this too, so it emits one alternative where strict
+    validation wants one. This predicate and ``_SEQUENCES_LABELLED_CHOICE`` describe hl7apy's
+    tables, not issue 151, so they outlive the shim: deleting the shim must keep them.
+    """
     return ref[0] == "choice" and name not in _SEQUENCES_LABELLED_CHOICE
 
 
@@ -164,7 +172,7 @@ def _as_sequence(ref: _Reference, *, choice: bool = False) -> _Reference:
     children = []
     for name, sub, (low, high), marker in ref[1]:
         if marker == "GRP":
-            sub = _as_sequence(sub, choice=_is_choice(name, sub))
+            sub = _as_sequence(sub, choice=is_choice_group(name, sub))
         children.append([name, sub, (0, high) if choice else (low, high), marker])
     return ("sequence", tuple(children), *ref[2:])
 
@@ -214,7 +222,7 @@ def _first_choice_error(element: Any, ref: _Reference) -> str | None:
         if marker != "GRP":
             continue
         for group in _occurrences(element, name):
-            error = _choice_error(group, sub) if _is_choice(name, sub) else None
+            error = _choice_error(group, sub) if is_choice_group(name, sub) else None
             if error is None:
                 error = _first_choice_error(group, sub)
             if error is not None:

@@ -27,7 +27,7 @@ from messagefoundry.generators import _hl7data as d
 from messagefoundry.parsing import validate
 
 # The strict validator's own choice test, so generation and validation agree on what a choice is.
-from messagefoundry.parsing.validate import _is_choice
+from messagefoundry.parsing.validate import is_choice_group
 
 _MESSAGES = _ref.MESSAGES
 _SEGMENTS = _ref.SEGMENTS
@@ -77,6 +77,8 @@ class Ctx:
     receiving_fac: str
     current: Patient | None = None
     seq: dict[str, int] = field(default_factory=dict)
+    # The current ORC's placer and filler order numbers (ORC-2, ORC-3), which its OBR repeats.
+    order_numbers: tuple[str, str] | None = None
 
 
 def next_seq(ctx: Ctx, name: str) -> int:
@@ -258,12 +260,16 @@ def _build_obx(rng: random.Random, ctx: Ctx) -> str:
 
 
 def _build_orc(rng: random.Random, ctx: Ctx) -> str:
+    control = rng.choice(d.ORDER_CONTROLS)
+    placer = d.ei(str(rng.randint(100_000, 999_999)))  # placer order number
+    filler = d.ei(str(rng.randint(100_000, 999_999)), "FILLER")
+    ctx.order_numbers = (placer, filler)
     return seg(
         "ORC",
         {
-            1: rng.choice(d.ORDER_CONTROLS),
-            2: d.ei(str(rng.randint(100_000, 999_999))),  # placer order number
-            3: d.ei(str(rng.randint(100_000, 999_999)), "FILLER"),
+            1: control,
+            2: placer,
+            3: filler,
             5: rng.choice(d.ORDER_STATUSES),
             9: d.ts(ctx.msg_dt),
             12: d.xcn(*rng.choice(d.CLINICIANS)),
@@ -273,12 +279,20 @@ def _build_orc(rng: random.Random, ctx: Ctx) -> str:
 
 def _build_obr(rng: random.Random, ctx: Ctx) -> str:
     code, text = rng.choice(d.SERVICES)
+    # Drawn even when an ORC supplies them, so every later value keeps its place in the stream.
+    placer = d.ei(str(rng.randint(100_000, 999_999)))
+    filler = d.ei(str(rng.randint(100_000, 999_999)), "FILLER")
+    if ctx.order_numbers is not None:
+        # OBR-2/OBR-3 repeat the order's ORC-2/ORC-3. Consumed, so an OBR in a later order
+        # without its own ORC does not borrow this one's numbers.
+        placer, filler = ctx.order_numbers
+        ctx.order_numbers = None
     return seg(
         "OBR",
         {
             1: str(next_seq(ctx, "OBR")),
-            2: d.ei(str(rng.randint(100_000, 999_999))),
-            3: d.ei(str(rng.randint(100_000, 999_999)), "FILLER"),
+            2: placer,
+            3: filler,
             4: d.cwe(code, text, "LN"),  # universal service id (required)
             7: d.ts(ctx.msg_dt),
         },
@@ -444,10 +458,12 @@ def _pick_alternative(group: str, alternatives: Any, rng: random.Random, spec: M
     """The one alternative of choice group ``group`` to emit.
 
     ``spec.preferred_alternative`` (OBR by default) when the group offers it and it can be built,
-    without drawing from ``rng``. Otherwise a seeded pick among the alternatives that can be
-    built, so a seed still reproduces its bytes.
+    without drawing from ``rng``. Otherwise a seeded pick among the segment alternatives that
+    can be built, so a seed reproduces its bytes for a given set of builders; adding a builder
+    can change that pick. No shipped hl7apy choice group has a group as an alternative, so only
+    segments are candidates.
     """
-    usable = [alt for alt in alternatives if alt[3] == "GRP" or _builder_for(spec, alt[0])]
+    usable = [alt for alt in alternatives if alt[3] == "SEG" and _builder_for(spec, alt[0])]
     if not usable:
         raise RuntimeError(f"no builder for any alternative of choice group {group}")
     preferred = next((alt for alt in usable if alt[0] == spec.preferred_alternative), None)
@@ -487,7 +503,7 @@ def _emit(
                     out.append(builder(rng, ctx))
         elif min_card >= 1 or any(name.endswith(s) for s in spec.group_suffixes):
             group_children = child_ref[1]
-            if _is_choice(name, child_ref):
+            if is_choice_group(name, child_ref):
                 group_children = [_pick_alternative(name, group_children, rng, spec)]
             _emit(group_children, rng, ctx, spec, force, out)
 
