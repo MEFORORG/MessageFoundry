@@ -2471,8 +2471,8 @@ function Get-RootCommonDirCmp($Root) {
 #     checkout, <its parent>/<its leaf>-<Name>; from the primary that is <repo-parent>/<repo-name>-<Name>.
 #     spawn.ps1 calls it for that sibling form only. With -Nested it makes
 #     <main worktree>/.claude/worktrees/<Name>, whichever checkout's copy runs. Either way it copies the
-#     leak-gate token list, builds the .venv and holds the add lock. remove.ps1 tears down either one,
-#     with -Nested for the second.
+#     leak-gate token list, builds the .venv and holds the add lock. remove.ps1 tears down only
+#     the sibling; a nested tree has NO scripted teardown (see new.ps1's Show-NextSteps for why).
 #   * The Claude Code harness makes a NESTED one at <main worktree>/.claude/worktrees/<slug> --
 #     `claude --worktree`, and a subagent's `isolation: worktree`. MEASURED 2026-09-30 for the second:
 #     a subagent whose parent session sat in a nested tree still got its own tree under the MAIN

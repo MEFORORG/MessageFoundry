@@ -63,18 +63,14 @@ def _advice_commands() -> list[str]:
     ]
 
 
-def _render(
-    cmd: str, *, repo_root: Path, worktree: Path, name: str, nested: bool = False
-) -> list[str]:
+def _render(cmd: str, *, repo_root: Path, worktree: Path, name: str) -> list[str]:
     """Turn one printed advice line into an argv, exactly as a reader copying it would.
 
-    Longest token first so no substitution eats a prefix of another. ``$nestedFlag`` is what new.ps1
-    sets for a ``-Nested`` tree (BACKLOG #1038).
+    Longest token first so no substitution eats a prefix of another.
     """
     text = cmd.replace('`"', '"')
     for token, value in (
         ("$WorktreePath", str(worktree)),
-        ("$nestedFlag", " -Nested" if nested else ""),
         ("$RepoRoot", str(repo_root)),
         ("$Name", name),
     ):
@@ -235,17 +231,14 @@ def test_the_advice_that_used_to_be_printed_still_throws_today(fx: Fixture) -> N
 
 
 # --- BACKLOG #1038: a -Nested tree, made by new.ps1 itself, then torn down by its own advice -------
+#
+# A nested tree has no scripted teardown (remove.ps1's -Nested route was withdrawn), so the advice is
+# one plain `git worktree remove` line plus a sentence saying what git does and does not check.
 
 
 def _run_new_nested(fx: Fixture, name: str) -> subprocess.CompletedProcess[str]:
     """Drive a COPY of new.ps1 living in the fixture, so it anchors there and never on this checkout."""
-    # remove.ps1 -Nested dot-sources the occupancy fence, which dot-sources the session registry.
-    for rel in (
-        "scripts/worktree/new.ps1",
-        "scripts/coord/lock.ps1",
-        "scripts/coord/occupancy.ps1",
-        "scripts/coord/session-registry.ps1",
-    ):
+    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
         dst = fx.primary / rel
         if not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -264,42 +257,25 @@ def _printed_advice(stdout: str) -> list[str]:
 def test_new_ps1_NESTED_lands_under_dot_claude_worktrees_and_its_own_advice_removes_it(
     fx: Fixture,
 ) -> None:
-    """Red before the fix: new.ps1 had no -Nested. Every printed cleanup line is run once, each
-    against a fresh tree, and each must leave nothing behind."""
-    first = _run_new_nested(fx, "probe")
-    assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
-    advice = _printed_advice(first.stdout)
-    assert len(advice) == 2, f"expected two printed cleanup commands, got {advice}"
+    """Red before the fix: new.ps1 had no -Nested. The printed line is run as printed."""
+    made = _run_new_nested(fx, "probe")
+    assert made.returncode == 0, f"{made.stdout}\n{made.stderr}"
+    advice = _printed_advice(made.stdout)
+    assert len(advice) == 1, f"expected one printed cleanup command, got {advice}"
+    assert "remove.ps1" not in made.stdout, "a nested tree has no scripted teardown to name"
+    assert "--force" not in advice[0]
+    assert "nothing checks whether a session is still in it" in made.stdout
 
-    for i, line in enumerate(advice):
-        name = "probe" if i == 0 else f"probe{i}"
-        if i > 0:
-            made = _run_new_nested(fx, name)
-            assert made.returncode == 0, f"{made.stdout}\n{made.stderr}"
-            line = _printed_advice(made.stdout)[i]
-        wt = fx.primary / ".claude" / "worktrees" / name
-        assert wt.is_dir()
-        assert str(wt).replace("\\", "/") in _registered(fx.primary)
-        assert not (fx.primary.parent / f"repo-{name}").exists(), "it made a SIBLING instead"
-        (wt / ".venv").mkdir(exist_ok=True)
+    wt = fx.primary / ".claude" / "worktrees" / "probe"
+    assert wt.is_dir()
+    assert str(wt).replace("\\", "/") in _registered(fx.primary)
+    assert not (fx.primary.parent / "repo-probe").exists(), "it made a SIBLING instead"
 
-        argv = [t.strip('"') for t in shlex.split(line, posix=False)]
-        # The printed remove.ps1 -Nested line reads the session registry under USERPROFILE. Point it
-        # at an empty fixture registry, never the developer's real one.
-        home = fx.root / "home"
-        (home / ".claude" / "sessions").mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-            env={**os.environ, "USERPROFILE": str(home)},
-        )
+    proc = _run([t.strip('"') for t in shlex.split(advice[0], posix=False)])
 
-        assert proc.returncode == 0, f"advice failed: {line}\n{proc.stdout}\n{proc.stderr}"
-        assert not wt.exists(), f"advice ran but left the worktree behind: {line}"
-        assert str(wt).replace("\\", "/") not in _registered(fx.primary)
+    assert proc.returncode == 0, f"advice failed: {advice[0]}\n{proc.stdout}\n{proc.stderr}"
+    assert not wt.exists(), f"advice ran but left the worktree behind: {advice[0]}"
+    assert str(wt).replace("\\", "/") not in _registered(fx.primary)
 
 
 def test_new_ps1_NESTED_from_a_LINKED_checkouts_copy_still_lands_under_the_main_worktree(

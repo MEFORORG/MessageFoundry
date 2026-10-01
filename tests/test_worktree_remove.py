@@ -38,9 +38,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
-import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -131,7 +128,6 @@ def run(
     *args: str,
     script: Path | None = None,
     repo_root: Path | str | None = None,
-    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the real script. ``repo_root`` defaults to the fixture primary and is NEVER omitted
     unless a test is deliberately exercising the ``$PSScriptRoot`` default against a copied script.
@@ -140,14 +136,7 @@ def run(
     root = fx.primary if repo_root is None else repo_root
     if root != "":
         argv += ["-RepoRoot", str(root)]
-    return subprocess.run(
-        [*argv, *args],
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-        cwd=str(cwd) if cwd else None,
-    )
+    return subprocess.run([*argv, *args], capture_output=True, text=True, timeout=180, check=False)
 
 
 def test_removes_a_clean_worktree(fx: Fixture) -> None:
@@ -313,224 +302,47 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     assert not fx.is_registered(wt)
 
 
-# --- BACKLOG #1038: -Nested reaches <repo>/.claude/worktrees/<Name> ------------------------------
+# --- BACKLOG #1038: what the removal must not lose ------------------------------------------------
 #
-# `new.ps1 -Nested` makes a tree under the main worktree's own .claude/worktrees, which the sibling
-# lookup can never find. These rows pin the teardown for it, its four extra refusals, and that the
-# default lookup is unchanged. Every -Nested run reads a FIXTURE session registry (-ConfigRoot), never
-# the developer's real one.
+# A `remove.ps1 -Nested` route existed for one round and was withdrawn: its occupancy fence could not
+# see an `isolation: worktree` subagent. These two guards stayed, because they hold on the one route
+# this script has.
 
 
-def _cfg(fx: Fixture) -> Path:
-    cfg = fx.root / "cfg"
-    (cfg / "sessions").mkdir(parents=True, exist_ok=True)
-    return cfg
-
-
-def _run_nested(
-    fx: Fixture, *args: str, cwd: Path | None = None
-) -> subprocess.CompletedProcess[str]:
-    return run(fx, *args, "-Nested", "-ConfigRoot", str(_cfg(fx)), cwd=cwd)
-
-
-def _add_nested(fx: Fixture, name: str) -> Path:
-    """A registered nested tree with an IGNORED .venv, as the real repository's .gitignore makes it."""
-    exclude = Path(_git(fx.primary, "rev-parse", "--git-path", "info/exclude").strip())
-    if not exclude.is_absolute():
-        exclude = fx.primary / exclude
-    exclude.parent.mkdir(parents=True, exist_ok=True)
-    if ".venv/" not in (exclude.read_text(encoding="utf-8") if exclude.exists() else ""):
-        with exclude.open("a", encoding="utf-8") as f:
-            f.write("\n.venv/\n")
-    path = fx.primary / ".claude" / "worktrees" / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _git(fx.primary, "worktree", "add", "-q", "-b", name, str(path))
-    (path / ".venv").mkdir()
-    (path / ".venv" / "marker.txt").write_text("ignored", encoding="utf-8")
-    return path
-
-
-@pytest.fixture
-def sleeper() -> Iterator[int]:
-    """A pid the occupancy fence reads as LIVE: spawned per test, so its start time and the record's
-    startedAt sit within a second of each other (the same reasoning as prune-merged's tests)."""
-    proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(900)"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        yield proc.pid
-    finally:
-        proc.kill()
-        proc.wait(timeout=30)
-
-
-def _write_session(fx: Fixture, pid: int, cwd: Path) -> None:
-    rec = {
-        "pid": pid,
-        "sessionId": f"s{pid}-0000",
-        "cwd": str(cwd),
-        "startedAt": int(time.time() * 1000),
-        "kind": "interactive",
-        "entrypoint": "claude-desktop",
-    }
-    (_cfg(fx) / "sessions" / f"{pid}.json").write_text(json.dumps(rec), encoding="utf-8")
-
-
-def test_nested_removes_a_tree_under_dot_claude_worktrees(fx: Fixture) -> None:
-    """Red before the fix: remove.ps1 had no -Nested parameter."""
-    wt = _add_nested(fx, "nest")
-    assert fx.is_registered(wt)
-
-    proc = _run_nested(fx, "-Name", "nest")
-
-    assert proc.returncode == 0, proc.stderr
-    assert not wt.exists()
-    assert not fx.is_registered(wt)
-    assert fx.branch_exists("nest")
-
-
-def test_without_nested_the_nested_tree_is_not_found_and_survives(fx: Fixture) -> None:
-    """The default lookup is unchanged: it names the SIBLING it looked for and touches nothing."""
-    wt = _add_nested(fx, "kept")
-
-    proc = run(fx, "-Name", "kept")
-
-    assert proc.returncode != 0
-    assert str(fx.sibling("kept")) in proc.stderr
-    assert wt.exists() and fx.is_registered(wt)
-
-
-def test_nested_refuses_a_missing_tree_and_names_the_nested_path(fx: Fixture) -> None:
-    """A sibling of the same name is not a fallback: -Nested looks only under .claude/worktrees."""
-    sibling = fx.add("same")
-
-    proc = _run_nested(fx, "-Name", "same")
-
-    assert proc.returncode != 0
-    assert "No such worktree" in proc.stderr
-    assert str(fx.primary / ".claude" / "worktrees" / "same") in proc.stderr
-    assert sibling.exists() and fx.is_registered(sibling)
-
-
-def test_nested_refuses_an_untracked_file_unless_forced(fx: Fixture) -> None:
-    """A Builder's new file not yet added is the work `worktree remove --force` would destroy."""
-    wt = _add_nested(fx, "draft")
-    (wt / "new_test.py").write_text("x = 1\n", encoding="utf-8")
-
-    refused = _run_nested(fx, "-Name", "draft")
-    assert refused.returncode != 0
-    assert "untracked" in refused.stderr
-    assert wt.exists() and fx.is_registered(wt)
-
-    forced = _run_nested(fx, "-Name", "draft", "-Force")
-    assert forced.returncode == 0, forced.stderr
-    assert not wt.exists()
-
-
-def test_nested_refuses_when_git_cannot_list_untracked_files(fx: Fixture) -> None:
-    """Red before round three: a failing `ls-files` printed nothing, which read as "no untracked
-    files". A corrupt index makes it exit 128."""
-    wt = _add_nested(fx, "broken")
-    (wt / "new_test.py").write_text("x = 1\n", encoding="utf-8")
-    index = Path(_git(wt, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
-    index.write_bytes(b"not an index")
-
-    proc = _run_nested(fx, "-Name", "broken")
-
-    assert proc.returncode != 0
-    assert "git ls-files failed" in proc.stderr
-    assert wt.exists()
-
-
-def test_nested_refuses_a_directory_git_does_not_register(fx: Fixture) -> None:
-    """Inside the main worktree, every `git -C` on a leftover directory answers for the MAIN one."""
-    ghost = fx.primary / ".claude" / "worktrees" / "ghost"
-    ghost.mkdir(parents=True)
-
-    proc = _run_nested(fx, "-Name", "ghost", "-Force")
-
-    assert proc.returncode != 0
-    assert "Not a registered worktree" in proc.stderr
-    assert ghost.exists()
-
-
-@pytest.mark.parametrize("name", [".", "..", "..."])
-def test_nested_refuses_a_name_that_is_only_dots(fx: Fixture, name: str) -> None:
-    """Under -Nested the name is a whole path component, so `..` would name the .claude directory."""
-    proc = _run_nested(fx, "-Name", name, "-Force")
-    assert proc.returncode != 0
-    assert "only dots" in proc.stderr
-
-
-def test_nested_refuses_a_tree_a_LIVE_session_is_recorded_in(fx: Fixture, sleeper: int) -> None:
-    """Red before round three: -Nested consulted no occupancy, so a live session's tree was removed
-    from under it and its git fell through to the shared primary."""
-    wt = _add_nested(fx, "busy")
-    _write_session(fx, sleeper, wt)
-
-    proc = _run_nested(fx, "-Name", "busy", "-Force")
-
-    assert proc.returncode != 0
-    assert "occupied" in proc.stderr
-    assert wt.exists() and fx.is_registered(wt)
-
-
-def test_nested_refuses_when_the_session_registry_cannot_be_read(fx: Fixture) -> None:
-    """Unreadable refuses rather than clears: a record that will not parse could be the occupant."""
-    wt = _add_nested(fx, "unsure")
-    (_cfg(fx) / "sessions" / "12345.json").write_text("{not json", encoding="utf-8")
-
-    proc = _run_nested(fx, "-Name", "unsure", "-Force")
-
-    assert proc.returncode != 0
-    assert "Occupancy unknown" in proc.stderr
-    assert wt.exists()
-
-
-def test_nested_refuses_when_the_caller_stands_inside_the_target(fx: Fixture) -> None:
-    wt = _add_nested(fx, "here")
-
-    proc = _run_nested(fx, "-Name", "here", "-Force", cwd=wt)
-
-    assert proc.returncode != 0
-    assert "standing inside" in proc.stderr
-    assert wt.exists() and fx.is_registered(wt)
-
-
-@pytest.mark.parametrize("nested", [False, True], ids=["sibling", "nested"])
 def test_a_detached_HEAD_holding_commits_no_ref_holds_is_refused_even_with_force(
-    fx: Fixture, nested: bool
+    fx: Fixture,
 ) -> None:
-    """Red before round three, in both layouts: removal deletes the HEAD reflog with the worktree, so
-    those commits would be reachable from nothing. -Force does not override it."""
-    if nested:
-        wt = fx.primary / ".claude" / "worktrees" / "loose"
-        wt.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        wt = fx.sibling("loose")
+    """Red before the fix: removal deletes the HEAD reflog with the worktree, so those commits would be
+    reachable from nothing. -Force means "discard changes" and does not override it."""
+    wt = fx.sibling("loose")
     _git(fx.primary, "worktree", "add", "-q", "--detach", str(wt))
     tip = _commit(wt, "loose.txt", "only here")
 
-    proc = (
-        _run_nested(fx, "-Name", "loose", "-Force")
-        if nested
-        else run(fx, "-Name", "loose", "-Force")
-    )
+    proc = run(fx, "-Name", "loose", "-Force")
 
     assert proc.returncode != 0
     assert "held by no ref" in proc.stderr
     assert wt.exists() and fx.is_registered(wt)
     # Control: once a branch holds the commit, the same removal goes through.
     _git(fx.primary, "branch", "keep-loose", tip)
-    again = (
-        _run_nested(fx, "-Name", "loose", "-Force")
-        if nested
-        else run(fx, "-Name", "loose", "-Force")
-    )
+    again = run(fx, "-Name", "loose", "-Force")
     assert again.returncode == 0, again.stderr
     assert not wt.exists()
+
+
+def test_a_git_status_that_FAILS_refuses_instead_of_reading_as_clean(fx: Fixture) -> None:
+    """Red before the fix: a corrupt index makes `git status` exit 128 and print nothing, which the
+    guard read as "no tracked changes", and the edit below was then force-removed without -Force."""
+    wt = fx.add("broken")
+    (wt / "seed.txt").write_text("an edit nobody committed\n", encoding="utf-8")
+    index = Path(_git(wt, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    index.write_bytes(b"not an index")
+
+    proc = run(fx, "-Name", "broken")
+
+    assert proc.returncode != 0
+    assert "git status failed" in proc.stderr
+    assert (wt / "seed.txt").read_text(encoding="utf-8") == "an edit nobody committed\n"
 
 
 # --- BACKLOG #1295: claims held by a removed worktree --------------------------

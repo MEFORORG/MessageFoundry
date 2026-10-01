@@ -7,7 +7,7 @@ sentence after it: a caller who is told "no" is handed a command to run instead,
 that most often reaches this rule that command *throws*.
 
 * ``remove.ps1 -Name <dir>`` resolves to ``<repo-parent>/<repo-leaf>-<Name>`` and refuses anything else.
-  (``-Nested`` was added later, BACKLOG #1038; rule 3d does not print it. Which mechanism makes which
+  (It has no nested route: one was added and withdrawn under BACKLOG #1038. Which mechanism makes which
   layout is stated once, in the gate's "WHICH MECHANISM MADE THIS WORKTREE" block.)
 * ``prune-merged.ps1`` excludes anything with a ``.claude/worktrees/`` path segment OUTRIGHT -- its own
   header says so, and ``-Name`` cannot reach them either. That exclusion is deliberate: those are the

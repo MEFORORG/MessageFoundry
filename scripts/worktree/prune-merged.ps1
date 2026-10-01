@@ -13,8 +13,8 @@
     the absence of a veto, not a permission. When the fence cannot look at all, nothing is pruned.
 
     Enumerates the <repo>-<name> sibling worktrees and removes each one that is ALL of the following.
-    It never touches a tree under .claude/worktrees, including one `new.ps1 -Nested` made -- remove.ps1
-    -Nested is that tree's teardown. Which mechanism makes which layout is stated once, in the
+    It never touches a tree under .claude/worktrees, including one `new.ps1 -Nested` made; no script
+    tears that tree down. Which mechanism makes which layout is stated once, in the
     "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1 (BACKLOG #1038).
 
       (a) merged     -- no commits beyond origin/main, OR a merged PR whose head is this exact tip, OR
