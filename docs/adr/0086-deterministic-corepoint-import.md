@@ -241,12 +241,15 @@ validated against an export, so this rule was written from the HL7 shapes alone.
 - The input handle is never rebound. A whole-tree write into it makes it unknown from that point.
 - Only a plain clone is read as one: two operands, a whole-tree destination, no qualifier, and no
   word but `to`, styled or not. A mode word, a `from` that reverses the direction, or a third
-  operand makes it an unread statement.
+  operand makes it an unread statement. Field writes are judged on the same words, so a mode word
+  styled as a keyword declines a write just as an unstyled one does.
 - Every other statement may overwrite every handle it names as a whole tree, in either reading of
   its markup. That covers an unread verb (`MsgLoad`, among others), a `MsgCreate` whose handle is
-  not its first operand, an `ActionListCall` whose list is not inlined and that passes a handle, and
-  a span class the role layer does not list. Each such handle is unknown afterwards. A call whose
-  list is inlined is read statement by statement instead. Only `MsgSend` and `MsgLog` are read-only.
+  not its first operand, an `ActionListCall` that passes a handle, and a span class the role layer
+  does not list. Each such handle is unknown afterwards. That holds for a call whose list is inlined
+  too, because the inlined list names the passed message by its own handle, which nothing ties to
+  the caller's: it can rebuild the message unseen. So a list that hands its input to a sub-list and
+  then sends it raises at that send. Only `MsgSend` and `MsgLog` are read-only.
   The list is kept small on purpose: a missing verb costs a raise, while a wrongly listed one would
   deliver the wrong message.
 - A statement in an unmodelled element, or in a branch its construct cannot continue, still counts

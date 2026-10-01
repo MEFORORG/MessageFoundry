@@ -185,7 +185,6 @@ class _Deferred:
 
     verb: str
     operands: tuple[Operand, ...]
-    connectives: tuple[str, ...] = ()
     qualified: bool = False
     in_control: bool = False
     flat: Action | UnmappedAction | None = None
@@ -193,7 +192,7 @@ class _Deferred:
     # class the role layer does not list cannot hide a handle from the fail-closed write rule.
     named: frozenset[str] = frozenset()
     # Every word of the statement that is neither an operand nor the verb, styled or not (see
-    # :func:`_statement_words`). The clone and ``MsgCreate`` shapes are judged on these.
+    # :func:`_statement_words`). Field writes, clones and ``MsgCreate`` are all judged on these.
     words: tuple[str, ...] = ()
 
 
@@ -1478,9 +1477,9 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
     flat_verb, operands = _split_verb(statement)
     # Unspanned runs and ``detail`` spans are NOT inert decoration: measured against the export they
     # carry comparison operators (``=``/``<>``/``contains``) and mode flags ("replace all", "interpret
-    # escapes"). A mapping may only fire when the statement's connectives fall inside that verb's known
-    # set and it carries no qualifier — otherwise the emitted call would silently lose an operator.
-    connectives = tuple(t.text for t in roles if t.role == "text" and t.text)
+    # escapes"). A mapping may only fire when the statement's words (see :func:`_statement_words`,
+    # unspanned or styled as a keyword) fall inside that verb's known set and it carries no qualifier —
+    # otherwise the emitted call would silently lose an operator.
     qualified = any(t.role == "detail" for t in roles)
     verb = _statement_verb(roles, flat_verb)
     role_operands = _operands_from_roles(roles) if roles else ()
@@ -1543,9 +1542,8 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
                 deferred=_Deferred(
                     verb,
                     role_operands,
-                    connectives,
-                    qualified,
-                    in_control,
+                    qualified=qualified,
+                    in_control=in_control,
                     named=named,
                     words=words,
                 ),
@@ -1737,7 +1735,8 @@ def _whole_written(deferred: _Deferred) -> frozenset[str]:
 # splitting an underscore would guess which of the two the export meant.
 _MESSAGE_TYPE = re.compile(r"^([A-Z0-9]{3})\^([A-Z0-9]{3})(?:\^([A-Z0-9_]{3,7}))?$")
 _HL7_VERSION = re.compile(r"^2\.[1-9](?:\.[1-9])?$")
-# The only unstyled words a ``MsgCreate`` may carry. Anything else (``merging input``) may change what
+# The only words a ``MsgCreate`` may carry besides its verb and operands, styled as a keyword or not
+# (see :func:`_statement_words`). Anything else (``merging input``) may change what
 # is built, and the skeleton would silently drop it.
 _MSGCREATE_CONNECTIVES = frozenset({"as", "version"})
 
@@ -1951,10 +1950,11 @@ class _Flow:
         if kind == "send":
             return self._send(step, env)
         if kind in ("block", "call"):
-            # A label, or an inlined call: its body runs in line, and the walk reads what it does. A
-            # call whose list is NOT inlined may rebuild a handle it passes, unseen, so what that call
-            # line names is unknown from here on.
-            if step.deferred is not None and not step.body:
+            # A label, or an inlined call: its body runs in line. A call may hand a handle to a list
+            # that rebuilds it, and an inlined list names the message by ITS OWN handle, which nothing
+            # here ties to the caller's. So what the call line names is unknown from here on, whether
+            # or not the list is inlined. Fail closed: a later send of it raises.
+            if step.deferred is not None:
                 _forget(env, step.deferred)
             settled = replace(step, body=tuple(self._run_in_line(step.body, env)))
         elif kind in _LOOP_KINDS:
@@ -2056,7 +2056,7 @@ class _Flow:
                 verb,
                 operands,
                 env,
-                connectives=deferred.connectives,
+                connectives=deferred.words,
                 qualified=deferred.qualified,
                 in_control=deferred.in_control,
             )
@@ -2072,7 +2072,11 @@ class _Flow:
         swallowed by a ``Catch``. It becomes a TODO instead: the segment has to be added by hand."""
         if not isinstance(result, Action) or result.target not in self._created:
             return result
-        path = json.loads(result.args[0]) if result.args else ""
+        # ``copy_field(src, dst)`` writes its LAST path; every other write helper writes its first.
+        written = ""
+        if result.args:
+            written = result.args[-1] if result.vocabulary == "copy_field" else result.args[0]
+        path = json.loads(written) if written else ""
         if (
             result.vocabulary in ("set_field", "append_to_field")
             and isinstance(path, str)

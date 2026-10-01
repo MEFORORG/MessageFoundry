@@ -2085,17 +2085,68 @@ def test_a_markup_free_write_without_an_input_still_lands_on_its_handle() -> Non
     assert 'set_field(msg, "MSH-12"' not in body
 
 
-def test_an_inlined_call_passing_the_input_keeps_it_bound() -> None:
-    """A call whose list is inlined is read statement by statement, so passing the input to it does
-    not unbind msg. Only a call whose list is not inlined does (see the parametrized test above)."""
+def test_an_inlined_call_passing_a_handle_still_unbinds_it() -> None:
+    """The Lander's PR 1900 repro. An inlined list names the passed message by its OWN handle, which
+    nothing ties to the caller's, so it can rebuild the message unseen: here a MsgCreate under %P.
+    What the call line passes is unknown after it, inlined or not, and a later send raises."""
+    rebuild = (
+        '<Call Data="ActionListCall &quot;Rebuild&quot; pass %OUT"><Actions>'
+        + _create("%P", _ADT_A04)
+        + "</Actions></Call>"
+    )
+    body = _handler_body(
+        _handler_source(_CLONE_OUT + rebuild + '<Line Data="MsgSend %OUT [OB_OUT]"/>')
+    )
+    assert 'Send("OB_OUT"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
+
+    # The input handed to an inlined list is unknown after it too: fail closed, a raise at the send.
     call = (
         '<Call Data="ActionListCall &quot;Sub&quot; pass %ADT"><Actions>'
         '<Line Data="ItemClear %ADT/PID-19"/></Actions></Call>'
     )
-    body = _handler_body(
+    passed = _handler_body(
         _handler_source(_WRITE_INPUT + call + _role_send("input-handle", "%ADT", "OB_IN"))
     )
-    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert 'Send("OB_IN"' not in passed
+
+    # The control arm: a call that passes no handle leaves the input bound.
+    plain = call.replace(" pass %ADT", "")
+    kept = _handler_body(
+        _handler_source(_WRITE_INPUT + plain + _role_send("input-handle", "%ADT", "OB_IN"))
+    )
+    assert '    sends.append(Send("OB_IN", msg))' in kept
+
+
+def test_a_keyword_styled_word_stops_a_field_write_mapping() -> None:
+    """A mode word the exporter styles as a keyword counts like an unstyled one: ``ItemAppend "x"
+    before PID-8`` is not an append, so it declines rather than map to ``append_to_field``."""
+    styled = _role_line(
+        _span("keyword", "ItemAppend")
+        + " "
+        + _span("literal", '"x"')
+        + " "
+        + _span("keyword", "before")
+        + " "
+        + _span("input-handle", "%ADT")
+        + _span("path", "/PID-8")
+    )
+    body = _handler_body(_handler_source(styled))
+    assert "append_to_field(" not in body
+    assert "# TODO: Corepoint ItemAppend" in body
+
+
+def test_a_declined_copy_into_a_built_message_names_the_field_it_writes() -> None:
+    """``copy_field(src, dst)`` writes its LAST path, so the decline names the destination."""
+    body = _handler_body(
+        _handler_source(
+            _create("%NEW", _ADT_A04)
+            + '<Line Data="ItemCopy %NEW/MSH-6 %NEW/PID-5"/>'
+            + _role_send("other-handle", "%NEW", "OB_NEW")
+        )
+    )
+    assert "copy_field(" not in body
+    assert "intended target PID-5" in body
 
 
 def test_a_send_in_a_branch_the_render_does_not_emit_never_becomes_a_send_of_msg() -> None:
