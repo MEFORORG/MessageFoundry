@@ -1080,8 +1080,8 @@ def test_dicom_guard_still_stands_aside_for_a_break_inside_the_crossing_window()
     # The DICOM verdict the shared loop must not move. The guard asks zlib for a whole window each
     # round, so a stream that breaks inside the window that crosses the cap raises zlib.error first
     # and is left to dcmread, whose decode path answers Cannot Understand. Asking for one byte past
-    # the cap would call it a bomb, and the SCP answers a bomb with Out of Resources, which a sender
-    # may retry.
+    # the cap would call it a bomb, so the SCP would log an over-cap refusal for what is a corrupt
+    # object. Both are final statuses since BACKLOG #2103; the log would name the wrong cause.
     from messagefoundry.parsing.dicom._inflate import bounded_inflate_or_error
     from messagefoundry.parsing.dicom.errors import DicomBombError
 

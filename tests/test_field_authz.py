@@ -19,7 +19,9 @@ from messagefoundry.api.field_authz import (
     revealable,
 )
 from messagefoundry.api.models import (
+    AlertInstanceInfo,
     CapturedResponseInfo,
+    ConnectionEventInfo,
     DeadLetterRow,
     EventInfo,
     MessageDetail,
@@ -341,8 +343,19 @@ def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> No
         "MessageDetail",
         "OutboxInfo",
     ]
-    # Every reveal site reads one of those sets, and together they cover all three models.
-    sites = re.findall(r"revealed=([^\n,]+?)(?=[,)\n])", source)
+    # BACKLOG #2443 added ONE other site, deliberately: the event and alert lists' per-item reveal,
+    # which lifts the error-text set on the one row the request names and on no other. It is pinned
+    # by its exact spelling so a second such site, or one that reveals more, still fails here.
+    per_item = re.findall(
+        r"revealed=revealable\(type\(i\), summary=False, error_text=i\.id == reveal\)", source
+    )
+    assert len(per_item) == 1, f"expected the one per-item reason reveal site, found {per_item}"
+    # Every other reveal site reads one of those sets, and together they cover all three models.
+    sites = [
+        s
+        for s in re.findall(r"revealed=([^\n,]+?)(?=[,)\n])", source)
+        if not s.startswith("revealable(type(i")
+    ]
     models = [m.group(1) for m in (re.fullmatch(r"reveal\[(\w+)\]", s) for s in sites) if m]
     assert len(models) == len(sites), (
         f"a reveal call site in api/app.py does not read the route's revealable() sets: {sites}"
@@ -375,13 +388,16 @@ def test_error_text_masking_is_keyed_by_model_and_catches_no_other_surface() -> 
     """BACKLOG #2436. By property name, ``detail`` would also reach ``CapturedResponseInfo.detail``
     on ``/responses``, a different datum with no reveal act. So the table is keyed by model, and
     that one stays complete for a holder. The list rows' ``error`` is the same stored value the
-    open masks, so it is in the table on purpose; the dead-letter row is the control."""
+    open masks, so it is in the table on purpose; the dead-letter row is the control. The event
+    and alert reasons joined under BACKLOG #2443."""
     assert dict(ERROR_TEXT_MASKED_UNTIL_REVEALED) == {
         MessageSummary: frozenset({"error"}),
         MessageDetail: frozenset({"error"}),
         OutboxInfo: frozenset({"last_error"}),
         EventInfo: frozenset({"detail"}),
         DeadLetterRow: frozenset({"last_error"}),
+        ConnectionEventInfo: frozenset({"reason"}),
+        AlertInstanceInfo: frozenset({"reason"}),
     }
     holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
     assert redact_unauthorized(_summary(), holder).error == "****"

@@ -166,7 +166,8 @@ DICOM connector, unchanged here.
 the database hops). Several of them assert through a library's own context (`build_asserted_https_handler`,
 `assert_ldap3_tls_suites`) where applying an operator string is a different problem with its own
 traps — `ldap3` in particular **swallows** an invalid `ciphers=` string, which `assert_ldap3_tls_suites`
-already refuses to go near. Retiring the six CBC-SHA2 suites from the inherited default: still gated on
+already refuses to go near. (Since the 2026-09-30 amendment below, the engine builds the LDAPS
+context itself and passes no `ciphers=` at all.) Retiring the six CBC-SHA2 suites from the inherited default: still gated on
 the peer census.
 
 ## To resolve on acceptance
@@ -199,7 +200,7 @@ calls it when `tls_ciphers` is unset, so those seams still read as the three cal
 | SMTP (EMAIL, DIRECT transport, alert email), syslog forwarder, FTPS, OIDC IdP, Postgres store (pinned-CA and verify-off branches), `verify` smoke | interpreter list | approved list |
 | Postgres store, default verifying branch | asyncpg's own context | approved list since a BACKLOG #300 follow-up: the engine builds the context with the same `ssl.create_default_context()` call asyncpg made for `ssl=True`, then narrows it, where it used to pass `ssl=True` |
 | Windows tray `/health` probe (`tray/probe.py`) | `truststore` context | approved list since owner ruling 2026-09-27 (engine PR 1690): the probe holds its own copies of the approved tuples, because it is a separate stdlib-plus-httpx package (ADR 0113), and `tests/test_tls_default_suites.py` checks them against the engine's |
-| LDAPS (`ldap3`) and all three Vault clients (`hvac`) | library's list | approved list since owner ruling 2026-09-27. `ldap3.Tls` gets `ciphers=` the approved names, and `assert_ldap3_tls_suites` refuses any other value. The Vault hops handshake on a urllib3 context `assert_hvac_tls_suites` builds and narrows. The accepted risk: an older domain controller that offers none of these suites fails to bind |
+| LDAPS (`ldap3`) and all three Vault clients (`hvac`) | library's list | approved list since owner ruling 2026-09-27. **CORRECTED 2026-09-30:** this read "`ldap3.Tls` gets `ciphers=` the approved names, and `assert_ldap3_tls_suites` refuses any other value". Since the 2026-09-30 amendment below, the engine builds the LDAPS context itself and passes ldap3 no `ciphers=`. The Vault hops handshake on a urllib3 context `assert_hvac_tls_suites` builds and narrows. The accepted risk: an older domain controller that offers none of these suites fails to bind |
 | At least: the SQL Server store, the DATABASE connector and `db_lookup` (ODBC drivers) | library's list | **unchanged**: the library builds the context, as BACKLOG #1170's third category records |
 
 A configured `tls_ciphers` or `[api].tls_ciphers` still wins over the default, and still runs the
@@ -333,3 +334,87 @@ In `tests/test_tls_default_suites.py`:
   `apply_operator_tls_ciphers`, which also narrows TLS 1.3.
   -> `test_every_operator_cipher_branch_narrows_tls13_too`,
   `test_no_engine_module_applies_a_cipher_string_outside_the_policy_module`
+
+---
+
+## Amendment (2026-09-30): LDAPS is narrowed by an engine `Tls` subclass (BACKLOG #2494, option 3)
+
+**The LDAPS hop now handshakes on a context the engine builds, so it narrows TLS 1.3 like every
+other engine-built hop.** Of the three options BACKLOG #2494 offered, the Manager chose option 3,
+"narrow ldap3's TLS 1.3 list by another route". It meets owner ruling R3 of 2026-09-27 (the
+library-built contexts are narrowed too) without the AES-128 exception option 2 would need.
+
+### Why it was needed
+
+ldap3 2.9.1 builds its context inside `Tls.wrap_socket` and takes no context from outside. Its one
+suite lever, `ciphers=`, reaches TLS 1.2 only. On an interpreter with `set_ciphersuites`, the
+allow-list drops `TLS_AES_128_GCM_SHA256` (the 2026-09-26 amendment above), but ldap3's context
+still offered it, so `assert_ldap3_tls_suites` refused. A first deployment on Python 3.15 would have
+lost Active Directory sign-in. The docstring recorded that as a fail-closed by design, pending this
+decision.
+
+### What changed
+
+- `tls_policy.assert_ldap3_tls_suites` now returns a factory, as `assert_hvac_tls_suites` does. The
+  factory calls `ssl.create_default_context(Purpose.SERVER_AUTH, cadata=...)`, the call ldap3
+  makes, then sets `check_hostname` and `verify_mode` in ldap3's order. It adds the posture every
+  engine-built client hop carries: a TLS 1.2 floor, strict X.509 flags when verifying,
+  `harden_kex_groups` and `narrow_to_approved_suites`. The last one sets TLS 1.2 suites, TLS 1.3
+  suites and signature schemes wherever the interpreter allows each. Then `harden_cipher_suites`
+  asserts the context and a shared check holds it to the approved list. It runs once at
+  construction, then once per connection.
+- `auth/ldap_tls.py` adds `NarrowedTls`, a subclass of `ldap3.Tls`. Its `wrap_socket` wraps the
+  socket with the factory's context and then calls ldap3's own host name check, unchanged. That
+  wrap step is copied from ldap3, and `tests/test_ldap_tls.py` pins a hash of ldap3's
+  `wrap_socket` source. Patching ldap3's module global for one call was rejected, because binds
+  run on worker threads and a module global is shared by all of them.
+- The bind no longer passes `ciphers=`. `NarrowedTls` builds the factory itself from `validate`
+  and `ca_certs_data`, and takes no other ldap3 argument, because the engine's context would not
+  carry one. The authenticator builds one `NarrowedTls` and hands it to every `ldap3.Server`.
+
+| Where | TLS 1.2 | TLS 1.3 | Signature schemes | Key-exchange groups |
+|---|---|---|---|---|
+| LDAPS on CPython 3.14 | 5 approved suites (unchanged) | all three, `TLS_AES_128_GCM_SHA256` included: the recorded gap of the 2026-09-26 amendment | stock list | inherited |
+| LDAPS where the interpreter has the setters (3.15) | 5 approved suites | the 2 approved suites | SHA-224 removed, as `narrow_signature_algorithms` reports | pinned, as `harden_kex_groups` reports |
+
+The suite columns of the 3.15 row were measured on CPython 3.15.0b3 with OpenSSL 3.5.7, locally.
+The bind constructs, its context offers exactly the two approved TLS 1.3 suites, and a real TLS 1.3
+handshake against a peer offering only `TLS_AES_128_GCM_SHA256` fails. ldap3's own `Tls` completes
+against the same peer, as the control. The last two columns are what each helper reported on that
+run, not a handshake reading.
+
+### What it keeps
+
+CA loading, verification mode and the absence of SNI are what ldap3 did, for the arguments the
+engine passes. ldap3's post-handshake host name check still runs, and still only when verifying.
+Each connection gets a fresh context, as before. `tests/test_tls_cipher_assertion_sites.py` now
+ties the context each connection wraps with to one the assertion ran on, by identity. The replica
+and its equivalence test are gone.
+
+### What it does not cover
+
+- **Referrals.** When ldap3 follows a referral, it builds a plain `ldap3.Tls` for the referred
+  server from a few attributes of this one. That copy carries no `ca_certs_data` and none of the
+  narrowing. This amendment does not change that path, and neither did the ones before it.
+- **Revocation.** The LDAPS context loads no CRL. It is still among the hops the DEPLOYMENT guide
+  lists as delegated.
+- **Client certificates, a pinned protocol version, `ssl_options` and SNI.** The engine passes
+  none, and `NarrowedTls` accepts none.
+- **The other TLS 1.3 residuals.** The 2026-09-26 amendment's 3.14 gap stands on every hop, LDAPS
+  included, and `tests/test_tls_default_suites.py` keeps its tripwire for the day the interpreter
+  changes.
+
+### Acceptance criteria
+
+- **AC-13** -- WHERE the interpreter has `set_ciphersuites`, THE SYSTEM SHALL build the LDAPS
+  authenticator without refusing, and its context SHALL offer exactly `APPROVED_TLS13_SUITES` at
+  TLS 1.3. WHEN it meets a TLS 1.3 peer offering only `TLS_AES_128_GCM_SHA256`, it SHALL fail the
+  handshake. -> `test_on_315_the_ldaps_bind_constructs_and_offers_no_tls13_aes128`,
+  `test_on_315_the_ldaps_bind_refuses_a_tls13_aes128_only_dc`, and on 3.14
+  `test_on_314_the_ldaps_bind_keeps_the_recorded_tls13_gap`
+- **AC-14** -- Every LDAPS connection SHALL wrap with a context the assertion ran on, and ldap3's
+  host name check SHALL still run when verifying.
+  -> `test_every_ldaps_connection_wraps_with_a_context_the_assertion_ran_on`,
+  `test_ldap3s_host_name_check_still_runs_after_the_handshake`
+- **AC-15** -- The LDAPS hop is a client hop in `tests/test_tls_default_suites.py`, so AC-7, AC-8
+  and AC-10 apply to it.

@@ -43,7 +43,7 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
    No → **`na`**, and write the rationale. No rationale, no `na`. Rule 1 scopes out a whole
    requirement, never one limb of it, and a cell grades every limb (§1.1b).
 2. **Has this cell been read against the ASVS requirement text at a known commit?**
-   No → **`unverified`**. *This is not a Pass.* ⚠️ It is also **not** "nobody looked" — the earlier
+   No → **`unverified`**. *This is not a Pass.* **CAUTION:** It is also **not** "nobody looked" — the earlier
    lineage graded these cells. What it graded them against was a paraphrase, because the ASVS 5.0.0
    text was not held anywhere in the project until 2026-07-31. So an inherited verdict is a verdict
    about a restatement of the requirement, which is why it has to be re-derived rather than trusted —
@@ -147,9 +147,9 @@ These are the real disputes. They are here so the next assessor reaches the same
 
 | Cell | Verdict | Which rule, and why |
 |---|---|---|
-| **5.4.3** | `na` | **Rule 1, and it moved for the same reason 11.7.1 did.** Antivirus scanning of inbound content is an **enterprise-provided** control — the deploying organisation's AV/EDR/ICAP stack over the drop directory, the SFTP landing zone and the upload path — so the verb's subject is outside the declared scope of §2. ⚠️ Previously scored `fail` under rule 3 and cited here as the worked example of one, on the reasoning that *a scan hook exists but its only shipped implementation is `_no_scan` and there is no configuration key at all, so an operator must author the scanner*. **That reasoning is still true of the code** — it simply answers rule 3's question, and rule 1 runs first. ⛔ **This `na` is WEAKER than 11.7.1's and its rationale says so on the cell:** the engine *does* ship a scan seam, so this is a control the product **could** implement, which makes the verdict conditional on the enterprise actually covering those paths. It therefore carries a **deployment requirement**, and a consult to test that premise on outbound-initiated SFTP pulls is filed in the ledger. **CLOSED by owner decision (2026-08-02); do not re-derive it.** |
+| **5.4.3** | `na` | **Rule 1, and it moved for the same reason 11.7.1 did.** Antivirus scanning of inbound content is an **enterprise-provided** control — the deploying organisation's AV/EDR/ICAP stack over the drop directory, the SFTP landing zone and the upload path — so the verb's subject is outside the declared scope of §2. **NOTE:** Previously scored `fail` under rule 3 and cited here as the worked example of one, on the reasoning that *a scan hook exists but its only shipped implementation is `_no_scan` and there is no configuration key at all, so an operator must author the scanner*. **That reasoning is still true of the code** — it simply answers rule 3's question, and rule 1 runs first. ⛔ **This `na` is WEAKER than 11.7.1's and its rationale says so on the cell:** the engine *does* ship a scan seam, so this is a control the product **could** implement, which makes the verdict conditional on the enterprise actually covering those paths. It therefore carries a **deployment requirement**, and a consult to test that premise on outbound-initiated SFTP pulls is filed in the ledger. **CLOSED by owner decision (2026-08-02); do not re-derive it.** |
 | **15.2.5** | `partial` | Rule 5, **not** rule 3. `[sandbox].mode` ships `off`, but `subprocess` mode is real and was verified by executing it. A working control that ships off. |
-| **11.7.1** | `na` | **Rule 1 — the hardest call in this table, and it moved.** The verb is *"full memory encryption is in use"*: a property of the **CPU, firmware and hypervisor**, not of the three software artifacts in §2. Outside the declared scope, so rule 1 fires before rule 3 is ever reached. **The objection this has to answer, because it is a good one:** ADR 0152's rungs 1–2 *do* ship in-engine, so the engine is not silent on this cell. But that code **reports on and gates against** the platform property — it never provides it. Reporting is not implementing (§2's first guard). ⚠️ Previously scored `fail` under rule 3 and cited here as the worked example of one. That reading was not wrong on its own terms; it answered *"does code implement the verb"* without first asking *"is the verb's subject in scope"*, and rule 1 runs first. **This cell has moved four times in eighteen days — it is CLOSED by owner decision (2026-08-02); do not re-derive it.** ⛔ It buys **no** Level 3 claim: see §2.1. |
+| **11.7.1** | `na` | **Rule 1 — the hardest call in this table, and it moved.** The verb is *"full memory encryption is in use"*: a property of the **CPU, firmware and hypervisor**, not of the three software artifacts in §2. Outside the declared scope, so rule 1 fires before rule 3 is ever reached. **The objection this has to answer, because it is a good one:** ADR 0152's rungs 1–2 *do* ship in-engine, so the engine is not silent on this cell. But that code **reports on and gates against** the platform property — it never provides it. Reporting is not implementing (§2's first guard). **NOTE:** Previously scored `fail` under rule 3 and cited here as the worked example of one. That reading was not wrong on its own terms; it answered *"does code implement the verb"* without first asking *"is the verb's subject in scope"*, and rule 1 runs first. **This cell has moved four times in eighteen days — it is CLOSED by owner decision (2026-08-02); do not re-derive it.** ⛔ It buys **no** Level 3 claim: see §2.1. |
 | **3.7.3** | `pass` | **Rule 4 — and this row is CORRECTED 2026-08-16.** It stood here as the table's worked example of a rule-3 `fail`, on the reasoning that there was *one off-site navigation, a bare 303, no interstitial and no cancel*. That described the code accurately when it was written. The interstitial was then **built**, and the record has carried this cell as `pass` since 2026-08-03 while this row went on saying `fail` — a worked example teaching the wrong answer for thirteen days. `[security].external_link_interstitial` ships `True` and `[security].organization_domains` ships **empty**, which is the strict position, so every absolute off-site destination is interstitialed out of the box and the verb is satisfied by a shipped default (`messagefoundry/config/settings.py:3743,3746`). **No live worked example of rule 3 remains in this table** — 5.4.3 and 11.7.1 both left it under rule 1 — and that is said plainly rather than patched with a substitute, because a stale example is worse than a missing one. |
 | **10.5.5** | `na` | Rule 1. The requirement is conditional — *"**when using** OIDC back-channel logout"* — and the precondition is false and unreachable by configuration. **Building it would create applicability.** |
 | **12.2.2** | `na` | Rule 1. No external-facing services on the declared scope. *Also a scoping error worth remembering: this row spent months scoring 12.3.1's verb.* |
@@ -186,7 +186,7 @@ that substrate rather than of the software, the requirement is outside the decla
 > **where configuration is outside the application's responsibility**. For example, DNS issues are
 > typically managed by a separate team or function."
 
-⚠️ **Do not over-read that, and do not reach for the fork clause to do this job.** The same chapter says
+**WARNING: Do not over-read that, and do not reach for the fork clause to do this job.** The same chapter says
 organizations are *"strongly encouraged to create an organization- or domain-specific fork that adjusts
 requirements"* — but its worked examples of omission are **technology-not-used** (*"omitting irrelevant
 sections (e.g., GraphQL, WebSockets, SOAP, if unused)"*), which is the functionality-based shape, and
@@ -302,17 +302,17 @@ gate is watching, which is the entire reason the drift gate exists (ADR 0156).
    not measuring anything.
 3. **A stable count is not evidence of a stable posture unless the anchors were re-verified in the same
    pass.** Report the drift check alongside the total, or you are publishing the freshness of the last
-   check rather than of the software. ⚠️ **Always state the pinned ASVS version with any total**, so a
+   check rather than of the software. **WARNING: Always state the pinned ASVS version with any total**, so a
    denominator change shows up as a version change instead of as progress — the corpus is pinned by
    digest in `[scorecard]`, and a 5.0.x patch release would move requirement text and counts on its own.
 
-⚠️ **This cuts against us more often than for us, which is why it is written down.** The survey is
+**NOTE: This cuts against us more often than for us, which is why it is written down.** The survey is
 incomplete, so most future movement will come from cause 2 — cells being re-verified against the
 requirement text for the first time — and the aggregate will get *worse* before it gets better as
 `unverified` cells resolve into real verdicts. **That is the survey working, not a regression**, and it
 should be reported as such rather than defended against.
 
-⚠️ **And state the debt in the right words.** `unverified` measures **re-verification debt**, not
+**NOTE: And state the debt in the right words.** `unverified` measures **re-verification debt**, not
 unassessed surface. Describing those cells as "never examined" or "nobody has looked at them"
 overstates the deficit and misdescribes the lineage: they were graded, repeatedly, against a
 paraphrase. The honest phrasing is *"N of 345 verified against the pinned requirement text; M carry

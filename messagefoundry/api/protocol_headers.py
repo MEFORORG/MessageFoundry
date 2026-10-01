@@ -57,10 +57,11 @@ response would change its status, which the floor must never do. The overrides t
 ``tests/test_header_floor_wire.py`` injects failures into those steps.
 
 **This leans on uvicorn and websockets INTERNALS.** None of the hooks above is public API.
-``pyproject.toml`` bounds uvicorn below the next minor, ``tests/test_header_floor_wire.py`` pins the
-versions it measured, uvicorn 0.49.0 and websockets 16.0, and drives every family on the wire
-against a control. The startup check is what holds between those: an upgrade that removes a hook
-stops the engine instead of shipping responses without the headers.
+``pyproject.toml`` bounds uvicorn below the next minor and does not bound websockets.
+``tests/test_header_floor_wire.py`` fails unless the installed versions are the ones it measured,
+``_MEASURED_UVICORN`` and ``_MEASURED_WEBSOCKETS``, and drives every family on the wire against a
+control. The startup check is what holds between those: an upgrade that removes a hook stops the
+engine instead of shipping responses without the headers.
 """
 
 from __future__ import annotations
@@ -421,7 +422,8 @@ def _build_floored_ws(base: type[Any]) -> type[asyncio.Protocol]:
         # absent, so the 101 and the denial, which the floor already covered, are not stamped twice.
         def write_http_response(self, *args: Any, **kwargs: Any) -> None:
             # No named parameters, so a changed signature reaches the server's own method
-            # unchanged instead of raising here. At 16.0 it is (status, headers, body=None).
+            # unchanged instead of raising here. At 16.0 and at 17.1 it is
+            # (status, headers, body=None).
             try:
                 headers = kwargs["headers"] if "headers" in kwargs else args[1]
                 for name, value in PROTOCOL_SECURITY_HEADERS:

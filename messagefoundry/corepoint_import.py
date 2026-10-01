@@ -65,8 +65,8 @@ XML is parsed through **defusedxml** with ``forbid_dtd``/``forbid_entities``/``f
 on, so a billion-laughs or external-entity payload raises instead of expanding.
 Paths ride across as data to :meth:`Message.set` at run time.
 
-Pure (parse + string codegen): no network, no message content, no dependency beyond the already-in-tree
-``defusedxml`` — safe to run anywhere.
+Pure (parse + string codegen): no network, no message content, no dependency beyond the engine's
+vendored ``defusedxml`` copy (``messagefoundry/_vendor/defusedxml/``) — safe to run anywhere.
 """
 
 from __future__ import annotations
@@ -83,13 +83,13 @@ from xml.etree.ElementTree import (  # nosec B405 — exception type only; every
     ParseError,
 )
 
-from defusedxml.common import DefusedXmlException
-from defusedxml.ElementTree import fromstring as _xml_fromstring
-
+from messagefoundry._vendor.defusedxml.common import DefusedXmlException
+from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
 from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
+    from collections.abc import Callable
     from xml.etree.ElementTree import (  # nosec B405 — type-only import (see above)
         Element,
     )
@@ -175,6 +175,8 @@ class Control:
     ``"case"``    ``ChooseFrom``/``<Case>`` with ``branches`` of kind ``"match"`` (``Matching``).
     ``"send"``    a ``MsgSend`` — ``args`` carries the rendered destination-name literal (empty when
                   the export names none, which degrades to a TODO marker rather than a guess).
+                  ``refusal`` is non-empty when the statement delivers a handle that is not provably
+                  ``msg``; the render then raises at the send site instead of sending (BACKLOG #313).
     ``"exit"``    ``Returns``/``ActionListExit``/``ActionListStop`` — no faithful vocabulary form, so a
                   TODO marker (never a silent flatten).
     ``"unknown"`` an element in a statement position whose TAG this layer does not model (a ``<Switch>``,
@@ -195,6 +197,8 @@ class Control:
     args: tuple[str, ...] = ()
     body: tuple[Step, ...] = field(default_factory=tuple)
     branches: tuple[Control, ...] = field(default_factory=tuple)
+    # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` sets it.
+    refusal: str = ""
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -760,8 +764,9 @@ def _role_verb(tokens: tuple[RoleToken, ...]) -> str:
     return ""
 
 
-def _subject_handle(action_list: Element) -> frozenset[str]:
-    """The one message handle an action-list's steps may be mapped against, or ``None``.
+def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[str]]:
+    """``(subject, held)`` for an action-list: the handles its steps may be mapped against, and the
+    handles known to hold ``msg``.
 
     A Corepoint action-list manipulates **several** messages at once (input, output, scratch), while a
     MessageFoundry Handler has exactly **one** ``msg``. So a field write is only faithfully
@@ -778,48 +783,107 @@ def _subject_handle(action_list: Element) -> frozenset[str]:
     non-input handle than deliver the input one, which is exactly why "the input handle" alone is the
     wrong predicate.)
 
-    Requires, therefore: exactly one distinct ``input-handle`` in the list, and either no ``MsgSend``
-    at all or a ``MsgSend`` that delivers that handle **or a whole-tree clone of it**. A clone — a
-    ``MsgTreeCopy`` of the input's ROOT into another handle — holds exactly the input's content, so a
-    write to it is a write to what ``msg`` will be; a *partial* copy is not, and is excluded, because
-    the destination tree then holds only the sub-node that was copied.
+    ``held`` therefore requires exactly one distinct ``input-handle`` in the list, and is that handle
+    **plus its whole-tree clones**. A clone — a ``MsgTreeCopy`` of the input's ROOT into another
+    handle — holds exactly the input's content, so a write to it is a write to what ``msg`` will be; a
+    *partial* copy is not, and is excluded, because the destination tree then holds only the sub-node
+    that was copied. A handle that ALSO receives a whole-tree copy of anything else (another tree, a
+    ``$variable``, a partial path) is not held, since its content may be that other thing; when that
+    handle is the input itself, nothing is held.
 
-    Anything else returns an empty set and **every** path-bearing statement in the list degrades to a
-    TODO — the honest output, because a cross-message write rendered as ``msg.set`` silently mutates
-    the wrong message."""
+    ``subject`` is ``held`` when the list sends nothing, the one held handle it delivers when the live
+    ``MsgSend`` statements deliver exactly one, and empty otherwise. Two held handles are two trees in
+    Corepoint, and folding both onto one ``msg`` would put a write meant for one into the other's send.
+    An empty subject means **every**
+    path-bearing statement in the list degrades to a TODO — the honest output, because a
+    cross-message write rendered as ``msg.set`` silently mutates the wrong message. A ``MsgSend`` of
+    anything outside ``held`` is refused by :func:`_send_refusal` (BACKLOG #313).
+
+    The scan skips ``@Disabled`` statements exactly where :func:`_parse_statement` does, and reads each
+    verb and kind through the same helpers. It is **flow-insensitive**: it does not see statement order
+    or whether a copy sits in a branch, so a send that runs before its clone is made, or a clone made
+    only on one branch, still counts as held. Modelling that is #313 step 2."""
     inputs: set[str] = set()
     delivered: set[str] = set()
     root_copies: list[tuple[str, str]] = []  # (source handle, destination handle)
-    for elem in action_list.iter():
+    for elem in _live_elements(action_list):
         data = _attr(elem, "Data")
-        if not data:
-            continue
-        tokens = parse_roles(data)
+        tokens = parse_roles(data) if data else ()
+        if not tokens:
+            continue  # markup-free: no handle roles to learn from
         inputs.update(t.text for t in tokens if t.source_class == "input-handle")
-        verb = _role_verb(tokens).lower()
+        # Every live element counts, an unmodelled tag included: it ran in Corepoint even though the
+        # render only marks it, and counting it can only narrow what is held.
+        verb = _statement_verb(tokens, _split_verb(strip_markup(data))[0])
         operands = _operands_from_roles(tokens)
-        if verb == "msgsend" and operands and operands[0].kind == "handle":
-            delivered.add(operands[0].text)
-        elif verb == "msgtreecopy" and len(operands) == 2:
-            src, dst = operands
-            if (
-                src.kind == "path"
-                and dst.kind == "path"
-                and _is_root_path(src.text)
-                and _is_root_path(dst.text)
-            ):
-                root_copies.append((src.handle, dst.handle))
+        if _statement_kind(_local(elem.tag), verb) == "send":
+            delivered.add(_whole_tree(operands[0]) if operands else "")  # "" is never held
+        elif verb.lower() == "msgtreecopy" and len(operands) == 2:
+            src, dst = (_whole_tree(o) for o in operands)
+            if dst:
+                # A source that is not a whole tree ("") overwrites ``dst`` with something foreign.
+                root_copies.append((src, dst))
     if len(inputs) != 1:
-        return frozenset()
-    subject = next(iter(inputs))
-    same = {subject}
-    # A clone chain is followed transitively, but only ever forward from the input.
+        return frozenset(), frozenset()
+    source = next(iter(inputs))
+    same = _clones_of(source, root_copies)
+    while True:
+        # A handle overwritten from outside the clone set may hold that other tree instead. Drop it,
+        # and every copy into or out of it, until nothing more drops.
+        foreign = {dst for src, dst in root_copies if src not in same}
+        if source in foreign:
+            return frozenset(), frozenset()
+        kept = [(s, d) for s, d in root_copies if s not in foreign and d not in foreign]
+        narrowed = _clones_of(source, kept)
+        if narrowed == same:
+            break
+        same = narrowed
+    held = frozenset(same)
+    if not delivered:
+        return held, held
+    # Only the ONE delivered tree is msg. A write to another held handle (the input after it was
+    # cloned, or a clone that is never sent) would otherwise land in the delivered message.
+    return (
+        frozenset(delivered) if len(delivered) == 1 and delivered <= held else frozenset()
+    ), held
+
+
+def _clones_of(source: str, root_copies: list[tuple[str, str]]) -> set[str]:
+    """``source`` plus every handle a chain of root copies reaches from it, only ever forward."""
+    same = {source}
     for _ in range(len(root_copies)):
         grew = {dst for src, dst in root_copies if src in same}
         if grew <= same:
             break
         same |= grew
-    return frozenset(same) if delivered <= same else frozenset()
+    return same
+
+
+def _live_elements(action_list: Element) -> list[Element]:
+    """Every element under ``action_list`` in document order, less each ``@Disabled`` subtree.
+
+    A ``<List>``/``<Actions>`` wrapper is walked even when it carries ``@Disabled``, because
+    :func:`_parse_list` flattens it and renders its statements live; the scan must see the same
+    statements the render emits."""
+    live: list[Element] = []
+    stack = list(reversed(list(action_list)))
+    while stack:
+        elem = stack.pop()
+        if _is_disabled(elem) and _local(elem.tag).lower() not in _LIST_TAGS:
+            continue
+        live.append(elem)
+        stack.extend(reversed(list(elem)))
+    return live
+
+
+def _whole_tree(operand: Operand) -> str:
+    """The handle ``operand`` names as a WHOLE message tree (``%OUT`` or ``%OUT/``), or ``""`` for
+    anything else: a ``$variable``, a partial path, a literal."""
+    if operand.kind == "handle":
+        return operand.text
+    if operand.kind == "path" and operand.handle and _is_root_path(operand.text):
+        return operand.handle
+    return ""
 
 
 def _is_root_path(text: str) -> bool:
@@ -1258,6 +1322,37 @@ def _role_send_args(operands: tuple[Operand, ...]) -> tuple[str, ...]:
     return ()
 
 
+def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
+    """Why a role-parsed ``MsgSend`` must not render as ``Send(dest, msg)``, or ``""`` when it may.
+
+    A Handler has one ``msg``: the inbound message. A ``MsgSend`` that names another handle (a scratch
+    or output tree the list built) would render as a send of ``msg`` and deliver the unmodified input
+    in place of the message Corepoint built. So the render raises at the send site instead
+    (BACKLOG #313, step 1). Dropping the send would make the handler filter silently.
+
+    It fails CLOSED: a send is allowed only when :func:`_whole_tree` names a handle in ``held``, the
+    same reading :func:`_message_handles` uses to fill ``delivered``. A ``$variable``, a partial path
+    or no handle at all is refused, because which message it sends is not known. A markup-free
+    statement has no roles and never reaches here. The handle is untrusted and unbounded, so it is
+    flattened and elided before it enters the text."""
+    sent = _whole_tree(operands[0]) if operands else ""
+    if sent and sent in held:
+        return ""
+    refuse = "the import refuses to send msg in its place"
+    if not sent:
+        return f"MsgSend names no message handle this import can identify as msg; {refuse}"
+    handle = _comment_text(sent, 60)
+    if not held:
+        return (
+            f"MsgSend delivers {handle}, and no handle in this action-list is known to be msg (it "
+            f"has no single input handle, or another tree overwrites its input); {refuse}"
+        )
+    return (
+        f"MsgSend delivers {handle}, which is not the input handle or a whole-tree clone of it, "
+        f"so it is not msg; {refuse}"
+    )
+
+
 def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control, ...]]:
     """Split a container body at its branch markers into ``(body, branches)``.
 
@@ -1318,7 +1413,11 @@ _MAX_NESTING = 100
 
 
 def _parse_list(
-    container: Element, subject: frozenset[str], in_control: bool, depth: int = 0
+    container: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
 ) -> list[Step]:
     """Parse the statement children of a ``<List>``/``<Actions>`` into ordered steps.
 
@@ -1333,7 +1432,7 @@ def _parse_list(
         tag = _local(child.tag).lower()
         if tag in _LIST_TAGS:
             # A doubly-wrapped list: flatten rather than lose the statements.
-            steps.extend(_parse_list(child, subject, in_control, depth + 1))
+            steps.extend(_parse_list(child, subject, held, in_control, depth + 1))
             continue
         # EVERY other child is a statement position and goes through _parse_statement — including a tag
         # this layer does not model, which comes back as an "unknown" marker plus its parsed subtree.
@@ -1341,7 +1440,7 @@ def _parse_list(
         # <DataPoint> package subtrees) dropped whole subtrees silently: those subtrees are children of
         # <Package>, NEVER of a <List>, so the tolerance was applied exactly where statements live and a
         # <Switch> — or a <Lines> typo — vanished with its body. Untrusted input is still never a crash.
-        produced = _parse_statement(child, subject, in_control, depth + 1)
+        produced = _parse_statement(child, subject, held, in_control, depth + 1)
         if (
             len(produced) == 1
             and isinstance(produced[0], Control)
@@ -1358,7 +1457,11 @@ def _parse_list(
 
 
 def _container_steps(
-    elem: Element, subject: frozenset[str], in_control: bool, depth: int = 0
+    elem: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
 ) -> list[Step]:
     """The nested body of ``elem``, in document order — every child, whatever shape it takes.
 
@@ -1367,11 +1470,15 @@ def _container_steps(
     is a **sibling** of the wrapper. Returning only the wrapper's children — as an earlier cut did the
     moment any wrapper existed — silently discarded those siblings, including an ``Else`` marker and its
     whole branch body."""
-    return _parse_list(elem, subject, in_control, depth + 1)
+    return _parse_list(elem, subject, held, in_control, depth + 1)
 
 
 def _parse_statement(
-    elem: Element, subject: frozenset[str], in_control: bool, depth: int = 0
+    elem: Element,
+    subject: frozenset[str],
+    held: frozenset[str],
+    in_control: bool,
+    depth: int = 0,
 ) -> list[Step]:
     """Parse one statement element into zero or more steps (a list, so a leaf can carry a body)."""
     tag = _local(elem.tag)
@@ -1388,25 +1495,15 @@ def _parse_statement(
     # set and it carries no qualifier — otherwise the emitted call would silently lose an operator.
     connectives = tuple(t.text for t in roles if t.role == "text" and t.text)
     qualified = any(t.role == "detail" for t in roles)
-    # Prefer the role layer's verb, but keep the flat reading as a NAMING fallback: a handful of verbs
-    # are not styled as a ``keyword`` span at all, and letting those collapse into "<unparsed>" would
-    # throw away the one thing that makes a TODO triageable — which verb it was.
-    verb = (_role_verb(roles) or flat_verb) if roles else flat_verb
+    verb = _statement_verb(roles, flat_verb)
     role_operands = _operands_from_roles(roles) if roles else ()
 
     source = _source_label(tag, verb)
-
-    kind = _CONTAINER_KIND_BY_TAG.get(tag.lower())
-    if kind is None:
-        # A ``<Line>``: control flow is carried by the verb, everything else is a transform statement.
-        kind = _KIND_BY_VERB.get(verb.lower())
-    elif kind in ("block", "call") and verb.lower() in _KIND_BY_VERB:
-        # ``<Call Data="ActionListCall …">`` — the verb is the more specific truth.
-        kind = _KIND_BY_VERB[verb.lower()]
+    kind = _statement_kind(tag, verb)
 
     # A construct NESTS its body under a placeholder condition; a ``<Block>``/``<Call>`` is a label
     # whose body stays at the same indentation, so it does not deepen control scope.
-    body = _container_steps(elem, subject, in_control or kind in _NESTING_KINDS, depth)
+    body = _container_steps(elem, subject, held, in_control or kind in _NESTING_KINDS, depth)
 
     if _is_disabled(elem):
         # Preserved in full as commented-out pseudo-source — the subtree is parsed (so it is visible and
@@ -1464,7 +1561,8 @@ def _parse_statement(
         # ``*body`` matters: a ``MsgSend`` element that carries a nested list would otherwise lose it
         # (the break/exit path below always kept its body — this one silently did not).
         args = _role_send_args(role_operands) if roles else _send_args(operands)
-        return [Control("send", source, statement, args=args), *body]
+        refusal = _send_refusal(role_operands, held) if roles else ""
+        return [Control("send", source, statement, args=args, refusal=refusal), *body]
     if kind in ("break", "exit"):
         return [Control(kind, source, statement), *body]
     if kind in ("block", "call"):
@@ -1475,6 +1573,28 @@ def _parse_statement(
     inner, branches = _split_branches(body)
     detail = _strip_leading_verb(statement, verb)
     return [Control(kind, source, detail, body=inner, branches=branches)]
+
+
+def _statement_verb(roles: tuple[RoleToken, ...], flat_verb: str) -> str:
+    """A statement's verb. Shared by :func:`_parse_statement` and :func:`_message_handles`, so the
+    scan that judges sends and the parse that renders them agree on which statements are sends.
+
+    Prefer the role layer's verb, but keep the flat reading as a NAMING fallback: a handful of verbs
+    are not styled as a ``keyword`` span at all, and letting those collapse into "<unparsed>" would
+    throw away the one thing that makes a TODO triageable — which verb it was."""
+    return (_role_verb(roles) or flat_verb) if roles else flat_verb
+
+
+def _statement_kind(tag: str, verb: str) -> str | None:
+    """The control kind a statement element renders as, or ``None`` for a transform statement."""
+    kind = _CONTAINER_KIND_BY_TAG.get(tag.lower())
+    if kind is None:
+        # A ``<Line>``: control flow is carried by the verb, everything else is a transform statement.
+        return _KIND_BY_VERB.get(verb.lower())
+    if kind in ("block", "call") and verb.lower() in _KIND_BY_VERB:
+        # ``<Call Data="ActionListCall …">`` — the verb is the more specific truth.
+        return _KIND_BY_VERB[verb.lower()]
+    return kind
 
 
 def _source_label(tag: str, verb: str) -> str:
@@ -1578,7 +1698,8 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
                 n += 1
             name = f"{name}_{n}"
         taken.add(name)
-        steps = tuple(_container_steps(action_list, _subject_handle(action_list), False))
+        subject, held = _message_handles(action_list)
+        steps = tuple(_container_steps(action_list, subject, held, False))
         scope = _disabled_scope(action_list, parents)
         if scope is not None:
             # The whole list is switched off: wrap it in ONE disabled node so it is preserved as
@@ -1843,6 +1964,19 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         out.extend(_generate_steps(ctrl.body, indent, in_loop=in_loop))
         return out
     if ctrl.kind == "send":
+        if ctrl.refusal:
+            # A send of the wrong message. The raise keeps the destination and the ``sends`` list, so
+            # the handler neither sends msg here, nor filters silently, nor gains a trailing Send.
+            # Reaching this line is a loud ERROR (dead-letter), never a delivery (BACKLOG #313). The
+            # outbound stays declared for the hand-finish; ``check`` reports it unreferenced until then,
+            # which is accurate: nothing sends to it yet.
+            dest = f"to {json.loads(ctrl.args[0])}" if ctrl.args else "(no destination named)"
+            message = _lit(f"Corepoint import: {ctrl.source_verb} {dest}: {ctrl.refusal}")
+            return [
+                f"{pad}# TODO: Corepoint {ctrl.source_verb} {_comment_text(dest)} — hand-finish: "
+                f"{_comment_text(ctrl.refusal)} ({label})",
+                f"{pad}raise NotImplementedError({message})",
+            ]
         if not ctrl.args:
             return [
                 f"{pad}# TODO: Corepoint {ctrl.source_verb} — hand-finish: no destination named "
@@ -1863,6 +1997,13 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
         # The complement of this filter is what :func:`_stray_branches` marks, so both sides read the
         # same predicate — a ``try`` that learns a new branch kind cannot leave one in neither set.
         handlers = [b for b in ctrl.branches if _renders_as_branch(ctrl.kind, b.kind)]
+        if _has_refused_send(ctrl.body):
+            # Every Catch renders as ``except Exception:``, which would swallow the refusal's raise
+            # and run the Catch body instead: a delivery or a silent filter (BACKLOG #313).
+            out.append(
+                f"{pad}except NotImplementedError:  # a refused MsgSend above — never caught"
+            )
+            out.append(f"{pad}    raise")
         if not handlers:
             out.append(f"{pad}except Exception:  # TODO: Corepoint Try with no Catch — hand-finish")
             out.append(f"{pad}    raise")
@@ -2054,12 +2195,24 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list."""
+    return _any_live_send(steps, lambda send: bool(send.args))
+
+
+def _has_refused_send(steps: tuple[Step, ...]) -> bool:
+    """Whether the tree renders a refused ``MsgSend`` as a live ``raise`` (see :func:`_send_refusal`)."""
+    return _any_live_send(steps, lambda send: bool(send.refusal))
+
+
+def _any_live_send(steps: tuple[Step, ...], test: Callable[[Control], bool]) -> bool:
+    """Whether any live (not ``@Disabled``) ``send`` in the tree, branches included, passes ``test``."""
     for step in steps:
         if not isinstance(step, Control) or step.kind == "disabled":
             continue
-        if step.kind == "send" and step.args:
+        if step.kind == "send" and test(step):
             return True
-        if _has_inline_send(step.body) or any(_has_inline_send(b.body) for b in step.branches):
+        if _any_live_send(step.body, test) or any(
+            _any_live_send(b.body, test) for b in step.branches
+        ):
             return True
     return False
 
@@ -2180,7 +2333,8 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 # TODO marker. The four ``_BRANCH_PARENT`` kinds are faithful only while a construct ADOPTS them, so a
 # BRANCH asks :func:`_renders_as_branch` rather than this set, and an orphaned marker counts unmapped.
 # ``break`` is faithful only inside a loop, so :func:`_count_steps` also reads its loop context: a
-# ``LoopExit`` outside a loop is a TODO marker and counts unmapped (BACKLOG #1860).
+# ``LoopExit`` outside a loop is a TODO marker and counts unmapped (BACKLOG #1860). A ``send`` that is
+# refused, or names no destination, is not sent either, and also counts unmapped (BACKLOG #313).
 _MAPPED_CONTROL_KINDS = frozenset(
     {
         "if",
@@ -2203,8 +2357,9 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
     """``(mapped, unmapped_source_names, disabled)`` over a step tree — the count-and-log accounting.
 
     Every source element lands in exactly one bucket: emitted as a vocabulary call or as real control
-    flow (*mapped*), emitted as an in-place TODO marker — an unmapped verb, an ``exit``, a ``LoopExit``
-    outside a loop, or an element whose tag is not modelled at all (*unmapped*), or preserved as
+    flow (*mapped*), emitted as an in-place TODO marker or a refusal — at least an unmapped verb, an
+    ``exit``, a ``LoopExit`` outside a loop, an element whose tag is not modelled at all, and a
+    ``MsgSend`` that is refused or names no destination (*unmapped*), or preserved as
     commented-out pseudo-source under a ``@Disabled`` element or action-list (*disabled*). Nothing is
     ever silently dropped.
 
@@ -2229,7 +2384,10 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
             # Counted as one preserved element; its whole subtree rides along in the comment block.
             disabled += 1
         else:
-            if (
+            if step.kind == "send" and (step.refusal or not step.args):
+                # Rendered as a raise or a bare TODO, never as the send, so not reported as shipped.
+                unmapped.append(step.source_verb)
+            elif (
                 step.kind in _MAPPED_CONTROL_KINDS
                 and step.kind not in _BRANCH_PARENT
                 and (step.kind != "break" or in_loop)

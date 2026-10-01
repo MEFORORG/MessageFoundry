@@ -93,6 +93,14 @@ under Changed says why engine 0.4.0 does not work with this console.
   dead-letter list masks each last error the same way and links it to that message's `/errors`.
   The engine masks the text in its response, so the page never carries it. Needs an engine whose
   `get_message` accepts `reveal_errors`.
+- **Event and alert reasons are masked until the operator asks** (`BACKLOG #2443`, ASVS 14.2.6,
+  owner ruling R12). `/ui/events`, `/ui/connection/{name}` and `/ui/alerts` show each reason as
+  `****`, with a "Reveal" link to the new `/ui/events/{id}/reason`,
+  `/ui/connection/{name}/events/{id}/reason` or `/ui/alerts/{id}/reason`. Each reveal needs
+  `messages:view_summary`, shows that one reason, and is audited. A role without that permission
+  sees no reason and no link, but still sees each event's kind and each alert's type and state.
+  Needs an engine whose `list_connection_events` and `list_active_alerts` accept `reveal`, and
+  whose `list_active_alerts` takes `request`. The seam digest does not record those keywords.
 - **The engine UI seam moved because the seam gate now covers the `auth.service` names this console
   imports** (`BACKLOG #2015`). Seam discovery used to read only `AuthService` from
   `messagefoundry.auth.service`. It now reads every name the console imports from there, such as

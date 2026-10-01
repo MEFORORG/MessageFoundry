@@ -141,7 +141,7 @@ class IngressGuardError(Exception):
 
     **Never raised with a body-holding error on its chain (BACKLOG #1796).** The caught error can hold
     the body: a ``UnicodeEncodeError``'s or ``UnicodeDecodeError``'s ``.object`` is the WHOLE text or
-    byte string, and an ``HL7PeekError`` from python-hl7 quotes what it failed on. ``from exc`` puts
+    byte string, and an ``HL7PeekError`` can wrap a parser error that quotes what it failed on. ``from exc`` puts
     that on ``__cause__``. ``from None`` only hides it from the default traceback printer and leaves it
     on ``__context__``, where a structured-logging serializer or a crash reporter still reads it. So
     each handler here that catches such an error keeps only the content-free reason in a local and

@@ -38,3 +38,14 @@ retaining the original copyright notice, the license conditions, and the
 no-endorsement disclaimer; the authoritative copyright and full license text
 ship in the pydicom distribution (its LICENSE and the bundled data-dictionary
 source). pynetdicom and (Phase-2) dicomweb-client are MIT-licensed.
+
+Third-party attribution — defusedxml (vendored in the engine package)
+----------------------------------------------------------------------
+common.py and ElementTree.py in messagefoundry/_vendor/defusedxml/ are
+copied from defusedxml 0.7.1, Copyright (c) 2013 by Christian Heimes, licensed
+to the PSF under a Contributor Agreement, and distributed under the Python
+Software Foundation License Version 2 (SPDX: PSF-2.0). The full license text
+ships beside them in that directory's LICENSE file, which is also one of the
+package's license-files. As that license asks, the changes made to the upstream
+files are summarized in that directory's README.md: a two-line header on each
+module, and a replacement __init__.py.

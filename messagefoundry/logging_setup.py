@@ -63,10 +63,6 @@ from messagefoundry.logging_guard import (
     LogWriteGuard,
     set_active_guard,
 )
-
-# Re-exported from a stdlib-only leaf so `parsing/` can call it without loading this module and the
-# config layer behind it (BACKLOG #1596). `configure_logging()` below still calls it.
-from messagefoundry.phi_log_silencer import silence_phi_prone_dependency_loggers
 from messagefoundry.redaction import redact_untrusted
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
@@ -84,7 +80,6 @@ __all__ = [
     "ensure_logger_sink",
     "set_runtime_level",
     "current_log_level",
-    "silence_phi_prone_dependency_loggers",
     "ControlCharScrubFilter",
     "RedactionFilter",
     "JsonFormatter",
@@ -1397,7 +1392,6 @@ def configure_logging(
         uvicorn_logger.propagate = True
         uvicorn_logger.setLevel(numeric)
 
-    silence_phi_prone_dependency_loggers()
     return forwarder_installed
 
 
