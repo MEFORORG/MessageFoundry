@@ -11,9 +11,11 @@ than against the one it was written for.
 
 **How it works.** A small grammar generates action-list SHAPES: statements (clone, ``MsgCreate``,
 field write, log, send, statements the import does not read, exits) inside constructs (If, ElseIf,
-Else in four export spellings, ChooseFrom, ForEach, Loop, Try and Catch in three spellings, Block,
-an inlined or bare ``ActionListCall``, an unmodelled tag, ``@Disabled`` with a sure and an unsure
-value, and a branch marker with no construct), with role markup present, absent or mixed and with
+Else in five export spellings and with a disabled branch line, ChooseFrom, ForEach in several
+spellings of what it binds, Loop, Try and Catch in three spellings, Block with a prose or a
+statement label, an inlined or bare ``ActionListCall``, an unmodelled tag, a ``<Line>`` carrying a
+nested list, ``@Disabled`` with a sure and an unsure value on a whole construct or on one branch
+marker, and a branch marker with no construct), with role markup present, absent or mixed and with
 hostile handle spellings. Each shape is rendered to XML and imported twice: by the head importer and
 by the step 1 importer, vendored byte-for-byte from main at ``bca583f2a`` (blob ``b88e7152``) as
 ``tests/fixtures/corepoint/step1_corepoint_import.py.txt``. A vendored copy, not ``git show
@@ -33,7 +35,11 @@ EXECUTED against one synthetic input, and their source is read, and the guard as
    proves is not the input;
 4. every LIVE send line in the head is provable on every path: the oracle's tree set at that send is
    exactly one known tree, of the same kind as the local (``msg`` only for the input itself). This
-   reaches the branches the executed path skips.
+   reaches the branches the executed path skips;
+5. a local other than ``msg`` is bound, and sent, only at the handler's own level (the narrowing,
+   ADR 0086). Together with an execution that runs past every refusal (each ``raise
+   NotImplementedError`` is read as a human deleting it), that puts every such send on the executed
+   path, so (i) compares the tree it actually delivers, not only its kind.
 
 All fixtures are synthetic. The shapes come from a fixed seed, so a failure is reproducible.
 """
@@ -173,7 +179,10 @@ Arm = tuple[str, "H | None", "tuple[Node, ...]"]
 @dataclass(frozen=True)
 class If:
     arms: tuple[Arm, ...]
-    form: str = "inbody"  # inbody | wrapper | lines | sibling
+    form: str = "inbody"  # inbody | wrapper | wrapper-bare | lines | sibling
+    # The index of an arm whose own line carries @Disabled="1" (-1: none). Not for "inbody", where
+    # the first arm's line is the construct itself.
+    off_arm: int = -1
 
 
 @dataclass(frozen=True)
@@ -230,10 +239,20 @@ class Off:
 
 @dataclass(frozen=True)
 class Orphan:
-    """A branch marker with no construct to continue; what follows it may or may not run."""
+    """A branch marker with no construct to continue (or one carrying ``@Disabled``, which no
+    construct can continue either); what follows it may or may not run."""
 
     kind: str
     body: tuple[Node, ...]
+    disabled: str = ""
+
+
+@dataclass(frozen=True)
+class Nested:
+    """A ``<Line>`` whose verb is no construct, carrying a nested list: an unmodelled construct."""
+
+    body: tuple[Node, ...]
+    verb: str = "Otherwise"
 
 
 Node = (
@@ -256,6 +275,7 @@ Node = (
     | Unknown
     | Off
     | Orphan
+    | Nested
 )
 
 
@@ -377,23 +397,31 @@ def _render_one(node: Node, inp: str, disabled: str = "") -> str:
             ):
                 return _render_one(inner, inp, value)
             return f'<Block Data="Off" Disabled="{_esc(value)}"><List>{_render((inner,), inp)}</List></Block>'
-        case If(arms, form):
+        case If(arms, form) as n:
             (k0, c0, b0), rest = arms[0], arms[1:]
             if form == "inbody":
                 content = _render(b0, inp) + "".join(
                     _line(_cond(k, c, inp)) + _render(b, inp) for k, c, b in rest
                 )
                 return f'<If Data="{_esc(_cond(k0, c0, inp))}"{dis}><List>{content}</List></If>'
-            chain = "".join(_line(_cond(k, c, inp), _render(b, inp)) for k, c, b in arms)
+            chain = "".join(
+                _line(_cond(k, c, inp), _render(b, inp), "1" if i == n.off_arm else "")
+                for i, (k, c, b) in enumerate(arms)
+            )
             if form == "wrapper":
                 return f"<If{dis}><List>{chain}</List></If>"
             if form == "wrapper-bare":  # the branch lines sit directly in the <If>, no <List>
                 return f"<If{dis}>{chain}</If>"
             if form == "sibling":
+                off = ' Disabled="1"' if n.off_arm == 0 else ""
                 chain = (
-                    f'<If Data="{_esc(_cond(k0, c0, inp))}"><List>{_render(b0, inp)}</List></If>'
+                    f'<If Data="{_esc(_cond(k0, c0, inp))}"{off}>'
+                    f"<List>{_render(b0, inp)}</List></If>"
                 )
-                chain += "".join(_line(_cond(k, c, inp), _render(b, inp)) for k, c, b in rest)
+                chain += "".join(
+                    _line(_cond(k, c, inp), _render(b, inp), "1" if i + 1 == n.off_arm else "")
+                    for i, (k, c, b) in enumerate(rest)
+                )
             return chain if not dis else f'<Block Data="Off"{dis}><List>{chain}</List></Block>'
         case Case(pre, arms):
             content = _render(pre, inp) + "".join(
@@ -405,6 +433,8 @@ def _render_one(node: Node, inp: str, disabled: str = "") -> str:
                 data = "ForEach %SRC/OBX $obx"  # a path into a handle and a variable: binds nothing
             elif over.cls == "plain":
                 data = f"ForEach {over.name} in %SRC/OBX"
+            elif over.cls == "verbless":  # a <Foreach> whose @Data does not start with its verb
+                data = f"{over.name} in %SRC/OBX"
             else:
                 data = f"{_kw('ForEach')} {_hs(over, inp)}"
             if form == "line":
@@ -433,8 +463,10 @@ def _render_one(node: Node, inp: str, disabled: str = "") -> str:
             return f'<Call Data="{_esc(line)}"{dis}><Actions>{_render(body, inp)}</Actions></Call>'
         case Unknown(body):
             return f'<Switch Data="Mystery"{dis}><List>{_render(body, inp)}</List></Switch>'
-        case Orphan(kind, body):
-            return _line(kind) + _render(body, inp)
+        case Orphan(kind, body, off):
+            return _line(kind, disabled=off) + _render(body, inp)
+        case Nested(body, verb):
+            return _line(_kw(verb), _render(body, inp), disabled)
     raise AssertionError(f"unrendered node {node!r}")
 
 
@@ -456,28 +488,40 @@ class _Env:
     def __init__(self, default: frozenset[Val] = frozenset({EMPTY})) -> None:
         self.vals: dict[str, frozenset[Val]] = {}
         self.default = default
+        # No path reaches this point: an exit ended every one that got here.
+        self.ended = False
 
     def get(self, key: str) -> frozenset[Val]:
-        return self.vals.get(key, self.default)
+        return frozenset() if self.ended else self.vals.get(key, self.default)
 
     def copy(self) -> _Env:
         env = _Env(self.default)
         env.vals = dict(self.vals)
+        env.ended = self.ended
         return env
 
     def havoc(self) -> None:
         self.vals = {}
-        self.default = frozenset({UNK})
+        self.default = frozenset({UNK})  # an ended env stays ended: get() answers nothing
 
     def same(self, other: _Env) -> bool:
         keys = self.vals.keys() | other.vals.keys()
-        return self.default == other.default and all(self.get(k) == other.get(k) for k in keys)
+        return (
+            self.ended == other.ended
+            and self.default == other.default
+            and all(self.get(k) == other.get(k) for k in keys)
+        )
 
 
 def _join(envs: Sequence[_Env]) -> _Env:
-    out = _Env(frozenset().union(*(e.default for e in envs)))
-    for key in set().union(*(e.vals.keys() for e in envs)):
-        out.vals[key] = frozenset().union(*(e.get(key) for e in envs))
+    live = [e for e in envs if not e.ended]
+    if not live:
+        out = _Env()
+        out.ended = True
+        return out
+    out = _Env(frozenset().union(*(e.default for e in live)))
+    for key in set().union(*(e.vals.keys() for e in live)):
+        out.vals[key] = frozenset().union(*(e.get(key) for e in live))
     return out
 
 
@@ -556,25 +600,34 @@ class _Oracle:
             case SendS(h, dest, _):
                 self.sends.setdefault(dest, set()).update(env.get(self.key(h.name)))
                 self.send_keys.setdefault(dest, set()).add(self.key(h.name))
-                if ctx.dead:
+                if ctx.dead and not env.ended:
                     self.dead.add(dest)
                 if ctx.doubt:
                     self.doubt.add(dest)
             case Unread():
                 env.havoc()
             case Exit():
-                pass  # neither importer models an exit; both render it as a TODO
+                # An exit ends the list: nothing after it runs on this path. Neither importer
+                # models it (both render a TODO), so a send after it that the head makes live is
+                # a send Corepoint never makes.
+                env = env.copy()
+                env.ended = True
             case LoopExit():
                 if ctx.loops:
                     ctx.loops[-1].append(env.copy())
             case Raw(_, havoc):
                 if havoc:
                     env.havoc()
-            case If(arms, _):
+            case If(arms, _, off_arm):
                 # A condition reads the handle it names; it never binds one (ADR 0086). A ForEach
                 # or a Catch line may bind the handle it names, and those two do (below).
                 outs = [env.copy()]  # every condition is a placeholder, so no arm may run
-                outs += [self.run(body, env.copy(), ctx.cond()) for _, _, body in arms]
+                for i, (_, _, body) in enumerate(arms):
+                    if i == off_arm:
+                        continue  # a disabled branch line never runs
+                    # What follows a disabled branch line has nothing certain to continue.
+                    arm_ctx = ctx.lost() if 0 <= off_arm < i else ctx.cond()
+                    outs.append(self.run(body, env.copy(), arm_ctx))
                 env = _join(outs)
             case Case(pre, arms):
                 env = self.run(pre, env, ctx)
@@ -609,15 +662,15 @@ class _Oracle:
                 # and afterwards so is every caller handle.
                 self.run(body, _Env(frozenset({UNK})), ctx)
                 env.havoc()
-            case Unknown(body):
+            case Unknown(body) | Nested(body):
                 env.havoc()
-                env = self.run(body, env, ctx.lost())
+                env = _join([env.copy(), self.run(body, env.copy(), ctx.lost())])
                 env.havoc()
             case Off(inner, value):
                 if value.strip().lower() in _DISABLED_SURE:
                     return env
                 env = _join([env.copy(), self.run((inner,), env.copy(), ctx.cond())])
-            case Orphan(_, body):
+            case Orphan(_, body, _):
                 env = _join([env.copy(), self.run(body, env.copy(), ctx.lost())])
         return env
 
@@ -712,8 +765,11 @@ def _execute(module: Any, xml: str, where: Path) -> _Run:
         return _Run("", [], None)
     registry = Registry()
     namespace: dict[str, Any] = {"__name__": "mefor_differential_generated"}
+    # Every refusal is read as a human deleting it: the handler runs on past it, so a send after a
+    # refusal is executed and checked too, in both importers alike.
+    runnable = _REFUSAL.sub(r"\1pass  # refusal removed by the guard", src)
     with _loading(where, registry):
-        exec(compile(src, _GENERATED, "exec"), namespace)
+        exec(compile(runnable, _GENERATED, "exec"), namespace)
     inp = Message.parse(_INPUT)
     try:
         result = registry.handlers["t"](inp)
@@ -730,6 +786,7 @@ def _execute(module: Any, xml: str, where: Path) -> _Run:
 
 
 _GENERATED = "generated-by-the-corepoint-import.py"
+_REFUSAL = re.compile(r"^(\s*)raise NotImplementedError\(.*\)$", re.MULTILINE)
 
 
 def _observed(message: object, inp: Message | None) -> str:
@@ -745,6 +802,10 @@ def _observed(message: object, inp: Message | None) -> str:
 
 
 _LIVE_SEND = re.compile(r'^(\s*)sends\.append\(Send\("([^"]+)", (\w+)\)\)')
+# A line that binds a local other than msg, or sends one.
+_LOCAL_LINE = re.compile(
+    r"^(\s*)(?:\w+_msg(?:_\d+)? = |sends\.append\(Send\(\"[^\"]+\", (?!msg\))\w+\)\))"
+)
 
 
 def _live_sends(src: str) -> list[tuple[int, str, str]]:
@@ -755,9 +816,14 @@ def _live_sends(src: str) -> list[tuple[int, str, str]]:
     ]
 
 
-def _send_indent(src: str, dest: str) -> int | None:
-    """The shallowest code line (not a comment) that sends or refuses to send to ``dest``."""
-    token = re.compile(rf'"{re.escape(dest)}"|to {re.escape(dest)}:')
+def _send_indent(src: str, dest: str, *, live_only: bool = False) -> int | None:
+    """The shallowest code line (not a comment) that sends, or refuses to send, to ``dest``. With
+    ``live_only``, a live send only: a refusal at any depth fails closed."""
+    token = re.compile(
+        rf'Send\("{re.escape(dest)}"'
+        if live_only
+        else rf'"{re.escape(dest)}"|to {re.escape(dest)}:'
+    )
     found = [
         len(line) - len(line.lstrip())
         # The handler only: the module's outbound() declarations name every destination at indent 0.
@@ -790,9 +856,16 @@ def _violations(shape: Shape) -> list[str]:
 
     # (ii), static: no send line is shallower in the head than in step 1.
     for dest in verdict.sends:
-        h_at, s_at = _send_indent(out_head.src, dest), _send_indent(out_step1.src, dest)
+        h_at = _send_indent(out_head.src, dest, live_only=True)
+        s_at = _send_indent(out_step1.src, dest)
         if h_at is not None and s_at is not None and h_at < s_at:
             found.append(f"(ii) {dest} sits at indent {h_at} in the head, {s_at} in step 1")
+
+    # The narrowing: a local other than msg is bound and sent only at the handler's own level.
+    for line in out_head.src.split("@handler")[-1].splitlines():
+        found_local = _LOCAL_LINE.match(line)
+        if found_local and len(found_local.group(1)) != 4:
+            found.append(f"(narrowing) a local is bound or sent below the handler level: {line}")
 
     # Every live send line of the head, on every path.
     step1_live = {(d, local) for _, d, local in _live_sends(out_step1.src)}
@@ -920,6 +993,12 @@ def _wrap(kind: str, body: tuple[Node, ...], b: _Build) -> Node:
     named = b.spell(rng.choice((b.inp, b.out))) if rng.random() < 0.5 else None
     if named is not None and rng.random() < 0.3:
         named = H(named.name, "plain")
+    # How a ForEach names what it binds: role markup, markup-free, without its verb first, or in
+    # a span whose class the reader must not trust (a variable or literal holding a handle name).
+    over = None
+    if rng.random() < 0.6:
+        over_cls = rng.choice(("", "plain", "verbless", "variable", "literal", "handle"))
+        over = H(b.spell(rng.choice((b.inp, b.out))).name, over_cls)
     form = rng.choice(_IF_FORMS)
     if kind == "if":
         return If((("If", named, body),), form)
@@ -934,7 +1013,10 @@ def _wrap(kind: str, body: tuple[Node, ...], b: _Build) -> Node:
     if kind == "case":
         return Case((), (body, ())) if rng.random() < 0.5 else Case(body, ((b.log(b.inp),),))
     if kind == "each":
-        return Each(body, named, rng.choice(("elem", "line")))
+        form = (
+            "elem" if over is not None and over.cls == "verbless" else rng.choice(("elem", "line"))
+        )
+        return Each(body, over, form)
     if kind == "loop":
         return Loop((*body, LoopExit())) if rng.random() < 0.5 else Loop(body)
     if kind == "try":
@@ -960,6 +1042,28 @@ def _wrap(kind: str, body: tuple[Node, ...], b: _Build) -> Node:
         return Off(Block(body), "on")
     if kind == "orphan":
         return Block((Orphan(rng.choice(("Else", "Catch", "Matching")), body),))
+    if kind == "disabled-marker":
+        # One branch marker carries @Disabled, so it continues nothing and what follows it folds
+        # into the arm before it.
+        value = rng.choice(("1", "on"))
+        return rng.choice(
+            (
+                Try((b.log(b.inp), Orphan("Catch", body, value)), ((b.log(b.inp),),)),
+                Case((Orphan("Matching", body, value),), ((b.log(b.inp),),)),
+                If((("If", None, (b.log(b.inp), Orphan("Else", body, value))),)),
+                Each((Orphan("Else", body, value),)),
+            )
+        )
+    if kind == "disabled-branch-line":
+        arms: tuple[Arm, ...] = (("If", None, (b.log(b.inp),)), ("Else", None, body))
+        return If(arms, rng.choice(_IF_FORMS[1:]), off_arm=0)
+    if kind == "nested-line":
+        return Nested(body)
+    if kind == "block-label":
+        # A Block whose label is itself a writing statement.
+        label = _leaf_data(b.clone(b.new, b.out), b.inp.name)
+        assert label is not None
+        return Block(body, label, havoc=True)
     if kind == "stray":
         # A bodyless branch marker inside a construct that cannot continue it: the importer adopts
         # it and renders it after the construct, with its scope lost.
@@ -994,6 +1098,10 @@ _KINDS = (
     "off-unsure",
     "orphan",
     "stray",
+    "disabled-marker",
+    "disabled-branch-line",
+    "nested-line",
+    "block-label",
 )
 
 
@@ -1195,6 +1303,102 @@ def _seed_shapes() -> Iterator[Shape]:
             SendS(_OUT, "OB_OUT"),
         ),
     )
+    # Under the narrowing nothing binds inside a construct, so what a ForEach or Catch line may
+    # bind matters most for the INPUT before the first bind: a loop that rebinds it, then a clone of
+    # it, would copy the message that arrived instead of what the loop left there.
+    for name in ("ADT", "%ADT", "%adt"):
+        for cls in ("", "plain", "verbless", "variable", "literal", "handle"):
+            over = H(name, cls)
+            form = "elem" if cls == "verbless" else "line"
+            after: tuple[Node, ...] = (
+                Clone(_ADT, _OUT, 1),
+                SendS(_OUT, "OB_OUT"),
+                SendS(_ADT, "OB_IN"),
+            )
+            yield Shape(
+                f"input-rebound-by-foreach-{name}-{cls or 'span'}",
+                "%ADT",
+                (Each((Log(_P),), over, form), *after),
+            )
+            if cls not in ("verbless",):
+                yield Shape(
+                    f"input-rebound-by-catch-{name}-{cls or 'span'}",
+                    "%ADT",
+                    (Try((Log(_P),), ((Log(_P),),), over, "wrapper"), *after),
+                )
+    # The HIGH with msg in the loose branch: step 1 kept that send under its placeholder.
+    in_sent: tuple[Node, ...] = (SendS(_ADT, "OB_IN"),)
+    for form in _IF_FORMS:
+        yield Shape(
+            f"d26545d6f-high-msg-1-{form}",
+            "%ADT",
+            (If((("If", _ADT, (Log(_P),)), ("Else", None, in_sent)), form),),
+        )
+        yield Shape(
+            f"d26545d6f-high-msg-2-{form}",
+            "%ADT",
+            (If((("If", None, ()), ("ElseIf", _ADT, in_sent)), form),),
+        )
+    for form in _TRY_FORMS:
+        yield Shape(
+            f"d26545d6f-high-msg-3-{form}", "%ADT", (Try((Log(_P),), (in_sent,), _ERR, form),)
+        )
+    # The code review of this branch (round 2): shapes that passed the guard as it then was.
+    new_sent: tuple[Node, ...] = (Create(_NEW, 4), SendS(_NEW, "OB_NEW"))
+    for value in ("1", "on"):
+        yield Shape(
+            f"review-disabled-catch-{value}",
+            "%ADT",
+            (Try((Log(_P), Orphan("Catch", new_sent, value)), ()),),
+        )
+        yield Shape(
+            f"review-disabled-matching-{value}",
+            "%ADT",
+            (Case((Orphan("Matching", new_sent, value),), ((Log(_P),),)),),
+        )
+        yield Shape(
+            f"review-disabled-else-{value}",
+            "%ADT",
+            (If((("If", None, (Log(_P), Orphan("Else", new_sent, value))),)),),
+        )
+    yield Shape(
+        "review-exit-then-build-and-send",
+        "%ADT",
+        (Log(_ADT), Exit(), Create(_OUT, 4), SendS(_OUT, "OB_OUT")),
+    )
+    yield Shape("review-nested-line", "%ADT", (Nested(new_sent),))
+    for form in _IF_FORMS[1:]:
+        yield Shape(
+            f"review-disabled-if-line-{form}",
+            "%ADT",
+            (If((("If", None, (Log(_P),)), ("Else", None, (SendS(_ADT, "OB_IN"),))), form, 0),),
+        )
+    yield Shape(
+        "review-verbless-foreach",
+        "%ADT",
+        (
+            Create(_OUT, 4),
+            Each((SendS(_OUT, "OB_LOOP"),), H("OUT", "verbless")),
+            SendS(_OUT, "OB_AFTER"),
+        ),
+    )
+    label = _leaf_data(Clone(_NEW, _OUT, 9), "%ADT")
+    assert label is not None
+    yield Shape(
+        "review-block-label-writes",
+        "%ADT",
+        (Create(_OUT, 4), Block((SendS(_OUT, "OB_OUT"),), label, havoc=True)),
+    )
+    for cls in ("variable", "literal"):
+        yield Shape(
+            f"review-foreach-span-class-{cls}",
+            "%ADT",
+            (
+                Clone(_ADT, _OUT, 1),
+                Each((SendS(_OUT, "OB_LOOP"),), H("OUT", cls), "line"),
+                SendS(_OUT, "OB_AFTER"),
+            ),
+        )
     # The existing hostile spellings, each cloned, called over and sent.
     for name in ("%OUT-", "%ÄÖ-ß.x", "%OUT(1)", "%OUT;A", "%_", "%1OUT"):
         h = H(name)

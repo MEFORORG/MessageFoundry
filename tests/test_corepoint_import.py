@@ -1632,8 +1632,13 @@ def test_a_msgcreate_into_the_input_handle_raises() -> None:
 
 
 def test_a_catch_cannot_swallow_a_refused_msgcreate(tmp_path: Path) -> None:
-    """A refused MsgCreate raises like a refused send, so the Try gains the same re-raise arm."""
-    body = "<Try><List>" + _create("%NEW") + '<Line Data="Catch"/>' + "</List></Try>"
+    """A refused MsgCreate raises like a refused send, so the Try gains the same re-raise arm. The
+    MsgCreate builds the input handle, which is refused wherever it sits: a ``MsgCreate`` of any
+    other handle inside a Try binds nothing under the narrowing and stays a TODO (ADR 0086)."""
+    create = _role_line(
+        _span("keyword", "MsgCreate") + " " + _span("input-handle", "%ADT") + _ADT_A04
+    )
+    body = "<Try><List>" + create + '<Line Data="Catch"/>' + "</List></Try>"
     src = _handler_body(_handler_source(body))
     assert src.index("except NotImplementedError:") < src.index("except Exception:")
     with pytest.raises(NotImplementedError, match="MsgCreate"):
@@ -1653,9 +1658,10 @@ def test_a_send_before_its_clone_fails_loudly(tmp_path: Path) -> None:
 
 
 def test_a_clone_on_one_branch_is_unbound_after_the_join(tmp_path: Path) -> None:
-    """A clone made inside a branch delivers there, but after the join the handle may hold nothing,
-    so a send of it refuses. Bound before a branch that does not touch it, the same send delivers
-    (the control arm)."""
+    """A clone made inside a branch binds nothing (the narrowing, ADR 0086), so neither a send in
+    the branch nor one after it delivers it. Bound before a branch that does not touch it, a send
+    neither inside nor after the branch delivers it either: the branch is the first construct
+    after a bind, so it unbinds every handle. The straight-line control delivers."""
     branch = (
         '<If Data="If (a)"><List>'
         + _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
@@ -1664,7 +1670,7 @@ def test_a_clone_on_one_branch_is_unbound_after_the_join(tmp_path: Path) -> None
     )
     body = branch + _role_send("other-handle", "%OUT", "OB_AFTER")
     src = _handler_body(_handler_source(body))
-    assert '        sends.append(Send("OB_IN_BRANCH", out_msg))' in src
+    assert 'Send("OB_IN_BRANCH"' not in src
     assert 'Send("OB_AFTER"' not in src
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_AFTER:' in src
     with pytest.raises(NotImplementedError, match="MsgSend to OB_AFTER"):
@@ -1675,8 +1681,10 @@ def test_a_clone_on_one_branch_is_unbound_after_the_join(tmp_path: Path) -> None
         _CLONE_OUT + untouched + "</List></If>" + _role_send("other-handle", "%OUT", "OB_AFTER")
     )
     control_src = _handler_body(_handler_source(control))
-    assert '    sends.append(Send("OB_AFTER", out_msg))' in control_src
-    assert "raise NotImplementedError" not in control_src
+    assert 'Send("OB_IN_BRANCH"' not in control_src
+    assert 'Send("OB_AFTER"' not in control_src
+    straight = _handler_body(_handler_source(_CLONE_OUT + _SEND_OUT))
+    assert '    sends.append(Send("OB_OUT", out_msg))' in straight
 
 
 def test_a_handle_rebound_inside_a_branch_is_unbound_after_the_join() -> None:
@@ -1726,7 +1734,8 @@ def test_a_handle_overwritten_on_one_branch_is_unbound_after_the_join() -> None:
 
 def test_a_loop_body_cannot_trust_a_handle_it_overwrites() -> None:
     """A later pass may start from what an earlier pass overwrote. A send at the top of the body of
-    a handle the body later overwrites refuses; one after a clone in the same pass delivers."""
+    a handle the body later overwrites refuses. Under the narrowing (ADR 0086) a clone inside the
+    loop binds nothing, so a send after it in the same pass refuses too."""
     overwrite = _tree_copy(
         _span("variable", "$saved"), _span("other-handle", "%OUT") + _span("path", "/")
     )
@@ -1751,8 +1760,8 @@ def test_a_loop_body_cannot_trust_a_handle_it_overwrites() -> None:
             + "</List></Foreach>"
         )
     )
-    assert '        sends.append(Send("OB_FRESH", out_msg))' in fresh
-    assert "raise NotImplementedError" not in fresh
+    assert 'Send("OB_FRESH"' not in fresh
+    assert "raise NotImplementedError" in fresh
 
 
 def test_a_flat_msgsend_of_the_input_sends_msg() -> None:
@@ -1996,10 +2005,10 @@ def test_a_markup_free_write_lands_on_the_handle_it_addresses() -> None:
 
 
 def test_a_try_with_no_catch_keeps_what_its_body_bound() -> None:
-    """No Catch renders as ``except Exception: raise``, so the code after it runs only when the body
-    completed: a clone made in the body is bound there."""
+    """Under the narrowing (ADR 0086) a clone inside a Try binds nothing, with or without a Catch,
+    so a send after it refuses either way."""
     body = _handler_body(_handler_source("<Try><List>" + _CLONE_OUT + "</List></Try>" + _SEND_OUT))
-    assert '    sends.append(Send("OB_OUT", out_msg))' in body
+    assert 'Send("OB_OUT"' not in body
     with_catch = _handler_body(
         _handler_source(
             "<Try><List>" + _CLONE_OUT + '<Line Data="Catch"/></List></Try>' + _SEND_OUT
@@ -2313,17 +2322,16 @@ def test_no_handle_spelling_sends_a_clone_made_before_a_call(handle: str) -> Non
 
 def test_a_call_that_only_reads_leaves_the_input_bound() -> None:
     """The control for the input: a call whose list only reads leaves the input as msg, whatever
-    it passes, while a clone made before the same call is unknown after it."""
-    body = _handler_body(
-        _handler_source(
-            _CLONE_OUT
-            + _call_of(" pass %ADT", _MSGLOG_P)
-            + _role_send("input-handle", "%ADT", "OB_IN")
-            + _SEND_OUT
-        )
-    )
+    it passes. A clone made before the same call is unknown after it, and so is the input then:
+    the call is the first construct after a bind (the narrowing, ADR 0086)."""
+    send_in = _role_send("input-handle", "%ADT", "OB_IN")
+    body = _handler_body(_handler_source(_call_of(" pass %ADT", _MSGLOG_P) + send_in))
     assert '    sends.append(Send("OB_IN", msg))' in body
-    assert 'Send("OB_OUT"' not in body
+    cloned = _handler_body(
+        _handler_source(_CLONE_OUT + _call_of(" pass %ADT", _MSGLOG_P) + send_in + _SEND_OUT)
+    )
+    assert 'Send("OB_IN"' not in cloned
+    assert 'Send("OB_OUT"' not in cloned
 
 
 _A04 = "as &quot;ADT^A04&quot; version &quot;2.5.1&quot;"
@@ -2925,7 +2933,7 @@ def test_a_called_lists_input_is_not_the_callers_msg() -> None:
         )
     )
     assert 'set_field(msg, "MSH-6", "SUB")' not in body
-    assert "    p_msg = Message.parse(" in body  # bound inside the list's own scope
+    assert "p_msg = Message.parse(" not in body  # inside a call nothing binds (ADR 0086)
     assert 'Send("OB_P"' not in body and 'Send("OB_IN"' not in body
 
 
@@ -3468,12 +3476,16 @@ def test_else_under_a_dead_condition_is_not_emitted_as_a_live_branch() -> None:
 
 def test_a_send_statement_keeps_its_nested_body() -> None:
     """The ``send`` path returned only the ``Send`` and dropped ``*body`` — unlike ``break``/``exit``
-    beside it, which have always carried theirs."""
+    beside it, which have always carried theirs. The body is kept as an unmodelled element's body
+    (its scope is not modelled), so it renders, and no handle is vouched for inside it: the write
+    to the input is a TODO naming its target."""
     send = _role_send("input-handle", "%ADT", "OB_A")
     assert send.endswith("/>")
     src = _handler_source(send[:-2] + '><List><Line Data="ItemClear %ADT/PID-19"/></List></Line>')
     assert 'sends.append(Send("OB_A", msg))' in src
-    assert 'set_field(msg, "PID-19", "")' in src
+    assert "a statement carrying a nested list" in src
+    assert "intended target PID-19" in src
+    assert 'set_field(msg, "PID-19", "")' not in src
     ast.parse(src)
 
 
@@ -3592,13 +3604,14 @@ def test_a_branch_whose_construct_names_a_handle_stays_a_branch(export: str) -> 
     assert "elif False:" in body or "    except Exception:" in body
 
 
-def test_a_send_where_the_scope_was_lost_raises_unless_step1_sent_msg() -> None:
+def test_a_branch_marker_with_no_construct_stops_binding() -> None:
     """A branch marker with no construct inlines what follows it, which Corepoint may never have
-    run. A send there of a message the list built raises; a send of msg stays as step 1 had it."""
+    run. From the marker on nothing binds (the narrowing, ADR 0086), so a send of a message built
+    after it raises, while a send of msg stays as step 1 had it."""
     lost = '<Block Data="Section"><List>' + _ELSE + _NEW_SENT + _SEND_INPUT + "</List></Block>"
     body = _handler_body(_handler_source(_WRITE_INPUT + lost))
     assert 'Send("OB_NEW"' not in body
-    assert "where the import lost the export's scope" in body
+    assert "new_msg = Message.parse(" not in body
     assert '    sends.append(Send("OB_IN", msg))' in body
 
 
@@ -3632,10 +3645,13 @@ def test_a_foreach_or_catch_naming_a_handle_in_any_spelling_unbinds_it(line: str
 
 def test_a_foreach_over_a_path_with_a_variable_still_reads() -> None:
     """The control for the word rule: ``ForEach %ADT/OBX $obx`` names a path into a handle and a
-    variable, neither a whole tree, so a clone made before it is still sent after it."""
+    variable, neither a whole tree, so the input is still msg after it. (A clone made before it is
+    not: the loop is the first construct after a bind, ADR 0086.)"""
     loop = '<Foreach Data="ForEach %ADT/OBX $obx"><List>' + _MSGLOG_P + "</List></Foreach>"
-    body = _handler_body(_handler_source(_CLONE_OUT + loop + _SEND_OUT))
-    assert '    sends.append(Send("OB_OUT", out_msg))' in body
+    body = _handler_body(_handler_source(loop + _SEND_INPUT))
+    assert '    sends.append(Send("OB_IN", msg))' in body
+    named = '<Foreach Data="ForEach ADT in %SRC/OBX"><List>' + _MSGLOG_P + "</List></Foreach>"
+    assert 'Send("OB_IN"' not in _handler_body(_handler_source(named + _SEND_INPUT))
 
 
 def test_a_try_holding_a_nested_try_is_not_a_branch_group_wrapper() -> None:
