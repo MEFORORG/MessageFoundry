@@ -228,14 +228,17 @@ operating system's own proxy settings, `proxy_url = "default"` and an explicit `
 lookup. So it covers exactly the hosts the guards call on-box, and a host they call off-box is left
 to the proxy. The guards refuse a cleartext hop to such a host, so none is a hop the engine judged
 on-box. It is also a rule of the engine's `urllib` openers only. A client built on another HTTP
-library is outside it.
+library is outside it: the operator API client and the `tee` tool follow the environment proxy even
+for a loopback address.
 
 - **`ProxyConfig.for_host` returns `None` for a loopback target**, as it does for a `proxy_no_proxy`
   match. The opener would dial that host direct anyway, so the pre-emptive `Proxy-Authorization`
   header must not be attached: on a direct request it would go to the destination. This narrows
   the #128 bypass text above by one case that needs no list entry. The skipped proxy is logged at
-  INFO. One adjacent case that predates this amendment is not closed here. It is a follow-up
-  recorded for the maintainer ledger.
+  INFO. **Not covered:** urllib's own bypass list (`NO_PROXY`, or the system's override list) can
+  also send a request direct, and `for_host` does not read that list. A proxy credential header
+  can still accompany such a request. That predates this amendment and is a follow-up recorded
+  for the maintainer ledger.
 - **The ECH sidecar opener passes `ProxyHandler({})`**, so that hop uses no proxy at all. The
   token-endpoint hop is re-addressed to the same sidecar on the token provider's opener, which
   does read the environment, so there the loopback rule is what keeps it direct. For that to hold,

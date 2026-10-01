@@ -1115,7 +1115,8 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > **This is a rule of the engine's own `urllib` openers**: at least the HTTP family and its token
 > endpoints, the alert webhook, the OIDC legs and the AI broker. A client built on another HTTP
 > library is outside it. Of those, the Vault clients refuse a loopback `http://` Vault behind a proxy
-> rather than bypass it (see `[secrets]`).
+> rather than bypass it (see `[secrets]`). The operator API client and the `tee` tool follow the
+> environment proxy even for a loopback engine address.
 >
 > **`tls_hop_attested` is a per-connection declaration, set with `tls_hop_attested_reason`** (owner
 > ruling 2026-09-24). It is a keyword on `inbound()` / `outbound()` / `FhirLookup()` /

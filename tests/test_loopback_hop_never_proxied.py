@@ -346,6 +346,9 @@ def test_the_public_bypass_predicate_agrees_with_the_transport() -> None:
     assert not rest.proxy_bypasses_host("partner.invalid:8080", None)
     assert not rest.proxy_bypasses_host("[2001:db8::1]:8080", None)
     assert not rest.proxy_bypasses_host("localhost ", None)
+    assert not rest.proxy_bypasses_host("partner.invalid", None)
+    assert not rest.proxy_bypasses_host("", None)
+    assert not rest.proxy_bypasses_host(None, None)
 
 
 def test_the_static_credential_report_lists_no_proxy_hop_for_a_loopback_target() -> None:
@@ -363,6 +366,3 @@ def test_the_static_credential_report_lists_no_proxy_hop_for_a_loopback_target()
         "OB", settings, None, targets=["http://127.0.0.1:18080/x", "https://partner.invalid/x"]
     )
     assert hop is not None and hop.name == "proxy:OB"
-    assert not rest.proxy_bypasses_host("partner.invalid", None)
-    assert not rest.proxy_bypasses_host("", None)
-    assert not rest.proxy_bypasses_host(None, None)
