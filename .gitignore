@@ -6,6 +6,8 @@ venv/
 *.egg-info/
 build/
 dist/
+# scripts/ci/invariant_mutations.py saves an engine file here while a break is applied (BACKLOG #1746).
+*.invariant-mutation-backup
 
 # Exception: a vendored GitHub Action's compiled output belongs in the repo, not a build artifact.
 # Without this, `dist/` above silently drops .github/actions/cla-assistant-lite/dist/index.js from

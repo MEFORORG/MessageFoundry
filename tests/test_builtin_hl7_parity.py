@@ -419,6 +419,8 @@ def test_whole_field_vs_component_semantics() -> None:
         ("PID-5.1", "DOE"),
         ("PID-5.2", "JANE"),
     ]
+    # The seven AC-2 cases above; dropping one would quietly narrow what this test checks.
+    assert len(cases) >= 7, f"only {len(cases)} AC-2 cases left: {cases}"
     peek = Peek.parse(msg)
     failures = [
         f"Peek.field({path!r}): got={peek.field(path)!r} expected-doc={want!r}"
