@@ -522,7 +522,7 @@ the construction gate had to remember to pass one. Now a caller that forgets is 
 needs the escape on a `warn` instance passes that posture.
 
 **`ad_allow_insecure_ldap` is clamped (vault BACKLOG #2354).** Under `enforce` it is inert, as
-every other weakened-TLS escape is. CORRECTED: the list below named it as still open, waiting on
+`MEFOR_ALLOW_INSECURE_TLS` is. CORRECTED: the list below named it as still open, waiting on
 engine PR 1877.
 
 **Still open after this census.** At least these:

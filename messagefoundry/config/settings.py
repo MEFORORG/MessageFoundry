@@ -2426,6 +2426,16 @@ class RetentionSettings(_Section):
         return self._parse_clock(self.vacuum_at) if self.vacuum_at else None
 
 
+def is_ldaps_address(server: str) -> bool:
+    """Whether an ``[auth].ad_server`` value names an LDAPS endpoint (vault BACKLOG #2354).
+
+    The scheme ``ldaps://`` and nothing looser. A bare host such as ``ldapsrv01.corp.example`` starts
+    with ``ldaps`` too, but ldap3 dials it on 389 with no TLS, so a prefix test without ``://`` would
+    take a cleartext bind for an encrypted one. ``AuthSettings`` and ``LdapAuthenticator`` both read
+    this, so the settings refusal and the TLS the authenticator builds agree on what is plain."""
+    return server.lower().startswith("ldaps://")
+
+
 def split_kerberos_spn(spn: str) -> tuple[str, str]:
     """Split ``[auth].kerberos_spn`` into ``(service, hostname)`` for pyspnego (BACKLOG #275).
 
@@ -2674,7 +2684,8 @@ class AuthSettings(_Section):
     ad_tls_ca_cert_pin: str | None = None
     # Explicit opt-in to a non-ldaps:// bind (trusted-net dev). Honoured only under
     # [security].enforcement = warn, and named as a loosening there (vault BACKLOG #2354). Under enforce it
-    # is inert: ServiceSettings refuses the plain bind at load, like every other weakened-TLS escape.
+    # is inert: ServiceSettings refuses the plain bind at load, as the MEFOR_ALLOW_INSECURE_TLS escape is
+    # inert there.
     ad_allow_insecure_ldap: bool = False
     # Finite network timeouts for EVERY ldap3 Server/Connection the authenticator builds (ASVS 13.1.3).
     # ldap3's own defaults are None on both, and the engine never calls socket.setdefaulttimeout, so
@@ -3185,14 +3196,13 @@ class AuthSettings(_Section):
 
     @property
     def plain_ldap_bind(self) -> bool:
-        """Whether AD is on and binds over plain ``ldap://`` rather than LDAPS.
+        """Whether AD is on and its ``ad_server`` is not an LDAPS address (vault BACKLOG #2354).
 
-        One definition for the three readers: the opt-in check below, the ``enforce`` refusal in
-        :class:`ServiceSettings`, and :func:`security_loosenings` (vault BACKLOG #2354)."""
+        Read by at least the opt-in check below, the ``enforce`` refusal in :class:`ServiceSettings`
+        and :func:`security_loosenings`. The scheme test is :func:`is_ldaps_address`, which
+        ``LdapAuthenticator`` shares."""
         return (
-            self.ad_enabled
-            and self.ad_server is not None
-            and not self.ad_server.lower().startswith("ldaps://")
+            self.ad_enabled and self.ad_server is not None and not is_ldaps_address(self.ad_server)
         )
 
     @model_validator(mode="after")
@@ -3203,7 +3213,8 @@ class AuthSettings(_Section):
         if self.plain_ldap_bind and not self.ad_allow_insecure_ldap:
             raise ValueError(
                 "ad_enabled requires an ldaps:// ad_server (credentials go over a SIMPLE bind); "
-                "set ad_allow_insecure_ldap=true only for a trusted-network dev override"
+                "ad_allow_insecure_ldap=true overrides this only under [security].enforcement = warn, "
+                "for a trusted-network dev box"
             )
         if self.ad_enabled and self.ad_bind_dn is None:
             raise ValueError("ad_enabled requires a service account: ad_bind_dn")
@@ -5706,20 +5717,26 @@ class ServiceSettings(BaseModel):
         """Under ``[security].enforcement = enforce``, ``[auth].ad_allow_insecure_ldap`` is inert, so a
         plain ``ldap://`` AD bind is refused (vault BACKLOG #2354).
 
-        Every other weakened-TLS escape is clamped this way (ADR 0092 decision 2, and
+        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way (ADR 0092 decision 2, and
         ``weakened_tls_escape_permitted``). This one was honoured at any dial, so on a first deployment
         at the shipped ``enforce`` it would have sent the service-account and user passwords over a
         cleartext SIMPLE bind. The dial and the bind live in different sections, so the check lives
         here, where the existing ``ldap://`` check already runs at load. ``LdapAuthenticator`` repeats
         it at build for a caller that hands it an ``AuthSettings`` alone. Under ``warn`` the opt-in is
-        honoured, warned at build and named by :func:`security_loosenings`."""
+        honoured, warned at build and named by :func:`security_loosenings`.
+
+        Not keyed on ``[auth].enabled``: with sign-in off nothing dials the directory, but turning
+        sign-in on would make the bind live with no second check, so the config is refused either way.
+        A loopback ``ldap://`` (an on-box LDAPS proxy) is refused too; the cleartext-hop gradient's
+        loopback ALLOW was not extended to this hop."""
         if self.auth.plain_ldap_bind and self.security.enforcement is SecurityEnforcement.ENFORCE:
             raise ValueError(
-                "[auth].ad_server is a plain ldap:// address, and [auth].ad_allow_insecure_ldap is "
+                "[auth].ad_server is not an ldaps:// address, and [auth].ad_allow_insecure_ldap is "
                 "inert under [security].enforcement = enforce: the service-account and user passwords "
-                "would cross the network in cleartext. Use an ldaps:// ad_server (anchor an internal CA "
-                "with ad_tls_ca_cert_file). For a trusted-network dev box only, set "
-                "[security].enforcement = warn"
+                "would cross the network in cleartext. Use an ldaps:// ad_server, and anchor an "
+                "internal CA with ad_tls_ca_cert_file if the directory needs one. The opt-in is "
+                "honoured only under enforcement = warn, and that relaxes every serve gate, not only "
+                "this one"
             )
         return self
 
@@ -6934,8 +6951,10 @@ def security_loosenings(
         )
     # Vault BACKLOG #2354: a plain ldap:// AD bind. ServiceSettings refuses it at load under enforce, so a
     # loaded config reaches this only at warn. Conditional on the bind being live: the flag beside an
-    # ldaps:// address, or with AD off, changes nothing and is not named.
-    if auth.plain_ldap_bind and auth.ad_allow_insecure_ldap:
+    # ldaps:// address, with AD off, or with sign-in off (nothing builds the authenticator) changes
+    # nothing and is not named. Sign-in is read off [security], as for the limiter entries below, so
+    # `security set` turning it on shows this at once.
+    if sec.require_sign_in and auth.plain_ldap_bind and auth.ad_allow_insecure_ldap:
         out.append(
             (
                 "ad_allow_insecure_ldap",

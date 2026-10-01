@@ -540,7 +540,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 
 ### `[auth].ad_allow_insecure_ldap = true` **with a plain `ldap://` `ad_server`** — AD binds in cleartext
 > **Conditional**, and reachable only at `[security].enforcement = warn`. Under `enforce` the switch is
-> inert and the config is refused at load, like every other weakened-TLS escape (vault BACKLOG #2354).
+> inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
+> #2354). A loopback `ldap://` address is refused too.
 > Beside an `ldaps://` address, or with `ad_enabled = false`, it changes nothing and is not reported.
 - **What you lose:** the encryption and the server authentication on the AD hop. Both binds are SIMPLE
   binds, so the service-account password and the password of every user who signs in or steps up cross

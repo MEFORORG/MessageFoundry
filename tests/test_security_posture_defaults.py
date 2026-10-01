@@ -38,6 +38,7 @@ from messagefoundry.config.settings import (
     load_settings,
     security_loosenings,
 )
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline import Engine
 
 
@@ -86,6 +87,27 @@ def _names(
             audit_chain_unkeyed=None,
         )
     ]
+
+
+def _risks(sec: SecuritySettings, auth: AuthSettings) -> dict[str, str]:
+    """Switch name -> risk text, for a [security] and [auth] pair with every other input at default."""
+    return dict(
+        security_loosenings(
+            sec,
+            StoreSettings(),
+            auth,
+            AlertsSettings(),
+            SecretRotationSettings(),
+            cleartext_hops=(),
+            expiry_relaxed_hops=(),
+            unverified_db_hops=(),
+            attested_hops=(),
+            revocation_attested_hops=(),
+            api=ApiSettings(),
+            store_privilege=None,
+            audit_chain_unkeyed=None,
+        )
+    )
 
 
 # --- the shipped defaults themselves ---------------------------------------------------------
@@ -1048,7 +1070,7 @@ def test_the_plaintext_hop_acknowledgement_is_not_reported_when_a_cert_serves_th
 
 # --- [auth].ad_allow_insecure_ldap: inert under enforce (vault BACKLOG #2354) -------------------
 #
-# Every other weakened-TLS escape is clamped under [security].enforcement = enforce. This one used to be
+# The MEFOR_ALLOW_INSECURE_TLS escape is clamped under [security].enforcement = enforce. This one used to be
 # honoured at any dial, so on a first deployment it would have sent both passwords over a cleartext
 # SIMPLE bind. The enforce arm is the one the clamp exists for; the warn arm is the control that shows
 # the same config loads when only the dial moves, so the refusal is keyed on the dial.
@@ -1084,24 +1106,25 @@ def test_plain_ldap_with_the_opt_in_loads_under_warn_and_is_named(tmp_path: Path
     """The control arm: the same config, with only the dial moved, loads and is reported."""
     settings = _load_plain_ldap(tmp_path, "warn")
     assert settings.auth.plain_ldap_bind is True
-    named = dict(
-        security_loosenings(
-            settings.security,
-            settings.store,
-            settings.auth,
-            settings.alerts,
-            settings.secret_rotation,
-            cleartext_hops=(),
-            expiry_relaxed_hops=(),
-            unverified_db_hops=(),
-            attested_hops=(),
-            revocation_attested_hops=(),
-            api=settings.api,
-            store_privilege=None,
-            audit_chain_unkeyed=None,
-        )
+    assert "cleartext" in _risks(settings.security, settings.auth)["ad_allow_insecure_ldap"]
+
+
+def test_a_bare_host_with_no_scheme_is_a_plain_bind(tmp_path: Path) -> None:
+    """ldap3 dials a scheme-less host on 389 with no TLS, even one whose name starts with "ldaps"."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(
+        _PLAIN_LDAP_AUTH.replace("ldap://dc.test.invalid:389", "ldapsrv01.test.invalid"),
+        encoding="utf-8",
     )
-    assert "cleartext" in named["ad_allow_insecure_ldap"]
+    with pytest.raises(ValueError, match="ad_allow_insecure_ldap is inert under"):
+        load_settings(config_path=path, environ=_BIND_ENV)
+
+
+def test_the_opt_in_with_sign_in_off_is_not_named() -> None:
+    """Nothing builds the authenticator with sign-in off, so there is no live bind to report."""
+    auth = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True)
+    assert "ad_allow_insecure_ldap" in _risks(SecuritySettings(), auth)
+    assert "ad_allow_insecure_ldap" not in _risks(SecuritySettings(require_sign_in=False), auth)
 
 
 def test_an_ldaps_server_under_enforce_still_loads(tmp_path: Path) -> None:
@@ -1128,6 +1151,35 @@ def test_the_authenticator_refuses_a_plain_bind_at_the_enforcing_default() -> No
         LdapAuthenticator(auth)
     with pytest.raises(LdapError, match="inert under"):
         LdapAuthenticator(auth, enforcing=True)
+    # Either dial input saying enforce refuses: a known enforcing posture wins over enforcing=False.
+    with pytest.raises(LdapError, match="inert under"):
+        LdapAuthenticator(auth, enforcing=False, posture=HopPosture(enforcing=True))
+    # A bare host that starts with "ldaps" is still a plain bind.
+    with pytest.raises(LdapError, match="inert under"):
+        LdapAuthenticator(_ad(ad_server="ldapsrv01.test.invalid", ad_allow_insecure_ldap=True))
+
+
+def test_a_refused_plain_bind_never_resolves_the_bind_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal runs before the secret fetch, so a build about to refuse holds no password."""
+    from messagefoundry.auth import ldap as ldap_module
+
+    calls: list[object] = []
+    monkeypatch.setattr(ldap_module, "resolve_connector_secret", lambda *a, **k: calls.append(a))
+    auth = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True)
+    with pytest.raises(ldap_module.LdapError, match="inert under"):
+        ldap_module.LdapAuthenticator(auth)
+    assert calls == []
+
+
+def test_the_authenticator_wants_the_opt_in_even_with_ad_off() -> None:
+    """AuthSettings checks the opt-in only while ad_enabled; a direct build must not assume it."""
+    from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
+
+    auth = _ad(ad_enabled=False, ad_server="ldap://dc.test.invalid:389")
+    with pytest.raises(LdapError, match="needs ad_allow_insecure_ldap"):
+        LdapAuthenticator(auth, enforcing=False)
 
 
 def test_the_authenticator_honours_a_plain_bind_under_warn_and_says_so(
@@ -2044,13 +2096,13 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "password_check_context",
         "password_check_username",
         "password_check_breached",
+        # REPORTED, so not an owed gap: named only with a live ldap:// bind, which this loop's lone
+        # flip never builds (ad_enabled stays off). The plain-LDAP section above pins it (#2354).
+        "ad_allow_insecure_ldap",
         # Security-relevant and gated ELSEWHERE, not by this registry — same owed note as [store].
         "enabled",  # the serve-time exposed-gates refuse an exposed auth-off instance outright
         "require_mfa",  # refused at exposure by the __main__ posture gates
         "ad_tls_verify",  # gated by weakened_tls_escape_permitted
-        # Reported, but only with a live ldap:// bind, which this loop's lone flip never builds
-        # (ad_enabled stays off). The plain-LDAP section above pins that it is named (#2354).
-        "ad_allow_insecure_ldap",
         "oidc_require_mfa_claim",  # gated by the OIDC serve gate
         # phi_read_rate_limit_enabled and admin_write_rate_limit_enabled left this set when
         # BACKLOG #1131 (E17) began naming them; the loop below now pins that they are reported.
