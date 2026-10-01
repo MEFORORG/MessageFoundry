@@ -165,7 +165,7 @@ suite("liveDebug namedElements", () => {
 
 suite("liveDebug buildLiveLenses", () => {
   test("router routing lens + inbound disposition lens + sole-handler send count", () => {
-    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summarize([row({})]), "adt_a01.hl7");
+    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summarize([row({})]), "adt_a01.hl7", false);
     const byLine = new Map(lenses.map((l) => [l.line, l.title]));
     assert.ok(byLine.get(2)?.includes("adt_a01.hl7: RECEIVED"), `inbound lens: ${byLine.get(2)}`);
     assert.ok(byLine.get(5)?.includes("routed → [acme_adt_handler]"), `router lens: ${byLine.get(5)}`);
@@ -177,7 +177,7 @@ suite("liveDebug buildLiveLenses", () => {
     const summary = summarize([
       row({ handlers: ["acme_adt_handler", "other_handler"], deliveries: [{ to: "A" }, { to: "B" }] }),
     ]);
-    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summary, "adt.hl7");
+    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summary, "adt.hl7", false);
     const byLine = new Map(lenses.map((l) => [l.line, l.title]));
     assert.ok(byLine.get(5)?.includes("routed → [acme_adt_handler, other_handler]"));
     assert.ok(!byLine.has(9), "no send-count lens when >1 handler ran (ambiguous attribution)");
@@ -185,7 +185,7 @@ suite("liveDebug buildLiveLenses", () => {
 
   test("unrouted run renders 'routed → (nowhere)'", () => {
     const summary = summarize([row({ handlers: [], deliveries: [], disposition: "UNROUTED" })]);
-    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summary, "x.hl7");
+    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summary, "x.hl7", false);
     const byLine = new Map(lenses.map((l) => [l.line, l.title]));
     assert.ok(byLine.get(5)?.includes("routed → (nowhere)"));
   });
@@ -467,6 +467,25 @@ suite("LiveDebugController per-run reveal (ASVS 14.2.6, vault BACKLOG #1187)", (
       release();
       await reveal;
       assert.strictEqual(controller.isShowingValues(), false, "a superseded reveal must not land");
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a masked run's lens tooltip shows an error count, never the error text (ground d1)", async () => {
+    // The CLI's masked error is scrubbed, not removed: a lone identifier passes it whole.
+    const quoted = "unmapped patient 900123456";
+    const runner: TraceRunner = async () => [traceEntry({ disposition: "ERROR", error: quoted })];
+    const controller = new LiveDebugController(runner);
+    try {
+      await controller.runWith("/synthetic/adt.hl7", "/ws");
+      const masked = controller.lensesForText(CONFIG_TEXT).find((l) => l.line === 2);
+      assert.ok(masked?.tooltip?.startsWith("1 of 1 message(s) failed."), masked?.tooltip);
+      assert.ok(!masked?.tooltip?.includes(quoted), `masked tooltip quoted the error: ${masked?.tooltip}`);
+
+      await controller.runWith("/synthetic/adt.hl7", "/ws", true); // control: the revealed run
+      const shown = controller.lensesForText(CONFIG_TEXT).find((l) => l.line === 2);
+      assert.strictEqual(shown?.tooltip, `Errors: ${quoted}`);
     } finally {
       controller.dispose();
     }

@@ -12,7 +12,9 @@
 // run the user asks for by name (`messagefoundry.revealValuesOnce`, ASVS 14.2.6, vault BACKLOG #1187):
 // that run alone passes `--show-phi` to the CLI, and every later run is masked again. The reveal is never
 // a session state, so a run the user did not ask for never carries real values, and real values never
-// even leave the Python process otherwise. Samples must be synthetic (under messageSetsDir).
+// even leave the Python process otherwise. Samples must be synthetic (under messageSetsDir). The same
+// holds for the per-message error text: a masked run's lens tooltip shows only how many messages
+// failed, because the CLI's masked error is scrubbed rather than removed (vault BACKLOG #1187, d1).
 //
 // SCOPE (bounded by the CLI shape): each traced entry is ONE message and FLATTENS handler→delivery
 // attribution (top-level `sends` carry no `handler`). So a per-`@handler` Send count is only unambiguous
@@ -21,68 +23,36 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, isExecGated, messageSetsDir, runJson, workspaceDir } from "./cli";
-import { findElements, isConfigFile, type ElementKind } from "./editorToolbar";
+import { findElements, isConfigFile } from "./editorToolbar";
+import {
+  buildLiveLenses,
+  rowsFromTrace,
+  summarize,
+  type LiveDryRunRow,
+  type LiveLens,
+  type LiveTraceEntry,
+  type NamedElement,
+  type TraceInvocation,
+  type TraceValue,
+} from "./liveDebugModel";
 
-/**
- * The subset of a traced `dryrun` entry this lane reads for the v1 CodeLens summary — deliberately
- * minimal: only routing/disposition fields, NOT any body. Derived from a {@link LiveTraceEntry} via
- * {@link rowsFromTrace}, so the same fold ({@link summarize}) drives the summaries as before.
- */
-export interface LiveDryRunRow {
-  inbound: string;
-  disposition: string;
-  handlers: string[];
-  deliveries: { to: string }[];
-  error: string | null;
-}
-
-// --- traced dry-run schema (messagefoundry/pipeline/dryrun_trace.py, ADR 0072) -------------------
-// A JSON-safe captured value. Without --show-phi the CLI collapses every value to the string
-// "REDACTED"; with it, scalars pass through (strings/numbers/bools/null, length-capped upstream).
-export type TraceValue = string | number | boolean | null;
-
-/** One executed source line: the locals it (re)bound and the `msg[...]`/`msg.set(...)` writes it made. */
-export interface TraceEvent {
-  line: number; // 1-based (Python line number)
-  event: string; // always "line"
-  assigned?: Record<string, TraceValue>;
-  writes?: { path: string; value: TraceValue }[];
-}
-
-/** A live db_lookup/fhir_lookup that a pure preview cannot evaluate (raised + re-raised by the tracer). */
-export interface TraceAnnotation {
-  line: number | null; // 1-based Handler line the call was made on (or null → fall back to def_line)
-  kind: string; // "live_lookup_skipped"
-  call: string; // "db_lookup" | "fhir_lookup"
-}
-
-/** One Router/Handler invocation's execution trace. */
-export interface TraceInvocation {
-  kind: string; // "router" | "handler"
-  name: string;
-  module: string | null;
-  file: string | null; // absolute path of the module that defines the fn
-  def_line: number | null; // 1-based
-  events: TraceEvent[];
-  disposition: string;
-  sends: { outbound: string }[];
-  routed_to: string[];
-  annotations: TraceAnnotation[];
-  truncated?: boolean;
-}
-
-/** One traced message (one array element of `dryrun --trace json`). */
-export interface LiveTraceEntry {
-  source?: string;
-  path?: string;
-  inbound: string;
-  disposition: string;
-  handlers: string[];
-  sends: { outbound: string }[];
-  error: string | null;
-  trace_ok?: boolean;
-  invocations: TraceInvocation[];
-}
+// The pure half lives in liveDebugModel.ts so the unit suite can run it; re-export it so every
+// importer of this module keeps working unchanged.
+export {
+  buildLiveLenses,
+  inboundTooltip,
+  rowsFromTrace,
+  summarize,
+  type LiveDryRunRow,
+  type LiveLens,
+  type LiveSummary,
+  type LiveTraceEntry,
+  type NamedElement,
+  type TraceAnnotation,
+  type TraceEvent,
+  type TraceInvocation,
+  type TraceValue,
+} from "./liveDebugModel";
 
 /**
  * The spawn seam. The real runner shells the CLI; tests inject a canned trace-JSON runner (no live
@@ -116,24 +86,6 @@ export function buildTraceArgs(cfgDir: string, samplePath: string, showPhi: bool
 export const cliTraceRunner: TraceRunner = (samplePath, cwd, showPhi) =>
   runJson<LiveTraceEntry[]>(buildTraceArgs(configDir(), samplePath, showPhi), cwd);
 
-/** Project the v1 CodeLens fields out of the richer trace entries (the summary path is unchanged). */
-export function rowsFromTrace(entries: LiveTraceEntry[]): LiveDryRunRow[] {
-  return entries.map((e) => ({
-    inbound: e.inbound,
-    disposition: e.disposition,
-    handlers: e.handlers,
-    deliveries: e.sends.map((s) => ({ to: s.outbound })),
-    error: e.error,
-  }));
-}
-
-/** A config element located by line, with the name from its `("...")` argument (router/handler/inbound). */
-export interface NamedElement {
-  line: number; // 0-based
-  kind: ElementKind;
-  name: string | null;
-}
-
 const QUOTED_RE = /["']([^"']+)["']/;
 
 /**
@@ -147,106 +99,6 @@ export function namedElements(text: string): NamedElement[] {
     const m = QUOTED_RE.exec(lines[el.line] ?? "");
     return { line: el.line, kind: el.kind, name: m ? m[1] : null };
   });
-}
-
-/** A rendered summary, as plain data (line + label). The provider maps these to `vscode.CodeLens`. */
-export interface LiveLens {
-  line: number; // 0-based
-  title: string;
-  tooltip?: string;
-}
-
-/** The aggregate of one dry-run over a (possibly multi-message) sample — everything the lenses need. */
-export interface LiveSummary {
-  messageCount: number;
-  handlersUnion: string[]; // handler names selected across the run, first-seen order, de-duped
-  dispositions: [string, number][]; // disposition → count, first-seen order
-  totalSends: number; // total deliveries across every message
-  soleHandler: string | null; // the one handler name IFF exactly one distinct handler ran (else null)
-  errors: string[]; // distinct per-message error strings
-}
-
-/**
- * Fold a run's rows into a {@link LiveSummary}. `soleHandler` is set only when the entire run selected
- * exactly one distinct handler — the sole case in which `totalSends` is unambiguously that handler's,
- * given the CLI flattens handler→delivery attribution. Pure; unit-testable.
- */
-export function summarize(rows: LiveDryRunRow[]): LiveSummary {
-  const handlersUnion: string[] = [];
-  const seen = new Set<string>();
-  const dispCounts = new Map<string, number>();
-  let totalSends = 0;
-  const errors: string[] = [];
-  for (const r of rows) {
-    for (const h of r.handlers) {
-      if (!seen.has(h)) {
-        seen.add(h);
-        handlersUnion.push(h);
-      }
-    }
-    dispCounts.set(r.disposition, (dispCounts.get(r.disposition) ?? 0) + 1);
-    totalSends += r.deliveries.length;
-    if (r.error) {
-      errors.push(r.error);
-    }
-  }
-  return {
-    messageCount: rows.length,
-    handlersUnion,
-    dispositions: [...dispCounts.entries()],
-    totalSends,
-    soleHandler: seen.size === 1 ? handlersUnion[0] : null,
-    errors: [...new Set(errors)],
-  };
-}
-
-/**
- * Build the CodeLens summaries for one config document's elements against a run summary. Attaches the
- * disposition to inbound() lines, the routing decision to `@router` lines, and a Send count to a
- * `@handler` line ONLY when it is the run's sole handler (unambiguous). Pure; unit-testable.
- */
-export function buildLiveLenses(
-  elements: NamedElement[],
-  summary: LiveSummary,
-  label: string,
-): LiveLens[] {
-  const out: LiveLens[] = [];
-  const dispText = summary.dispositions.length
-    ? summary.dispositions
-        .map(([d, n]) => (summary.messageCount === 1 ? d : `${n} ${d}`))
-        .join(" · ")
-    : "no messages";
-  for (const el of elements) {
-    if (el.kind === "inbound") {
-      const prefix = label ? `${label}: ` : "";
-      out.push({
-        line: el.line,
-        title: `$(pulse) ${prefix}${dispText}`,
-        tooltip: summary.errors.length
-          ? `Errors: ${summary.errors.join("; ")}`
-          : `Live dry-run of ${label || "the selected sample"} (${summary.messageCount} message(s)).`,
-      });
-    } else if (el.kind === "router") {
-      const routed = summary.handlersUnion.length
-        ? `[${summary.handlersUnion.join(", ")}]`
-        : "(nowhere)";
-      out.push({
-        line: el.line,
-        title: `$(arrow-right) routed → ${routed}`,
-        tooltip: "Handlers this router selected across the sample run (from dryrun `handlers`).",
-      });
-    } else if (el.kind === "handler" && summary.soleHandler !== null && el.name === summary.soleHandler) {
-      const n = summary.totalSends;
-      out.push({
-        line: el.line,
-        title: `$(arrow-small-right) ${n} Send${n === 1 ? "" : "s"}`,
-        tooltip:
-          "Send count is attributable here because exactly one handler ran this sample. v1 flattens " +
-          "handler→delivery attribution, so per-handler counts for a multi-handler module are v2.",
-      });
-    }
-  }
-  return out;
 }
 
 // --- v2 inline decorations (per-statement values + hover) ----------------------------------------
@@ -819,7 +671,12 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (!this.rows) {
       return [];
     }
-    return buildLiveLenses(namedElements(text), summarize(this.rows), this.sampleLabel ?? "");
+    return buildLiveLenses(
+      namedElements(text),
+      summarize(this.rows),
+      this.sampleLabel ?? "",
+      this.shownRunRevealed,
+    );
   }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
