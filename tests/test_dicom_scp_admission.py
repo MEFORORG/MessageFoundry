@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import socket
+import socketserver
 import ssl
 import time
 from collections.abc import AsyncIterator, Callable
@@ -180,14 +182,19 @@ async def test_a_peer_outside_the_allowlist_gets_no_association() -> None:
         assert len(captured) == 1
 
 
-def test_the_c_store_check_still_refuses_a_peer_the_accept_gate_did_not_see() -> None:
+def test_the_c_store_check_still_refuses_a_peer_the_accept_gate_did_not_see(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # The accept gate rides on hooks in a third-party server class. The per-C-STORE check stays behind
     # it, so an object from a peer outside the allowlist is never committed even if that gate is not
     # run. _FakeStoreEvent's requestor address is 127.0.0.1.
     captured: list[bytes] = []
     event = _FakeStoreEvent(transfer_syntax="1.2.840.10008.1.2.1", data_set=b"\x00" * 32)
     refused = _build_scp(captured, source_ip_allowlist=_NOT_LOOPBACK)
-    assert refused._on_c_store(event) == 0x0124  # Refused: Not Authorized, before any decode
+    with caplog.at_level(logging.WARNING, logger=_LOG):
+        assert refused._on_c_store(event) == 0x0124  # Refused: Not Authorized, before any decode
+    # This path means the accept gate did not run, so the line names the calling AE as well.
+    assert any("a C-STORE (AE 'MODALITY1')" in m for m in _warnings(caplog))
     # CONTROL: the same event from an allowed address goes on to the decode trap (0xC000).
     allowed = _build_scp(captured, source_ip_allowlist=_LOOPBACK)
     assert allowed._on_c_store(event) == 0xC000
@@ -211,6 +218,23 @@ async def test_a_fault_in_the_accept_gate_refuses_the_peer_and_keeps_the_listene
         monkeypatch.setattr(dicom_module, "peer_ip_allowed", netaddr.peer_ip_allowed)
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
         assert (established, status) == (True, 0x0000), "the listener must still be accepting"
+
+
+async def test_a_fault_in_the_refusal_path_is_logged_once_and_still_refuses(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The last line of defence on the accept loop. It must refuse, say so once, and not once per
+    # connection, because in this state every connection is refused.
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("refusal path fault")
+
+    async with _running_scp({"source_ip_allowlist": _NOT_LOOPBACK}) as scp:
+        monkeypatch.setattr(scp, "_log_refused_peer", broken)
+        with caplog.at_level(logging.DEBUG, logger=_LOG):
+            for _ in range(3):
+                assert await asyncio.to_thread(_closed_after, scp.sockport, wait=3.0) is not None
+        faults = [m for m in _warnings(caplog) if "admission check itself failed" in m]
+        assert len(faults) == 1, faults
 
 
 # --- Refusals are logged per peer, not per connection --------------------------------------------
@@ -250,11 +274,11 @@ def test_the_refusal_log_is_per_peer_and_capped_across_peers(
     assert len(caplog.records) == before
 
 
-def test_a_later_refusal_line_counts_the_ones_that_were_not_logged(
+def test_a_later_refusal_line_carries_the_running_count(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(dicom_module, "_REFUSAL_LOG_WINDOW_SECONDS", 0.2)
-    scp = _build_scp([], source_ip_allowlist=_NOT_LOOPBACK)  # the window is read at construction
+    scp = _build_scp([], source_ip_allowlist=_NOT_LOOPBACK)
     with caplog.at_level(logging.WARNING, logger=_LOG):
         for _ in range(5):
             scp._admit_connection(("192.0.2.1", 40000))
@@ -263,7 +287,29 @@ def test_a_later_refusal_line_counts_the_ones_that_were_not_logged(
         scp._admit_connection(("192.0.2.1", 40000))
     lines = _warnings(caplog)
     assert len(lines) == 2
-    assert "4 other refused" in lines[1], lines[1]
+    assert "1 refused in all" in lines[0], lines[0]
+    assert "6 refused in all" in lines[1], lines[1]
+
+
+def test_the_refusal_table_stays_bounded_whatever_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An entry exists only for a line written inside the current window, so a stream of addresses
+    # that are each seen once cannot grow the table past the per-window ceiling.
+    monkeypatch.setattr(dicom_module, "_REFUSAL_LOG_WINDOW_SECONDS", 0.05)
+    scp = _build_scp([], source_ip_allowlist=_NOT_LOOPBACK)
+    ceiling = dicom_module._REFUSAL_LOG_MAX_PER_WINDOW
+    seen = 0
+    for window in range(4):
+        for n in range(ceiling * 2):
+            scp._admit_connection((f"198.51.{window}.{n}", 40000))
+            seen += 1
+            assert len(scp._refusal_logged) <= ceiling
+        time.sleep(0.08)
+    assert scp._refusals == seen, "every refusal is counted, logged or not"
+    # CONTROL: the table was really in use, and aged entries really left it.
+    scp._admit_connection(("203.0.113.9", 40000))
+    assert list(scp._refusal_logged) == ["203.0.113.9"]
 
 
 # --- The TLS handshake is bounded, capped and off the accept loop --------------------------------
@@ -431,6 +477,41 @@ async def test_handshakes_in_flight_are_capped_and_the_slots_come_back(
                 sock.close()
 
 
+async def test_a_slot_is_given_back_when_no_thread_could_be_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The slot is taken on the accept loop, before the connection's thread exists. If that thread
+    # cannot be started, nothing else would ever give the slot back.
+    def cannot_start(self: object, request: object, client_address: object) -> None:
+        raise RuntimeError("no thread for this connection")
+
+    async with _running_scp(_tls_settings(tmp_path)) as scp:
+        with monkeypatch.context() as patched:
+            patched.setattr(socketserver.ThreadingMixIn, "process_request", cannot_start)
+            took = await asyncio.to_thread(_closed_after, scp.sockport, wait=3.0)
+            assert took is not None, "socketserver closes a connection whose dispatch raised"
+        assert scp._server._pending == {}, "the slot must not stay held"
+        # CONTROL: with the dispatch restored, the same listener serves a handshake.
+        completed, _ = await asyncio.to_thread(_tls_handshake, scp.sockport, budget=5.0)
+        assert completed
+
+
+async def test_a_connection_that_times_out_ends_its_handshake_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A poll slice that finds nothing to read raises a TimeoutError with no errno, and the handshake
+    # goes on. The transport itself timing out raises one WITH an errno. That one must end the
+    # handshake, not be retried until the bound.
+    def transport_timed_out(self: ssl.SSLSocket, block: bool = False) -> None:
+        raise TimeoutError(errno.ETIMEDOUT, "connection timed out")
+
+    async with _running_scp(_tls_settings(tmp_path)) as scp:  # the shipped 10 s handshake bound
+        monkeypatch.setattr(ssl.SSLSocket, "do_handshake", transport_timed_out)
+        took = await asyncio.to_thread(_closed_after, scp.sockport, wait=4.0)
+        assert took is not None, "the handshake was retried instead of ended"
+        assert took < _TLS_HANDSHAKE_TIMEOUT / 2
+
+
 async def test_stop_does_not_wait_out_a_pending_handshake(tmp_path: Path) -> None:
     async with _running_scp(_tls_settings(tmp_path)) as scp:  # the shipped 10 s handshake bound
         silent = socket.create_connection(("127.0.0.1", scp.sockport), timeout=3)
@@ -515,8 +596,6 @@ def test_the_scp_runs_its_own_server_class_over_the_pinned_hooks() -> None:
     overrides defined and never called, and the address check and the handshake bound would
     silently lapse. ``start_serving`` also uses two names ``AE.start_server`` uses itself.
     """
-    import socketserver
-
     from pynetdicom import AE
     from pynetdicom.transport import AssociationServer, ThreadedAssociationServer
     from pynetdicom.utils import make_target
@@ -527,7 +606,37 @@ def test_the_scp_runs_its_own_server_class_over_the_pinned_hooks() -> None:
     assert "get_request" in vars(AssociationServer)
     assert "process_request_thread" in vars(ThreadedAssociationServer)
     assert callable(socketserver.BaseServer.verify_request)
-    for name in ("get_request", "verify_request", "process_request_thread", "start_serving"):
+    for name in (
+        "get_request",
+        "verify_request",
+        "process_request",
+        "process_request_thread",
+        "start_serving",
+    ):
         assert name in vars(cls), f"the admitting server no longer defines {name}"
     assert AE()._servers == [], "start_serving records the server on AE._servers"
     assert callable(make_target)
+
+
+def test_a_pynetdicom_that_left_the_socketserver_routing_is_refused() -> None:
+    # The overrides are only called because socketserver's own loop calls them. A server class
+    # that drove its own accept loop would leave them defined and unused, so the SCP refuses to
+    # start on one.
+    from pynetdicom.transport import ThreadedAssociationServer
+
+    dicom_module._require_socketserver_routing(ThreadedAssociationServer)  # CONTROL: 3.0.4 passes
+
+    class OwnLoop(ThreadedAssociationServer):
+        def serve_forever(self, poll_interval: float = 0.5) -> None:
+            raise NotImplementedError
+
+    class OwnDispatch(ThreadedAssociationServer):
+        def process_request(self, request: object, client_address: object) -> None:
+            raise NotImplementedError
+
+    class NotThreaded(socketserver.TCPServer):
+        pass
+
+    for left in (OwnLoop, OwnDispatch, NotThreaded):
+        with pytest.raises(RuntimeError, match="does not route an accepted connection"):
+            dicom_module._require_socketserver_routing(left)

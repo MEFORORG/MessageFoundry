@@ -56,9 +56,10 @@ Data Set *before* it is decoded, so an over-cap object is a DIMSE failure before
 commit; never above the engine's 16 MiB binary ingress ceiling) + DICOM-over-TLS. An object the engine's
 ingress refuses is recorded `ERROR` and answered with a DIMSE failure, never Success (BACKLOG #1910). A non-loopback cleartext SCP is refused at startup unless `serve --allow-insecure-bind`.
 
-**Each peer control applies at the earliest point its input is known.** The SCP checks the peer
-address first, because it is known as soon as the connection is accepted. The calling AE title is
-only known once the association request is read, so that check comes later.
+**The SCP checks the peer address before it reads anything.** The address is known as soon as the
+connection is accepted, so that check comes first. The calling AE title is only known once the
+association request is read, so that check comes later. The table lists at least these controls,
+in the order the SCP applies them.
 
 | Control | When the SCP applies it | What a peer that fails it gets |
 |---|---|---|
@@ -74,9 +75,15 @@ One SCP runs at most 256 TLS handshakes at once, and at most 32 from one peer ad
 over either number is closed. Those are the MLLP listener's two connection caps. Here they count a
 connection only while it is in its handshake. After that, `max_associations` is the limit.
 
+**A sender the SCP refuses at accept sees only a closed connection.** It gets no DIMSE status and
+no association rejection. So the sender cannot tell this refusal from an SCP it cannot reach, and a
+sender that retries a failed connection will retry this one. This engine's own C-STORE client does:
+it treats a failed association as transient. The reason is in the SCP's log, not on the sender's
+side. Add the sender's address to `source_ip_allowlist` to admit it.
+
 **A refused address is logged once a minute, not once per connection.** The SCP writes one
 `WARNING` per refused address per 60 seconds, and at most 20 such lines per 60 seconds over every
-address together. Each line counts the refusals that were not logged since the last one. A TLS
+address together. Each line carries the SCP's running count of refusals, logged or not. A TLS
 handshake that fails is logged at `DEBUG` only.
 
 **The C-STORE status the SCP answers tells the sender whether to re-send** (BACKLOG #2103). DICOM PS3.4
