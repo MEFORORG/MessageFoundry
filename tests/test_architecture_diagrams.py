@@ -26,8 +26,12 @@ WHAT THIS DOES NOT COVER, at least:
   READMEs are outside it too, so a block copied there is not refused.
 - Rule a compares whole lines. A copy whose node ids were all renamed shares no line and passes.
 - Rule c runs one way. A table row whose home doc holds no diagram is not refused.
+- Rule c counts docs, not diagrams. A second diagram in a doc that already has a row needs no new
+  row, and neither does a new diagram in the index file itself.
 - Rule b accepts a folder at the repository root, so a root folder can stand in for an engine
   package of the same name.
+- Rule d goes by file name. An export saved as ``topology.png`` or ``security.svg`` is not refused.
+- Rules a, c and d read the working tree, so an untracked file can fail them before it is committed.
 
 This module imports no engine code. It reads ``messagefoundry/`` only as a directory listing.
 """
@@ -67,16 +71,20 @@ _QUOTE_PREFIX = re.compile(r"^[ \t]*(?:>[ \t]?)+")
 
 #: One or more lower-case path segments, each ending in a slash, that end the token:
 #: ``pipeline/``, ``samples/config/``. The lookbehind drops ``<br/>`` and the tail of a longer
-#: path. The lookahead drops ``FastAPI/uvicorn`` and ``decode/parse``. A first segment is two
-#: characters or more, so ``w/ TLS`` is not a folder.
-_FOLDER = re.compile(r"(?<![\w<./-])((?:[a-z_][a-z0-9_-]+/)+)(?!\w)")
+#: path. The lookahead drops ``FastAPI/uvicorn``, ``decode/parse`` and the close of a slanted
+#: Mermaid shape, ``[/text/]``. A first segment is two characters or more, so ``w/ TLS`` is not a
+#: folder.
+_FOLDER = re.compile(r"(?<![\w<./-])((?:[a-z_][a-z0-9_-]+/)+)(?![\w\]])")
 
 #: A Markdown link to a ``.md`` file in the same directory, with or without ``./`` or an anchor.
 _LINK = re.compile(r"\]\((?:\./)?([^)\s#/]+\.md)(?:#[^)\s]*)?\)")
 
 #: Lines every diagram in the set shares on purpose, so they say nothing about a copy: the shared
-#: ``classDef`` palette, comments, the diagram header and ``end``.
-_SHARED_LINE = re.compile(r"^(?:classDef\b|%%|end$|(?:flowchart|graph|sequenceDiagram)\b)")
+#: ``classDef`` palette, comments, ``end``, and the header lines of each diagram type.
+_SHARED_LINE = re.compile(
+    r"^(?:classDef\b|%%|end$|direction\b|autonumber\b"
+    r"|(?:flowchart|graph|sequenceDiagram|stateDiagram|classDiagram|erDiagram)\b)"
+)
 
 #: Two blocks in different docs are one diagram, copied and then edited, when this fraction of the
 #: SMALLER block's lines is also in the other. Measured against the smaller block, so a lifted
@@ -103,7 +111,9 @@ def mermaid_blocks(text: str) -> list[str]:
     for line in text.splitlines():
         fence = _FENCE_LINE.match(line)
         if not run:
-            if fence:
+            # A backtick fence cannot have a backtick in its info string. A line that does is
+            # prose that starts with inline code, and reading it as a fence would hide a block.
+            if fence and not (fence.group(2)[0] == "`" and "`" in fence.group(3) + fence.group(4)):
                 run = fence.group(2)
                 quoted = ">" in fence.group(1)
                 body = [] if fence.group(3).lower() == "mermaid" else None
@@ -272,7 +282,8 @@ def test_no_diagram_export_is_back() -> None:
     # The floor: the walk must see the directory, or an export in it could not be seen either.
     assert _HOME in names
     assert stray_exports(names) == [], (
-        "the Mermaid block is the only copy of a diagram. Do not commit an exported image"
+        "the Mermaid block is the only copy of a diagram. Keep an exported image outside docs/, "
+        "and do not commit one"
     )
 
 
@@ -328,6 +339,11 @@ def test_a_block_quoted_inside_a_longer_fence_is_an_example_not_a_diagram() -> N
     assert mermaid_blocks(example + _doc(_BLOCK)) == [_BLOCK]
 
 
+def test_prose_that_starts_with_inline_code_does_not_hide_the_next_block() -> None:
+    prose = f"{_FENCE}mermaid{_FENCE} fences render on GitHub.\n\n"
+    assert mermaid_blocks(prose + _doc(_BLOCK, _SMALL)) == [_BLOCK, _SMALL]
+
+
 def test_an_unclosed_block_is_an_error_that_names_its_doc() -> None:
     unclosed = f"{_FENCE}mermaid\nflowchart TB\n  A --> B\n"
     with pytest.raises(ValueError, match="never closed"):
@@ -380,6 +396,10 @@ def test_folder_tokens_takes_folders_and_leaves_the_look_alikes() -> None:
     assert folder_tokens(text) == {"api", "pipeline", "store"}
     nested = _doc('flowchart LR\n  A["samples/config/ and net-helper/"] --> B[".github/workflows"]')
     assert folder_tokens(nested) == {"samples/config", "net-helper"}
+    # A slanted Mermaid shape closes with `/]`. That slash ends a shape, not a folder name.
+    assert (
+        folder_tokens(_doc("flowchart LR\n  A[/Operator input here/] --> B[/more here\\]")) == set()
+    )
 
 
 def test_a_folder_that_does_not_exist_is_refused(tmp_path: Path) -> None:
@@ -448,8 +468,12 @@ def test_an_index_file_with_no_index_table_is_an_error() -> None:
 def test_a_real_engine_folder_renamed_in_the_index_file_is_refused() -> None:
     text = _real_docs()[_HOME]
     roots = [_ENGINE, _ROOT]
-    assert "pipelne" not in missing_folders(text, roots)
-    assert "pipelne" in missing_folders(text.replace("pipeline/", "pipelne/"), roots)
+    # Any engine folder the index file names will do. This picks one and does not pin which.
+    named = sorted(name for name in folder_tokens(text) if _is_folder(_ENGINE / name))
+    assert named, f"no Mermaid block in docs/{_HOME} names an engine folder. Fix this test's pick"
+    real, misspelt = f"{named[0]}/", f"{named[0]}zz/"
+    assert named[0] + "zz" not in missing_folders(text, roots)
+    assert named[0] + "zz" in missing_folders(text.replace(real, misspelt), roots)
 
 
 def test_a_new_diagram_doc_is_refused_until_the_real_index_table_names_it() -> None:
@@ -460,23 +484,28 @@ def test_a_new_diagram_doc_is_refused_until_the_real_index_table_names_it() -> N
     # A link in prose, outside the table, changes nothing.
     docs[_HOME] = home + f"\nSee [{name}]({name}).\n"
     assert unindexed_holders(docs, _HOME) == [name]
+    # A row directly under the heading. The reader takes every `|` line of that section.
     row = f"| New | [{name}]({name}) |"
-    docs[_HOME] = home.replace("| Diagram | Home doc |", f"| Diagram | Home doc |\n{row}", 1)
-    assert docs[_HOME] != home
+    docs[_HOME] = home.replace(_INDEX_HEADING, f"{_INDEX_HEADING}\n\n{row}", 1)
     assert unindexed_holders(docs, _HOME) == []
 
 
 def test_a_real_block_copied_into_a_second_doc_is_refused() -> None:
     home = _real_docs()[_HOME]
-    block = mermaid_blocks(home)[1]
-    assert "Postgres" in block
+    # The largest block, whichever it is. Nothing here pins its position or its labels.
+    blocks = mermaid_blocks(home)
+    number = max(range(len(blocks)), key=lambda i: len(_content_lines(blocks[i]))) + 1
+    block = blocks[number - 1]
     name = "A-NEW-DIAGRAM-DOC.md"
     assert copied_blocks({_HOME: home, name: _doc(block)}) == [
-        f"{name} block 1 and {_HOME} block 2 are identical"
+        f"{name} block 1 and {_HOME} block {number} are identical"
     ]
-    drifted = copied_blocks({_HOME: home, name: _doc(block.replace("Postgres", "PostgreSQL"))})
+    # The copy then drifts: one line is dropped and one is added.
+    lines = block.splitlines()
+    edited = "\n".join([*lines[:-1], "  ZZ_NEW --> ZZ_MORE"])
+    drifted = copied_blocks({_HOME: home, name: _doc(edited)})
     assert len(drifted) == 1, drifted
-    assert drifted[0].startswith(f"{name} block 1 and {_HOME} block 2 share "), drifted
+    assert drifted[0].startswith(f"{name} block 1 and {_HOME} block {number} share "), drifted
 
 
 @pytest.mark.parametrize("name", _DELETED_EXPORTS)
