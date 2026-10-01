@@ -1160,3 +1160,64 @@ def test_bash_and_powershell_get_the_same_answer_for_the_same_command(
     assert verdicts["Bash"] == verdicts["PowerShell"], f"{label}: {verdicts}"
     if expected is not None:
         assert verdicts["Bash"] == expected, f"{label}: {verdicts}"
+
+
+# --- BACKLOG #1874 step 3, answered DO-NOT-BUILD: class B keeps its cwd keying ------------------------
+#
+# Step 3 asked rule 3b to key on occupancy evidence instead of cwd. An adversarial review found no safe
+# signal: session_id is shared by a Manager and its subagents and reused across launches, and a creator
+# stamp breaks when a Manager moves its own Builder's tree. So the LOGIC is unchanged and the class B
+# deny instead teaches a route this gate already allows: compose in the object store, then create.
+#
+# The allowed rows are the claim the new text makes, so they are pinned here beside it. A text that
+# taught a route the gate refused would be the unrunnable-remedy defect of #1032 again.
+
+COMPOSE_ROUTE = [
+    # As the deny prints them, aimed at the primary...
+    'git -C "{primary}" merge-tree --write-tree main victim-branch',
+    'git -C "{primary}" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -p main -m batch',
+    'git -C "{primary}" worktree add --detach "{fresh}" main',
+    'git -C "{primary}" push origin main:refs/heads/batch-184',
+    # ...and aimed at ANOTHER session's worktree, the case the Manager asked to see allowed.
+    'git -C "{victim}" merge-tree --write-tree main victim-branch',
+    'git -C "{victim}" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -p main -m batch',
+    'git -C "{victim}" worktree add --detach "{fresh}" main',
+]
+
+
+def test_the_class_B_deny_teaches_the_compose_then_create_route(
+    hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """Red before this change: the first bullet only said to drop the `-C`."""
+    reason = assert_denied(
+        run_gate(
+            bash(f'git -C "{hijack_repo.victim}" merge main', cwd=hijack_repo.mine),
+            hijack_repos_file,
+        )
+    )
+    for needle in (
+        "merge-tree --write-tree",
+        "commit-tree",
+        "worktree add --detach",
+        "non-zero",
+        "isolation: worktree",
+        "PLAIN terminal",
+    ):
+        assert needle.lower() in reason.lower(), (
+            f"{needle!r} missing from the class B deny:\n{reason}"
+        )
+
+
+@pytest.mark.parametrize("template", COMPOSE_ROUTE)
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_the_compose_route_is_ALLOWED_while_a_merge_into_another_tree_is_not(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tmp_path: Path, template: str, tool: str
+) -> None:
+    command = template.format(
+        victim=hijack_repo.victim, primary=hijack_repo.primary, fresh=tmp_path / "GateRepo-batch"
+    )
+    assert run_gate(bash(command, cwd=hijack_repo.mine, tool=tool), hijack_repos_file) is None, (
+        command
+    )
+    merge = f'git -C "{hijack_repo.victim}" merge main'
+    assert_denied(run_gate(bash(merge, cwd=hijack_repo.mine, tool=tool), hijack_repos_file))

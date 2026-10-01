@@ -2693,7 +2693,17 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         # worktree has checked out -- for which `new.ps1` would die with "already checked out at ...".
         # That is the unrunnable-remediation defect of #1032/#1035, so the bullet is omitted rather than
         # filled with a placeholder the reader would have to guess at.
+        #
+        # THE FIRST BULLET TEACHES A ROUTE, NOT A KEY (BACKLOG #1874 step 3, answered DO-NOT-BUILD). The
+        # item asked this class to key on occupancy evidence instead of cwd. An adversarial review found
+        # no safe signal: session_id is shared by a Manager and its subagents and reused across launches,
+        # and a creator stamp breaks when a Manager moves its own Builder's tree. So the logic keeps its
+        # cwd keying, and the text names a route this gate already allows -- merge-tree, commit-tree,
+        # worktree add --detach, push -- with tests/test_worktree_gate.py pinning each as ALLOWED beside
+        # the deny. It names no stamp or record, because anything a session could write, a session
+        # could forge.
         $selfTopQ = Get-SafeForCommand $selfTopRaw
+        $govQ = Get-SafeForCommand $gov.Display
         $verbMsg = Get-SafeForMessage $Verb
         $headMsg = Get-SafeForMessage $head
         Write-Deny -Rule "3b" -Detail "git $Verb -> $selfTopRaw" -Reason @"
@@ -2705,8 +2715,17 @@ refuses this: its only worktree guard blocks a second CHECKOUT of a live branch,
 aimed at a worktree from outside never trips it. It is a worktree of $(Get-SafeForMessage $gov.Display).
 
 What to do instead:
-  * If this is YOUR work, do it in YOUR OWN worktree -- drop the `-C` (or the `cd`) that aims this command
-    at that directory, and run it where you are standing.
+  * To COMBINE branches -- a wave, a batch -- compose the result in git's object store and give it a NEW
+    worktree. None of these moves any worktree's HEAD, so this gate allows every one. Per branch, with
+    each new commit as the next <base>:
+        git -C $govQ merge-tree --write-tree <base> <branch>
+        git -C $govQ commit-tree <tree> -p <base> -p <branch> -m 'merge <branch>'
+    A NON-ZERO exit from merge-tree means a CONFLICT: stop, and send that item back to a Builder rather
+    than resolving it here. Then, with <tip> the last commit:
+        git -C $govQ worktree add --detach <new path> <tip>
+        git -C $govQ push origin <tip>:refs/heads/<batch>
+  * If you dispatch a Builder subagent to work in a worktree, dispatch it with ``isolation: worktree``:
+    its payload cwd is then its own tree, and this rule lets it move that tree's HEAD.
   * To READ that worktree's branch without touching one file of it, use the plumbing:
         git -C $selfTopQ show $(Get-SafeForCommand $head -Suffix ':<path>')
         git -C $selfTopQ diff $(Get-SafeForCommand $head -Prefix 'HEAD..')
