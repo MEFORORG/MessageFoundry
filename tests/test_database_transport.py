@@ -351,7 +351,7 @@ def test_build_odbc_dsn_requires_driver() -> None:
 
 
 def test_build_odbc_dsn_brace_quotes_values() -> None:
-    # An injection attempt in a param value can't close the brace early (the inner } is doubled).
+    # An injection attempt in a password can't close the brace early (the inner } is doubled).
     dsn = _build_odbc_dsn(
         {"odbc_driver": "PostgreSQL Unicode", "server": "db.example", "password": "p};DROP"}
     )
@@ -381,7 +381,7 @@ def test_build_odbc_dsn_rejects_reserved_param_key(reserved: str) -> None:
 
 
 def test_generic_destination_builds_without_database() -> None:
-    # The generic dialect may omit `database` (e.g. Oracle service name) — the destination still builds.
+    # The generic dialect may omit `database` (not every driver takes one) — the destination still builds.
     d = build_destination(
         Destination(
             name="OB_DB_GEN",
@@ -461,12 +461,14 @@ def test_a_sentinel_sslpassword_never_appears_in_the_captured_log(
     for params in (
         {"SSLmode": "disable", "sslpassword": sentinel},
         {"sslpassword": sentinel},
-        {"PWD_SSL": "off", "Encrypt": "no"},
     ):
         logged = _generic_dsn_logs(dict(params), caplog)
         reason = generic_odbc_tls_unenforced(params) or ""
         assert caplog.records, "the probe logged nothing, so an absence would prove nothing"
         assert sentinel not in logged and sentinel not in reason
+    # The classifier alone. `PWD_SSL` is not an accepted odbc_params keyword, so the builder refuses
+    # it before anything is logged (vault BACKLOG #2577) and only the classifier can be handed it.
+    reason = generic_odbc_tls_unenforced({"PWD_SSL": "off", "Encrypt": "no"}) or ""
     assert "PWD_SSL" not in reason and "Encrypt=no" in reason
 
 
