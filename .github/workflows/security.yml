@@ -1092,7 +1092,25 @@ jobs:
           # green PR for a reason that has nothing to do with its diff. Same posture as bandit==1.9.4
           # above and zizmor==1.5.2: bump deliberately, in a PR that also clears any new findings.
           # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
-          python -m pip install --upgrade pip "semgrep==1.172.0"
+          #
+          # RETRIED, because semgrep's transitive set resolves live from PyPI and one index read can
+          # come back empty. Merge-group run 36832387843 (2026-10-01) failed at this install, in the
+          # semgrep job, with ResolutionImpossible: pip saw "no matching distributions" for
+          # pydantic-core at ANY version. The same pin resolved pydantic-core 2.46.5 on the same runner
+          # image six minutes later, so it was a transient index read, not a new release. Still
+          # fail-closed: three failures exit 1, and nothing here touches the scan below. The `until`
+          # condition is exempt from `bash -e`. tests/test_semgrep_install_retry.py pins all of this.
+          attempt=1
+          until python -m pip install --upgrade pip "semgrep==1.172.0"
+          do
+            if [ "${attempt}" -ge 3 ]; then
+              echo "::error::semgrep did not install after 3 attempts. Failing closed: no scan ran."
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt}: semgrep install failed; retrying"
+            sleep "$((attempt * 15))"
+            attempt=$((attempt + 1))
+          done
           # --error: any finding fails the step — and the job, now that this gate is blocking.
           #
           # SCOPE = the whole repo minus the excludes below, which is the bandit exclude set in this
@@ -1390,7 +1408,25 @@ jobs:
           # green PR for a reason that has nothing to do with its diff. Same posture as bandit==1.9.4
           # above and zizmor==1.5.2: bump deliberately, in a PR that also clears any new findings.
           # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
-          python -m pip install --upgrade pip "semgrep==1.172.0"
+          #
+          # RETRIED, because semgrep's transitive set resolves live from PyPI and one index read can
+          # come back empty. Merge-group run 36832387843 (2026-10-01) failed at this install, in the
+          # semgrep job, with ResolutionImpossible: pip saw "no matching distributions" for
+          # pydantic-core at ANY version. The same pin resolved pydantic-core 2.46.5 on the same runner
+          # image six minutes later, so it was a transient index read, not a new release. Still
+          # fail-closed: three failures exit 1, and nothing here touches the scan below. The `until`
+          # condition is exempt from `bash -e`. tests/test_semgrep_install_retry.py pins all of this.
+          attempt=1
+          until python -m pip install --upgrade pip "semgrep==1.172.0"
+          do
+            if [ "${attempt}" -ge 3 ]; then
+              echo "::error::semgrep did not install after 3 attempts. Failing closed: no scan ran."
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt}: semgrep install failed; retrying"
+            sleep "$((attempt * 15))"
+            attempt=$((attempt + 1))
+          done
           # --error: any finding fails the step — and the job, now that this gate is blocking.
           #
           # SCOPE = the whole repo minus the excludes below, which is the bandit exclude set in this

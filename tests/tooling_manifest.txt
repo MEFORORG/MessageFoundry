@@ -157,6 +157,7 @@ tests/test_security_composite_parity.py
 tests/test_security_posture.py
 tests/test_security_txt_expiry_reminder.py
 tests/test_selfheal_installed_parity.py
+tests/test_semgrep_install_retry.py
 tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py
