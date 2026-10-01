@@ -56,6 +56,37 @@ Data Set *before* it is decoded, so an over-cap object is a DIMSE failure before
 commit; never above the engine's 16 MiB binary ingress ceiling) + DICOM-over-TLS. An object the engine's
 ingress refuses is recorded `ERROR` and answered with a DIMSE failure, never Success (BACKLOG #1910). A non-loopback cleartext SCP is refused at startup unless `serve --allow-insecure-bind`.
 
+**The SCP checks the peer address before it reads anything.** The address is known as soon as the
+connection is accepted, so that check comes first. The calling AE title is only known once the
+association request is read, so that check comes later. The table lists at least these controls,
+in the order the SCP applies them.
+
+| Control | When the SCP applies it | What a peer that fails it gets |
+|---|---|---|
+| `source_ip_allowlist` | when the connection is accepted, before the TLS handshake and before anything is read from the peer | the connection is closed. No association forms, so no object is sent |
+| the TLS handshake (`tls=true`), with the client certificate when `tls_ca_file` is set | after the address check, on the connection's own thread, and within 10 seconds | the connection is closed. A handshake that is slow, or never starts, does not delay another sender's |
+| `calling_ae_allowlist` and `require_called_ae_title` | when the association request is read | the association is rejected. No object is sent |
+| `max_object_bytes` | for each C-STORE, once the object has been received and before it is decoded | status `0xC010`, below |
+
+The 10 second handshake bound is a deadline for the whole handshake. It is the same constant the
+MLLP listener uses, and it is not a setting.
+
+One SCP runs at most 256 TLS handshakes at once, and at most 32 from one peer address. A connection
+over either number is closed. Those are the MLLP listener's two connection caps. Here they count a
+connection only while it is in its handshake.
+
+**A sender the SCP refuses at accept sees only a closed connection.** It gets no DIMSE status and
+no association rejection. So the sender cannot tell this refusal from an SCP it cannot reach, and a
+sender that retries a failed connection will retry this one. This engine's own C-STORE client does:
+it treats a failed association as transient, and the object keeps its place at the head of its
+lane while it retries. The reason is in the SCP's log, not on the sender's side. Add the sender's
+address to `source_ip_allowlist` to admit it.
+
+**A refused address is logged once a minute, not once per connection.** The SCP writes one
+`WARNING` per refused address per 60 seconds, and at most 20 such lines per 60 seconds over every
+address together. Each line carries the SCP's running count of refusals, logged or not. A TLS
+handshake that fails is logged at `DEBUG` only.
+
 **The C-STORE status the SCP answers tells the sender whether to re-send** (BACKLOG #2103). DICOM PS3.4
 Annex B (Table B.2-1) has no "object too large" status. It has two failure classes that matter here.
 **Out of Resources** (`0xA7xx`) says the SCP cannot take the object now; senders, this engine's own SCU
@@ -71,7 +102,7 @@ The SCP answers at least these statuses:
 | `0xC010` | Cannot Understand, final | the object is over `max_object_bytes`, raw or re-encoded, or a deflated object inflates past the SCP's inflate bound. That bound is the lesser of `max_object_bytes` and 16 MiB, the ceiling the codec applies when a Router parses the object (BACKLOG #2104). Both limits are fixed, so a re-send is refused again |
 | `0xC000` | Cannot Understand, final | the object would not decode or re-encode, the engine's ingress refused it and recorded `ERROR`, or the SCP hit an error it did not expect, including running out of memory |
 | `0xA700` | Out of Resources, re-send | the commit raised, for example a store that is down; the commit did not finish within `timeout_seconds`; or the engine's loop is not running |
-| `0x0124` | Refused: Not Authorized | the peer IP is not in `source_ip_allowlist` |
+| `0x0124` | Refused: Not Authorized | the peer IP is not in `source_ip_allowlist`. This is a second check behind the one at accept, which closes such a peer's connection before any association forms, so a sender should not see this status. Each one is logged |
 
 The low byte of `0xC010` is the SCP's own choice, which PS3.4 allows inside `0xCxxx`. It separates an
 over-cap refusal from a decode failure in the sender's log. It stays clear of the codes `pynetdicom`

@@ -1272,6 +1272,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.load_verify_locations()",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.verify_mode = CERT_REQUIRED",
+            # vault BACKLOG #2583: the SCP runs the inbound TLS handshake itself, on the
+            # connection's own thread and against a deadline, in place of the wrap pynetdicom ran
+            # on its accept loop. Same server SSLContext, built by _server_ssl_context above.
+            "tls_context:.wrap_socket()",
             "tls_context:ssl.SSLContext",
             "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.auth.trust_anchors",

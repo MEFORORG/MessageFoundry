@@ -45,10 +45,15 @@ def _build_scp(captured: list[bytes], **settings_overrides: object) -> DicomScpS
 
 
 def _scu_cstore(
-    port: int, data: bytes, *, calling_ae: str = "MODALITY1"
+    port: int,
+    data: bytes,
+    *,
+    calling_ae: str = "MODALITY1",
+    tls_args: tuple[ssl.SSLContext, str] | None = None,
 ) -> tuple[bool, int | None]:
     """Run a blocking pynetdicom SCU: associate + C-STORE ``data``. Returns
-    ``(established, status)`` — ``status`` is the DIMSE C-STORE status (``None`` if not established)."""
+    ``(established, status)`` — ``status`` is the DIMSE C-STORE status (``None`` if not established).
+    ``tls_args`` is pynetdicom's ``(client context, server hostname)`` for DICOM-over-TLS."""
     from pydicom import dcmread
     from pynetdicom import AE
 
@@ -56,7 +61,7 @@ def _scu_cstore(
     ae = AE(ae_title=calling_ae)
     ae.add_requested_context(ds.SOPClassUID, ds.file_meta.TransferSyntaxUID)
     # Address the SCP's called AE title (it runs with require_called_ae_title=True).
-    assoc = ae.associate("127.0.0.1", port, ae_title=_SCP_AE)
+    assoc = ae.associate("127.0.0.1", port, ae_title=_SCP_AE, tls_args=tls_args)
     if not assoc.is_established:
         return (False, None)
     try:
@@ -114,14 +119,17 @@ async def test_scp_rejects_unlisted_calling_ae() -> None:
 
 async def test_scp_rejects_unlisted_peer_ip() -> None:
     captured: list[bytes] = []
-    # An allowlist that excludes loopback → the C-STORE is refused before any commit.
+    # An allowlist that excludes loopback: the connection is closed when it is accepted, so no
+    # association forms and no object is ever sent (vault BACKLOG #2583). Until then the SCP let the
+    # association form and refused each C-STORE with 0x0124, after it had received the object. The
+    # accept-time tests, with their controls, are in tests/test_dicom_scp_admission.py.
     scp = _build_scp(captured, source_ip_allowlist=["10.0.0.0/8"])
     handler = await _capture_handler_factory(captured)
     await scp.start(handler)
     try:
         established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
-        assert established is True  # association ok; C-STORE refused
-        assert status == 0x0124  # Refused: Not authorized
+        assert established is False
+        assert status is None
         assert captured == [], "a non-allowlisted peer's object must never be committed"
     finally:
         await scp.stop()
