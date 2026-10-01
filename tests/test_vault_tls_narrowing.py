@@ -765,8 +765,9 @@ def test_an_http_vault_through_an_https_proxy_is_refused_at_construction(
     from messagefoundry.config.secretprovider import SecretProviderError
     from messagefoundry.store.keyprovider import KeyProviderError
 
+    own = SecretProviderError if build is _kv_client else KeyProviderError
     monkeypatch.setenv("HTTP_PROXY", proxy.url)
-    with pytest.raises((SecretProviderError, KeyProviderError), match=r"https:// proxy"):
+    with pytest.raises(own, match=r"https:// proxy"):
         build("http://127.0.0.1:9")
     assert proxy.negotiated == [] and proxy.failures == 0
 

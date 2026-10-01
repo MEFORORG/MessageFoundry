@@ -2537,8 +2537,9 @@ def vault_client_verify_kwargs(
         host = urllib.parse.urlsplit(addr or "").hostname or ""
     except ValueError:
         # A malformed bracketed host. urllib's error text can quote it, so it is not raised here;
-        # the client build refuses the address with fixed text instead (BACKLOG #2317).
-        host = ""
+        # the client build refuses the address with fixed text instead (BACKLOG #2317). NOT "":
+        # is_loopback_hop_host("") is True, and an unreadable host must not count as on-box.
+        host = "(unreadable host)"
     anchor = resolve_trust_anchor(connection_ca_file=ca_file, host=host, policy=TrustAnchorPolicy())
     verify = requests_verify_from_anchor(anchor, cell=cell)
     return {} if verify is None else {"verify": verify}

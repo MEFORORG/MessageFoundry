@@ -1366,12 +1366,12 @@ directly is refused too, as the next paragraph says.
 for at least the KV secret provider here, the store key provider and the Transit cipher. It covers
 a direct `http://` address and one behind an `http://` proxy, including hvac's own `VAULT_ADDR`
 fallback. The one `http://` address allowed is a loopback Vault that the client reaches with no
-proxy, because that hop stays on the box. Loopback means the name `localhost` or a literal address
-in `127.0.0.0/8` or `::1`; no other name counts, whatever it resolves to. The refusal comes when
-the client is built, as the provider's own fail-closed error, and again before each send in case a
-proxy appeared since. Its text names no part of the address, and `[security].enforcement` does not
-relax it. An `https://` Vault behind an `http://` proxy is still allowed: the token rides inside
-the TLS tunnel to Vault.
+proxy, because that hop stays on the box. Loopback is decided without DNS: the name `localhost` or
+a loopback IP literal, and no other name, whatever it resolves to. An address that does not read as
+one well-formed URL is refused too. The refusal comes when the client is built, as the provider's
+own fail-closed error, and again before each send in case a proxy appeared since. Its text names no
+part of the address, and `[security].enforcement` does not relax it. An `https://` Vault behind an
+`http://` proxy is still allowed: the token rides inside the TLS tunnel to Vault.
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.

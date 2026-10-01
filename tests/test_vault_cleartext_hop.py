@@ -162,6 +162,14 @@ def _transit(monkeypatch: pytest.MonkeyPatch, addr: str | None) -> Any:
     return build_transit_cipher(StoreSettings())
 
 
+#: Each entry point's own fail-closed type. Pinned per entry point, so a provider that raised the
+#: other provider's type would go red.
+_OWN_TYPE: dict[Any, type[Exception]] = {
+    _kv: SecretProviderError,
+    _kek: KeyProviderError,
+    _transit: KeyProviderError,
+}
+
 _ENTRY_POINTS = pytest.mark.parametrize(
     "entry", [_kv, _kek, _transit], ids=["kv-secret", "store-key", "transit"]
 )
@@ -188,10 +196,10 @@ def _no_dial(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     return dials
 
 
-def _assert_refused(caught: pytest.ExceptionInfo[Exception]) -> None:
+def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: Any = _kv) -> None:
     """The provider raised its own fail-closed type, caused by the cleartext refusal, and kept the
     refusal's text whole."""
-    assert isinstance(caught.value, _FAIL_CLOSED)
+    assert type(caught.value) is _OWN_TYPE[entry]
     assert isinstance(caught.value.__cause__, InsecureHopRefused)
     assert str(caught.value) == str(caught.value.__cause__)
 
@@ -204,9 +212,9 @@ def test_a_direct_http_address_is_refused_before_anything_is_sent(
     refusal is the provider's own fail-closed type, so a caller that handles only that type, such
     as ``rotate-key``, still exits cleanly."""
     dials = _no_dial(monkeypatch)
-    with pytest.raises(_FAIL_CLOSED, match="not https://") as caught:
+    with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
         entry(monkeypatch, _REMOTE_HTTP)
-    _assert_refused(caught)
+    _assert_refused(caught, entry)
     assert dials == []
 
 
@@ -217,9 +225,9 @@ def test_hvacs_own_vault_addr_fallback_is_checked_too(
     """With the MEFOR_* address unset, hvac reads ``VAULT_ADDR``. The check reads the address the
     client actually holds, so the fallback cannot route around it."""
     monkeypatch.setenv("VAULT_ADDR", _REMOTE_HTTP)
-    with pytest.raises(_FAIL_CLOSED, match="not https://") as caught:
+    with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
         entry(monkeypatch, None)
-    _assert_refused(caught)
+    _assert_refused(caught, entry)
 
 
 @_ENTRY_POINTS
@@ -231,8 +239,22 @@ def test_hvacs_own_vault_addr_fallback_is_checked_too(
         "http://vault.synthetic.test\\@127.0.0.1:8200",
         # A bracketed host that is no address: both parsers raise, and both quote the address.
         "http://[vault-secret-host.synthetic.test]:8200",
+        # urllib3 accepts it and dials the name before the backslash; urllib rejects it, quoting
+        # the bracketed part.
+        "http://vault.synthetic.test\\@[vault-secret-host]:8200",
+        # Same disagreement on an https address: the trust anchor would be resolved for one host
+        # while urllib3 dials the other.
+        "https://vault.synthetic.test\\@127.0.0.1:8200",
+        # requests will not prepare it, and its error quotes the address.
+        "https://[vault-secret-host]:8200",
     ],
-    ids=["backslash-userinfo", "bracketed-name"],
+    ids=[
+        "backslash-userinfo",
+        "bracketed-name",
+        "backslash-then-bracket",
+        "https-backslash",
+        "https-bracketed-name",
+    ],
 )
 def test_an_address_the_parsers_disagree_on_is_refused_at_construction(
     entry: EntryPoint, address: str, monkeypatch: pytest.MonkeyPatch
@@ -240,10 +262,10 @@ def test_an_address_the_parsers_disagree_on_is_refused_at_construction(
     """RED before the round-1 repair: the first built cleanly and was refused only at send, and
     the second raised a plain ValueError quoting the host."""
     dials = _no_dial(monkeypatch)
-    with pytest.raises(_FAIL_CLOSED, match="not https://") as caught:
+    with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
         entry(monkeypatch, address)
-    _assert_refused(caught)
-    for fragment in ("synthetic.test", "vault-secret-host", "127.0.0.1", "8200"):
+    _assert_refused(caught, entry)
+    for fragment in ("synthetic.test", "secret-host", "127.0.0.1", "8200"):
         assert fragment not in str(caught.value)
     assert dials == []
 
@@ -257,7 +279,7 @@ def test_control_an_https_address_passes_the_check(
     with pytest.raises(_FAIL_CLOSED) as caught:
         entry(monkeypatch, f"https://127.0.0.1:{listener.port}")
     assert not isinstance(caught.value.__cause__, InsecureHopRefused)
-    assert "not https://" not in str(caught.value)
+    assert "well-formed https://" not in str(caught.value)
     assert listener.connections >= 1
 
 
@@ -274,6 +296,14 @@ def test_control_a_loopback_http_vault_with_no_proxy_passes_the_check(
     assert listener.connections >= 1
 
 
+def test_control_leading_whitespace_on_an_https_address_is_still_accepted() -> None:
+    """requests strips it before sending, as it did before this check existed. An NSSM
+    environment line can carry it."""
+    from messagefoundry.config import secretprovider_vault
+
+    secretprovider_vault._build_client("  https://vault.synthetic.test:8200", _TOKEN)
+
+
 # --- the proxy cases ------------------------------------------------------------------------------
 
 
@@ -285,9 +315,9 @@ def test_a_loopback_http_vault_behind_an_http_proxy_is_refused(
     """A loopback address sent through a proxy is not on the box: the proxy reads the request,
     token and all. RED before the change: the request reached the proxy."""
     monkeypatch.setenv(variable, listener.url)
-    with pytest.raises(_FAIL_CLOSED, match="not https://") as caught:
+    with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
         entry(monkeypatch, f"http://127.0.0.1:{_closed_port()}")
-    _assert_refused(caught)
+    _assert_refused(caught, entry)
     assert listener.connections == 0, "a socket reached the proxy"
 
 
@@ -295,7 +325,7 @@ def test_a_remote_http_vault_behind_an_http_proxy_is_refused(
     monkeypatch: pytest.MonkeyPatch, listener: _Listener
 ) -> None:
     monkeypatch.setenv("HTTP_PROXY", listener.url)
-    with pytest.raises(_FAIL_CLOSED, match="not https://") as caught:
+    with pytest.raises(_FAIL_CLOSED, match="well-formed https://") as caught:
         _kv(monkeypatch, _REMOTE_HTTP)
     _assert_refused(caught)
     assert listener.connections == 0
@@ -307,11 +337,17 @@ def test_control_an_https_vault_behind_an_http_proxy_is_built(
 ) -> None:
     """The token rides inside the TLS tunnel to Vault, so the proxy sees only the ``CONNECT``
     target. Engine PR 1752 left this shape unchanged, and so does this check."""
+    import requests
+
     from messagefoundry.config import secretprovider_vault
 
     monkeypatch.setenv(variable, listener.url)
-    secretprovider_vault._build_client("https://vault.synthetic.test:8200", _TOKEN)
-    assert listener.connections == 0
+    client = secretprovider_vault._build_client("https://vault.synthetic.test:8200", _TOKEN)
+    # The send goes to the proxy, which hangs up on the CONNECT: a requests error, never the
+    # refusal. Mutation: refuse any proxied hop at send time; red, InsecureHopRefused.
+    with pytest.raises(requests.exceptions.RequestException):
+        client.adapter.get("v1/secret/data/mefor/ad")
+    assert listener.connections >= 1
 
 
 def test_a_proxy_that_appears_after_construction_is_refused_before_sending(
@@ -324,7 +360,7 @@ def test_a_proxy_that_appears_after_construction_is_refused_before_sending(
 
     client = secretprovider_vault._build_client(f"http://127.0.0.1:{_closed_port()}", _TOKEN)
     monkeypatch.setenv("HTTP_PROXY", listener.url)
-    with pytest.raises(InsecureHopRefused, match="not https://"):
+    with pytest.raises(InsecureHopRefused, match="well-formed https://"):
         client.adapter.get("v1/secret/data/mefor/ad")
     assert listener.connections == 0, "a socket reached the proxy"
 
@@ -360,7 +396,7 @@ def test_a_client_whose_address_cannot_be_read_is_refused(
     class _Client:
         adapter = _Adapter()
 
-    with pytest.raises(InsecureHopRefused, match="not https://"):
+    with pytest.raises(InsecureHopRefused, match="well-formed https://"):
         strict_requests.mount_strict_reply_adapter(
             _Client(), connector="Vault test hop", ssl_context_factory=ssl.create_default_context
         )
@@ -410,7 +446,7 @@ def test_on_box_and_https_addresses_are_allowed(url: str) -> None:
 def test_every_other_address_is_refused(url: str, proxy: str | None) -> None:
     from messagefoundry.transports.strict_requests import _refuse_a_cleartext_vault_hop
 
-    with pytest.raises(InsecureHopRefused, match="not https://"):
+    with pytest.raises(InsecureHopRefused, match="well-formed https://"):
         _refuse_a_cleartext_vault_hop(url, proxy, connector="Vault test hop")
 
 
@@ -450,3 +486,38 @@ def test_the_refusal_ignores_the_enforcement_dial(monkeypatch: pytest.MonkeyPatc
         pytest.raises(InsecureHopRefused),
     ):
         _refuse_a_cleartext_vault_hop(_REMOTE_HTTP, None, connector="Vault test hop")
+
+
+# --- a caller that maps the provider's type to its own message ---------------------------------
+
+
+@pytest.mark.parametrize("cleartext", [True, False], ids=["cleartext-refusal", "control"])
+def test_provision_admin_shows_the_cleartext_refusal_not_the_canned_text(
+    cleartext: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """provision-admin turns a SecretProviderError into a canned 'check the reference' line. For
+    the cleartext refusal it shows the refusal's own fixed text instead, which says what to fix.
+    The control: any other SecretProviderError still gets the canned line."""
+    import messagefoundry.__main__ as cli
+    import messagefoundry.auth.service as service
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.transports.strict_requests import _CLEARTEXT_VAULT_HOP
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        if cleartext:
+            refusal = InsecureHopRefused(f"Vault KV secret provider: {_CLEARTEXT_VAULT_HOP}")
+            raise SecretProviderError(str(refusal)) from refusal
+        raise SecretProviderError("synthetic: unresolved reference")
+
+    monkeypatch.setattr(service, "AuthService", _raise)
+    with pytest.raises(cli._ProvisionAuthRefused) as caught:
+        cli._build_provision_auth_service(
+            ServiceSettings(),
+            object(),  # type: ignore[arg-type]
+            posture=HopPosture(enforcing=True),
+        )
+    if cleartext:
+        assert "well-formed https://" in str(caught.value)
+    else:
+        assert str(caught.value) == cli._PROVISION_AUTH_REFUSALS["reference"]

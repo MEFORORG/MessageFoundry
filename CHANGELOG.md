@@ -405,18 +405,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   nobody. Use an `https://` Vault address. A direct `http://` Vault address was not refused by
   this change; the next entry refuses it.
   (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
-- **BREAKING: the three Vault clients refuse a Vault address that is not `https://`.** The KV
+- **BREAKING: the Vault clients refuse a Vault address that is not `https://`.** At least the KV
   secret provider, the store key provider and the Transit cipher took an `http://` address with no
   scheme check, so on a first deployment with one the `X-Vault-Token` would have crossed the
   network in cleartext, directly or through an `http://` proxy. Each now refuses such an address
   when its client is built, and again before each send in case a proxy appeared since. That
-  includes an address from hvac's own `VAULT_ADDR` fallback. The one `http://` address allowed is
-  a loopback Vault (`localhost`, or a literal in `127.0.0.0/8` or `::1`) reached with no proxy,
-  the shared cleartext-hop rule's on-box case; hvac's built-in default, `http://localhost:8200`, is one. At
-  build, each client raises its provider's own fail-closed error (`SecretProviderError` or
+  includes an address from hvac's own `VAULT_ADDR` fallback, and an address that does not read as
+  one well-formed URL. The one `http://` address allowed is a loopback Vault reached with no
+  proxy, the shared cleartext-hop rule's on-box case, as `docs/CONFIGURATION.md` section
+  `[secrets]` states it; hvac's built-in default, `http://localhost:8200`, is one. At build, each client raises its provider's own fail-closed error (`SecretProviderError` or
   `KeyProviderError`), caused by an `InsecureHopRefused` whose fixed text names no part of the
   address. The `https://`-proxy refusal above now reaches callers the same way at build; it was a
   bare `ValueError`. Before a send, the refusal is the `InsecureHopRefused` itself.
+  `provision-admin` prints the refusal's own text, not its canned line about the secret reference.
   `[security].enforcement` does not relax it, since this hop has no posture in scope and no way to
   declare an accepted risk. An `https://` Vault behind an `http://` proxy is unchanged: the token
   rides inside the TLS tunnel. (`BACKLOG #2317`, ASVS 12.3.1)
