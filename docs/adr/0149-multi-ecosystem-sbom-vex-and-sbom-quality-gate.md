@@ -150,6 +150,53 @@ states the scope). The VEX is hand-maintained and must not drift into stale/fals
 registry/marketplace via CI (unchanged: operators build the image, the extension ships separately);
 promoting any of these gates to blocking; automated VEX generation.
 
+## Amendment 2026-09-30 — a second engine SBOM, resolved on Windows
+
+**Finding.** The core lock carries `sys_platform` markers. `colorama` and `sspilib` install only on
+`win32`; `uvloop` installs everywhere else. `cyclonedx-py environment` lists what is installed, so the one
+engine SBOM, built on `ubuntu-latest`, listed `uvloop` and left out the other two. The engine runs as a
+Windows service (`docs/SERVICE.md`) as well as in the Linux container. So a deploying site on Windows
+would have received an SBOM naming a package it does not run and missing two it does. Measured
+2026-09-30 on Windows, Python 3.14.6, `cyclonedx-bom` 7.3.1, from the same recipe: 40 components with no
+pip, each with a license, version and PackageURL, including `colorama` 0.4.6 and `sspilib` 0.5.0, and no
+`uvloop`.
+
+**Decision.** Ship two engine SBOMs: `messagefoundry-sbom.cdx.json` (Linux, unchanged) and
+`messagefoundry-sbom-windows.cdx.json` (Windows).
+
+- `release.yml` gains a `sbom-windows` job on `windows-latest`. It holds `contents: read` only, builds
+  the SBOM and uploads it as a workflow artifact. The `release` job `needs:` it, downloads the file,
+  and signs, SLSA-attests, scores and attaches it exactly as it does the Linux SBOM. Nothing from the
+  artifact executes in the privileged job. A release that cannot build the Windows SBOM does not ship,
+  rather than shipping without it.
+- `security.yml` gains a matching `sbom-windows` job, the pre-tag dry-run for the release job, as `sbom`
+  already is for the Linux step. `tests/test_ci_venv_pinning.py` holds each runner's pair of installs
+  byte-identical.
+- The Windows scratch venv takes the Linux step's shape: made with `--without-pip` and filled by the
+  outer interpreter's pip through `--python`, so the venv's seeded pip is not listed as an engine
+  component. Every path to it is absolute: a relative `--python` path fails on Windows with WinError 2.
+- `sbom_finalize.py --record-sys-platform` records the finalizing interpreter's own `sys.platform` in
+  each engine SBOM, as the `metadata.properties` entry `messagefoundry:resolved-for:sys_platform`
+  (`linux` or `win32`). The two files share a root component, so without it only the filename told
+  them apart. The helper runs in the same step as the install, so the value names the runner that
+  resolved the lock. It is not a check on the components.
+
+**Options considered.**
+
+| Option | Verdict |
+|---|---|
+| One SBOM listing the union, with a platform property per component | Rejected. CycloneDX has no standard field that scopes a component to a platform, and scanners such as `trivy sbom` would read the union as installed everywhere. A site would get findings for packages it does not run. It also needs a hand-written merge step beside the generator. |
+| Build the Windows set on Linux with `pip install --platform win_amd64` | Rejected. `--platform` changes which wheel tags pip accepts. pip still evaluates environment markers against the interpreter running it, so the markers this amendment is about would resolve as Linux. |
+| A Windows matrix leg of the `release` job | Rejected. That job holds `id-token: write`, so every signing and publishing step would need a platform guard, and the Windows leg would run beside the signing identity. |
+| A separate unprivileged Windows job, handed over as an artifact | **Chosen.** |
+
+**Costs.** One `windows-latest` job per release and per nightly `security.yml` run. This repository is
+public, so hosted runners cost no money, but each run takes a Windows runner from the shared pool. The
+release now also depends on a Windows runner being available.
+
+**Not changed.** The npm extension and container-image SBOMs. The container SBOM already covers the Linux
+image as a whole.
+
 ## To resolve on acceptance
 
 - [x] Confirm MessageFoundry is not FDA-regulated (owner-confirmed 2026-07-21) — no medical-device SBOM

@@ -58,6 +58,7 @@ from messagefoundry.config.code_sets import (
     code_set as _resolve_code_set,
 )
 from messagefoundry.config.models import (
+    DEFAULT_DB_CONNECT_TIMEOUT,
     AckAfter,
     AckMode,
     BatchConfig,
@@ -74,6 +75,7 @@ from messagefoundry.config.models import (
     _check_cleartext_acceptance,
     _check_hop_attestation,
     _check_revocation_attestation,
+    check_db_connect_timeout,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -658,7 +660,7 @@ def DatabaseRef(
     port: int | EnvRef = 1433,
     encrypt: bool = True,
     trust_server_certificate: bool = False,
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
@@ -685,6 +687,14 @@ def DatabaseRef(
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
     0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
     attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
+    # Refused here, at declaration, because a reference set is first dialled at sync time, after
+    # start (BACKLOG #2089). The other DATABASE declarations are checked when their connector is built.
+    # An env() ref has no value yet; the sync checks it once resolved.
+    if not isinstance(connect_timeout, EnvRef):
+        try:
+            check_db_connect_timeout(connect_timeout, "DatabaseRef")
+        except ValueError as exc:
+            raise WiringError(str(exc)) from None
     return ReferenceSourceSpec(
         "database",
         {
@@ -778,7 +788,7 @@ def DatabaseLookup(
     port: int | EnvRef = 1433,
     encrypt: bool = True,
     trust_server_certificate: bool = False,
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     max_rows: int = 500,  # refuse a result larger than this; 0 = no ceiling (BACKLOG #1730)
@@ -3128,7 +3138,7 @@ def Database(
     port: int | EnvRef = 1433,
     encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     trust_server_certificate: bool = False,  # SQL Server preset only
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",  # name the OS-installed driver for 'generic'
     odbc_params: dict[str, str | EnvRef]
@@ -3219,7 +3229,7 @@ def DatabasePoll(
     port: int | EnvRef = 1433,
     encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     trust_server_certificate: bool = False,  # SQL Server preset only
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",  # name the OS-installed driver for 'generic'
     odbc_params: dict[str, str | EnvRef]

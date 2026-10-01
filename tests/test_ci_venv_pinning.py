@@ -113,6 +113,7 @@ in ADR 0034 §3, which is why it is still in `RELEASE_PINNED_TOOLS`.
 
 from __future__ import annotations
 
+import functools
 import re
 import tomllib
 from pathlib import Path
@@ -130,6 +131,12 @@ LOCK_ONLY_VENVS = (
     ("security.yml", "/tmp/sbomenv"),
     ("security.yml", "/tmp/lockcheck"),
 )
+
+#: The runners the engine SBOM is built on, one step per runner in each of `release.yml` and
+#: `security.yml`. Two, because the core lock's `sys_platform` markers resolve differently on win32 and
+#: the engine deploys on both (docs/SUPPLY-CHAIN.md, ADR 0149's 2026-09-30 amendment). Declared up
+#: here, not beside `_sbom_steps`, because parametrize decorators above that helper read it at import.
+_SBOM_RUNNERS = ("ubuntu-latest", "windows-latest")
 
 #: Workflows carrying at least one lock-only scratch venv (for the file-wide ``--upgrade-deps`` check).
 _WORKFLOW_FILES = tuple(dict.fromkeys(wf for wf, _ in LOCK_ONLY_VENVS))
@@ -163,8 +170,9 @@ def _installs_into(venv: str, line: str) -> bool:
 
 
 def _venv_create_re(venv: str) -> re.Pattern[str]:
-    """``python -m venv [flags] <venv>`` — flags allowed, because the SBOM venvs carry ``--without-pip``."""
-    return re.compile(rf"\bpython3?\s+-m\s+venv\s+(?:-\S+\s+)*{re.escape(venv)}(?:\s|$)")
+    """``python -m venv [flags] <venv>`` — flags allowed, because the SBOM venvs carry ``--without-pip``.
+    The path may be double-quoted, as the Windows SBOM steps' ``"$RUNNER_TEMP/sbomenv"`` is."""
+    return re.compile(rf'\bpython3?\s+-m\s+venv\s+(?:-\S+\s+)*"?{re.escape(venv)}"?(?:\s|$)')
 
 
 @pytest.mark.parametrize(("workflow", "venv"), LOCK_ONLY_VENVS)
@@ -200,8 +208,9 @@ def test_scratch_venvs_do_not_hide_an_unpinned_pip_fetch(workflow: str) -> None:
     )
 
 
+@pytest.mark.parametrize("runner", _SBOM_RUNNERS)
 @pytest.mark.parametrize("workflow", ("release.yml", "security.yml"))
-def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str) -> None:
+def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: str) -> None:
     """The venv `cyclonedx_py environment` reads must be built ``--without-pip``.
 
     Environment mode lists EVERY distribution installed in the venv it is pointed at, and a plain
@@ -215,12 +224,24 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str) -> None:
     interpreter's pip and the whole release toolchain; and seeding the venv, then uninstalling pip.
     The second reaches the same SBOM, but only while the uninstall line survives, and nothing here
     would notice it going.
+
+    BOTH RUNNERS since the Windows-resolved SBOM (ADR 0149's 2026-09-30 amendment): the Windows venv's
+    interpreter is ``"$RUNNER_TEMP/sbomenv/Scripts/python.exe"``, so the pattern takes either layout.
+
+    The venv, once pip-less, must be filled the one way that works: by the OUTER pip's ``--python``,
+    from the hashed core lock, at an ABSOLUTE path. Installing through the venv's own pip would fail,
+    and the easy "fix" is to drop ``--without-pip``. Measured on Windows: a RELATIVE ``--python`` path
+    fails with WinError 2 and installs nothing.
     """
-    shell = _executed_shell(_sbom_step_run(workflow))
-    scanned = re.search(r"cyclonedx_py\s+environment\s+(\S+)/bin/python\b", shell)
-    assert scanned, f"{workflow}'s SBOM step no longer names the venv interpreter it scans"
+    shell = _executed_shell(_sbom_step_run(workflow, runner))
+    scanned = re.search(
+        r'cyclonedx_py\s+environment\s+"?(\S+?)/(?:bin/python|Scripts/python\.exe)\b', shell
+    )
+    assert scanned, f"{workflow}'s {runner} SBOM step no longer names the venv interpreter it scans"
     venv = scanned.group(1)
     code = [ln.strip() for ln in shell.splitlines()]
+    # Implied by the interpreter match above; stated on `code`, which the own-pip walk below reads.
+    assert code, f"{workflow}'s {runner} SBOM step has no shell lines to check"
     creates = [ln for ln in code if _venv_create_re(venv).search(ln)]
     assert len(creates) == 1, (
         f"{workflow}'s SBOM step should create {venv} exactly once, found {creates}"
@@ -230,8 +251,7 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str) -> None:
         f"{workflow} creates the SBOM scan venv WITH a seeded pip: {creates[0]!r}. `cyclonedx_py "
         f"environment` lists every installed dist, so the shipped SBOM would carry the interpreter's "
         f"bundled pip, the venv's installer and no part of what `pip install messagefoundry` pulls. "
-        f"Create it with `--without-pip` and install into it with the outer pip's "
-        f"`--python {venv}/bin/python`."
+        f"Create it with `--without-pip` and install into it with the outer pip's `--python`."
     )
     assert "--system-site-packages" not in flags, (
         f"{workflow} creates the SBOM scan venv with --system-site-packages: {creates[0]!r}. "
@@ -239,6 +259,32 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str) -> None:
     )
     assert not [ln for ln in code if re.search(r"\bensurepip\b", ln)], (
         f"{workflow}'s SBOM step runs ensurepip, which re-seeds the pip `--without-pip` kept out"
+    )
+    own_pip = [
+        ln
+        for ln in code
+        if re.search(
+            rf"{re.escape(venv)}/(?:bin|Scripts)/(?:pip|python(?:\.exe)?\s+-m\s+pip)\b", ln
+        )
+    ]
+    assert not own_pip, f"{workflow} installs through the pip-less venv's own pip: {own_pip}"
+    core = [ln for ln in _installs_in(shell) if "docker/locks/requirements-core.lock" in ln]
+    assert len(core) == 1, f"{workflow}'s {runner} SBOM step installs the core lock {core}"
+    assert re.search(rf'--python\s+"?{re.escape(venv)}/\S+\s+install\b', core[0]), (
+        f"{workflow} does not fill {venv} through the outer pip's `--python`: {core[0]!r}"
+    )
+    assert "--require-hashes" in core[0], (
+        f"{workflow}: core lock install without hashes: {core[0]!r}"
+    )
+    assert venv.startswith(("/", "$RUNNER_TEMP/")), (
+        f"{workflow}'s SBOM venv path {venv!r} is relative; `pip --python` fails on it on Windows"
+    )
+    # The platform label is what tells the Linux and Windows SBOMs apart once the filename is gone,
+    # and the install twin check above cannot see a finalize line drop it on one side only.
+    finalize = [ln for ln in shell.replace("\\\n", " ").splitlines() if "sbom_finalize.py" in ln]
+    assert len(finalize) == 1, f"{workflow}'s {runner} SBOM step finalizes {len(finalize)} times"
+    assert "--record-sys-platform" in finalize[0].split(), (
+        f"{workflow}'s {runner} SBOM is finalized without --record-sys-platform: {finalize[0]!r}"
     )
 
 
@@ -398,8 +444,9 @@ SECURITY_YML_PIP_BOOTSTRAPS = 4
 #: is silent (`pytest -q --cov` dies on `unrecognized arguments`, `|| true` swallows it, and the
 #: diff-coverage step reports "skipped" and exits 0).
 #:
-#: `release-tools.lock` carries the largest count and needs the exact number most, because ONE of its
-#: six `release.yml` sites fails quietly. Losing the install would still leave `python -m build` and
+#: `release-tools.lock` carries the largest count and needs the exact number most, because TWO of its
+#: seven `release.yml` sites fail quietly (the Linux and the Windows SBOM steps). Losing the install
+#: would still leave `python -m build` and
 #: `python -m sigstore` failing loudly; `python -m cyclonedx_py` failing reads as the release breaking at
 #: the SBOM, not as a pinning regression. Read each job's own `permissions:` block for what those sites
 #: run with — restating it here would be a second copy free to drift, and the first draft of this comment
@@ -411,9 +458,12 @@ LOCK_INSTALLED_TOOLCHAINS = (
     ("security.yml", "ci/locks/ci-scanners.lock", 5),
     ("zizmor.yml", "ci/locks/ci-scanners.lock", 1),
     ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
-    # SIX since ADR 0201: the toolkit build step in the `release` job installs its own `build`.
-    ("release.yml", "ci/locks/release-tools.lock", 6),
-    ("security.yml", "ci/locks/release-tools.lock", 1),
+    # SEVEN in release.yml: SIX since ADR 0201 (the toolkit build step in the `release` job installs
+    # its own `build`), and one more since the Windows-resolved engine SBOM. That SBOM also makes TWO in
+    # security.yml: each file's `sbom-windows` job installs the lock for `cyclonedx_py`, beside the
+    # Linux SBOM step's own install.
+    ("release.yml", "ci/locks/release-tools.lock", 7),
+    ("security.yml", "ci/locks/release-tools.lock", 2),
     # The last two were installing from a lock with no row here, so no exact count watched them
     # (BACKLOG #1545). `required-workflow-state.yml` installs `ci-scanners.lock` for PyYAML in both of
     # its jobs, `reachable` and `accurate`. `ci.yml`'s packaging build job installs `release-tools.lock`
@@ -2152,35 +2202,55 @@ def _installs_in(run_body: str) -> tuple[str, ...]:
     )
 
 
-def _sbom_step_run(workflow: str) -> str:
-    """The ``run:`` body of the ONE step that builds the CycloneDX SBOM, located by what it does
-    (``cyclonedx_py environment``). Shared by the twin check and the seeded-pip check so the two cannot
-    disagree about which step is the SBOM step."""
-    owning = [run for _, run in _run_blocks(workflow) if "cyclonedx_py environment" in run]
-    assert len(owning) == 1, (
-        f"{workflow} has {len(owning)} step(s) running `cyclonedx_py environment`, expected exactly 1. "
-        f"Re-point these SBOM checks rather than letting them read the wrong step."
+@functools.cache
+def _sbom_steps(workflow: str) -> dict[str, str]:
+    """``{runner: run body}`` for every step in ``workflow`` that builds the engine CycloneDX SBOM.
+
+    The step is located by what it DOES (`cyclonedx_py environment`) rather than by its `name:`, because
+    the paired steps are deliberately named differently -- `release.yml` ships its SBOM and
+    `security.yml` rehearses it -- and a name is also the one thing here that may be reworded freely.
+
+    KEYED BY THE JOB'S `runs-on`, exactly one step per runner. Pairing by runner is what stops a Linux
+    step being compared against a Windows one, or two Linux steps hiding a missing Windows twin.
+    Cached because every parametrized SBOM case reads the same two files; callers must not mutate it.
+    """
+    yaml = pytest.importorskip("yaml")
+    doc = yaml.safe_load((_WORKFLOWS / workflow).read_text(encoding="utf-8"))
+    pairs = [
+        (str(job.get("runs-on")), step["run"])
+        for job in (doc.get("jobs") or {}).values()
+        for step in job.get("steps") or []
+        if isinstance(step.get("run"), str) and "cyclonedx_py environment" in step["run"]
+    ]
+    # One sorted comparison catches a missing runner and a doubled one alike.
+    assert sorted(runner for runner, _ in pairs) == sorted(_SBOM_RUNNERS), (
+        f"{workflow} builds the engine SBOM on {sorted(r for r, _ in pairs)}, expected exactly one "
+        f"step on each of {list(_SBOM_RUNNERS)}. Re-point this twin check rather than letting it "
+        f"compare the wrong pair of steps."
     )
-    return owning[0]
+    return dict(pairs)
 
 
-def _sbom_step_installs(workflow: str) -> tuple[str, ...]:
-    """Every `pip install` line inside the step that builds the CycloneDX SBOM, in order.
+def _sbom_step_run(workflow: str, runner: str) -> str:
+    """The ``run:`` body of ``workflow``'s SBOM step on ``runner``. A view over ``_sbom_steps``, shared
+    by the twin check and the seeded-pip check so they cannot disagree about which step is the SBOM
+    step."""
+    return _sbom_steps(workflow)[runner]
+
+
+def _sbom_step_installs(workflow: str, runner: str) -> tuple[str, ...]:
+    """Every `pip install` line inside the SBOM step that runs on ``runner``, in order.
 
     SCOPED TO THE STEP, and that scoping is the whole point of this helper. Until 2026-09-10 the two
     installs could be found by searching the file for a line naming `cyclonedx-bom`; BACKLOG #332 step 6
     moved that tool into `ci/locks/release-tools.lock`, so the line is now
-    `pip install --require-hashes -r ci/locks/release-tools.lock` -- which `release.yml` runs at SIX
+    `pip install --require-hashes -r ci/locks/release-tools.lock` -- which `release.yml` runs at several
     sites. An unscoped search would have compared an arbitrary one of them against `security.yml`'s and
     reported agreement it had not actually checked.
-
-    The step is located by what it DOES (`cyclonedx_py environment`) rather than by its `name:`, because
-    the two steps are deliberately named differently -- `release.yml` ships its SBOM and `security.yml`
-    rehearses it -- and a name is also the one thing here that may be reworded freely.
     """
-    installs = _installs_in(_sbom_step_run(workflow))
+    installs = _installs_in(_sbom_step_run(workflow, runner))
     assert installs, (
-        f"{workflow}'s SBOM step runs no `pip install` — this check has nothing to compare"
+        f"{workflow}'s {runner} SBOM step runs no `pip install` — this check has nothing to compare"
     )
     return installs
 
@@ -2196,8 +2266,9 @@ _RELEASE_TOOL_MODULES = ("build", "cyclonedx_py", "sigstore")
 _RELEASE_TOOLS_LOCK = "ci/locks/release-tools.lock"
 
 
-def test_sbom_install_is_byte_identical_in_release_and_security() -> None:
-    """The two CycloneDX SBOM steps must run the SAME install commands.
+@pytest.mark.parametrize("runner", _SBOM_RUNNERS)
+def test_sbom_install_is_byte_identical_in_release_and_security(runner: str) -> None:
+    """Each runner's pair of CycloneDX SBOM steps must run the SAME install commands.
 
     Nothing in PR CI executes `release.yml` (tag push only, ADR 0034 "What no test can see"), so the
     documented way to validate its SBOM step before cutting a tag is to dispatch `security.yml`'s sbom
@@ -2211,11 +2282,15 @@ def test_sbom_install_is_byte_identical_in_release_and_security() -> None:
     picking one is exactly how a twin check ends up watching the half that did not move. Comparing the
     tuple needs no anchor and is strictly stronger: an install added to one side and not the other
     fails here rather than at a tag push.
+
+    ONE PAIR PER RUNNER since 2026-09-30: `release.yml`'s `sbom-windows` job is rehearsed by
+    `security.yml`'s, exactly as the Linux steps are.
     """
-    release, security = _sbom_step_installs("release.yml"), _sbom_step_installs("security.yml")
-    print(f"[ci-venv-pinning] SBOM step installs compared: {len(release)} line(s) each")
+    release = _sbom_step_installs("release.yml", runner)
+    security = _sbom_step_installs("security.yml", runner)
+    print(f"[ci-venv-pinning] {runner} SBOM step installs compared: {len(release)} line(s) each")
     assert release == security, (
-        "the SBOM install commands have drifted:\n"
+        f"the {runner} SBOM install commands have drifted:\n"
         + "  release.yml :\n    "
         + "\n    ".join(release)
         + "\n  security.yml:\n    "
@@ -2231,9 +2306,9 @@ def test_the_step_that_runs_a_release_tool_also_installs_it(workflow: str) -> No
     """The step running `python -m build` / `cyclonedx_py` / `sigstore` must install the lock ITSELF.
 
     THE INVARIANT THE SITE COUNT CANNOT STATE. `LOCK_INSTALLED_TOOLCHAINS` asserts that `release.yml`
-    holds exactly five `--require-hashes -r ci/locks/release-tools.lock` lines, and that is an AGGREGATE:
-    a refactor that drops the harness build's install and adds one to some new step keeps the total at
-    five and stays green, with the harness wheel then built by whatever `build` the runner happened to
+    holds exactly seven `--require-hashes -r ci/locks/release-tools.lock` lines, and that is an
+    AGGREGATE: a refactor that drops the harness build's install and adds one to some new step keeps the total at
+    seven and stays green, with the harness wheel then built by whatever `build` the runner happened to
     have. The count sees a number; this sees the pairing, and it names the offending STEP rather than
     reporting that a number moved.
 
@@ -2254,7 +2329,7 @@ def test_the_step_that_runs_a_release_tool_also_installs_it(workflow: str) -> No
         if not any(_RELEASE_TOOLS_LOCK in ln for ln in _installs_in(run)):
             offenders.append(f"{label} runs {used} but does not install {_RELEASE_TOOLS_LOCK}")
     print(f"[ci-venv-pinning] {workflow}: {checked} step(s) run a release tool")
-    # Non-vacuity: `security.yml` runs exactly the SBOM step, `release.yml` five. A zero here means the
+    # Non-vacuity: `security.yml` runs its two SBOM steps, `release.yml` seven. A zero here means the
     # scan stopped matching, which must not read as "no offenders".
     assert checked > 0, (
         f"{workflow} has no step invoking {list(_RELEASE_TOOL_MODULES)} — either the release path was "

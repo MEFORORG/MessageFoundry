@@ -331,7 +331,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 - **OS.** Windows Server 2022/2025 is the primary supported platform (Windows-service deploy via NSSM); Windows Server 2019 and Windows 10/11 are supported; the engine also runs on modern Linux (under systemd — no bundled installer); macOS is development only.
 
-- **Runtime.** Python 3.14+ (64-bit). No C compiler needed for the default install. The Windows service uses NSSM (registering it needs admin rights).
+- **Runtime.** Python 3.14+ (64-bit). Whether the default install needs a C compiler depends on the interpreter; see [SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md). The Windows service uses NSSM (registering it needs admin rights).
 
 - **Store.** SQLite (WAL) is the bundled, zero-setup default for single-node; **PostgreSQL 13+** or **SQL Server 2022/2025** for production (run the server DB on its own host; SQL Server also needs the OS-level ODBC Driver 18, RCSI recommended). MySQL/Oracle aren’t supported.
 
@@ -476,12 +476,12 @@ The runtime core is around twenty packages; everything past it is an **opt-in ex
 
 | **Group** | **Packages** | **What for** |
 |----|----|----|
-| **Core runtime** | hl7apy, python-hl7, pydantic, aiosqlite, fastapi, starlette, uvicorn, httptools, websockets, uvloop (not on Windows), argon2-cffi, cryptography, ldap3, pyspnego, tomlkit, tzdata, psutil, httpx, truststore | HL7 validate/parse, config models, the SQLite store, the API (Starlette carries its own explicit floor), password hashing + AES-256-GCM PHI-at-rest, AD/Kerberos auth, TOML writing, tz data, host gauges for the Prometheus /metrics surface (the engine renders the exposition itself), and the shared HTTP client (apiclient, tray, harness monitor, ASGI test client) with OS-trust-store verification. Always installed, plus one annotated-types\<0.8 constraint pin on a transitive. Hardened XML parsing is not a dependency: it is a vendored copy of defusedxml 0.7.1 in `messagefoundry/_vendor/defusedxml/`. |
+| **Core runtime** | hl7apy, python-hl7, pydantic, aiosqlite, fastapi, starlette, uvicorn, httptools, websockets, uvloop (not on Windows), argon2-cffi, cryptography, ldap3, pyspnego, tomlkit, tzdata, psutil, httpx, truststore | HL7 validate/parse, config models, the SQLite store, the API (Starlette carries its own explicit floor), password hashing + AES-256-GCM PHI-at-rest, AD/Kerberos auth, TOML writing, tz data, host gauges for the Prometheus /metrics surface (the engine renders the exposition itself), and the shared HTTP client (apiclient, tray, harness monitor, ASGI test client) with OS-trust-store verification. Always installed. Hardened XML parsing is not a dependency: it is a vendored copy of defusedxml 0.7.1 in `messagefoundry/_vendor/defusedxml/`. |
 | \[harness\] | PySide6 | The standalone PySide6 test harness GUI. (Was `[console]` before the desktop console was retired — BACKLOG #103; its HTTP client, httpx + truststore, moved to the core runtime.) |
 | \[postgres\] | asyncpg | PostgreSQL store backend (no OS dependency; ships compiled wheels). |
 | \[sqlserver\] | aioodbc *+ OS ODBC Driver 18* | SQL Server store backend (the ODBC driver installs at the OS level, not via pip). |
 | \[sftp\] | paramiko | SFTP transport for the REMOTEFILE connector (FTP/FTPS use the stdlib). |
-| \[fhir\] | fhir.resources, fhirpathpy | The typed FHIR model + FHIRPath codec behind parsing/fhir/. |
+| \[fhir\] | fhir.resources, fhir-core, fhirpathpy | The typed FHIR model + FHIRPath codec behind parsing/fhir/. fhir-core is declared only to floor it. |
 | \[dicom\] | pynetdicom, pydicom | DICOM C-STORE SCP/SCU connectors + the headers/SR codec (no pixel data, so no numpy). |
 | \[x12\] | pyx12 | Opt-in *strict* X12 validation; the tolerant X12 peek/parse hot path needs nothing. |
 | \[xml\] | lxml, xmlschema, signxml | XML/SOAP accessors, XSD validation, and XML-DSig signatures. |
