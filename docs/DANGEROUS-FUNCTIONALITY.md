@@ -24,9 +24,17 @@ Five things:
    `adr-analyze`. The scans in sections 4, 5 and 7 read it with the engine.
 
 The 2026-08-22 owner ruling on scope named the first two, and its purpose was to bring the
-deployment path in. It says nothing about the other three. The extension and the web console ship
-to the same operators, and the toolkit ships beside the engine at the same version. So this page
-covers all three.
+deployment path in. It says nothing about the other three, so each is here for its own reason:
+
+- The web console runs inside the engine's own process.
+- The extension ships to the same operators.
+- The toolkit carries the engine's own commands. Each command it registers is a row in the
+  engine's command table, `CLI_TIERS` in `messagefoundry/cli_surface.py`, and ADR 0201 moves
+  those commands out of the engine wheel a slice at a time. A site must not leave this page by
+  moving between wheels.
+
+Shipping at the engine's version is not a reason on its own. See the test harness under "What is
+deliberately not here".
 
 It does not cover your Routers and Handlers. Those are yours, and section 1 explains why that
 matters more than anything else here.
@@ -718,9 +726,11 @@ in your own documentation.
 **Third-party components.** [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) designates the risky ones.
 Per-library decisions that matter to a deploying operator are recorded in the ADRs cited above.
 
-**The published test harness.** `messagefoundry-harness` is a tool for testing an engine, not part
-of a deployment. It does start processes. It is out of this page's scope, which is a choice about
-this page rather than a claim that it holds none of these classes.
+**The published test harness.** `messagefoundry-harness` is a tool for testing an engine, and it
+does start processes. It ships at the engine's version, as the toolkit does. But it registers none
+of the engine's commands, the engine wheel does not contain its `harness/` package, and it does not
+run inside the engine. The extension's reason, shipping to the same operators, would reach it. So
+leaving it out is a choice about this page, not a claim that it holds none of these classes.
 
 ## Keeping this page true
 
