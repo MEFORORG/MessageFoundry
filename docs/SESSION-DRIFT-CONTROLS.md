@@ -448,6 +448,12 @@ shell writes.
 
 ### G11 — The two worktree layouts have diverged, and only one has teardown
 
+> **CORRECTED 2026-09-30 (BACKLOG #1038).** The finding below was true when written and is kept as
+> written. Since then `new.ps1 -Nested` also builds under `<primary>/.claude/worktrees/`, and
+> `remove.ps1 -Nested` tears that tree down. `prune-merged.ps1` is still sibling-only. Which mechanism
+> makes which layout is stated once, in the "WHICH MECHANISM MADE THIS WORKTREE" block of
+> `scripts/hooks/worktree_gate.ps1`.
+
 `new.ps1` builds **siblings** (`<parent>/<repo>-<name>`). Claude Code's own `--worktree`, the desktop app,
 and subagent isolation all build **nested** worktrees under `<primary>/.claude/worktrees/`. Both
 populations are live (5 sibling, 3 nested). The gate's exemption and rule 3's third lookahead are written

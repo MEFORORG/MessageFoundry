@@ -302,6 +302,57 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     assert not fx.is_registered(wt)
 
 
+# --- BACKLOG #1038: -Nested reaches <repo>/.claude/worktrees/<Name> ------------------------------
+#
+# `new.ps1 -Nested` makes a tree under the checkout's own .claude/worktrees, which the sibling lookup
+# can never find. These rows pin the teardown for it, and that the default lookup is unchanged.
+
+
+def _add_nested(fx: Fixture, name: str) -> Path:
+    path = fx.primary / ".claude" / "worktrees" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _git(fx.primary, "worktree", "add", "-q", "-b", name, str(path))
+    (path / ".venv").mkdir()
+    (path / ".venv" / "marker.txt").write_text("untracked", encoding="utf-8")
+    return path
+
+
+def test_nested_removes_a_tree_under_dot_claude_worktrees(fx: Fixture) -> None:
+    """Red before the fix: remove.ps1 had no -Nested parameter."""
+    wt = _add_nested(fx, "nest")
+    assert fx.is_registered(wt)
+
+    proc = run(fx, "-Name", "nest", "-Nested")
+
+    assert proc.returncode == 0, proc.stderr
+    assert not wt.exists()
+    assert not fx.is_registered(wt)
+    assert fx.branch_exists("nest")
+
+
+def test_without_nested_the_nested_tree_is_not_found_and_survives(fx: Fixture) -> None:
+    """The default lookup is unchanged: it names the SIBLING it looked for and touches nothing."""
+    wt = _add_nested(fx, "kept")
+
+    proc = run(fx, "-Name", "kept")
+
+    assert proc.returncode != 0
+    assert str(fx.sibling("kept")) in proc.stderr
+    assert wt.exists() and fx.is_registered(wt)
+
+
+def test_nested_refuses_a_missing_tree_and_names_the_nested_path(fx: Fixture) -> None:
+    """A sibling of the same name is not a fallback: -Nested looks only under .claude/worktrees."""
+    sibling = fx.add("same")
+
+    proc = run(fx, "-Name", "same", "-Nested")
+
+    assert proc.returncode != 0
+    assert "No such worktree" in proc.stderr
+    assert str(fx.primary / ".claude" / "worktrees" / "same") in proc.stderr
+    assert sibling.exists() and fx.is_registered(sibling)
+
+
 # --- BACKLOG #1295: claims held by a removed worktree --------------------------
 #
 # `claim.ps1 -Release` is WORKTREE-SCOPED, so a claim outliving its holder can never be released

@@ -5,7 +5,8 @@
     Remove a git worktree created by new.ps1 (and optionally its branch).
 
 .DESCRIPTION
-    Removes the sibling worktree directory <repo>-<Name>. Refuses if the worktree has uncommitted
+    Removes the sibling worktree directory <repo>-<Name>, or with -Nested <repo>\.claude\worktrees\<Name>
+    (what `new.ps1 -Nested` makes). Refuses if the worktree has uncommitted
     *tracked* changes (so you don't lose work) unless -Force; the untracked .venv / node_modules are
     expected and removed automatically.
 
@@ -52,7 +53,10 @@ param(
     # Repo to operate on. Defaults to this script's own checkout -- which is what makes an absolute-
     # path invocation from ANY cwd resolve the checkout that owns the worktree. Tests point it at a
     # fixture so the real logic is what gets exercised.
-    [string]$RepoRoot
+    [string]$RepoRoot,
+    # Remove <RepoRoot>\.claude\worktrees\<Name> instead of the <repo>-<Name> sibling: the teardown for
+    # `new.ps1 -Nested` (BACKLOG #1038). Every guard below applies unchanged.
+    [switch]$Nested
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,9 +65,14 @@ if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\.."
 elseif (-not (Test-Path -LiteralPath $RepoRoot)) { throw "RepoRoot does not exist: $RepoRoot" }
 else { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path }
 
-$Parent = Split-Path $RepoRoot -Parent
-$RepoName = Split-Path $RepoRoot -Leaf
-$WorktreePath = Join-Path $Parent "$RepoName-$Name"
+if ($Nested) {
+    $WorktreePath = Join-Path (Join-Path (Join-Path $RepoRoot ".claude") "worktrees") $Name
+}
+else {
+    $Parent = Split-Path $RepoRoot -Parent
+    $RepoName = Split-Path $RepoRoot -Leaf
+    $WorktreePath = Join-Path $Parent "$RepoName-$Name"
+}
 
 if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
 

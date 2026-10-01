@@ -12,8 +12,10 @@
     anywhere on this host, so nothing here can PROVE a session is gone -- a DEAD/STALE/absent verdict is
     the absence of a veto, not a permission. When the fence cannot look at all, nothing is pruned.
 
-    Enumerates the <repo>-<name> sibling worktrees that new.ps1 creates and removes each one that is ALL
-    of:
+    Enumerates the <repo>-<name> sibling worktrees and removes each one that is ALL of the following.
+    It never touches a tree under .claude/worktrees, including one `new.ps1 -Nested` made -- remove.ps1
+    -Nested is that tree's teardown. Which mechanism makes which layout is stated once, in the
+    "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1 (BACKLOG #1038).
 
       (a) merged     -- no commits beyond origin/main, OR a merged PR whose head is this exact tip, OR
                         its OWN upstream branch is gone (squash-merged + remote-deleted),

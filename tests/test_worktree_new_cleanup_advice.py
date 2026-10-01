@@ -63,14 +63,18 @@ def _advice_commands() -> list[str]:
     ]
 
 
-def _render(cmd: str, *, repo_root: Path, worktree: Path, name: str) -> list[str]:
+def _render(
+    cmd: str, *, repo_root: Path, worktree: Path, name: str, nested: bool = False
+) -> list[str]:
     """Turn one printed advice line into an argv, exactly as a reader copying it would.
 
-    Longest token first so no substitution eats a prefix of another.
+    Longest token first so no substitution eats a prefix of another. ``$nestedFlag`` is what new.ps1
+    sets for a ``-Nested`` tree (BACKLOG #1038).
     """
     text = cmd.replace('`"', '"')
     for token, value in (
         ("$WorktreePath", str(worktree)),
+        ("$nestedFlag", " -Nested" if nested else ""),
         ("$RepoRoot", str(repo_root)),
         ("$Name", name),
     ):
@@ -228,3 +232,54 @@ def test_the_advice_that_used_to_be_printed_still_throws_today(fx: Fixture) -> N
 
     assert not target.exists()
     assert str(target).replace("\\", "/") not in _registered(fx.primary)
+
+
+# --- BACKLOG #1038: a -Nested tree, made by new.ps1 itself, then torn down by its own advice -------
+
+
+def _run_new_nested(fx: Fixture, name: str) -> subprocess.CompletedProcess[str]:
+    """Drive a COPY of new.ps1 living in the fixture, so it anchors there and never on this checkout."""
+    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
+        dst = fx.primary / rel
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(_REPO / rel, dst)
+    script = fx.primary / "scripts" / "worktree" / "new.ps1"
+    return _run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
+        + ["-Name", name, "-Nested", "-NoInstall"]
+    )
+
+
+def _printed_advice(stdout: str) -> list[str]:
+    return [ln.split("#   ", 1)[1] for ln in stdout.splitlines() if ln.startswith("  #   ")]
+
+
+def test_new_ps1_NESTED_lands_under_dot_claude_worktrees_and_its_own_advice_removes_it(
+    fx: Fixture,
+) -> None:
+    """Red before the fix: new.ps1 had no -Nested. Every printed cleanup line is run once, each
+    against a fresh tree, and each must leave nothing behind."""
+    first = _run_new_nested(fx, "probe")
+    assert first.returncode == 0, f"{first.stdout}\n{first.stderr}"
+    advice = _printed_advice(first.stdout)
+    assert len(advice) == 2, f"expected two printed cleanup commands, got {advice}"
+
+    for i, line in enumerate(advice):
+        name = "probe" if i == 0 else f"probe{i}"
+        if i > 0:
+            made = _run_new_nested(fx, name)
+            assert made.returncode == 0, f"{made.stdout}\n{made.stderr}"
+            line = _printed_advice(made.stdout)[i]
+        wt = fx.primary / ".claude" / "worktrees" / name
+        assert wt.is_dir()
+        assert str(wt).replace("\\", "/") in _registered(fx.primary)
+        assert not (fx.primary.parent / f"repo-{name}").exists(), "it made a SIBLING instead"
+        (wt / ".venv").mkdir(exist_ok=True)
+
+        argv = [t.strip('"') for t in shlex.split(line, posix=False)]
+        proc = _run(argv)
+
+        assert proc.returncode == 0, f"advice failed: {line}\n{proc.stdout}\n{proc.stderr}"
+        assert not wt.exists(), f"advice ran but left the worktree behind: {line}"
+        assert str(wt).replace("\\", "/") not in _registered(fx.primary)
