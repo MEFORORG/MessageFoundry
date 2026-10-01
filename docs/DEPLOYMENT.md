@@ -14,6 +14,162 @@ the engine needs, see [`ANTIVIRUS-FIREWALL.md`](ANTIVIRUS-FIREWALL.md).
 
 ---
 
+## Deployment topologies at a glance
+
+Four pictures show which processes would run on which host, and which network hops are encrypted.
+They describe the design. Each one links to the section that holds the settings and startup checks.
+
+**How to read them.** A frame is one host. A cylinder is the message store. An arrow points from the
+side that opens the connection. Each arrow label names the protocol and says whether the hop is
+encrypted.
+
+### Topology 1: single node
+
+This is the default shape. It answers what runs on the one server and what crosses the network.
+The engine runs as the Windows service `MessageFoundry`, which NSSM starts with
+`messagefoundry serve` ([`SERVICE.md`](SERVICE.md)). The API and the web console at `/ui` live in
+that same process and bind `127.0.0.1` port `8765`. The message store is a local SQLite file.
+
+```mermaid
+flowchart LR
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+  classDef opstool fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+
+  T1UP(["Sending partner system"]):::ext
+  T1DOWN(["Receiving partner system"]):::ext
+
+  subgraph T1HOST["Engine host: one Windows server"]
+    T1BROWSER["Operator browser<br/>web console at /ui"]:::opstool
+    T1API["Engine API and web console<br/>127.0.0.1 port 8765<br/>sign-in required"]:::api
+    T1ENGINE["Engine: messagefoundry serve<br/>Windows service under NSSM"]:::core
+    T1STORE[("Message store<br/>SQLite file in WAL mode")]:::store
+  end
+
+  T1BROWSER -->|"HTTPS and WSS on loopback<br/>encrypted"| T1API
+  T1API ---|"same process"| T1ENGINE
+  T1ENGINE -->|"local file<br/>no network hop"| T1STORE
+  T1UP -->|"MLLP with tls = true<br/>encrypted"| T1ENGINE
+  T1ENGINE -->|"MLLP with tls = true<br/>encrypted"| T1DOWN
+```
+
+The browser hop uses the engine's own certificate. Topology 3 says which certificate that is.
+
+Inbound listeners bind `127.0.0.1` by default (`[inbound].bind_host`). To receive from another host,
+a site would set that address and `tls = true` on the MLLP connection. The engine refuses a
+non-loopback MLLP listener that has no TLS. Partner systems may use other connection types, and each
+type has its own TLS posture. The [channel matrix](#channel--tls-posture-matrix) lists every one.
+
+### Topology 2: message store on a remote server database
+
+This picture answers where the message store lives when it is not the local SQLite file.
+`[store].backend` selects `sqlserver` or `postgres`, and the engine dials the database on another
+host. A deployment uses one backend, not both. Each hop encrypts by default
+(`[store].encrypt = true`) and verifies the server certificate
+(`[store].trust_server_certificate = false`).
+
+```mermaid
+flowchart LR
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+
+  subgraph T2ENGHOST["Engine host"]
+    T2ENGINE["Engine: messagefoundry serve"]:::core
+  end
+
+  subgraph T2SSHOST["Database host when backend = sqlserver"]
+    T2SS[("Message store<br/>SQL Server, default port 1433")]:::store
+  end
+
+  subgraph T2PGHOST["Database host when backend = postgres"]
+    T2PG[("Message store<br/>PostgreSQL, default port 5432")]:::store
+  end
+
+  T2ENGINE -->|"ODBC Driver 18 with Encrypt=yes<br/>encrypted, server certificate verified"| T2SS
+  T2ENGINE -->|"asyncpg over TLS<br/>encrypted, server certificate and host name verified"| T2PG
+```
+
+The API, the web console and the partner hops match topology 1. The setup steps, the database
+grants and the certificate options are in [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md).
+
+### Topology 3: who terminates TLS for the API
+
+This picture answers which process holds the certificate on the API hop. By default the engine
+serves TLS itself. A site may instead declare a reverse proxy that terminates TLS in front, with
+`[api].tls_terminated_upstream = true` and `[api].trusted_proxies`.
+
+```mermaid
+flowchart LR
+  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
+  classDef opstool fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+
+  subgraph T3DEFAULT["Default: the engine serves TLS itself"]
+    T3CLIENTA["Browser or API client"]:::opstool
+    T3ENGINEA["Engine API<br/>operator certificate when tls_cert_file is set<br/>otherwise a self-signed pair minted on first run"]:::api
+    T3CLIENTA -->|"HTTPS and WSS<br/>encrypted"| T3ENGINEA
+  end
+
+  subgraph T3PROXY["Declared reverse proxy: tls_terminated_upstream = true"]
+    T3CLIENTB["Browser or API client"]:::opstool
+    T3RP["Reverse proxy<br/>terminates TLS"]:::ext
+    T3ENGINEB["Engine API<br/>mints no certificate<br/>trusts forwarded headers only from trusted_proxies"]:::api
+    T3CLIENTB -->|"HTTPS and WSS<br/>encrypted"| T3RP
+    T3RP -->|"HTTP and WS, plaintext by design<br/>the site secures this hop<br/>HTTPS instead when tls_cert_file is set"| T3ENGINEB
+  end
+```
+
+In the default, an operator-supplied `[api].tls_cert_file` wins. With none, the engine mints a
+self-signed pair beside the store on first run and reuses it
+([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+That pair is a placeholder. On the shipped posture, the engine refuses a non-loopback API bind until
+an operator certificate or a declared proxy is configured.
+
+Behind a declared proxy the engine mints nothing, because serving HTTPS there would break the proxy's
+own hop. The proxy-to-engine hop is then plaintext by design. `serve` refuses to start until
+`[api].plaintext_upstream_hop_acknowledged = true` records that the site has taken that hop on. With
+`[api].tls_cert_file` also set, the engine serves that hop over TLS and needs no acknowledgement.
+[Before you expose off-loopback](#before-you-expose-off-loopback) lists the full startup checks.
+
+### Topology 4: web console from another machine
+
+This picture answers how an operator on another PC would reach the engine. There is no client to
+install: the browser opens `https://<engine-host>:8765/ui`, and the engine serves the console on an
+operator certificate. Remote access is off by default. Treat this picture as the shape and
+[`REMOTE-CONSOLE.md`](REMOTE-CONSOLE.md) as the checklist.
+
+```mermaid
+flowchart LR
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+  classDef opstool fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+
+  subgraph T4PC["Operator PC"]
+    T4BROWSER["Browser<br/>no client to install"]:::opstool
+  end
+
+  subgraph T4HOST["Engine host"]
+    T4API["Engine API and web console at /ui<br/>routable listen address, port 8765<br/>operator certificate, sign-in required"]:::api
+    T4ENGINE["Engine: messagefoundry serve"]:::core
+    T4STORE[("Message store")]:::store
+  end
+
+  T4BROWSER -->|"HTTPS and WSS<br/>encrypted, operator certificate"| T4API
+  T4API ---|"same process"| T4ENGINE
+  T4ENGINE -->|"local file, or the TLS hop in topology 2"| T4STORE
+```
+
+The engine side would set `[security].local_access_only = false`, `[security].listen_address`,
+`[security].serve_web_console = true`, `[security].web_console_public_address` and
+`[api].tls_cert_file`. The engine refuses to serve `/ui` on a non-loopback address with only its
+self-signed pair. A site that fronts the console with a reverse proxy would use the proxy shape in
+topology 3 instead.
+
+---
+
 ## On-premises by default
 
 MessageFoundry runs **on-premises** and binds **loopback (`127.0.0.1`) by default** — the engine API
