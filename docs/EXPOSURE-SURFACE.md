@@ -12,7 +12,7 @@ These limits apply to the whole page:
 
 - It describes the engine as shipped. What a deployment would expose depends on its configuration.
   [Read your own instance's lists](#read-your-own-instances-lists) says how to get that.
-- Its lists say "at least". The full inventory of every interface is
+- Its lists say "at least". A longer inventory of interfaces is
   [section 5 of ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md#5-communications-inventory-asvs-1311).
   A test guards that inventory against drift, and the section says what the test can see.
 - Configuration is Python that runs inside the engine. No allow-list on this page bounds what a
@@ -47,8 +47,8 @@ These settings change the size of the operator surface:
   one operator socket per engine shard.
 
 [ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) has a port table for at least the
-MLLP, DICOM and X12 listeners and the operator API, and a sample Windows Firewall rule for MLLP. It
-has no row for some listeners on this page. For the TLS and peer controls on each listener, see the
+MLLP, DICOM and X12 listeners and the operator API. It has no row for some listeners on this page.
+For the TLS and peer controls on each listener, see the
 [channel matrix](DEPLOYMENT.md#channel--tls-posture-matrix).
 
 ## Each outbound hop has its own limit on the target, and some have none
@@ -69,6 +69,7 @@ list means. The engine's own update check makes no network call: `[update_check]
 | Store database on SQL Server or PostgreSQL | One target, `[store].server`. The default SQLite store is a local file | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | HashiCorp Vault, for the store key or for Connection secrets | One target each: `MEFOR_STORE_VAULT_ADDR` and `MEFOR_SECRETS_VAULT_ADDR` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Syslog forwarding and the startup clock check | `[logging].forward_host` and `[logging].ntp_peer` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| Startup TLS-floor probe, behind a declared TLS terminator under `enforce` | One target, `[security].web_console_public_address` | No list | `probe_tls_floor` in `messagefoundry/config/tls_probe.py` |
 | Backup to a network share | `[backup].destination` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 
 The table leaves out at least these:
@@ -99,30 +100,29 @@ checklist. `serve` would exit with code 2, before it starts the web server, on a
 | Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
 | Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |
 | Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
-| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. `[egress].allowed_proxy` never counts. `allowed_smtp` and `allowed_direct` count only while that switch is unset |
+| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated |
 
 Under `enforcement = warn`, the proxy-attestation and open-egress guards only warn, and the
 operator-bind guard accepts the override that DEPLOYMENT.md describes. The sign-in, revocation and
 plaintext-hop guards refuse under `warn` too.
 
-`serve` refuses on more than this table. At least these can stop it too: a web console switched on
-by name (`[security].serve_web_console = true`) on an exposed instance, and off-box log forwarding
-that is not set up. So can `[security].require_mfa` turned off on an exposed instance. The checklist
-covers those settings. So clearing one guard does not mean `serve` starts. A site that sets
-`[api].tls_cert_file` on a network bind would meet the revocation guard next.
+`serve` refuses on more than this table, so clearing one guard does not mean `serve` starts. The
+checklist names more of these refusals. Each `return 2` in `_serve` in `messagefoundry/__main__.py`
+is one.
 
-A listener guard is different. At startup it fails one Connection, and `serve` keeps going. Under
-`enforce`, a non-loopback MLLP, HTTP, DICOM, raw TCP or X12 listener that has no TLS does not bind,
+A listener guard is different. At startup it fails one Connection, and `serve` keeps going. By
+default, a non-loopback MLLP, HTTP, DICOM, raw TCP or X12 listener that has no TLS does not bind,
 and its Connection shows as failed. Raw TCP and X12 have no TLS to turn on. A Connection that sets
 `tls_hop_attested` with a reason crosses this guard, and the engine reports it as a loosening.
+`_inbound_insecure_bind_permitted` in `messagefoundry/pipeline/wiring_runner.py` holds the rule.
 
 At least two more listener checks fail a Connection under `enforce`, and `tls_hop_attested` clears
-neither. One is client-certificate revocation on a mutual-TLS listener. The other is peer control on
-a non-loopback HTTP listener, which
+neither. `check_inbound_revocation` covers a mutual-TLS listener. `check_http_intake_auth` covers a
+non-loopback HTTP listener, which
 [CONNECTIONS.md](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023) describes.
-These checks run when each inbound Connection starts, in `RegistryRunner` in
-`messagefoundry/pipeline/wiring_runner.py`. So a running engine does not prove that every listener
-passed. On a config reload the same refusal fails the whole reload.
+Both are in the same file, and each docstring says what clears the check. They run when each
+inbound Connection starts. So a running engine does not prove that every listener passed. On a
+config reload the same refusal fails the whole reload.
 
 **The operator socket serves TLS in every topology but one.** With no operator certificate, the
 engine mints a self-signed pair on first run and serves TLS with it. The exception is
@@ -132,17 +132,14 @@ and speaks plaintext to the declared proxy, so that hop is the site's to protect
 has the detail.
 
 `[security].allowed_client_networks` is a second layer. It does not limit who can reach the socket.
-It answers a request with a 403 when the client address is outside the listed networks. It is empty
-by default, which means no restriction. At least these limits apply:
+It refuses a request whose client address is outside the listed networks. It is empty by default,
+which means no restriction. At least these limits apply:
 
 - The check runs after the engine accepts the connection.
 - `/health` is exempt, and loopback is always allowed.
-- A proxy the engine was not told about hides the client address. If that proxy forwards over
-  loopback, each request through it shows a loopback address. The list admits loopback, so it does
-  nothing for those requests. The engine may log one warning about this, but only if no request has
-  come from any other address. Do not count on it.
-- If the proxy forwards from another address, or address translation sits in front, a client shows
-  that address and not its own. The list cannot tell those clients apart.
+- A proxy the engine was not told about, or address translation in front, hides the client address.
+  The list then cannot tell those clients apart. `messagefoundry/api/client_networks.py` describes
+  the cases.
 - It does not cover the inbound Connection listeners. Each of those takes its own
   `source_ip_allowlist`.
 
@@ -170,7 +167,7 @@ No one command gives the whole answer. Each row below has a stated gap.
 | Which Connections exist, and of what type? | `messagefoundry graph --config <config dir> --json` | It imports the config modules, so it runs their code. It prints each Connection's type and authored settings. It does not print the bind address, and an `env()` value shows as a placeholder |
 | What is a running engine serving? | `GET /connections` | Needs the `monitoring:read` permission. One row per endpoint, with its method. It shows no bind address, and it fills a port for MLLP rows only. It shows only what the caller's scope and the answering engine shard cover |
 | Which protective switches are off on a running engine? | `GET /security/posture` | It reports the engine shard that answers |
-| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | Its `values` and `set` fields come from the `[security]` table of the authored file, with no environment override applied. Its loosening list also reads at least `[store]`, `[auth]`, `[alerts]`, `[secret_rotation]` and `[api]`. Where one of those takes `MEFOR_*` overrides, the read applies them from the shell that runs the command, not from the service. If that read fails, `loosenings_partial` is true and those sections show shipped defaults. The command leaves out at least `MEFOR_SECURITY_*` environment overrides, a `serve --host` override and every per-Connection loosening. Its `loosenings_scope` field names some of these gaps |
+| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the authored file, not the running service. It does not see the service's environment or command line, or any Connection. `MEFOR_*` variables in the shell that runs it can change its loosening list. A path that does not exist is not an error: it prints shipped defaults. Its `loosenings_scope` field names some of these gaps. `_security` in `messagefoundry/__main__.py` is the source |
 | Which Connections carry a loosening, across all engine shards? | `messagefoundry check --config <config dir>` | It also runs the config modules. It opens no store |
 
 ## `messagefoundry verify` does not measure exposure
