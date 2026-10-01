@@ -1140,8 +1140,13 @@ def test_path_form_warns_at_construction_naming_the_connection(
     ids=["create", "transaction", "if-none-exist", "conditional-update"],
 )
 def test_path_form_is_refused_where_it_would_do_nothing(over: dict[str, str]) -> None:
+    # Both layers refuse: the factory, so the loaded graph never holds one and `check` never names
+    # one, and the connector, for settings that did not come through the factory.
     with pytest.raises(ValueError, match="update_url_form='path' applies only"):
-        _dest(update_url_form="path", **over)
+        FHIR(url=BASE, update_url_form="path", **over)  # type: ignore[arg-type]
+    settings = {**FHIR(url=BASE, **over).settings, "update_url_form": "path"}  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="update_url_form='path' applies only"):
+        build_destination(Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings))
 
 
 def test_unknown_update_url_form_is_refused() -> None:

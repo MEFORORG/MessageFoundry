@@ -959,10 +959,10 @@ class FhirDestination(DestinationConnector):
             headers = {**headers, **self._signer.signature_headers(data)}
         # ASVS 4.2.5: FHIR is the one destination whose URL is genuinely per-message -- _resolve_request
         # builds it from the resource type (the id left the URL with vault BACKLOG #1965, bar #2550's
-        # path form), and _FHIR_TYPE_RE bounds the type's grammar but not its LENGTH. The construction gate only ever saw base_url, so without this a
-        # crafted resourceType ships an unbounded request line. Placed before the try below because
-        # these raise
-        # NegativeAckError/DeliveryError, which its handlers deliberately do not catch.
+        # path form), and _FHIR_TYPE_RE bounds the type's grammar but not its LENGTH. The construction
+        # gate only ever saw base_url, so without this a crafted resourceType ships an unbounded
+        # request line. Placed before the try below because these raise NegativeAckError/DeliveryError,
+        # which its handlers deliberately do not catch.
         try:
             enforce_send_time_length_limits(
                 url,

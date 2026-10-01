@@ -2691,6 +2691,15 @@ def FHIR(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
+    if update_url_form == "path" and not (
+        conditional == "if-match" or (conditional is None and interaction == "update")
+    ):
+        # Refused here as well as in FhirDestination, so the loaded graph cannot hold a path-form
+        # connection that would never build, and path_form_fhir_updates names only real ones (#2550).
+        raise ValueError(
+            "FHIR update_url_form='path' applies only to interaction='update' or "
+            "conditional='if-match'"
+        )
     _reject_envref_headers("FHIR", headers)
     _check_tls_ca_file("FHIR", tls_ca_file)
     _reject_envref_in_lists(
