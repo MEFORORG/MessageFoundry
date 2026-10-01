@@ -105,6 +105,7 @@ import logging
 import re
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
 from messagefoundry.config.tls_policy import is_loopback_hop_host
@@ -689,7 +690,7 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
     """urllib's proxy handler, except that a loopback hop is dialled direct (vault BACKLOG #2579).
 
     The stock handler takes its proxies from the caller, or from ``HTTP_PROXY``, ``HTTPS_PROXY``
-    and, on Windows, the system proxy. It sends a request direct only when urllib's own bypass list
+    and the system's own proxy settings. It sends a request direct only when urllib's own bypass list
     names the host, and with no ``NO_PROXY`` that list is empty. So a request to ``127.0.0.1``
     would go to the proxy, on a hop the cleartext guards allowed because it stays on the box. For
     an ``http`` URL the proxy would then read the request, body and credentials included.
@@ -786,16 +787,17 @@ def build_strict_opener(
 def _proxies_of(handler: urllib.request.ProxyHandler) -> dict[str, str]:
     """The scheme-to-proxy map ``handler`` was built with, or refuse.
 
-    urllib keeps it on ``proxies``. A runtime that drops the attribute must stop the opener being
-    built, not build one that reads the environment in place of what the caller configured.
+    urllib keeps it on ``proxies``, as whatever mapping the caller passed. A runtime that drops
+    the attribute must stop the opener being built, not build one that reads the environment in
+    place of what the caller configured.
     """
     proxies = vars(handler).get("proxies")
-    if not isinstance(proxies, dict):
+    if not isinstance(proxies, Mapping):
         raise TypeError(
             "cannot read the proxies this ProxyHandler carries, so a loopback-direct handler "
             "cannot take them over; refusing to build the opener"
         )
-    return proxies
+    return dict(proxies)
 
 
 def _name_of(handler: object) -> str:

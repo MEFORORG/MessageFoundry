@@ -3703,8 +3703,10 @@ class EgressSettings(_Section):
     # ADR 0126 (#112/#128): a site-wide DEFAULT forward/egress web proxy for the HTTP family
     # (REST/SOAP/FHIR/fhir_lookup/DICOMweb + the OAuth2/SMART token endpoints). A connection that sets no
     # per-connection `proxy` inherits this; a per-connection value overrides it. None (default) = no
-    # site-wide proxy (byte-identical — only per-connection proxies apply). "default" = the OS default web
-    # proxy (getproxies()); an http(s):// address = an explicit proxy. Credentials stay per-connection
+    # site-wide proxy from this file (only per-connection proxies apply; an off-box hop still follows
+    # the environment proxy urllib reads on its own). "default" = the OS default web
+    # proxy (getproxies()); an http(s):// address = an explicit proxy. A loopback host is never
+    # proxied, whichever of these named the proxy (vault BACKLOG #2579). Credentials stay per-connection
     # (secrets via env()), not a global TOML value. Env: MEFOR_EGRESS_PROXY_URL.
     proxy_url: str | None = None
     # The site-wide NO_PROXY-style bypass list inherited by a connection that sets no per-connection

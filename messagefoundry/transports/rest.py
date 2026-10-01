@@ -1168,11 +1168,12 @@ def _proxy_bypasses(host: str, bypass: tuple[str, ...]) -> bool:
     return False
 
 
-def _goes_direct(host: str, bypass: tuple[str, ...]) -> bool:
-    """Whether ``host`` is dialled direct, past a per-connection proxy: a loopback host always
-    (vault BACKLOG #2579, see ``bounded_read.LoopbackDirectProxyHandler``), and a ``proxy_no_proxy``
-    match (#128). The loopback case needs no entry in the list and cannot be switched off."""
-    return is_never_proxied_host(host) or _proxy_bypasses(host, bypass)
+def _is_loopback_target(host: str) -> bool:
+    """Whether a proxy target is a loopback host, which is dialled direct whatever proxy is
+    configured (vault BACKLOG #2579, see ``bounded_read.LoopbackDirectProxyHandler``). It needs no
+    ``proxy_no_proxy`` entry and cannot be switched off. Brackets and a port are stripped first, as
+    :func:`_proxy_bypasses` strips them, so both read one host the same way."""
+    return is_never_proxied_host(_strip_proxy_host_port(host))
 
 
 #: The one Digest algorithm this engine answers a challenge with, on the origin 401 path
@@ -1357,8 +1358,17 @@ class ProxyConfig:
 
         A loopback host is bypassed with no entry in the list (vault BACKLOG #2579). The opener
         would dial it direct anyway, so the pre-emptive ``Proxy-Authorization`` header must not be
-        attached either: on a direct request it would go to the destination itself."""
-        if _goes_direct(host, self.bypass):
+        attached either: on a direct request it would go to the destination itself. That makes an
+        operator's proxy setting inert for this host, so it is logged."""
+        if _is_loopback_target(host):
+            logger.info(
+                "the web proxy (%s) is not used for loopback host %r: a loopback hop is always "
+                "dialled direct",
+                self.redacted,
+                host,
+            )
+            return None
+        if _proxy_bypasses(host, self.bypass):
             return None
         return _HostProxy(self)
 
@@ -1497,7 +1507,7 @@ def proxy_bypasses_host(host: str | None, no_proxy: Any) -> bool:
     if host is None:
         # Each entry normalised as _proxy_bypasses does, so "*.", "*:80" and "[*]" count as "*".
         return any(_strip_proxy_host_port(raw).lower().rstrip(".") == "*" for raw in bypass)
-    return _goes_direct(host, bypass)
+    return _is_loopback_target(host) or _proxy_bypasses(host, bypass)
 
 
 def proxy_config_from_settings(
@@ -1889,8 +1899,9 @@ class RestDestination(DestinationConnector):
             # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
             # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
             # never the verify/proxy/insecure opener built above for a direct destination hop.
-            # The empty proxy map is what makes "no proxy" true: without it urllib would add a handler
-            # that reads HTTP_PROXY and the system proxy (vault BACKLOG #2579).
+            # The empty proxy map keeps any proxy handler off this opener (vault BACKLOG #2579). The
+            # loopback rule alone already dials every accepted sidecar direct, so this adds no
+            # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
 
     def _ech_request(

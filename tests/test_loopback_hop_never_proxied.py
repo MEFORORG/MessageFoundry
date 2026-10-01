@@ -22,7 +22,9 @@ Synthetic data only: every host name is reserved or made up.
 
 from __future__ import annotations
 
+import logging
 import sys
+import types
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -178,6 +180,14 @@ def test_an_empty_proxy_map_means_no_proxy_at_all(environment_proxy: None) -> No
     assert _dialled(opener, "http://127.0.0.1:18080/x") == "127.0.0.1:18080"
 
 
+def test_a_proxy_map_that_is_not_a_dict_is_taken_over() -> None:
+    """urllib's handler keeps whatever mapping it was given, so the replacement must read any."""
+    proxies = types.MappingProxyType(_BOTH_SCHEMES)
+    _assert_only_loopback_goes_direct(
+        build_strict_opener(urllib.request.ProxyHandler(proxies))  # type: ignore[arg-type]
+    )
+
+
 def test_another_proxy_handler_type_is_refused() -> None:
     """A subclass could route a loopback hop by its own rule, so the opener is not built."""
 
@@ -299,17 +309,29 @@ def test_a_sidecar_the_loopback_rule_would_not_cover_is_refused(host: str) -> No
 # --- a per-connection proxy and a loopback destination -------------------------------------------
 
 
-def test_a_loopback_destination_gets_no_proxy_handler_and_no_proxy_credential() -> None:
+def test_a_loopback_destination_gets_no_proxy_handler_and_no_proxy_credential(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A per-connection proxy resolved for a loopback target is no proxy: the shared opener, and no
-    ``Proxy-Authorization`` header, which would otherwise be sent to the destination itself."""
+    ``Proxy-Authorization`` header, which would otherwise be sent to the destination itself. The
+    operator's proxy setting is inert for that host, so the log says so."""
+    skipped = "is not used for loopback host"
     settings = {"proxy_url": "http://127.0.0.1:3128", "proxy_user": "pu", "proxy_password": "pw"}
-    dest = _rest("http://127.0.0.1:18080/x", **settings)
+    with caplog.at_level(logging.INFO, logger=rest.__name__):
+        dest = _rest("http://127.0.0.1:18080/x", **settings)
     assert dest._opener is rest._NO_REDIRECT_OPENER
     assert "Proxy-Authorization" not in dest._headers
-    # CONTROL: the same proxy settings on an off-box destination carry both.
-    control = _rest("https://partner.invalid/x", **settings)
+    assert [r.getMessage() for r in caplog.records if skipped in r.getMessage()] == [
+        "the web proxy (http://127.0.0.1:3128) is not used for loopback host '127.0.0.1': "
+        "a loopback hop is always dialled direct"
+    ]
+    # CONTROL: the same proxy settings on an off-box destination carry both, and log no skip.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=rest.__name__):
+        control = _rest("https://partner.invalid/x", **settings)
     assert control._opener is not rest._NO_REDIRECT_OPENER
     assert control._headers["Proxy-Authorization"].startswith("Basic ")
+    assert not [r for r in caplog.records if skipped in r.getMessage()]
 
 
 def test_the_public_bypass_predicate_agrees_with_the_transport() -> None:
@@ -317,6 +339,10 @@ def test_the_public_bypass_predicate_agrees_with_the_transport() -> None:
     assert rest.proxy_bypasses_host("127.0.0.1", None)
     assert rest.proxy_bypasses_host("localhost", ["intranet.invalid"])
     assert rest.proxy_bypasses_host("::1", None)
+    # Brackets and a port are read as the bypass list reads them.
+    assert rest.proxy_bypasses_host("[::1]", None)
+    assert rest.proxy_bypasses_host("127.0.0.1:8080", None)
+    assert not rest.proxy_bypasses_host("partner.invalid:8080", None)
     assert not rest.proxy_bypasses_host("partner.invalid", None)
     assert not rest.proxy_bypasses_host("", None)
     assert not rest.proxy_bypasses_host(None, None)

@@ -386,6 +386,9 @@ def test_proxy_digest_handler_answers_sha256() -> None:
     chal = {"realm": "r", "nonce": "n", "algorithm": "SHA-256"}
     result = handler.get_authorization(req, chal)
     assert result and 'algorithm="SHA-256"' in result
+    # The same handler and challenge on a request that was NOT routed through the proxy: no answer.
+    # This is the off-box case, where urllib's own bypass list sent the request direct.
+    assert handler.get_authorization(urllib.request.Request(HTTP_DEST), chal) is None
     planted = "planted-proxy-secret"
     recipe = _ProxyDigestRecipe(f"http://pu:{planted}@127.0.0.1:3128", "pu", planted)
     assert planted not in repr(recipe)
@@ -412,19 +415,18 @@ def test_a_407_on_a_request_that_bypassed_the_proxy_gets_no_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The credential lookup matches any URL, so the handler must refuse to answer a 407 on a
-    request that went DIRECT. urllib sends one direct when its proxy_bypass matches the host, and
-    that 407 came from the destination or the cleartext hop to it. Answering would hand the proxy
-    password's digest, over a nonce the other side chose, to whoever sent the 407.
+    request that went DIRECT. That 407 came from the destination or the cleartext hop to it.
+    Answering would hand the proxy password's digest, over a nonce the other side chose, to whoever
+    sent the 407.
 
-    The opener is built for an off-box destination, so it carries the proxy Digest handler. A
-    connection whose own destination is loopback gets no proxy handler at all (vault BACKLOG #2579).
+    The opener is built for an off-box destination, so it carries the proxy Digest handler. The
+    request then goes to a loopback origin, which the opener dials direct (vault BACKLOG #2579).
+    The other way a request goes direct, urllib's own bypass list, needs an off-box host that
+    answers; ``test_proxy_digest_handler_answers_sha256`` covers that one at the handler.
     """
     with _DigestProxy("SHA-256") as origin:
         opener = _digest_proxy_opener(monkeypatch, LOOPBACK_PROXY)
         assert any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in opener.handlers)
-        # Now route this host direct, past the proxy, as a bypass entry would. The origin is
-        # loopback, which the opener dials direct in any case.
-        monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
         with pytest.raises(urllib.error.HTTPError) as ei:
             opener.open(urllib.request.Request(f"{origin.url}/x"), timeout=10)
         ei.value.close()

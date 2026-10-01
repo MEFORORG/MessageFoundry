@@ -221,13 +221,23 @@ which says it uses no proxy, would use one.
 built, `transports/bounded_read.py::build_strict_opener`. That function replaces urllib's proxy
 handler with `LoopbackDirectProxyHandler`, which leaves a request alone when its host is one the
 cleartext guards accept as loopback. It asks their own predicate, `tls_policy.is_loopback_hop_host`,
-so the two cannot disagree. The rule covers a proxy from the environment, the Windows system proxy,
-`proxy_url = "default"` and an explicit `proxy_url` alike.
+so the guard and the handler cannot disagree. The rule covers a proxy from the environment, the
+operating system's own proxy settings, `proxy_url = "default"` and an explicit `proxy_url` alike.
+
+**What the rule does not claim.** It reads the host as the guards read it, from the URL, with no DNS
+lookup. A host the guards call off-box is left to the proxy even where the socket layer would dial
+loopback for it: at least a trailing-dot name, a short form such as `127.1`, and a percent-encoded
+host. The guards refuse a cleartext hop to each of those, so none is a hop the engine judged on-box.
+It is also a rule of the engine's `urllib` openers only. The operator API client and the `tee` tool
+use other clients and still follow the environment proxy.
 
 - **`ProxyConfig.for_host` returns `None` for a loopback target**, as it does for a `proxy_no_proxy`
   match. The opener would dial that host direct anyway, so the pre-emptive `Proxy-Authorization`
   header must not be attached: on a direct request it would go to the destination. This narrows
-  the #128 bypass text above by one case that needs no list entry.
+  the #128 bypass text above by one case that needs no list entry. The skipped proxy is logged at
+  INFO. **Not closed here:** urllib's own bypass list (`NO_PROXY`, or the system's override list)
+  can also send an off-box request direct, and `for_host` cannot see that list. On such a request
+  the pre-emptive header would still ride to the destination. That predates this amendment.
 - **The ECH sidecar opener passes `ProxyHandler({})`**, so that hop uses no proxy at all. The
   token-endpoint hop is re-addressed to the same sidecar on the token provider's opener, which
   does read the environment, so there the loopback rule is what keeps it direct. For that to hold,
