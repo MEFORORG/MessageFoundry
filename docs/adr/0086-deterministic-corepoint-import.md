@@ -247,15 +247,18 @@ validated against an export, so this rule was written from the HL7 shapes alone.
 - Every other statement may overwrite every handle it names as a whole tree, in either reading of
   its markup. That covers an unread verb (`MsgLoad`, among others), a `MsgCreate` whose handle is
   not its first operand, and a span class the role layer does not list. Each such handle is unknown
-  afterwards. Only `MsgSend` and `MsgLog` are read-only.
+  afterwards. Only `MsgSend` and `MsgLog` are read-only. That read-only list is kept small on
+  purpose: a missing verb costs a raise, while a wrongly listed one would deliver the wrong message.
 - An inlined `ActionListCall` runs in its own scope, because nothing ties the handle names inside a
   called list to the caller's. The called list starts knowing no handle, so its writes and sends of
-  any handle it did not bind there decline or raise. After the call, every handle the call line
-  passes (whole or as a path) and every handle the called list names or binds is unknown to the
-  caller. So a list that hands its input to a sub-list, or calls one that names it, and then sends
-  it raises at that send. A call with no inlined list renders a TODO marker and counts unmapped.
-  The list is kept small on purpose: a missing verb costs a raise, while a wrongly listed one would
-  deliver the wrong message.
+  any handle it did not bind there decline or raise. Its own `input-handle` does not decide the
+  caller's input. After the call, the caller can vouch for no handle the call might reach, judged by
+  name on the raw text and case-insensitively, so no pass syntax or span class can hide one: any
+  word of the call line, and any `%` handle anywhere in the called list. A call whose list is not
+  inlined renders a TODO marker, counts unmapped, and leaves every handle unknown. So a list that
+  hands its input to a sub-list, or calls one that names it, and then sends it raises at that send.
+  That includes a sub-list that only reads or forwards the input, which is the cost of failing
+  closed.
 - A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
   its whole-tree writes. Nothing it binds is trusted after it.
 
@@ -271,8 +274,9 @@ markup-free list ends `MsgSend $out [OB_ACME_ADT]`, which now raises where it us
 fixture's import summary moves from 21 mapped and 8 unmapped to 20 and 9.
 
 In a list with any role markup, a markup-free field write maps only as the role layer would (no
-`copy_field`, no repeating segment, no MSH-1/MSH-2), and lands on the local of the one handle its
-paths address. If that handle holds no known message, the write declines to a TODO marker
+`copy_field`, no repeating segment, no MSH-1/MSH-2, nothing inside a branch or loop), and lands on the
+local of the one handle its paths address. A markup-free list never writes MSH-1/MSH-2 either. In a
+wholly markup-free list, a called list's writes still land on `msg`, as all its writes do. If that handle holds no known message, the write declines to a TODO marker
 rather than land on `msg`. A markup-free whole-tree write makes the handles it names unknown, as
 above.
 

@@ -2137,7 +2137,26 @@ def _inlined_call(*statements: str, passing: str = " pass %OUT") -> str:
             _inlined_call(_write("other-handle", "%OUT", "SUB"), passing=""),
             id="body-writes-a-caller-name",
         ),
-        pytest.param(_inlined_call(passing=" pass %OUT/PID"), id="partial-path-pass"),
+        pytest.param(
+            _inlined_call('<Line Data="EnvLogText &quot;x&quot;"/>', passing=" pass %OUT/PID"),
+            id="partial-path-pass",
+        ),
+        pytest.param(
+            _inlined_call(_create("%P", _ADT_A04), passing=" (%OUT)"), id="parenthesised-pass"
+        ),
+        pytest.param(
+            _inlined_call(
+                _create("%P", _ADT_A04),
+                passing=" &lt;span class='action-list-call-pass'&gt;Pass: OUT&lt;/span&gt;",
+            ),
+            id="pass-span-without-percent",
+        ),
+        pytest.param(_inlined_call(_create("%out", _ADT_A04), passing=""), id="other-case"),
+        pytest.param(
+            _inlined_call('<Switch Data="Mystery %OUT/PID-5"/>', passing=""),
+            id="unknown-tag-in-the-list",
+        ),
+        pytest.param('<Line Data="ActionListCall &quot;Rebuild&quot;"/>', id="not-inlined"),
     ],
 )
 def test_an_inlined_call_runs_in_its_own_scope(call: str) -> None:
@@ -2167,6 +2186,40 @@ def test_a_called_lists_input_is_not_the_callers_msg() -> None:
     assert 'set_field(msg, "MSH-6", "SUB")' not in body
     assert "    p_msg = Message.parse(" in body  # bound inside the list's own scope
     assert 'Send("OB_P"' not in body and 'Send("OB_IN"' not in body
+
+
+def test_a_called_lists_input_handle_does_not_erase_the_callers() -> None:
+    """The caller's input is decided by the caller's own statements: a called list that marks its
+    own input-handle does not make the caller's input ambiguous."""
+    inner = _inlined_call(
+        _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%P")), passing=""
+    )
+    body = _handler_body(
+        _handler_source(_WRITE_INPUT + inner + _role_send("input-handle", "%ADT", "OB_IN"))
+    )
+    assert '    set_field(msg, "MSH-6", "X")' in body
+    assert '    sends.append(Send("OB_IN", msg))' in body
+
+
+def test_a_markup_free_write_in_a_branch_of_a_marked_list_declines() -> None:
+    """Inside a construct a role-parsed write declines (its condition is a dead placeholder), so a
+    markup-free one in the same list does too, rather than run live inside ``try:``."""
+    body = _handler_body(
+        _handler_source(
+            _WRITE_INPUT
+            + '<Try><Line Data="ItemClear %ADT/PID-19"/></Try>'
+            + _role_send("input-handle", "%ADT", "OB_IN")
+        )
+    )
+    assert 'set_field(msg, "PID-19"' not in body
+    assert "inside a branch or loop declines" in body
+
+
+def test_a_markup_free_framing_write_is_never_emitted() -> None:
+    """MSH-1/MSH-2 corrupt the framing, so even a list with no role markup never writes them."""
+    src = _handler_body(_handler_source('<Line Data="ItemCopy &quot;#&quot; %ADT/MSH-2"/>'))
+    assert "set_field(" not in src
+    assert "a framing field this import never writes" in src
 
 
 def test_a_call_with_no_inlined_list_is_a_marker_and_counted_unmapped() -> None:

@@ -194,8 +194,9 @@ class _Deferred:
     # Every word of the statement that is neither an operand nor the verb, styled or not (see
     # :func:`_statement_words`). Field writes, clones and ``MsgCreate`` are all judged on these.
     words: tuple[str, ...] = ()
-    # Whether the verb was styled as a keyword span. Only a field write reads this (see _Flow).
-    styled: bool = True
+    # Whether the verb was styled as a keyword span. Only a field write reads this (see _Flow), and
+    # the default is the fail-closed one: an unstyled verb declines.
+    styled: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,7 +208,9 @@ class Control:
 
     ``"block"``   a ``<Block>`` section label / ``<Call>`` inline — a **comment** plus its body at the
                   *same* indentation (a ``<Block>`` is a label, never an action, so it emits no step).
-    ``"call"``    an ``ActionListCall`` whose target list is inlined — rendered like ``"block"``.
+    ``"call"``    an ``ActionListCall``. With its target list inlined it renders like ``"block"``, and
+                  the list runs in its own handle scope (see :meth:`_Flow._call`). With nothing
+                  inlined it renders a TODO marker and counts unmapped.
     ``"if"``      with ``branches`` of kind ``"elif"``/``"else"``.
     ``"for"``     ``ForEach`` · ``"while"`` ``Loop`` · ``"break"`` ``LoopExit``.
     ``"try"``     with ``branches`` of kind ``"except"`` (``Catch``).
@@ -833,7 +836,18 @@ def _input_handle(action_list: Element) -> tuple[str, bool]:
     keeps the superseded model's reading, in which a markup-free field write lands on ``msg``."""
     inputs: set[str] = set()
     marked = False
+    # A called list's own input handle is the message it was passed, not the caller's msg (see
+    # _Flow._call), so an inlined ``<Call>`` body does not vote on the caller's input.
+    called = {
+        id(inner)
+        for elem in _live_elements(action_list)
+        if _local(elem.tag).lower() == "call"
+        for inner in elem.iter()
+        if inner is not elem
+    }
     for elem in _live_elements(action_list):
+        if id(elem) in called:
+            continue
         data = _attr(elem, "Data")
         tokens = parse_roles(data) if data else ()
         marked = marked or bool(tokens)
@@ -1559,7 +1573,9 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
                 "pending",
                 verb,
                 statement,
-                deferred=_Deferred(verb, flat_operands, flat=flat, named=named),
+                deferred=_Deferred(
+                    verb, flat_operands, in_control=in_control, flat=flat, named=named
+                ),
             )
         else:
             # No statement at all — reported rather than skipped, because a silently-ignored element is
@@ -1583,17 +1599,8 @@ def _parse_statement(elem: Element, in_control: bool, depth: int = 0) -> list[St
     if kind in ("block", "call"):
         # A ``<Block>`` is a section LABEL, not an action, and a ``<Call>``'s target list is inlined:
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
-        # A call may hand a handle, or a path into one, to a list that changes it unseen, so the flow
-        # sees every handle the call line names, whole or partial.
-        passed = named | {o.handle for o in (*role_operands, *flat_operands) if o.handle}
-        call_writes = (
-            _Deferred(verb, handle_operands, qualified=qualified, named=passed, words=words)
-            if kind == "call" and passed
-            else None
-        )
-        return [
-            Control(kind, source, statement or note or tag, body=tuple(body), deferred=call_writes)
-        ]
+        # What a call may reach is judged by :meth:`_Flow._call` from the call line's raw text.
+        return [Control(kind, source, statement or note or tag, body=tuple(body))]
 
     inner, branches = _split_branches(body)
     detail = _strip_leading_verb(statement, verb)
@@ -1848,6 +1855,22 @@ class _Env(Mapping[str, str]):
                     self.unbind(handle)
 
 
+#: In a set of handle keys: the statement may reach ANY handle (a call whose list is not inlined).
+_EVERY_HANDLE = "\x00every"
+_NAME_WORD = re.compile(r"[A-Za-z0-9_]+")
+_HANDLE_WORD = re.compile(r"%([A-Za-z0-9_]+)")
+
+
+def _handle_key(handle: str) -> str:
+    """A handle's name for matching by name: no ``%``, case-folded."""
+    return handle.lstrip("%").lower()
+
+
+def _hit(keys: frozenset[str], handle: str) -> bool:
+    """Whether a set of handle keys (see :meth:`_Flow._written`) reaches ``handle``."""
+    return _EVERY_HANDLE in keys or _handle_key(handle) in keys
+
+
 def _forget(env: _Env, deferred: _Deferred) -> None:
     """Unbind every handle the statement may overwrite whole (see :func:`_whole_written`)."""
     for handle in _whole_written(deferred):
@@ -1883,7 +1906,7 @@ class _Flow:
         # Keyed by the id of a body tuple of the unsettled tree. The tuple rides in the value, so it
         # stays alive and its id cannot be reused for another body while this walk runs.
         self._written_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
-        self._mentioned_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
+        self._text_memo: dict[int, tuple[tuple[Step, ...], frozenset[str]]] = {}
 
     def handler(self, steps: tuple[Step, ...]) -> tuple[Step, ...]:
         env = _Env({self._input: "msg"} if self._input else {})
@@ -1902,7 +1925,8 @@ class _Flow:
         return settled, changes
 
     def _written(self, steps: tuple[Step, ...]) -> frozenset[str]:
-        """Every handle any live statement in ``steps`` may overwrite whole, nested constructs included.
+        """The keys (see :func:`_hit`) of every handle any live statement in ``steps`` may overwrite
+        whole, nested constructs included; :data:`_EVERY_HANDLE` when that may be any handle.
 
         Read on the UNSETTLED tree, so it is a syntactic answer: a clone this walk will bind counts as
         a write as surely as an overwrite it cannot model. A loop and a ``Try`` use it to say which
@@ -1915,10 +1939,10 @@ class _Flow:
         for step in steps:
             if not isinstance(step, Control) or step.kind == "disabled":
                 continue
-            if step.deferred is not None and step.kind in ("pending", "unknown", "call"):
-                found |= _whole_written(step.deferred)
+            if step.deferred is not None and step.kind in ("pending", "unknown"):
+                found.update(_handle_key(h) for h in _whole_written(step.deferred))
             if step.kind == "call":
-                found |= self._mentioned(step.body)  # what a call leaves unknown (see _call)
+                found |= self._call_keys(step)  # what a call leaves unknown (see _call)
             found |= self._written(step.body)
             for branch in step.branches:
                 found |= self._written(branch.body)
@@ -1967,8 +1991,10 @@ class _Flow:
         elif kind in _LOOP_KINDS:
             # A later pass may start from what an earlier one overwrote, so a handle the body may
             # overwrite is unknown throughout it, and after it (the body may run no times at all).
-            for handle in self._written(step.body):
-                env.unbind(handle)
+            written = self._written(step.body)
+            for handle in list(env):
+                if _hit(written, handle):
+                    env.unbind(handle)
             body, _ = self._arm(step.body, env)
             settled = replace(step, body=tuple(body))
         elif kind == "try":
@@ -2010,8 +2036,10 @@ class _Flow:
         outcomes = [body_changes]
         # A Catch may start anywhere in the body, so what the body may overwrite is unknown there.
         mark = env.mark()
-        for handle in self._written(step.body):
-            env.unbind(handle)
+        written = self._written(step.body)
+        for handle in list(env):
+            if _hit(written, handle):
+                env.unbind(handle)
         settled_catches: dict[int, Control] = {}
         for branch in catches:
             start = env.mark()
@@ -2030,36 +2058,45 @@ class _Flow:
 
         Nothing ties the handle names inside a called list to the caller's: it may name the message
         it was passed by its own input handle, or reuse a caller's name for a different tree. So the
-        inlined body starts knowing no handle at all, and after the call every handle that the call
-        line passes (whole or as a path) or that the body names or binds is unknown to the caller.
-        Fail closed: anything the caller later sends of those raises."""
-        if step.deferred is not None:
-            _forget(env, step.deferred)
+        inlined body starts knowing no handle at all. Afterwards the caller can vouch for no handle
+        the call might reach, judged by NAME on the raw text, case-insensitively, so no pass syntax
+        or span class can hide one (see :meth:`_call_keys`). Fail closed: a later send of one of
+        those raises."""
+        keys = self._call_keys(step)
         body = self._run_in_line(step.body, _Env({}))
-        for handle in self._mentioned(step.body):
-            env.unbind(handle)
+        for handle in list(env):
+            if _hit(keys, handle):
+                env.unbind(handle)
         return replace(step, body=tuple(body))
 
-    def _mentioned(self, steps: tuple[Step, ...]) -> frozenset[str]:
-        """Every handle any live statement in ``steps`` names, whole or as a path, nested included.
+    def _call_keys(self, step: Control) -> frozenset[str]:
+        """The handle keys a call may reach: every word of its call line (a pass may be spelled any
+        way), and every ``%`` handle named anywhere in its inlined list. A call whose list is not
+        inlined may reach any handle at all."""
+        if not step.body:
+            return frozenset({_EVERY_HANDLE})
+        return frozenset(w.lower() for w in _NAME_WORD.findall(step.detail)) | self._text_keys(
+            step.body
+        )
 
-        Syntactic and memoized like :meth:`_written`. A called list's statements touch handles the
-        caller can no longer vouch for, so this is the set the caller unbinds after the call."""
-        cached = self._mentioned_memo.get(id(steps))
+    def _text_keys(self, steps: tuple[Step, ...]) -> frozenset[str]:
+        """Every ``%`` handle key named in the raw text of any live statement in ``steps``.
+
+        Read from the statement text rather than from parsed operands, so a span class the role
+        layer does not list, an unknown tag, or a path operand cannot hide a handle. Memoized."""
+        cached = self._text_memo.get(id(steps))
         if cached is not None:
             return cached[1]
         found: set[str] = set()
         for step in steps:
             if not isinstance(step, Control) or step.kind == "disabled":
                 continue
-            if step.deferred is not None:
-                found |= step.deferred.named
-                found.update(o.handle for o in step.deferred.operands if o.handle)
-            found |= self._mentioned(step.body)
+            found.update(w.lower() for w in _HANDLE_WORD.findall(step.detail))
+            found |= self._text_keys(step.body)
             for branch in step.branches:
-                found |= self._mentioned(branch.body)
+                found |= self._text_keys(branch.body)
         result = frozenset(found)
-        self._mentioned_memo[id(steps)] = (steps, result)
+        self._text_memo[id(steps)] = (steps, result)
         return result
 
     def _strays(self, ctrl: Control, env: _Env) -> Control:
@@ -2142,8 +2179,22 @@ class _Flow:
         default: it lands on the local of the one handle it addresses, or declines. It also maps
         only as the role layer would map it: never ``copy_field``, which clears the destination when
         the source is absent, never a repeating segment, never MSH-1/MSH-2."""
-        if not isinstance(flat, Action) or not self._marked:
+        if not isinstance(flat, Action):
             return flat
+        if not self._marked:
+            # MSH-1/MSH-2 corrupt the framing whichever model reads the list (see _FRAMING_PATHS).
+            if _written_path(flat) in _FRAMING_PATHS:
+                return UnmappedAction(
+                    flat.source_class,
+                    f"targets {_written_path(flat)}, a framing field this import never writes",
+                )
+            return flat
+        if deferred.in_control:
+            return UnmappedAction(
+                flat.source_class,
+                "a markup-free write inside a branch or loop declines, as a role-parsed one does; "
+                f"intended target {_written_path(flat)}",
+            )
         target = _written_path(flat)
         if flat.vocabulary not in ("set_field", "append_to_field") or not _writable(target):
             return UnmappedAction(
