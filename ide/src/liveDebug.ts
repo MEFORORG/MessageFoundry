@@ -8,10 +8,11 @@
 // structured `dryrun --trace` JSON.
 //
 // PHI (CLAUDE.md §9). The inline values are message-derived, hence PHI, and are screenshot-/screenshare-
-// capturable. They render as a redacted placeholder (`▸ ⋯`) BY DEFAULT. Real values appear ONLY under a
-// SEPARATE, independent "reveal values" toggle (`messagefoundry.toggleRevealValues`, off by default)
-// that is NOT the "MEFOR Live" toggle: only when it is on do we pass `--show-phi` to the CLI, so real
-// values never even leave the Python process otherwise. Samples must be synthetic (under messageSetsDir).
+// capturable. They render as a redacted placeholder (`▸ ⋯`) BY DEFAULT. Real values appear ONLY for ONE
+// run the user asks for by name (`messagefoundry.revealValuesOnce`, ASVS 14.2.6, vault BACKLOG #1187):
+// that run alone passes `--show-phi` to the CLI, and every later run is masked again. The reveal is never
+// a session state, so a run the user did not ask for never carries real values, and real values never
+// even leave the Python process otherwise. Samples must be synthetic (under messageSetsDir).
 //
 // SCOPE (bounded by the CLI shape): each traced entry is ONE message and FLATTENS handler→delivery
 // attribution (top-level `sends` carry no `handler`). So a per-`@handler` Send count is only unambiguous
@@ -86,7 +87,8 @@ export interface LiveTraceEntry {
 /**
  * The spawn seam. The real runner shells the CLI; tests inject a canned trace-JSON runner (no live
  * engine — the CI ide job has no Python). `showPhi` is threaded through so the runner can decide whether
- * to request real values; it maps 1:1 to the "reveal values" toggle, NEVER to "MEFOR Live".
+ * to request real values; it is true only for the one run the user asked to reveal, NEVER for a run
+ * that "MEFOR Live" starts on save.
  */
 export type TraceRunner = (
   samplePath: string,
@@ -108,7 +110,7 @@ export function buildTraceArgs(cfgDir: string, samplePath: string, showPhi: bool
 
 /**
  * The production runner: `messagefoundry dryrun --config <cfg> --messages <sample> --trace json
- * [--show-phi]`. `--show-phi` is present ONLY when the reveal-values toggle is on; otherwise the CLI
+ * [--show-phi]`. `--show-phi` is present ONLY on a run the user asked to reveal; otherwise the CLI
  * redacts every captured value at the source, so no PHI leaves the Python process.
  */
 export const cliTraceRunner: TraceRunner = (samplePath, cwd, showPhi) =>
@@ -249,7 +251,7 @@ export function buildLiveLenses(
 
 // --- v2 inline decorations (per-statement values + hover) ----------------------------------------
 
-/** The redacted placeholder shown in place of any real value while "reveal values" is off. */
+/** The redacted placeholder shown in place of any real value on a run that was not revealed. */
 export const REVEAL_PLACEHOLDER = "⋯";
 /** The exact string the CLI substitutes for a captured value when `--show-phi` was NOT passed. */
 const TRACE_REDACTED = "REDACTED";
@@ -297,7 +299,7 @@ function renderAfter(items: LineItem[], reveal: boolean): string {
 function renderHover(items: LineItem[], reveal: boolean): string {
   const header = reveal
     ? "**Live values** (synthetic sample)"
-    : "**Live values** — hidden. Toggle *MessageFoundry: Reveal Values* to show (PHI; synthetic only).";
+    : "**Live values** — hidden. Run *MessageFoundry: Reveal Values for One Run* to show them for one run (PHI; synthetic only).";
   const body = items.map((it) => `- \`${it.label}\` = \`${renderValue(it.value, reveal)}\``);
   return [header, ...body].join("\n");
 }
@@ -374,10 +376,10 @@ export function invocationsForFile(entries: LiveTraceEntry[], fsPath: string): T
 }
 
 /**
- * The live-debug controller: owns the on/off state, a SEPARATE reveal-values state, the chosen sample,
- * the last run's rows + trace, a debounced save watcher, its CodeLens provider, and the inline
- * decorations. Both toggles are off by default. The dry-run spawn is injectable so the whole pipeline is
- * testable with canned trace JSON and no engine.
+ * The live-debug controller: owns the on/off state, the chosen sample, the last run's rows + trace and
+ * whether that one run was revealed, a debounced save watcher, its CodeLens provider, and the inline
+ * decorations. Live is off by default, and every run is masked unless the user asked to reveal that run.
+ * The dry-run spawn is injectable so the whole pipeline is testable with canned trace JSON and no engine.
  */
 export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disposable {
   private readonly changed = new vscode.EventEmitter<void>();
@@ -385,9 +387,10 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
 
   private enabled = false;
   private running = false;
-  // Reveal-values is a SEPARATE, independent gate from `enabled`. OFF by default; only when it is on do
-  // we request real values (--show-phi). Toggling "MEFOR Live" never changes it, and vice-versa.
-  private revealValues = false;
+  // Whether the trace in `entries` came from a run the user asked to reveal (ASVS 14.2.6, vault BACKLOG
+  // #1187). It describes ONE stored run, not a session preference: each run sets it from its own
+  // `showPhi`, so the next run (a save, a re-toggle) stores false and renders masked again.
+  private shownRunRevealed = false;
   private rows: LiveDryRunRow[] | null = null;
   private entries: LiveTraceEntry[] | null = null; // last traced run (drives the inline decorations)
   private error: string | null = null;
@@ -426,8 +429,9 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     return this.enabled;
   }
 
-  isRevealingValues(): boolean {
-    return this.revealValues;
+  /** True while the decorations show real values from the one run the user asked to reveal. */
+  isShowingValues(): boolean {
+    return this.shownRunRevealed;
   }
 
   private updateStatus(): void {
@@ -454,20 +458,27 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     sb.tooltip = `Live-debug on save · sample: ${this.sampleLabel ?? "(none)"}. Click to turn off.`;
   }
 
-  /** Reflect the reveal-values gate in its OWN status item (distinct icon/label from "MEFOR Live"). */
+  /**
+   * Reflect the shown run in its OWN status item (distinct icon/label from "MEFOR Live"). Hidden, a click
+   * reveals ONE run; shown, a click hides it now. Either way the next run is masked.
+   */
   private updateRevealStatus(): void {
     const sb = this.revealStatusBar;
     if (!sb) {
       return;
     }
-    if (this.revealValues) {
-      sb.text = "$(eye) Values: Shown";
+    if (this.shownRunRevealed) {
+      sb.text = "$(eye) Values: This Run";
+      sb.command = "messagefoundry.hideValues";
       sb.tooltip =
-        "Live-debug inline values are REVEALED (PHI, screenshot-capturable). Click to hide. Synthetic samples only.";
+        "Live-debug shows real values from ONE run (PHI, screenshot-capturable). Click to hide them now. " +
+        "The next run hides them anyway. Synthetic samples only.";
     } else {
       sb.text = "$(eye-closed) Values: Hidden";
+      sb.command = "messagefoundry.revealValuesOnce";
       sb.tooltip =
-        "Live-debug inline values are hidden (PHI-safe). Click to reveal real values — synthetic samples only.";
+        "Live-debug inline values are hidden (PHI-safe). Click to re-run once with real values shown. " +
+        "The next run hides them again. Synthetic samples only.";
     }
   }
 
@@ -475,40 +486,61 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
   async toggle(): Promise<void> {
     if (this.enabled) {
       this.enabled = false;
+      // Orphan any run still in flight, so a reveal that lands after Live is off stores nothing.
+      this.runToken += 1;
+      this.running = false;
       this.rows = null;
       this.entries = null;
+      this.shownRunRevealed = false;
       this.error = null;
       this.updateStatus();
+      this.updateRevealStatus();
       this.changed.fire();
       this.refreshActiveDecorations();
       return;
     }
+    if (await this.enable()) {
+      await this.run(false);
+    }
+  }
+
+  /** Turn Live on, picking a synthetic sample if none is chosen. False (and Live left off) if none is. */
+  private async enable(): Promise<boolean> {
     this.enabled = true;
     const ok = await this.ensureSample();
     if (!ok) {
       this.enabled = false;
-      this.updateStatus();
-      return;
     }
     this.updateStatus();
-    await this.run();
+    return ok;
   }
 
   /**
-   * Flip the SEPARATE reveal-values gate. This is NOT the Live toggle: it only decides whether real
-   * values are requested. Turning it OFF drops any in-memory trace (which may hold real values) and
-   * re-decorates as redacted immediately; when Live is on it re-runs so the store reflects the new gate.
-   * Independent of Live: toggling it while Live is off just records the preference (no run, no reveal).
+   * The user's explicit act for ONE run (ASVS 14.2.6, vault BACKLOG #1187): run the dry-run now with
+   * `--show-phi` and show that run's real values. Nothing is armed for later, so the next run (a save,
+   * a re-toggle) is masked again. Turns Live on first if it is off, since decorations render only then.
    */
-  async toggleReveal(): Promise<void> {
-    this.revealValues = !this.revealValues;
-    if (!this.revealValues) {
-      this.entries = null; // never keep real values around once hidden
+  async revealOnce(): Promise<void> {
+    if (!this.enabled && !(await this.enable())) {
+      return;
     }
+    await this.run(true);
+  }
+
+  /**
+   * Hide the shown run's values now. Drops the in-memory trace (it holds real values) and, when Live is
+   * on, re-runs masked so the decorations come back as placeholders.
+   */
+  async hideValues(): Promise<void> {
+    if (!this.shownRunRevealed) {
+      return;
+    }
+    this.entries = null; // never keep real values around once hidden
+    this.shownRunRevealed = false;
     this.updateRevealStatus();
     this.refreshActiveDecorations();
     if (this.enabled && this.samplePath) {
-      await this.run(); // re-fetch with/without --show-phi to match the new gate
+      await this.run(false);
     }
   }
 
@@ -529,7 +561,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     }
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = undefined;
-      void this.run();
+      void this.run(false); // a save-triggered run is never a reveal
     }, this.debounceMs());
   }
 
@@ -576,7 +608,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     return true;
   }
 
-  private async run(): Promise<void> {
+  private async run(showPhi: boolean): Promise<void> {
     if (!this.enabled) {
       return;
     }
@@ -593,6 +625,8 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (isExecGated()) {
       this.rows = null;
       this.entries = null;
+      this.shownRunRevealed = false;
+      this.updateRevealStatus();
       this.error = "workspace not trusted — live-debug disabled until you trust this workspace";
       this.updateStatus();
       this.changed.fire();
@@ -600,23 +634,24 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       return;
     }
     // this.samplePath is set by ensureSample above.
-    await this.runWith(this.samplePath as string, ws);
+    await this.runWith(this.samplePath as string, ws, showPhi);
   }
 
   /**
-   * Run the (injected) trace-runner against a sample and store the result. The current reveal-values
-   * gate is threaded through as `showPhi` — the ONLY place --show-phi is (conditionally) requested. A
-   * per-run token discards a superseded run's late result, so a rapid save-storm always renders the
-   * newest run only. Public so a test can drive it with a canned runner (no sample-pick, no workspace).
+   * Run the (injected) trace-runner against a sample and store the result. `showPhi` is this run's own
+   * reveal request, masked by default — the ONLY place --show-phi is (conditionally) requested. The
+   * stored result records whether IT was revealed, so the next run decides afresh. A per-run token
+   * discards a superseded run's late result, so a rapid save-storm always renders the newest run only.
+   * Public so a test can drive it with a canned runner (no sample-pick, no workspace).
    */
-  async runWith(samplePath: string, cwd: string): Promise<void> {
+  async runWith(samplePath: string, cwd: string, showPhi = false): Promise<void> {
     const token = ++this.runToken;
     this.running = true;
     this.updateStatus();
     let entries: LiveTraceEntry[] | null = null;
     let err: string | null = null;
     try {
-      entries = await this.runner(samplePath, cwd, this.revealValues);
+      entries = await this.runner(samplePath, cwd, showPhi);
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
     }
@@ -627,9 +662,11 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     this.samplePath = samplePath;
     this.sampleLabel = path.basename(samplePath);
     this.entries = entries;
+    this.shownRunRevealed = showPhi && entries !== null;
     this.rows = entries ? rowsFromTrace(entries) : null;
     this.error = err;
     this.updateStatus();
+    this.updateRevealStatus();
     this.changed.fire();
     this.refreshActiveDecorations();
   }
@@ -644,7 +681,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
   /**
    * Render (or clear) the per-line inline value decorations on `editor`. Clears whenever Live is off,
    * a run errored, there's no trace, or the editor isn't a config module. Otherwise it maps the active
-   * module's invocations to redacted-by-default (real only when reveal is on) `after`-text + hover.
+   * module's invocations to redacted-by-default (real only for a revealed run) `after`-text + hover.
    */
   private applyDecorations(editor: vscode.TextEditor | undefined): void {
     if (!editor || !this.valueDecoration || !this.warnDecoration) {
@@ -663,7 +700,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       return;
     }
     const invs = invocationsForFile(this.entries, editor.document.uri.fsPath);
-    const inline = inlineValuesFor(invs, this.revealValues);
+    const inline = inlineValuesFor(invs, this.shownRunRevealed);
     const values: vscode.DecorationOptions[] = [];
     const warns: vscode.DecorationOptions[] = [];
     const lastLine = editor.document.lineCount - 1;
@@ -727,8 +764,8 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
 }
 
 /**
- * Wire live-debug into the extension: two left status-bar items — the "MEFOR Live" toggle and the
- * SEPARATE "reveal values" toggle (both off by default) — their commands, this lane's own CodeLens
+ * Wire live-debug into the extension: two left status-bar items — the "MEFOR Live" toggle (off by
+ * default) and the SEPARATE per-run reveal item (hidden by default) — their commands, this lane's own CodeLens
  * provider (VS Code allows several per language — this coexists with the editor-toolbar provider), the
  * inline-decoration types, a save watcher, and an active-editor watcher (re-decorate on editor swaps).
  * Returns the controller (for tests / callers).
@@ -740,9 +777,9 @@ export function registerLiveDebug(context: vscode.ExtensionContext): LiveDebugCo
   controller.setStatusBar(statusBar);
   statusBar.show();
 
-  // The reveal-values control is its OWN status item + command, independent of "MEFOR Live".
+  // The per-run reveal is its OWN status item, independent of "MEFOR Live". Its command flips between
+  // revealValuesOnce and hideValues with the shown run (set in updateRevealStatus).
   const revealBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49);
-  revealBar.command = "messagefoundry.toggleRevealValues";
   controller.setRevealStatusBar(revealBar);
   revealBar.show();
 
@@ -767,9 +804,10 @@ export function registerLiveDebug(context: vscode.ExtensionContext): LiveDebugCo
     warnDecoration,
     vscode.commands.registerCommand("messagefoundry.toggleLiveDebug", () => void controller.toggle()),
     vscode.commands.registerCommand(
-      "messagefoundry.toggleRevealValues",
-      () => void controller.toggleReveal(),
+      "messagefoundry.revealValuesOnce",
+      () => void controller.revealOnce(),
     ),
+    vscode.commands.registerCommand("messagefoundry.hideValues", () => void controller.hideValues()),
     vscode.languages.registerCodeLensProvider({ language: "python" }, controller),
     vscode.workspace.onDidSaveTextDocument((doc) => controller.onSave(doc)),
     vscode.window.onDidChangeActiveTextEditor(() => controller.refreshActiveDecorations()),

@@ -125,9 +125,11 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 - **Live Debug** (*MessageFoundry: Toggle Live Debug*, or the **MEFOR Live** status-bar item) — with it
   on, every save of a config module re-runs a dry-run against a **synthetic** sample and annotates the
   code in place: a routing/disposition summary above each `inbound()` / `@router` / `@handler`, and the
-  per-line values each executed line produced. Message-derived values render **redacted by default**;
-  *Reveal Values* is a separate toggle and only ever applies to synthetic samples. It never contacts a
-  real engine, and the re-run is debounced (`messagefoundry.liveDebug.debounceMs`).
+  per-line values each executed line produced. Message-derived values render **redacted by default**.
+  *Reveal Values for One Run* (or the **Values: Hidden** status-bar item) re-runs once with real values
+  shown, and the next run is masked again; *Hide Revealed Values* hides them sooner. Use it on
+  synthetic samples only. It never contacts a real engine, and the re-run is debounced
+  (`messagefoundry.liveDebug.debounceMs`).
 - **Cookbook** (*MessageFoundry: Open Cookbook*) — a searchable gallery of solved HL7 routing/transform
   problems (crosswalk a code, split a batch, enrich via a lookup, fan out to several outbounds, …); each
   entry inserts real, editable Python at the cursor. Fully offline — no model call, and it works with

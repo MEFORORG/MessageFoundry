@@ -369,31 +369,86 @@ suite("LiveDebugController with a mocked traced-dryrun spawn", () => {
   });
 });
 
-suite("LiveDebugController reveal-values gate (SEPARATE from MEFOR Live)", () => {
-  test("--show-phi is requested ONLY when reveal is on; Live never sets it, reveal toggles alone", async () => {
-    let lastShowPhi: boolean | undefined;
+suite("LiveDebugController per-run reveal (ASVS 14.2.6, vault BACKLOG #1187)", () => {
+  // A reveal is the user's act on ONE run, never a session state (owner rulings R13 and R15 of
+  // ASVS-OWNER-RULINGS-2026-09-28-BATCH174.md). These pin the three arms: masked by default, shown
+  // for the run that asked, and masked again on the very next run.
+  test("a run with no reveal request is masked (control)", async () => {
+    const calls: boolean[] = [];
     const runner: TraceRunner = async (_s, _c, showPhi) => {
-      lastShowPhi = showPhi;
+      calls.push(showPhi);
       return [traceEntry({})];
     };
     const controller = new LiveDebugController(runner);
     try {
-      // Default: reveal off → no --show-phi.
       await controller.runWith("/synthetic/adt.hl7", "/ws");
-      assert.strictEqual(lastShowPhi, false, "default run must NOT pass --show-phi");
-      assert.strictEqual(controller.isRevealingValues(), false);
+      assert.deepStrictEqual(calls, [false], "a default run must NOT pass --show-phi");
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
 
-      // Reveal ON via its OWN toggle. Live is off, so this does not auto-run — proving independence.
-      await controller.toggleReveal();
-      assert.strictEqual(controller.isRevealingValues(), true);
-      await controller.runWith("/synthetic/adt.hl7", "/ws");
-      assert.strictEqual(lastShowPhi, true, "reveal-on run passes --show-phi");
+  test("the run that asks shows values, and the next run is masked again", async () => {
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({})];
+    };
+    const controller = new LiveDebugController(runner);
+    try {
+      await controller.runWith("/synthetic/adt.hl7", "/ws", true);
+      assert.deepStrictEqual(calls, [true], "the revealed run passes --show-phi");
+      assert.strictEqual(controller.isShowingValues(), true);
 
-      // Reveal back OFF → subsequent runs stop requesting PHI again.
-      await controller.toggleReveal();
-      assert.strictEqual(controller.isRevealingValues(), false);
+      // The next run (a save does exactly this) carries no reveal request and stores a masked result.
       await controller.runWith("/synthetic/adt.hl7", "/ws");
-      assert.strictEqual(lastShowPhi, false, "reveal-off run must not pass --show-phi");
+      assert.deepStrictEqual(calls, [true, false], "the run after a reveal must NOT pass --show-phi");
+      assert.strictEqual(controller.isShowingValues(), false, "the reveal must not outlive its run");
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a revealed run that fails shows nothing", async () => {
+    const runner: TraceRunner = () => Promise.reject(new Error("boom"));
+    const controller = new LiveDebugController(runner);
+    try {
+      await controller.runWith("/synthetic/adt.hl7", "/ws", true);
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a revealed run superseded by a masked one leaves the newest run masked", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      if (showPhi) {
+        await gate; // the reveal is slow, so a save-triggered masked run overtakes it
+      }
+      return [traceEntry({})];
+    };
+    const controller = new LiveDebugController(runner);
+    try {
+      const reveal = controller.runWith("/a.hl7", "/ws", true);
+      await controller.runWith("/a.hl7", "/ws");
+      release();
+      await reveal;
+      assert.strictEqual(controller.isShowingValues(), false, "a superseded reveal must not land");
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("hideValues drops a shown run's values before the next run", async () => {
+    const controller = new LiveDebugController(async () => [traceEntry({})]);
+    try {
+      await controller.runWith("/synthetic/adt.hl7", "/ws", true);
+      assert.strictEqual(controller.isShowingValues(), true);
+      await controller.hideValues(); // Live is off here, so this only hides; no run follows
+      assert.strictEqual(controller.isShowingValues(), false);
     } finally {
       controller.dispose();
     }
@@ -419,11 +474,13 @@ suite("liveDebug contributions", () => {
     assert.ok(cmds.includes("messagefoundry.toggleLiveDebug"), "toggleLiveDebug command missing");
   });
 
-  test("package.json contributes the SEPARATE reveal-values command", () => {
+  test("package.json contributes the per-run reveal and hide commands, and no session toggle", () => {
     const cmds = pkg().contributes.commands.map((c) => c.command);
+    assert.ok(cmds.includes("messagefoundry.revealValuesOnce"), "revealValuesOnce command missing");
+    assert.ok(cmds.includes("messagefoundry.hideValues"), "hideValues command missing");
     assert.ok(
-      cmds.includes("messagefoundry.toggleRevealValues"),
-      "toggleRevealValues command missing",
+      !cmds.includes("messagefoundry.toggleRevealValues"),
+      "the session-wide reveal toggle must stay retired (vault BACKLOG #1187)",
     );
   });
 
