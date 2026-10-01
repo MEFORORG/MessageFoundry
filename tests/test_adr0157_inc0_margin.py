@@ -390,8 +390,9 @@ class _Clock:
 class _RecordingPool(LendsItself):
     """A lease pool that records the per-statement timeout and can advance either clock mid-flight.
 
-    Since BACKLOG #2523 the clamp reaches the statement as the timeout on its borrow, which
-    :class:`LendsItself` records; ``last_timeout`` reads it back.
+    Since BACKLOG #2523 the clamp bounds the statement and its release, and the borrow gets the
+    fence instead. :class:`LendsItself` records the release's timeout, which is the statement's,
+    and ``last_timeout`` reads it back.
 
     ``db_advance_before`` moves the DB clock to the instant the statement EXECUTES (which is where a
     real server stamps ``lease_expires_at``); ``mono_advance_after`` moves this node's monotonic clock
@@ -416,7 +417,7 @@ class _RecordingPool(LendsItself):
 
     @property
     def last_timeout(self) -> float | None:
-        return self.last_acquire_timeout
+        return self.last_release_timeout
 
     async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
         self.calls += 1

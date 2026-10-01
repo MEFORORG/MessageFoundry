@@ -70,6 +70,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 from uuid import uuid4
 
+from messagefoundry.config.settings import MAX_ACQUIRE_DELAY_SECONDS
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.redaction import safe_exc
 
@@ -306,18 +307,31 @@ _NOT_RETURNED: Any = object()
 
 
 async def _call_within(
-    pool: Any, timeout: float, method: Literal["execute", "fetchrow", "fetch"], sql: str, *args: Any
+    pool: Any,
+    timeout: float,
+    method: Literal["execute", "fetchrow", "fetch"],
+    sql: str,
+    *args: Any,
+    borrow_timeout: float | None = None,
 ) -> Any:
-    """Run one asyncpg statement with a hard bound on the whole call, the driver's unwind included.
+    """Run one asyncpg statement with a hard bound on the call, the driver's unwind included.
 
-    Every statement :class:`DbCoordinator` sends goes through here (BACKLOG #2523). Why not
-    ``asyncio.timeout(t)`` around ``pool.execute``: the pool's own ``execute``/``fetchrow``/``fetch``
-    acquire with no timeout, and asyncpg 0.31.0's pool release, which is shielded from the cancel,
-    waits for a cancelled statement's server acknowledgement for as long as that acquire timeout.
-    None means no limit at all, so a statement cancelled mid-flight, by a stop() or by a timeout,
-    could hold its caller forever. Passing ``timeout`` to ``acquire`` gives the release the same
-    budget, after which asyncpg terminates the connection. **So this costs at most twice
-    ``timeout``**, and a caller that needs a whole-call budget passes half of it.
+    At least every statement :class:`DbCoordinator` sends after ``start()`` goes through here
+    (BACKLOG #2523); the start-up DDL borrows the same way by hand. Why not ``asyncio.timeout(t)``
+    around ``pool.execute``: the pool's own ``execute``/``fetchrow``/``fetch`` borrow with no
+    timeout, and asyncpg 0.31.0's pool release, which is shielded from a cancel, waits for a
+    cancelled statement's server acknowledgement for as long as the release's budget. That budget
+    defaults to the borrow's timeout, so None meant no limit at all, and a statement cancelled
+    mid-flight, by a ``stop()`` or by a timeout, could hold its caller forever.
+
+    **Three waits, and each is bounded on its own.** The release gets ``timeout`` explicitly
+    (``pool.release(con, timeout=...)``), after which asyncpg terminates the connection. The
+    statement gets ``timeout``. The borrow shares the statement's deadline when ``borrow_timeout``
+    is None, so the call costs at most twice ``timeout``, and a caller that needs a whole-call
+    budget passes half of it. A caller that passes ``borrow_timeout`` waits that long for a
+    connection first, and the statement's own ``timeout`` starts after it. The lease statements do
+    that: they share the store's pool, and a renew that fails on a busy pool rather than a dead
+    one would self-fence a healthy leader.
 
     A failure AFTER the statement returned is the connection's return to the pool failing, so a
     write has committed and its result is returned rather than lost. Reporting that write as failed
@@ -325,25 +339,34 @@ async def _call_within(
     result is just as good after its release fails.
 
     **A cancel from outside is restored, because the bound would otherwise swallow it.** When the
-    release's budget runs out, asyncpg terminates the connection and re-raises the release's own
-    ``TimeoutError``, which replaces the ``CancelledError`` the caller was unwinding with. The
-    maintenance loop catches ``Exception``, so a ``stop()`` that cancelled it mid-statement would see
-    it carry on to the next step, a claim, as if the statement had merely failed. So a cancel that
-    reached the statement is raised again when ``cancelling()`` rose during this call:
-    ``asyncio.timeout`` uncancels only its own, so a rise is a cancel from outside. A caller already
-    unwinding from an earlier cancel, such as ``stop()`` in a cancelled task, does not count, and
-    keeps its ordinary error handling."""
+    release fails, asyncpg terminates the connection and re-raises the release's own error, which
+    replaces the ``CancelledError`` the caller was unwinding with. The maintenance loop catches
+    ``Exception``, so a ``stop()`` that cancelled it mid-statement would see it carry on to the next
+    step, a claim, as if the statement had merely failed. So a cancel that reached the statement is
+    raised again when ``cancelling()`` rose during this call: ``asyncio.timeout`` uncancels only its
+    own, so a rise is a cancel from outside. A caller already unwinding from an earlier cancel, such
+    as ``stop()`` in a cancelled task, does not count, and keeps its ordinary error handling."""
+    loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     baseline = task.cancelling() if task is not None else 0
     result: Any = _NOT_RETURNED
     cancelled = False
     try:
-        async with asyncio.timeout(timeout), pool.acquire(timeout=timeout) as con:
-            try:
-                result = await getattr(con, method)(sql, *args)
-            except asyncio.CancelledError:
-                cancelled = True
-                raise
+        if borrow_timeout is None:
+            deadline = loop.time() + timeout
+            con = await pool.acquire(timeout=timeout)
+        else:
+            con = await pool.acquire(timeout=borrow_timeout)
+            deadline = loop.time() + timeout
+        try:
+            async with asyncio.timeout_at(deadline):
+                try:
+                    result = await getattr(con, method)(sql, *args)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+        finally:
+            await pool.release(con, timeout=timeout)
     except Exception as exc:
         if cancelled and task is not None and task.cancelling() > baseline:
             raise asyncio.CancelledError from exc
@@ -369,19 +392,25 @@ async def stop_tasks_within(
     Shared by both coordinators' ``stop()`` for the reason :func:`stepdown_pause_seconds` is
     (BACKLOG #2523). A plain ``gather`` waited for each cancelled task to unwind, and a task
     cancelled inside a statement unwinds through its driver's release, which is the wait this item
-    names. ``asyncio.wait`` returns at the bound and leaves a slow task finishing on its own. Such a
-    task is already cancelled, so it can no longer claim the lease; it can only finish releasing its
-    connection. The release write ``stop()`` sends next is owner-scoped and runs on the DB, so a
-    claim the server is still applying is ordered against it there, not here.
+    names. ``asyncio.wait`` returns at the bound and leaves a slow task finishing on its own.
 
-    Never raises: a task's stored error is read and dropped, as ``return_exceptions=True`` did."""
+    **What leaving it behind costs.** The task is cancelled, so it will not run another step. But a
+    claim it sent before the cancel may still be on the server, and the server can apply it AFTER
+    the release ``stop()`` sends next. The claim's renew arm still matches, because the release
+    moves only the expiry, so the stopped node then holds a live lease for one TTL and a standby
+    waits that out. The old unbounded gather avoided this only by waiting for the server's cancel
+    acknowledgement, which is the wait that never ends on a dead server. The cost is the one a
+    failed release already had.
+
+    Never raises. A task's stored error is read and logged here rather than raised, because the
+    caller is shutting down; a cancellation is the expected outcome and is not logged."""
     for task in tasks:
         task.cancel()
     if not tasks:
         return
     done, pending = await asyncio.wait(tasks, timeout=timeout)
     for task in (*done, *pending):
-        task.add_done_callback(_drop_task_outcome)
+        task.add_done_callback(_log_task_outcome)
     if pending:
         log.warning(
             "cluster: node %s stopped with %d background task(s) still unwinding after %.1fs",
@@ -391,10 +420,13 @@ async def stop_tasks_within(
         )
 
 
-def _drop_task_outcome(task: asyncio.Task[None]) -> None:
-    """Read a finished task's outcome, so a stored error is not reported as never retrieved."""
-    if not task.cancelled():
-        task.exception()
+def _log_task_outcome(task: asyncio.Task[None]) -> None:
+    """Read a finished background task's outcome, and log a real error rather than drop it."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning("cluster: a background task ended with an error at stop: %s", safe_exc(exc))
 
 
 class StepdownOutcome(NamedTuple):
@@ -541,9 +573,7 @@ def fence_tick_seconds(fence_timeout_seconds: float) -> float:
     return max(0.05, min(1.0, fence_timeout_seconds / 5.0))
 
 
-def stepdown_pause_seconds(
-    heartbeat_seconds: float, sibling_acquire_delay_seconds: float = 0.0
-) -> float:
+def stepdown_pause_seconds(heartbeat_seconds: float, sibling_acquire_delay_seconds: float) -> float:
     """How long a node declines to claim after a VOLUNTARY stepdown (ADR 0056 slice 1).
 
     Module-level, and shared by both coordinators, for the reason :func:`fence_tick_seconds` is: it is
@@ -561,10 +591,14 @@ def stepdown_pause_seconds(
     has passed on the DB clock. The drained node's reclaim goes through the renew arm, which carries no
     delay term. So without this term a drained node whose siblings are all delayed past two heartbeats
     takes its own lease back when the pause ends, which is the defect #1507 described. The caller
-    passes :func:`longest_promotable_sibling_delay`; the default ``0.0`` is the no-sibling case, where
-    only the two heartbeats apply. A negative or non-finite value counts as zero, so it can neither
-    shorten the pause below two heartbeats nor make it endless. The pause can end early; the pause
-    lift in :meth:`DbCoordinator._claim_or_renew_lease` says when.
+    passes :func:`longest_promotable_sibling_delay`; ``0.0`` is the no-sibling case, where only the
+    two heartbeats apply. The argument is required for the reason it is required on
+    ``step_down_leadership`` (BACKLOG #2539): a forgotten one must fail, not fall back to the bare
+    pause. A negative or non-finite value counts as zero, so it can neither shorten the pause below
+    two heartbeats nor make it endless, and a value above ``MAX_ACQUIRE_DELAY_SECONDS`` counts as
+    that bound. The settings validator refuses such a delay, but this one is read back from a
+    ``nodes`` row, which something else may have written. The pause can end early; the pause lift
+    in :meth:`DbCoordinator._claim_or_renew_lease` says when.
 
     Two limits remain. The pause is measured in THIS node's heartbeat and monotonic clock, so a
     sibling configured with a longer heartbeat can miss the window. And the sibling delays are the
@@ -579,7 +613,7 @@ def stepdown_pause_seconds(
     promotable node is leaderless for it, which is the operator's own request but should not linger.
     """
     delay = sibling_acquire_delay_seconds if math.isfinite(sibling_acquire_delay_seconds) else 0.0
-    return 2.0 * heartbeat_seconds + max(0.0, delay)
+    return 2.0 * heartbeat_seconds + min(max(0.0, delay), MAX_ACQUIRE_DELAY_SECONDS)
 
 
 #: The share of the fence timeout a paused tick's owner read may hold the leadership lock
@@ -588,11 +622,10 @@ def stepdown_pause_seconds(
 _PAUSED_READ_FENCE_SHARE = 0.75
 
 
-def paused_read_budget_seconds(
-    fence_timeout_seconds: float, statement_timeout_seconds: float | None
-) -> float:
+def paused_read_budget_seconds(fence_timeout_seconds: float) -> float:
     """The whole-call budget for the owner read a tick sends while the stepdown pause holds
-    (BACKLOG #2540). Shared by both coordinators for the reason :func:`stepdown_pause_seconds` is.
+    (BACKLOG #2540): 75 percent of the fence timeout. Shared by both coordinators for the reason
+    :func:`stepdown_pause_seconds` is.
 
     **Why the read needs its own bound.** The read runs under :attr:`DbCoordinator._leadership_lock`,
     and a stepdown waits for that lock for at most ``leader_fence_timeout_seconds``. During the pause
@@ -602,21 +635,22 @@ def paused_read_budget_seconds(
     ``503 lock-timeout``. On Postgres the renew clamp bounded it, but the clamp is validated against
     the detection margin, not the fence, and a long TTL lets it exceed the fence.
 
-    **The decision, recorded in docs/CLUSTERING.md under the stepdown pause:** the read keeps
-    its place inside the lock and gets a per-statement bound of ``min(statement timeout, 75 percent
-    of the fence)``. A missing or zero statement timeout means "no limit", so the fence share alone
-    applies. Two other shapes were rejected. Folding the pause into the claim statement breaks the
-    BACKLOG #1508 retry, which clears the owed release write when the claim returns no row. Moving
-    the read outside the lock races a concurrent stepdown.
+    **The decision, recorded in docs/CLUSTERING.md under the stepdown pause:** the read keeps its
+    place inside the lock, and it ends by the smaller of its statement timeout and this budget. Two
+    other shapes were rejected. Folding the pause into the claim statement breaks the BACKLOG #1508
+    retry, which clears the owed release write when the claim returns no row. Moving the read
+    outside the lock races a concurrent stepdown.
 
-    The caller must spend this as a WHOLE-CALL budget, the driver's unwind included. Postgres
-    passes half of it to :func:`_call_within`, which costs at most twice its timeout. SQL Server
-    wraps the store call in ``asyncio.timeout``; the store quarantines a cancelled connection
-    without waiting on a running statement, so that unwind is short."""
-    share = _PAUSED_READ_FENCE_SHARE * fence_timeout_seconds
-    if statement_timeout_seconds is None or not statement_timeout_seconds > 0:
-        return share
-    return min(statement_timeout_seconds, share)
+    How each backend spends it, the driver's unwind included:
+
+    * Postgres: :func:`_call_within` at ``min(renew clamp, budget / 2)``, because that helper costs
+      at most twice its timeout. The halving applies only when the clamp is the larger term.
+    * SQL Server: an ``asyncio.timeout`` of the whole budget around the store read. The store's own
+      ``command_timeout`` still ends the statement cleanly when it is the shorter of the two, so the
+      client-side cancel, which quarantines a pooled connection, fires only when the store's limit
+      would overrun the budget. The store does not wait on a running statement to quarantine it, so
+      that unwind is short."""
+    return _PAUSED_READ_FENCE_SHARE * fence_timeout_seconds
 
 
 def demote_stop_budget(
@@ -1040,15 +1074,15 @@ class DbCoordinator:
         # entirely when an operator sets the documented command_timeout=0). It does not widen the
         # detection margin, which the baseline stamp already fixed; it bounds how long a renew this
         # node issued BEFORE it self-fenced can still be in flight, re-extending the very lease it is
-        # standing down from. Since BACKLOG #2523 it bounds EVERY statement this coordinator sends,
-        # the acquire and asyncpg's release included (_call), so it overrides the pool's
-        # command_timeout everywhere but the start-up DDL.
+        # standing down from. Since BACKLOG #2523 it also bounds the lease statements' release, and a
+        # stepdown's release write (_call_lease). It does not bound their borrow; see _call_lease.
         self._renew_timeout = lease_renew_timeout_seconds
-        # BACKLOG #2540: the paused tick's owner read, as the per-call timeout _call_within takes.
-        # Half the budget, because that helper costs at most twice its timeout.
-        self._paused_read_timeout = (
-            paused_read_budget_seconds(leader_fence_timeout_seconds, lease_renew_timeout_seconds)
-            / 2.0
+        # BACKLOG #2540: the paused tick's owner read, as the timeout _call_within takes. That helper
+        # costs at most twice its timeout, so the budget is halved, and only when the clamp is the
+        # larger term; paused_read_budget_seconds says why the read needs its own bound.
+        self._paused_read_timeout = min(
+            lease_renew_timeout_seconds,
+            paused_read_budget_seconds(leader_fence_timeout_seconds) / 2.0,
         )
         # The fence watchdog polls this often; small relative to the fence timeout so a fence fires
         # promptly (well before the lease TTL). Pure in-memory check — no DB.
@@ -1148,8 +1182,9 @@ class DbCoordinator:
     async def stop(self) -> None:
         """Release leadership, cancel both background tasks, and mark this node left. Idempotent and
         safe even if :meth:`start` raised before the tasks existed (then there's nothing to tear down).
-        Ordered so the tasks are stopped BEFORE the lease is released, so a still-running tick can't
-        re-acquire after we release. The tombstone is skipped when the release spent its whole bound
+        Ordered so the tasks are cancelled BEFORE the lease is released, so a tick can't START a claim
+        after we release. A claim already on the server when the bounded wait gives up can still land
+        after the release; :func:`stop_tasks_within` says what that costs. The tombstone is skipped when the release spent its whole bound
         (BACKLOG #1987), so a stopped node's row can then read ``active`` until it goes stale."""
         self._stop.set()
         tasks = [t for t in (self._heartbeat_task, self._fence_task) if t is not None]
@@ -1325,17 +1360,32 @@ class DbCoordinator:
     async def _call(
         self, method: Literal["execute", "fetchrow", "fetch"], sql: str, *args: Any
     ) -> Any:
-        """Send one statement through :func:`_call_within`, bounded by the renew clamp, so it costs at
-        most twice that (BACKLOG #2523).
+        """Send one statement that is not a lease statement, bounded at the fence timeout
+        (BACKLOG #2523): the heartbeat, the registration, the config-version token and the
+        membership and lease reads. It costs at most twice the fence.
 
-        The pool's own ``execute``/``fetchrow``/``fetch`` borrow with no acquire timeout, so a
-        statement cancelled in flight could wait forever in asyncpg's release. That wait used to hold
-        ``stop()`` behind a cancelled heartbeat task, and a stepdown behind a tick holding
-        :attr:`_leadership_lock`. The renew clamp is the bound because it is the coordinator's one
-        validated per-statement value, and it sits inside the detection margin. The acquire wait now
-        counts against it: a renew that cannot borrow a connection within the clamp fails, and the
-        maintenance loop retries it next tick without demoting, as it does any failed renew."""
-        return await _call_within(self._pool, self._renew_timeout, method, sql, *args)
+        The pool's own ``execute``/``fetchrow``/``fetch`` borrow with no timeout, so a statement
+        cancelled in flight could wait forever in asyncpg's release, and that wait held ``stop()``
+        behind a cancelled heartbeat task. Any finite bound closes that. The fence is used rather
+        than the renew clamp because none of these runs under :attr:`_leadership_lock`, and the
+        clamp is sized for one lease row, not for a start-up registration or an API read on a busy
+        pool. A node that cannot run one of them within the fence would self-fence anyway."""
+        return await _call_within(self._pool, self._fence_timeout, method, sql, *args)
+
+    async def _call_lease(
+        self, method: Literal["execute", "fetchrow"], sql: str, *args: Any
+    ) -> Any:
+        """Send a lease statement: the claim, or a stepdown's release write (BACKLOG #2523).
+
+        The statement and asyncpg's release are each bounded at the renew clamp, so a tick holding
+        :attr:`_leadership_lock` over a hung statement lets it go within twice the clamp. The borrow
+        gets the fence timeout instead, and its wait does not count against the clamp. These share
+        the store's pool, and a renew that failed because the pool was busy, rather than because the
+        server was dead, would self-fence a healthy leader under load. A leader that cannot borrow
+        within the fence self-fences on its own clock either way."""
+        return await _call_within(
+            self._pool, self._renew_timeout, method, sql, *args, borrow_timeout=self._fence_timeout
+        )
 
     def _log_cluster_enabled_once(self) -> None:
         global _logged_cluster_enabled
@@ -1368,10 +1418,11 @@ class DbCoordinator:
         # this module's import to the store package for no benefit.
         from messagefoundry.store.postgres import CLUSTER_SCHEMA
 
-        # The acquire is bounded (BACKLOG #2523), which also bounds asyncpg's release if this is
-        # cancelled. The DDL itself is not: it may wait on a peer's advisory lock, so the pool's
-        # command_timeout stays its only ceiling.
-        async with self._pool.acquire(timeout=self._renew_timeout) as conn:  # noqa: SIM117
+        # The borrow and asyncpg's release are bounded at the fence (BACKLOG #2523). The DDL itself
+        # is not: it may wait on a peer's advisory lock, so the pool's command_timeout stays its only
+        # ceiling.
+        conn = await self._pool.acquire(timeout=self._fence_timeout)
+        try:
             async with conn.transaction():
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock($1, hashtext($2))",
@@ -1382,6 +1433,8 @@ class DbCoordinator:
                 # also runs; the comments that explain each one live there.
                 for statement in CLUSTER_SCHEMA:
                     await conn.execute(statement)
+        finally:
+            await self._pool.release(conn, timeout=self._fence_timeout)
 
     async def _register(self) -> None:
         """Upsert this node's row as ``active`` (a restart re-activates a prior 'left' tombstone). The
@@ -1609,7 +1662,7 @@ class DbCoordinator:
             if row is not None and row["owner"] != self.node_id:
                 self._no_claim_until = 0.0
             return False
-        row = await self._call(
+        row = await self._call_lease(
             "fetchrow",
             "INSERT INTO leader_lease (lease_key, owner, lease_expires_at, leader_epoch) "
             "VALUES ($1, $2, EXTRACT(EPOCH FROM clock_timestamp()) + $3, 1) "
@@ -1627,8 +1680,8 @@ class DbCoordinator:
             self.node_id,
             self._lease_ttl,
             self._acquire_delay,
-            # ADR 0157 Inc 0: _call bounds this at the renew clamp, the acquire included, so the
-            # pool's command_timeout never applies. On expiry it raises TimeoutError, which the
+            # ADR 0157 Inc 0: _call_lease bounds the statement at the renew clamp, so the pool's
+            # command_timeout never applies. The borrow before it has its own bound. On expiry it raises TimeoutError, which the
             # maintenance loop logs and retries WITHOUT demoting: _last_renew_ok is simply not
             # advanced, so the watchdog fences only if the failure outlives the fence timeout. That
             # is the same handling a raise already got, so the clamp adds a bound, not a new path.
@@ -1741,11 +1794,12 @@ class DbCoordinator:
         the SYNCHRONOUS in-memory demotion, so before this lock that demotion happened immediately and
         now it happens behind a tick's DB round trip. A tick suspended in ``fetchrow`` holds the lock,
         and while this call waits, the node an operator is draining still answers :meth:`is_leader`
-        ``True`` and still binds listeners. Since BACKLOG #2523 a tick's statement is bounded at the
-        renew clamp, acquire and release included (:meth:`_call`), so it holds the lock for at most
-        twice that per statement. It used to have no bound but ``[store].command_timeout``, with an
-        acquire that carried no timeout at all. **That is a bound on the tick, not on this wait**:
-        the clamp is validated against the detection margin, not against the fence timeout.
+        ``True`` and still binds listeners. Since BACKLOG #2523 a tick's claim is bounded at the
+        renew clamp, with its release (:meth:`_call_lease`), so a hung claim holds the lock for at
+        most twice that once it has a connection. Its borrow waits up to the fence on a busy pool.
+        It used to have no bound but ``[store].command_timeout``, and a release that could wait for
+        ever. **That is a bound on the tick, not on this wait**: the clamp is validated against the
+        detection margin, not against the fence timeout.
 
         So the wait is bounded here too, and a timeout refuses with ``503`` rather than demoting
         anything — :func:`acquire_leadership_lock` holds that bound and the reasoning behind it.
@@ -1801,8 +1855,9 @@ class DbCoordinator:
             elif arming:
                 # ARMED A SECOND TIME, from the instant the write RETURNED, taking whichever expiry is
                 # LATER. The arm above is measured from before the write, so the write's own duration
-                # comes out of the pause. Since BACKLOG #2523 that duration is bounded at twice the
-                # renew clamp; the SQL Server twin's has only `[store].command_timeout`, and a bound
+                # comes out of the pause. Since BACKLOG #2523 that duration is bounded, at the borrow
+                # wait plus twice the renew clamp; the SQL Server twin's has only
+                # `[store].command_timeout`, and a bound
                 # is still a cost taken out of the pause. The window that matters starts when the row
                 # becomes takeable, which is the
                 # commit, not the call: measuring from before it would hand a sibling (the pause - write
@@ -1881,8 +1936,8 @@ class DbCoordinator:
         ``timeout`` bounds the write through :func:`_execute_within`. Only :meth:`stop` passes it. A
         self-fenced node's pool is the one most likely to hang, and a stop must not wait on it; a
         write that misses the bound is a failed write (``wrote=False``, the release still owed) and
-        the row ages out at its TTL. A stepdown passes none and gets the renew clamp, as every other
-        statement does (BACKLOG #2523). Its request deadline is an ``asyncio.timeout`` around the
+        the row ages out at its TTL. A stepdown passes none and gets the lease bounds the claim gets
+        (:meth:`_call_lease`, BACKLOG #2523). Its request deadline is an ``asyncio.timeout`` around the
         handler, which could not bound an asyncpg write for the reason :func:`_call_within` gives, so
         before #2523 that write had no bound. A stepdown write that misses the clamp raises
         :class:`StepdownReleaseUnconfirmed`, and a retry re-sends it."""
@@ -1926,13 +1981,14 @@ class DbCoordinator:
                 "LEAST(lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())) "
                 "WHERE lease_key = $1 AND owner = $2"
             )
-            status = await _execute_within(
-                self._pool,
-                self._renew_timeout if timeout is None else timeout,
-                release_sql,
-                self._lease_key,
-                self.node_id,
-            )
+            if timeout is None:  # a stepdown: the lease bounds, as the claim gets
+                status = await self._call_lease(
+                    "execute", release_sql, self._lease_key, self.node_id
+                )
+            else:  # stop(): one whole-write bound, borrow included
+                status = await _execute_within(
+                    self._pool, timeout, release_sql, self._lease_key, self.node_id
+                )
         except Exception as exc:  # the pool may already be closing on shutdown — log, don't raise
             log.warning(
                 "cluster: node %s failed to release the leadership lease (it will expire on its "

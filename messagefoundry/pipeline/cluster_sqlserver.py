@@ -134,13 +134,10 @@ class SqlServerCoordinator:
         # widening it is a multi-site enumeration — the exact defect class this avoids).
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
-        # BACKLOG #2540: the whole-call budget for the paused tick's owner read, from the store's
-        # own statement timeout (duck-typed; a stand-in without one gets the fence share alone).
-        command_timeout = getattr(getattr(store, "_settings", None), "command_timeout", None)
-        self._paused_read_budget = paused_read_budget_seconds(
-            leader_fence_timeout_seconds,
-            float(command_timeout) if isinstance(command_timeout, (int, float)) else None,
-        )
+        # BACKLOG #2540: the whole-call budget for the paused tick's owner read. The store's own
+        # [store].command_timeout still ends the statement first when it is the shorter of the two;
+        # paused_read_budget_seconds says why that matters here.
+        self._paused_read_budget = paused_read_budget_seconds(leader_fence_timeout_seconds)
         # Small relative to the fence timeout so a fence fires promptly (well before the lease TTL).
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
         # Leader-preference (ADR 0096): `acquire_delay` handicaps ONLY take-over of an EXPIRED lease (added

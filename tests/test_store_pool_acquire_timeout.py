@@ -354,11 +354,12 @@ _REPO = Path(__file__).resolve().parents[1]
 # "is a connection borrowed here?" — adjacent questions with different answers.
 #
 # An `acquire(timeout=...)` is NOT counted: it is the bounded borrow, and asyncpg 0.31.0 also gives
-# that timeout to the shielded release (`pool.py:932`). The coordinator's start-up DDL borrows that
-# way since BACKLOG #2523, and counting it would report a bounded site as unbounded.
+# that timeout to the shielded release by default (`pool.py:932`). `timeout=None` IS counted: it is
+# the unbounded borrow spelled out. The coordinator's start-up DDL borrows the bounded way since
+# BACKLOG #2523, and counting it would report a bounded site as unbounded.
 _UNBOUNDED_BORROW = re.compile(
     r"(?:await|async with) self\._pool\."
-    r"(?:(?:fetch|fetchrow|fetchval|execute|executemany)\(|acquire\((?!timeout=))"
+    r"(?:(?:fetch|fetchrow|fetchval|execute|executemany)\(|acquire\((?!timeout=(?!None\b)))"
 )
 
 

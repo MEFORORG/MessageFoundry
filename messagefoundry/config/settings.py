@@ -4400,8 +4400,10 @@ def _derived_renew_timeout_seconds(margin_seconds: float) -> float:
 
 
 #: The largest ``[cluster].acquire_delay_seconds`` the config accepts (BACKLOG #2539). Picked, not
-#: derived; ``ClusterSettings._nonneg_acquire_delay`` says why.
-_MAX_ACQUIRE_DELAY_SECONDS = 3600.0
+#: derived; ``ClusterSettings._nonneg_acquire_delay`` says why. The stepdown pause also clamps a
+#: sibling delay to it (``pipeline.cluster.stepdown_pause_seconds``), because that delay is read
+#: back from a ``nodes`` row, which something other than this validator may have written.
+MAX_ACQUIRE_DELAY_SECONDS = 3600.0
 
 
 class ClusterSettings(_Section):
@@ -4550,10 +4552,10 @@ class ClusterSettings(_Section):
         # left that node unable to reclaim for hours, and an infinite or NaN delay could never be
         # met at all. 3600 s is picked, not derived: the docs only ever describe delays of seconds
         # to minutes, and an hour leaves ample room above that.
-        if not 0 <= value <= _MAX_ACQUIRE_DELAY_SECONDS:
+        if not 0 <= value <= MAX_ACQUIRE_DELAY_SECONDS:
             raise ValueError(
                 "acquire_delay_seconds must be between 0 and "
-                f"{_MAX_ACQUIRE_DELAY_SECONDS:g} (0 disables the leader-preference handicap)"
+                f"{MAX_ACQUIRE_DELAY_SECONDS:g} (0 disables the leader-preference handicap)"
             )
         return value
 

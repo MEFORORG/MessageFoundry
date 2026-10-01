@@ -327,12 +327,23 @@ async def test_stop_with_only_a_delayed_sibling_hands_over_after_the_delay(backe
 
 
 def test_the_pause_adds_the_sibling_delay_and_never_shortens() -> None:
-    assert stepdown_pause_seconds(10.0) == 20.0
+    assert stepdown_pause_seconds(10.0, 0.0) == 20.0
     assert stepdown_pause_seconds(10.0, 45.0) == 65.0
     assert stepdown_pause_seconds(10.0, -5.0) == 20.0
     # A non-finite delay would make the pause endless and the cluster leaderless until a restart.
     assert stepdown_pause_seconds(10.0, math.inf) == 20.0
     assert stepdown_pause_seconds(10.0, math.nan) == 20.0
+    # BACKLOG #2539: a delay above the config bound counts as the bound. The validator refuses one,
+    # but this value is read back from a nodes row, which something else may have written.
+    assert stepdown_pause_seconds(10.0, 3600.0) == 3620.0
+    assert stepdown_pause_seconds(10.0, 1e9) == 3620.0
+
+
+def test_the_pause_requires_the_sibling_delay_too() -> None:
+    # The same reason as the coordinators' signature: a forgotten delay must fail, not fall back to
+    # the bare two-heartbeat pause.
+    param = inspect.signature(stepdown_pause_seconds).parameters["sibling_acquire_delay_seconds"]
+    assert param.default is inspect.Parameter.empty
 
 
 def _with_delay(member: ClusterMember, delay: float) -> ClusterMember:

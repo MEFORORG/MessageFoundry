@@ -20,8 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Awaitable, Iterator
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Iterator
 
 import pytest
 
@@ -116,57 +115,64 @@ class _Conn:
 
 
 class _AsyncpgPool:
-    """asyncpg 0.31.0's pool, reduced to the behaviour the bound depends on.
+    """asyncpg 0.31.0's pool, reduced to the behaviour the bounds depend on.
 
-    ``acquire(timeout=t)`` lends a connection. When the borrower is cancelled while a statement is in
-    flight, the release waits ``t`` for the server to acknowledge the cancel, then raises
-    ``TimeoutError`` (asyncpg terminates the connection and re-raises). ``t=None`` waits for ever.
-    The pool-level ``execute``/``fetchrow`` borrow with ``timeout=None``, as asyncpg's do."""
+    ``await acquire(timeout=t)`` lends a connection and records ``t``. ``release(con, timeout=r)``
+    models the shielded release: when a statement on ``con`` was cancelled in flight, it waits ``r``
+    for the server to acknowledge the cancel, then raises ``TimeoutError`` (asyncpg terminates the
+    connection and re-raises). ``r=None`` waits for ever. The pool-level ``execute``/``fetchrow``
+    borrow and release with no timeout, as asyncpg's do."""
 
     def __init__(self, server: _Server) -> None:
         self._server = server
         self.acquire_timeouts: list[float | None] = []
+        self.release_timeouts: list[float | None] = []
         # The connection dies under the cancel: asyncpg's reset then raises at once, and re-raises
         # that error over the CancelledError the borrower was unwinding with.
         self.release_fails = False
+        # A busy pool: the borrow waits this long, or fails at its own timeout if that is shorter.
+        self.borrow_delay = 0.0
 
-    @asynccontextmanager
-    async def acquire(self, *, timeout: float | None = None) -> AsyncIterator[_Conn]:
+    async def acquire(self, *, timeout: float | None = None) -> _Conn:
         self.acquire_timeouts.append(timeout)
-        con = _Conn(self._server)
-        try:
-            yield con
-        except asyncio.CancelledError:
-            if con.in_flight:
-                if self.release_fails:
-                    raise ConnectionError(
-                        "connection was closed in the middle of operation"
-                    ) from None
-                await asyncio.wait_for(asyncio.Event().wait(), timeout)
-            raise
+        if self.borrow_delay:
+            if timeout is not None and self.borrow_delay > timeout:
+                await asyncio.sleep(timeout)
+                raise TimeoutError
+            await asyncio.sleep(self.borrow_delay)
+        return _Conn(self._server)
+
+    async def release(self, con: _Conn, *, timeout: float | None = None) -> None:
+        self.release_timeouts.append(timeout)
+        if con.in_flight:  # a statement on it was cancelled before it returned
+            con.in_flight = False
+            if self.release_fails:
+                raise ConnectionError("connection was closed in the middle of operation")
+            await asyncio.wait_for(asyncio.Event().wait(), timeout)
 
     async def execute(self, sql: str, *args: object) -> str:
-        async with self.acquire() as con:
+        con = await self.acquire()
+        try:
             return await con.execute(sql, *args)
+        finally:
+            await self.release(con)
 
     async def fetchrow(self, sql: str, *args: object) -> object:
-        async with self.acquire() as con:
+        con = await self.acquire()
+        try:
             return await con.fetchrow(sql, *args)
-
-
-class _StoreSettings:
-    def __init__(self, command_timeout: float) -> None:
-        self.command_timeout = command_timeout
+        finally:
+            await self.release(con)
 
 
 class _SqlStore:
     """The SQL Server store's ``_fetchone``/``_execute``. Its cancel unwinds at once: the real store
     quarantines the cancelled connection without waiting on a running statement."""
 
-    def __init__(self, server: _Server, command_timeout: float | None = None) -> None:
+    _settings = None
+
+    def __init__(self, server: _Server) -> None:
         self._server = server
-        # The store's [store].command_timeout, which the coordinator reads for the paused owner read.
-        self._settings = None if command_timeout is None else _StoreSettings(command_timeout)
 
     async def _fetchone(self, sql: str, params: tuple[object, ...]) -> object:
         return await self._server.run(sql, str(params[1]) if len(params) > 1 else "")
@@ -204,15 +210,13 @@ def _pg(server: _Server, node: str = "A", **kw: float) -> tuple[DbCoordinator, _
     return coord, pool
 
 
-def _ss(
-    server: _Server, node: str = "A", command_timeout: float | None = None
-) -> SqlServerCoordinator:
+def _ss(server: _Server, node: str = "A", fence: float = _FENCE) -> SqlServerCoordinator:
     return SqlServerCoordinator(
-        _SqlStore(server, command_timeout),
+        _SqlStore(server),
         node,
         heartbeat_seconds=10.0,
         leader_lease_ttl_seconds=_TTL,
-        leader_fence_timeout_seconds=_FENCE,
+        leader_fence_timeout_seconds=fence,
         stop_write_timeout_seconds=_STOP_BOUND,
         run_schema_ddl=False,
     )
@@ -241,15 +245,15 @@ async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_borrow_bound(
 ) -> None:
     """stop() cancels the maintenance task while its heartbeat UPDATE is hung on the server. The
     task must FINISH, not merely be left behind by stop()'s own bound: its connection goes back to the
-    pool within the renew clamp.
+    pool within the release's timeout, which for a statement other than a lease one is the fence.
 
     MUTATION ARM, measured: send the statement through the pool's own ``execute`` (as before #2523)
-    and the task is still running when stop() returns, because the release waits for ever."""
-    # A clamp long enough that stop()'s cancel lands well inside it on a loaded runner. If the
+    and the task is still running after stop() returns, because the release waits for ever."""
+    # A fence long enough that stop()'s cancel lands well inside it on a loaded runner. If the
     # coordinator's own deadline fired first, the loop would move on to a claim before stop() ran.
-    renew = 0.3
+    fence = 1.0
     server.hang.add(_HEARTBEAT_SQL)
-    a, pool = _pg(server, renew=renew)
+    a, pool = _pg(server, fence=fence)
     await a.start()
     await asyncio.wait_for(server.hung.wait(), _GUARD)
     heartbeat = a._heartbeat_task
@@ -259,16 +263,17 @@ async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_borrow_bound(
 
     assert elapsed < _STOP_BOUND + _SLACK
     # stop() did not wait for it (its own bound is shorter), but the task finishes within the
-    # clamp, because the release it is waiting in was borrowed with that timeout.
-    await asyncio.wait({heartbeat}, timeout=2 * renew + _SLACK)
+    # release's timeout.
+    await asyncio.wait({heartbeat}, timeout=fence + _SLACK)
     assert heartbeat.done(), "the cancelled heartbeat is still waiting on its connection's release"
     # And it finished CANCELLED. The stand-in's release raises TimeoutError over the cancel, as
     # asyncpg's does; without _call_within restoring the cancel, the loop logs that as a failed
     # heartbeat and goes on to send a claim after stop() had cancelled it.
     assert heartbeat.cancelled(), "the cancel was swallowed by the release's TimeoutError"
     assert server.row.owner is None, "the cancelled loop went on to claim the lease"
-    assert renew in pool.acquire_timeouts
-    assert None not in pool.acquire_timeouts, "a statement borrowed with no acquire timeout"
+    assert fence in pool.release_timeouts
+    assert None not in pool.acquire_timeouts, "a statement borrowed with no timeout"
+    assert None not in pool.release_timeouts, "a statement released with no timeout"
 
 
 async def test_a_cancel_survives_a_release_that_raises_over_it(server: _Server) -> None:
@@ -276,13 +281,13 @@ async def test_a_cancel_survives_a_release_that_raises_over_it(server: _Server) 
     error over the cancel the borrower was unwinding with, and the maintenance loop catches
     ``Exception``. Here the connection dies under the cancel, so the release raises at once.
 
-    The renew clamp is set long on purpose. With a short one the coordinator's own deadline fires
-    inside the release and cancels it, which hides the swallow, so the test above cannot see it.
+    The fence is set long on purpose, so the coordinator's own deadline cannot fire first and turn
+    the hung heartbeat into an ordinary timeout before stop() cancels it.
 
     MUTATION ARM, measured: drop the restore in ``_call_within`` and the loop logs a failed heartbeat,
     then sends a claim and takes the lease after stop() had cancelled it."""
     server.hang.add(_HEARTBEAT_SQL)
-    a, pool = _pg(server, renew=_GUARD)
+    a, pool = _pg(server, fence=_GUARD)
     pool.release_fails = True
     await a.start()
     await asyncio.wait_for(server.hung.wait(), _GUARD)
@@ -329,7 +334,24 @@ async def test_stop_is_bounded_when_a_background_task_never_unwinds(
         await stuck
 
 
-# --- a stepdown ---------------------------------------------------------------------------------
+# --- the lease statements -----------------------------------------------------------------------
+
+
+async def test_a_busy_pool_does_not_fail_the_renew(server: _Server) -> None:
+    """Review finding on the first cut of #2523: the renew clamp also bounded the wait for a pool
+    connection. The coordinator shares the store's pool, so a leader whose pool was merely busy
+    failed every renew and self-fenced under load. The borrow now waits up to the fence, apart from
+    the clamp, which still bounds the statement.
+
+    MUTATION ARM, measured: make the claim's borrow share the statement's deadline again and this
+    renew raises TimeoutError."""
+    a, pool = _pg(server, renew=0.05, fence=_GUARD)
+    pool.borrow_delay = 0.3  # longer than the clamp, well inside the fence
+
+    await asyncio.wait_for(a._maintain_leadership(), _GUARD)
+
+    assert a.is_leader() is True
+    assert pool.acquire_timeouts[-1] == _GUARD and pool.release_timeouts[-1] == 0.05
 
 
 async def test_a_stepdown_whose_release_write_hangs_returns_within_the_bound(
@@ -370,7 +392,7 @@ async def test_a_stepdown_queued_behind_a_hung_claim_gets_the_lock(server: _Serv
     elapsed, outcome = await _timed(a.step_down_leadership(sibling_acquire_delay_seconds=0.0))
 
     assert elapsed < _FENCE, f"the stepdown waited {elapsed:.2f}s for the lock"
-    assert getattr(outcome, "drained", False) is True
+    assert outcome.drained is True
     with pytest.raises(TimeoutError):
         await tick  # the hung renew failed at its bound; the loop would log it and retry
 
@@ -395,6 +417,10 @@ async def test_a_lock_timeout_is_still_the_answer_when_the_tick_outlasts_the_fen
 
 # --- the paused tick's owner read (BACKLOG #2540) ----------------------------------------------
 
+# Longer than the other tests' fence, so the margin between the read's budget (three quarters of
+# this) and the lock wait is wide enough for a loaded runner.
+_PAUSED_FENCE = 3.0
+
 
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
 async def test_a_stalled_paused_read_still_lets_a_retried_stepdown_in(
@@ -404,15 +430,18 @@ async def test_a_stalled_paused_read_still_lets_a_retried_stepdown_in(
     the write. Its next tick sends the pause's owner read under the leadership lock, and the store
     stalls. The operator retries the stepdown, which waits for that lock only up to the fence.
 
-    Each backend's statement timeout is set LONGER than the fence, as SQL Server's 30 s default is
-    against the 20 s fence, so only the paused read's own bound can let the retry in.
+    The stall outlasts the fence on both backends: the Postgres renew clamp is set longer than the
+    fence, and the SQL Server stand-in has no statement timeout, as ``command_timeout = 0`` has none
+    and the shipped 30 s exceeds the 20 s fence. So only the read's own bound can let the retry in.
 
     MUTATION ARMS, measured: on Postgres send the read at the renew clamp, and on SQL Server drop
     its ``asyncio.timeout``; each retry then answers StepdownLockTimeout, the 503."""
     if backend == "postgres":
-        coord: DbCoordinator | SqlServerCoordinator = _pg(server, renew=_GUARD)[0]
+        coord: DbCoordinator | SqlServerCoordinator = _pg(
+            server, renew=_GUARD, fence=_PAUSED_FENCE
+        )[0]
     else:
-        coord = _ss(server, command_timeout=_GUARD)
+        coord = _ss(server, fence=_PAUSED_FENCE)
     await coord._maintain_leadership()
     assert coord.is_leader() is True
 
@@ -428,33 +457,24 @@ async def test_a_stalled_paused_read_still_lets_a_retried_stepdown_in(
 
     elapsed, outcome = await _timed(coord.step_down_leadership(sibling_acquire_delay_seconds=0.0))
 
-    assert elapsed < _FENCE, f"{backend}: the retry waited {elapsed:.2f}s for the lock"
+    assert elapsed < _PAUSED_FENCE, f"{backend}: the retry waited {elapsed:.2f}s for the lock"
     assert outcome.lease_released is True and coord._lease_release_owed is False, backend
     with pytest.raises(TimeoutError):
         await tick  # the stalled read failed at its bound; the loop logs it and the pause holds
     assert coord.is_leader() is False
 
 
-def test_the_paused_read_budget_stays_under_the_fence() -> None:
-    # The shipped SQL Server case: a 30 s command timeout against a 20 s fence.
-    assert paused_read_budget_seconds(20.0, 30.0) == 15.0
-    # A shorter statement timeout wins, as the Postgres renew clamp's 4.5 s does.
-    assert paused_read_budget_seconds(20.0, 4.5) == 4.5
-    # [store].command_timeout = 0 means "no limit", and the fence share alone applies.
-    assert paused_read_budget_seconds(20.0, 0.0) == 15.0
-    assert paused_read_budget_seconds(20.0, None) == 15.0
+def test_the_paused_read_budget_and_how_each_backend_spends_it() -> None:
+    # The whole-call budget: three quarters of the fence, so always under it.
+    assert paused_read_budget_seconds(20.0) == 15.0
     for fence in (0.5, 5.0, 20.0, 120.0):
-        for statement in (None, 0.0, 1.0, fence, 10 * fence):
-            assert paused_read_budget_seconds(fence, statement) < fence
-
-
-def test_each_coordinator_derives_the_budget_from_its_own_statement_timeout() -> None:
+        assert paused_read_budget_seconds(fence) < fence
     server = _Server()
-    pg, _pool = _pg(server, fence=20.0, renew=4.5)
-    assert pg._paused_read_timeout == 4.5 / 2  # _call_within costs at most twice its timeout
-    ss = SqlServerCoordinator(
-        _SqlStore(server, 30.0), "B", leader_fence_timeout_seconds=20.0, run_schema_ddl=False
-    )
-    assert ss._paused_read_budget == 15.0  # the shipped [store].command_timeout and fence
-    # A store stand-in with no settings gets the fence share alone.
-    assert _ss(server)._paused_read_budget == paused_read_budget_seconds(_FENCE, None)
+    # Postgres at the shipped settings: the 4.5 s clamp is already the smaller term, so the read
+    # keeps it rather than half of it. Twice 4.5 is still under the 15 s budget.
+    assert _pg(server, fence=20.0, renew=4.5)[0]._paused_read_timeout == 4.5
+    # A clamp longer than half the budget is cut to half, because the call costs twice its timeout.
+    assert _pg(server, fence=20.0, renew=9.0)[0]._paused_read_timeout == 7.5
+    # SQL Server spends the whole budget; the store's own command_timeout ends the read first when
+    # it is shorter, which keeps the client-side cancel for the case it is needed.
+    assert _ss(server, fence=20.0)._paused_read_budget == 15.0
