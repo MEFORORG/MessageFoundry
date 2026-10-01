@@ -760,9 +760,14 @@ def test_an_http_vault_through_an_https_proxy_is_refused_at_construction(
 ) -> None:
     """requests clears the CA and sets CERT_NONE for an ``http://`` URL, so the only TLS leg, the one
     to the proxy carrying the token, would authenticate nobody. RED before the change: the client
-    was built."""
+    was built. Since BACKLOG #2317 each client raises its provider's own fail-closed type, with
+    the refusal's text kept whole."""
+    from messagefoundry.config.secretprovider import SecretProviderError
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    own = SecretProviderError if build is _kv_client else KeyProviderError
     monkeypatch.setenv("HTTP_PROXY", proxy.url)
-    with pytest.raises(ValueError, match=r"https:// proxy"):
+    with pytest.raises(own, match=r"https:// proxy"):
         build("http://127.0.0.1:9")
     assert proxy.negotiated == [] and proxy.failures == 0
 

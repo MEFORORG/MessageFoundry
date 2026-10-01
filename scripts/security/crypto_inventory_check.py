@@ -582,7 +582,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
     # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
     # and asserts it, and loads requests' CA onto it. It refuses a CERT_NONE connection.
-    "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
+    # BACKLOG #2317 adds the tls_policy import: the cleartext-hop authority (is_loopback_hop_host,
+    # insecure_hop_disposition) refuses an http:// Vault that is not loopback reached directly. That
+    # is a posture decision on the scheme, and it calls no cipher or context.
+    "messagefoundry/transports/strict_requests.py": frozenset(
+        {"messagefoundry.config.tls_policy", "ssl"}
+    ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
     # engine's cert, it pins trust to exactly that PEM (ssl.create_default_context with cafile=);

@@ -6190,8 +6190,16 @@ def _build_provision_auth_service(
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
             hop_posture=posture,
         )
-    except SecretProviderError:
-        refusal = _PROVISION_AUTH_REFUSALS["reference"]
+    except SecretProviderError as exc:
+        # BACKLOG #2317: the Vault provider raises a cleartext-address refusal as its own type.
+        # Its text is fixed and names no part of the address, so it is shown, as the
+        # InsecureHopRefused arm below would show it.
+        cause = exc.__cause__
+        refusal = (
+            _sentence(cause)
+            if isinstance(cause, InsecureHopRefused)
+            else _PROVISION_AUTH_REFUSALS["reference"]
+        )
     except LdapError:
         refusal = _PROVISION_AUTH_REFUSALS["ldap"]
     except FileNotFoundError:
