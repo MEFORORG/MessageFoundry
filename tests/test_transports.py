@@ -248,7 +248,7 @@ def test_claim_unique_falls_back_to_copy_when_link_unsupported(
 ) -> None:
     # On FAT/exFAT/SMB os.link raises a non-FileExistsError OSError; delivery must still land via an
     # exclusive-create copy, still claiming a unique name when the target exists (low-5).
-    def _no_link(src: str, dst: str) -> None:
+    def _no_link(*_a: object, **_k: object) -> None:
         raise OSError("hard links not supported on this filesystem")
 
     monkeypatch.setattr(os, "link", _no_link)
@@ -273,7 +273,7 @@ def test_claim_unique_copy_fallback_is_not_world_readable(
     # mkstemp temp + the os.link/os.replace paths that inherit it. A delivered file can carry PHI, so
     # the fallback must not be the one path that leaves it group/world-readable (CodeQL
     # py/overly-permissive-file). Assert the group/other bits are clear (umask-independent).
-    def _no_link(src: str, dst: str) -> None:
+    def _no_link(*_a: object, **_k: object) -> None:
         raise OSError("hard links not supported on this filesystem")
 
     monkeypatch.setattr(os, "link", _no_link)
@@ -656,7 +656,8 @@ async def test_file_source_delete_failure_leaves_file_in_place(
     src = FileSource(
         Source(type=ConnectorType.FILE, settings={"directory": str(inbox), "after_read": "delete"})
     )
-    monkeypatch.setattr(Path, "unlink", _raise_locked)  # every delete raises
+    # Every delete raises. The delete arm unlinks by dir_fd on POSIX; Path.unlink calls os.unlink too.
+    monkeypatch.setattr(os, "unlink", _raise_locked)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         src._after_processing(inbox / "m.hl7")
     assert (inbox / "m.hl7").exists()  # still there, not silently dropped
@@ -2049,7 +2050,7 @@ async def test_file_source_delete_failure_logs_neither_the_name_nor_a_raw_except
     def _locked(*_a: object, **_k: object) -> None:
         raise OSError(f"locked: {name}")
 
-    monkeypatch.setattr(Path, "unlink", _locked)
+    monkeypatch.setattr(os, "unlink", _locked)  # the delete arm unlinks by dir_fd on POSIX
     with filtered_sink(_FILE_LOGGER) as sink:
         _file_source_for(inbox, after_read="delete")._after_processing(inbox / name)
     assert "could not delete" in sink.text

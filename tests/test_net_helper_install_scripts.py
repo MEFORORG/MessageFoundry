@@ -182,9 +182,12 @@ def test_the_installer_carries_no_copy_of_the_archive_pin() -> None:
     )
     # Every 64-hex literal here must be the binary pin, which test_nssm_pin.py keeps equal to
     # install-service.ps1's. Anything else is an unguarded second pin.
-    stray = {
-        h.upper() for h in _SHA256.findall(helper_installer) if h.upper() != binary.group(1).upper()
-    }
+    hashes = _SHA256.findall(helper_installer)
+    assert len(hashes) >= 1, (
+        "CONTROL FAILED: install-net-helper.ps1 holds no 64-hex literal, not even the nssm.exe pin, "
+        "so the stray-pin search below is aimed at nothing"
+    )
+    stray = {h.upper() for h in hashes if h.upper() != binary.group(1).upper()}
     assert not stray, (
         f"install-net-helper.ps1 carries hash literals other than the nssm.exe pin: {sorted(stray)}. "
         "The archive pin lives in install-service.ps1 only, and the helper binary's hash is "

@@ -1360,8 +1360,18 @@ the TLS leg to the proxy uses the same approved suites as the Vault leg. It is v
 same anchor too: the CA file when one is set, so the proxy's certificate must chain to it, and the
 public bundle otherwise. An `http://` Vault address through an
 `https://` proxy is **refused**, because that leg could not be verified. Use an `https://` Vault
-address (BACKLOG #300). Do not read `NO_PROXY` as the remedy: it sends the token over plain `http://`
-the whole way, which is weaker still, and a direct `http://` Vault address is not refused.
+address (BACKLOG #300). `NO_PROXY` is not a way around it either: a remote `http://` Vault reached
+directly is refused too, as the next paragraph says.
+**Each Vault client refuses a Vault address that is not `https://`** (BACKLOG #2317). That holds
+for at least the KV secret provider here, the store key provider and the Transit cipher. It covers
+a direct `http://` address and one behind an `http://` proxy, including hvac's own `VAULT_ADDR`
+fallback. The one `http://` address allowed is a loopback Vault that the client reaches with no
+proxy, because that hop stays on the box. Loopback is decided without DNS: the name `localhost` or
+a loopback IP literal, and no other name, whatever it resolves to. An address that does not read as
+one well-formed URL is refused too. The refusal comes when the client is built, as the provider's
+own fail-closed error, and again before each send in case a proxy appeared since. Its text names no
+part of the address, and `[security].enforcement` does not relax it. An `https://` Vault behind an
+`http://` proxy is still allowed: the token rides inside the TLS tunnel to Vault.
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.

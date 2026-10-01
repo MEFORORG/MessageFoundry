@@ -97,6 +97,9 @@ messagefoundry_toolkit/** text=auto eol=lf
 /README.md text=auto eol=lf
 /CHANGELOG.md text=auto eol=lf
 /pyproject.toml text=auto eol=lf
+# The toolkit wheel's own license files (BACKLOG #1192), shipped via its `[project].license-files`.
+/packaging/messagefoundry-toolkit/LICENSE text=auto eol=lf
+/packaging/messagefoundry-toolkit/NOTICE text=auto eol=lf
 
 # tee/anon/ is a VENDORED COPY of messagefoundry/anon/, and tests/test_anon_parity.py compares the
 # two BYTE FOR BYTE. The stanza above pins the engine side. Leaving this side unpinned makes that

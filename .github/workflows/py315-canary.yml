@@ -62,6 +62,11 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONFAULTHANDLER: "1"
+      # ci.yml's full-suite leg's extras, minus `harness`: PySide6 has no cp315 wheel, and the canary
+      # runs no Qt. Copied by hand, so re-read that install line when it changes. Without these,
+      # tests whose extra CI always installs (the vault hops, for one) failed here for a missing
+      # import, which read as a 3.15 finding.
+      EXTRAS: dev,fhir,dicom,x12,xml,webauthn,vault
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,31 +104,43 @@ jobs:
       # DELIBERATELY UNCONSTRAINED, as in freethread-smoke.yml: constraints.lock records what
       # resolved on 3.14, and pinning it here measures the lock instead of 3.15. A dependency with no
       # cp315 wheel is a FINDING, so sdists are allowed and the next step names each one.
-      - name: Install the engine (dev extra)
+      - name: Install the engine (dev and CI extras)
         id: install
         if: steps.setup.outcome == 'success'
         continue-on-error: true
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --report pip-report.json -e ".[dev]"
+          python -m pip install --report pip-report.json -e ".[$EXTRAS]"
 
-      # pyyaml, pulled in by uvicorn[standard], has had no cp315 Windows wheel, and its sdist crashed
-      # a 3.15 prerelease interpreter locally. The failed install stays a finding in the verdict;
-      # this fallback only lets the TLS tests still run. The standard extra is not needed by them.
-      - name: Fallback install without uvicorn's standard extra
+      # One requirement with no cp315 wheel and a source build that fails (pyyaml's crashed a 3.15
+      # prerelease interpreter locally) makes pip install nothing at all. This installs each
+      # requirement on its own, so the rest still land and the TLS tests still run. The failed full
+      # install stays a finding in the verdict, and the requirements that would not install are named.
+      - name: Fallback install, one requirement at a time
         id: fallback
         if: steps.setup.outcome == 'success' && steps.install.outcome != 'success'
         continue-on-error: true
         run: |
           python -m pip install --no-deps -e .
           python - > fallback-requirements.txt <<'PY'
-          import tomllib
+          import os, tomllib
           with open("pyproject.toml", "rb") as f:
               project = tomllib.load(f)["project"]
-          for req in project["dependencies"] + project["optional-dependencies"]["dev"]:
-              print(req.replace("uvicorn[standard]", "uvicorn"))
+          reqs = list(project["dependencies"])
+          for extra in os.environ["EXTRAS"].split(","):
+              reqs += project["optional-dependencies"][extra]
+          for req in reqs:
+              print(req)
           PY
-          python -m pip install -r fallback-requirements.txt
+          mkdir -p pip-reports
+          FAILED=""
+          N=0
+          while IFS= read -r REQ; do
+            N=$((N + 1))
+            python -m pip install --report "pip-reports/$N.json" "$REQ" || FAILED="$FAILED; $REQ"
+          done < fallback-requirements.txt
+          echo "not installable: ${FAILED#; }"
+          echo "failed=${FAILED#; }" >> "$GITHUB_OUTPUT"
 
       - name: Name the dependencies that installed from an sdist
         id: wheels
@@ -133,15 +150,19 @@ jobs:
           python - <<'PY'
           import json, os
           from pathlib import Path
-          report = Path("pip-report.json")
-          if not report.is_file():
-              names = "unknown (install failed before pip wrote its report; read the install log)"
+          # The full install writes pip-report.json; the fallback writes one report per requirement.
+          reports = [Path("pip-report.json"), *sorted(Path("pip-reports").glob("*.json"))]
+          reports = [r for r in reports if r.is_file()]
+          if not reports:
+              names = "unknown (no install wrote a report; read the install log)"
           else:
-              items = json.loads(report.read_text(encoding="utf-8"))["install"]
+              items = [i for r in reports for i in json.loads(r.read_text(encoding="utf-8"))["install"]]
               sdists = sorted(
-                  i["metadata"]["name"]
-                  for i in items
-                  if i.get("download_info", {}).get("url", "").endswith((".tar.gz", ".zip"))
+                  {
+                      i["metadata"]["name"]
+                      for i in items
+                      if i.get("download_info", {}).get("url", "").endswith((".tar.gz", ".zip"))
+                  }
               )
               names = ", ".join(sdists) or "none"
           print(f"built from sdist (no cp315 wheel): {names}")
@@ -185,6 +206,7 @@ jobs:
           PROBE: ${{ steps.probe.outcome }}
           INSTALL: ${{ steps.install.outcome }}
           FALLBACK: ${{ steps.fallback.outcome }}
+          NOT_INSTALLABLE: ${{ steps.fallback.outputs.failed }}
           TLS: ${{ steps.tls.outcome }}
           SUITE: ${{ steps.suite.outcome }}
           VERSION: ${{ steps.probe.outputs.version }}
@@ -229,7 +251,8 @@ jobs:
             echo "| provision 3.15 | $SETUP (${VERSION:-n/a}, ${OPENSSL:-n/a}) |"
             echo "| SSLContext.set_groups present | ${SET_GROUPS:-n/a} |"
             echo "| install | $INSTALL |"
-            echo "| fallback install (no uvicorn standard extra) | ${FALLBACK:-n/a} |"
+            echo "| fallback install, one requirement at a time | ${FALLBACK:-n/a} |"
+            echo "| not installable on 3.15 | ${NOT_INSTALLABLE:-n/a} |"
             echo "| built from sdist | ${SDISTS:-n/a} |"
             echo "| TLS and apiclient tests | $TLS: ${TLS_SUMMARY:-n/a} |"
             echo "| engine suite smoke | $SUITE: ${SUITE_SUMMARY:-n/a} |"
