@@ -317,8 +317,8 @@ async def test_a_too_early_approve_raises_the_alert_keyed_off_the_connection_gra
     with pytest.raises(ApprovalError):
         await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert sink.too_early == [(f"approval:{approval_id}", "dead_letter_replay")]
-    # BACKLOG #1898: a catch-all rule's control_action is dispatched at the event's key, so the key
-    # must never parse as a connection name.
+    # BACKLOG #1898: no control_action fires on this event type. The key must also never parse as a
+    # connection name, so it can never be a restart's default target.
     assert not is_connection_name(sink.too_early[0][0])
 
 

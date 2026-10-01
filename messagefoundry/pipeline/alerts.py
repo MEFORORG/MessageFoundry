@@ -154,10 +154,11 @@ class AlertSink(Protocol):
         store backend (``sqlite``, ``sqlserver`` or ``postgres``). ``name`` is ``intake:<reason>``,
         so each bound is its own instance and a drained backlog cannot resolve a low-disk pause. It
         names no node: both bounds measure the one shared store, and a cluster node id changes on
-        every restart, so a node-keyed instance could never be resolved by the next start. Its
-        colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
-        ``name`` never reaches a real connection; a rule that sets ``control_target`` restarts that
-        connection. Carries counts and sizes only: no message content, no PHI. Raised when a pause
+        every restart, so a node-keyed instance could never be resolved by the next start. It is not
+        a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898).
+        Its colon also keeps ``name`` outside the connection-name grammar, which guards only the
+        default target, never a rule's ``control_target``. Carries counts and sizes only: no
+        message content, no PHI. Raised when a pause
         starts and again about every five minutes while it holds, as :meth:`queue_buildup` is, so a
         notifier's re-alert, escalation and suspend logic see a condition that persists. Emitted by
         :class:`~messagefoundry.pipeline.intake_bound.IntakeBoundMonitor`;
@@ -232,9 +233,8 @@ class AlertSink(Protocol):
 
         The prefix does not hide the event from rules. ``AlertRule.connection`` defaults to ``"*"``,
         so a catch-all rule matches it. Where a catch-all rule is the first match, its ``mute`` or
-        ``transports=[]`` silences this reminder. Its ``control_action`` is dispatched at ``name``,
-        or, when the rule sets ``control_target``, at that real connection, which it restarts. Scope
-        such rules to real connection names or to one ``event_type``. Rules apply only where
+        ``transports=[]`` silences this reminder. No ``control_action`` fires on it, since it is not
+        a connection-scoped event (BACKLOG #1898). Rules apply only where
         ``[alerts]`` has a transport; without one, :class:`LoggingAlertSink` logs every event.
 
         This is the OPERATOR's copy. The holder and the issuing administrator each get their own
@@ -264,13 +264,14 @@ class AlertSink(Protocol):
         it may be a script. Not raised when the request reads as younger than zero, since that is a
         clock behind the requester's and not a fast approver.
 
-        ``name`` is ``approval:<approval id>``, the key :meth:`approval_approver_provenance` uses. Its
-        colon is outside the connection-name grammar, so a rule's ``control_action`` dispatched at
-        ``name`` never reaches a real connection (BACKLOG #1898). The prefix does not hide the event
-        from rules: a catch-all rule matches it, and if that rule sets ``control_target`` it restarts
-        that real connection. Scope such rules to real connection names or to one ``event_type``.
-        Repeated early tries on one request fold into one instance. Nothing resolves the instance
-        when the request is later decided, so an operator resolves it. Carries the key, the
+        ``name`` is ``approval:<approval id>``, the key :meth:`approval_approver_provenance` uses. It
+        is not a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG
+        #1898). Its colon also keeps ``name`` outside the connection-name grammar, which guards
+        only the default target, never a rule's ``control_target``.
+        The prefix does not hide the event from rules: a catch-all rule still matches it for
+        severity, routing and mute. Repeated early tries on one request fold into one instance.
+        Nothing resolves the instance when the request is later decided, so an operator resolves
+        it. Carries the key, the
         operation key and a fixed reason string: no username, no params, no PHI. The
         ``approval.too_early`` audit row is the durable record. Emitted by
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
@@ -281,9 +282,11 @@ class AlertSink(Protocol):
     ) -> None:
         """A held dual-control request was RELEASED by an approver whose account changed after the
         request was made (BACKLOG #315; why, on ``ApprovalGate._approver_changes``). The release
-        went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. The
-        colon is outside the connection-name grammar, so a rule's ``control_action`` can never land
-        on a real connection through it (BACKLOG #1898). ``changed`` holds one or more of
+        went ahead: this flags it and refuses nothing. ``name`` is ``approval:<approval id>``. It is
+        not a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898),
+        and the colon keeps ``name`` outside the connection-name grammar, which guards only the
+        default target, never a rule's ``control_target``.
+        ``changed`` holds one or more of
         ``account_created``, ``password_changed`` and ``totp_enrolled``. Carries the key, the
         operation key and the slugs only: no username, no params, no PHI. The
         ``approval.approver_provenance`` audit row is the durable record. Emitted by

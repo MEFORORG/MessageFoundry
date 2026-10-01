@@ -4,7 +4,7 @@
 
 Two-tier strategy (see docs/ARCHITECTURE.md):
 
-* **Tolerant tier** — :class:`~messagefoundry.parsing.peek.Peek` (``python-hl7``) parses
+* **Tolerant tier** — :class:`~messagefoundry.parsing.peek.Peek` (the built-in parser, ADR 0054) parses
   any reasonably-formed message and lets us *peek* at fields (e.g. MSH-9 trigger) for
   routing without choking on conformance issues. This is the hot path; every message
   goes through it.
@@ -149,13 +149,3 @@ __all__ = [
     "AmbiguousLocalTimeError",
     "NonExistentLocalTimeError",
 ]
-
-# Defense-in-depth for review finding C-1: python-hl7 logs raw field values at ERROR on
-# benign-but-unmapped escape sequences (hl7/util.py unescape), a PHI leak hit on every message via
-# summarize(). Silence its loggers the moment the parsing layer — the only thing that triggers
-# unescape — is imported, so CLI/embedded paths that never call configure_logging() are covered too.
-# Idempotent; configure_logging() also calls it for the serve path. Imported from its stdlib-only leaf
-# and not from logging_setup, which would load the config layer into this package (BACKLOG #1596).
-from messagefoundry.phi_log_silencer import silence_phi_prone_dependency_loggers as _silence_hl7
-
-_silence_hl7()

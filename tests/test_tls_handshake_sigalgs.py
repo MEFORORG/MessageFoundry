@@ -404,9 +404,9 @@ def _postgres_verify_off(k: Kit) -> object:
 
 
 def _ldaps(k: Kit) -> object:
-    """The real caller: ``LdapAuthenticator`` asserts the kwargs from its own ``_tls_kwargs``. The
-    context measured is the one the gate rebuilds from those kwargs, which is a replica: ldap3 builds
-    its own inside ``Tls.wrap_socket`` and holds none to compare against (the gate's docstring)."""
+    """The real caller: ``LdapAuthenticator`` builds its ``NarrowedTls``, which runs the factory
+    once at construction. Since BACKLOG #2494 that factory builds the context each LDAPS
+    connection wraps with, so the context measured is the kind the hop uses, not a replica."""
     return LdapAuthenticator(
         AuthSettings(
             ad_enabled=True,
@@ -417,6 +417,11 @@ def _ldaps(k: Kit) -> object:
         )
     )
 
+
+#: The LDAPS site. Its factory builds the context ldap3 wraps each connection with (BACKLOG #2494).
+_LDAPS_SITE = (
+    "messagefoundry/config/tls_policy.py::assert_ldap3_tls_suites.narrowed_context::connector"
+)
 
 #: Every derived site, with how to build it. Each factory calls the REAL builder; the context
 #: measured is the one that builder handed to ``harden_cipher_suites``, captured by a spy.
@@ -437,7 +442,7 @@ _SITES: dict[str, Callable[[Kit], object]] = {
     "messagefoundry/config/tls_policy.py::build_asserted_https_handler::connector": lambda k: (
         tls_policy.build_asserted_https_handler(connector="urllib default handler (measurement)")
     ),
-    "messagefoundry/config/tls_policy.py::assert_ldap3_tls_suites::connector": _ldaps,
+    _LDAPS_SITE: _ldaps,
     "messagefoundry/config/tls_policy.py::assert_hvac_tls_suites.narrowed_context::connector": (
         lambda k: tls_policy.assert_hvac_tls_suites({}, connector="Vault (measurement)")
     ),
@@ -487,11 +492,10 @@ _CLIENT_SITES = [s for s in _SITES if s not in _SERVER_SITES]
 _VAULT_SITE = (
     "messagefoundry/config/tls_policy.py::assert_hvac_tls_suites.narrowed_context::connector"
 )
-#: Sites whose product exposes no context to tie the capture to: the hvac factory builds a fresh one
-#: per connection, and ldap3 builds its own at connect time from the kwargs the gate replicated.
-_HOLDS_NO_CONTEXT = frozenset(
-    {_VAULT_SITE, "messagefoundry/config/tls_policy.py::assert_ldap3_tls_suites::connector"}
-)
+#: Sites whose product exposes no context to tie the capture to: the hvac and LDAPS factories each
+#: build a fresh one per connection. tests/test_tls_cipher_assertion_sites.py ties the LDAPS context
+#: a connection wraps with to one the assertion ran on.
+_HOLDS_NO_CONTEXT = frozenset({_VAULT_SITE, _LDAPS_SITE})
 _VAULT_EXTRA = pytest.mark.skipif(
     not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
     reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",

@@ -309,6 +309,10 @@ if ($Status) {
             # different times from different checkouts, one recomputed line describes none of them.
             $wired = Get-WiredStateDir $cmd
             $coll = Get-WiredCollectorPath $cmd
+            # A command bash cannot parse publishes nowhere, whatever path it names (BACKLOG #1459).
+            # Said IN ADDITION to the path arms below, not instead of them: the path it names is
+            # still a fact an operator may need, and a root can be PowerShell source AND elsewhere.
+            $psSource = Test-IsPowerShellSourceStatusLine $cmd
             if ($null -eq $wired) {
                 Write-Host "    publishes to  : UNKNOWN (legacy command, no -StateDir -- the collector chooses at run time)"
                 Write-Host "                    re-install this root to bake the path in: -ConfigDir `"$($t.Root)`""
@@ -320,7 +324,12 @@ if ($Status) {
             }
             else {
                 Write-Host "    publishes to  : $wired"
-                $ok++
+                if ($psSource) { $bad++ } else { $ok++ }
+            }
+            if ($psSource) {
+                Write-Host "    but it cannot : the command is PowerShell source, and bash (which runs a statusLine) cannot parse it, so it publishes NOTHING" -ForegroundColor Yellow
+                # The legacy arm above already printed the same re-install line; one is enough.
+                if ($null -ne $wired) { Write-Host "                    re-install this root to replace it: -ConfigDir `"$($t.Root)`"" }
             }
             if ($coll) { Write-Host "    collector     : $coll   exists: $(Test-Path -LiteralPath $coll)" }
             else { Write-Host "    collector     : UNKNOWN (command shape not recognised)" }
@@ -505,6 +514,7 @@ foreach ($t in $targets) {
             # produced a block reading "published somewhere else / was: <path> / now: <the same path>"
             # -- the publish path had not moved at all, the COLLECTOR had. A line that contradicts the
             # two lines under it is the same defect this whole change exists to remove.
+            $wasPsSource = Test-IsPowerShellSourceStatusLine $existing
             $why = if (-not $wasState) {
                 "carried no -StateDir, so the collector chose its own default at run time"
             }
@@ -514,13 +524,21 @@ foreach ($t in $targets) {
             elseif ($wasColl -and $wasColl -ne $CollectorPath) {
                 "named a different collector"
             }
+            elseif ($wasPsSource) {
+                "was PowerShell source, which bash cannot parse, so it published nothing"
+            }
             else {
-                "differed from this command in some other way (refreshInterval, or an unrecognised shape)"
+                "differed from this command in some other way (quoting, refreshInterval, or an unrecognised shape)"
             }
             Write-Host "  REWIRED    $($t.Settings)"
             Write-Host "             replaced a $MARKER statusLine that $why"
             Write-Host "             was: $(if ($wasState) { $wasState } else { '(no -StateDir -- the collector chose its own default)' })"
             Write-Host "             now: $stateDir"
+            # PowerShell source is ALSO said when an earlier arm took the reason: the old command may
+            # have named another path or collector as well, and the operator needs both facts (#1459).
+            if ($wasPsSource -and $why -notlike "was PowerShell source*") {
+                Write-Host "             the old command was also PowerShell source, which bash cannot parse, so it published nothing"
+            }
             if ($wasColl -and $wasColl -ne $CollectorPath) {
                 Write-Host "             collector was: $wasColl"
                 Write-Host "             collector now: $CollectorPath"

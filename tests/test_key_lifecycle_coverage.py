@@ -194,6 +194,7 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/auth/trust_anchors.py": _KEYLESS,
     "messagefoundry/auth/webauthn.py": _EPHEMERAL + "; the credentials it verifies are PUBLIC keys",
     "messagefoundry/auth/ldap.py": _VERIFY_ONLY,
+    "messagefoundry/auth/ldap_tls.py": _VERIFY_ONLY,
     "messagefoundry/auth/oidc/claims.py": _VERIFY_ONLY,
     "messagefoundry/auth/oidc/jwks.py": _VERIFY_ONLY,
     "messagefoundry/auth/oidc/flow.py": _EPHEMERAL + " (PKCE verifier, state, nonce). The OIDC "

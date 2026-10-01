@@ -120,7 +120,7 @@ async def _load_database_source(
     is the value, else the value is a dict of the other columns. The dial-out is gated by the
     fail-closed ``[egress].allowed_db`` allowlist (like a DATABASE poll source). Reuses
     ``transports/database.py`` for the DSN/pool (the SQL-Server ``[sqlserver]`` extra)."""
-    from messagefoundry.transports.database import _build_dsn, _make_pool
+    from messagefoundry.transports.database import _build_dsn, _login_timeout, _make_pool
 
     server = str(settings.get("server", ""))
     if egress is not None:
@@ -149,7 +149,12 @@ async def _load_database_source(
     attested = hop_attestation_from_settings(settings)
     # fail-loud on weakened TLS / bad auth, before dialing
     dsn = _build_dsn(dict(settings), attested=attested)
-    pool = await _make_pool(dsn, int(settings.get("pool_max", 5)), autocommit=True)
+    pool = await _make_pool(
+        dsn,
+        int(settings.get("pool_max", 5)),
+        autocommit=True,
+        login_timeout=_login_timeout(settings, "DATABASE reference source", dialect="sqlserver"),
+    )
     # BACKLOG #1052: bound the borrow. This pool is throwaway (closed in the finally below), but the
     # acquire was unbounded, so an unresponsive server could hold the reference-sync runner's pass
     # open indefinitely — and the runner is a single sequential loop over every declared set, so one

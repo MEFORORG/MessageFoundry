@@ -78,11 +78,13 @@ _BLOCKING_SECURITY_JOBS = frozenset(
     }
 )
 
-# ADVISORY by design: these MUST keep continue-on-error. Both are cron/dispatch-only, so promoting one
+# ADVISORY by design: these MUST keep continue-on-error. All three are cron/dispatch-only, so promoting one
 # without also removing its `if:` would wedge every PR (see security.yml's own notes on trivy).
 # WHERE the flag sits differs: `sbom` carries it on the job, `trivy` on its one scan step, and a job
 # listed in _STEP_ADVISORY_JOBS below is graded there instead of by the job-level rule.
-_ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
+# `sbom-windows` is `sbom`'s Windows twin (the engine SBOM resolved on win32, ADR 0149's 2026-09-30
+# amendment) and carries the flag on the job, the same way.
+_ADVISORY_SECURITY_JOBS = frozenset({"sbom", "sbom-windows", "trivy"})
 
 # ADVISORY BY PLACEMENT: hard-failing, but NOT in branch protection. This is a third posture the file
 # previously could not express, and it is not new to the repo -- `dast.yml` already ships it and

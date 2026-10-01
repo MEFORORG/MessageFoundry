@@ -568,7 +568,7 @@ jobs:
             --output-format JSON --output-file sbom-python.cdx.json
           # Declare the SBOM lifecycle (CISA "Build" type) + backfill the hatchling-dynamic root version.
           python scripts/security/sbom_finalize.py sbom-python.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
       - name: Generate the VS Code extension SBOM (npm, install-free)
         # if: always() so a Python-SBOM failure above doesn't skip this independent generator.
         if: always()
@@ -611,6 +611,49 @@ jobs:
           path: |
             sbom-python.cdx.json
             sbom-ide.cdx.json
+          if-no-files-found: ignore
+
+  sbom-windows:
+    name: SBOM (CycloneDX, engine resolved on Windows)
+    runs-on: windows-latest
+    # Two hash-locked installs and one SBOM render.
+    # Advisory and schedule-only, so a cap that fires here costs a nightly, not a merge.
+    timeout-minutes: 20
+    # The Windows twin of the engine SBOM above, and the pre-tag dry-run for release.yml's
+    # `sbom-windows` job, exactly as `sbom` is for the Linux step. Why the engine ships a second,
+    # Windows-resolved SBOM is ADR 0149's 2026-09-30 amendment. A separate job rather than a matrix
+    # leg of `sbom`, because that job's npm and sbomqs steps are Linux-only and would each need a
+    # platform guard.
+    continue-on-error: true
+    # Same gate as `sbom`, for the same reason: the SBOM derives from a committed lockfile.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Generate the Windows-resolved engine SBOM (license-complete, hash-locked core runtime)
+        shell: bash
+        run: |
+          # HASH-PINNED and BYTE-IDENTICAL to release.yml's sbom-windows install, enforced by
+          # tests/test_ci_venv_pinning.py. That job's step says why the venv has no pip and why every
+          # path is absolute; read it there rather than here, so the reasons cannot drift apart.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m venv --without-pip "$RUNNER_TEMP/sbomenv"
+          python -m pip --python "$RUNNER_TEMP/sbomenv/Scripts/python.exe" install --require-hashes -r docker/locks/requirements-core.lock
+          python -m cyclonedx_py environment "$RUNNER_TEMP/sbomenv/Scripts/python.exe" \
+            --pyproject pyproject.toml --mc-type application \
+            --output-format JSON --output-file sbom-python-windows.cdx.json
+          python scripts/security/sbom_finalize.py sbom-python-windows.cdx.json \
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+      - name: Upload the Windows SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-cyclonedx-windows
+          path: sbom-python-windows.cdx.json
           if-no-files-found: ignore
 
   trivy:

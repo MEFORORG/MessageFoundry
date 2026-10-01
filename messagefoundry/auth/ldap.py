@@ -23,7 +23,7 @@ import ssl
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from messagefoundry.auth.trust_anchors import ad_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
@@ -33,11 +33,10 @@ from messagefoundry.config.settings import (
     split_kerberos_spn,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import (
-    APPROVED_TLS12_SUITES,
-    HopPosture,
-    assert_ldap3_tls_suites,
-)
+from messagefoundry.config.tls_policy import HopPosture
+
+if TYPE_CHECKING:
+    from messagefoundry.auth.ldap_tls import NarrowedTls
 
 logger = logging.getLogger(__name__)
 
@@ -447,53 +446,35 @@ class LdapAuthenticator:
                 "production.",
                 INSECURE_TLS_ESCAPE_ENV,
             )
-        # BACKLOG #1317. Assert the suite list this hop will negotiate (ASVS 12.1.2). Verification-off
-        # is refused/warned above; this is the separate question of whether the traffic is ENCRYPTED and
-        # the peer AUTHENTICATED at all, which was inherited from the interpreter default and unchecked.
-        # Measured: the inherited list is clean today, so this raises on no supported configuration --
-        # it converts an inherited property into a checked one, the same move harden_cipher_suites
-        # documents. Done ONCE here rather than in _server() because the answer is fixed by config and
-        # _server() runs up to three times per login; AuthService builds this eagerly, so a bad suite
-        # list fails app startup rather than the first bind.
+        # BACKLOG #1317, #2494. The engine builds this hop's TLS context (ASVS 12.1.2): narrowed to the
+        # approved suites at TLS 1.2 and, where the interpreter allows it, TLS 1.3, then asserted.
+        # Verification-off is refused/warned above; this is the separate question of whether the
+        # traffic is ENCRYPTED and the peer AUTHENTICATED at all. NarrowedTls builds and asserts that
+        # context once here, so a bad one fails app startup (AuthService builds this eagerly), and
+        # again for every connection. One Tls serves every Server: ldap3.Tls holds only settings.
+        # The CA goes in as the bytes checked above, never a path (BACKLOG #2034); None loads the OS
+        # trust store, as ldap3 did. The accepted risk of owner ruling 2026-09-27 stands: an older
+        # domain controller that offers none of the approved suites fails to bind.
+        self._tls: NarrowedTls | None = None
         if self._ldaps:
-            assert_ldap3_tls_suites(self._tls_kwargs(), connector=_LDAPS_CONNECTOR)
+            from messagefoundry.auth.ldap_tls import NarrowedTls  # lazy: it imports ldap3
 
-    def _tls_kwargs(self) -> dict[str, Any]:
-        """The ``ldap3.Tls`` arguments for this bind — the SINGLE definition, read by both consumers.
-
-        ``__init__`` asserts the suite list these resolve to and ``_server()`` builds the real ``Tls``
-        from them, so the two cannot drift onto different shapes. Keep it that way: the assertion runs
-        against a REBUILT context (``ldap3.Tls`` holds no ``SSLContext`` to check directly), and a
-        rebuilt context is only evidence about this hop while it is built from the hop's own arguments.
-
-        The CA goes in as ``ca_certs_data``, the bytes ``__init__`` checked, and never as
-        ``ca_certs_file`` (BACKLOG #2034). ``None`` means no CA is configured, and ldap3 then loads
-        the OS trust store, as it did before.
-
-        ``ciphers`` narrows the TLS 1.2 suites to the approved AEAD list (BACKLOG #300, owner ruling
-        2026-09-27), the same list every engine-built context offers. The assertion refuses any other
-        value, because ldap3 silently swallows a string OpenSSL rejects. The accepted risk, named in
-        the ruling: an older domain controller that offers none of these suites fails to bind.
-        """
-        return {
-            "validate": ssl.CERT_REQUIRED if self._s.ad_tls_verify else ssl.CERT_NONE,
-            "ca_certs_data": self._ca_certs_data,
-            "ciphers": ":".join(APPROVED_TLS12_SUITES),
-        }
+            self._tls = NarrowedTls(
+                validate=ssl.CERT_REQUIRED if settings.ad_tls_verify else ssl.CERT_NONE,
+                ca_certs_data=self._ca_certs_data,
+                connector=_LDAPS_CONNECTOR,
+            )
 
     def _server(self) -> Any:
         import ldap3
 
-        tls = None
-        if self._ldaps:
-            tls = ldap3.Tls(**self._tls_kwargs())
         # ASVS 13.1.3: ldap3's Server.connect_timeout defaults to None (wait forever) and the engine
         # never sets a process-wide socket default, so this is the ONLY bound on the TCP connect to the
         # domain controller. Every Server in this module is built here, so threading it here covers the
         # service-account bind AND the user bind.
         return ldap3.Server(
             self._s.ad_server,
-            tls=tls,
+            tls=self._tls,
             get_info=ldap3.NONE,
             connect_timeout=self._s.ad_connect_timeout,
         )

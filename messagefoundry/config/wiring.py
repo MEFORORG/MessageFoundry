@@ -58,6 +58,7 @@ from messagefoundry.config.code_sets import (
     code_set as _resolve_code_set,
 )
 from messagefoundry.config.models import (
+    DEFAULT_DB_CONNECT_TIMEOUT,
     AckAfter,
     AckMode,
     BatchConfig,
@@ -74,6 +75,7 @@ from messagefoundry.config.models import (
     _check_cleartext_acceptance,
     _check_hop_attestation,
     _check_revocation_attestation,
+    check_db_connect_timeout,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -470,26 +472,48 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
 
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
-    would otherwise arrive at the connector exactly as a list item written directly does. A list
-    that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
-    offenders: list[str] = []
+    would otherwise arrive at the connector exactly as a list item written directly does.
+
+    A default that is ITSELF a reference, in either spelling, is refused whole rather than followed.
+    :func:`resolve_env_settings` resolves one link only, so that inner reference is never resolved.
+    Wherever the outer key is unset, the connector gets the inner reference object instead of a list.
+    It gets it even when the environment sets the inner key. At least ``proxy_no_proxy`` then reads
+    as an empty list, and every host silently goes through the proxy. So the fallback link never
+    works, and there is no clean version of it to let through. Refusing at the first link also means
+    nothing walks a marker that is its own default. The ``connections.toml`` type check refuses this
+    shape first for at least the list settings it models, since it wants an array and finds a table.
+    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
+    items: list[str] = []
+    chains: list[str] = []
     for name, value in settings.items():
         label = name
         if isinstance(value, EnvRef):
             label, value = f"{name} env() default", value.default
+            if _is_nested_envref(value):
+                chains.append(name)
+                continue
         if isinstance(value, list | tuple | set | frozenset):
-            offenders += [
+            items += [
                 f"{label} item {index}"
                 for index, item in enumerate(value)
                 if _contains_envref(item)
             ]
-    if offenders:
-        raise WiringError(
-            f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
-            "not env-resolved, so it would reach the connector as its repr with any default= inside "
-            "it. Write the items as static values, or let one env() reference stand for the whole "
-            "setting."
+    problems: list[str] = []
+    if items:
+        problems.append(
+            f"{', '.join(items)} may not be an env() reference - nested settings are not "
+            "env-resolved, so it would reach the connector unresolved, where a str() of it carries "
+            "any default= inside it. Write the items as static values, or let one env() reference "
+            "stand for the whole setting."
         )
+    if chains:
+        problems.append(
+            f"{', '.join(chains)} env() default may not itself be an env() reference - only one "
+            "link is resolved, so wherever the outer key is unset the connector gets the inner "
+            "reference, not a list. Give the outer env() a static list default instead."
+        )
+    if problems:
+        raise WiringError(f"{factory} " + f" {factory} ".join(problems))
 
 
 def parse_env_setting(value: Any) -> Any:
@@ -658,7 +682,7 @@ def DatabaseRef(
     port: int | EnvRef = 1433,
     encrypt: bool = True,
     trust_server_certificate: bool = False,
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
@@ -685,6 +709,14 @@ def DatabaseRef(
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
     0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
     attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
+    # Refused here, at declaration, because a reference set is first dialled at sync time, after
+    # start (BACKLOG #2089). The other DATABASE declarations are checked when their connector is built.
+    # An env() ref has no value yet; the sync checks it once resolved.
+    if not isinstance(connect_timeout, EnvRef):
+        try:
+            check_db_connect_timeout(connect_timeout, "DatabaseRef")
+        except ValueError as exc:
+            raise WiringError(str(exc)) from None
     return ReferenceSourceSpec(
         "database",
         {
@@ -778,7 +810,7 @@ def DatabaseLookup(
     port: int | EnvRef = 1433,
     encrypt: bool = True,
     trust_server_certificate: bool = False,
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     max_rows: int = 500,  # refuse a result larger than this; 0 = no ceiling (BACKLOG #1730)
@@ -3132,7 +3164,7 @@ def Database(
     port: int | EnvRef = 1433,
     encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     trust_server_certificate: bool = False,  # SQL Server preset only
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",  # name the OS-installed driver for 'generic'
     odbc_params: dict[str, str | EnvRef]
@@ -3223,7 +3255,7 @@ def DatabasePoll(
     port: int | EnvRef = 1433,
     encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     trust_server_certificate: bool = False,  # SQL Server preset only
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",  # name the OS-installed driver for 'generic'
     odbc_params: dict[str, str | EnvRef]

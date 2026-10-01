@@ -121,6 +121,9 @@ async def test_clean_release_lets_standby_take_over_immediately(coords) -> None:
     assert a.is_leader() is True
     await a._release_leadership()
     assert a.is_leader() is False
+    # The release stamps the DB clock's now at millisecond resolution and the take-over predicate is
+    # strict (BACKLOG #1986), so B's claim must land in a later millisecond than the release.
+    await asyncio.sleep(0.01)
     await b._maintain_leadership()
     assert b.is_leader() is True
     owner, _expires = await b.leadership_lease()
@@ -291,6 +294,34 @@ async def test_preferred_delay0_wins_expired_lease_race_over_delayed_node(
     assert dr.is_leader() is True
     owner, _expires = await dr.leadership_lease()
     assert owner == "DR"
+
+
+@pytest.mark.parametrize("how", ["stepdown", "stop"])
+async def test_a_released_lease_honours_leader_preference(
+    coords, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    # BACKLOG #1986 against the REAL release T-SQL: a planned stepdown and a clean stop stamp the
+    # lease expiry with the same `_DB_NOW` expression the MERGE reads, so the delay still weighs
+    # against a RELEASED lease. Driven clock, for the reason BACKLOG #351 gives above.
+    make, _ = coords
+    a = make("A")
+    p = make("P", acquire_delay_seconds=0.0)
+    dr = make("DR", acquire_delay_seconds=0.5)
+    _set_db_clock(monkeypatch, _FROZEN_EPOCH)
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+    if how == "stepdown":
+        await a.step_down_leadership(sibling_acquire_delay_seconds=0.5)
+    else:
+        await a.stop()
+
+    # Control: the release stamped the driven clock. The old statement wrote 0.
+    assert await a.leadership_lease() == ("A", _FROZEN_EPOCH)
+    _set_db_clock(monkeypatch, _FROZEN_EPOCH + 0.25)  # released 0.25 s ago: inside DR's 0.5 s delay
+    await dr._maintain_leadership()
+    assert dr.is_leader() is False, "the delayed node took a released lease"
+    await p._maintain_leadership()
+    assert p.is_leader() is True
 
 
 # --- full start()/stop() lifecycle electing exactly one leader --------------
