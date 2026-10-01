@@ -38,11 +38,12 @@ path that directory is on another host, reached over SMB. A database-poll or rem
 FTP, FTPS) Connection dials out. Timer, loopback and pass-through Connections reach no outside
 system.
 
-These settings change the size of the operator surface:
+At least these settings change the size of the operator surface:
 
 - `[api].expose_docs` is false by default. Set to true, the engine also serves `/docs`, `/redoc` and
   `/openapi.json`.
-- `[security].serve_web_console = false` stops the engine from mounting `/ui`.
+- `[security].serve_web_console = false` stops the engine from mounting `/ui`. Left unset, `/ui`
+  also stays unmounted on at least a non-loopback bind.
 - Under `supervise`, each engine shard gets its own API port, counted up from `--base-port`. Count
   one operator socket per engine shard.
 
@@ -59,15 +60,15 @@ list means. The engine's own update check makes no network call: `[update_check]
 
 | Outbound hop | Setting that limits the target | An empty list means | Read more |
 |---|---|---|---|
-| Outbound Connections, the `db_lookup` and `fhir_lookup` reads, and database-poll and remote-file inbound Connections | The `[egress].allowed_*` destination lists, one per transport | Refuse every destination of that type while `[security].block_unlisted_outbound` is on. Allow any destination of that type while it is set to false | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
+| Outbound Connections, the `db_lookup` and `fhir_lookup` reads, and database-poll and remote-file inbound Connections | The `[egress].allowed_*` destination lists | Refuse every destination of that type while `[security].block_unlisted_outbound` is on. Allow any destination of that type while it is set to false | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
 | SMART and OAuth2 token endpoints | `[egress].allowed_http` | The same | `_check_credential_token_url_egress` in `messagefoundry/pipeline/wiring_runner.py` |
-| Forward web proxy | `[egress].allowed_proxy` | Refuse a proxy address. The `default` proxy, which the operating system names, is exempt | [CONFIGURATION.md](CONFIGURATION.md#egress) |
+| Forward web proxy | `[egress].allowed_proxy` | Refuse a proxy address. The `default` value is exempt: it names no address in config | [CONFIGURATION.md](CONFIGURATION.md#egress) |
 | AI assistance broker | `[ai].allowed_endpoints` | Refuse the endpoint | [CONFIGURATION.md](CONFIGURATION.md#ai--ai-coding-assistance-policy) |
 | OpenID Connect identity provider | `[auth].oidc_allowed_endpoints` | Refused at load while OpenID Connect is on | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Alert webhook and alert email | `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts` | Any host | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
 | Active Directory over LDAP | One target, `[auth].ad_server` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Store database on SQL Server or PostgreSQL | One target, `[store].server`. The default SQLite store is a local file | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
-| HashiCorp Vault, for the store key or for Connection secrets | One target each: `MEFOR_STORE_VAULT_ADDR` and `MEFOR_SECRETS_VAULT_ADDR` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| HashiCorp Vault, for the store key or for Connection secrets | One target each: `MEFOR_STORE_VAULT_ADDR` and `MEFOR_SECRETS_VAULT_ADDR`. With one unset, the Vault client falls back to its own `VAULT_ADDR` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Syslog forwarding and the startup clock check | `[logging].forward_host` and `[logging].ntp_peer` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Startup TLS-floor probe, behind a declared TLS terminator under `enforce` | One target, `[security].web_console_public_address` | No list | `probe_tls_floor` in `messagefoundry/config/tls_probe.py` |
 | Backup to a network share | `[backup].destination` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
@@ -100,15 +101,15 @@ checklist. `serve` would exit with code 2, before it starts the web server, on a
 | Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
 | Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |
 | Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
-| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated |
+| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. `_serve` in `messagefoundry/__main__.py` says which lists count |
 
 Under `enforcement = warn`, the proxy-attestation and open-egress guards only warn, and the
 operator-bind guard accepts the override that DEPLOYMENT.md describes. The sign-in, revocation and
 plaintext-hop guards refuse under `warn` too.
 
 `serve` refuses on more than this table, so clearing one guard does not mean `serve` starts. The
-checklist names more of these refusals. Each `return 2` in `_serve` in `messagefoundry/__main__.py`
-is one.
+checklist names more of these refusals, and `_serve` holds at least some of the rest. Others come
+later, once the web server has started.
 
 A listener guard is different. At startup it fails one Connection, and `serve` keeps going. By
 default, a non-loopback MLLP, HTTP, DICOM, raw TCP or X12 listener that has no TLS does not bind,
@@ -138,8 +139,8 @@ which means no restriction. At least these limits apply:
 - The check runs after the engine accepts the connection.
 - `/health` is exempt, and loopback is always allowed.
 - A proxy the engine was not told about, or address translation in front, hides the client address.
-  The list then cannot tell those clients apart. `messagefoundry/api/client_networks.py` describes
-  the cases.
+  The list then cannot tell those clients apart. Behind an undeclared proxy that forwards over loopback,
+  it admits every request. `messagefoundry/api/client_networks.py` describes the cases.
 - It does not cover the inbound Connection listeners. Each of those takes its own
   `source_ip_allowlist`.
 
@@ -167,12 +168,12 @@ No one command gives the whole answer. Each row below has a stated gap.
 | Which Connections exist, and of what type? | `messagefoundry graph --config <config dir> --json` | It imports the config modules, so it runs their code. It prints each Connection's type and authored settings. It does not print the bind address, and an `env()` value shows as a placeholder |
 | What is a running engine serving? | `GET /connections` | Needs the `monitoring:read` permission. One row per endpoint, with its method. It shows no bind address, and it fills a port for MLLP rows only. It shows only what the caller's scope and the answering engine shard cover |
 | Which protective switches are off on a running engine? | `GET /security/posture` | It reports the engine shard that answers |
-| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the authored file, not the running service. It does not see the service's environment or command line, or any Connection. `MEFOR_*` variables in the shell that runs it can change its loosening list. A path that does not exist is not an error: it prints shipped defaults. Its `loosenings_scope` field names some of these gaps. `_security` in `messagefoundry/__main__.py` is the source |
+| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the authored file, not the running service. It does not see the service's environment or command line, or any Connection. `MEFOR_*` variables in the shell that runs it can change its loosening list. A path that does not exist is not an error: it prints shipped defaults. A file that fails to load sets `loosenings_partial`, and the list can then miss entries. Its `loosenings_scope` field names some of these gaps. `_security` in `messagefoundry/__main__.py` is the source |
 | Which Connections carry a loosening, across all engine shards? | `messagefoundry check --config <config dir>` | It also runs the config modules. It opens no store |
 
 ## `messagefoundry verify` does not measure exposure
 
-`verify` is an on-box acceptance check with five sections: host, store, smoke, manual and
+`verify` is an on-box acceptance check. Its sections are at least host, store, smoke, manual and
 federation. [testing/VERIFY.md](testing/VERIFY.md) is its reference. It checks that the host can run
 the engine and that the configured store opens. It checks that one synthetic message routes. It
 checks that the federated sign-in settings hold together.
@@ -180,9 +181,8 @@ checks that the federated sign-in settings hold together.
 It does not check at least these, read from `messagefoundry/verify/`:
 
 - Firewall rules, or reach from another host. The `host.ports` row is always MANUAL. It only tests
-  whether three ports are free on `127.0.0.1`.
-- The ports your Connections bind. Those three ports are the `--mllp-port` value (default `2575`), a
-  fixed `11112`, and `[api].port`. The row does not read your config directory.
+  whether a few ports are free on `127.0.0.1`.
+- The ports your Connections bind. The `host.ports` row does not read your config directory.
 - The operator bind and its TLS. The `manual.tls` row is MANUAL. A person confirms it.
 - Egress. No row reads an `[egress]` list, and `verify` dials no partner. The self smoke is a dry run
   with no network. The live smoke sends one message to the engine's own listener.
