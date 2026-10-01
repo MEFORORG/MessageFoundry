@@ -242,14 +242,18 @@ validated against an export, so this rule was written from the HL7 shapes alone.
 - Only a plain clone is read as one: two operands, a whole-tree destination, no qualifier, and no
   word but `to`, styled or not. A mode word, a `from` that reverses the direction, or a third
   operand makes it an unread statement. Field writes are judged on the same words, so a mode word
-  styled as a keyword declines a write just as an unstyled one does.
+  styled as a keyword declines a write just as an unstyled one does. A field write whose verb itself
+  is unstyled still declines, as it did before step 2.
 - Every other statement may overwrite every handle it names as a whole tree, in either reading of
   its markup. That covers an unread verb (`MsgLoad`, among others), a `MsgCreate` whose handle is
-  not its first operand, an `ActionListCall` that passes a handle, and a span class the role layer
-  does not list. Each such handle is unknown afterwards. That holds for a call whose list is inlined
-  too, because the inlined list names the passed message by its own handle, which nothing ties to
-  the caller's: it can rebuild the message unseen. So a list that hands its input to a sub-list and
-  then sends it raises at that send. Only `MsgSend` and `MsgLog` are read-only.
+  not its first operand, and a span class the role layer does not list. Each such handle is unknown
+  afterwards. Only `MsgSend` and `MsgLog` are read-only.
+- An inlined `ActionListCall` runs in its own scope, because nothing ties the handle names inside a
+  called list to the caller's. The called list starts knowing no handle, so its writes and sends of
+  any handle it did not bind there decline or raise. After the call, every handle the call line
+  passes (whole or as a path) and every handle the called list names or binds is unknown to the
+  caller. So a list that hands its input to a sub-list, or calls one that names it, and then sends
+  it raises at that send. A call with no inlined list renders a TODO marker and counts unmapped.
   The list is kept small on purpose: a missing verb costs a raise, while a wrongly listed one would
   deliver the wrong message.
 - A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
@@ -266,7 +270,8 @@ superseded model's reading and still land on `msg`. That is how the synthetic fi
 markup-free list ends `MsgSend $out [OB_ACME_ADT]`, which now raises where it used to send `msg`. The
 fixture's import summary moves from 21 mapped and 8 unmapped to 20 and 9.
 
-In a list with any role markup, a markup-free field write lands on the local of the one handle its
+In a list with any role markup, a markup-free field write maps only as the role layer would (no
+`copy_field`, no repeating segment, no MSH-1/MSH-2), and lands on the local of the one handle its
 paths address. If that handle holds no known message, the write declines to a TODO marker
 rather than land on `msg`. A markup-free whole-tree write makes the handles it names unknown, as
 above.

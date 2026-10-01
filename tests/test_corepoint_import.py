@@ -2110,12 +2110,117 @@ def test_an_inlined_call_passing_a_handle_still_unbinds_it() -> None:
     )
     assert 'Send("OB_IN"' not in passed
 
-    # The control arm: a call that passes no handle leaves the input bound.
-    plain = call.replace(" pass %ADT", "")
+    # The control arm: a call that passes no handle, to a list that names none, leaves the input bound.
+    plain = (
+        '<Call Data="ActionListCall &quot;Log&quot;"><Actions>'
+        '<Line Data="EnvLogText &quot;called&quot;"/></Actions></Call>'
+    )
     kept = _handler_body(
         _handler_source(_WRITE_INPUT + plain + _role_send("input-handle", "%ADT", "OB_IN"))
     )
     assert '    sends.append(Send("OB_IN", msg))' in kept
+
+
+def _inlined_call(*statements: str, passing: str = " pass %OUT") -> str:
+    return (
+        f'<Call Data="ActionListCall &quot;Sub&quot;{passing}"><Actions>'
+        + "".join(statements)
+        + "</Actions></Call>"
+    )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(_inlined_call(_create("%OUT", _ADT_A04)), id="rebuilt-under-the-same-name"),
+        pytest.param(
+            _inlined_call(_write("other-handle", "%OUT", "SUB"), passing=""),
+            id="body-writes-a-caller-name",
+        ),
+        pytest.param(_inlined_call(passing=" pass %OUT/PID"), id="partial-path-pass"),
+    ],
+)
+def test_an_inlined_call_runs_in_its_own_scope(call: str) -> None:
+    """A called list starts knowing no handle, and every handle its call line passes (whole or as a
+    path) or its body names or binds is unknown to the caller afterwards. So none of these sends the
+    caller's %OUT, and a send inside the list of a handle it did not bind refuses."""
+    body = _handler_body(_handler_source(_CLONE_OUT + call + _SEND_OUT))
+    assert 'Send("OB_OUT"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
+
+
+def test_a_called_lists_input_is_not_the_callers_msg() -> None:
+    """Inside the called list, its input handle is whatever was passed, not the caller's msg. A
+    write there must not land on msg, and a handle the list binds is not the caller's to send."""
+    inner = _inlined_call(
+        _write("input-handle", "%ADT", "SUB"),
+        _create("%P", _ADT_A04),
+    )
+    body = _handler_body(
+        _handler_source(
+            _CLONE_OUT
+            + inner
+            + _role_send("other-handle", "%P", "OB_P")
+            + _role_send("input-handle", "%ADT", "OB_IN")
+        )
+    )
+    assert 'set_field(msg, "MSH-6", "SUB")' not in body
+    assert "    p_msg = Message.parse(" in body  # bound inside the list's own scope
+    assert 'Send("OB_P"' not in body and 'Send("OB_IN"' not in body
+
+
+def test_a_call_with_no_inlined_list_is_a_marker_and_counted_unmapped() -> None:
+    """Nothing was inlined, so the render must not say it was, nor count it as shipped."""
+    steps = '<Line Data="ActionListCall &quot;Sub&quot;"/>'
+    src = _handler_body(_handler_source(steps))
+    assert "# TODO: Corepoint ActionListCall — called list not inlined" in src
+    assert "(called list inlined)" not in src
+    assert _count_steps(_handler_steps(steps), in_loop=False) == (0, ["ActionListCall"], 0)
+
+
+def test_framing_and_markup_free_copies_never_reach_a_built_or_cloned_message() -> None:
+    """MSH-2 is refused on a built message as everywhere else, and in a list with role markup a
+    markup-free copy (which clears an absent source's destination) or a repeating-segment write
+    declines as the role layer would."""
+    body = _handler_body(
+        _handler_source(
+            _create("%NEW", _ADT_A04)
+            + '<Line Data="ItemClear %NEW/MSH-2"/>'
+            + _CLONE_OUT
+            + '<Line Data="ItemCopy %OUT/PID-5 %OUT/PID-6"/>'
+            + '<Line Data="ItemClear %OUT/OBX-5"/>'
+            + _SEND_OUT
+        )
+    )
+    assert "MSH-2" not in body.split("# TODO")[0]
+    assert 'set_field(new_msg, "MSH-2"' not in body
+    assert "copy_field(" not in body
+    assert 'set_field(out_msg, "OBX-5"' not in body
+    assert "intended target PID-6" in body
+
+
+def test_an_unstyled_field_write_verb_still_declines() -> None:
+    """Reading words styled or not must not widen field-write mapping: a field write whose verb is
+    unstyled declined before step 2 and still does. A keyword-styled ``to`` still maps."""
+    unstyled = _role_line(
+        "ItemCopy "
+        + _span("literal", '"X"')
+        + " to "
+        + _span("input-handle", "%ADT")
+        + _span("path", "/MSH-6")
+    )
+    assert "set_field(" not in _handler_body(_handler_source(unstyled))
+    styled_to = _role_line(
+        _span("keyword", "ItemCopy")
+        + " "
+        + _span("literal", '"X"')
+        + " "
+        + _span("keyword", "to")
+        + " "
+        + _span("input-handle", "%ADT")
+        + _span("path", "/MSH-6")
+    )
+    assert '    set_field(msg, "MSH-6", "X")' in _handler_body(_handler_source(styled_to))
 
 
 def test_a_keyword_styled_word_stops_a_field_write_mapping() -> None:
