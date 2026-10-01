@@ -36,6 +36,7 @@ from messagefoundry.config.secretprovider import SecretProvider, resolve_connect
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
+    is_ldaps_address,
     split_kerberos_spn,
     weakened_tls_escape_permitted,
 )
@@ -493,6 +494,34 @@ class LdapAuthenticator:
     ) -> None:
         if not settings.ad_server or not settings.ad_user_search_base:
             raise LdapError("AD is enabled but ad_server / ad_user_search_base are not configured")
+        # One definition of "is this bind LDAPS", read by the plain-bind refusal and the verify-off
+        # refusal below, the suite assertion, and _server(). It is the settings module's own test, so
+        # this and AuthSettings agree: a bare host that merely starts with "ldaps" is plain (#2354).
+        self._ldaps = is_ldaps_address(str(settings.ad_server))
+        # Vault BACKLOG #2354: a plain bind sends both passwords in cleartext. ServiceSettings refuses
+        # it at load under [security].enforcement = enforce; this repeats that refusal for a caller that
+        # hands over an AuthSettings alone. It refuses if EITHER dial input says enforce: `enforcing`
+        # (the [security].enforcement dial, defaulting to enforce) or a known enforcing `posture`. It
+        # runs before the bind secret is resolved, so a refused build never fetches the password.
+        if not self._ldaps:
+            if not settings.ad_allow_insecure_ldap:
+                # AuthSettings requires the opt-in only while ad_enabled; a direct construction can
+                # carry ad_enabled = false, so check it here too rather than assume it.
+                raise LdapError(
+                    "ad_server is not an ldaps:// address; a plain bind needs "
+                    "ad_allow_insecure_ldap = true under [security].enforcement = warn."
+                )
+            if enforcing or (posture is not None and posture.enforcing):
+                raise LdapError(
+                    "ad_server is not an ldaps:// address, and ad_allow_insecure_ldap is inert under "
+                    "[security].enforcement = enforce (the binds would send passwords in cleartext). "
+                    "Use an ldaps:// ad_server."
+                )
+            logger.warning(
+                "AD binds over plain ldap:// (ad_allow_insecure_ldap=true, honoured because "
+                "[security].enforcement = warn) -- the service-account and user passwords cross the "
+                "network in cleartext; do not use in production."
+            )
         # Resolve the effective service-account bind password ONCE at construction (ADR 0019 §5): from a
         # [secrets].provider when ad_bind_password_secret is set, else the env-sourced ad_bind_password
         # (byte-identical when no reference/provider). A configured-but-unresolvable reference fails closed
@@ -507,9 +536,6 @@ class LdapAuthenticator:
         if not settings.ad_bind_dn or not self._bind_password:
             raise LdapError("AD is enabled but the service-account bind is not configured")
         self._s = settings
-        # One definition of "is this bind LDAPS", read by the verify-off refusal below, the suite
-        # assertion, and _server(). The assertion would have been its third open-coded spelling.
-        self._ldaps = str(settings.ad_server).lower().startswith("ldaps")
         # BACKLOG #2034 (ASVS 6.7.1): check [auth].ad_tls_ca_cert_file ONCE, here, and keep the bytes
         # the pin, ACL and path check read. Every bind hands ldap3 those bytes as ca_certs_data, so a
         # file swapped after this check is never trusted. ldap3 used to get the path, and read the
@@ -525,16 +551,18 @@ class LdapAuthenticator:
         # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
         # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
         # so current_hop_posture() would be None here; the posture must be passed explicitly or the
-        # clamp below would be inert. None (a direct/test/embedding construction) falls back to the
-        # unclamped escape — byte-identical to the pre-#329 bare read.
+        # escape below is refused. None (a direct/test/embedding construction) FAILS CLOSED: the escape
+        # is not permitted (vault BACKLOG #2354). CORRECTED: this read that None *"falls back to the
+        # unclamped escape -- byte-identical to the pre-#329 bare read"*; weakened_tls_escape_permitted
+        # stopped doing that in engine PR 1886.
         self._posture = posture
         # A disabled-cert-verification posture (ad_tls_verify=false over LDAPS) would make the service-
         # account and user binds MITM-able on first deployment, so it REFUSES at startup unless the
         # operator sets the explicit MEFOR_ALLOW_INSECURE_TLS dev escape (ASVS 12.3.2). #329 routes that
         # escape through the ADR-0092 clamp (weakened_tls_escape_permitted): under an enforcing-PHI
         # posture the escape is INERT, so it can never silence this refusal on such an instance — the
-        # blunt env var no longer buys verify-off there. With the escape permitted (non-enforcing/non-PHI
-        # or unstamped posture), we still warn loudly once at startup.
+        # blunt env var no longer buys verify-off there. With the escape permitted (a known, non-enforcing
+        # posture; an unstamped one now refuses), we still warn loudly once at startup.
         if self._ldaps and not settings.ad_tls_verify:
             if not weakened_tls_escape_permitted(self._posture):
                 raise LdapError(

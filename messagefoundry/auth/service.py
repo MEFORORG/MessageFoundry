@@ -1782,6 +1782,8 @@ class AuthService:
             # thread the instance hop posture too — LDAPS is built out of the connector-construction gate,
             # so its ad_tls_verify=false escape clamp is inert unless the posture arrives explicitly here.
             # BACKLOG #2034: the enforcement dial too, since the authenticator now checks its CA anchor.
+            # Vault BACKLOG #2354: the same dial decides whether a plain ldap:// bind is refused, so it
+            # is a transport control here and not only an anchor-ACL knob. Pass the real dial.
             self._ldap = LdapAuthenticator(
                 settings,
                 secret_provider=secret_provider,
