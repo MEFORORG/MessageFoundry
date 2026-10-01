@@ -952,7 +952,9 @@ QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM=
 # format / lint / types
 ruff format .
 ruff check .
-mypy messagefoundry messagefoundry_webconsole messagefoundry_toolkit   # the packages ci.yml checks
+# mypy: the three legs ci.yml runs. Name the platform, or a Windows box checks win32 only.
+mypy --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
+mypy --platform win32 messagefoundry messagefoundry_toolkit
 mypy --explicit-package-bases tests   # BACKLOG #1799; the profile and its exemptions: pyproject.toml
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui

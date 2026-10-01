@@ -59,7 +59,9 @@ maintainer.)
    ```powershell
    ruff check .
    ruff format --check .
-   mypy messagefoundry messagefoundry_webconsole messagefoundry_toolkit   # the packages CI checks
+   # The three mypy legs CI runs. Name the platform, or a Windows box checks win32 only.
+   mypy --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
+   mypy --platform win32 messagefoundry messagefoundry_toolkit
    mypy --explicit-package-bases tests   # needs CI's extras: scripts\worktree\ensure-venv.ps1 installs them
    $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
    ```
