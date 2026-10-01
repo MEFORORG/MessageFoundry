@@ -79,7 +79,7 @@ flowchart TB
 
   subgraph DEV["Dev / test tooling"]
     CLI["CLI: messagefoundry<br/>serve, check, dryrun, verify and more"]:::devtool
-    TOOLKIT["Toolkit: messagefoundry-toolkit<br/>authoring and development commands"]:::devtool
+    TOOLKIT["Toolkit: messagefoundry-toolkit<br/>authoring and development tooling"]:::devtool
     GEN["Synthetic HL7 generators<br/>generators/"]:::devtool
     HARNESS["Test harness<br/>harness/ · PySide6 · MLLP send/receive"]:::devtool
   end
@@ -98,7 +98,7 @@ flowchart TB
 
   subgraph BUILD["Build / release"]
     CI["CI · .github/workflows<br/>tests · SAST · SBOM · sign"]:::build
-    PYPI(["PyPI: messagefoundry and its companion distributions<br/>Trusted Publishing on a version tag"]):::build
+    PYPI(["PyPI<br/>Trusted Publishing on a version tag"]):::build
   end
 
   %% operator tools reach the engine only through the API
@@ -144,22 +144,23 @@ engine code and keeps its own SQLite — used to run MEFOR in parallel with a le
 migration ([TEE-RELAY.md](TEE-RELAY.md)).
 
 The **toolkit** ([`messagefoundry_toolkit/`](../messagefoundry_toolkit/)) is a separate distribution
-that holds the authoring and development commands, so a production install carries the engine alone
-(ADR 0201). The toolkit imports the engine. The engine never imports the toolkit. The harness reaches
-the engine two ways: over MLLP as a sender and receiver, and over the API as a client.
+for authoring and development tooling. ADR 0201 moves those commands out of the engine command in
+slices, so run either command with `--help` to see where a command lives. The toolkit imports the
+engine. The engine never imports the toolkit. The harness reaches the engine two ways: over MLLP as a
+sender and receiver, and over the API as a client.
 
 Partner systems connect through any Connection type the connector registry holds, not only MLLP and
-files. [CONNECTIONS.md](CONNECTIONS.md) lists every type. The release workflow in **CI** builds four
-distributions: `messagefoundry`, `messagefoundry-webconsole`, `messagefoundry-harness` and
-`messagefoundry-toolkit`. It publishes to PyPI by Trusted Publishing on a version tag.
-[SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) describes that chain.
+files. [CONNECTIONS.md](CONNECTIONS.md) lists every type. The release workflow in **CI** builds the
+engine and the distributions under [`packaging/`](../packaging/), and publishes to PyPI by Trusted
+Publishing on a version tag. [SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) describes that chain, with its tags
+and gates.
 
 ---
 
 ## 2. System topology — components & boundaries
 
 The engine is a headless **asyncio** service; clients are **separate processes** that reach it
-**only** through the localhost HTTP/WebSocket API. The dependency rule is one-way: `pipeline` /
+**only** through the localhost HTTPS/WebSocket API. The dependency rule is one-way: `pipeline` /
 `transports` / `parsing` / `store` / `config` never import `api` — the API depends on
 the engine, and the clients (web console, harness) depend on the API.
 
@@ -175,13 +176,13 @@ flowchart TB
   HARNESS["Test harness<br/>(PySide6)"]:::client
 
   subgraph API_BND["API: 127.0.0.1 by default, TLS, auth + RBAC, the only client API surface"]
-    API["api/ — FastAPI + uvicorn<br/>HTTP + WebSocket"]:::api
+    API["api/: FastAPI + uvicorn<br/>HTTPS + WebSocket"]:::api
     AUTH["auth/ — authn + RBAC<br/>deny-by-default · hash-chained audit"]:::api
   end
 
   subgraph ENGINE["Engine — headless asyncio service (no GUI imports)"]
     PIPE["pipeline/ — RegistryRunner<br/>listener · router · transform · delivery workers"]:::engine
-    TRANS["transports/: connector registry<br/>socket, file, web service, database and mail families"]:::engine
+    TRANS["transports/: connector registry<br/>socket, file, web service, database, mail<br/>and internal source families"]:::engine
     PARSE["parsing/: pure parsing library<br/>built-in HL7 parser, hl7apy strict validation<br/>X12, DICOM, FHIR and XML codecs"]:::engine
     STORE[("store/: staged queue<br/>SQLite WAL, SQL Server, Postgres, AES-256-GCM")]:::engine
     CFG["config/ — code-first wiring<br/>Connections · Routers · Handlers · environments/"]:::engine
@@ -207,18 +208,13 @@ flowchart TB
   NSSM ==> ENGINE
 ```
 
-The `transports/` label names connector families, not single types, so it stays true as connectors
-are added. The socket family includes MLLP, raw TCP, X12 and DICOM. The file family includes local
-and remote files. The web service family includes the HTTP listener, REST, SOAP and FHIR. The mail
-family includes SMTP email and Direct. [CONNECTIONS.md](CONNECTIONS.md) is the full list, and the
-only one to keep current.
+The `transports/` label names connector families, not single connector types.
+[CONNECTIONS.md](CONNECTIONS.md) lists every connector, and is the one list to keep current.
 
-The API binds `127.0.0.1` by default. The engine serves TLS itself, and mints a self-signed
-certificate on first run when the operator supplies none
-([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
-The one exception is a declared reverse proxy that terminates TLS in front of the engine. The harness
-is a client in two ways: it calls the API through the shared `apiclient` library, and it sends and
-receives MLLP as a test partner.
+The API binds `127.0.0.1` by default and is served over TLS.
+[ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
+says where the certificate comes from. The harness is a client in two ways: it calls the API through
+the shared `apiclient` library, and it sends and receives MLLP as a test partner.
 
 ---
 
@@ -226,7 +222,8 @@ receives MLLP as a test partner.
 
 The message store **is** the queue: a transactional staged queue with a `stage` discriminator. The
 default store is SQLite (WAL), and SQL Server and Postgres are the server backends. The inbound is
-**ACKed on receipt** — once the raw message is durably committed to the `ingress` stage, *before* routing/transform/delivery. Each handoff is a **single committed
+**ACKed on receipt** — once the raw message is durably committed to the `ingress` stage,
+*before* routing/transform/delivery. Each handoff is a **single committed
 transaction** (claim → produce next-stage rows → complete this stage), giving at-least-once delivery,
 retries, and replay without a separate broker. Because a re-run must re-derive identical output,
 **Routers and Transforms are pure**; **outbound connections are idempotent**.
@@ -269,6 +266,7 @@ flowchart TB
 
   ING -.->|"records"| D1
   RW -.->|"records"| D2
+  TW -.->|"records a declined Send"| D3
   DW -.->|"records"| D3
   D1 -.-> FIN
   D2 -.-> FIN
