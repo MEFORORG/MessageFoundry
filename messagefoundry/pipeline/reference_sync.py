@@ -112,11 +112,32 @@ def _cell(value: Any) -> Any:
     return _json_default(value)  # date/Decimal/bytes -> iso/str/base64
 
 
+def reference_connection_name(name: str) -> str:
+    """How a reference set names itself in a hop refusal or audit line: ``reference:<name>``, the
+    shape the runner's alerts already use. The colon sits inside the quotes the record adds, and
+    ``reference`` is not a credential word, so the log scrub leaves it alone."""
+    return f"reference:{name}"
+
+
+def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None = None) -> str:
+    """Build a DATABASE reference source's DSN, refusing weakened TLS under the AMBIENT hop posture.
+
+    The one place both callers build it: the sync, just before it dials, and ``build_check``, so a
+    source that every sync would refuse fails ``messagefoundry check``, dry-run and reload instead
+    (vault BACKLOG #2354). The source is always the SQL Server preset, since ``DatabaseRef`` takes no
+    ``dialect``. The per-connection attestation is read and validated here too (#200)."""
+    from messagefoundry.transports.database import _build_dsn
+
+    attested = hop_attestation_from_settings(settings)
+    return _build_dsn(dict(settings), attested=attested, connection=connection)
+
+
 async def _load_database_source(
     settings: Mapping[str, Any],
     egress: EgressSettings | None,
     *,
     posture: HopPosture | None = None,
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Materialize a SQL-backed reference source (ADR 0006 increment 2) into ``{key: value}``.
 
@@ -130,8 +151,8 @@ async def _load_database_source(
     no posture and fell back to the UNCLAMPED ``MEFOR_ALLOW_INSECURE_TLS`` escape. Under ``enforce``
     that let a DatabaseRef with ``encrypt=false`` cross in the clear, where the ``db_lookup`` twin
     refuses the same hop. ``None`` keeps the ambient posture, so a caller already inside a scope is
-    unchanged."""
-    from messagefoundry.transports.database import _build_dsn, _login_timeout, _make_pool
+    unchanged. ``name`` is the reference set, so a refusal or an attestation line names it."""
+    from messagefoundry.transports.database import _login_timeout, _make_pool
 
     server = str(settings.get("server", ""))
     if egress is not None:
@@ -154,14 +175,13 @@ async def _load_database_source(
     statement = str(settings.get("statement", ""))
     if not key_col or not statement:
         raise ReferenceSyncError("DATABASE reference source requires 'statement' and 'key_column'")
-    # Per-connection insecure-hop attestation (#200), the twin of the db_lookup executor's: this sync
-    # dials the same customer DB through the same weakened-TLS gate, so dropping the attestation
-    # refused a hop the operator had attested.
-    attested = hop_attestation_from_settings(settings)
-    # fail-loud on weakened TLS / bad auth, before dialing. Stamped so the escape is clamped exactly as
-    # the db_lookup executor's is (wiring_runner._build_lookup_executor).
+    # Fail loud on weakened TLS or bad auth, before dialing. The posture is stamped so the escape is
+    # clamped, as wiring_runner._build_lookup_executor does for db_lookup. One difference: a None
+    # posture here keeps the ambient one, where that method's None clears it.
     with active_hop_posture(posture if posture is not None else current_hop_posture()):
-        dsn = _build_dsn(dict(settings), attested=attested)
+        dsn = database_source_dsn(
+            settings, connection=None if name is None else reference_connection_name(name)
+        )
     pool = await _make_pool(
         dsn,
         int(settings.get("pool_max", 5)),
@@ -408,7 +428,7 @@ class ReferenceSyncRunner:
             )  # blocking file I/O off-loop
         elif kind == "database":
             rows = await _load_database_source(  # async aioodbc dial
-                settings, self._egress, posture=self._hop_posture
+                settings, self._egress, posture=self._hop_posture, name=spec.name
             )
         else:
             raise ReferenceSyncError(

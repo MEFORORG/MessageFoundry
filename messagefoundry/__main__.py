@@ -2371,7 +2371,8 @@ def _serve(args: argparse.Namespace) -> int:
     # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
     # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection;
     # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal; at least the
-    # bind gates' and raw-TCP guard's tls_hop_attested line, though a DatabaseRef sync logs nothing),
+    # bind gates' and raw-TCP guard's tls_hop_attested line, and the database weakened-TLS line that a
+    # DatabaseRef source also writes, without the reason),
     # and all of them completely by `messagefoundry check` and GET /security/posture, which both have
     # the graph.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as

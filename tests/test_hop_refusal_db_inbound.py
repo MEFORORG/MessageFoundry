@@ -361,6 +361,62 @@ def test_reference_runner_threads_its_posture_into_the_sync(
     assert "Encrypt=no" in seen[0]
 
 
+def _ref_registry(**ref_kwargs: Any) -> Any:
+    from messagefoundry.config.wiring import DatabaseRef, ReferenceSpec, Registry
+
+    reg = Registry()
+    source = DatabaseRef(
+        server="db.example.org",
+        database="d",
+        statement="SELECT code FROM t",
+        key_column="code",
+        **ref_kwargs,
+    )
+    reg.add_reference(ReferenceSpec(name="codes", source=source))
+    return reg
+
+
+def _build_check(reg: Any, posture: HopPosture | None) -> None:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    build_check_registry(
+        reg, inbound_bind_host="127.0.0.1", env_values={}, egress=EgressSettings(), posture=posture
+    )
+
+
+def test_build_check_refuses_a_weakened_reference_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A source every sync would refuse fails `check`, dry-run and reload, and names the set.
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with pytest.raises(WiringError, match="weakened") as exc:
+        _build_check(_ref_registry(encrypt=False), PROD_PHI)
+    assert "'reference:codes'" in str(exc.value)
+
+
+def test_build_check_passes_a_verifying_reference_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Control: the shipped default passes the same check under the same posture.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _build_check(_ref_registry(), PROD_PHI)
+
+
+def test_build_check_passes_an_attested_reference_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Control: the per-connection attestation is the audited way across, as on every other DB hop.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _build_check(
+        _ref_registry(
+            encrypt=False,
+            tls_hop_attested=True,
+            tls_hop_attested_reason="proxy-terminated TLS on a dedicated segment",
+        ),
+        PROD_PHI,
+    )
+
+
+def test_build_check_honours_the_escape_on_a_warn_instance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    _build_check(_ref_registry(encrypt=False), STAGING_PHI)
+
+
 async def test_engine_hands_its_posture_to_the_reference_runner(tmp_path: Path) -> None:
     # The last link: the engine builds the runner, so a runner that CAN carry a posture but is never
     # given one would leave the clamp inert on every real serve.

@@ -160,6 +160,7 @@ from messagefoundry.pipeline.phase_timing import (
     DeliveryPhaseTiming,
     delivery_phase_timing_enabled,
 )
+from messagefoundry.pipeline.reference_sync import database_source_dsn, reference_connection_name
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
 from messagefoundry.pipeline.saturation import SaturationDetector
@@ -8906,6 +8907,15 @@ def _build_check_connectors(
     if resolved_lookups:
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
         DatabaseLookupExecutor(resolved_lookups)
+    # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
+    # posture, so a source every sync would refuse fails check, dry-run and reload rather than only
+    # surfacing as a failed sync after start. Builds no pool and opens no socket.
+    for rname, rspec in registry.references.items():
+        if rspec.source.kind == "database":
+            database_source_dsn(
+                resolve_env_settings(rspec.source.settings, env_values),
+                connection=reference_connection_name(rname),
+            )
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         fsettings = _fhir_lookup_settings(fspec, env_values, egress)

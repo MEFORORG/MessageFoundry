@@ -803,7 +803,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **It is always reported, though not always logged:** at least the inbound bind gates and the
   raw-TCP/MLLP hop guard log a suppressed enforcing refusal at WARNING with the reason. The OAuth2 and
   SMART token-endpoint seams and the database weakened-TLS line do not put the reason on it, and a
-  `DatabaseRef` sync logs nothing. The complete record is the two reports. `messagefoundry check` prints a
+  `DatabaseRef` source writes that same line. The complete record is the two reports. `messagefoundry check` prints a
   `tls-hop-attested` line listing the **whole** attested set, and `GET /security/posture` carries a
   `tls_hop_attested` loosening naming every attesting declaration of each kind above. Each gate and
   both reports read the attestation from the same place, so a hop cannot be crossed on an attestation
