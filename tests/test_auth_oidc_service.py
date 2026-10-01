@@ -1284,7 +1284,9 @@ async def test_unreachable_idp_does_not_affect_local_or_ad_login(
 
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
+        # No account is bound: the directory leg below is Windows SSO's, and a bound account is
+        # refused there whatever the IdP is doing (vault BACKLOG #2609).
+        service = await _service(store, rsa_key, bind=None)
         await create_local_user_chosen(
             service,
             username="alice",
@@ -1306,9 +1308,10 @@ async def test_unreachable_idp_does_not_affect_local_or_ad_login(
         ).ok
 
         assert (await service.login("alice", "Sup3rSecret!!")).ok
-        # The directory path is unaffected by the dead IdP. Minted through _complete_ad_login rather
-        # than an AD password login, which is retired (BACKLOG #1137) -- this is the tail Kerberos
-        # reaches, so it is the AD login that still exists.
+        # The directory path is unaffected by the dead IdP, for an account with no federated
+        # binding. Minted through _complete_ad_login rather than an AD password login, which is
+        # retired (BACKLOG #1137) -- this is the tail Kerberos reaches, so it is the AD login that
+        # still exists.
         assert (await service._complete_ad_login(PRINCIPAL, None, mfa_verified=True)).ok
     finally:
         await store.close()

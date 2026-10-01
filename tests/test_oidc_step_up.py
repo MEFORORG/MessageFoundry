@@ -40,6 +40,7 @@ from tests.test_auth_oidc_service import (
     DEFAULT_SUB,
     PRINCIPAL,
     _audit_rows,
+    _bind,
     _claims,
     _FakeLdap,
     _flow,
@@ -132,13 +133,18 @@ async def _mechanism(store: MessageStore, token: str) -> str | None:
 async def test_a_federated_session_is_minted_as_oidc_and_a_kerberos_one_as_kerberos(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ADR 0184 item (iv): one hybrid account, two mechanisms, and the SESSION says which ran."""
+    """ADR 0184 item (iv): one hybrid account, two mechanisms, and the SESSION says which ran.
+
+    The Kerberos session is minted BEFORE the account is bound. A bound account is refused Windows
+    SSO (vault BACKLOG #2609), and a first bind revokes no session, so that is the one order in
+    which an account holds both."""
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
-        federated = await _oidc_session(service, monkeypatch, rsa_key)
+        service = await _service(store, rsa_key, bind=None)
         kerberos = await service._complete_ad_login(PRINCIPAL, None, mfa_verified=False)
         assert kerberos.ok and kerberos.token is not None
+        await _bind(service, store, DEFAULT_SUB)
+        federated = await _oidc_session(service, monkeypatch, rsa_key)
         assert await _mechanism(store, federated) == SessionMechanism.OIDC.value
         assert await _mechanism(store, kerberos.token) == SessionMechanism.KERBEROS.value
         assert await service.session_steps_up_at_idp(federated)
@@ -184,14 +190,16 @@ async def test_an_oidc_session_cannot_step_up_with_a_password(
 async def test_a_kerberos_session_of_the_same_account_keeps_the_password_leg(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
-    """The inverse: the refusal keys on the SESSION, so the same account signed in by Kerberos still
-    re-binds (ADR 0142 Amendment B: "those sessions keep their existing step-up")."""
+    """The inverse: the refusal keys on the SESSION, so a session Kerberos minted before the account
+    was bound still re-binds (ADR 0142 Amendment B: "those sessions keep their existing step-up").
+    Minted before the bind, because a bound account is refused Windows SSO (vault BACKLOG #2609)."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _CountingLdap()
-        service = await _service(store, rsa_key, ldap=ldap)
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
         login = await service._complete_ad_login(PRINCIPAL, None, mfa_verified=False)
         assert login.ok and login.token is not None and login.identity is not None
+        await _bind(service, store, DEFAULT_SUB)
 
         elevation = await service.reauth(login.identity, "pw", token=login.token)
 
@@ -229,9 +237,11 @@ async def test_the_step_up_request_sends_max_age_zero_and_prompt_login(
 async def test_a_non_oidc_session_cannot_start_the_idp_leg(rsa_key: rsa.RSAPrivateKey) -> None:
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
+        # Minted before the bind: a bound account is refused Windows SSO (vault BACKLOG #2609).
+        service = await _service(store, rsa_key, bind=None)
         login = await service._complete_ad_login(PRINCIPAL, None, mfa_verified=False)
         assert login.token is not None
+        await _bind(service, store, DEFAULT_SUB)
         with pytest.raises(oidc.FlowError):
             await _begin(service, login.token)
     finally:
