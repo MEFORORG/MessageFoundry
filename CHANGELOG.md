@@ -6,7 +6,7 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.5.0] — 2026-09-30 — Early Access
+## [0.5.0] — 2026-10-01 — Early Access
 
 ### Added
 - **The `messagefoundry-toolkit` wheel is now signed, attested and licensed like the engine wheel.**

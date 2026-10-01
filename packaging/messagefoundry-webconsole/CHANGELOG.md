@@ -20,7 +20,7 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
-## [0.4.0] — 2026-09-30 — Early Access
+## [0.4.0] — 2026-10-01 — Early Access
 
 **Requires engine 0.5.0. Supported engine UI seam: `32ad621e6081555e`**, the value engine 0.5.0
 ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
