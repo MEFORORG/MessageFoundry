@@ -281,22 +281,50 @@ lag, not a lost-leader incident.
 
 ## Deployment topology (active-passive)
 
+This diagram shows which node takes sender traffic in an active-passive cluster, and what the
+standby does while it waits. Senders connect to a floating VIP (virtual IP address) or a load
+balancer, never to a fixed node. Only the primary binds the listener ports, so the health check
+passes only there. Both nodes use one shared server database, which holds the leadership lease and
+the message store.
+
+```mermaid
+flowchart TB
+  classDef io fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+
+  PARTNERS(["MLLP and TCP senders<br/>(partners)"]):::io
+  VIP["Floating VIP or load balancer<br/>health check: TCP connect to the listener port"]:::ext
+
+  subgraph NODES["Engine nodes: same config dir, same store settings"]
+    NODE_A["Node A: PRIMARY<br/>holds the leadership lease<br/>binds every listener<br/>graph running: router, transform and delivery workers"]:::core
+    NODE_B["Node B: STANDBY (warm)<br/>binds no listeners, runs no workers<br/>keeps a membership heartbeat<br/>contends for the leadership lease"]:::core
+  end
+
+  subgraph SHARED_DB["Shared server database: PostgreSQL or SQL Server"]
+    LEASE_ROW[("leader_lease row<br/>one owner, expiry on the database clock")]:::store
+    NODES_TABLE[("nodes table<br/>membership heartbeats")]:::store
+    MSG_STORE[("Message store<br/>the durable staged queue")]:::store
+  end
+
+  RECEIVERS(["Downstream receivers<br/>reached through outbound Connections"]):::io
+
+  PARTNERS ==> VIP
+  VIP ==>|"port bound, check passes"| NODE_A
+  VIP -.->|"port NOT bound, check fails"| NODE_B
+  NODE_A ==>|"reads and writes the queue"| MSG_STORE
+  NODE_A ==>|"delivers"| RECEIVERS
+  NODE_A -->|"renews every heartbeat"| LEASE_ROW
+  NODE_B -->|"acquires only after the lease expires"| LEASE_ROW
+  NODE_A -->|"heartbeat"| NODES_TABLE
+  NODE_B -->|"heartbeat"| NODES_TABLE
 ```
-                      ┌──────────────── floating VIP / load balancer ────────────────┐
-   MLLP/TCP senders ──▶  health check = TCP connect to the listener port              │
-   (partners)         │  (only the PRIMARY binds it, so the VIP always lands on it)   │
-                      └───────────────┬───────────────────────────┬──────────────────┘
-                                      │ bound (primary)            │ NOT bound (standby)
-                              ┌───────▼────────┐           ┌───────▼────────┐
-                              │  node A         │           │  node B         │
-                              │  PRIMARY        │           │  STANDBY (warm) │
-                              │  graph running  │           │  no listeners   │
-                              │  (leader lease) │           │  contends only  │
-                              └───────┬─────────┘           └───────┬─────────┘
-                                      └──────────┬───────────────────┘
-                                        shared server DB (the lease + queue)
-                                        DB-tier HA: PG replication / SQL Server Always On
-```
+
+**Legend.** Thick arrows carry messages, and only the primary has them. Thin arrows are coordination
+traffic, which every node sends on each heartbeat. The dotted arrow is the health check that fails
+on the standby, so the VIP sends no sender traffic there. Cylinders are data held in the shared
+database.
 
 **One primary processes; the rest are warm standbys.** All nodes point at the **same** server DB and run
 the **same** config dir; the `leader_lease` row elects exactly one primary, which alone binds listeners
