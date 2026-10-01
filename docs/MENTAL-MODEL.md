@@ -386,21 +386,10 @@ messagefoundry serve --config ./mefor-config/config --env prod # the engine just
 
 The built-in HA model is **active-passive failover** (the Corepoint/Rhapsody model): run N identical engine processes against one shared server database; exactly one — the leader — runs the whole graph, and the rest are warm standbys that take over on failure. Single-node is the byte-identical default; a cluster is opt-in. **Active-active HA** — the same graph running concurrently on every node — is not part of the product (dropped 2026-06-18, code removed). That is a decision about *availability*, not about capacity: adding capacity is a separate, built axis, and it is §15. Full guide: docs/CLUSTERING.md.
 
-```
-              floating VIP / load balancer
-   (health check = TCP connect to the listener port;
-    only the PRIMARY binds it, so traffic lands on the primary)
-                          |
-              +-----------+-----------+
-              |                       |
-        node A: PRIMARY         node B: STANDBY (warm)
-        graph running           no listeners; contends for leadership only
-              |                       |
-              +-----------+-----------+
-                          |
-         shared server DB (leader lease + durable queue)
-         DB-tier HA: PostgreSQL replication / SQL Server Always On
-```
+The diagram of this topology is in [CLUSTERING.md](CLUSTERING.md), under the heading "Deployment
+topology (active-passive)". It shows the floating VIP or load balancer, the primary that alone
+binds the listeners, the warm standby, and the shared server database that holds the leader lease
+and the durable queue.
 
 ### How it works
 
