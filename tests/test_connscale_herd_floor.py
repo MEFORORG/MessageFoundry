@@ -485,19 +485,28 @@ def test_a_leg_with_non_ascii_digits_is_refused(leg: str) -> None:
         )
 
 
-def test_the_pattern_keeps_the_pre_gate_language_over_ascii_inputs() -> None:
-    # Seeded random ASCII strings over the characters that matter: on ASCII input the only change,
-    # \d to [0-9], decides nothing differently. The accept count is the control: a generator that
-    # never produced a valid leg would make "no disagreement" mean nothing.
+def test_the_pattern_is_the_pre_gate_language_restricted_to_ascii() -> None:
+    # The exact claim: _LEG accepts a string if and only if the pre-gate pattern did AND it is ASCII.
+    # Non-ASCII digits AND a non-ASCII letter are in the alphabet, in every position, so widening any
+    # class (a \d or \w, in the os part as well as the version) reds here. The accept count is the
+    # control: a generator that never produced a valid leg would make "no disagreement" mean nothing.
     rnd = random.Random(1415)
-    alphabet = [*"ab09._- py3.4", "-py", "py"]
+    alphabet = [*"ab09._- py3.4", "-py", "py", "٣", "３", "é"]
     accepted = 0
     for _ in range(50_000):
         text = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 14)))
-        before = bool(_PRE_GATE_LEG.fullmatch(text))
-        assert bool(_LEG.fullmatch(text)) is before, text
-        accepted += before
+        expected = bool(_PRE_GATE_LEG.fullmatch(text)) and text.isascii()
+        assert bool(_LEG.fullmatch(text)) is expected, ascii(text)
+        accepted += expected
     assert accepted > 50, accepted
+
+
+def test_the_refusal_names_a_non_ascii_digit_by_its_escape() -> None:
+    with pytest.raises(ConnScaleProfileError, match=r"ASCII letters.*\\uff13"):
+        load_connscale_profile_text(
+            _profile_text_with("empty_claims_herd_floor_legs = ['ubuntu-latest-py３.14']"),
+            where="<unit>",
+        )
 
 
 def test_many_distinct_legs_are_kept_in_order_once_each() -> None:

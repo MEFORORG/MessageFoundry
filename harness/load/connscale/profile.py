@@ -426,7 +426,11 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
 
 
 def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
-    """Parse ``empty_claims_herd_floor_legs``: absent -> ``()``; else a list of non-empty strings."""
+    """Parse ``empty_claims_herd_floor_legs``: absent -> ``()``; else a list of CI legs.
+
+    Each entry must match :data:`_LEG` after stripping surrounding space, ASCII only; anything else
+    is refused with the shape error, never kept. Duplicates collapse, first-seen order kept.
+    """
     if raw is None:
         return ()
     if not isinstance(raw, list):
@@ -434,28 +438,33 @@ def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
     # A dict keeps first-seen order and dedupes in one pass, so many entries cost linear time too.
     out: dict[str, None] = {}
     for item in raw:
+        leg = item.strip() if isinstance(item, str) else None
         # The shape is checked, not just non-emptiness: the harvest report prints a leg with a SPACE
         # ("ubuntu-latest py3.14"), and a leg copied from it would parse, never match, and disarm the
         # floor with nothing reporting it.
-        if not isinstance(item, str) or not _LEG.fullmatch(item.strip()):
+        if leg is None or not _LEG.fullmatch(leg):
+            # ascii(), so a full-width digit shows as its escape rather than as a look-alike.
             raise ConnScaleProfileError(
                 f"{where}: every 'empty_claims_herd_floor_legs' entry must name a CI leg as "
-                f"'<os>-py<version>' with no spaces, e.g. 'ubuntu-latest-py3.14'; got {item!r}"
+                f"'<os>-py<version>' in ASCII letters, digits, '.', '_' and '-', with no spaces, "
+                f"e.g. 'ubuntu-latest-py3.14'; got {ascii(item)}"
             )
-        out.setdefault(item.strip(), None)
+        out.setdefault(leg, None)
     return tuple(out)
 
 
-#: A CI leg as ci.yml spells it in MEFOR_CONNSCALE_LEG: ``<matrix os>-py<python version>``.
+#: A CI leg in the ``<matrix os>-py<python version>`` shape ci.yml exports in MEFOR_CONNSCALE_LEG.
+#: A shape check only: it cannot tell a real leg from a well-formed one the matrix never runs.
 #:
-#: ASCII DIGITS ONLY, ``[0-9]`` and never ``\d``. A ``str`` pattern's ``\d`` also matches full-width
-#: and other Unicode digits, and a leg spelled with them parses here and can never equal the ASCII
-#: value ci.yml exports, so the floor would silently disarm: a fail-open on a gate.
+#: ASCII ONLY, twice over: ``[0-9]`` and never ``\d``, and compiled with ``re.ASCII`` so a later
+#: ``\d`` or ``\w`` cannot quietly widen it. A ``str`` pattern's ``\d`` also matches full-width and
+#: other Unicode digits, and a leg spelled with them would parse, never equal the ASCII value ci.yml
+#: exports, and silently disarm the floor: a fail-open on a gate.
 #:
 #: The version group is POSSESSIVE (``*+``): nothing follows it under ``fullmatch``, so it changes no
 #: decision, and it never gives characters back, which is the mitigation
 #: ``tests/test_security_static.py``'s nested-quantifier gate recognises.
-_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py[0-9]+(?:\.[0-9]+)*+")
+_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py[0-9]+(?:\.[0-9]+)*+", re.ASCII)
 
 
 def _claim_modes_from(raw: Any, where: str) -> tuple[str, ...]:
