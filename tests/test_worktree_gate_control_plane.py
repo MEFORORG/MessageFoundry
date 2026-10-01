@@ -974,6 +974,104 @@ def test_the_git_invocation_pattern_is_defined_EXACTLY_ONCE(repo: SimpleNamespac
     )
 
 
+# --------------------------------------------- BACKLOG #1072: a heredoc body that is DATA, not a command
+#
+# The row's fourth shape. Writing a disarm-key line into a FILE is not a config write, and the per-line
+# view could not tell: it scanned every heredoc body line raw, so ``cat <<'EOF' > notes.txt`` whose body
+# quoted a disarm refused, on the fleet's own documentation and commit-message tooling. The logical view
+# (Split-LogicalLines) already left such a body out; the per-line view is what denied.
+#
+# THE FIX REMOVES A DENY, SO THE MUST-TRIP ARMS ARE THE HALF THAT MATTERS. Each one is a shape where the
+# body, or text beside it, really runs. Every one of them denies on the gate before this change too, so
+# they are guards on the fix rather than red-first rows; the must-not-trip rows are the red-first half.
+
+_DISARM = "git config core.hooksPath /dev/null"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(f"cat <<'EOF' > notes.txt\n{_DISARM}\nEOF", id="line_leading"),
+        pytest.param(f"cat <<'EOF' > notes.txt\nsee: {_DISARM} here\nEOF", id="non_line_leading"),
+        pytest.param(f"cat <<-'EOF' > notes.txt\n\t{_DISARM}\n\tEOF", id="tab_stripped_form"),
+        pytest.param(f'tee notes.md <<"EOF"\n{_DISARM}\nEOF', id="double_quoted_word"),
+        pytest.param(f"cat <<\\EOF > notes.txt\n{_DISARM}\nEOF", id="backslash_word"),
+        pytest.param(
+            f"cat > msg.txt <<'EOF'\nfix: refuse {_DISARM}\nEOF\ngit commit -F msg.txt",
+            id="commit_message_file_idiom",
+        ),
+        pytest.param(
+            f"cat <<'EOF' > notes.md\nThe rule refuses {_BACKTICK}{_DISARM}{_BACKTICK}.\nEOF",
+            id="markdown_backticks_in_body",
+        ),
+    ],
+)
+def test_a_DATA_heredoc_body_naming_a_disarm_is_allowed(
+    repo: SimpleNamespace, command: str
+) -> None:
+    """BACKLOG #1072, over-deny. Every row DENIED before this change; ``cat`` and ``tee`` never run
+    their input, and the delimiter is quoted, so the shell expands nothing inside the body either."""
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+def test_a_DATA_heredoc_body_naming_a_tree_swap_is_allowed_too(repo: SimpleNamespace) -> None:
+    """The per-line view is shared by rules 3, 3b, 3c and 3d, so the fix is not a rule-3c carve-out.
+    This row pins it for rule 3 from the primary, where the same body line used to refuse."""
+    command = "cat <<'EOF' > notes.txt\ngit reset --hard\nEOF"
+    assert run_gate(shell(command, cwd=repo.primary), repo.repos) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The body is CODE: an interpreter reads it.
+        pytest.param(f"bash <<'EOF'\n{_DISARM}\nEOF", id="interpreter_reads_the_body"),
+        pytest.param(f"source /dev/stdin <<'EOF'\n{_DISARM}\nEOF", id="source_reads_the_body"),
+        pytest.param(f"at now <<'EOF'\n{_DISARM}\nEOF", id="unlisted_program_reads_the_body"),
+        # The reader comes AFTER the heredoc on the same line, which the logical view does not model.
+        pytest.param(f"cat <<'EOF' | bash\n{_DISARM}\nEOF", id="piped_into_an_interpreter"),
+        pytest.param(f"cat <<'EOF' > s.sh && ./s.sh\n{_DISARM}\nEOF", id="written_then_run"),
+        # Code review round one measured these two ALLOWING against a draft that let "harmless"
+        # programs share the line: the file just written is named like one, or git runs it as a hook.
+        pytest.param(f"cat <<'EOF' > git && ./git\n{_DISARM}\nEOF", id="run_under_an_allowed_name"),
+        pytest.param(
+            f"cat <<'EOF' > .git/hooks/pre-commit && git commit -am x\n{_DISARM}\nEOF",
+            id="written_as_a_hook_then_git_runs_it",
+        ),
+        pytest.param(f"cat <<'EOF' > ls ; ls\n{_DISARM}\nEOF", id="bare_name_beside_the_owner"),
+        # A PATH to cat is not cat: it can be anything, including a script that runs its input.
+        pytest.param(f"./cat <<'EOF' > notes.txt\n{_DISARM}\nEOF", id="owner_spelled_as_a_path"),
+        # An UNQUOTED delimiter expands the body, so a substitution in it runs.
+        pytest.param(f"cat <<EOF > notes.txt\n$({_DISARM})\nEOF", id="unquoted_word_substitution"),
+        # Text OUTSIDE the body.
+        pytest.param(f"cat <<'EOF' > notes.txt\nprose\nEOF\n{_DISARM}", id="after_the_terminator"),
+        pytest.param(f"cat <<'EOF' > n.txt && {_DISARM}\nprose\nEOF", id="on_the_opening_line"),
+        # Not a heredoc at all: the `<<` is quoted, or commented out.
+        pytest.param(f"echo \"<<'EOF'\"\n{_DISARM}\nEOF", id="opener_inside_quotes"),
+        pytest.param(f"echo hi # cat <<'EOF'\n{_DISARM}\nEOF", id="opener_inside_a_comment"),
+        # No terminator the shell accepts, so the model is not trusted to say where the body ends.
+        pytest.param(f"cat <<'EOF' > notes.txt\n{_DISARM}", id="unterminated"),
+        pytest.param(f"cat <<'EOF' > notes.txt\n{_DISARM}\nEOF ", id="terminator_with_a_space"),
+    ],
+)
+def test_a_heredoc_that_RUNS_or_is_not_one_still_denies_a_disarm(
+    repo: SimpleNamespace, command: str
+) -> None:
+    """BACKLOG #1072, the must-trip half. Each row reaches the shared config or cannot be proved not to."""
+    reason = assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+    assert "setting 'core.hooksPath'" in reason
+
+
+def test_an_UNQUOTED_data_heredoc_still_denies_and_that_is_a_stated_residual(
+    repo: SimpleNamespace,
+) -> None:
+    """The fix trusts only a QUOTED delimiter. An unquoted body is expanded, and this gate does not model
+    which expansions run a command, so a plain disarm line in one still refuses. Pinned so a widening is a
+    decision with a test diff rather than a drift."""
+    command = f"cat <<EOF > notes.txt\n{_DISARM}\nEOF"
+    assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+
+
 # ------------------------------------------- rule 3c: the target candidates are a SET (BACKLOG #1065)
 #
 # The rule took the FIRST `-C` on the line as "the repository being configured" and read git exiting

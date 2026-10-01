@@ -16,7 +16,7 @@ A DICOM object is **binary**; it rides the ``str``/TEXT ingress+store as base64 
 carriage (``RawMessage.from_bytes`` at the SCP, ``.raw_bytes`` here — the one decode), **never** the
 lossy latin-1 round-trip.
 
-Two tiers, mirroring python-hl7 (tolerant) / hl7apy (strict):
+Two tiers, mirroring HL7 v2's built-in tolerant parser / hl7apy (strict):
 
 * **Tolerant (the hot path):** :class:`~messagefoundry.parsing.dicom.peek.DicomPeek` — a cheap shallow
   read of ``SOPClassUID``/``Modality``/study-series-instance UIDs for routing (``stop_before_pixels``,
@@ -25,7 +25,7 @@ Two tiers, mirroring python-hl7 (tolerant) / hl7apy (strict):
   full header + SR ``ContentSequence`` walk (headers/SR only — **no pixel data, no ``numpy``**), lazily
   pulling the optional ``messagefoundry[dicom]`` extra (``pydicom``).
 
-DICOM ↔ HL7 v2 mapping stays in code-first Handlers (``DicomDataset`` in → python-hl7 ``Message`` out)
+DICOM ↔ HL7 v2 mapping stays in code-first Handlers (``DicomDataset`` in → HL7 ``Message`` out)
 via the :mod:`~messagefoundry.parsing.dicom.hl7_map` helpers, never a declarative mapper.
 """
 

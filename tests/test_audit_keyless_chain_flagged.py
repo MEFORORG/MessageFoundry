@@ -292,8 +292,12 @@ async def test_both_server_backends_report_a_keyless_chain_on_a_keyed_store(
         async def fetchrow(self, sql: str, *_a: Any) -> Any:
             return await _fetchone(sql)
 
-        async def execute(self, sql: str, *_a: Any) -> None:
+        async def execute(self, sql: str, *_a: Any) -> str:
             written.append(sql)
+            return "INSERT 0 1"  # asyncpg's tag: one keying row went in
+
+        async def fetchone(self) -> tuple[int]:
+            return (1,)  # SQL Server's guarded INSERT OUTPUT: one keying row went in
 
     @contextlib.asynccontextmanager
     async def _conn() -> Any:

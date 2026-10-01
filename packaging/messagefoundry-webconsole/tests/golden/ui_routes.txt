@@ -6,6 +6,7 @@ GET /ui/account/password
 GET /ui/account/sessions
 GET /ui/ad-groups
 GET /ui/alerts
+GET /ui/alerts/{alert_id}/reason
 GET /ui/approvals
 GET /ui/audit
 GET /ui/cluster
@@ -14,10 +15,12 @@ GET /ui/cluster/live
 GET /ui/cluster/stepdown-confirm
 GET /ui/config
 GET /ui/connection/{name}
+GET /ui/connection/{name}/events/{event_id}/reason
 GET /ui/connections
 GET /ui/connections/purge-confirm
 GET /ui/dead-letters
 GET /ui/events
+GET /ui/events/{event_id}/reason
 GET /ui/login
 GET /ui/messages
 GET /ui/messages/search

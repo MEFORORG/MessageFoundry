@@ -206,7 +206,8 @@ def test_release_load_bearing_canaries_present() -> None:
         "SLSA attest action pinned": "uses: actions/attest-build-provenance@",
         "SLSA subjects incl SBOM + VEX": (
             'subject-path: "dist/*.tar.gz, dist/*.whl, '
-            'messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"'
+            "messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json, "
+            'messagefoundry-sbom-windows.cdx.json"'
         ),
         # PyPI publish via the pinned pypa action, tag-gated, reading the clean staging dir
         "PyPI publish action pinned": "uses: pypa/gh-action-pypi-publish@",
@@ -218,6 +219,96 @@ def test_release_load_bearing_canaries_present() -> None:
     }
     missing = [name for name, tok in required.items() if tok not in rel]
     assert not missing, f"release.yml lost these load-bearing guards: {missing}"
+
+
+#: The Windows-resolved engine SBOM, built by the unprivileged `sbom-windows` job and shipped by the
+#: `release` job beside the Linux one (docs/SUPPLY-CHAIN.md, ADR 0149's 2026-09-30 amendment).
+_WINDOWS_SBOM = "messagefoundry-sbom-windows.cdx.json"
+_ENGINE_SBOMS = ("messagefoundry-sbom.cdx.json", _WINDOWS_SBOM)
+
+
+def test_the_windows_sbom_is_built_unprivileged_and_shipped_like_the_linux_one() -> None:
+    """The Windows SBOM must reach every sink the Linux SBOM reaches, and be built without the key.
+
+    Each assertion names a way it silently goes wrong:
+
+    - the job must run on a WINDOWS runner, because only a Windows interpreter resolves the core lock's
+      ``sys_platform`` markers as a Windows install does -- moved to Linux, it is a second Linux SBOM
+      with a Windows filename;
+    - it holds ``contents: read`` ONLY, so nothing it runs sits beside the signing identity;
+    - it runs exactly when ``release`` does: the same job ``if:``, and ``release`` needs it, so a
+      release cannot proceed without the file or ship one from a skipped job;
+    - its upload refuses a missing file, rather than failing two jobs later at the download;
+    - the ``release`` job downloads it, and it is signed, SLSA-attested, attached to the GitHub
+      release and uploaded as a workflow artifact. Both engine SBOMs are held to those four sinks, so
+      neither can drop out of one while the other still reaches it.
+    """
+    jobs = _jobs()
+    win, rel = jobs.get("sbom-windows"), jobs.get("release")
+    assert win and rel, "release.yml lost its `sbom-windows` or `release` job"
+
+    assert win.get("runs-on") == "windows-latest", win.get("runs-on")
+    assert win.get("permissions") == {"contents": "read"}, win.get("permissions")
+    assert _despace(str(win.get("if"))) == _despace(str(rel.get("if"))), (
+        f"sbom-windows and release must share one job guard: {win.get('if')!r} vs {rel.get('if')!r}"
+    )
+    needs = rel.get("needs")
+    assert "sbom-windows" in ([needs] if isinstance(needs, str) else list(needs or [])), needs
+
+    uploads = [
+        st
+        for st in win.get("steps") or []
+        if str(st.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1, f"sbom-windows has {len(uploads)} artifact uploads"
+    assert uploads[0]["with"].get("if-no-files-found") == "error", uploads[0]["with"]
+    artifact = uploads[0]["with"]["name"]
+    assert uploads[0]["with"]["path"] == _WINDOWS_SBOM
+
+    steps = rel.get("steps") or []
+    downloads = [
+        st
+        for st in steps
+        if str(st.get("uses", "")).startswith("actions/download-artifact@")
+        and (st.get("with") or {}).get("name") == artifact
+    ]
+    assert len(downloads) == 1, (
+        f"release downloads the {artifact!r} artifact {len(downloads)} times"
+    )
+
+    def body(pred: Callable[[dict], bool]) -> str:
+        hits = [st for st in steps if pred(st)]
+        assert len(hits) == 1, f"expected exactly one matching step, found {len(hits)}"
+        return _executed_shell(str(hits[0].get("run") or "")) + str(hits[0].get("with") or "")
+
+    # THE SIGN COMMAND ITSELF, continuations joined, not the whole step: the step's `ls -l` names the
+    # file's `.sigstore*` bundle too, so a whole-body match stayed green with the file dropped from
+    # `sigstore sign`. Measured by that mutation while writing this test.
+    signing = body(lambda st: "python -m sigstore sign" in str(st.get("run") or ""))
+    sign_cmd = [
+        ln for ln in signing.replace("\\\n", " ").splitlines() if "python -m sigstore sign" in ln
+    ]
+    assert len(sign_cmd) == 1, f"expected one `sigstore sign` command, found {sign_cmd}"
+    sinks = {
+        "Sigstore signing": sign_cmd[0],
+        "SLSA attestation": body(
+            lambda st: str(st.get("uses", "")).startswith("actions/attest-build-provenance@")
+        ),
+        "GitHub release assets": body(lambda st: "gh release create" in str(st.get("run") or "")),
+        "workflow artifact upload": body(
+            lambda st: str(st.get("uses", "")).startswith("actions/upload-artifact@")
+        ),
+    }
+    missing = [(f, sink) for f in _ENGINE_SBOMS for sink, text in sinks.items() if f not in text]
+    assert not missing, f"an engine SBOM does not reach these sinks: {missing}"
+    # The Sigstore bundle must ride along wherever the file does, or an operator cannot verify it.
+    unbundled = [
+        (f, sink)
+        for f in _ENGINE_SBOMS
+        for sink in ("GitHub release assets", "workflow artifact upload")
+        if f"{f}.sigstore" not in sinks[sink]
+    ]
+    assert not unbundled, f"an engine SBOM ships without its Sigstore bundle: {unbundled}"
 
 
 #: The two halves every publish/release guard in release.yml must carry.

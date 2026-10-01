@@ -18,7 +18,6 @@ from messagefoundry.config.wiring import (
     _check_accepts_predicate,
     message_type_of,
 )
-from messagefoundry.parsing._backend import backend
 from messagefoundry.parsing.message import Message, RawMessage
 
 _ADT = (
@@ -30,23 +29,21 @@ _ORU = "MSH|^~\\&|A|B|C|D|20200101||ORU^R01|MSG1|P|2.5\rOBR|1\r"
 _ADT_CODE_ONLY = "MSH|^~\\&|A|B|C|D|20200101||ADT|MSG1|P|2.5\r"
 
 
-@pytest.mark.parametrize("builtin", [True, False], ids=["builtin", "python_hl7"])
-def test_component_wise_match_three_component_and_custom_sep(builtin: bool) -> None:
+def test_component_wise_match_three_component_and_custom_sep() -> None:
     """AC-5: matches a conformant 3-component MSH-9 and a custom component separator (never a whole-field
     caret-literal compare)."""
-    with backend(builtin=builtin):
-        adt = Message.parse(_ADT)
-        assert message_type_of("ADT^A01")(adt) is True  # 3-component source, 2-component spec
-        assert message_type_of("ADT^A01^ADT_A01")(adt) is True  # structure component ignored
-        assert message_type_of("ADT")(adt) is True  # code-only
-        assert message_type_of("ADT^*")(adt) is True  # wildcard trigger
-        assert message_type_of("*^A01")(adt) is True  # wildcard code
-        assert message_type_of("ORU^R01")(adt) is False
-        assert message_type_of("ADT^A02")(adt) is False  # right code, wrong trigger
-        assert message_type_of("ORU^R01", "ADT^A01")(adt) is True  # variadic union
+    adt = Message.parse(_ADT)
+    assert message_type_of("ADT^A01")(adt) is True  # 3-component source, 2-component spec
+    assert message_type_of("ADT^A01^ADT_A01")(adt) is True  # structure component ignored
+    assert message_type_of("ADT")(adt) is True  # code-only
+    assert message_type_of("ADT^*")(adt) is True  # wildcard trigger
+    assert message_type_of("*^A01")(adt) is True  # wildcard code
+    assert message_type_of("ORU^R01")(adt) is False
+    assert message_type_of("ADT^A02")(adt) is False  # right code, wrong trigger
+    assert message_type_of("ORU^R01", "ADT^A01")(adt) is True  # variadic union
 
-        custom = Message.parse(_ADT_CUSTOM_SEP)  # MSH-2 component sep is '@'
-        assert message_type_of("ADT^A01")(custom) is True
+    custom = Message.parse(_ADT_CUSTOM_SEP)  # MSH-2 component sep is '@'
+    assert message_type_of("ADT^A01")(custom) is True
 
 
 def test_code_only_message_matches_code_specs() -> None:

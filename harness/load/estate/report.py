@@ -20,7 +20,16 @@ from dataclasses import dataclass, field
 EXIT_OK = 0
 EXIT_SLO_VIOLATION = 1
 
-SCHEMA_VERSION = 1
+# 2 since BACKLOG #2011: records gained `rate_window`, `in_hold_samples` and `make_up_samples`, and
+# every rate-derived value moved to the window `runner._throughput_rates` defines.
+SCHEMA_VERSION = 2
+
+#: Names the window an estate record's rates were computed over (BACKLOG #2011). The window, and what
+#: moved when it changed, are defined once in `harness.load.estate.runner._throughput_rates`. No reader
+#: in this tree consumes the field yet; it exists so a later one can tell the two populations apart,
+#: and renaming the name or the value would hide that split from it. It is owned here, not imported
+#: from the connscale report: the two harnesses mark their own windows.
+RATE_WINDOW = "in_hold_excl_drain"
 
 
 @dataclass(frozen=True)
@@ -54,8 +63,8 @@ class EstateRecord:
     # --- calibration target vs achieved (EVENTS, not messages — the load-bearing readout) ---
     target_total_event_rate: float  # per_conn_event_rate × count
     target_per_conn_event_rate: float
-    achieved_written_per_s: float  # engine delivery msg/s over the hold (Δwritten / Δt)
-    achieved_read_per_s: float  # engine intake msg/s over the hold (Δread / Δt)
+    achieved_written_per_s: float  # engine delivery msg/s over the rate window (Δwritten / Δt)
+    achieved_read_per_s: float  # engine intake msg/s over the rate window (Δread / Δt)
     achieved_total_event_rate: float  # read/s + written/s = in + out events/sec
     achieved_per_conn_event_rate: float  # achieved_total_event_rate / count
 
@@ -74,6 +83,12 @@ class EstateRecord:
     ack_p95_ms: float
     ack_p99_ms: float
 
+    # --- the rate window: how many readings the achieved rates were read over, and how many of those
+    # were make-up readings taken after the sampler stopped. Required, so a record can never carry the
+    # RATE_WINDOW marker without the counts it was read from. ---
+    in_hold_samples: int
+    make_up_samples: int
+
     # --- headroom: CPU-per-event denominator (None where the OS probe couldn't read) ---
     cpu_seconds_total: float | None = None
     cpu_util_cores_mean: float | None = None
@@ -84,6 +99,9 @@ class EstateRecord:
     def to_json_dict(self) -> dict[str, object]:
         return {
             "count": self.count,
+            "rate_window": RATE_WINDOW,
+            "in_hold_samples": self.in_hold_samples,
+            "make_up_samples": self.make_up_samples,
             "shape": {
                 "simple_count": self.simple_count,
                 "hub_count": self.hub_count,
@@ -187,6 +205,18 @@ class EstateReport:
                 f"{('ok' if r.no_loss.ok else 'FAIL'):>8}{_na(_round_or_none(r.cpu_us_per_event, 2)):>11}"
                 f"{r.ack_p99_ms:>9.1f}"
             )
+        lines.append(f"rates: rate_window={RATE_WINDOW} (the post-drain final is excluded)")
+        for r in self.records:
+            if r.in_hold_samples < 2:
+                lines.append(
+                    f"WARNING: N={r.count} rates were read over {r.in_hold_samples} reading(s); a "
+                    "rate window needs two, so its achieved rates read 0.0, not a measured zero"
+                )
+            elif r.make_up_samples:
+                lines.append(
+                    f"note: N={r.count} rate window ends on {r.make_up_samples} make-up reading(s) "
+                    "taken after the sampler stopped, so it may run past the hold"
+                )
         lines.append("")
         lines.append("SLOs:")
         if not self.slos:

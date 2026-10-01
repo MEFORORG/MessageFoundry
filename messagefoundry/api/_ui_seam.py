@@ -256,6 +256,11 @@ from typing import Any
 #: BACKLOG #2436 (ASVS 14.2.6, owner ruling R12): ``get_message`` gained a second keyword,
 #: ``reveal_errors``, on the same terms and with the same blind spot. The digest did not move.
 #:
+#: BACKLOG #2443 (ASVS 14.2.6, owner ruling R12): ``list_connection_events`` and
+#: ``list_active_alerts`` gained the keyword ``reveal``, and ``list_active_alerts`` now takes
+#: ``request``; the console passes both. ``ConnectionEventInfo`` and ``AlertInstanceInfo`` now
+#: subclass ``PhiGatedModel``, with the same fields. Same blind spot again: the digest did not move.
+#:
 #: BACKLOG #2015: discovery now reads every name the console imports from ``auth.service``, not
 #: only ``AuthService``. Those include step-up action constants, an exception, and result
 #: dataclasses whose fields the console reads; ``tests/test_seam_discovery.py`` pins the set.
@@ -269,7 +274,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "10a6cc7c95459dcc"
+ENGINE_UI_SEAM: str = "32ad621e6081555e"
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,7 +449,7 @@ class UiDeps:
     #: Whether to interpose the "you are leaving this site" page at all. On by default; off is a
     #: posture decision and the serve gate says so.
     external_link_interstitial: bool = True
-    #: ⚠️ The audited escape — destinations navigated to with NO notification and NO cancel, which is
+    #: WARNING: The audited escape — destinations navigated to with NO notification and NO cancel, which is
     #: exactly what 3.7.3 asks for. Non-empty produces a startup warning naming every entry.
     external_link_allowlist: tuple[str, ...] = ()
     #: Host of the configured IdP authorization endpoint, for DISPLAY on the interstitial. Derived

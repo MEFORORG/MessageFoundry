@@ -413,9 +413,9 @@ def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
 
     Reads ``VERIFY_CRL_CHECK_LEAF`` off the context itself rather than trusting that some setting was
     configured somewhere. That distinction is the whole point: ``[tls].crl_file`` is instance-wide, but
-    the hops it reaches are not — an ``ldap3.Tls`` or a ``truststore`` context is built by a library that
-    never sees the policy, so a setting-shaped test would report "revocation is checked" for a handshake
-    that checks nothing. Asking the object that performs the handshake cannot make that mistake.
+    the hops it reaches are not — the LDAPS context loads no CRL, and a ``truststore`` context is
+    built by a library that never sees the policy, so a setting-shaped test would report "revocation
+    is checked" for a handshake that checks nothing. Asking the object that performs the handshake cannot make that mistake.
 
     ``None`` (no context — a hop that is not TLS, or a caller that has none to hand) is ``False``:
     absent evidence is not evidence of checking.
@@ -1168,9 +1168,9 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
     so the failure is never blamed on an operator's ``tls_ciphers``.
 
     **Reach.** Every engine-built context that narrows its suites, through
-    :func:`narrow_to_approved_suites` or :func:`apply_operator_tls_ciphers`. At least these are not
-    reached: the LDAPS hop, whose context ldap3 builds from arguments that carry no signature list,
-    and the contexts outside this module (``apiclient``, ``tray``, ``tls_probe``).
+    :func:`narrow_to_approved_suites` or :func:`apply_operator_tls_ciphers`, the LDAPS hop included
+    since BACKLOG #2494 (:func:`assert_ldap3_tls_suites`). At least these are not reached: the
+    contexts outside this module (``apiclient``, ``tray``, ``tls_probe``).
 
     A ``truststore.SSLContext`` is narrowed through its inner context, as in
     :func:`narrow_tls13_suites` and for the same reason."""
@@ -1373,118 +1373,83 @@ def urllib_handler_context(
     return ctx
 
 
-#: The ``ldap3.Tls`` keyword arguments :func:`assert_ldap3_tls_suites` can faithfully replicate.
-#:
-#: These are the three the engine passes, and each is measured: ``validate`` becomes ``verify_mode``
-#: (no effect on the suite list, replicated anyway so the probe mirrors ldap3's construction rather
-#: than approximating it), ``ca_certs_data`` changes the trust anchors and not one entry of the
-#: negotiable suite list, and ``ciphers`` is the suite list itself. Every OTHER ``Tls`` argument is
-#: REFUSED rather than ignored.
-#:
-#: ``ca_certs_file`` left this set in BACKLOG #2034. The bind now hands ldap3 the checked bytes rather
-#: than the path, so a path here would mean the bind reads the anchor again, after its check. Refusing
-#: it turns that regression into a construction-time error.
-#:
-#: ``ciphers`` joined in BACKLOG #300 (owner ruling 2026-09-27: narrow the library-built contexts
-#: too). It is admitted for ONE value only, the approved TLS 1.2 list joined by ``:``, and it is
-#: REQUIRED. The function's docstring says why any other value must still be refused.
-_LDAP3_TLS_REPLICABLE_KWARGS = frozenset({"validate", "ca_certs_data", "ciphers"})
+def _narrow_library_context(ctx: ssl.SSLContext, *, connector: str, hop: str) -> None:
+    """:func:`narrow_to_approved_suites` for a library-built hop, a refusal re-raised as ValueError.
 
-
-def assert_ldap3_tls_suites(tls_kwargs: Mapping[str, object], *, connector: str) -> None:
-    """Assert the suite list of the context ``ldap3`` will build from these ``Tls`` arguments.
-
-    The LDAPS sibling of :func:`build_asserted_https_handler`, and the one site where that function's
-    method — hold the library's OWN context and check it — is **not available**. Measured: an
-    ``ldap3.Tls`` carries zero ``SSLContext`` attributes. It stores the arguments and builds the context
-    inside ``Tls.wrap_socket`` at connect time, from ``create_default_context(Purpose.SERVER_AUTH,
-    cafile=...)`` followed by ``check_hostname = False`` and ``verify_mode = validate``; there is no
-    ``ssl_context=`` parameter to inject one through. So the engine can never hold the object this hop
-    will use, and the identity check the urllib openers get in
-    ``tests/test_tls_cipher_assertion_sites.py`` is impossible here.
-
-    This therefore rebuilds ldap3's construction and asserts THAT. It is a weaker guarantee than
-    identity, and it is only honest because the gap is closed by measurement rather than by argument:
-    ``test_the_ldaps_replica_matches_the_context_ldap3_actually_builds`` drives ldap3's **real**
-    ``wrap_socket`` over a socketpair, captures the ``SSLContext`` off the resulting ``SSLSocket``, and
-    requires its suite list to equal this one's. If ldap3 changes how it builds that context, the
-    replica stops matching and that test goes red.
-
-    **It REFUSES any ``Tls`` argument it cannot replicate, and that refusal is load-bearing.** An
-    argument outside :data:`_LDAP3_TLS_REPLICABLE_KWARGS` raises here rather than being replicated
-    wrongly or passed over in silence.
-
-    **``ciphers`` is REQUIRED, and only one value passes (BACKLOG #300).** The owner ruled on
-    2026-09-27 that the library-built contexts are narrowed to the approved list too, and ldap3 takes
-    a suite list only as this string. Any other value is a trap: ``ldap3/core/tls.py`` wraps
-    ``set_ciphers`` in ``except ssl.SSLError: pass``, so a string OpenSSL rejects is **swallowed
-    silently**. Measured, the hop then drops to 3 TLS 1.3 suites with the TLS 1.2 list emptied, and
-    nothing reports it. So the value must equal :data:`APPROVED_TLS12_SUITES` joined by ``:``, which
-    carries no ``@`` directive, and the replica applies it with a ``set_ciphers`` that does NOT
-    swallow. A string OpenSSL rejects fails here, at construction, and never reaches ldap3. A missing
-    ``ciphers`` is refused too, so the hop cannot fall back to the interpreter's wider list while this
-    check still passes.
-
-    The replica is then held to the approved list itself, not only to the four properties
-    :func:`harden_cipher_suites` checks: it must offer at least one TLS 1.2 suite, and every suite
-    must be in :data:`_APPROVED_TLS_SUITES`. Not the whole list: ``set_ciphers`` drops a name the
-    OpenSSL build lacks, such as ChaCha20 on a FIPS build, and every engine seam allows that. ldap3
-    cannot narrow TLS 1.3, and
-    on CPython 3.14 nothing can (:func:`narrow_tls13_suites` says why). On an interpreter where the
-    engine CAN drop ``TLS_AES_128_GCM_SHA256``, the allow-list drops it and this refuses LDAPS, which
-    fails closed; ``tests/test_tls_default_suites.py`` goes red that day so this is re-derived.
-
-    ``ca_certs_data`` is accepted and deliberately **not loaded**: it changes the trust anchors and not
-    one entry of the suite list (measured). ``ca_certs_file`` is refused, because the bind loads the
-    checked bytes and never the path (BACKLOG #2034).
-
-    Raises :class:`ValueError` at construction, like every other assertion site.
-    """
-    unreplicable = sorted(set(tls_kwargs) - _LDAP3_TLS_REPLICABLE_KWARGS)
-    if unreplicable:
-        raise ValueError(
-            f"{connector}: cannot assert this hop's TLS suites — ldap3.Tls argument(s) "
-            f"{', '.join(unreplicable)} change the context ldap3 builds in a way this check does not "
-            f"replicate, so it would be asserting a context the hop will not use."
-        )
-    validate = tls_kwargs.get("validate")
-    if not isinstance(validate, int):
-        raise ValueError(
-            f"{connector}: cannot assert this hop's TLS suites — no `validate` given, so the peer "
-            f"verification mode ldap3 will apply is unknown. Refusing rather than guessing it."
-        )
-    approved = ":".join(APPROVED_TLS12_SUITES)
-    if tls_kwargs.get("ciphers") != approved:
-        raise ValueError(
-            f"{connector}: ldap3.Tls must be given `ciphers` equal to the approved TLS 1.2 list "
-            f"({approved}) and nothing else (BACKLOG #300). A missing value leaves the interpreter's "
-            f"wider list in place, and ldap3 SWALLOWS a string OpenSSL rejects (except "
-            f"ssl.SSLError: pass), which silently strips every TLS 1.2 suite."
-        )
-    ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
-    # Order is ldap3's, and it matters: check_hostname must go False BEFORE verify_mode, or setting
-    # CERT_NONE on a hostname-checking context raises. (ldap3 runs its own hostname check after the
-    # handshake instead — `check_hostname(...)` at the end of Tls.wrap_socket.) ldap3 applies the
-    # cipher string last, as here, and without an @SECLEVEL prefix, which keeps the level.
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.VerifyMode(validate)
+    The ldap3 and hvac factories share it. Each still calls :func:`harden_cipher_suites` itself
+    after it, so the call-site guards see the assertion at each seam by name."""
     try:
-        ctx.set_ciphers(approved)
-    except ssl.SSLError as exc:
+        narrow_to_approved_suites(ctx)  # TLS 1.2, TLS 1.3 and sigalgs (BACKLOG #300, #2494)
+    except (ssl.SSLError, RuntimeError) as exc:
         raise ValueError(
-            f"{connector}: this OpenSSL build selects none of the approved TLS 1.2 suites "
-            f"({approved}), so ldap3 would silently offer no TLS 1.2 suite (BACKLOG #300)."
+            f"{connector}: this OpenSSL build refuses the approved suite list, so {hop} cannot "
+            f"be narrowed (BACKLOG #300): {exc}"
         ) from exc
-    harden_cipher_suites(ctx, connector=connector)
+
+
+def _hold_to_approved_list(ctx: ssl.SSLContext, *, connector: str, hop: str) -> None:
+    """Refuse ``ctx`` unless it offers a TLS 1.2 suite and every suite is on the approved list.
+
+    Not the whole list: ``set_ciphers`` drops a name the OpenSSL build lacks, such as ChaCha20 on a
+    FIPS build, and every engine seam allows that. The library-built hops run this after
+    :func:`harden_cipher_suites`, which checks four properties and not the list (owner ruling
+    2026-09-27, BACKLOG #300)."""
     ciphers = ctx.get_ciphers()
     tls12 = [c for c in ciphers if c.get("protocol") != "TLSv1.3"]
     unlisted = sorted({str(c.get("name", "?")) for c in ciphers} - _APPROVED_TLS_SUITES)
     if not tls12 or unlisted:
         raise ValueError(
-            f"{connector}: the TLS context ldap3 will build is not narrowed to the approved list "
-            f"(ASVS 12.1.2, BACKLOG #300). TLS 1.2 suites: {len(tls12)}. Unlisted: "
-            f"{', '.join(unlisted) or 'none'}."
+            f"{connector}: {hop} is not narrowed to the approved list (ASVS 12.1.2, BACKLOG "
+            f"#300). TLS 1.2 suites: {len(tls12)}. Unlisted: {', '.join(unlisted) or 'none'}."
         )
+
+
+def assert_ldap3_tls_suites(
+    *, validate: ssl.VerifyMode, ca_certs_data: str | None, connector: str
+) -> Callable[[], ssl.SSLContext]:
+    """Build and assert the LDAPS hop's TLS context; return the factory that builds it.
+
+    The LDAPS sibling of :func:`assert_hvac_tls_suites`, and the same shape since BACKLOG #2494.
+    ldap3 2.9.1 builds its own context inside ``Tls.wrap_socket`` and offers no way in, and
+    ``ciphers=`` was its only suite lever. That lever reaches TLS 1.2 only, so on an interpreter
+    that can drop ``TLS_AES_128_GCM_SHA256`` (owner ruling R4, :func:`narrow_tls13_suites`) the old
+    assertion refused LDAPS. A first deployment on Python 3.15 would have lost directory sign-in.
+
+    **So the engine builds the context, and ldap3 only wraps the socket with it.**
+    ``messagefoundry.auth.ldap_tls.NarrowedTls`` is the engine's ``ldap3.Tls``. Its ``wrap_socket``
+    calls the factory this returns, once per connection, as ldap3 built one per connection. The
+    factory keeps what ldap3 did, in ldap3's order:
+
+    * ``ssl.create_default_context(Purpose.SERVER_AUTH, cadata=...)``, the call ldap3 makes, so CA
+      loading is the same: the checked bytes when a CA is configured, else the OS trust store. The
+      bytes, never a path (BACKLOG #2034), so no bind reads the anchor again after its check;
+    * ``check_hostname = False`` before ``verify_mode = validate``, because ldap3 checks the host
+      name itself after the handshake, and ``NarrowedTls`` still calls ldap3's own check.
+
+    It then adds the engine posture every other seam carries: a TLS 1.2 floor, strict X.509 flags
+    when it verifies, the approved key-exchange groups (:func:`harden_kex_groups`), and
+    :func:`narrow_to_approved_suites`, which sets the TLS 1.2 suites, the TLS 1.3 suites and the
+    signature schemes wherever the interpreter allows each. Then :func:`harden_cipher_suites`
+    asserts it, and :func:`_hold_to_approved_list` holds it to the approved list. This runs the
+    factory once before returning, so a narrowing that stopped working fails at construction.
+    Raises :class:`ValueError`, like every other assertion site.
+    """
+
+    def narrowed_context() -> ssl.SSLContext:
+        ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cadata=ca_certs_data)
+        ctx.check_hostname = False  # ldap3's order: before CERT_NONE, or setting it raises
+        ctx.verify_mode = validate
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        if validate != ssl.CERT_NONE:
+            harden_verify_flags(ctx)
+        harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+        _narrow_library_context(ctx, connector=connector, hop="the LDAPS TLS context")
+        harden_cipher_suites(ctx, connector=connector)
+        _hold_to_approved_list(ctx, connector=connector, hop="the LDAPS TLS context")
+        return ctx
+
+    narrowed_context()  # fail at construction, not on the first bind
+    return narrowed_context
 
 
 #: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` admits UNCONDITIONALLY.
@@ -1631,23 +1596,9 @@ def assert_hvac_tls_suites(
 
     def narrowed_context() -> ssl.SSLContext:
         ctx = create_urllib3_context()
-        try:
-            narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
-        except (ssl.SSLError, RuntimeError) as exc:
-            raise ValueError(
-                f"{connector}: this OpenSSL build refuses the approved suite list, so the Vault "
-                f"TLS context cannot be narrowed (BACKLOG #300): {exc}"
-            ) from exc
+        _narrow_library_context(ctx, connector=connector, hop="the Vault TLS context")
         harden_cipher_suites(ctx, connector=connector)
-        ciphers = ctx.get_ciphers()
-        tls12 = [c for c in ciphers if c.get("protocol") != "TLSv1.3"]
-        unlisted = sorted({str(c.get("name", "?")) for c in ciphers} - _APPROVED_TLS_SUITES)
-        if not tls12 or unlisted:
-            raise ValueError(
-                f"{connector}: the Vault TLS context is not narrowed to the approved list (ASVS "
-                f"12.1.2, BACKLOG #300). TLS 1.2 suites: {len(tls12)}. Unlisted: "
-                f"{', '.join(unlisted) or 'none'}."
-            )
+        _hold_to_approved_list(ctx, connector=connector, hop="the Vault TLS context")
         return ctx
 
     narrowed_context()  # fail at construction, not on the first connection

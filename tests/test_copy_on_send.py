@@ -7,8 +7,7 @@ bytes, on the shape every transform path funnels through), AC-11 (flag OFF is by
 the caller's reference and a divergent fan-out collapses to last-write, exactly as before), and the
 propagation guards: the run-context provider activates only in the transform phase, all three
 transform-phase ``RunContext`` builders thread the flag (the fused silent-miss backstop), the sandbox
-marshalling carries the scalar, and a snapshotted ``Send.message`` survives the sandbox IPC codec on
-both backends.
+marshalling carries the scalar, and a snapshotted ``Send.message`` survives the sandbox IPC codec.
 """
 
 from __future__ import annotations
@@ -31,7 +30,6 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.parsing._backend import backend
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline._sandbox_codec import (
     _Blobs,
@@ -193,25 +191,23 @@ def test_marshalled_run_context_carries_flag() -> None:
     assert _rc_round_trip(RunContext()).snapshot_on_send is False
 
 
-@pytest.mark.parametrize("builtin", [True, False], ids=["builtin", "python_hl7"])
-def test_snapshotted_send_message_survives_the_sandbox_codec(builtin: bool) -> None:
-    """AC-4: a snapshotted ``Send.message`` survives the child→parent marshalling on both backends and
+def test_snapshotted_send_message_survives_the_sandbox_codec() -> None:
+    """AC-4: a snapshotted ``Send.message`` survives the child→parent marshalling and
     still encodes identically (so ``send.message.encode()`` succeeds in the parent).
 
     Re-pointed from pickle to the MFW2 codec, which is the path the engine actually uses now; leaving
     it on pickle would have kept asserting a route the engine no longer takes (a false green)."""
-    with backend(builtin=builtin):
-        msg = Message.parse(_ADT)
-        with run_contexts(RunContext(snapshot_on_send=True), phase="transform"):
-            send = Send("OB_A", msg)
-        assert send.message is not msg
-        blobs = _Blobs()
-        node = enc_result("transform", send, blobs)
-        restored = dec_result("transform", node, _Reader(blobs.items))
-        # The codec carries the ENCODED text, so the parent's Send.message is already the str
-        # dryrun's `send.message if isinstance(..., str) else .encode()` would have produced.
-        assert isinstance(restored, Send)
-        assert restored.message == msg.encode()
+    msg = Message.parse(_ADT)
+    with run_contexts(RunContext(snapshot_on_send=True), phase="transform"):
+        send = Send("OB_A", msg)
+    assert send.message is not msg
+    blobs = _Blobs()
+    node = enc_result("transform", send, blobs)
+    restored = dec_result("transform", node, _Reader(blobs.items))
+    # The codec carries the ENCODED text, so the parent's Send.message is already the str
+    # dryrun's `send.message if isinstance(..., str) else .encode()` would have produced.
+    assert isinstance(restored, Send)
+    assert restored.message == msg.encode()
 
 
 def test_provider_registered_before_unmapped_capture() -> None:

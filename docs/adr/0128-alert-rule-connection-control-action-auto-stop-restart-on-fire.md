@@ -1,6 +1,8 @@
 # ADR 0128 — Alert-rule connection-control action (auto stop/restart on fire)
 
 - **Status:** Accepted (2026-07-17) — demand-gate build (lane `dg-s1a`); pushes/PR owner-approved.
+  Amended 2026-09-30 (BACKLOG #1898): `control_action` is refused at load on an event type that is not
+  connection-scoped. See the amendment under §1.
 - **Built:** Yes — additive. `AlertRule.control_action` / `control_target` in
   [`config/settings.py`](../../messagefoundry/config/settings.py), carried through
   `AlertRuleSet.decide → _RuleDecision`, dispatched by
@@ -31,6 +33,17 @@ its `_RuleDecision` carries the action; there is **no embedded code/expression**
 §1's "typed data, never `eval`"). The whitelist is exactly the two warm-restart primitives — `stop` +
 `start` alone are not offered (a bare stop with no re-arm is an easy way to silently wedge a feed; a
 restart is the safe remediation an operator actually wants).
+
+**Amendment (BACKLOG #1898, 2026-09-30).** `control_action` is now allowed only with a connection-scoped
+`event_type`: the set `_ALERT_CONTROL_EVENT_TYPES` in
+[`config/settings.py`](../../messagefoundry/config/settings.py). `AlertRule` refuses the pair at config
+load for `"any"` and every other type. The other types put a stand-in in `connection`, such as a bare
+username, `store` or a cert label. A stand-in that fits the connection-name grammar would have
+restarted an unrelated connection. A `control_target`, when set, must be a connection name on a rule
+that has a `control_action`. `NotifierAlertSink._emit` also skips the action, logged, for an event
+outside the set; that reaches only a rule built past the validator. At least two gaps stay open, and
+the comment on the set names them: stand-ins raised under `connection_stopped`, and an inbound or
+outbound name reaching the restart for the other side.
 
 ### §2 — The sink is DECOUPLED from the runner: an INJECTED async callback
 

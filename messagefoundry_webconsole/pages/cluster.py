@@ -46,8 +46,9 @@ _INTRO = (
 _NOTICES: dict[str, str] = {
     # "Lease", not "leadership": a self-fenced node no longer led when it released (BACKLOG #1988).
     "released": (
-        "Leadership lease released. A standby takes the lease on its next heartbeat. Before you start "
-        "maintenance, wait until the lease owner below has moved and this node's connections are quiet."
+        "Leadership lease released. A standby takes the lease on its next heartbeat, or after its "
+        "acquire delay if it has one. Before you start maintenance, wait until the lease owner below "
+        "has moved and this node's connections are quiet."
     ),
     "drained": (
         "Leadership lease released with force, and no other node could take over. Nothing does leader work "
@@ -229,7 +230,8 @@ def _leadership_state(cluster: ClusterStatus, nodes: ClusterNodeList) -> Markup:
         return el(
             "p",
             "Failover in progress: no node holds live leadership yet. A standby takes the lease on "
-            f"its next heartbeat. Nodes that can take it: {names}. This page refreshes every 5 seconds.",
+            "its next heartbeat, or after its acquire delay if it has one. Nodes that can take it: "
+            f"{names}. This page refreshes every 5 seconds.",
             class_="banner",
         )
     return el(
@@ -315,8 +317,8 @@ def _controls(cluster: ClusterStatus, nodes: ClusterNodeList, *, can_control: bo
         el(
             "p",
             "A planned stepdown makes this node release its leadership lease. A standby takes the "
-            "lease on its next heartbeat and starts the graph. This node keeps running as a standby; "
-            "it is not a shutdown.",
+            "lease on its next heartbeat, or after its acquire delay if it has one, and starts the "
+            "graph. This node keeps running as a standby; it is not a shutdown.",
             class_="muted",
         ),
     ]
@@ -429,8 +431,8 @@ def _planned_confirm_text(node: str, others: list[ClusterNode], *, holds: bool) 
     text = [
         el(
             "p",
-            f"{_releases(node, holds=holds)} A standby takes the lease on its next heartbeat and "
-            "starts the graph.",
+            f"{_releases(node, holds=holds)} A standby takes the lease on its next heartbeat, or "
+            "after its acquire delay if it has one, and starts the graph.",
         ),
         el(
             "p",
@@ -491,8 +493,9 @@ def _force_confirm_text(node: str, others: list[ClusterNode], *, holds: bool) ->
             "p",
             f"A forced drain does not stay drained. If no other node takes the lease, {node} takes it "
             "back on its first heartbeat after the stepdown pause, which lasts two heartbeats (20 "
-            "seconds at the shipped default). To keep leader work stopped for a maintenance window, "
-            "stop the service instead.",
+            "seconds at the shipped default) plus the longest acquire delay among the other "
+            "promotable nodes. To keep leader work stopped for a maintenance window, stop the "
+            "service instead.",
         ),
         el(
             "p",

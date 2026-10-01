@@ -150,8 +150,8 @@ def test_a_negative_cap_is_refused_at_build(build: Build, key: str, attr: str) -
 
 
 def test_the_dicom_scp_object_cap_reads_a_string_zero_as_uncapped() -> None:
-    """The SCP resolves an uncapped object size to the engine's ingress ceiling and keeps the
-    configured value for its inflate bound. ``"0"`` used to reach the inflate bound as a live zero, so
+    """The SCP resolves an uncapped object size to the engine's ingress ceiling, and its inflate bound
+    to the codec's inflate ceiling. ``"0"`` used to reach the inflate bound as a live zero, so
     every deflated object would have been refused while the object cap itself looked uncapped."""
     zero, string_zero = _SCP({"max_object_bytes": 0}), _SCP({"max_object_bytes": "0"})
     assert string_zero._max_object_bytes == zero._max_object_bytes

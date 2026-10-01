@@ -1,8 +1,22 @@
 # ADR 0133 — Alert escalation tiers, schedule-aware thresholds, and content-triggered alerts (the #56 remainder)
 
-- **Status:** Accepted (2026-07-18) — DEMAND-GATE-BACKLOG Wave 4 (lane `dg-s1b`) — **PARTIALLY BUILT; corrected 2026-09-09**, see **Built** below.  <!-- Proposed → Accepted → Superseded by NNNN / Rejected -->
+- **Status:** Accepted (2026-07-18) — DEMAND-GATE-BACKLOG Wave 4 (lane `dg-s1b`) — **PARTIALLY BUILT; corrected 2026-09-09**, see **Built** below. **D3 RETRACTED 2026-09-30 by owner ruling, not planned** (BACKLOG #1504); D1, D2 and D4 keep the build state the **Built** bullet records. See **Retraction of D3** below.  <!-- Proposed → Accepted → Superseded by NNNN / Rejected -->
+- **Retraction of D3 (2026-09-30).** The batch 183 Manager's record of the ruling, verbatim:
+  *"Owner ruling 2026-09-30, given to the batch 183 Manager in session: ADR 0133 D3 is retracted and
+  not planned, and the unreachable content_match plumbing is removed with it, in one engine PR."*
+  That PR is BACKLOG #1504. **What it removed:** at least `content_match` in `_ALERT_EVENT_TYPES`,
+  `AlertRule.content_label` and its filter in `AlertRuleSet`, and `NotifierAlertSink.content_match`.
+  It also removed the `label` fallback for an instance's `reason`, and `content_label` on the rules
+  API and in the alert-rule editor's field list. Three D3 tests went too. A rule naming
+  `event_type = "content_match"` or setting `content_label` is now refused at load, like any
+  unknown event type or key. **Why it is retracted rather than finished.** Two grounds, and this
+  bullet is where they are stated. First, nothing could fire it: a Handler is called with its
+  payload alone. Second, finishing it would break purity. A Handler that emits an alert performs an
+  external side effect, which the purity invariant (CLAUDE.md section 2) forbids. An at-least-once
+  re-run would emit it again, and D3's throttle only bounded that re-emit. The 2026-09-09 notes below
+  record the tree before the removal, so read their D3 facts as history.
 - **Built (re-verified against the tree 2026-09-09):** **D1, D2 and D4 are BUILT. D3 is NOT BUILT as a
-  reachable capability** — it is plumbing nothing outside the tests can fire. The words that stood on the
+  reachable capability** — it is plumbing nothing outside the tests can fire *(that plumbing was removed 2026-09-30)*. The words that stood on the
   Status line — *"Accepted (2026-07-18, built)"* — claimed all four decisions shipped. They are corrected
   here rather than deleted, because that is the sentence a reader would otherwise carry forward, and an
   unqualified "built" over a D3 with zero non-test callers over-claims what the tree delivers.
@@ -22,11 +36,14 @@
   - **BUILT — D4's column on all three backends.** `alert_instance.escalation_tier` on SQLite (`ALTER TABLE
     ADD COLUMN`, `store/store.py`), Postgres (`ADD COLUMN IF NOT EXISTS`, `store/postgres.py`) and SQL Server
     (`COL_LENGTH`-gated `ADD`, `store/sqlserver.py`), kept monotonic by `MAX`/`GREATEST`/`CASE`.
-  - **BUILT — D3's config and notifier half only.** `content_match` is in `_ALERT_EVENT_TYPES`
+  - **REMOVED 2026-09-30 (BACKLOG #1504); this bullet is history.** It read *"BUILT — D3's config
+    and notifier half only"*, and described the tree as of 2026-09-09.
+    `content_match` is in `_ALERT_EVENT_TYPES`
     (`config/settings.py`); `AlertRule.content_label` filters on it in `AlertRuleSet.decide`; and
     `NotifierAlertSink.content_match(connection, *, label, rule_id=None)` exists with the PHI-free shape this
     ADR specifies — no value parameter.
-  - **NOT BUILT — D3's reachability, which is the capability itself.** `content_match` is absent from the
+  - **RETRACTED 2026-09-30, not planned; this bullet is history.** It read *"NOT BUILT — D3's
+    reachability, which is the capability itself"*. `content_match` is absent from the
     `AlertSink` Protocol and from `LoggingAlertSink`, both in `pipeline/alerts.py`, while the engine holds
     its sink as `self._alert_sink: AlertSink` (`pipeline/wiring_runner.py`). So the type the engine programs
     against does not carry the method, and a deployment configuring no `[alerts]` transport gets
@@ -36,20 +53,26 @@
   - **D3's sentence "calls this via the alert sink the engine already threads into its runners" is FALSE as
     written**, and is kept below so the correction sits beside the claim. The engine threads a sink into its
     runners. It threads nothing into a Handler, and the threaded type lacks the method.
-  - **Every test this ADR names EXISTS.** `test_escalates_by_occurrence_count`, `test_schedule_aware_decide`,
+  - **Every test this ADR names EXISTS** *(true on 2026-09-09; see the correction at the end of this bullet)*. `test_escalates_by_occurrence_count`, `test_schedule_aware_decide`,
     `test_content_match_event_is_phi_free` and `test_content_match_reemit_is_idempotent` are all in
     `tests/test_alert_escalation.py`, and `test_three_backend_parity_columns` is in
     `tests/test_alert_state.py`. The defect is what AC-3 and AC-4 assert, not a missing test — see the note
-    under the Acceptance Criteria.
+    under the Acceptance Criteria. **CORRECTED 2026-09-30:** the two `content_match` tests were removed
+    with D3 (BACKLOG #1504). In their place, the same file pins that the event type and the
+    `content_label` key are refused and the emit method is absent.
   - **This is build state, not live impact.** There are zero deployments (CLAUDE.md section 0), so nothing
-    is exposed and no operator depends on this. The remainder is BACKLOG #81, which already records it.
+    is exposed and no operator depends on this. **CORRECTED 2026-09-30:** this bullet ended *"The
+    remainder is BACKLOG #81, which already records it."* D3 is no longer a remainder of anything. It is
+    retracted and not planned, so the only NOT BUILT part this ADR still records is D1's
+    operator-visible half. Narrowing #81 to match is a ledger edit in the maintainer-internal
+    repository, not in this one.
 - **Date:** 2026-07-18
 - **Related:** BACKLOG #81 (the confirmed remainder of #56) · **refines** [ADR 0014](0014-alerting-rules-engine.md)
   (the rules engine + the pure `AlertRuleSet.decide` + the per-`(type, connection)` throttle this escalation
   and content path ride) · **builds on** [ADR 0044](0044-operator-alert-state.md) (the resolvable
   `alert_instance` state; this adds the `escalation_tier` column beside the #143 `suspended_until` one) ·
   [ADR 0001](0001-staged-pipeline-architecture.md) (the at-least-once / **routers-and-transforms-must-be-pure**
-  invariant the content-trigger carve-out below reconciles) · [ADR 0095](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)
+  invariant the content-trigger carve-out below claimed to reconcile; it did not, and D3 is retracted) · [ADR 0095](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)
   (the `Schedule` / `ActiveWindow` model #147 built, **reused** verbatim for schedule-aware rules) ·
   [CLAUDE.md](../../CLAUDE.md) §2/§9 (PHI-free alerts, no new PHI tier) ·
   [`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py) ·
@@ -83,15 +106,18 @@ Two invariants bound the design and **must not** be relaxed:
   matched field value**.
 - **Routers and transforms must be pure (ADR 0001).** A Handler that emits a content-triggered alert
   performs a **side effect**; under at-least-once a stage re-run **re-emits** it. This must be reconciled
-  (below), not silently broken.
+  (below), not silently broken. **CORRECTED 2026-09-30:** it was not reconciled, and D3 is retracted
+  (see the D3 section).
 
 ## Decision
 
 **Add three additive, occurrence/severity-driven capabilities to the ADR 0014 rules layer + the ADR 0044
 state, all off by default and byte-identical when unconfigured.** Escalation and schedule-awareness are
 pure config on `AlertRule` evaluated synchronously on the existing emit path; content-triggers add one new
-PHI-free `content_match` event type + an emit method. One durable column (`alert_instance.escalation_tier`)
+PHI-free `content_match` event type + an emit method (**retracted 2026-09-30 and removed; see D3**). One durable column (`alert_instance.escalation_tier`)
 is added beside the #143 `suspended_until` (STORE-SERIALIZED, three backends, ADR 0064 hash bump).
+**CORRECTED 2026-09-30:** two capabilities remain, escalation and schedule-awareness. The third,
+content triggers, is retracted (see D3).
 
 ### D1 — Escalation tiers are OCCURRENCE-driven, evaluated synchronously (NOT a timed chain)
 
@@ -126,6 +152,10 @@ AND-combined, two rules for OR". Reusing the built, tested model adds no new tim
 dependency (`zoneinfo` is stdlib).
 
 ### D3 — Content-triggered alerts: a PHI-free `content_match` event, reconciled with purity via the throttle/dedup
+
+> **RETRACTED 2026-09-30 by owner ruling, not planned (BACKLOG #1504).** The ruling, what was
+> removed and why are in the **Retraction of D3** bullet at the top of this ADR. The original text
+> is kept below, unchanged, as the record of what was decided.
 
 Add `content_match` to `_ALERT_EVENT_TYPES` and a `NotifierAlertSink.content_match(connection, *, label,
 rule_id=None)` emit method. The event carries **only** `{type: "content_match", connection, label}` — a
@@ -167,16 +197,24 @@ no new PHI tier.
 - **AC-2** — WHEN a rule carries a `schedule`, THE SYSTEM SHALL match it only when `schedule.is_active(now)`
   (inside its windows, or outside when `invert`), so an out-of-window rule does not apply.
   → `tests/test_alert_escalation.py::test_schedule_aware_decide`
-- **AC-3** — WHEN a Handler emits a `content_match`, THE SYSTEM SHALL emit a PHI-free event
-  (connection + label + rule id only, **never** a matched field value) that flows through the rules /
-  throttle / state machinery.
-  → `tests/test_alert_escalation.py::test_content_match_event_is_phi_free`
-- **AC-4** — WHEN the same `content_match (connection)` is re-emitted (a transform re-run), THE SYSTEM SHALL
-  fold it into the one open instance (throttle/dedup) rather than open a second — the purity/at-least-once
-  reconciliation.
-  → `tests/test_alert_escalation.py::test_content_match_reemit_is_idempotent`
+- **AC-3 and AC-4 — WITHDRAWN 2026-09-30 with D3 (BACKLOG #1504).** Their text is kept below as
+  history, in a quote so that `adr-analyze` does not count them as live criteria. The tests they
+  named were removed with D3.
+
+  > **AC-3** — WHEN a Handler emits a `content_match`, THE SYSTEM SHALL emit a PHI-free event
+  > (connection + label + rule id only, **never** a matched field value) that flows through the rules /
+  > throttle / state machinery.
+  > → `tests/test_alert_escalation.py::test_content_match_event_is_phi_free` (removed)
+  >
+  > **AC-4** — WHEN the same `content_match (connection)` is re-emitted (a transform re-run), THE SYSTEM SHALL
+  > fold it into the one open instance (throttle/dedup) rather than open a second — the purity/at-least-once
+  > reconciliation.
+  > → `tests/test_alert_escalation.py::test_content_match_reemit_is_idempotent` (removed)
+
 - **NOTE added 2026-09-09 — AC-1, AC-2 and AC-5 are MET. AC-3 and AC-4 are NOT MET, and the tests they name
-  DO exist.** Both tests are real, and both call `NotifierAlertSink.content_match` **directly**. Neither
+  DO exist.** **CORRECTED 2026-09-30:** AC-3 and AC-4 are WITHDRAWN with D3, and the two tests this
+  note names were removed with it (BACKLOG #1504). The rest of this note is the 2026-09-09 record.
+  Both tests are real, and both call `NotifierAlertSink.content_match` **directly**. Neither
   exercises the "WHEN a Handler emits a `content_match`" premise, because no Handler can emit one:
   `content_match` is on neither the `AlertSink` Protocol nor `LoggingAlertSink` (`pipeline/alerts.py`), no
   alert emitter is exported from `messagefoundry/__init__.py`, and a Handler is called with the payload
@@ -192,6 +230,7 @@ no new PHI tier.
 1. **Occurrence-driven escalation + schedule-as-match-gate + a PHI-free content event through the existing
    rules/throttle/state — CHOSEN.** Additive, synchronous, no timer, reuses the #147 `Schedule` and the ADR
    0044 de-dup grain; the throttle/dedup makes the content re-emit idempotent (purity preserved).
+   **CORRECTED 2026-09-30:** the content half of this option is retracted; see **Retraction of D3**.
 2. **Timed multi-stage escalation chains (warn now → page in 15 min).** Rejected — the ADR 0014 §3 decline
    stands (needs a scheduler/timer; a cluster-wide timed sweep would need leader-gating and durable
    last-escalated state). Occurrence-driven covers the real "persistent condition" need without it.
@@ -201,19 +240,27 @@ no new PHI tier.
 4. **Carry the matched value in the `content_match` event for context.** Rejected — a direct PHI leak; the
    event is connection + label + rule id only, and the durable `reason` is the (non-PHI) label at most.
 
+**CORRECTED 2026-09-30:** options 3 and 4 describe the retracted D3 design. No `content_match` event,
+`content_label` routing or `label`-derived `reason` exists any more; see **Retraction of D3**.
+
 ## Consequences
 
 **Positive** — Operators get progressive (occurrence-driven) escalation, time-of-day-aware routing, and
 content/Action-Point alerts, all through the **one** rules/throttle/state path — no new mental model, no new
 transport, no new PHI tier. Content re-emits are idempotent by construction (the throttle/dedup), so the
-at-least-once/purity invariant holds.
+at-least-once/purity invariant holds. **CORRECTED 2026-09-30:** the content/Action-Point half of
+this paragraph did not hold and D3 is retracted; see **Retraction of D3**. Operators get the
+escalation and schedule-aware halves only.
 
 **Negative / risks** — One more additive column on three backends (a parity surface kept in lock-step by the
 column test + the ADR 0064 hash). The occurrence counter + escalation are per-node/advisory (same posture as
 the ADR 0014 throttle); the durable `count`/`escalation_tier` are the cross-restart record. A content-alert
 Handler must honor the PHI-free contract (label, never the value) — enforced by the sink's method signature
-(no value parameter) and the closed event shape, documented here.
+(no value parameter) and the closed event shape, documented here. **CORRECTED 2026-09-30:** that sink
+method was removed with D3, so this risk no longer applies.
 
 **Out of scope / stays as-is** — Timed multi-stage escalation chains (ADR 0014 §3 decline stands; any future
 timed re-eval sweep MUST be leader-gated). Cross-node durable dedup of shared-resource events (ADR 0014 §4).
 A declarative content-match expression language (content matching stays code-first in a Handler).
+**CORRECTED 2026-09-30:** with D3 retracted, the engine offers no content-triggered alert at all,
+code-first or declarative.

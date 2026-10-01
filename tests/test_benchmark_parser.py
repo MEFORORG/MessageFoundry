@@ -15,10 +15,12 @@ What this module contributes on *any* build:
 * a small, deterministic **benchmark harness** — :func:`bench_single_thread` /
   :func:`bench_multi_thread` over a synthetic HL7 batch, returning msg/s and the parsed routing so a
   caller can compute a scaling ratio;
-* a **correctness smoke** proving the harness parses a synthetic batch correctly, that the built-ins
-  and python-hl7 backends agree, and — the property that makes the multi-thread path trustworthy —
-  that parsing the batch across a thread pool yields **identical, deterministic** results to the
-  single-thread pass (pure parse, no shared state);
+* a **correctness smoke** proving the harness parses a synthetic batch correctly and — the property
+  that makes the multi-thread path trustworthy — that parsing the batch across a thread pool yields
+  **identical, deterministic** results to the single-thread pass (pure parse, no shared state). The
+  check that the built-in and python-hl7 backends agreed on the batch retired with python-hl7;
+  ``tests/test_builtin_hl7_parity.py`` holds the built-in parser to python-hl7's recorded answers
+  over the same generator shapes;
 * a very conservative, non-flaky **floor guard** that catches a catastrophic single-thread throughput
   regression (orders of magnitude, not micro-noise);
 * the AC-6 **scaling measurement** itself as a reported-not-gated test: it runs only on a
@@ -39,7 +41,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-import messagefoundry.parsing._backend as _backend
 from messagefoundry.generators import _core, all_types  # noqa: F401 — registers the generators
 from messagefoundry.parsing import normalize
 from messagefoundry.parsing.peek import Peek
@@ -173,18 +174,6 @@ def test_multi_thread_matches_single_thread_deterministic() -> None:
     _, serial = bench_single_thread(batch)
     _, threaded = bench_multi_thread(batch, workers=4)
     assert threaded == serial
-
-
-def test_both_backends_agree_on_batch() -> None:
-    """Built-ins (default) and python-hl7 backends produce identical routing for the batch — the
-    benchmark is measuring the same work either way (ties PARSE-15 to the ADR 0054 parity guarantee).
-    """
-    batch = _synthetic_batch()
-    with _backend.backend(builtin=True):
-        builtins_out = _parse_all_serial(batch)
-    with _backend.backend(builtin=False):
-        pyhl7_out = _parse_all_serial(batch)
-    assert builtins_out == pyhl7_out
 
 
 def test_single_thread_throughput_floor() -> None:
