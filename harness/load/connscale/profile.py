@@ -446,11 +446,16 @@ def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
     return tuple(out)
 
 
-#: A CI leg as ci.yml spells it in MEFOR_CONNSCALE_LEG: ``<matrix os>-py<python version>``. The
-#: version group is POSSESSIVE (``*+``): nothing follows it under ``fullmatch``, so the language is
-#: unchanged, and it never gives characters back, which is the mitigation
+#: A CI leg as ci.yml spells it in MEFOR_CONNSCALE_LEG: ``<matrix os>-py<python version>``.
+#:
+#: ASCII DIGITS ONLY, ``[0-9]`` and never ``\d``. A ``str`` pattern's ``\d`` also matches full-width
+#: and other Unicode digits, and a leg spelled with them parses here and can never equal the ASCII
+#: value ci.yml exports, so the floor would silently disarm: a fail-open on a gate.
+#:
+#: The version group is POSSESSIVE (``*+``): nothing follows it under ``fullmatch``, so it changes no
+#: decision, and it never gives characters back, which is the mitigation
 #: ``tests/test_security_static.py``'s nested-quantifier gate recognises.
-_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py\d+(?:\.\d+)*+")
+_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py[0-9]+(?:\.[0-9]+)*+")
 
 
 def _claim_modes_from(raw: Any, where: str) -> tuple[str, ...]:

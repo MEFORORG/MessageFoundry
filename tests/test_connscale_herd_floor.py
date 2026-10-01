@@ -431,8 +431,9 @@ def test_the_hostile_legs_cannot_hang_the_leg_pattern() -> None:
     assert json.loads(done.stdout) == [False] * len(_HOSTILE_LEGS)
 
 
-#: The pattern the nested-quantifier gate flagged, kept here so "the language is unchanged" is a
-#: claim this module checks rather than one a comment makes.
+#: The pattern the nested-quantifier gate flagged, kept here so "nothing else changed" is a claim
+#: this module checks rather than one a comment makes. It differs from ``_LEG`` on one class of input
+#: on purpose: non-ASCII digits, which ``_LEG`` refuses.
 _PRE_GATE_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py\d+(?:\.\d+)*")
 
 
@@ -465,11 +466,31 @@ def test_the_leg_pattern_decides_each_case_as_before(leg: str, ok: bool) -> None
             load_connscale_profile_text(text, where="<unit>")
 
 
-def test_the_possessive_pattern_has_the_pre_gate_language() -> None:
-    # Seeded random strings over the characters that matter. The accept count is the control: a
-    # generator that never produced a valid leg would make "no disagreement" mean nothing.
+@pytest.mark.parametrize(
+    "leg",
+    [
+        "ubuntu-latest-py３.１４",  # full-width digits
+        "ubuntu-latest-py٣.١٤",  # Arabic-Indic digits
+        "ubuntu-latest-py3.１４",  # one non-ASCII group after an ASCII one
+    ],
+    ids=["full-width", "arabic-indic", "mixed"],
+)
+def test_a_leg_with_non_ascii_digits_is_refused(leg: str) -> None:
+    # ci.yml exports the leg in ASCII, so a leg spelled with other digits could never match: parsed,
+    # it would disarm the floor with nothing reporting it. The pre-gate pattern accepted it.
+    assert _PRE_GATE_LEG.fullmatch(leg), "the pre-gate pattern's \\d did accept this leg"
+    with pytest.raises(ConnScaleProfileError, match=_SHAPE_ERROR):
+        load_connscale_profile_text(
+            _profile_text_with(f"empty_claims_herd_floor_legs = ['{leg}']"), where="<unit>"
+        )
+
+
+def test_the_pattern_keeps_the_pre_gate_language_over_ascii_inputs() -> None:
+    # Seeded random ASCII strings over the characters that matter: on ASCII input the only change,
+    # \d to [0-9], decides nothing differently. The accept count is the control: a generator that
+    # never produced a valid leg would make "no disagreement" mean nothing.
     rnd = random.Random(1415)
-    alphabet = [*"ab09._- py3.4", "-py", "py", "٣"]
+    alphabet = [*"ab09._- py3.4", "-py", "py"]
     accepted = 0
     for _ in range(50_000):
         text = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 14)))
