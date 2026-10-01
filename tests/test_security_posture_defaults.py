@@ -2174,10 +2174,11 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
     app = create_managed_app(
         db_path=tmp_path / "managed_posture.db",
         poll_interval=0.05,
-        # enabled=False so the route stays reachable without a session; the stash is deliberately
-        # OUTSIDE the `enabled` guard, and that is exactly what this pins — a settings object that
-        # exists but is disabled is still the resolved settings the registry must read.
+        # enabled=False plus the opt-in so the route stays reachable without a session; the stash is
+        # deliberately OUTSIDE the `enabled` guard, and that is exactly what this pins — a settings
+        # object that exists but is disabled is still the resolved settings the registry must read.
         auth_settings=_ad(ad_session_recheck_seconds=0, enabled=False),
+        allow_no_auth=True,
     )
     transport = httpx.ASGITransport(app=app)
     async with (

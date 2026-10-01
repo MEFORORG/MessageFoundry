@@ -1646,8 +1646,8 @@ async def test_disabled_auth_fails_closed_unless_opted_in(engine: Engine) -> Non
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         assert (await c.get("/stats")).status_code == 503
-    # ...unless the embedding/served path opts in explicitly (create_managed_app does this when
-    # auth is off, guarded by __main__'s loopback-only check).
+    # ...unless the embedding/served path opts in explicitly (`serve` does this when sign-in is
+    # off, after __main__'s start-up refusals; neither factory does it by omission).
     transport = httpx.ASGITransport(app=create_app(engine, auth=service, allow_no_auth=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         assert (await c.get("/stats")).status_code == 200
