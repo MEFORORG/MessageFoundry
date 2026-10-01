@@ -188,6 +188,14 @@ Two argument-list starts are not pinned that way:
   may win there too. What holds it: `repo_path` must name an existing folder, and the tray runs as
   the signed-in user, who owns `tray.toml`.
 
+**What each child is handed.** A process started with no environment of its own gets a copy of the
+engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
+environment for the sandbox worker, the disaster-recovery hook and the engine shards. Its
+docstring says what each one gets, and why that is not an isolation boundary by itself. The other
+starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
+lists each one that does so by inheritance, with its reason, and fails a new start that names no
+environment.
+
 **The other forms are the ones to look at hardest.**
 
 **The disaster-recovery hook runs a shell string.** `pipeline/dr.py` calls

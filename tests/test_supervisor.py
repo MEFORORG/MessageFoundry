@@ -62,7 +62,8 @@ def test_spec_argv_includes_env_and_service_config_when_given() -> None:
     argv = specs[0].argv
     assert "--env" in argv and "prod" in argv
     assert "--service-config" in argv and "svc.toml" in argv
-    assert argv[:4] == (specs[0].argv[0], "-m", "messagefoundry", "serve")
+    # -P keeps the working directory off the shard's import path (vault BACKLOG #2587).
+    assert argv[:5] == (specs[0].argv[0], "-P", "-m", "messagefoundry", "serve")
 
 
 def test_spec_argv_includes_project_root_when_given() -> None:

@@ -37,6 +37,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from messagefoundry.childenv import SAFE_PATH_FLAG, engine_environment
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.sharding import require_unified_store, shard_ids
@@ -53,7 +54,9 @@ class ShardSpec:
 
     ``db_path`` and ``port`` are derived deterministically from the operator's ``--db``/``--port``
     bases so a restart re-attaches to the SAME store and re-binds the SAME API port. ``argv`` is the
-    full ``python -m messagefoundry serve ...`` command line.
+    full ``python -P -m messagefoundry serve ...`` command line. A ``spawn`` that runs it must pass
+    :func:`messagefoundry.childenv.engine_environment`, as :func:`_default_spawn` does: ``-P`` takes
+    the working directory off the child's import path and that environment names the package.
     """
 
     shard: str
@@ -102,6 +105,7 @@ def build_shard_specs(
         db_path = _shard_db_path(db_base, shard, single=single)
         argv = [
             exe,
+            SAFE_PATH_FLAG,
             "-m",
             "messagefoundry",
             "serve",
@@ -185,12 +189,16 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
 
     The new group also stops the console's own Ctrl-C from reaching the child, which is why
     :meth:`Supervisor._request_stop` has to deliver the break explicitly on every shutdown path.
+
+    The child is a whole engine, so it gets the whole environment, secrets included, and gets it
+    by name (:func:`messagefoundry.childenv.engine_environment`, vault BACKLOG #2587).
     """
+    env = engine_environment()
     if sys.platform == "win32":
         return await asyncio.create_subprocess_exec(
-            *spec.argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            *spec.argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, env=env
         )
-    return await asyncio.create_subprocess_exec(*spec.argv)
+    return await asyncio.create_subprocess_exec(*spec.argv, env=env)
 
 
 @dataclass

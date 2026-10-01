@@ -56,7 +56,9 @@ line either — the boundary this seam draws is to the **engine**, not between a
 **What isolation buys (and its honest limits).** The child is a *separate OS process*: even if the
 admin code opens a socket or spins the CPU, it cannot touch the parent's DEK, audit chain, or
 sockets — those objects are never constructed in the child (it loads the message *graph*, not the
-store/crypto). On top of that address-space boundary the child adds defence-in-depth: a
+store/crypto). Its environment is an allowlist, not the engine's own
+(:mod:`messagefoundry.childenv`, which also says why that is not a boundary by itself).
+On top of that address-space boundary the child adds defence-in-depth: a
 forbidden-import guard (``socket``/store/crypto), a wall-clock cap enforced by the parent (plus
 POSIX ``RLIMIT_CPU``/``RLIMIT_AS`` when available), and a fail-closed refusal of the live
 ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop, which a process boundary
@@ -100,8 +102,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Final
 
+from messagefoundry.childenv import SAFE_PATH_FLAG, worker_environment
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, SandboxError
@@ -119,8 +123,9 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-#: The worker is launched as ``python -m <WORKER_MODULE>`` (stdlib runpy), inheriting this
-#: interpreter + ``sys.path`` so it imports the same ``messagefoundry`` build.
+#: The worker is launched as ``python -P -m <WORKER_MODULE>`` (stdlib runpy) under this interpreter.
+#: :mod:`messagefoundry.childenv` says what ``-P`` is for and how the child still imports the same
+#: ``messagefoundry`` build as the engine.
 WORKER_MODULE = "messagefoundry.pipeline._sandbox_worker"
 
 #: Top-level dotted module prefixes a sandboxed Router/Handler may not import. The address-space
@@ -635,7 +640,7 @@ class SandboxSession:
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
         # POSIX-only ``setsid`` (False on Windows, where a job object does the reaping instead).
         proc = subprocess.Popen(  # nosec B603
-            [sys.executable, "-m", WORKER_MODULE],
+            [sys.executable, SAFE_PATH_FLAG, "-m", WORKER_MODULE],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             # CAPTURED, not inherited (BACKLOG #343, ADR 0176): with ``stderr=None`` the child's stderr
@@ -645,6 +650,11 @@ class SandboxSession:
             bufsize=0,
             close_fds=True,
             start_new_session=sys.platform != "win32",
+            # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
+            # environment (vault BACKLOG #2587). The one engine variable that crosses is the
+            # config-source escape, because the child runs ``load_config`` itself and would
+            # otherwise refuse a directory its parent loaded under that escape.
+            env=worker_environment(engine_switches=(INSECURE_CONFIG_SOURCE_ESCAPE_ENV,)),
         )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
         # BOTH drains start before anything that can raise between here and the boot frame write. For

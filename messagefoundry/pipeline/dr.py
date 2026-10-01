@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
@@ -778,11 +779,15 @@ async def _run_command(command: str) -> bool:
     """Run an operator-supplied shell command OFF the event loop and return whether it exited 0. Uses the
     asyncio subprocess API (never blocks the loop). The command is operator-configured (``[dr]``), not
     request-derived, so it is run via the shell exactly as the operator wrote it (parity with the way the
-    backup destination / other operator-configured paths are trusted)."""
+    backup destination / other operator-configured paths are trusted).
+
+    Its environment is :func:`messagefoundry.childenv.hook_environment`: the operator's ordinary
+    variables, without the engine's own (vault BACKLOG #2587)."""
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
+        env=hook_environment(),
     )
     await proc.wait()
     return proc.returncode == 0
