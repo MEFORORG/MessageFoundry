@@ -8,6 +8,168 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [0.5.0] — 2026-09-30 — Early Access
 
+### Added
+- **The `messagefoundry-toolkit` wheel is now signed, attested and licensed like the engine wheel.**
+  The release job signs it with Sigstore, attaches its `.sigstore.json` bundle to the GitHub
+  release, and adds it to the SLSA build-provenance subjects, so `gh attestation verify` works on
+  it. The wheel now ships `LICENSE` and `NOTICE`. See
+  [SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md). (`BACKLOG #1192`)
+- **Both engine SBOMs now list the vendored defusedxml.** The engine carries defusedxml 0.7.1 in
+  `messagefoundry/_vendor/`, so no installer pulls it, and the SBOM generator lists only installed
+  packages. `scripts/security/sbom_finalize.py` now adds a component for each vendored package, with
+  its version, `PSF-2.0` licence and purl `pkg:pypi/defusedxml@0.7.1`. Its `pedigree` records the
+  upstream sdist hash and each upstream file's SHA-256. A scanner reading either SBOM can now match
+  an advisory against the copy the engine runs. (`BACKLOG #2498`)
+- **A Windows-resolved engine SBOM ships with each release.** The new signed release asset
+  `messagefoundry-sbom-windows.cdx.json` lists the packages the engine installs on Windows, beside
+  `messagefoundry-sbom.cdx.json` for Linux. The two differ because the core lock picks some packages
+  by platform. It carries its own Sigstore bundle and SLSA provenance, so the checks in
+  [SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md) work on it too. A release now scores both engine SBOMs
+  with sbomqs even when one score fails. The nightly and manual `security.yml` runs now score the
+  Windows SBOM too, so a fault in it can show before a tag reaches it. (`BACKLOG #2521`)
+
+### Changed
+- **A new default limit on the MLLP listener: `max_inflight_frames` (32).** At most this many
+  complete frames of one listener are in the inbound handler (decode, parse, validate, ingress
+  commit) at once. The row measured about 64 MiB of handling cost per 16 MiB message, so the peak
+  was `max_connections` times that, 10 to 16 GiB across 256 frames; it is now a setting of its own.
+  A frame over the limit waits for a slot, first come first served, and is never refused, dropped
+  or NAK'd; once decoded it is always handled, as with the limit off, and a waiter still queued at
+  stop is cancelled past the shutdown grace like a slow handler. It still holds the bytes it arrived
+  in, so the raw buffer bound is unchanged. `None`/`0` turns it off. It is an inbound-only parameter of `MLLP()` and of a `connections.toml` MLLP inbound.
+  ([BACKLOG #1725](docs/BACKLOG.md), act 3)
+- **`messagefoundry generate` now gives every ORM^O01 an order detail.** The generator used to
+  leave ORDER_DETAIL out, because it emitted every required child of a group, and the order
+  detail's OBR/RQD/RQ1/RXO/ODS/ODT group is a choice. It now emits one alternative of a choice
+  group, OBR by default. Each generated ORM^O01 now ends ORC then OBR and passes strict
+  validation, so a corpus generated before this change differs in its ORM files.
+  (`BACKLOG #2497`)
+
+### Removed
+- **python-hl7 is no longer a dependency.** The engine's own tolerant parser (ADR 0054) has been the
+  default since it merged, and python-hl7 was only its fallback. The fallback is gone, and so are
+  the `parsing/_backend.py` switch and the logger silencer that existed for python-hl7. A fault
+  inside the parser is now refused as `HL7PeekError`, which the listener NAKs `AR` and records as
+  `ERROR`; before, it fell back to python-hl7. **BREAKING:** `Message.parse` on a body with no
+  leading `MSH`, `FHS` or `BHS`, or with a header too short to read, now raises `HL7PeekError`, a
+  `ValueError`, where it raised `hl7.ParseException` or an `IndexError`. A Handler that catches
+  `ValueError` around it now catches that refusal too.
+  The outbound MSH encoding-character override now re-encodes through the engine's parser too. A
+  field whose escape character is never closed now reads with that text kept: `SMITH\` reads as
+  `SMITH\`, where python-hl7 dropped it and read `SMITH` (upstream python-hl7 issue 84). The
+  parity suite holds the parser to python-hl7 0.4.5's answers, recorded once before it left. (ADR
+  0054 amendment)
+
+### Fixed
+- **A DATABASE connection's `connect_timeout` now bounds the SQL Server login.** The SQL Server
+  preset used to write it into the connection string as `Connection Timeout`, which ODBC Driver 18
+  ignores, so the setting did nothing. It now reaches the driver as its login timeout, at least on
+  `Database(...)`, `DatabasePoll(...)`, `DatabaseLookup(...)` and `DatabaseRef(...)`. The `generic`
+  dialect is unchanged and still gets no login timeout from the engine. The value must be a whole
+  number of seconds, at least 1. The first three refuse any other value when the connection is
+  built. `DatabaseRef` refuses a literal value when declared, but an `env()` value only at each sync,
+  so `messagefoundry check` does not catch that case. (`BACKLOG #2089`)
+- **The DICOM server (SCP) now answers a status that tells the sender whether to re-send.** An object
+  over the object or inflate cap was answered Out of Resources (`0xA700`), which senders retry, though
+  a re-send is refused again. It is now Cannot Understand `0xC010`, a final refusal. A commit that
+  raised was answered Cannot Understand (`0xC000`), though a store that is down may recover. It is now
+  Out of Resources (`0xA700`), as is a C-STORE that arrives after the engine's loop has stopped. A
+  negative `max_object_bytes` is still refused at build, but the message
+  no longer says `0` or `None` disables the cap; on the SCP both resolve to 16 MiB. See
+  `docs/DICOM.md` section 3 for the statuses. (`BACKLOG #2103`)
+- **The DICOM server (SCP) now refuses a small deflated object that inflates past 16 MiB.** It bounded
+  the inflate by `max_object_bytes`, 128 MiB at the shipped default, while the codec that parses the
+  object after commit refuses anything past a fixed 16 MiB. So such an object was answered Success
+  and could then only be recorded `ERROR`. The SCP's inflate bound is now the lesser of
+  `max_object_bytes` and 16 MiB, and the object is refused before commit. (`BACKLOG #2104`)
+- **A generated OBR now repeats its order's placer and filler numbers.** OBR-2 and OBR-3 drew
+  fresh numbers instead of copying ORC-2 and ORC-3, as HL7 requires. In generated OML, MDM and
+  ORU messages that carry an ORC then an OBR, only those two fields change, so a corpus
+  generated before this change differs there. (`BACKLOG #2497`)
+- **AD sign-in no longer fails on Linux over the receive timeout.** The engine passed
+  `[auth].ad_receive_timeout`, a float, straight to ldap3. On every non-Windows host ldap3 packs
+  that value as an integer. So each AD socket open would have raised `struct.error` after the TCP
+  connect and before the bind was sent. On a first Linux deployment, AD sign-in would have failed
+  for every user. Windows was not affected. The engine now passes ldap3 the timeout rounded up to
+  whole seconds, so it is never shorter than configured. Both AD timeouts are also refused at
+  config load above 3600 seconds. That cap keeps them far below the point where a socket timeout
+  overflows, which would fail sign-in outside the audited error path. (`BACKLOG #2546`)
+
+### Security
+- **On the stdlib event loop, an MLLP TLS listener now applies `source_ip_allowlist`,
+  `max_connections` and `max_connections_per_host` before the TLS handshake, not after it.** The
+  listener accepts plain TCP, runs those checks exactly as a plaintext listener does, and only then
+  starts TLS on the admitted socket. Before, a socket that never sent a ClientHello sat outside all
+  three for up to the 10 s handshake bound, so a peer could hold as many as its connect rate
+  allowed. Now each one holds a real slot, is refused with the same `at_capacity` or
+  `peer_not_allowlisted` event as a plaintext connection, and is closed by stop(). A socket refused
+  this way never starts a handshake. A handshake that fails or times out gives its slot back and,
+  as before, emits no connection event and logs at DEBUG only. `established` is emitted once the
+  handshake completes. **Under uvloop, which the engine's own `uvloop` dependency installs outside
+  Windows, nothing changes**: the loop still runs the handshake and the three checks apply after it,
+  because the listener's own upgrade could not be verified safe on uvloop. ([BACKLOG #1606](docs/BACKLOG.md))
+- **BREAKING: an alert rule's `control_action` now needs a connection-scoped `event_type`.** Config
+  load refuses a rule that sets `control_action` with `event_type = "any"` or with any type outside
+  `connection_stopped`, `connection_error`, `queue_buildup`, `message_stall`, `saturation` and
+  `lane_stuck`. Most other types put a stand-in in `connection`, and some stand-ins fit the
+  connection-name grammar, such as a bare username, `store` or a cert label. A catch-all rule could
+  therefore aim a restart at an unrelated connection with that name. Load also refuses a
+  `control_target` that is not a connection name, or one on a rule with no `control_action`. This
+  replaces the advice in the `approval_too_early` and `initial_credential_expiring` entries of this
+  release to scope such rules: those rules are now refused.
+  ([ADR 0128](docs/adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md),
+  `BACKLOG #1898`)
+- **BREAKING: a FHIR `update` or `if-match` no longer puts the resource id in the request URL.**
+  A RESTful update is `PUT {base}/{ResourceType}/{id}`, so on a first deployment a message-derived
+  id would have reached the receiving server's access logs. The `FHIR()` destination now sends both
+  as the one entry of a `transaction` Bundle, POSTed to `{base}`. The entry's `request` carries
+  `PUT {ResourceType}/{id}`, and the `If-Match` ETag moves into `request.ifMatch`. The resource is
+  spliced in byte for byte. The receiving server must support the `transaction` interaction, and for
+  `if-match` it must honor the entry's `ifMatch`. A 2xx reply whose entry status failed is
+  classified on that status, and `capture_response_headers` reads `ETag`, `Location` and
+  `Last-Modified` from the entry. A resource id made only of dots is now refused. A `fhir_lookup`
+  read-by-id still carries the id in its path, which is what a RESTful read is; owner ruling R3
+  names the two writes only. See [CONNECTIONS.md](docs/CONNECTIONS.md), "An update keeps the
+  resource id out of the URL". (vault `BACKLOG #1965`, ASVS 14.2.1)
+- **A connection event's or an alert's reason is masked until a per-item reveal** (ASVS 14.2.6,
+  owner ruling R12). `ConnectionEventInfo.reason` and `AlertInstanceInfo.reason` join the
+  per-property map on the `messages:view_summary` tier. `GET /events`,
+  `GET /connections/{name}/events` and `GET /alerts/active` return each reason as `****` to a
+  holder, and `null` to a caller without that permission, until a `reveal=<id>` query parameter
+  asks for one. That reveal charges the PHI-read budget and writes a `connection_event_reveal` or
+  `alert_reveal` audit row. The alert ack, resolve, suspend and resume replies mask the reason the
+  same way. Every other field stays readable under the route's monitoring permission. The web
+  console adds three reveal routes; its changelog has the console half. See
+  [SECURITY.md](docs/SECURITY.md) and [PHI.md](docs/PHI.md) section 3. (`BACKLOG #2443`)
+- **A connection's start-failure reason is masked until the operator reveals it** (ASVS 14.2.6,
+  owner ruling R12). `ConnectionRow.error` and `ConnectionMetadata.error` join the per-property
+  map on the `messages:view_summary` tier. `GET /connections` and
+  `GET /connections/{name}/metadata` return the error as `****` to a holder, and `null` to a caller
+  without that permission. `reveal=<connection name>` on the dashboard, or `reveal=true` on the
+  metadata route, returns it whole. That reveal needs `messages:view_summary`, is refused for a
+  connection outside a scoped caller's channels, charges the PHI-read budget, and writes a
+  `connection_error_reveal` audit row. The `status` word, the `errored` count and every other field
+  stay readable under `monitoring:read`. The metadata route gains an ungated `fault` field
+  (`failed` or `filtered`), so a role that sees `error` as `null` can still tell that the connection
+  is down. `EngineClient.connections()` takes the same `reveal`.
+- **Each gated response model now gets a serializer over its own gated properties only.** The
+  shared one covered every field with a gateable name, gated or not, so a model whose `metadata`
+  is a dict could not be gated. The published schema of every other model is unchanged. See
+  [SECURITY.md](docs/SECURITY.md) and [PHI.md](docs/PHI.md) section 2. (`BACKLOG #2443`)
+- **The AD hop follows no LDAP referral.** ldap3 follows one by default, and on a bound connection
+  it binds to the referred host with the same service-account password, over a TLS setup without the
+  pinned CA or the narrowed suites, or over plain `ldap://`. A first deployment would have sent that
+  password to whatever host one referral named. Every `ldap3.Connection` the engine builds now sets
+  `auto_referrals=False`, and its `ldap3.Server` sets `allowed_referral_hosts=[]`. A referral result
+  to a search or to the user bind is refused as a directory error naming only the referred hosts,
+  and one to the service-account bind fails that bind as before. Sign-in audits it as
+  `auth.login_error`, and the session reconciler never revokes on it. A site whose users or groups
+  span several domains of a forest would need a global catalog, or a search base in the bound
+  controller's own domain. The `BACKLOG #2494` TLS-context entry says a followed referral still gets
+  a plain ldap3 context. This supersedes that note: no referral is followed, so no referred hop is
+  opened. See [ADR 0180](docs/adr/0180-asserting-tls-suites-on-a-library-that-exposes-no-sslcontext.md)
+  Amendment F. (`BACKLOG #2530`)
+
 ### Changed
 - **The `[fhir]` extra now needs `fhir-core>=1.1.11`, and annotated-types is no longer capped.**
   `pyproject.toml` capped annotated-types below 0.8 because fhir-core 1.1.9 imported the `SLOTS`
