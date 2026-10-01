@@ -131,9 +131,14 @@ def test_nssm_sha_pin_is_present_and_well_formed() -> None:
     )
 
 
-def test_integrity_branch_is_fail_closed_throw_not_warn() -> None:
-    """The hash-mismatch branch REFUSES: it compares against the pin and ``throw``s, and does not
-    downgrade to ``Write-Warning`` (which would trust an unverified binary)."""
+def test_integrity_branch_is_fail_closed() -> None:
+    """A download that fails the pin is never opened, and no matching download means a throw.
+
+    Since BACKLOG #2504 there is more than one source, so a mismatch skips to the next source rather
+    than throwing on the spot. What must hold is that the mismatch branch deletes the file and moves
+    on without marking it verified, and that nothing is extracted until a download has matched.
+    ``tests/test_nssm_pin.py`` runs this function against stand-in sources; this reads its shape.
+    """
     text = _script_text()
     # The comparison is against the pin, computed with SHA256.
     assert "Get-FileHash -Algorithm SHA256" in text, (
@@ -143,7 +148,7 @@ def test_integrity_branch_is_fail_closed_throw_not_warn() -> None:
         "the computed hash must be compared against the pinned $NssmSha256"
     )
 
-    # Isolate the mismatch block and prove it is a hard throw, not a warn.
+    # Isolate the mismatch block and prove it leaves the download unused: skip it, or throw.
     m = re.search(
         r"if\s*\(\s*\$hash\s*-ne\s*\$NssmSha256\s*\)\s*\{(?P<body>.*?)\}",
         text,
@@ -151,12 +156,20 @@ def test_integrity_branch_is_fail_closed_throw_not_warn() -> None:
     )
     assert m is not None, "the '$hash -ne $NssmSha256' mismatch block is missing"
     body = m.group("body")
-    assert "throw" in body, "integrity mismatch must THROW (fail closed), not continue"
-    assert "Write-Warning" not in body, (
-        "integrity mismatch must not be downgraded to Write-Warning (that fails OPEN)"
+    assert re.search(r"^\s*(continue|throw)\b", body, re.MULTILINE), (
+        "an integrity mismatch must skip the source or throw; it must not fall through to use it"
     )
+    assert "$verified" not in body, "an integrity mismatch must never mark the download verified"
     # The rejected artifact is deleted so a stale bad zip can't be reused.
     assert "Remove-Item" in body, "the mismatched download must be removed on failure"
+    # Only a matching download is extracted: the no-match branch throws before Expand-Archive.
+    unverified = re.search(r"if\s*\(\s*-not\s+\$verified\s*\)\s*\{(?P<body>.*?)\}", text, re.DOTALL)
+    assert unverified is not None, "there is no refusal for when no download matched"
+    assert "throw" in unverified.group("body"), "no matching download must THROW (fail closed)"
+    assert unverified.start() > m.start(), "the no-match refusal must follow the per-source check"
+    assert unverified.end() < text.index("Expand-Archive"), (
+        "the archive is extracted before the no-match refusal, so an unverified archive is opened"
+    )
 
 
 def test_download_is_tls_hardened_and_extracts_win64() -> None:

@@ -17,8 +17,9 @@
     resolved. It does NOT parse messagefoundry.toml: a TOML parser here would be a second definition
     of that block rather than a second reader of it (BACKLOG #1523).
 
-    IT DOES NOT DOWNLOAD NSSM, and that is deliberate. install-service.ps1 pins the archive URL and
-    its SHA-256 in $NssmUrl / $NssmSha256, and this script does not repeat them. So pass -NssmPath,
+    IT DOES NOT DOWNLOAD NSSM, and that is deliberate. install-service.ps1 pins the archive URL, its
+    mirrors and its SHA-256 in $NssmUrl / $NssmMirrorUrls / $NssmSha256, and this script does not
+    repeat them. So pass -NssmPath,
     or have nssm on PATH; net-helper/README.md "Prepare the files once" is the download-and-check
     procedure, and it names that same pin.
 
@@ -435,7 +436,8 @@ function Resolve-HelperNssm {
         if (-not $onPath) {
             throw ("nssm.exe not found. Pass -NssmPath, or put nssm on PATH. net-helper/README.md " +
                 "'Prepare the files once' has the download and the hash check; the pinned archive " +
-                "and its SHA-256 are `$NssmUrl and `$NssmSha256 in install-service.ps1.")
+                "and its SHA-256 are `$NssmUrl (or a copy from `$NssmMirrorUrls) and `$NssmSha256 " +
+                "in install-service.ps1.")
         }
         $found = $onPath.Source
         $where = "the nssm on PATH"
