@@ -79,9 +79,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # Lists messagefoundry/ as a directory and holds every folder token in the Mermaid blocks of
         # docs/architecture-diagram.md (`pipeline/`, `store/`, ...) to a folder that exists. What
         # breaks that arm is an engine package being renamed or removed, which arrives as an ENGINE
-        # diff and does not trip the tooling job's path gate (scripts/**, .github/**, the ledger).
-        # Its other arms read docs/*.md, which makes it a doc-drift guard, but those are not the
-        # reason it stays.
+        # diff, and the `tooling=true` predicate in ci.yml names no `messagefoundry/` path. Listed
+        # as tooling it would run on no leg for that change. Its other arms read docs/*.md. The
+        # tooling predicate does name `docs/`, so those arms alone would be reached there, but they
+        # are not the reason it stays.
         "test_architecture_diagrams.py",
         "test_asvs_apply.py",
         "test_asvs_residual_lint.py",
