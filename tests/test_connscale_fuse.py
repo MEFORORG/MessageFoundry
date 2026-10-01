@@ -6,6 +6,7 @@ GO/NO-GO verdict logic. Pure + hermetic (no live engine / SQL Server)."""
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -457,14 +458,14 @@ def test_default_single_arm_sweep_is_byte_identical() -> None:
 
 def _stub_run_one_step(
     monkeypatch: pytest.MonkeyPatch,
-) -> list[dict[str, object]]:
+) -> list[dict[str, Any]]:
     """Replace runner._run_one_step with a hermetic stub (no engine / SQL Server): it records every
     call's per-cell coordinates + the node tag / api_port the real step would use, and returns a fake
     ConnScaleRecord keyed to the call so build_fuse_comparison aggregates the trials. Returns the calls
     list the test asserts on."""
     from harness.load.connscale import runner as runner_mod
 
-    calls: list[dict[str, object]] = []
+    calls: list[dict[str, Any]] = []
 
     async def _stub(
         prof: object,
@@ -521,7 +522,7 @@ trials = 3
     # Exactly `trials` records per arm, trial indices 0..2 for each (fuse, count) cell.
     per_arm: dict[tuple[bool, int], set[int]] = {}
     for c in calls:
-        per_arm.setdefault((c["fuse_mode"], c["count"]), set()).add(c["trial"])  # type: ignore[index]
+        per_arm.setdefault((c["fuse_mode"], c["count"]), set()).add(c["trial"])
     assert len(per_arm) == 4  # (b0,256),(b1,256),(b0,512),(b1,512)
     assert all(indices == {0, 1, 2} for indices in per_arm.values())
     # The fusion comparison aggregates the 3 repeats per arm by key — the >=3 trials §6.4b needs.

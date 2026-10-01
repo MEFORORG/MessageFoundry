@@ -129,7 +129,8 @@ jobs:
             --pyproject pyproject.toml --mc-type application \
             --of JSON -o messagefoundry-sbom-windows.cdx.json
           python scripts/security/sbom_finalize.py messagefoundry-sbom-windows.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
 
       - name: Hand the Windows SBOM to the signing job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -139,6 +140,9 @@ jobs:
           # `error`, not `ignore`: the `release` job needs this file, and a missing one must fail HERE
           # with the cause named rather than at a download step two jobs later.
           if-no-files-found: error
+          # A hand-off: the signed copy on the GitHub release is the record (BACKLOG #2521). After a
+          # day, re-run ALL jobs; re-running `release` alone fails at its download step, by name.
+          retention-days: 1
 
   release:
     # Source-repo only — and since the MEFORORG cutover, MEFORORG/MessageFoundry IS the source repo.
@@ -719,8 +723,12 @@ jobs:
           # Declare the SBOM's lifecycle (CISA "Build" type / draft-2025 "Generation Context") and backfill
           # the root component's version (hatchling-dynamic, so --pyproject leaves it null). Exits non-zero
           # on a structurally broken BOM, failing the release before it ships one.
+          # --vendored-from lists the third-party code the wheel carries in messagefoundry/_vendor/
+          # (defusedxml), which environment mode cannot see because nothing installs it. It also exits
+          # non-zero when a vendored package's README does not record what its component needs.
           python scripts/security/sbom_finalize.py messagefoundry-sbom.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
 
       - name: Fetch the Windows-resolved SBOM from the sbom-windows job
         # Built on a Windows runner by the unprivileged job above. It lands beside the Linux SBOM and
@@ -797,10 +805,14 @@ jobs:
           # continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG #1698).
           # The Windows-resolved SBOM is scored by the same verified binary: it was built on another
           # runner, but the scoring happens here, behind the same pin.
-          /usr/local/bin/sbomqs score -b messagefoundry-sbom.cdx.json
-          /usr/local/bin/sbomqs score -b messagefoundry-sbom-windows.cdx.json
+          # Each score runs whatever the other did; the step still fails if either did (BACKLOG #2521).
+          # Under `bash -e` a failing first score used to skip the second, and continue-on-error hid it.
+          rc=0
+          /usr/local/bin/sbomqs score -b messagefoundry-sbom.cdx.json || rc=1
+          /usr/local/bin/sbomqs score -b messagefoundry-sbom-windows.cdx.json || rc=1
           /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
           /usr/local/bin/sbomqs compliance --ntia messagefoundry-sbom-windows.cdx.json || true
+          exit "$rc"
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |
@@ -929,6 +941,11 @@ jobs:
           # Release notes = this version's CHANGELOG section (fall back to a one-liner).
           awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "MessageFoundry $tag" > notes.md
+          # GitHub refuses a release body over 125,000 characters, and the 0.5.0 section is about
+          # 256,000. Shrink an over-long body to each entry's title plus a link to the full section at
+          # this tag, or `gh release create` fails here and the PyPI publish below never runs.
+          python scripts/release/release_notes.py notes.md \
+            --full-url "https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/CHANGELOG.md"
           # `edit` needs an explicit true/false: a bare `--prerelease` only ever SETS the flag, so a
           # re-run could never demote a release that had been mis-marked as a pre-release.
           case "$ver" in
@@ -1370,6 +1387,9 @@ jobs:
           # version root, separate release notes.
           awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}'             packaging/messagefoundry-webconsole/CHANGELOG.md > notes.md || true
           [ -s notes.md ] || echo "MessageFoundry web console $tag" > notes.md
+          # The same 125,000-character ceiling as the engine release step above.
+          python scripts/release/release_notes.py notes.md \
+            --full-url "https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/packaging/messagefoundry-webconsole/CHANGELOG.md"
           case "$ver" in
             *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
             *)   pre_create="";             pre_edit="--prerelease=false" ;;

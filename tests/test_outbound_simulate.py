@@ -22,6 +22,7 @@ from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
+    Payload,
     Registry,
     Send,
     WiringError,
@@ -40,7 +41,7 @@ ADT = (
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
     yield s
     await s.close()
@@ -70,7 +71,8 @@ def _registry(inbox: Path, outdir: Path, *, simulate: bool = False) -> Registry:
     )
     reg.add_router("r", lambda m: ["h"])
 
-    def handle(msg: Message) -> Send:
+    def handle(msg: Payload) -> Send:
+        assert isinstance(msg, Message)  # no accepts= on this handler, so the runner parses
         msg["MSH-3"] = "FOUNDRY"  # a transform, so MEFOR's would-send output is observable
         return Send("file_out", msg)
 
@@ -281,7 +283,9 @@ async def test_simulate_capturing_outbound_captures_nothing(
     finally:
         await runner.stop()
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM response")  # noqa: SLF001 — test query
-    assert (await cur.fetchone())["n"] == 0  # nothing captured — egress (and its reply) suppressed
+    row = await cur.fetchone()
+    assert row is not None
+    assert row["n"] == 0  # nothing captured — egress (and its reply) suppressed
 
 
 async def test_reload_toggles_simulate(store: MessageStore, tmp_path: Path) -> None:

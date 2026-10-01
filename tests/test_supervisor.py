@@ -13,6 +13,7 @@ import asyncio
 import logging
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +145,14 @@ def test_shard_db_composes_under_project_root(tmp_path: object) -> None:
 # --- lifecycle (fake process) ------------------------------------------------
 
 
+def _spawner(
+    fn: Callable[[ShardSpec], Awaitable[_FakeProcess]],
+) -> Callable[[ShardSpec], Awaitable[asyncio.subprocess.Process]]:
+    """Hand Supervisor a fake spawn. The fakes stand in for asyncio's Process and answer every call
+    Supervisor makes on one; that is the whole of the claim this return type makes."""
+    return fn  # type: ignore[return-value]
+
+
 class _FakeProcess:
     """A controllable stand-in for asyncio.subprocess.Process.
 
@@ -192,7 +201,9 @@ async def test_spawns_one_child_per_shard_then_stops_cleanly() -> None:
         spawned.append(p)
         return p
 
-    sup = Supervisor([_spec("a", 8765), _spec("b", 8766)], spawn=spawn, terminate_grace=2.0)
+    sup = Supervisor(
+        [_spec("a", 8765), _spec("b", 8766)], spawn=_spawner(spawn), terminate_grace=2.0
+    )
     run = asyncio.create_task(sup.run())
     # Let both children spawn.
     for _ in range(50):
@@ -218,7 +229,7 @@ async def test_restarts_a_crashed_child() -> None:
         spawned.append(p)
         return p
 
-    sup = Supervisor([_spec("a")], spawn=spawn, restart=True, terminate_grace=2.0)
+    sup = Supervisor([_spec("a")], spawn=_spawner(spawn), restart=True, terminate_grace=2.0)
     run = asyncio.create_task(sup.run())
     while not spawned:
         await asyncio.sleep(0)
@@ -247,7 +258,7 @@ async def test_no_restart_when_disabled() -> None:
         spawned.append(p)
         return p
 
-    sup = Supervisor([_spec("a")], spawn=spawn, restart=False)
+    sup = Supervisor([_spec("a")], spawn=_spawner(spawn), restart=False)
     run = asyncio.create_task(sup.run())
     while not spawned:
         await asyncio.sleep(0)
@@ -277,7 +288,9 @@ async def test_stop_alone_drains_children_without_cancelling_run() -> None:
         spawned.append(p)
         return p
 
-    sup = Supervisor([_spec("a", 8765), _spec("b", 8766)], spawn=spawn, terminate_grace=2.0)
+    sup = Supervisor(
+        [_spec("a", 8765), _spec("b", 8766)], spawn=_spawner(spawn), terminate_grace=2.0
+    )
     run = asyncio.create_task(sup.run())
     for _ in range(50):
         if len(spawned) == 2:
@@ -316,7 +329,7 @@ async def test_stop_requests_then_waits_then_forces() -> None:
         return proc
 
     grace = 0.05
-    sup = Supervisor([_spec("a")], spawn=spawn, terminate_grace=grace)
+    sup = Supervisor([_spec("a")], spawn=_spawner(spawn), terminate_grace=grace)
     run = asyncio.create_task(sup.run())
     for _ in range(50):
         if "a" in sup._children:
@@ -427,7 +440,7 @@ async def test_terminate_escalates_to_kill_after_grace() -> None:
         return proc
 
     # A tiny grace so the kill-after-timeout path runs fast.
-    sup = Supervisor([_spec("a")], spawn=spawn, terminate_grace=0.05)
+    sup = Supervisor([_spec("a")], spawn=_spawner(spawn), terminate_grace=0.05)
     run = asyncio.create_task(sup.run())
     for _ in range(50):
         if "a" in sup._children:  # wait until the child is spawned + registered

@@ -20,13 +20,21 @@ Five things:
 3. **The VS Code extension** in `ide/` (section 9, and its parsers in section 7).
 4. **The web console**, `messagefoundry_webconsole`, which the engine serves at `/ui` (section 10).
 5. **The toolkit**, `messagefoundry_toolkit`, shipped as the `messagefoundry-toolkit` distribution.
-   It holds the authoring commands that ADR 0201 moved out of the engine wheel, such as
+   It holds the authoring commands that ADR 0201 is moving out of the engine wheel, such as
    `adr-analyze`. The scans in sections 4, 5 and 7 read it with the engine.
 
 The 2026-08-22 owner ruling on scope named the first two, and its purpose was to bring the
-deployment path in. It says nothing about the other three. The extension and the web console ship
-to the same operators, and the toolkit ships beside the engine at the same version. So this page
-covers all three.
+deployment path in. It says nothing about the other three, so each is here for its own reason:
+
+- The web console runs inside the engine's own process.
+- The extension ships to the same operators.
+- The toolkit carries the engine's own commands. Each command it registers is a row in the
+  engine's command table, `CLI_TIERS` in `messagefoundry/cli_surface.py`, and ADR 0201 moves
+  those commands out of the engine wheel a slice at a time. A site must not leave this page by
+  moving between wheels.
+
+Shipping at the engine's version is not a reason on its own. See the test harness under "What is
+deliberately not here".
 
 It does not cover your Routers and Handlers. Those are yours, and section 1 explains why that
 matters more than anything else here.
@@ -424,7 +432,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
 | The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
-| Decision records, for `messagefoundry-toolkit adr-analyze`. It reads each `[0-9]*.md` file at the top of the `--adr-dir` folder, `docs/adr` by default. Regular expressions pick out each record's status, acceptance criteria and open items. For each `tests/`, `fixtures/`, `samples/` or `harness/` path a criterion names, it checks whether that path exists under `--repo-root`. Nothing bounds a record's size, and a linked path may climb out of that root with `..`. So a record is only as trusted as its author. | `messagefoundry_toolkit/adr_analyze.py` |
+| Decision records, for `messagefoundry-toolkit adr-analyze`. It reads each `[0-9]*.md` file at the top of the `--adr-dir` folder, `docs/adr` by default. Regular expressions pick out each record's status, acceptance criteria and open items. For each `tests/`, `fixtures/`, `samples/` or `harness/` path a criterion names, it checks whether that path exists under `--repo-root`. A linked path that climbs out of that root with `..`, or has a part named for a DOS device such as `NUL` or `nul.py`, is reported and not checked, on every platform. A symbolic link inside that root is still followed. Nothing bounds a record's size, so a record is only as trusted as its author. | `messagefoundry_toolkit/adr_analyze.py` |
 
 The first two tables rest on a judgement about where each input comes from, and the test cannot
 check that judgement. Re-read a row when its module changes what it reads.
@@ -725,9 +733,11 @@ in your own documentation.
 **Third-party components.** [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) designates the risky ones.
 Per-library decisions that matter to a deploying operator are recorded in the ADRs cited above.
 
-**The published test harness.** `messagefoundry-harness` is a tool for testing an engine, not part
-of a deployment. It does start processes. It is out of this page's scope, which is a choice about
-this page rather than a claim that it holds none of these classes.
+**The published test harness.** `messagefoundry-harness` is a tool for testing an engine, and it
+does start processes. It ships at the engine's version, as the toolkit does. But none of its commands
+is a row in `CLI_TIERS`, it holds none of the code ADR 0201 moves out of the engine wheel, and it
+does not run inside the engine. The extension's reason, shipping to the same operators, would reach it. So
+leaving it out is a choice about this page, not a claim that it holds none of these classes.
 
 ## Keeping this page true
 

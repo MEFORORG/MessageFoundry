@@ -61,8 +61,8 @@ class _FakeResp:
     def __enter__(self) -> _FakeResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _FakeOpener:
@@ -248,7 +248,7 @@ async def test_rest_over_length_minted_bearer_is_a_credential_fault_and_is_inval
 
     dest = _dest()
     provider = _Provider()
-    dest._token_provider = provider  # type: ignore[assignment]
+    dest._token_provider = provider
     dest._opener = _FakeOpener()  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send("x")
@@ -575,7 +575,8 @@ def test_no_redirect_handler_refuses_redirect_and_is_wired_into_default_opener()
     assert result is None  # refuses to build a follow-up request → no redirect
 
     # And the refusal is wired into the shared verifying opener, so every REST delivery inherits it.
-    assert any(isinstance(h, rest._NoRedirectHandler) for h in rest._NO_REDIRECT_OPENER.handlers)
+    handlers = rest._NO_REDIRECT_OPENER.handlers  # type: ignore[attr-defined]  # typeshed omits it
+    assert any(isinstance(h, rest._NoRedirectHandler) for h in handlers)
 
 
 def test_outbound_headers_from_metadata_is_pure_and_sanitizing() -> None:

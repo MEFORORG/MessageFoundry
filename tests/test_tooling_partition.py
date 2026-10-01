@@ -117,12 +117,6 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # reads the real `git ls-files` scope -- which is the half that makes it engine-subject.
         "test_control_char_check.py",
         "test_crypto_inventory_scanner.py",
-        # AST-scans at least messagefoundry/**/*.py and messagefoundry_toolkit/**/*.py for every
-        # ctypes import and every process start. It holds docs/DANGEROUS-FUNCTIONALITY.md to those
-        # inventories (BACKLOG #1934, #1190). A new site arrives as an ENGINE or TOOLKIT diff. That
-        # diff does not trip the tooling path gate. So as tooling this test would face nothing on
-        # the change it exists to catch.
-        "test_dangerous_functionality_doc.py",
         "test_dependency_boundaries.py",
         "test_ech_record_premise.py",
         # Same shape as control_char_check and licence_header_gate above, and listed for the same
@@ -239,6 +233,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_reply_hint_thread_affinity.py",
         #   adr0071_statement_rt_inventory -> drives a real SqlServerStore through its bench module
         "test_adr0071_statement_rt_inventory.py",
+        # Same shape as adr0071 above, reached through a sibling helper rather than a bench module:
+        # it drives the real SqlServerStore handoffs and pins their round-trip counts (ADR 0075
+        # AC-5), but every engine import lives in tests/adr0075_batch_harness.py, which the
+        # classifier does not follow (BACKLOG #1799). A regression arrives as a
+        # messagefoundry/store/sqlserver.py diff, which the tooling path gate does not see.
+        "test_adr0075_rt_count_gate.py",
         #   install_instruction_provenance -> globs messagefoundry/**/*.py
         "test_install_instruction_provenance.py",
         #   sds_rule_ids_are_stable -> :397 rglobs messagefoundry/**/*.py. Milder than the four above

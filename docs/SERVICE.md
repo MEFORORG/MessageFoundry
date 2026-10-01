@@ -580,10 +580,10 @@ This service is **headless**. Operators watch and run it from the **browser web 
 same-origin at `/ui` (not part of the service runtime — a separate wheel the engine mounts
 in-process). It publishes as its **own** distribution on its own version line. With the console on,
 the engine refuses to start beside a console built for a different UI seam, so match the pair:
-console 0.3.0 for engine 0.4.0. Install it into the engine venv:
+console 0.4.0 for engine 0.5.0. Install it into the engine venv:
 
 ```powershell
-pip install "messagefoundry-webconsole==0.3.0"       # into the engine venv (pairs with engine 0.4.0)
+pip install "messagefoundry-webconsole==0.4.0"       # into the engine venv (pairs with engine 0.5.0)
 pip install -e packaging/messagefoundry-webconsole   # or, from a source checkout
 ```
 

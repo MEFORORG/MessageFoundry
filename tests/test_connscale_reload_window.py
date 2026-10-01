@@ -507,7 +507,9 @@ def test_no_reload_probe_records_not_measured_rather_than_zero() -> None:
     assert rec.post_reload_extra_hold_s is None
     assert rec.post_reload_reply_s is None
     assert rec.post_reload_drops is None
-    assert rec.to_json_dict()["wall5_reload"]["stranded"] is None
+    wall5 = rec.to_json_dict()["wall5_reload"]
+    assert isinstance(wall5, dict)
+    assert wall5["stranded"] is None
     assert rec.to_json_dict()["wall5_reload"] == {
         "seconds": None,
         "stranded": None,
@@ -595,7 +597,7 @@ def _outgoing(seq: int) -> Outgoing:
     return Outgoing(seq=seq, code="ADT", control_id=f"C{seq}", payload=payload)
 
 
-async def _no_ack_fault_step(*, unacked_just_before_reload: bool) -> runner.NoLoss:
+async def _no_ack_fault_step(*, unacked_just_before_reload: bool) -> NoLoss:
     """One connection, a 1.2 s hold, the probe at 0.6 s. 2 sends are ACKed, then 28 go unACKed
     until the reload closes the socket, then 6 more after it are ACKed: 28 of 36 unconfirmed, 78%.
 

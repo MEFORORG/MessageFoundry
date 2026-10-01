@@ -97,6 +97,8 @@ def test_split_command_line_matches_the_win32_oracle() -> None:
     It runs over ``_SPLIT_CASES`` itself, so a case added to the table above is checked against the
     real function too rather than only against a hand-written expectation.
     """
+    if sys.platform != "win32":  # the skipif above already skips it; this line tells mypy
+        pytest.skip("Windows only")
     import ctypes
     import random
     from ctypes import wintypes

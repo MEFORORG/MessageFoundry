@@ -27,6 +27,12 @@ from messagefoundry.apiclient import EngineClient
 from messagefoundry.parsing.message import Message
 
 
+def _as_client(fake: object) -> EngineClient:
+    """Hand a scenario verifier a fake client. Each fake answers the calls its test makes, which is
+    all the verifier asks of an EngineClient; that is the whole of the claim this return type makes."""
+    return fake  # type: ignore[return-value]
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -158,9 +164,9 @@ def test_verify_dead_letter_ignores_preexisting_rows() -> None:
             return SimpleNamespace(dead_letters=self._rows, total=len(self._rows))
 
     stale = FakeClient(["OTHER1", "OTHER2"])  # two pre-existing dead letters, foreign control ids
-    assert not _verify_dead_letter(scenario, stale, ["MINE1", "MINE2"], 0.05, []).ok
+    assert not _verify_dead_letter(scenario, _as_client(stale), ["MINE1", "MINE2"], 0.05, []).ok
     mine = FakeClient(["MINE1", "MINE2", "OTHER1"])
-    assert _verify_dead_letter(scenario, mine, ["MINE1", "MINE2"], 5.0, []).ok
+    assert _verify_dead_letter(scenario, _as_client(mine), ["MINE1", "MINE2"], 5.0, []).ok
 
 
 def test_verify_disposition_queries_per_control_id_and_surfaces_send_errors() -> None:
@@ -170,13 +176,15 @@ def test_verify_disposition_queries_per_control_id_and_surfaces_send_errors() ->
     queried: list[str | None] = []
 
     class FakeClient:
-        def list_messages(self, *, control_id: str | None = None, limit: int = 50, **k: object):  # type: ignore[no-untyped-def]
+        def list_messages(self, *, control_id: str | None = None, limit: int = 50, **k: object):
             queried.append(control_id)
             return SimpleNamespace(
                 messages=[SimpleNamespace(control_id=control_id, status="processed")]
             )
 
-    result = _verify_disposition(scenario, FakeClient(), ["A", "B"], 5.0, ["connection refused"])
+    result = _verify_disposition(
+        scenario, _as_client(FakeClient()), ["A", "B"], 5.0, ["connection refused"]
+    )
     assert result.ok
     assert set(queried) >= {"A", "B"}  # per-control-id, not one blanket page
     assert "send error" in result.detail
@@ -197,8 +205,8 @@ def test_cli_rejects_unknown_scenario(capsys: pytest.CaptureFixture[str]) -> Non
 def test_repeated_scenario_cannot_pass_with_previous_run_rows(
     monkeypatch: pytest.MonkeyPatch, expect: str
 ) -> None:
-    stored: set[str] = set()
-    runs: list[set[str]] = []
+    stored: set[str | None] = set()
+    runs: list[set[str | None]] = []
 
     def send(host: str, port: int, payloads: list[str]) -> list[str]:
         ids = {Message.parse(raw)["MSH-10"] for raw in payloads}
@@ -219,7 +227,7 @@ def test_repeated_scenario_cannot_pass_with_previous_run_rows(
     scenario = Scenario(
         "repeat", "", "ADT", "A05", count=3, expect=expect, dead_letter_destination="echo"
     )
-    client = Client()
+    client = _as_client(Client())
     assert run_scenario(scenario, client, timeout=0.01).ok
     assert not run_scenario(scenario, client, timeout=0.01).ok
     assert len(runs[0]) == len(runs[1]) == 3

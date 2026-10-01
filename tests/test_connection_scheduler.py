@@ -73,7 +73,7 @@ def _free_port() -> int:
         s.close()
 
 
-async def _wait_until(predicate, timeout: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+async def _wait_until(predicate, timeout: float = 2.0) -> None:
     async def _poll() -> None:
         while not predicate():
             await asyncio.sleep(0.01)
@@ -82,7 +82,7 @@ async def _wait_until(predicate, timeout: float = 2.0) -> None:  # type: ignore[
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "sched.db")
     yield s
     await s.close()
@@ -108,7 +108,9 @@ def test_same_day_window_membership() -> None:
 def test_past_midnight_wrap() -> None:
     # Mon 22:00 → 06:00 wraps past midnight, anchored on the Monday it opened.
     s = Schedule(
-        windows=[ActiveWindow(days={MON}, start=time(22, 0), end=time(6, 0), timezone="UTC")]
+        windows=[
+            ActiveWindow(days=frozenset({MON}), start=time(22, 0), end=time(6, 0), timezone="UTC")
+        ]
     )
     assert s.is_active(_utc(2026, 7, 13, 23))  # Mon evening — inside
     assert s.is_active(_utc(2026, 7, 14, 5))  # Tue 05:00 — morning tail of the Mon window
@@ -126,7 +128,11 @@ def test_maintenance_invert() -> None:
 def test_timezone_is_evaluated_locally() -> None:
     # A New-York window: 13:00 UTC = 09:00 EDT (summer) is inside 08:00–17:00 local.
     s = Schedule(
-        windows=[ActiveWindow(days={MON}, start=time(8), end=time(17), timezone="America/New_York")]
+        windows=[
+            ActiveWindow(
+                days=frozenset({MON}), start=time(8), end=time(17), timezone="America/New_York"
+            )
+        ]
     )
     assert s.is_active(_utc(2026, 7, 13, 13))  # 09:00 EDT
     assert not s.is_active(_utc(2026, 7, 13, 3))  # 23:00 EDT Sunday
@@ -134,11 +140,17 @@ def test_timezone_is_evaluated_locally() -> None:
 
 def test_model_validation() -> None:
     with pytest.raises(ValueError):
-        ActiveWindow(days={MON}, start=time(8), end=time(8), timezone="UTC")  # start == end
+        ActiveWindow(
+            days=frozenset({MON}), start=time(8), end=time(8), timezone="UTC"
+        )  # start == end
     with pytest.raises(ValueError):
-        ActiveWindow(days={MON}, start=time(8), end=time(9), timezone="Nowhere/Nope")  # bad tz
+        ActiveWindow(
+            days=frozenset({MON}), start=time(8), end=time(9), timezone="Nowhere/Nope"
+        )  # bad tz
     with pytest.raises(ValueError):
-        ActiveWindow(days={9}, start=time(8), end=time(9), timezone="UTC")  # weekday out of range
+        ActiveWindow(
+            days=frozenset({9}), start=time(8), end=time(9), timezone="UTC"
+        )  # weekday out of range
 
 
 # === runner scheduler ========================================================

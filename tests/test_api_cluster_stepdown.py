@@ -47,6 +47,7 @@ from messagefoundry.pipeline.cluster import (
     StepdownReleaseUnconfirmed,
 )
 from messagefoundry.store import MessageStore
+from messagefoundry.store.base import AdminStore, Row
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >=15 chars, no vendor terms — satisfies the ASVS password policy
@@ -157,7 +158,7 @@ async def _engine(tmp_path: Path, coordinator: ClusterCoordinator | None = None)
     return eng
 
 
-async def _service(store: MessageStore, settings: AuthSettings | None = None) -> AuthService:
+async def _service(store: AdminStore, settings: AuthSettings | None = None) -> AuthService:
     service = AuthService(
         store,
         settings
@@ -170,7 +171,7 @@ async def _service(store: MessageStore, settings: AuthSettings | None = None) ->
 
 
 def _client(engine: Engine | None, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))  # type: ignore[arg-type]
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -241,7 +242,7 @@ async def _admin(
         await engine.stop()
 
 
-async def _rows(engine: Engine, action: str) -> list[dict[str, object]]:
+async def _rows(engine: Engine, action: str) -> list[Row]:
     return [r for r in await engine.store.list_audit(limit=200) if r["action"] == action]
 
 

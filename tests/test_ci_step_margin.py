@@ -17,7 +17,6 @@ from, re-reading was 0-for-7 at catching a wrong number.
 from __future__ import annotations
 
 import json
-import math
 import re
 from pathlib import Path
 
@@ -25,8 +24,12 @@ import pytest
 
 from scripts.ci.step_margin import (
     DEFAULT_MIN_MARGIN,
+    RE_DERIVE,
+    RE_SIZE,
     Baseline,
     MarginError,
+    Verdict,
+    annotation,
     clock_dir,
     decide,
     find_baseline,
@@ -36,6 +39,7 @@ from scripts.ci.step_margin import (
     parse_clock,
     read_mark,
     self_check,
+    sized_cap_minutes,
     summary_block,
     write_mark,
 )
@@ -66,6 +70,14 @@ _GATED: dict[str, tuple[str, str, str]] = {
 
 #: Flat view, for the assertions that only care about which steps are gated at all.
 _GATED_STEPS = tuple(step for step, _, _ in _GATED.values())
+
+
+@pytest.fixture(autouse=True)
+def _off_a_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test here runs as if off a runner, so `main` prints no workflow command. The tooling job
+    runs this module ON a runner, and a failing test replays its stdout into the job log, where a
+    `::warning` naming a real leg would read as a real finding. The one test that wants it opts in."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
 
 
 def _uncensored(seconds: int = 600) -> Baseline:
@@ -249,9 +261,240 @@ def test_exceeding_the_recorded_maximum_says_RE_DERIVE_and_names_the_pool() -> N
     verdict = decide(
         elapsed_seconds=700, cap_seconds=3300, outcome="success", baseline=_uncensored(600)
     )
-    note = next(n for n in verdict.notes if n.startswith("RE-DERIVE"))
+    note = verdict.escalation_message
+    assert note.startswith("RE-DERIVE")
     assert "11:40" in note and "10:00" in note
     assert "measured 2026-01-01" in note  # the pool travels with the number
+    assert not any(n.startswith((RE_DERIVE, RE_SIZE)) for n in verdict.notes)  # one copy only
+    assert (verdict.escalation, verdict.exit_code) == (RE_DERIVE, 0)
+
+
+# --- escalating RE-DERIVE (BACKLOG #1842) ---------------------------------------------------------
+
+
+def test_a_run_under_its_record_raises_no_escalation() -> None:
+    verdict = decide(
+        elapsed_seconds=600, cap_seconds=3300, outcome="success", baseline=_uncensored(600)
+    )
+    assert verdict.escalation is None and verdict.escalation_message == ""
+    assert annotation(verdict, step="Tests (pytest)", leg="ubuntu-latest") is None
+
+
+def test_a_run_over_its_record_whose_cap_still_meets_the_rule_is_RE_DERIVE_and_stays_green() -> (
+    None
+):
+    """11:40 over a 10:00 record: the rule gives ceil_minute(1.35 x 11:40) = 16:00, under the 20:00
+    cap, so only the record is due. Exit 0: a finding about a table never reds a leg."""
+    verdict = decide(
+        elapsed_seconds=700, cap_seconds=1200, outcome="success", baseline=_uncensored(600)
+    )
+    assert (verdict.code, verdict.exit_code, verdict.escalation) == ("OK", 0, RE_DERIVE)
+    assert "11:40" in verdict.escalation_message and "10:00" in verdict.escalation_message
+
+
+def test_a_run_that_breaks_the_sizing_rule_is_RE_SIZE_and_still_stays_green() -> None:
+    """The shape that came before engine PR 1778 was ejected: green windows-2022 runs over the 4:11
+    row under a 6:00 cap. 4:30 against 6:00 is 1.333x, over the 1.30x floor, and the rule gives
+    ceil_minute(1.35 x 4:30) = 7:00. That band is the warning time the escalation exists for.
+
+    Falsified by flipping the RE-SIZE comparison to `<`: RED here. Restored.
+    """
+    verdict = decide(
+        elapsed_seconds=270, cap_seconds=360, outcome="success", baseline=_uncensored(251)
+    )
+    assert (verdict.code, verdict.exit_code, verdict.escalation) == ("OK", 0, RE_SIZE)
+    msg = verdict.escalation_message
+    assert "4:30" in msg and "4:11" in msg and "cap of 7:00" in msg and "6:00 in force" in msg
+    # The red line, 6:00 / 1.30 = 276.9s, to a tenth, so a green run just under it cannot read as on it.
+    assert "over 276.9s" in msg
+    assert "(merge_group and pull_request)" in msg and "pushes to main alone" in msg
+    assert "never by hand" in msg
+
+
+def test_the_escalation_rides_on_a_LOW_verdict_without_changing_its_exit() -> None:
+    verdict = decide(
+        elapsed_seconds=284, cap_seconds=360, outcome="success", baseline=_uncensored(251)
+    )
+    assert (verdict.code, verdict.exit_code, verdict.escalation) == ("LOW", 1, RE_SIZE)
+
+
+def test_a_run_the_gate_reds_is_RE_SIZE_even_when_the_rule_alone_would_say_RE_DERIVE() -> None:
+    """Under --min-margin 1.40 the gate can red a run the 1.35 rule still accepts. A red leg must not
+    be told only the record is due. 5:05 over a 4:40 row, 7:00 cap: 1.377x, LOW at 1.40; the rule
+    gives ceil_minute(6:51.75) = 7:00, no larger than the cap."""
+    verdict = decide(
+        elapsed_seconds=305,
+        cap_seconds=420,
+        outcome="success",
+        baseline=_uncensored(280),
+        min_margin=1.40,
+    )
+    assert (verdict.code, verdict.escalation) == ("LOW", RE_SIZE)
+
+
+def test_a_censored_row_never_escalates() -> None:
+    """A censored row is a lower bound, so a run above it is expected and says nothing new."""
+    censored = Baseline(
+        step="Tests (pytest)",
+        leg="windows-2025",
+        max_passing_seconds=600,
+        censored=True,
+        censored_by="a fixture cap",
+        source="a fixture; measured 2026-01-01 over a pool of nothing.",
+    )
+    verdict = decide(elapsed_seconds=700, cap_seconds=3300, outcome="success", baseline=censored)
+    assert verdict.escalation is None
+    assert any("this run is 116.7% of it" in n for n in verdict.notes)
+
+
+@pytest.mark.parametrize("outcome", ["failure", "cancelled", "skipped"])
+def test_a_run_that_did_not_succeed_never_escalates(outcome: str) -> None:
+    """A truncated or absent observation says nothing about the record, in either direction."""
+    verdict = decide(
+        elapsed_seconds=900, cap_seconds=360, outcome=outcome, baseline=_uncensored(251)
+    )
+    assert verdict.escalation is None
+
+
+def test_the_sizing_rule_is_ceil_minute_one_point_three_five_floored_at_five() -> None:
+    assert sized_cap_minutes(60) == 5  # the floor binds
+    assert sized_cap_minutes(222) == 5  # 1.35 x 3:42 = 4:59.7
+    assert sized_cap_minutes(223) == 6  # 1.35 x 3:43 = 5:01.05
+    assert sized_cap_minutes(305) == 7  # a 5:05 row sizes to 7 (6:51.75 rounded up)
+    assert sized_cap_minutes(2800) == 63  # exactly 63:00; the raw float product ceils to 64
+
+
+def test_the_annotation_is_a_WARNING_with_its_title_and_message_escaped() -> None:
+    """A warning, never an error: the step concluded success. A raw `:` or `,` in a title, or a raw
+    `%` or newline anywhere, would truncate or corrupt the workflow command."""
+    verdict = decide(
+        elapsed_seconds=700, cap_seconds=1200, outcome="success", baseline=_uncensored(600)
+    )
+    line = annotation(verdict, step="Web console tests (pytest)", leg="windows-2022")
+    assert line is not None
+    assert line.startswith(
+        "::warning title=step-margin RE-DERIVE%3A Web console tests (pytest) @ windows-2022::RE-DERIVE: "
+    )
+    tricky = Baseline(
+        step="s",
+        leg="l",
+        max_passing_seconds=600,
+        censored=False,
+        censored_by="",
+        source="50% of runs,\nsecond line",
+    )
+    odd = annotation(
+        decide(elapsed_seconds=700, cap_seconds=1200, outcome="success", baseline=tricky),
+        step="a, b",
+        leg="x",
+    )
+    assert odd is not None
+    assert "\n" not in odd
+    assert "title=step-margin RE-DERIVE%3A a%2C b @ x::" in odd
+    assert "50%25 of runs,%0Asecond line" in odd
+
+
+_FIXTURE_ROW = """
+[[baseline]]
+step = "<fixture step>"
+leg = "<fixture leg>"
+max_passing = "5:05"
+censored = false
+censored_by = ""
+source = "a synthetic test fixture: a 5:05 row under a 7:00 cap; no pool at all."
+"""
+
+
+def _fixture_main(tmp_path: Path, elapsed: int, cap_minutes: int) -> tuple[int, str]:
+    baseline = tmp_path / "baseline.toml"
+    baseline.write_text(_FIXTURE_ROW, encoding="utf-8")
+    summary = tmp_path / "summary.md"
+    rc = main(
+        [
+            "--step",
+            "<fixture step>",
+            "--leg",
+            "<fixture leg>",
+            "--cap-minutes",
+            str(cap_minutes),
+            "--outcome",
+            "success",
+            "--elapsed-seconds",
+            str(elapsed),
+            "--baseline",
+            str(baseline),
+            "--summary-file",
+            str(summary),
+        ]
+    )
+    return rc, summary.read_text(encoding="utf-8")
+
+
+def test_main_on_a_runner_prints_the_annotation_and_the_banner_and_exits_0(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """5:15 over a 5:05 row under a 7:00 cap is 1.333x, green, and the rule gives 8:00: RE-SIZE. It
+    is annotated, bannered above the verdict, and exits 0. The fixture names no real leg, so a
+    failing run replaying this stdout cannot plant an annotation about one."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    rc, text = _fixture_main(tmp_path, elapsed=315, cap_minutes=7)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "::warning title=step-margin RE-SIZE%3A <fixture step> @ <fixture leg>::RE-SIZE: " in out
+    assert text.index("> RE-SIZE: this run took 315.0s (5:15)") < text.index("**OK**")
+    assert text.count("this run took 315.0s") == 1  # bannered, not repeated as a bullet
+    assert "control (record)" in text
+
+
+def test_main_off_a_runner_prints_no_workflow_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, text = _fixture_main(tmp_path, elapsed=315, cap_minutes=7)
+    assert rc == 0
+    assert "::warning" not in capsys.readouterr().out
+    assert "> RE-SIZE:" in text  # the summary still carries it
+
+
+def test_the_record_controls_refuse_when_the_escalation_cannot_speak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The escalation's own negative control: neuter it and the check exits 2, not a quiet 0."""
+    import scripts.ci.step_margin as sm
+
+    def silent(*_args: object, **_kwargs: object) -> tuple[str | None, str]:
+        return None, ""
+
+    monkeypatch.setattr(sm, "record_escalation", silent)
+    with pytest.raises(MarginError) as exc:
+        self_check()
+    assert "did not escalate as designed" in str(exc.value)
+
+
+def test_the_record_controls_refuse_when_the_escalation_reds_a_leg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other failure: an escalation that moves the exit code is the #1842 defect itself."""
+    import scripts.ci.step_margin as sm
+
+    real_decide = sm.decide
+
+    def reddening(**kwargs: object) -> Verdict:
+        v = real_decide(**kwargs)  # type: ignore[arg-type]
+        if v.escalation is None:
+            return v
+        return Verdict(
+            code="LOW",
+            exit_code=1,
+            headline=v.headline,
+            notes=v.notes,
+            escalation=v.escalation,
+            escalation_message=v.escalation_message,
+        )
+
+    monkeypatch.setattr(sm, "decide", reddening)
+    with pytest.raises(MarginError) as exc:
+        self_check()
+    assert "changed the exit code" in str(exc.value)
 
 
 def test_a_gated_step_with_no_recorded_maximum_FAILS_CLOSED() -> None:
@@ -320,6 +563,8 @@ def test_the_live_control_returns_both_answers() -> None:
     lines = self_check()
     assert any("LOW, exit 1" in line for line in lines)
     assert any("OK, exit 0" in line for line in lines)
+    assert any(f"-> {RE_DERIVE}, OK, exit 0" in line for line in lines)
+    assert any(f"-> {RE_SIZE}, OK, exit 0" in line for line in lines)
 
 
 def test_the_control_refuses_when_the_gate_cannot_go_red(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -876,10 +1121,10 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
     The cap and the row live in different files (BACKLOG #1842). A row raised without its cap, or a
     cap lowered past its row, leaves a leg whose worst KNOWN green run would red the gate -- the
     state #1842 was filed against, with 5 of 30 merge groups ejected. A cap raised by hand with no
-    new row is the other drift: a bound derived from another bound. So two assertions: the row is
-    not LOW at its cap, against the gate's own floor; and the cap is exactly the sizing rule ci.yml's
-    "THE SECOND RE-DERIVATION" note states and "THE THIRD RE-DERIVATION" applies, ceil_minute(1.35x
-    the row), floored at 5:00.
+    new row is the other drift: a bound derived from another bound. So the row must not be LOW at
+    its cap, against the gate's own floor; and the cap must be exactly the sizing rule,
+    ceil_minute(1.35x the row) floored at 5:00, as `step_margin.sized_cap_minutes` computes it. An
+    integer restatement of the rule beside it fails if that function's arithmetic moves.
 
     Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:43 row (7:00 /
     5:43 = 1.224x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
@@ -903,7 +1148,9 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
             f"{DEFAULT_MIN_MARGIN:.2f}x floor -- the slowest known green run would red this leg. "
             f"Re-size the cap from the row, or re-measure the row."
         )
-        sized = max(5, math.ceil(1.35 * recorded / 60))
+        sized = sized_cap_minutes(recorded)
+        # Rows are whole seconds, so integer arithmetic states the rule with no float rounding.
+        assert sized == max(5, -(-135 * recorded // 6000)), "the shared sizing rule moved"
         assert cap == sized, (
             f"{leg['os']}: webconsole_margin_cap is {cap}m, but its row records "
             f"{format_clock(recorded)} and ceil_minute(1.35x) of that, floored at 5:00, is {sized}m. "
@@ -1064,8 +1311,8 @@ def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
         # step, whose own note in ci.yml offers 2 as "the conservative rung" when engine timing tests
         # flake. Taking that rung halves THIS step's workers, and every margin figure #1879 recorded
         # was measured at 4 -- 1.058x and 1.103x were what the two breaching legs needed at the caps
-        # then in force (every cap has moved since; see ci.yml's "THE THIRD RE-DERIVATION"), with no
-        # measurement at all at 2. A `> 1` bound stays green through exactly that change, so it would
+        # then in force (every cap has been re-derived since; see ci.yml's second and third
+        # re-derivation notes), with no measurement at all at 2. A `> 1` bound stays green through exactly that change, so it would
         # let the merge-group ejections come back while still reading as a parallelism guard.
         assert isinstance(count, int) and count >= 4, (
             f"{name} sets {knob.group(1)}={count!r}. The web console step's margin arithmetic was "

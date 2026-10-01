@@ -84,8 +84,8 @@ class _FakeResp:
     def __enter__(self) -> _FakeResp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _FakeOpener:
@@ -120,7 +120,7 @@ def _executor(
     ex = FhirLookupExecutor(conn or _CONN)
     opener = _FakeOpener(exc=exc, body=body, status=status)
     for name in ex.connections:  # swap the per-connection opener for the fake
-        ex._opener[name] = opener  # type: ignore[attr-defined]
+        ex._opener[name] = opener  # type: ignore[assignment]
     return ex, opener
 
 
@@ -643,7 +643,7 @@ async def test_smart_bearer_applied_and_reminted_on_401() -> None:  # AC-5
 
     ex, opener = _executor(body=PATIENT.encode())
     prov = _FakeProvider()
-    ex._token["epic"] = prov  # type: ignore[attr-defined]
+    ex._token["epic"] = prov
     await ex.read("epic", "Patient/123")
     req = opener.requests[0]
     # The SMART bearer rides the Authorization header on the GET.
@@ -653,9 +653,9 @@ async def test_smart_bearer_applied_and_reminted_on_401() -> None:  # AC-5
     # On a 401 the provider is invalidated so the next read re-mints.
     ex2 = FhirLookupExecutor(_CONN)
     opener2 = _FakeOpener(exc=_http_error(401))
-    ex2._opener["epic"] = opener2  # type: ignore[attr-defined]
+    ex2._opener["epic"] = opener2  # type: ignore[assignment]
     prov2 = _FakeProvider()
-    ex2._token["epic"] = prov2  # type: ignore[attr-defined]
+    ex2._token["epic"] = prov2
     with pytest.raises(FhirLookupError, match="401"):
         await ex2.read("epic", "Patient/123")
     assert prov2.invalidated == 1
@@ -746,8 +746,8 @@ def _smart_executor(pem: str, token_opener: Any) -> tuple[FhirLookupExecutor, _F
         algorithm=SignatureAlgorithm.ES256,
         scope="system/Patient.rs",
     )
-    provider._opener = token_opener  # type: ignore[assignment]
-    ex._token["epic"] = provider  # type: ignore[attr-defined]
+    provider._opener = token_opener
+    ex._token["epic"] = provider
     return ex, fhir_opener
 
 
@@ -790,7 +790,7 @@ async def test_smart_token_url_over_the_length_limit_is_a_lookup_error(_ec_pem: 
     # The mint measures the configured token URL and raises ValueError when it is over the limit.
     # That is a config fault the Handler cannot fix, but it must still arrive as the lookup error.
     ex, fhir_opener = _smart_executor(_ec_pem, _FakeOpener())
-    ex._token["epic"].token_url = _TOKEN_URL + "?" + "a" * 9000  # type: ignore[attr-defined]
+    ex._token["epic"].token_url = _TOKEN_URL + "?" + "a" * 9000
     for call in (lambda: ex.read("epic", "Patient/123"), lambda: ex.test_connection("epic")):
         with pytest.raises(FhirLookupError) as err:
             await call()
@@ -912,7 +912,7 @@ async def test_a_refused_hop_reaches_the_handler_as_a_lookup_error() -> None:
     # BACKLOG #2059: the send-time re-check raised a raw InsecureHopRefused, a ValueError the
     # sandbox worker does not catch, so the Handler saw a crash instead of a lookup error.
     ex, opener = _executor(body=PATIENT.encode())
-    ex._hop_guard["epic"] = _refusing_guard()  # type: ignore[attr-defined]
+    ex._hop_guard["epic"] = _refusing_guard()
     with pytest.raises(FhirLookupError) as err:
         await ex.read("epic", "Patient/123")
     assert type(err.value) is FhirLookupError
@@ -927,7 +927,7 @@ async def test_the_probe_re_checks_the_hop_too() -> None:
     ex, opener = _executor(body=b'{"resourceType":"CapabilityStatement"}')
     await ex.test_connection("epic")
     assert len(opener.requests) == 1
-    ex._hop_guard["epic"] = _refusing_guard()  # type: ignore[attr-defined]
+    ex._hop_guard["epic"] = _refusing_guard()
     with pytest.raises(FhirLookupError) as err:
         await ex.test_connection("epic")
     assert type(err.value) is FhirLookupError
@@ -977,12 +977,12 @@ async def test_a_retry_does_not_start_a_second_live_read_beside_an_abandoned_one
     finally:
         opener.release.set()
     for _ in range(500):
-        if not ex._still_running("epic"):  # type: ignore[attr-defined]
+        if not ex._still_running("epic"):
             break
         await asyncio.sleep(0.01)
-    assert not ex._still_running("epic")  # type: ignore[attr-defined]
+    assert not ex._still_running("epic")
     # Nothing is kept once it finished: a done future holds the reply or the bearer's frames.
-    assert ex._abandoned == {}  # type: ignore[attr-defined]
+    assert ex._abandoned == {}
     assert len(opener.requests) == 1  # the abandoned read, which ran to its end
     # Once it has ended, reads go through again.
     assert (await asyncio.to_thread(call))["id"] == "123"
@@ -1032,7 +1032,7 @@ def test_a_read_that_finishes_as_the_wait_runs_out_keeps_its_own_outcome(
         RegistryRunner._run_fhir_lookup(runner, "epic", "Patient/123")  # type: ignore[arg-type]
     assert err.value is own
     assert not isinstance(err.value.__context__, TimeoutError)  # the wait did not decide it
-    assert ex._abandoned == {}  # type: ignore[attr-defined]
+    assert ex._abandoned == {}
 
 
 async def test_remote_disconnected_keeps_the_os_error_wording() -> None:
@@ -1171,8 +1171,8 @@ def test_check_fhir_lookup_permits_allowlisted_smart_token_url() -> None:  # DEL
 
 def _reg_with_fhir_handler(fn: Any) -> Registry:
     reg = Registry()
-    reg.add_router("r", lambda msg: ["h"])  # type: ignore[arg-type]
-    reg.add_handler("h", fn)  # type: ignore[arg-type]
+    reg.add_router("r", lambda msg: ["h"])
+    reg.add_handler("h", fn)
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=2576), router="r"))
     return reg
 
@@ -1196,8 +1196,8 @@ def test_router_raises_when_calling_fhir_lookup() -> None:  # AC-3 (router)
         fhir_lookup("epic", "Patient/123")  # routers are pure — no live lookup
         return ["h"]
 
-    reg.add_router("r", router)  # type: ignore[arg-type]
-    reg.add_handler("h", lambda msg: None)  # type: ignore[arg-type]
+    reg.add_router("r", router)
+    reg.add_handler("h", lambda msg: None)
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=2577), router="r"))
     raw = "MSH|^~\\&|S|F|R|F|20260614||ADT^A01|1|P|2.5\rPID|1||M1^^^MR\r"
     result = dryrun.dry_run(reg, raw, inbound="IB")

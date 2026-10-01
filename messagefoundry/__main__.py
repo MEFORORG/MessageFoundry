@@ -21,6 +21,11 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 
 from __future__ import annotations
 
+# PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
+# open a store or read a service TOML use these. The rest below runs on every command or is the
+# logging chain, so it stays eager. The heavy import is deferred in config/__init__.py.
+__lazy_modules__ = ["sqlite3", "tomllib"]
+
 import argparse
 import functools
 import json
@@ -6190,8 +6195,16 @@ def _build_provision_auth_service(
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
             hop_posture=posture,
         )
-    except SecretProviderError:
-        refusal = _PROVISION_AUTH_REFUSALS["reference"]
+    except SecretProviderError as exc:
+        # BACKLOG #2317: the Vault provider raises a cleartext-address refusal as its own type.
+        # Its text is fixed and names no part of the address, so it is shown, as the
+        # InsecureHopRefused arm below would show it.
+        cause = exc.__cause__
+        refusal = (
+            _sentence(cause)
+            if isinstance(cause, InsecureHopRefused)
+            else _PROVISION_AUTH_REFUSALS["reference"]
+        )
     except LdapError:
         refusal = _PROVISION_AUTH_REFUSALS["ldap"]
     except FileNotFoundError:

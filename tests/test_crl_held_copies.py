@@ -330,7 +330,7 @@ def test_a_held_copy_of_a_path_no_row_names_gets_its_own_row(pki: _Pki) -> None:
     runner = CertExpiryRunner(
         list,
         CertMonitorSettings(warn_days=30),
-        alert_sink=sink,  # type: ignore[arg-type]  # the duck-typed recorder test_cert_expiry uses
+        alert_sink=sink,  # test_cert_expiry's recorder, a LoggingAlertSink
         watch_unlisted_held_crls=True,
     )
 

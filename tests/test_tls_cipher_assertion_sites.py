@@ -146,7 +146,7 @@ def asserted_contexts(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ssl.SS
 
 def _opener_context(opener: urllib.request.OpenerDirector) -> ssl.SSLContext | None:
     """The ``SSLContext`` ``opener``'s https handler will hand every connection it opens."""
-    for handler in opener.handlers:
+    for handler in opener.handlers:  # type: ignore[attr-defined]  # typeshed omits it
         if hasattr(handler, "https_open"):
             ctx = getattr(handler, "_context", None)
             if isinstance(ctx, ssl.SSLContext):
@@ -667,9 +667,10 @@ def _context_urllib3_builds_for(client: Any) -> ssl.SSLContext:
     the handshake uses whoever built it.
     """
     import urllib3.connection  # noqa: PLC0415  (optional [vault] extra; module-scope would break base)
+    import urllib3.util.ssl_  # noqa: PLC0415  (the module urllib3.connection imports it from)
 
     captured: list[ssl.SSLContext] = []
-    real = urllib3.connection.ssl_wrap_socket
+    real = urllib3.util.ssl_.ssl_wrap_socket
 
     def spy(*args: Any, **kwargs: Any) -> Any:
         ctx = kwargs.get("ssl_context")
@@ -746,7 +747,8 @@ def test_the_transit_cipher_client_is_the_asserted_one(
     claim: rebind one and this goes red.
     """
 
-    assert crypto_transit._build_client is keyprovider_vault._build_client
+    # The re-import IS the subject, so the unexported name is read on purpose.
+    assert crypto_transit._build_client is keyprovider_vault._build_client  # type: ignore[attr-defined]
 
 
 @_vault_extra
@@ -967,7 +969,7 @@ def test_the_handler_factory_refuses_when_it_cannot_reach_the_context(
     class _NoContextHandler(urllib.request.HTTPSHandler):
         def __init__(self) -> None:
             super().__init__()
-            del self._context
+            del self._context  # type: ignore[attr-defined]  # a private stdlib attribute
 
     monkeypatch.setattr(urllib.request, "HTTPSHandler", _NoContextHandler)
     with pytest.raises(ValueError, match="cannot reach the TLS context"):

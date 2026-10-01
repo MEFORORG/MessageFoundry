@@ -400,8 +400,8 @@ class _Resp:
     def __enter__(self) -> _Resp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _Opener:
@@ -514,7 +514,9 @@ async def test_x12_rte_raw_tcp_271_capture_reingresses_and_routes(rte_store: Any
 
         assert json.loads(child["metadata"])["correlation_id"] == origin
         assert seen.get("txn") == ["271"]  # the Router peeked the re-ingressed reply as X12
-        assert (await store.get_message(origin))["status"] == MessageStatus.PROCESSED.value
+        origin_msg = await store.get_message(origin)
+        assert origin_msg is not None
+        assert origin_msg["status"] == MessageStatus.PROCESSED.value
         assert await store.pending_depth("IB_LOOP", stage=Stage.RESPONSE.value) == (0, None)
     finally:
         await partner.stop()  # the rte_store fixture closes the store
@@ -580,7 +582,9 @@ async def test_x12_over_rest_bare_body_reingresses_and_routes(store: MessageStor
     child = await _drain_reingress(store, reg, child_mid, MessageStatus.FILTERED.value)
     assert child is not None and child["status"] == MessageStatus.FILTERED.value
     assert child["raw"] == resp.body  # the bare 271 body, re-ingressed verbatim
-    assert (await store.get_message(origin))["status"] == MessageStatus.PROCESSED.value
+    origin_msg = await store.get_message(origin)
+    assert origin_msg is not None
+    assert origin_msg["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_x12_over_soap_envelope_into_x12_loopback_errors_not_dropped(
@@ -621,5 +625,7 @@ async def test_x12_over_soap_envelope_into_x12_loopback_errors_not_dropped(
     assert child is not None and child["status"] == MessageStatus.ERROR.value  # NOT dropped
     assert child["raw"] == resp.body  # the raw SOAP envelope is preserved for the operator
     # the origin's reply WAS handled (its Stage.RESPONSE token was consumed) -> PROCESSED
-    assert (await store.get_message(origin))["status"] == MessageStatus.PROCESSED.value
+    origin_msg = await store.get_message(origin)
+    assert origin_msg is not None
+    assert origin_msg["status"] == MessageStatus.PROCESSED.value
     assert await store.pending_depth("IB_LOOP", stage=Stage.RESPONSE.value) == (0, None)

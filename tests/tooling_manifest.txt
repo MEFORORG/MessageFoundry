@@ -114,6 +114,7 @@ tests/test_dast_claims.py
 tests/test_defaulted_credential_lint.py
 tests/test_dep1_lock_resync_lockstep.py
 tests/test_dependabot_automerge_guardrails.py
+tests/test_dependabot_cap_ignores.py
 tests/test_docs_runbooks.py
 tests/test_failure_signal.py
 tests/test_feature_map_claims.py
@@ -156,6 +157,7 @@ tests/test_security_composite_parity.py
 tests/test_security_posture.py
 tests/test_security_txt_expiry_reminder.py
 tests/test_selfheal_installed_parity.py
+tests/test_semgrep_install_retry.py
 tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py

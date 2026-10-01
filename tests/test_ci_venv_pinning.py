@@ -130,6 +130,11 @@ LOCK_ONLY_VENVS = (
     ("release.yml", "/tmp/sbomenv"),
     ("security.yml", "/tmp/sbomenv"),
     ("security.yml", "/tmp/lockcheck"),
+    # The Windows SBOM steps' venv (BACKLOG #2521). Missing until then, so an unhashed install into
+    # it passed this rule. `test_sbom_scan_venv_is_created_without_a_seeded_pip` now refuses any
+    # SBOM scan venv that is not listed here.
+    ("release.yml", "$RUNNER_TEMP/sbomenv"),
+    ("security.yml", "$RUNNER_TEMP/sbomenv"),
 )
 
 #: The runners the engine SBOM is built on, one step per runner in each of `release.yml` and
@@ -151,6 +156,12 @@ def _code_lines(wf: Path) -> list[str]:
     ]
 
 
+def _venv_tool(venv: str, tools: str) -> str:
+    """A regex fragment for one of ``tools`` inside ``venv``, in either layout: ``<venv>/bin/pip3.14``
+    or ``"<venv>/Scripts/python.exe"``, with any version suffix and an optional closing quote."""
+    return rf'{re.escape(venv)}/(?:bin|Scripts)/(?:{tools})[\d.]*(?:\.exe)?"?'
+
+
 def _installs_into(venv: str, line: str) -> bool:
     """True when ``line`` runs a pip install INTO ``venv``, in any of three spellings:
     ``<venv>/bin/pip install ...``, ``<venv>/bin/python -m pip install ...``, and the OUTER pip driving
@@ -161,7 +172,7 @@ def _installs_into(venv: str, line: str) -> bool:
     is named before the subcommand. Each command in a ``&&``/``;``/``|`` chain is judged on its own, so
     an earlier install on the same line cannot hide a later one.
     """
-    named = re.compile(rf"{re.escape(venv)}(?:/bin/(?:pip|python)[\d.]*|/)?(?=\s|$)")
+    named = re.compile(rf'(?:{_venv_tool(venv, "pip|python")}|{re.escape(venv)}/?"?)(?=\s|$)')
     for command in re.split(r"&&|\|\||[;|]", line):
         match = _PIP_INSTALL.search(command)
         if match is not None and named.search(command[: match.end()]):
@@ -260,14 +271,12 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
     assert not [ln for ln in code if re.search(r"\bensurepip\b", ln)], (
         f"{workflow}'s SBOM step runs ensurepip, which re-seeds the pip `--without-pip` kept out"
     )
-    own_pip = [
-        ln
-        for ln in code
-        if re.search(
-            rf"{re.escape(venv)}/(?:bin|Scripts)/(?:pip|python(?:\.exe)?\s+-m\s+pip)\b", ln
-        )
-    ]
+    own_pip = [ln for ln in code if _own_pip_re(venv).search(ln)]
     assert not own_pip, f"{workflow} installs through the pip-less venv's own pip: {own_pip}"
+    assert (workflow, venv) in LOCK_ONLY_VENVS, (
+        f"{workflow}'s {runner} SBOM scan venv {venv!r} is not in LOCK_ONLY_VENVS, so nothing "
+        "checks that every install into it is hash-verified (BACKLOG #2521)"
+    )
     core = [ln for ln in _installs_in(shell) if "docker/locks/requirements-core.lock" in ln]
     assert len(core) == 1, f"{workflow}'s {runner} SBOM step installs the core lock {core}"
     assert re.search(rf'--python\s+"?{re.escape(venv)}/\S+\s+install\b', core[0]), (
@@ -286,6 +295,61 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
     assert "--record-sys-platform" in finalize[0].split(), (
         f"{workflow}'s {runner} SBOM is finalized without --record-sys-platform: {finalize[0]!r}"
     )
+    # Environment mode cannot see code the wheel carries in its own tree, so without this flag the
+    # SBOM omits the vendored defusedxml the engine parses untrusted XML with (BACKLOG #2498).
+    assert re.search(r"--vendored-from\s+messagefoundry/_vendor(?:\s|$)", finalize[0]), (
+        f"{workflow}'s {runner} SBOM is finalized without --vendored-from messagefoundry/_vendor: "
+        f"{finalize[0]!r}"
+    )
+
+
+def _own_pip_re(venv: str) -> re.Pattern[str]:
+    """A command run through ``venv``'s OWN pip: ``<venv>/bin/pip ...`` or ``<venv>/bin/python -m pip``.
+
+    The OUTER pip's ``--python "<venv>/Scripts/python.exe" install`` is not a match: there the venv's
+    interpreter is an argument, followed by ``install`` rather than ``-m pip``.
+    """
+    return re.compile(
+        rf"{_venv_tool(venv, 'pip')}(?=\s|$)|{_venv_tool(venv, 'python')}\s+-m\s+pip\b"
+    )
+
+
+_WIN = "$RUNNER_TEMP/sbomenv"
+_WIN_PY = f'"{_WIN}/Scripts/python.exe"'
+
+
+@pytest.mark.parametrize(
+    ("venv", "line", "own", "installs"),
+    [
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/pip install x", True, True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/pip3.14 install x", True, True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/python -m pip install x", True, True),
+        ("/tmp/sbomenv", "/tmp/sbomenv/bin/python3.14 -m pip install x", True, True),
+        # BACKLOG #2521 finding 2: the closing quote used to hide the Windows interpreter.
+        (_WIN, f"{_WIN_PY} -m pip install x", True, True),
+        (_WIN, f"{_WIN}/Scripts/python.exe -m pip install x", True, True),
+        (_WIN, f'"{_WIN}/Scripts/pip.exe" install x', True, True),
+        # The outer pip driving the venv: an install into it, but not through its own pip.
+        (_WIN, f"python -m pip --python {_WIN_PY} install -r a.lock", False, True),
+        (
+            "/tmp/sbomenv",
+            "python -m pip --python /tmp/sbomenv/bin/python install -r a",
+            False,
+            True,
+        ),
+        # A quote closing unrelated text is not a quoted pip.
+        (_WIN, f'echo "{_WIN} needs no pip" install x', False, False),
+        # The control: a line naming the venv that installs nothing must match neither.
+        (_WIN, f"python -m cyclonedx_py environment {_WIN_PY} \\", False, False),
+    ],
+)
+def test_venv_patterns_see_every_spelling(venv: str, line: str, own: bool, installs: bool) -> None:
+    """The own-pip refusal and ``LOCK_ONLY_VENVS``'s install finder each see only what their pattern
+    matches, so a missed spelling is a silent pass. Each must see a quoted Windows interpreter and a
+    versioned or ``.exe`` pip, and the own-pip one must miss the outer pip the venv is meant to get.
+    """
+    assert bool(_own_pip_re(venv).search(line)) is own
+    assert _installs_into(venv, line) is installs
 
 
 # --- the release path: every named package must carry a version ------------------------------------
@@ -317,8 +381,11 @@ _PIP_VALUE_FLAGS = (
     "--use-deprecated",
     "--resume-retries",
 )
+# `pip`, `pip3.14`, and a quoted `".../Scripts/pip.exe"` (BACKLOG #2521): a spelling this misses is an
+# install no pin rule ever sees. The closing quote counts only after a path, so `echo "upgrade pip"
+# install` stays text.
 _PIP_INSTALL = re.compile(
-    r"\bpip3?\s+(?:(?:(?:"
+    r"(?:(?<=/)pip[\d.]*(?:\.exe)?\"?|\bpip[\d.]*(?:\.exe)?)\s+(?:(?:(?:"
     + "|".join(re.escape(f) for f in _PIP_VALUE_FLAGS)
     + r")\s+\S+|-\S+)\s+)*install\b"
 )
