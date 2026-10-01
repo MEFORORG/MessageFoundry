@@ -1529,7 +1529,17 @@ with no page.
   flagged at that release, like any new account, and its notification address gets the
   `account_created` notice.
 - **A directory grant.** An account that gets Administrator because the *directory* added it to a
-  group already mapped to Administrator raises no alert. The engine never sees that grant.
+  group already mapped to Administrator raises no `administrator_granted` alert. The API's
+  user-administration routes raise that alert, and a directory change does not pass through them.
+  The engine does see the grant, at the account's next sign-in. It writes an
+  `auth.ad_roles_resynced` audit row with the old and new roles. Where a notifier is configured,
+  it also sends a roles-changed notice to that account's own notification address. Neither is an
+  alert. An account that holds a live session when the directory changes is seen sooner, by the
+  [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
+  while it is on, which is the default. It revokes the session and raises `ad_session_revoked`
+  with reason `roles_changed`, which does not name the role. An account with no live session
+  raises no alert at all, so watch membership of the mapped group in the directory itself.
+  **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
 
 The check also flags some releases that changed nothing. A login that rehashes a password after an
 argon2 parameter change restamps `password_changed_at`, so each approver's first release after such a
