@@ -1353,6 +1353,8 @@ class ProxyConfig:
     auth_header: tuple[tuple[str, str], ...]  # (("Proxy-Authorization", "Basic .."),) or ()
     digest: _ProxyDigestRecipe | None
     redacted: str  # a PHI/secret-safe rendering of the proxy for logs (never the raw URL/creds)
+    # The declaring connection's name, for a log record. A name, never a setting value.
+    connection: str | None = None
 
     def _build_proxy_handler(self) -> urllib.request.ProxyHandler:
         if self.use_default:
@@ -1366,13 +1368,16 @@ class ProxyConfig:
         A loopback host is bypassed with no entry in the list (vault BACKLOG #2579). The opener
         would dial it direct anyway, so the pre-emptive ``Proxy-Authorization`` header must not be
         attached either: on a direct request it would go to the destination itself. That makes an
-        operator's proxy setting inert for this host, so it is logged."""
+        operator's proxy setting inert for this host, so it is logged.
+
+        The record states the fact and names the connection, and nothing else. It carries no
+        part of the proxy URL and no part of ``host``. Both are read out of the settings mapping
+        that also holds the connection's credentials, and a proxy URL can carry userinfo."""
         if _is_loopback_target(host):
             logger.info(
-                "the web proxy (%s) is not used for loopback host %r: a loopback hop is always "
-                "dialled direct",
-                self.redacted,
-                host,
+                "connection %s; the configured web proxy is not used for a loopback target, "
+                "because a loopback hop is always dialled direct",
+                audit_connection_name(self.connection),
             )
             return None
         if _proxy_bypasses(host, self.bypass):
@@ -1553,6 +1558,7 @@ def proxy_config_from_settings(
             auth_header=(),
             digest=None,
             redacted="default web proxy",
+            connection=connection,
         )
     proxy_scheme = urllib.parse.urlsplit(proxy_url).scheme.lower()
     if proxy_scheme not in ("http", "https"):
@@ -1577,6 +1583,7 @@ def proxy_config_from_settings(
         auth_header=auth_header,
         digest=digest,
         redacted=_redact_url(proxy_url),
+        connection=connection,
     )
 
 
