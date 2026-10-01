@@ -512,7 +512,9 @@ class _Coordinator(NullCoordinator):
     async def leadership_lease(self) -> tuple[str | None, float | None]:
         return ("node-a", 1_700_000_030.0) if self._clustered else (self.node_id, None)
 
-    async def step_down_leadership(self) -> StepdownOutcome:
+    async def step_down_leadership(
+        self, *, sibling_acquire_delay_seconds: float = 0.0
+    ) -> StepdownOutcome:
         self.step_down_calls += 1
         if self._raises is not None:
             raise self._raises
