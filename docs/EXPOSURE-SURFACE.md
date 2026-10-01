@@ -33,7 +33,7 @@ At least these open a listening socket. Each one binds loopback (`127.0.0.1`) by
 **The settings file is not the last word on a bind.** `serve --host` and `serve --port` override it,
 and so do `MEFOR_*` environment variables. Read the service's command line and environment too.
 
-The other inbound types open no listening socket. A File Connection reads a directory. On a UNC
+At least these inbound types open no listening socket. A File Connection reads a directory. On a UNC
 path that directory is on another host, reached over SMB. A database-poll or remote-file (SFTP,
 FTP, FTPS) Connection dials out. Timer, loopback and pass-through Connections reach no outside
 system.
@@ -62,7 +62,7 @@ list means. The engine's own update check makes no network call: `[update_check]
 |---|---|---|---|
 | Outbound Connections, the `db_lookup` and `fhir_lookup` reads, and database-poll and remote-file inbound Connections | The `[egress].allowed_*` destination lists | Refuse every destination of that type while `[security].block_unlisted_outbound` is on. Allow any destination of that type while it is set to false | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
 | SMART and OAuth2 token endpoints | `[egress].allowed_http` | The same | `_check_credential_token_url_egress` in `messagefoundry/pipeline/wiring_runner.py` |
-| Forward web proxy | `[egress].allowed_proxy` | Refuse a proxy address. The `default` value is exempt: it names no address in config | [CONFIGURATION.md](CONFIGURATION.md#egress) |
+| Forward web proxy | `[egress].allowed_proxy` | Refuse a proxy address. The `default` value is exempt: the environment or operating system names that proxy, not the config | [CONFIGURATION.md](CONFIGURATION.md#egress) |
 | AI assistance broker | `[ai].allowed_endpoints` | Refuse the endpoint | [CONFIGURATION.md](CONFIGURATION.md#ai--ai-coding-assistance-policy) |
 | OpenID Connect identity provider | `[auth].oidc_allowed_endpoints` | Refused at load while OpenID Connect is on | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Alert webhook and alert email | `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts` | Any host | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
@@ -92,7 +92,8 @@ for some of these hops. It says to mirror each outbound firewall rule with its a
 
 [DEPLOYMENT.md](DEPLOYMENT.md#bind-guard-behavior-summary) describes the bind guards and their
 overrides, and [Before you expose off-loopback](DEPLOYMENT.md#before-you-expose-off-loopback) is the
-checklist. `serve` would exit with code 2, before it starts the web server, on at least these:
+checklist. `serve` would exit with code 2, before it starts the web server, on at least these.
+Each one is in `_serve` in `messagefoundry/__main__.py`.
 
 | Guard | What it refuses |
 |---|---|
@@ -101,7 +102,7 @@ checklist. `serve` would exit with code 2, before it starts the web server, on a
 | Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
 | Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |
 | Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
-| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. `_serve` in `messagefoundry/__main__.py` says which lists count |
+| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. `_serve` says which lists count |
 
 Under `enforcement = warn`, the proxy-attestation and open-egress guards only warn, and the
 operator-bind guard accepts the override that DEPLOYMENT.md describes. The sign-in, revocation and
@@ -109,7 +110,7 @@ plaintext-hop guards refuse under `warn` too.
 
 `serve` refuses on more than this table, so clearing one guard does not mean `serve` starts. The
 checklist names more of these refusals, and `_serve` holds at least some of the rest. Others come
-later, once the web server has started.
+later in startup.
 
 A listener guard is different. At startup it fails one Connection, and `serve` keeps going. By
 default, a non-loopback MLLP, HTTP, DICOM, raw TCP or X12 listener that has no TLS does not bind,
@@ -118,12 +119,12 @@ and its Connection shows as failed. Raw TCP and X12 have no TLS to turn on. A Co
 `_inbound_insecure_bind_permitted` in `messagefoundry/pipeline/wiring_runner.py` holds the rule.
 
 At least two more listener checks fail a Connection under `enforce`, and `tls_hop_attested` clears
-neither. `check_inbound_revocation` covers a mutual-TLS listener. `check_http_intake_auth` covers a
-non-loopback HTTP listener, which
-[CONNECTIONS.md](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023) describes.
-Both are in the same file, and each docstring says what clears the check. They run when each
-inbound Connection starts. So a running engine does not prove that every listener passed. On a
-config reload the same refusal fails the whole reload.
+neither. `check_inbound_revocation` covers a mutual-TLS listener, and `tls_crl_file` or
+`tls_revocation_attested` clears it. `check_http_intake_auth` covers a non-loopback HTTP listener,
+which [CONNECTIONS.md](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023)
+describes. Both are in the same file. They run when each inbound Connection starts. So a running
+engine does not prove that every listener passed. On a config reload the same refusal fails the
+whole reload.
 
 **The operator socket serves TLS in every topology but one.** With no operator certificate, the
 engine mints a self-signed pair on first run and serves TLS with it. The exception is
@@ -168,7 +169,7 @@ No one command gives the whole answer. Each row below has a stated gap.
 | Which Connections exist, and of what type? | `messagefoundry graph --config <config dir> --json` | It imports the config modules, so it runs their code. It prints each Connection's type and authored settings. It does not print the bind address, and an `env()` value shows as a placeholder |
 | What is a running engine serving? | `GET /connections` | Needs the `monitoring:read` permission. One row per endpoint, with its method. It shows no bind address, and it fills a port for MLLP rows only. It shows only what the caller's scope and the answering engine shard cover |
 | Which protective switches are off on a running engine? | `GET /security/posture` | It reports the engine shard that answers |
-| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the authored file, not the running service. It does not see the service's environment or command line, or any Connection. `MEFOR_*` variables in the shell that runs it can change its loosening list. A path that does not exist is not an error: it prints shipped defaults. A file that fails to load sets `loosenings_partial`, and the list can then miss entries. Its `loosenings_scope` field names some of these gaps. `_security` in `messagefoundry/__main__.py` is the source |
+| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the authored file, not the running service. It does not see the service's environment or command line, or any Connection. A path that does not exist is not an error: it prints shipped defaults. When `loosenings_partial` is true, the list can miss entries. Its `loosenings_scope` field names some of these gaps. `_security` in `messagefoundry/__main__.py` is the source |
 | Which Connections carry a loosening, across all engine shards? | `messagefoundry check --config <config dir>` | It also runs the config modules. It opens no store |
 
 ## `messagefoundry verify` does not measure exposure
