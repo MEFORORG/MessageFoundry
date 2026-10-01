@@ -1169,55 +1169,96 @@ def test_bash_and_powershell_get_the_same_answer_for_the_same_command(
 # stamp breaks when a Manager moves its own Builder's tree. So the LOGIC is unchanged and the class B
 # deny instead teaches a route this gate already allows: compose in the object store, then create.
 #
-# The allowed rows are the claim the new text makes, so they are pinned here beside it. A text that
-# taught a route the gate refused would be the unrunnable-remedy defect of #1032 again.
+# The deny's own `git` lines are the claim, so they are pulled out of the reason and run through the
+# gate. A text that taught a route the gate refused would be the unrunnable-remedy defect of #1032.
 
-COMPOSE_ROUTE = [
-    # As the deny prints them, aimed at the primary...
-    'git -C "{primary}" merge-tree --write-tree main victim-branch',
-    'git -C "{primary}" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -p main -m batch',
-    'git -C "{primary}" worktree add --detach "{fresh}" main',
-    'git -C "{primary}" push origin main:refs/heads/batch-184',
-    # ...and aimed at ANOTHER session's worktree, the case the Manager asked to see allowed.
-    'git -C "{victim}" merge-tree --write-tree main victim-branch',
-    'git -C "{victim}" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -p main -m batch',
-    'git -C "{victim}" worktree add --detach "{fresh}" main',
-]
+#: Placeholder -> a concrete value of the right shape, so a printed line becomes a runnable command.
+_ROUTE_FILL = {
+    "<base>": "main",
+    "origin/<branch>": "victim-branch",
+    "<branch>": "victim-branch",
+    "<tree>": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+    "<tip>": "main",
+    "<batch>": "batch-184",
+}
+
+
+def _class_b_reason(repo: HijackRepo, repos_file: Path, tool: str = "Bash") -> str:
+    command = f'git -C "{repo.victim}" merge main'
+    return assert_denied(run_gate(bash(command, cwd=repo.mine, tool=tool), repos_file))
+
+
+def _printed_route(reason: str, fresh: Path) -> list[str]:
+    lines = [ln.strip() for ln in reason.splitlines() if ln.strip().startswith("git ")]
+    route = [ln for ln in lines if not ln.startswith("git -C ")]  # the READ plumbing keeps its -C
+    filled = []
+    for ln in route:
+        ln = ln.replace("<new path>", f'"{fresh}"')
+        for placeholder, value in _ROUTE_FILL.items():
+            ln = ln.replace(placeholder, value)
+        assert "<" not in ln, f"an unfilled placeholder survives: {ln}"
+        filled.append(ln)
+    return filled
 
 
 def test_the_class_B_deny_teaches_the_compose_then_create_route(
-    hijack_repo: HijackRepo, hijack_repos_file: Path
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tmp_path: Path
 ) -> None:
-    """Red before this change: the first bullet only said to drop the `-C`."""
-    reason = assert_denied(
-        run_gate(
-            bash(f'git -C "{hijack_repo.victim}" merge main', cwd=hijack_repo.mine),
-            hijack_repos_file,
-        )
-    )
+    """Red before this change: the deny named no route at all."""
+    reason = _class_b_reason(hijack_repo, hijack_repos_file)
     for needle in (
+        "git fetch origin",
         "merge-tree --write-tree",
         "commit-tree",
         "worktree add --detach",
-        "non-zero",
+        "exit 1 with conflict",
         "isolation: worktree",
-        "PLAIN terminal",
+        "your own worktree",
+        "plain terminal",
     ):
-        assert needle.lower() in reason.lower(), (
-            f"{needle!r} missing from the class B deny:\n{reason}"
-        )
+        assert needle in reason.lower(), f"{needle!r} missing from the class B deny:\n{reason}"
+    route = _printed_route(reason, tmp_path / "GateRepo-batch")
+    assert len(route) == 5, route
 
 
-@pytest.mark.parametrize("template", COMPOSE_ROUTE)
 @pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
-def test_the_compose_route_is_ALLOWED_while_a_merge_into_another_tree_is_not(
-    hijack_repo: HijackRepo, hijack_repos_file: Path, tmp_path: Path, template: str, tool: str
+def test_every_route_line_the_deny_PRINTS_is_allowed_and_the_merge_still_is_not(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tmp_path: Path, tool: str
 ) -> None:
-    command = template.format(
-        victim=hijack_repo.victim, primary=hijack_repo.primary, fresh=tmp_path / "GateRepo-batch"
+    """Driven from the seat that was just refused, through the same tool."""
+    reason = _class_b_reason(hijack_repo, hijack_repos_file, tool)
+    for line in _printed_route(reason, tmp_path / "GateRepo-batch"):
+        verdict = run_gate(bash(line, cwd=hijack_repo.mine, tool=tool), hijack_repos_file)
+        assert verdict is None, f"the deny teaches a line the gate refuses: {line}"
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        'git -C "{victim}" merge-tree --write-tree main victim-branch',
+        'git -C "{victim}" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -p main -m batch',
+        'git -C "{victim}" worktree add --detach "{fresh}" main',
+    ],
+)
+def test_the_route_aimed_AT_another_sessions_worktree_is_allowed_too(
+    hijack_repo: HijackRepo, hijack_repos_file: Path, tmp_path: Path, template: str
+) -> None:
+    """None of these moves that worktree's HEAD, which is the only thing class B guards."""
+    command = template.format(victim=hijack_repo.victim, fresh=tmp_path / "GateRepo-batch")
+    assert run_gate(bash(command, cwd=hijack_repo.mine), hijack_repos_file) is None, command
+
+
+def test_a_HEAD_move_in_an_isolated_builders_own_nested_tree_is_allowed(
+    hijack_repo: HijackRepo, hijack_repos_file: Path
+) -> None:
+    """The isolation line's claim: with its payload cwd in its own tree under .claude/worktrees, a
+    Builder's merge there is its own work."""
+    own = hijack_repo.primary / ".claude" / "worktrees" / "agent-abc"
+    own.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "agent-branch", str(own)],
+        cwd=hijack_repo.primary,
+        check=True,
+        capture_output=True,
     )
-    assert run_gate(bash(command, cwd=hijack_repo.mine, tool=tool), hijack_repos_file) is None, (
-        command
-    )
-    merge = f'git -C "{hijack_repo.victim}" merge main'
-    assert_denied(run_gate(bash(merge, cwd=hijack_repo.mine, tool=tool), hijack_repos_file))
+    assert run_gate(bash("git merge main", cwd=own), hijack_repos_file) is None
