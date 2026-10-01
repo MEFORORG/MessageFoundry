@@ -94,6 +94,9 @@ def _closed_after(port: int, *, wait: float) -> float | None:
 def _unverified_client_context() -> ssl.SSLContext:
     """A TLS client context for the throwaway server certificate. Loopback tests only."""
     ctx = ssl.create_default_context()
+    # The floor is stated, not inherited from the interpreter's default, as the engine's other TLS
+    # tests state it: see _verifying_client_ctx in tests/test_api_tls.py.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
@@ -119,6 +122,7 @@ def _tls_handshake(port: int, *, budget: float) -> tuple[bool, float]:
 
 def _scu_cstore_tls(port: int, data: bytes, *, ca_file: str) -> tuple[bool, int | None]:
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # stated floor; see _unverified_client_context
     return _scu_cstore(port, data, tls_args=(ctx, "127.0.0.1"))
 
 
