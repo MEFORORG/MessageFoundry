@@ -150,7 +150,7 @@ Outbound destinations are gated **at the application layer** by the `[egress]` a
 | **DATABASE connector** (partner DB poll/write) | TCP **1433** (partner SQL Server, `aioodbc`, `[sqlserver]` extra) | `[egress].allowed_db` | **Distinct from the message-store backend.** `DatabaseSource` polls a partner table (leader-gated, no listener — it dials out); `DatabaseDestination` writes to it. Open a *separate* rule from any store-backend rule below. |
 | **AD / LDAP outbound** *(only if you use AD auth)* | **636** for `ldaps://`, or **389** if `ad_allow_insecure_ldap` | — | Port comes from the `ad_server` URL (e.g. `ldaps://dc1.example.com:636`); it is **not** hard-coded. **Kerberos (88) is *not* an engine outbound** — the engine validates a SPNEGO ticket the *client* already obtained from the KDC (server-side validation), so do **not** open outbound 88 from the engine box. |
 | **Message-store backend** *(only if you use a remote store)* — SQL Server **1433** / PostgreSQL **5432** | 1433 / 5432 | — | Open only if the **store** itself is a remote SQL Server / Postgres rather than the default local SQLite. |
-| **NSSM download** — `nssm.cc` (HTTPS 443) | 443 | — | **🔧 INSTALL-TIME ONLY.** One-time download of the wrapper; close after install. |
+| **NSSM download** — `nssm.cc`, then `web.archive.org` if `nssm.cc` fails (HTTPS 443) | 443 | — | **🔧 INSTALL-TIME ONLY.** One-time download of the wrapper; close after install. The installer checks either copy against its SHA-256 pin. |
 | **PyPI** — `pypi.org` / `files.pythonhosted.org` (HTTPS 443) | 443 | — | **🔧 INSTALL-TIME ONLY.** Package install; not needed at steady state. |
 
 > Rows marked **🔧 INSTALL-TIME ONLY** are needed once to install the service and its dependencies. They are **not** part of steady-state operation — remove or disable them after install.
@@ -193,7 +193,7 @@ New-NetFirewallRule `
 
 Separate the **one-time install** from **steady-state operation**:
 
-- **Install-time only (close afterward):** outbound HTTPS 443 to **`nssm.cc`** (NSSM download) and to **PyPI** (`pypi.org` / `files.pythonhosted.org`) for package install. These are the only two install-time openings and are marked 🔧 in the outbound table.
+- **Install-time only (close afterward):** outbound HTTPS 443 to **`nssm.cc`** (NSSM download, with **`web.archive.org`** as its fallback) and to **PyPI** (`pypi.org` / `files.pythonhosted.org`) for package install. These are the only two install-time openings and are marked 🔧 in the outbound table.
 - **Steady state:** the per-connection inbound listeners, the per-partner outbound connections, and (if configured) AD/LDAPS and a remote store backend. No PyPI or `nssm.cc` access is required once installed.
 
 ---

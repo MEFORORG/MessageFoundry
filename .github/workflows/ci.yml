@@ -3657,11 +3657,39 @@ jobs:
     # the nssm.exe in it by full path, the copy the installer checked (install-service.ps1,
     # Resolve-Nssm). The nssm on the runner's PATH is Chocolatey's, which that check refuses.
     # tests/test_nssm_pin.py fails on at least the other spellings of nssm it lists.
+    #
+    # BACKLOG #2504: SMOKE_NSSM_CACHED_EXE is a copy of that checked nssm.exe, kept in the Actions cache
+    # so a warm run never downloads NSSM at all. It is handed to the installer as -NssmPath, which
+    # refuses it unless it matches the pin, so a wrong cache entry fails closed rather than running.
     env:
       SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
+      SMOKE_NSSM_CACHED_EXE: C:\mefor-ci-cache\nssm-2.24-win64\nssm.exe
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The cache key is the nssm.exe pin itself, read from the installer rather than restated here,
+      # so changing the pin can never be served the old binary under a matching key.
+      # The path is in env, not in the script, because tests/test_nssm_pin.py requires every run: line
+      # naming the installer to be a run of it.
+      - name: Read the NSSM pin for the cache key
+        id: nssm-pin
+        env:
+          PIN_SOURCE: scripts/service/install-service.ps1
+        run: |
+          $found = @(Select-String -LiteralPath $env:PIN_SOURCE -CaseSensitive `
+            -Pattern '^\$NssmExeSha256 = "([0-9A-F]{64})"$')
+          if ($found.Count -ne 1) { throw "$env:PIN_SOURCE must assign `$NssmExeSha256 once; found $($found.Count)" }
+          "pin=$($found[0].Matches[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
+
+      # Exact key only, no restore-keys: a partial match would be some other binary. Caches are saved
+      # only off the merge queue (see the save step), so a queue run reads the one main saved.
+      - name: Restore the pinned NSSM from the cache
+        id: nssm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SMOKE_NSSM_CACHED_EXE }}
+          key: nssm-2.24-win64-${{ steps.nssm-pin.outputs.pin }}
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -3687,12 +3715,17 @@ jobs:
 
       # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
       # match what the console launches on an end-user machine — catches 5.1-only behaviour
-      # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). The installer
-      # downloads the pinned NSSM release into $env:SMOKE_NSSM_DIR.
+      # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). On a cache hit the
+      # installer checks the cached copy against the pin and copies it into $env:SMOKE_NSSM_DIR; on
+      # a miss it downloads the pinned release, from nssm.cc or a mirror, and checks that instead.
       - name: Install the service
         shell: powershell
+        env:
+          NSSM_CACHE_HIT: ${{ steps.nssm-cache.outputs.cache-hit }}
         run: |
           $exe = (Get-Command messagefoundry).Source
+          $cached = @{}
+          if ($env:NSSM_CACHE_HIT -eq 'true') { $cached['NssmPath'] = $env:SMOKE_NSSM_CACHED_EXE }
           # Run as the 'prod' environment (ADR 0017: `serve` requires an explicit active environment;
           # install-service.ps1 -Environment threads it into the service command + resolves
           # environments/prod.toml). INFO not DEBUG: `serve` refuses DEBUG in prod (Gate #1 — DEBUG can
@@ -3710,7 +3743,7 @@ jobs:
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
           # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
           # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
-          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir @cached
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
           # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
           # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an
@@ -3790,6 +3823,23 @@ jobs:
             "MEFOR_VALUE_REGISTRY_KEY_PASSWORD=smoke-key-pass" `
             "MEFOR_VALUE_REGISTRY_USER=smoke-user" `
             "MEFOR_VALUE_REGISTRY_PASSWORD=smoke-pass"
+
+      # BACKLOG #2504: cache the copy the installer just checked, right after the install so a later
+      # failing step cannot stop it being saved. Not from the merge queue: a cache saved there is
+      # scoped to that run's temporary queue ref, which no later run can read. The nightly run on
+      # main saves it, and every queue run can read what main saved.
+      - name: Stage the checked NSSM for the cache
+        if: steps.nssm-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        run: |
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $env:SMOKE_NSSM_CACHED_EXE) | Out-Null
+          Copy-Item -LiteralPath "$env:SMOKE_NSSM_DIR\nssm.exe" -Destination $env:SMOKE_NSSM_CACHED_EXE -Force
+
+      - name: Save the pinned NSSM to the cache
+        if: steps.nssm-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SMOKE_NSSM_CACHED_EXE }}
+          key: nssm-2.24-win64-${{ steps.nssm-pin.outputs.pin }}
 
       - name: Verify the data-directory DACL (review finding H-13)
         shell: powershell

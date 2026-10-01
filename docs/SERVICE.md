@@ -37,7 +37,9 @@ venv interpreter) and the per-connection firewall openings the service needs.
    runs in `-NssmDir`, `C:\Program Files\MessageFoundry\nssm` by default. It refuses a folder that
    anyone but administrators can write to or owns, because it runs that file as administrator. It
    fills the folder from `-NssmPath`, from an `nssm` on `PATH`, or by downloading the pinned,
-   SHA‑256‑verified release. No manual install needed.
+   SHA‑256‑verified release. It downloads from `nssm.cc`, and falls back to the Internet Archive's
+   copy of the same file when `nssm.cc` fails; either one must match the pin. No manual install
+   needed.
    A copy you already have is used only if its SHA-256 matches the pinned win64 `nssm.exe` from
    NSSM 2.24. The installer refuses a `-NssmPath` copy that does not match, and names both hashes.
    A copy on `PATH` that does not match is skipped with a warning, and the installer downloads the
