@@ -528,7 +528,8 @@ LOCK_INSTALLED_TOOLCHAINS = (
     # SEVEN in release.yml: SIX since ADR 0201 (the toolkit build step in the `release` job installs
     # its own `build`), and one more since the Windows-resolved engine SBOM. That SBOM also makes TWO in
     # security.yml: each file's `sbom-windows` job installs the lock for `cyclonedx_py`, beside the
-    # Linux SBOM step's own install.
+    # Linux SBOM step's own install. Moving that Linux step out of `release` into the unprivileged
+    # `sbom-linux` job (2026-09-30) moved one install between jobs and left the file's count at seven.
     ("release.yml", "ci/locks/release-tools.lock", 7),
     ("security.yml", "ci/locks/release-tools.lock", 2),
     # The last two were installing from a lock with no row here, so no exact count watched them

@@ -79,20 +79,105 @@ on:
 permissions: {}
 
 jobs:
+  # THE TWO ENGINE SBOMS ARE BUILT BY THE TWO UNPRIVILEGED JOBS BELOW, AND ONLY SIGNED BY `release`.
+  #
+  # Each holds `contents: read` and nothing else: no id-token, no attestations, no write. So the
+  # release-tools install, the core-lock install and `cyclonedx_py environment` all run AWAY from the
+  # identity that Sigstore-signs, attests and publishes. The Linux SBOM was built inside `release`
+  # until 2026-09-30, which put three package installs beside that credential for no reason: the
+  # SBOM is bytes, and producing bytes needs no write scope. ADR 0149's 2026-09-30 amendment.
+  #
+  # `release` downloads both, scores, signs, attests and attaches them. Nothing from either artifact
+  # EXECUTES there; each file is read by sbomqs and by `sigstore sign`. Both jobs carry the same
+  # repository guard and console-tag exclusion as `release`, so they run exactly when it does, and
+  # `release` needs both: a release that cannot produce either SBOM does not ship, rather than
+  # shipping without it.
+  #
+  # Two jobs rather than one matrix job, because the two step bodies differ in every path (the venv
+  # layout, the absolute $RUNNER_TEMP path Windows forces, the output name), so a matrix would hold
+  # one `if:`-guarded step per runner. Each job's install lines are BYTE-IDENTICAL to its twin in
+  # security.yml (`sbom` and `sbom-windows`), enforced by tests/test_ci_venv_pinning.py, which pairs
+  # them by `runs-on`: those jobs are the pre-tag dry-run for these.
+  sbom-linux:
+    # The Linux-resolved engine SBOM, the one `pip install messagefoundry` on Linux pulls.
+    if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
+    runs-on: ubuntu-latest
+    # Two hash-locked installs and one SBOM render; security.yml's `sbom` twin runs in minutes.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Generate the shipped CycloneDX SBOM (license-complete, hash-locked core runtime)
+        run: |
+          # Build the SBOM from the ACTUAL installed core runtime (docker/locks/requirements-core.lock,
+          # hash-locked) via `cyclonedx-py environment`, NOT `requirements <lockfile>`: environment mode
+          # reads each installed dist's METADATA, so component LICENSES are populated (a draft-2025 CISA
+          # minimum element) — the requirements parser has no metadata and emits license-less components.
+          # The core lock is the honest closure a `pip install messagefoundry` pulls (the all-extras
+          # requirements.lock drags PySide6/dev tooling the wheel never requires); pip-audit still audits
+          # the all-extras set. See docs/SUPPLY-CHAIN.md + ADR 0149.
+          # HASH-PINNED (BACKLOG #332 step 6): `cyclonedx-bom` replaced an inline pin of the top package
+          # only, and now flows through the PEP 735 `release-tools` group into ci/locks/release-tools.lock
+          # so its transitives are hashed too. The `~=7.3.1` bound is UNCHANGED, and its rationale lives
+          # ONCE, at that group in pyproject.toml.
+          # No pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
+          # BYTE-IDENTICAL to security.yml's SBOM install, enforced by tests/test_ci_venv_pinning.py.
+          # Nothing in PR CI executes release.yml (tag push only), so ADR 0034's documented pre-tag check
+          # is to dispatch security.yml's sbom job and read ITS log -- which only proves anything while
+          # the two steps run the same commands. NOTE that job is ALSO gated to schedule/workflow_dispatch,
+          # so the dry-run has to be dispatched by hand; no pull request performs it. Both halves of this
+          # install are therefore unexercised until a tag, a dispatch, or the nightly cron on `main`.
+          # NO SEEDED PIP IN THE SCAN VENV. A plain `python -m venv` copies the interpreter's bundled
+          # (ensurepip) pip into it, and environment mode lists every installed dist, so the SBOM
+          # listed pip: the venv's installer, which `pip install messagefoundry` never pulls. Listing it
+          # at ANY version is inaccurate, and it draws scanner findings whenever the bundled pip lags a
+          # fix (a local Windows 3.14 build seeded pip 26.1.2, which scanners flag). So the fix is
+          # absence, not a bump. `--without-pip` leaves the venv empty and the OUTER pip installs into
+          # it via `--python` (pip >= 22.3; it must precede `install`). ensurepip seeds pip alone on
+          # 3.12+, so there is no setuptools or wheel to drop. Guarded by tests/test_ci_venv_pinning.py.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m venv --without-pip /tmp/sbomenv
+          python -m pip --python /tmp/sbomenv/bin/python install --require-hashes -r docker/locks/requirements-core.lock
+          python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
+            --pyproject pyproject.toml --mc-type application \
+            --of JSON -o messagefoundry-sbom.cdx.json
+          # Declare the SBOM's lifecycle (CISA "Build" type / draft-2025 "Generation Context") and backfill
+          # the root component's version (hatchling-dynamic, so --pyproject leaves it null). Exits non-zero
+          # on a structurally broken BOM, failing the release before it ships one.
+          # --vendored-from lists the third-party code the wheel carries in messagefoundry/_vendor/
+          # (defusedxml), which environment mode cannot see because nothing installs it. It also exits
+          # non-zero when a vendored package's README does not record what its component needs.
+          python scripts/security/sbom_finalize.py messagefoundry-sbom.cdx.json \
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
+
+      - name: Hand the Linux SBOM to the signing job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-linux
+          path: messagefoundry-sbom.cdx.json
+          # `error`, not `ignore`: the `release` job needs this file, and a missing one must fail HERE
+          # with the cause named rather than at a download step a job later.
+          if-no-files-found: error
+          # A hand-off: the signed copy on the GitHub release is the record (BACKLOG #2521). After a
+          # day, re-run ALL jobs; re-running `release` alone fails at its download step, by name.
+          retention-days: 1
+
   sbom-windows:
-    # The Windows-resolved engine SBOM, built HERE and signed by the `release` job below.
-    #
-    # WHY A SECOND SBOM: the core lock's sys_platform markers install a different package set on
-    # win32, and the engine also deploys as a Windows service, so the Linux SBOM would be wrong for a
-    # Windows site. Only a Windows interpreter resolves those markers as a Windows install does. The
-    # decision and the rejected alternatives are in ADR 0149's 2026-09-30 amendment.
-    #
-    # SPLIT FROM `release` ON PURPOSE. This job holds `contents: read` and nothing else: no id-token,
-    # no attestations, no write. It produces bytes, and the privileged job signs and attests them.
-    # Nothing from the artifact EXECUTES in that job; it is read by sbomqs and by `sigstore sign`.
-    # Same repository guard and the same console-tag exclusion as `release`, so it runs exactly when
-    # that job does, and `release` carries `needs: sbom-windows`: a release that cannot produce the
-    # Windows SBOM does not ship, rather than shipping without it.
+    # The Windows-resolved engine SBOM. WHY A SECOND SBOM: the core lock's sys_platform markers
+    # install a different package set on win32, and the engine also deploys as a Windows service, so
+    # the Linux SBOM would be wrong for a Windows site. Only a Windows interpreter resolves those
+    # markers as a Windows install does. The decision and the rejected alternatives are in ADR 0149's
+    # 2026-09-30 amendment. Why it is split from `release` is the comment above `sbom-linux`.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
     runs-on: windows-latest
     # Two hash-locked installs and one SBOM render; security.yml's sbom-windows twin runs in minutes.
@@ -114,7 +199,7 @@ jobs:
         # workflow shell-syntax and pipefail screens can parse it.
         shell: bash
         run: |
-          # The Linux step's recipe in the `release` job, pip-less scan venv included (that step says
+          # The Linux step's recipe in the `sbom-linux` job, pip-less scan venv included (that step says
           # why the venv carries no pip), with one difference a Windows runner forces: the venv lives
           # under $RUNNER_TEMP and every path to it is ABSOLUTE, with the Windows layout
           # (Scripts/python.exe). Measured on Windows: `pip --python` given a RELATIVE interpreter path
@@ -138,7 +223,7 @@ jobs:
           name: sbom-windows
           path: messagefoundry-sbom-windows.cdx.json
           # `error`, not `ignore`: the `release` job needs this file, and a missing one must fail HERE
-          # with the cause named rather than at a download step two jobs later.
+          # with the cause named rather than at a download step a job later.
           if-no-files-found: error
           # A hand-off: the signed copy on the GitHub release is the record (BACKLOG #2521). After a
           # day, re-run ALL jobs; re-running `release` alone fails at its download step, by name.
@@ -164,8 +249,8 @@ jobs:
     # NOT on a console tag: the console has its own job below and its own version root, so an
     # engine release built from `webconsole-v*` would ship the engine at the console's version.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
-    # The Windows-resolved SBOM it signs beside the Linux one; that job's header says why it is split.
-    needs: sbom-windows
+    # The two engine SBOMs it signs; the comment above `sbom-linux` says why they are built apart.
+    needs: [sbom-linux, sbom-windows]
     runs-on: ubuntu-latest
     # Hang backstop against GitHub's 360-minute default; security.yml's `jobs:` note carries the
     # reasoning. The most generous cap in this file: it builds, signs and publishes, so it waits on
@@ -686,53 +771,17 @@ jobs:
           # permanent, because a version number cannot be re-used.
           python scripts/release/forbidden_members.py 'dist-pub/*.whl' 'dist-pub/*.tar.gz'
 
-      - name: Generate the shipped CycloneDX SBOM (license-complete, hash-locked core runtime)
-        run: |
-          # Build the SBOM from the ACTUAL installed core runtime (docker/locks/requirements-core.lock,
-          # hash-locked) via `cyclonedx-py environment`, NOT `requirements <lockfile>`: environment mode
-          # reads each installed dist's METADATA, so component LICENSES are populated (a draft-2025 CISA
-          # minimum element) — the requirements parser has no metadata and emits license-less components.
-          # The core lock is the honest closure a `pip install messagefoundry` pulls (the all-extras
-          # requirements.lock drags PySide6/dev tooling the wheel never requires); pip-audit still audits
-          # the all-extras set. See docs/SUPPLY-CHAIN.md + ADR 0149.
-          # HASH-PINNED (BACKLOG #332 step 6): `cyclonedx-bom` replaced an inline pin of the top package
-          # only, and now flows through the PEP 735 `release-tools` group into ci/locks/release-tools.lock
-          # so its transitives are hashed too. The `~=7.3.1` bound is UNCHANGED, and its rationale lives
-          # ONCE, at that group in pyproject.toml.
-          # No pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
-          # BYTE-IDENTICAL to security.yml's SBOM install, enforced by tests/test_ci_venv_pinning.py.
-          # Nothing in PR CI executes release.yml (tag push only), so ADR 0034's documented pre-tag check
-          # is to dispatch security.yml's sbom job and read ITS log -- which only proves anything while
-          # the two steps run the same commands. NOTE that job is ALSO gated to schedule/workflow_dispatch,
-          # so the dry-run has to be dispatched by hand; no pull request performs it. Both halves of this
-          # install are therefore unexercised until a tag, a dispatch, or the nightly cron on `main`.
-          # NO SEEDED PIP IN THE SCAN VENV. A plain `python -m venv` copies the interpreter's bundled
-          # (ensurepip) pip into it, and environment mode lists every installed dist, so the SBOM
-          # listed pip: the venv's installer, which `pip install messagefoundry` never pulls. Listing it
-          # at ANY version is inaccurate, and it draws scanner findings whenever the bundled pip lags a
-          # fix (a local Windows 3.14 build seeded pip 26.1.2, which scanners flag). So the fix is
-          # absence, not a bump. `--without-pip` leaves the venv empty and the OUTER pip installs into
-          # it via `--python` (pip >= 22.3; it must precede `install`). ensurepip seeds pip alone on
-          # 3.12+, so there is no setuptools or wheel to drop. Guarded by tests/test_ci_venv_pinning.py.
-          python -m pip install --require-hashes -r ci/locks/release-tools.lock
-          python -m venv --without-pip /tmp/sbomenv
-          python -m pip --python /tmp/sbomenv/bin/python install --require-hashes -r docker/locks/requirements-core.lock
-          python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
-            --pyproject pyproject.toml --mc-type application \
-            --of JSON -o messagefoundry-sbom.cdx.json
-          # Declare the SBOM's lifecycle (CISA "Build" type / draft-2025 "Generation Context") and backfill
-          # the root component's version (hatchling-dynamic, so --pyproject leaves it null). Exits non-zero
-          # on a structurally broken BOM, failing the release before it ships one.
-          # --vendored-from lists the third-party code the wheel carries in messagefoundry/_vendor/
-          # (defusedxml), which environment mode cannot see because nothing installs it. It also exits
-          # non-zero when a vendored package's README does not record what its component needs.
-          python scripts/security/sbom_finalize.py messagefoundry-sbom.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
-            --vendored-from messagefoundry/_vendor
+      - name: Fetch the Linux-resolved SBOM from the sbom-linux job
+        # Built by the unprivileged job of that name, so no package install for it runs beside this
+        # job's signing identity. It is signed, attested and attached below; nothing in it runs here.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom-linux
+          path: .
 
       - name: Fetch the Windows-resolved SBOM from the sbom-windows job
-        # Built on a Windows runner by the unprivileged job above. It lands beside the Linux SBOM and
-        # is signed, attested and attached exactly like it; nothing in it runs here.
+        # Built on a Windows runner by the unprivileged job of that name. It lands beside the Linux
+        # SBOM and is signed, attested and attached exactly like it; nothing in it runs here.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sbom-windows
@@ -803,8 +852,8 @@ jobs:
           # gate (ADR 0149). It calls the binary the BLOCKING step above verified, by the path it was
           # installed at, so no other `sbomqs` earlier on PATH can stand in for it. This
           # continue-on-error softens a score and never a pin (owner ruling 2026-09-30, BACKLOG #1698).
-          # The Windows-resolved SBOM is scored by the same verified binary: it was built on another
-          # runner, but the scoring happens here, behind the same pin.
+          # Both engine SBOMs are scored by the same verified binary: each was built by an unprivileged
+          # job on its own runner, but the scoring happens here, behind the same pin.
           # Each score runs whatever the other did; the step still fails if either did (BACKLOG #2521).
           # Under `bash -e` a failing first score used to skip the second, and continue-on-error hid it.
           rc=0
@@ -978,9 +1027,10 @@ jobs:
         # gated on a mutually exclusive ref), so the singular wording is the finding.
         # Every OTHER failure mode keeps the always() behaviour this step exists for: a build, sign,
         # SBOM, release or publish failure still uploads whatever dist/ holds. ONE EXCEPTION sits
-        # outside this job: when the `sbom-windows` job fails, `needs:` skips this whole job, so a
-        # dry run uploads nothing. That job's own log names the cause, and a release that cannot
-        # produce the Windows SBOM must not ship, so the trade is taken deliberately.
+        # outside this job: when either SBOM job (`sbom-linux`, `sbom-windows`) fails, `needs:` skips
+        # this whole job, so a dry run uploads nothing. That job's own log names the cause, and a
+        # release that cannot produce both engine SBOMs must not ship, so the trade is taken
+        # deliberately.
         # DELIBERATELY THE WHOLE STEP'S OUTCOME, not just its leak branch. The gate exits non-zero
         # from several paths and only one of them is "a member is outside the allowlist" — the rest
         # are "the listing did not succeed / did not cover the file / is not our archive". Narrowing

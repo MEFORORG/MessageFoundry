@@ -53,8 +53,11 @@ the current set.
 The SBOM generator lists what is actually installed, so one SBOM cannot be right for both. The engine
 runs as a Windows service ([SERVICE.md](SERVICE.md)) and in a Linux container, so the release ships
 both. The Windows SBOM is built on a Windows runner, because only a Windows interpreter picks packages
-the way a Windows install does. A separate job with read-only access builds it, and the release job
-signs and attests it like the Linux one.
+the way a Windows install does.
+
+Neither SBOM is built by the job that signs. Each comes from its own job with read-only access, one on
+Linux and one on Windows, so no package install runs beside the signing identity. The release job
+downloads both files, then scores, signs, attests and attaches them.
 
 Each file also records its platform inside the file. Look for the `metadata.properties` entry named
 `messagefoundry:resolved-for:sys_platform`. Its value is `linux` or `win32`. This helps once the file
@@ -163,9 +166,10 @@ have not, the document says nothing about that CVE and your scanner's finding st
   `docker/locks/requirements-core.lock` (environment mode populates licenses from installed metadata),
   then `scripts/security/sbom_finalize.py` declares the lifecycle, backfills the dynamic version,
   records the platform, and adds a component for each package vendored under `messagefoundry/_vendor/`,
-  which environment mode cannot see. This runs twice, once on a Linux runner and once on a Windows runner. Both
-  runs build their scratch environment without pip, so pip is not listed: pip installs the engine
-  but is not part of it. The broader all-extras dependency set is continuously audited by
+  which environment mode cannot see. This runs twice, once on a Linux runner and once on a Windows
+  runner, each in its own read-only job (`sbom-linux` and `sbom-windows` in `release.yml`). Both runs
+  build their scratch environment without pip, so pip is not listed: pip installs the engine but is
+  not part of it. The broader all-extras dependency set is continuously audited by
   **pip-audit**.
 - **VS Code extension** — `@cyclonedx/cyclonedx-npm --package-lock-only` over the committed
   `ide/package-lock.json` (install-free, full tree). The extension bundles its payload with esbuild and

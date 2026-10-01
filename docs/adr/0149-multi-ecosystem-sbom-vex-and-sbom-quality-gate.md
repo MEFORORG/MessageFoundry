@@ -197,6 +197,25 @@ release now also depends on a Windows runner being available.
 **Not changed.** The npm extension and container-image SBOMs. The container SBOM already covers the Linux
 image as a whole.
 
+**Follow-up, same day: the Linux SBOM leaves the signing job too.** The `release` job still built the
+Linux SBOM itself, so the release-tools install, the core-lock install and `cyclonedx-py environment`
+ran beside its `contents: write`, `id-token: write` and `attestations: write`. The reason this amendment
+gave for building the Windows SBOM apart applies to the Linux one unchanged: producing an SBOM needs no
+write scope.
+
+- `release.yml` gains a `sbom-linux` job on `ubuntu-latest`, shaped like `sbom-windows`: `contents:
+  read` only, the same job guard as `release`, and an upload that fails on a missing file. Its build
+  step is the Linux step moved verbatim, so its install lines stay byte-identical to `security.yml`'s
+  `sbom` job.
+- The `release` job `needs:` both jobs and builds no SBOM. It downloads both files, then scores, signs,
+  SLSA-attests and attaches them. `tests/test_release_pipeline.py` refuses a `cyclonedx_py` step back
+  inside it.
+- Two jobs rather than one matrix job. The two build steps differ in every path, so a matrix would carry
+  one platform-guarded step per runner. `tests/test_ci_venv_pinning.py` also pairs each release step with
+  its `security.yml` twin by the job's literal `runs-on`, and a matrix makes that an expression.
+- Cost: one more `ubuntu-latest` job per release. A failure in either SBOM job now skips the whole
+  `release` job, including its always-run artifact upload, as a Windows failure already did.
+
 ## To resolve on acceptance
 
 - [x] Confirm MessageFoundry is not FDA-regulated (owner-confirmed 2026-07-21) — no medical-device SBOM
