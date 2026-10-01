@@ -33,6 +33,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
     assert_hvac_tls_suites,
     vault_client_verify_kwargs,
 )
@@ -159,17 +160,24 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # are still the ones the hop uses. The adapter also gives every connection a context from the
     # factory (BACKLOG #300). crypto_transit.py shares this function, so its per-cell client gets
     # the strict reader and the narrowing too, and so this client takes the larger Transit ceiling.
+    # The mount also refuses an address that would send the token in cleartext (BACKLOG #2317), so
+    # both clients built here are checked before any I/O.
     from messagefoundry.transports.strict_requests import (
         MAX_VAULT_REPLY_BYTES,
         mount_strict_reply_adapter,
     )
 
-    mount_strict_reply_adapter(
-        client,
-        connector=_VAULT_TRANSIT_CONNECTOR,
-        ssl_context_factory=context_factory,
-        limit=MAX_VAULT_REPLY_BYTES,
-    )
+    try:
+        mount_strict_reply_adapter(
+            client,
+            connector=_VAULT_TRANSIT_CONNECTOR,
+            ssl_context_factory=context_factory,
+            limit=MAX_VAULT_REPLY_BYTES,
+        )
+    except InsecureHopRefused as exc:
+        # Raised as this module's own fail-closed type, which every caller handles (rotate-key,
+        # DR backups, open_store), with the refusal's fixed text kept whole.
+        raise KeyProviderError(str(exc)) from exc
     return client
 
 

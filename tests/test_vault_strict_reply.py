@@ -421,10 +421,18 @@ def test_control_the_stock_response_class_reads_a_bare_cr_head_as_an_answer(
         assert _get(_client(server.port))["data"]["data"]["value"] == "synthetic"
 
 
-def test_a_bare_cr_head_is_refused_through_an_http_proxy() -> None:
+def test_a_bare_cr_head_is_refused_through_an_http_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     """``requests`` builds a separate pool manager for a proxy, so the head check must reach it
     too. The scripted server stands in for the proxy: an ``http`` target through an ``http`` proxy
-    is sent to the proxy, which answers it."""
+    is sent to the proxy, which answers it.
+
+    Since BACKLOG #2317 the adapter refuses that request before sending, because the token would
+    cross to the proxy in cleartext; tests/test_vault_cleartext_hop.py measures that refusal. So
+    this test turns it off, to keep measuring the head check on the proxy's pools as a second
+    layer under it. Shipped code no longer reaches this path; the layer is defence in depth."""
+    from messagefoundry.transports import strict_requests
+
+    monkeypatch.setattr(strict_requests, "_refuse_a_cleartext_vault_hop", lambda *a, **k: None)
     with _ScriptedVault([(_CR_IN_HEADER_LINE, False), (_ok(), False)]) as server:
         session = _session_with(limit=1000)
         proxies = {"http": f"http://127.0.0.1:{server.port}"}

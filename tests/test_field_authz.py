@@ -22,6 +22,8 @@ from messagefoundry.api.models import (
     AlertInstanceInfo,
     CapturedResponseInfo,
     ConnectionEventInfo,
+    ConnectionMetadata,
+    ConnectionRow,
     DeadLetterRow,
     EventInfo,
     MessageDetail,
@@ -350,11 +352,29 @@ def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> No
         r"revealed=revealable\(type\(i\), summary=False, error_text=i\.id == reveal\)", source
     )
     assert len(per_item) == 1, f"expected the one per-item reason reveal site, found {per_item}"
+    # BACKLOG #2443 step 4 added the connections dashboard's per-connection reveal, pinned the same
+    # way: it lifts ConnectionRow's error-text set on the rows of the one name the request gives.
+    per_conn = re.findall(
+        r"lift = revealable\(ConnectionRow, summary=False, error_text=True\)", source
+    )
+    assert len(per_conn) == 1, f"expected the one per-connection reveal set, found {per_conn}"
+    # Exactly one use of that set, and it sits behind the equality with the named connection. Any
+    # second ``revealed=lift`` fails here whatever its predicate, so none can lift every row.
+    assert source.count("revealed=lift") == 1, "the per-connection set must have one call site"
+    conn_sites = re.findall(
+        r"redact_unauthorized\(r, identity, revealed=lift\)\s+if _row_conn\(r\) == reveal\n", source
+    )
+    assert len(conn_sites) == 1, f"expected the one per-connection reveal site, found {conn_sites}"
+    # And the one connection's metadata route, whose path names the item, behind its reveal flag.
+    meta_sites = re.findall(
+        r"revealed=revealable\(ConnectionMetadata, summary=False, error_text=True\)", source
+    )
+    assert len(meta_sites) == 1, f"expected the one metadata reveal site, found {meta_sites}"
     # Every other reveal site reads one of those sets, and together they cover all three models.
     sites = [
         s
         for s in re.findall(r"revealed=([^\n,]+?)(?=[,)\n])", source)
-        if not s.startswith("revealable(type(i")
+        if not s.startswith(("revealable(type(i", "revealable(ConnectionMetadata")) and s != "lift"
     ]
     models = [m.group(1) for m in (re.fullmatch(r"reveal\[(\w+)\]", s) for s in sites) if m]
     assert len(models) == len(sites), (
@@ -398,6 +418,8 @@ def test_error_text_masking_is_keyed_by_model_and_catches_no_other_surface() -> 
         DeadLetterRow: frozenset({"last_error"}),
         ConnectionEventInfo: frozenset({"reason"}),
         AlertInstanceInfo: frozenset({"reason"}),
+        ConnectionRow: frozenset({"error"}),
+        ConnectionMetadata: frozenset({"error"}),
     }
     holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
     assert redact_unauthorized(_summary(), holder).error == "****"
