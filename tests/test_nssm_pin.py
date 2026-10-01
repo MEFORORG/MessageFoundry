@@ -177,9 +177,9 @@ _STUBS = """
   $webCalls = [Collections.Generic.List[string]]::new()
   $webTimeouts = [Collections.Generic.List[string]]::new()
   function Invoke-WebRequest {
-    param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec)
+    param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec, $OperationTimeoutSeconds)
     $webCalls.Add("$Uri")
-    $webTimeouts.Add("$TimeoutSec")
+    $webTimeouts.Add("$TimeoutSec/$OperationTimeoutSeconds")
     if ($webErrors.ContainsKey("$Uri")) { throw $webErrors["$Uri"] }
     if (-not $webFiles.ContainsKey("$Uri")) { throw 'NETWORK TOUCHED' }
     Copy-Item -LiteralPath $webFiles["$Uri"] -Destination $OutFile -Force
@@ -634,12 +634,16 @@ def test_the_real_sources_are_https_with_nssm_cc_first_and_a_mirror_elsewhere(
     )
     # With the network refused, every real source was asked, in order, and each failure warned.
     assert report["install-path-bad-calls"] == sources, report["install-path-bad-calls"]
-    # Each with a timeout: PowerShell 7 otherwise waits forever on a source that hangs, and the
-    # mirrors are never reached.
+    # Each with both timeouts, since the stub takes both, as PowerShell 7.4 does: without them a
+    # source that hangs, before or after its headers, keeps the mirrors from being tried.
     timeouts = report["install-path-bad-timeouts"]
-    assert len(timeouts) == len(sources) and all(
-        str(s).isdigit() and int(s) > 0 for s in timeouts
-    ), f"a download has no timeout: {timeouts}"
+    assert len(timeouts) == len(sources), timeouts
+    for pair in timeouts:
+        connect, operation = str(pair).split("/")
+        assert connect.isdigit() and int(connect) > 0, f"a download has no -TimeoutSec: {pair}"
+        assert operation.isdigit() and int(operation) > 0, (
+            f"a download has no -OperationTimeoutSeconds where the cmdlet takes one: {pair}"
+        )
     case = _case(report, "install-path-bad")
     for url in sources:
         assert url in str(case["error"]), f"the final refusal does not name {url}: {case['error']}"
@@ -1225,9 +1229,19 @@ def test_the_service_smoke_caches_nssm_only_through_the_installers_check() -> No
     install_step = steps[install]
     run = str(install_step["run"])
     assert f"$hit = $env:{_CACHED_VAR}" in run, run
-    assert "$cached['NssmPath'] = $hit" in run, run
-    assert "-eq $env:NSSM_PIN" in run, "a cache hit is used without comparing it to the pin"
+    # One guarded statement: the file exists AND matches the pin, THEN it becomes -NssmPath.
+    guarded = re.compile(
+        r"if \(\(Test-Path -LiteralPath \$hit\) -and \(Get-FileHash -Algorithm SHA256 "
+        r"-LiteralPath \$hit\)\.Hash -eq \$env:NSSM_PIN\) \{ \$cached\['NssmPath'\] = \$hit \}"
+    )
+    assert guarded.search(run), "a cache hit is used without first matching it to the pin"
+    assert run.count("$cached['NssmPath']") == 1, "the cached copy is handed over on another path"
     assert "@cached" in run, "the install does not pass the cached copy on"
+    # Outside the queue the restore is lookup-only and restores no file, so only the queue may
+    # treat a hit as a file to use.
+    hit_env = str((install_step.get("env") or {}).get("NSSM_CACHE_HIT"))
+    assert "github.event_name == 'merge_group'" in hit_env, hit_env
+    assert steps[restore]["with"].get("lookup-only") == "${{ github.event_name != 'merge_group' }}"
     assert sum(_CACHED_VAR in line for line in run.splitlines()) == 1, (
         f"the install step uses {_CACHED_VAR} other than as -NssmPath"
     )
@@ -1250,3 +1264,6 @@ def test_the_service_smoke_caches_nssm_only_through_the_installers_check() -> No
     assert pin_ref in str((staging.get("env") or {}).get("NSSM_PIN")), staging.get("env")
     save_if = str(steps[save].get("if", ""))
     assert f"steps.{staging.get('id')}.outputs.staged == 'true'" in save_if, save_if
+    # Caching is a convenience: a failure in it must not skip the smoke steps after it.
+    for step in (staging, steps[save]):
+        assert step.get("continue-on-error") is True, f"{step.get('name')} can red the smoke"

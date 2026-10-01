@@ -3659,8 +3659,8 @@ jobs:
     # tests/test_nssm_pin.py fails on at least the other spellings of nssm it lists.
     #
     # BACKLOG #2504: SMOKE_NSSM_CACHED_EXE is a copy of that checked nssm.exe, kept in the Actions cache
-    # so a warm run never downloads NSSM at all. It is handed to the installer as -NssmPath, which
-    # refuses it unless it matches the pin, so a wrong cache entry fails closed rather than running.
+    # so a merge-queue run with a warm cache never downloads NSSM. It is handed to the installer as
+    # -NssmPath, which refuses it unless it matches the pin, so a wrong entry fails closed.
     env:
       SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
       SMOKE_NSSM_CACHED_EXE: C:\mefor-ci-cache\nssm-2.24-win64\nssm.exe
@@ -3682,14 +3682,17 @@ jobs:
           if ($found.Count -ne 1) { throw "$env:PIN_SOURCE must assign `$NssmExeSha256 once; found $($found.Count)" }
           "pin=$($found[0].Matches[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
 
-      # Exact key only, no restore-keys: a partial match would be some other binary. Caches are saved
-      # only off the merge queue (see the save step), so a queue run reads the one main saved.
+      # Exact key only, no restore-keys: a partial match would be some other binary. Only a merge-queue
+      # run USES the cache, so an nssm.cc outage cannot red the queue. A nightly or manual run only
+      # looks the key up (lookup-only) and always downloads, so it keeps proving that nssm.cc or a
+      # mirror still serves the pinned bytes; it saves the copy when the key is missing.
       - name: Restore the pinned NSSM from the cache
         id: nssm-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SMOKE_NSSM_CACHED_EXE }}
-          key: nssm-2.24-win64-${{ steps.nssm-pin.outputs.pin }}
+          key: nssm-2.24-win64-${{ matrix.os }}-${{ steps.nssm-pin.outputs.pin }}
+          lookup-only: ${{ github.event_name != 'merge_group' }}
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -3724,15 +3727,16 @@ jobs:
       - name: Install the service
         shell: powershell
         env:
-          NSSM_CACHE_HIT: ${{ steps.nssm-cache.outputs.cache-hit }}
+          # A lookup-only hit outside the queue restored nothing, so it counts as a miss here.
+          NSSM_CACHE_HIT: ${{ github.event_name == 'merge_group' && steps.nssm-cache.outputs.cache-hit || 'false' }}
           NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
         run: |
           $exe = (Get-Command messagefoundry).Source
           $cached = @{}
           if ($env:NSSM_CACHE_HIT -eq 'true') {
             $hit = $env:SMOKE_NSSM_CACHED_EXE
-            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $hit).Hash -eq $env:NSSM_PIN) { $cached['NssmPath'] = $hit }
-            else { Write-Warning "The cached copy does not match the pin; ignoring it and downloading." }
+            if ((Test-Path -LiteralPath $hit) -and (Get-FileHash -Algorithm SHA256 -LiteralPath $hit).Hash -eq $env:NSSM_PIN) { $cached['NssmPath'] = $hit }
+            else { Write-Warning "The cached copy is missing or does not match the pin; ignoring it and downloading." }
           }
           # Run as the 'prod' environment (ADR 0017: `serve` requires an explicit active environment;
           # install-service.ps1 -Environment threads it into the service command + resolves
@@ -3837,9 +3841,11 @@ jobs:
       # copy is saved only when it is there and matches the pin. Not from the merge queue: a cache
       # saved there is scoped to that run's temporary queue ref, which no later run can read. The
       # nightly run on main saves it, and every queue run can read what main saved.
+      # continue-on-error: caching is a convenience, so a failure here must not skip the smoke.
       - name: Stage the checked NSSM for the cache
         id: nssm-stage
         if: ${{ !cancelled() && steps.nssm-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group' }}
+        continue-on-error: true
         env:
           NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
         run: |
@@ -3854,10 +3860,11 @@ jobs:
 
       - name: Save the pinned NSSM to the cache
         if: ${{ !cancelled() && steps.nssm-stage.outputs.staged == 'true' }}
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SMOKE_NSSM_CACHED_EXE }}
-          key: nssm-2.24-win64-${{ steps.nssm-pin.outputs.pin }}
+          key: nssm-2.24-win64-${{ matrix.os }}-${{ steps.nssm-pin.outputs.pin }}
 
       - name: Verify the data-directory DACL (review finding H-13)
         shell: powershell

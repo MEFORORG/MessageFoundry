@@ -534,6 +534,14 @@ function Save-PinnedNssm {
         $extract = Join-Path $work "extract"
         [Net.ServicePointManager]::SecurityProtocol =
             [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        # Timeouts, so a source that hangs does not keep the mirrors from being tried. -TimeoutSec
+        # covers the connection and the response headers. A body that stalls after them is covered
+        # by -OperationTimeoutSeconds on PowerShell 7.4 and later, which otherwise waits forever,
+        # and by the framework's own read timeout, about five minutes, on Windows PowerShell 5.1.
+        $timeouts = @{ TimeoutSec = 60 }
+        if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey("OperationTimeoutSeconds")) {
+            $timeouts["OperationTimeoutSeconds"] = 180
+        }
         $failures = @()
         $verified = $false
         $attempt = 0
@@ -544,9 +552,7 @@ function Save-PinnedNssm {
             $zip = Join-Path $work "nssm-2.24-$attempt.zip"
             Write-Host "  trying $url"
             try {
-                # A timeout, so a source that hangs does not keep the mirrors from being tried.
-                # PowerShell 7 otherwise waits forever.
-                Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 60
+                Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing @timeouts
                 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
             } catch {
                 $failures += "$url : $($_.Exception.Message)"

@@ -194,7 +194,7 @@ New-NetFirewallRule `
 Separate the **one-time install** from **steady-state operation**:
 
 - **Install-time only (close afterward):** outbound HTTPS 443 to **`nssm.cc`** (NSSM download, with **`web.archive.org`** as its fallback) and to **PyPI** (`pypi.org` / `files.pythonhosted.org`) for package install. These are the only install-time openings, for two purposes, and are marked 🔧 in the outbound table.
-- **Steady state:** the per-connection inbound listeners, the per-partner outbound connections, and (if configured) AD/LDAPS and a remote store backend. No PyPI or `nssm.cc` access is required once installed.
+- **Steady state:** the per-connection inbound listeners, the per-partner outbound connections, and (if configured) AD/LDAPS and a remote store backend. No PyPI, `nssm.cc` or `web.archive.org` access is required once installed.
 
 ---
 
