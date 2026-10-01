@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -310,6 +311,35 @@ async def test_a_seed_dir_that_cannot_be_resolved_is_an_audited_refusal(
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(archive=archive, actor="alice")
         assert exc.value.kind == "seed"
+        # Its own message: the operator's directory failed, so the remedy is not "set seed_dir".
+        assert "could not be resolved" in str(exc.value)
+        assert Path(archive).name not in str(exc.value)
+        assert not coord.active
+        assert (await _actions(store)).count("dr_activation_aborted") == 1
+    finally:
+        await store.close()
+
+
+async def test_a_seed_dir_that_does_not_answer_in_time_is_an_audited_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same abort when the resolve hangs past takeover_timeout_seconds. RED if the bound is
+    # dropped (the call then returns late and activation carries on) or if the timeout escapes.
+    store, archive, ss = await _seed(tmp_path)
+
+    def slow(_archive: str, _seed_dir: str) -> Path | None:
+        time.sleep(0.5)
+        return Path(archive)
+
+    try:
+        coord, _state = _coord(
+            store, ss, seed_dir=str(Path(archive).parent), takeover_timeout_seconds=0.05
+        )
+        monkeypatch.setattr(dr_module, "_confined_archive", slow)
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(archive=archive, actor="alice")
+        assert exc.value.kind == "seed"
+        assert "could not be resolved" in str(exc.value)
         assert not coord.active
         assert (await _actions(store)).count("dr_activation_aborted") == 1
     finally:

@@ -44,7 +44,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -5306,12 +5306,10 @@ class DrSettings(_Section):
     def _seed_dir_absolute(cls, value: str) -> str:
         # "" switches request-named archives off. A blank-but-present or relative value would
         # instead resolve against the service's working directory and quietly open that. So blank
-        # reads as "" and relative fails at load. Either platform's absolute form is accepted: this
-        # file may be validated on another OS than the DR box.
+        # reads as "" and relative fails at load. "Absolute" is judged for THIS platform, the one
+        # that will resolve it: a rooted path with no drive is relative on Windows.
         value = value.strip()
-        if value and not (
-            PureWindowsPath(value).is_absolute() or PurePosixPath(value).is_absolute()
-        ):
+        if value and not os.path.isabs(value):
             raise ValueError(f"[dr].seed_dir must be an absolute path, or omitted ({value!r})")
         return value
 

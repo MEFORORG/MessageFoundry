@@ -326,6 +326,9 @@ configurable `[dr].activation_mode`:
 > runs the operator's takeover hook and binds the priority listeners; a release runs the release hook and
 > unbinds every inbound. Each is at least as consequential as a stepdown, so each takes the same fresh proof
 > and the new-client-address check that comes with it. The cost is a typed password during a site failover.
+> A directory or federated session carries no step-up window from its login, and re-proves at its directory
+> or identity provider. If that service sat at the failed site, such a session cannot promote the box, so a DR
+> box needs a local administrator account. The runbook owns that account; the engine does not create it.
 > The window form is used, not the action-bound form of ADR 0077, because the comparable operator writes
 > (stepdown, purge, reload) use it.
 >

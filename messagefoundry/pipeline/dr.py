@@ -377,23 +377,34 @@ class DrCoordinator:
         :func:`~messagefoundry.pipeline.path_confine.confine` judges the text of ``archive`` first,
         with no filesystem call on it, then resolves, off the event loop. The caller verifies the
         RESOLVED path, so the file that was checked is the file that is opened. Every refusal
-        aborts with one message, and the audit row alone records the path that was asked for."""
+        aborts with one message, and the audit row alone records the path that was asked for.
+
+        A ``seed_dir`` this box cannot resolve is a different answer: it is the operator's own
+        directory that failed, so the abort says so and names no part of the request."""
         seed_dir = self._settings.seed_dir
         resolved: Path | None = None
         if seed_dir:
+            timeout = self._settings.takeover_timeout_seconds
             try:
                 resolved = await asyncio.wait_for(
-                    asyncio.to_thread(_confined_archive, archive, seed_dir),
-                    timeout=self._settings.takeover_timeout_seconds,
+                    asyncio.to_thread(_confined_archive, archive, seed_dir), timeout=timeout
                 )
             except OSError as exc:
-                # A seed_dir this box cannot resolve (an unreachable share, say) or that does not
-                # answer in time (TimeoutError is an OSError) is a refusal like any other, so it
-                # still leaves its abort row.
+                # An unreachable share, say, or one that does not answer in time (TimeoutError is
+                # an OSError). Still an abort with its audit row, never an unhandled error.
                 log.warning(
-                    "DR activation: could not resolve the request archive against "
-                    "[dr].seed_dir: %s",
+                    "DR activation: could not resolve [dr].seed_dir for a request archive: %s",
                     safe_exc(exc),
+                )
+                await self._record_aborted(
+                    "seed",
+                    f"[dr].seed_dir could not be resolved from this box within {timeout:g}s, so "
+                    "the archive named in the request was not checked — refusing to activate "
+                    "(ADR 0048 fail-closed). Check that the seed directory is reachable, or name "
+                    "the archive in [dr].seed_archive",
+                    actor,
+                    now,
+                    requested=archive,
                 )
         if resolved is None:
             await self._record_aborted(

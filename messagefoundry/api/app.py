@@ -6909,7 +6909,8 @@ def create_app(
         a new audit-chain segment → acquire-VIP-or-abort → serve under the DR run-profile. An optional
         ``{"archive": "<path>"}`` body overrides ``[dr].seed_archive`` (the runbook may pass the chosen
         #60 backup). A request may name only an archive under ``[dr].seed_dir``; with that unset, or for
-        a path outside it, activation aborts (422) before the path is touched (vault BACKLOG #2581).
+        a path outside it, activation aborts (422). ``pipeline/path_confine.py`` says what is and is
+        not touched first (vault BACKLOG #2581).
         ``{"dba_attests_restored": true}`` is the operator's per-activation attestation that
         the DBA restored the server-DB ``mefor`` database (REQUIRED on postgres/sqlserver, ignored on
         SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""

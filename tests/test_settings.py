@@ -1716,14 +1716,17 @@ def test_dr_seed_dir_parses_and_defaults_off(tmp_path: Path) -> None:
     # Vault BACKLOG #2581: "" (the default) means a request may name no archive at all. A local
     # path parses; a cloud URL is the only rejected form (covered above).
     assert DrSettings().seed_dir == ""
-    cfg = _write(tmp_path / "dr_seed_dir.toml", "[dr]\nenabled = true\nseed_dir = 'D:/dr/seeds'\n")
-    assert load_settings(config_path=cfg, environ={}).dr.seed_dir == "D:/dr/seeds"
-    # Either platform's absolute form parses, and a share does too.
-    assert DrSettings(seed_dir="/srv/dr/seeds").seed_dir == "/srv/dr/seeds"
-    assert DrSettings(seed_dir="//nas/mefor/seeds").seed_dir == "//nas/mefor/seeds"
+    seeds = (tmp_path / "seeds").as_posix()  # absolute on the platform running the test
+    cfg = _write(tmp_path / "dr_seed_dir.toml", f"[dr]\nenabled = true\nseed_dir = '{seeds}'\n")
+    assert load_settings(config_path=cfg, environ={}).dr.seed_dir == seeds
     # Blank-but-present reads as off. It must never reach the engine as a path, where it would
     # resolve to the working directory.
     assert DrSettings(seed_dir="   ").seed_dir == ""
+    # "Absolute" is this platform's. A rooted path with no drive is relative on Windows, and a
+    # drive-letter path is a relative name anywhere else.
+    other_platform = "/srv/dr/seeds" if os.name == "nt" else "D:/dr/seeds"
+    with pytest.raises(ValidationError):
+        DrSettings(seed_dir=other_platform)
 
 
 def test_auth_mfa_secure_defaults_and_totp_skew_validation() -> None:
