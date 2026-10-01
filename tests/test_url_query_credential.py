@@ -89,11 +89,16 @@ def test_detector_leaves_benign_parameters_alone(url: str) -> None:
             "https://p.example.invalid/x?key1=a&api_key2=b&apiKey2=c&token[]=d&api+key=e",
             ["'api key'", "'token[]'", "apiKey2", "api_key2", "key1"],
         ),
-        # Control: ids and keys that are not secrets.
+        # Control: ids and keys that are not secrets, and flags that end in auth or jwt.
         (
             "https://p.example.invalid/x?idempotency_key=a&partition_key=b&routingKey=c"
-            "&primaryKey=d&NextPartitionKey=e&NextRowKey=f",
+            "&NextPartitionKey=e&NextRowKey=f&requireAuth=1&useOAuth=1&useJwt=1",
             [],
+        ),
+        # Review round 3: an Azure account key, and an indexed array name.
+        (
+            "https://p.example.invalid/x?primaryKey=a&secondaryKey=b&token[0]=c",
+            ["'token[0]'", "primaryKey", "secondaryKey"],
         ),
     ],
 )
@@ -133,28 +138,53 @@ def test_userinfo_mask_ignores_an_at_sign_in_the_query() -> None:
     the end of a userinfo and the view showed the wrong host."""
     from messagefoundry.config.wiring import redacted_settings
 
-    url = "https://h.example.invalid/x?email=a@b.example.invalid&key=SYNTHETIC-9"
-    assert (
-        redacted_settings({"url": url})["url"]
-        == "https://h.example.invalid/x?email=a@b.example.invalid&key=***"
-    )
+    for url in (
+        "https://h.example.invalid:8443/x?email=a@b.example.invalid&key=SYNTHETIC-9",
+        "https://h.example.invalid/x?t=12:00&email=a@b.example.invalid&key=SYNTHETIC-9",
+        "https://[::1]/x?email=a@b.example.invalid&key=SYNTHETIC-9",
+    ):
+        assert redacted_settings({"url": url})["url"] == url.replace("SYNTHETIC-9", "***")
 
 
-@pytest.mark.parametrize("password", ["p?ss", "p#ss", "pa/ss"])
-def test_userinfo_mask_fails_toward_masking_a_password_holding_a_delimiter(password: str) -> None:
-    """Lander QA on 4e1c148c5e: ending the authority at the first ``/``, ``?`` or ``#`` let these
-    passwords through verbatim, and urllib's proxy parser accepts them."""
+@pytest.mark.parametrize(
+    ("user", "password"),
+    [
+        ("user", "p?ss"),
+        ("user", "p#ss"),
+        ("user", "pa/ss"),
+        ("user", "a@b?c"),
+        ("alice@corp", "p?ss"),
+    ],
+)
+def test_userinfo_mask_fails_toward_masking_a_password_holding_a_delimiter(
+    user: str, password: str
+) -> None:
+    """Lander QA on 4e1c148c5e, and review round 3: these passwords came back whole or in part,
+    and urllib's proxy parser accepts them."""
     from messagefoundry.config.wiring import redacted_settings
 
-    shown = redacted_settings({"proxy_url": f"http://user:{password}@proxy.example.invalid:3128"})
-    assert shown["proxy_url"] == "http://user:***@proxy.example.invalid:3128"
+    shown = redacted_settings({"proxy_url": f"http://{user}:{password}@proxy.example.invalid:3128"})
+    assert shown["proxy_url"] == f"http://{user}:***@proxy.example.invalid:3128"
+
+
+def test_a_query_credential_is_masked_behind_a_password_holding_a_question_mark() -> None:
+    """The userinfo mask runs first, so a "?" in the password cannot move the query span."""
+    from messagefoundry.config.wiring import redacted_settings
+
+    url = "http://user:p?ss@h.example.invalid/x?key=SYNTHETIC-10"
+    assert redacted_settings({"url": url})["url"] == "http://user:***@h.example.invalid/x?key=***"
 
 
 def test_userinfo_mask_leaves_a_url_with_no_userinfo_alone() -> None:
+    """Controls that reach the new branches: an "@" after the path, with and without a port."""
     from messagefoundry.config.wiring import redacted_settings
 
-    url = "http://proxy.example.invalid:3128/path?x=1#f"
-    assert redacted_settings({"proxy_url": url})["proxy_url"] == url
+    for url in (
+        "http://proxy.example.invalid:3128/path?x=1#f",
+        "https://h.example.invalid:8443/users/a@b.example.invalid",
+        "https://h.example.invalid/users/a@b.example.invalid",
+    ):
+        assert redacted_settings({"proxy_url": url})["proxy_url"] == url
 
 
 def test_mask_fails_toward_masking_when_urlsplit_strips_a_control_character() -> None:
@@ -165,6 +195,13 @@ def test_mask_fails_toward_masking_when_urlsplit_strips_a_control_character() ->
     url = "https://h.example.invalid/p?key=SE\tCRET&fmt=json"
     assert credential_query_params(url) == ["key"]
     assert mask_credential_query(url) == "https://h.example.invalid/p?key=***&fmt=json"
+    # A tab inside the NAME, which urlsplit drops before the detector sees it.
+    url = "https://h.example.invalid/p?api_\tkey=SECRET&fmt=json"
+    assert credential_query_params(url) == ["api_key"]
+    assert mask_credential_query(url) == "https://h.example.invalid/p?api_\tkey=***&fmt=json"
+    # A copy of the query in the fragment must not draw the mask away from the real one.
+    url = "https://h.example.invalid/p?key=SE\tCRET#?key=SECRET"
+    assert mask_credential_query(url) == "https://h.example.invalid/p?key=***#?key=SECRET"
 
 
 def test_mask_and_detector_agree_on_where_the_query_is() -> None:

@@ -505,15 +505,19 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
 
 #: Query-parameter NAMES that carry a credential in a URL and in nothing else here. Each is too
 #: ordinary for :data:`_CREDENTIAL_WORDS` -- ``key=`` is a cache key in log text, which is why that
-#: list leaves it out -- but a query parameter is a narrower place, and these three are how the
-#: common partner APIs spell a credential there: an API ``key=`` or ``subscription-key=``, a shared
-#: access ``sig=``, and a signed URL's ``X-Amz-Signature=``.
+#: list leaves it out -- but a query parameter is a narrower place, and these are how common partner
+#: APIs spell a credential there: an API ``key=`` or ``subscription-key=``, a shared access ``sig=``,
+#: a signed URL's ``X-Amz-Signature=``, and a bare ``auth=`` or ``jwt=``.
 _QUERY_CREDENTIAL_WORDS = ("key", "sig", "signature", "auth", "jwt")
+
+#: Words matched only as a whole name or after a separator, never as a camelCase tail: as a tail they
+#: name ordinary flags (``requireAuth``, ``useOAuth``, ``useJwt``).
+_QUERY_NO_CAMEL_WORDS = frozenset({"auth", "jwt"})
 
 #: Credential names written as ONE word with no separator, such as ``accesstoken`` or
 #: ``sessionid``. Matched at the end of the name with every separator removed, so ``x_accesstoken``
 #: matches too. Kept to compounds, because a bare tail such as ``token`` with no separator would
-#: also match ``pagetoken``-style words this module has no reason to judge.
+#: also match ``pagetoken``-style words.
 _QUERY_CREDENTIAL_COMPOUNDS = (
     "accesstoken",
     "authtoken",
@@ -528,19 +532,44 @@ _QUERY_CREDENTIAL_COMPOUNDS = (
     "clientsecret",
 )
 
-#: The words a credential parameter NAME may end in, casefolded. Matched as a whole name or as the
-#: last segment after a ``.``, ``_`` or ``-`` (:func:`_is_credential_param`), so ``monkey`` and
-#: ``keyword`` are not ``key`` and ``bypass`` is not ``pass``. Plain string tests rather than a regex
-#: composed from these tuples: a composed pattern is one more blind spot for the ReDoS scanner in
-#: ``tests/test_security_static.py``, and this needs none of what a regex buys.
+#: The words a credential parameter NAME may end in, casefolded. Plain string tests rather than a
+#: regex composed from these tuples: a composed pattern is one more blind spot for the ReDoS scanner
+#: in ``tests/test_security_static.py``, and this needs none of what a regex buys.
 _QUERY_CREDENTIAL_TAILS = tuple(
     word.casefold() for word in _CREDENTIAL_WORDS + _TOKEN_WORDS + _QUERY_CREDENTIAL_WORDS
+)
+
+#: The separators a parameter name is split on. A space is one because ``parse_qsl`` decodes ``+``
+#: to a space, so ``api+key`` reaches the test as ``api key``.
+_QUERY_NAME_SEPARATORS = ("_", "-", ".", " ")
+
+#: Every ``<separator><word>`` a name may end in, built once rather than per call.
+_QUERY_CREDENTIAL_SUFFIXES = tuple(
+    f"{sep}{word}" for word in _QUERY_CREDENTIAL_TAILS for sep in _QUERY_NAME_SEPARATORS
 )
 
 #: Key-material names, matched as the whole name. Most of them already end in ``_key``, which the
 #: ``key`` tail reaches; ``encryption_keys_retired`` and ``intake_api_key_next`` do not, and this set
 #: is what names those two.
 _QUERY_KEY_MATERIAL = frozenset(word.casefold() for word in _KEY_MATERIAL_WORDS)
+
+#: Names that END in a credential word and are not credentials: pagination cursors, sort,
+#: partition, row and routing keys, idempotency keys and public keys. Compared with every separator
+#: removed, so ``pageToken``, ``page_token`` and ``next-page-token`` all match. A short list on
+#: purpose: each entry is a name a partner API is known to use for something that is not a secret,
+#: and widening it narrows the detector. ``primaryKey`` is NOT here: Azure names a storage account
+#: secret that way, beside ``secondaryKey``.
+_QUERY_NOT_CREDENTIAL_TAILS = (
+    "pagetoken",
+    "nexttoken",
+    "continuationtoken",
+    "publickey",
+    "sortkey",
+    "partitionkey",
+    "rowkey",
+    "routingkey",
+    "idempotencykey",
+)
 
 
 def _camel_tail(name: str, word: str) -> bool:
@@ -558,54 +587,33 @@ def _camel_tail(name: str, word: str) -> bool:
     return before.islower() or before.isdigit() or (before.isupper() and rest.islower())
 
 
-#: Names that END in a credential word and are not credentials: pagination cursors, sort,
-#: partition, row and routing keys, idempotency keys and public keys. Compared with every separator
-#: removed, so ``pageToken``, ``page_token`` and ``next-page-token`` all match. A short list on
-#: purpose: each entry is a name a partner API is known to use for something that is not a secret,
-#: and widening it narrows the detector.
-_QUERY_NOT_CREDENTIAL_TAILS = (
-    "pagetoken",
-    "nexttoken",
-    "continuationtoken",
-    "publickey",
-    "sortkey",
-    "partitionkey",
-    "rowkey",
-    "routingkey",
-    "primarykey",
-    "idempotencykey",
-)
-
-#: The separators a parameter name is split on. A space is one because ``parse_qsl`` decodes ``+``
-#: to a space, so ``api+key`` reaches the test as ``api key``.
-_QUERY_NAME_SEPARATORS = ("_", "-", ".", " ")
-
-
 def _base_name(name: str) -> str:
-    """``name`` without a trailing ``[]`` or trailing digits, so ``token[]``, ``key1`` and
-    ``apiKey2`` are judged as ``token``, ``key`` and ``apiKey``."""
-    base = name.strip()
-    base = base.removesuffix("[]")
+    """``name`` without tab, CR or LF (which ``urlsplit`` drops, so the detector never sees them),
+    without a trailing index such as ``[]`` or ``[0]``, and without trailing digits. So
+    ``token[]``, ``token[0]``, ``key1`` and ``apiKey2`` are judged as ``token``, ``token``, ``key``
+    and ``apiKey``."""
+    base = name.replace("\t", "").replace("\r", "").replace("\n", "").strip()
+    if base.endswith("]") and "[" in base:
+        base = base[: base.rfind("[")]
     return base.rstrip("0123456789") or base
 
 
 def _is_credential_param(name: str) -> bool:
     base = _base_name(name)
     folded = base.casefold()
-    if folded in _QUERY_KEY_MATERIAL:
+    if folded in _QUERY_KEY_MATERIAL or folded in _QUERY_CREDENTIAL_TAILS:
         return True
     joined = folded
     for sep in _QUERY_NAME_SEPARATORS:
         joined = joined.replace(sep, "")
     if joined.endswith(_QUERY_NOT_CREDENTIAL_TAILS):
         return False
-    if joined.endswith(_QUERY_CREDENTIAL_COMPOUNDS):
+    if joined.endswith(_QUERY_CREDENTIAL_COMPOUNDS) or folded.endswith(_QUERY_CREDENTIAL_SUFFIXES):
         return True
     return any(
-        folded == word
-        or folded.endswith(tuple(f"{sep}{word}" for sep in _QUERY_NAME_SEPARATORS))
-        or _camel_tail(base, word)
+        _camel_tail(base, word)
         for word in _QUERY_CREDENTIAL_TAILS
+        if word not in _QUERY_NO_CAMEL_WORDS
     )
 
 
@@ -629,10 +637,12 @@ def credential_query_params(url: str) -> list[str]:
     raising, because a parser error would quote the URL.
 
     A heuristic over names, from this module's own vocabulary plus :data:`_QUERY_CREDENTIAL_WORDS`.
-    A name matches as a whole, as its last segment after ``.``, ``_`` or ``-``, or as a camelCase
-    tail (``accessToken``). It misses a credential under a name it does not know, and it will name
-    a parameter that only looks like one (``page_token``). Its callers WARN rather than refuse for
-    that reason.
+    A name is judged after dropping a trailing index (``[0]``) and trailing digits. It matches as a
+    whole word, as its last segment after ``.``, ``_``, ``-`` or a space (a decoded ``+``), as a
+    one-word compound (:data:`_QUERY_CREDENTIAL_COMPOUNDS`), or as a camelCase tail
+    (``accessToken``), unless it is a known non-secret (:data:`_QUERY_NOT_CREDENTIAL_TAILS`). It
+    misses a credential under a name it does not know, and it can name a parameter that only looks
+    like one. Its callers WARN rather than refuse for that reason.
 
     Not :class:`logging_setup.CredentialQueryScrubFilter`'s list. That one scrubs VALUES out of log
     text and carries ``code`` and ``state`` for the OIDC callback; neither is a credential name on a
@@ -655,37 +665,27 @@ def mask_credential_query(url: str, *, placeholder: str = "***") -> str:
     For display surfaces that show a configured URL (``config.wiring.redacted_settings``, which
     serves ``GET /metadata`` and ``graph --json``). Everything else in the URL is kept as written,
     including every other parameter, so the view stays useful. A parameter is judged by the same
-    name test as :func:`credential_query_params`; a name with no ``=`` has no value to mask."""
+    name test as :func:`credential_query_params`; a name with no ``=`` has no value to mask.
+
+    It splits the raw text, the fragment off first and then the query at the first ``?``, the
+    spans ``urlsplit`` uses. It does not call ``urlsplit``: that drops tab, CR and LF, so its query
+    is not always a substring of the URL as written, and finding it again by search can land on a
+    copy in the fragment. A ``?`` or ``#`` inside a userinfo password moves both spans, so a caller
+    that shows a URL masks the userinfo FIRST (``config.wiring.redacted_settings`` does)."""
     import urllib.parse  # noqa: PLC0415 -- see credential_query_params
 
-    def masked(query: str) -> str:
-        parts = []
-        for part in query.split("&"):
-            name, equals, _value = part.partition("=")
-            if equals and _is_credential_param(urllib.parse.unquote_plus(name)):
-                parts.append(f"{name}={placeholder}")
-            else:
-                parts.append(part)
-        return "&".join(parts)
-
-    # The query span is found by urlsplit, the parser credential_query_params uses, so the two agree
-    # about which parameters a URL has. The rest of the URL is kept as written.
-    try:
-        query = urllib.parse.urlsplit(url).query
-    except ValueError:
-        query = None
-    start = url.find("?" + query) if query else -1
-    if query and start >= 0:
-        end = start + 1 + len(query)
-        return f"{url[: start + 1]}{masked(query)}{url[end:]}"
-    # urlsplit strips tab, CR and LF and can refuse a URL, and then its query is not a substring of
-    # the URL as written. Fail toward masking: split the raw text instead, the fragment off first as
-    # urlsplit does, so a value the detector names is never shown because the two parsers disagree.
     before, hash_mark, fragment = url.partition("#")
-    head, question, raw_query = before.partition("?")
+    head, question, query = before.partition("?")
     if not question:
         return url
-    return f"{head}?{masked(raw_query)}{hash_mark}{fragment}"
+    parts = []
+    for part in query.split("&"):
+        name, equals, _value = part.partition("=")
+        if equals and _is_credential_param(urllib.parse.unquote_plus(name)):
+            parts.append(f"{name}={placeholder}")
+        else:
+            parts.append(part)
+    return f"{head}?{'&'.join(parts)}{hash_mark}{fragment}"
 
 
 def _run(text: str, placeholder: str, folded: str | None) -> str:

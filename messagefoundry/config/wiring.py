@@ -1424,24 +1424,39 @@ def _mask_url_userinfo(value: object) -> object:
     if not isinstance(value, str) or "@" not in value or "//" not in value:
         return value
     scheme, _, rest = value.partition("//")
-    # The clean case first: an "@" inside the authority, which ends at the first "/", "?" or "#".
-    # That keeps an "@" in a query (``/x?email=a@b.com``) from being read as the end of a userinfo.
-    end = min(
-        (i for i in (rest.find("/"), rest.find("?"), rest.find("#")) if i >= 0), default=len(rest)
-    )
-    authority, tail = rest[:end], rest[end:]
-    userinfo, at, hostpart = authority.rpartition("@")
-    if not at:
-        # A password may itself hold "/", "?" or "#", which ends that authority early, and urllib's
-        # proxy parser accepts it (``http://user:p?ss@proxy:3128``). So fail toward masking: split
-        # at the LAST "@" in the whole rest, as this did before. The cost is a wrong host in the
-        # view when a query "@" follows a host with a port; a password is never shown.
-        userinfo, at, hostpart = rest.rpartition("@")
+    # The authority ends at the first "/", as urllib's proxy parser reads it. A "?" or "#" does NOT
+    # end it here, because that parser keeps both in a password (``http://user:p?ss@proxy:3128``),
+    # and the LAST "@" in it ends the userinfo, so an "@" in the user (``alice@corp:pw@proxy``) or
+    # in the password is kept inside it. An "@" after the first "/" is a path or query "@"
+    # (``/x?email=a@b.com``) and leaves the URL alone.
+    slash = rest.find("/")
+    authority = rest if slash < 0 else rest[:slash]
+    if "@" in authority:
+        userinfo, _, hostpart = authority.rpartition("@")
+        tail = rest[len(authority) :]
+    elif slash >= 0 and "@" in rest[slash:] and not authority.startswith("["):
+        # A password may hold a "/" too (``user:pa/ss@proxy``), which ends that authority early.
+        # Tell it from a host and port (``h:8443/users/a@b``) by the port: digits only is a port.
+        # Anything else after the ":" is read as a password and masked to the LAST "@", failing
+        # toward masking; the cost is a wrong host in the view, never a shown password.
+        _host, colon, after = authority.partition(":")
+        if not colon or after.isdigit():
+            return value
+        userinfo, _, hostpart = rest.rpartition("@")
         tail = ""
-    if not at or ":" not in userinfo:
-        return value  # no userinfo, or a user with no password -- nothing secret to remove
+    else:
+        return value
+    if ":" not in userinfo:
+        return value  # a user with no password -- nothing secret to remove
     user, _, _pw = userinfo.partition(":")
     return f"{scheme}//{user}:***@{hostpart}{tail}"
+
+
+def _mask_url(value: str) -> object:
+    """Both URL masks, userinfo FIRST: a "?" or "#" in a password moves the query span the query
+    mask reads, so masking the password first is what lets the query mask find the real query."""
+    masked = _mask_url_userinfo(value)
+    return mask_credential_query(masked) if isinstance(masked, str) else masked
 
 
 def _redact_header_name(name: object) -> str:
@@ -1499,7 +1514,7 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
                 default = value.default
                 if isinstance(default, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
                     # A URL default gets the same two masks as a literal URL below (ASVS 14.2.1).
-                    default = _mask_url_userinfo(mask_credential_query(default))
+                    default = _mask_url(default)
                 ref["default"] = default
             out[name] = ref
         elif is_secret:
@@ -1508,7 +1523,7 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view. ASVS
             # 14.2.1 -- and the value of a credential-like QUERY parameter, by the same name test
             # the construction warning uses, or /metadata would serve the key it warns about.
-            out[name] = _mask_url_userinfo(mask_credential_query(value))
+            out[name] = _mask_url(value)
         elif name == "headers" and isinstance(value, dict):
             # Both axes: a header NAME is rendered through _redact_header_name before it is used as
             # the output key AND before it is handed to the value rule, so a reference in the name
