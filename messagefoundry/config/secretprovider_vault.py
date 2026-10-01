@@ -135,7 +135,8 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # BACKLOG #2053 (ASVS 4.2.1): read every KV reply through bounded_read rather than urllib3's
     # lenient body reader. Mounted AFTER construction, so the arguments asserted above are still
     # the ones the hop uses. The adapter also gives every connection a context from the factory
-    # (BACKLOG #300). Imported lazily: requests is on the [vault] extra, like hvac.
+    # (BACKLOG #300). Imported lazily: requests is on the [vault] extra, like hvac. It also refuses
+    # an address that would send the token in cleartext (BACKLOG #2317), so it runs before any I/O.
     from messagefoundry.transports.strict_requests import mount_strict_reply_adapter
 
     mount_strict_reply_adapter(

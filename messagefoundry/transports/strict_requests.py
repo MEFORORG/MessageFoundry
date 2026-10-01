@@ -87,6 +87,12 @@ import urllib3.exceptions
 import urllib3.poolmanager
 from urllib3.util.ssl_ import resolve_cert_reqs
 
+from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
+    enforce_insecure_hop,
+    insecure_hop_disposition,
+    is_loopback_hop_host,
+)
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     EgressReplyError,
@@ -371,8 +377,15 @@ class StrictReplyAdapter(requests.adapters.HTTPAdapter):
         # BACKLOG #300: an https pool for an http:// request can only be an https proxy's, and
         # requests will not verify it. Checked at construction too; this also catches a proxy
         # setting that changed after the client was built.
-        if pool.scheme == "https" and _scheme_of(request.url) != "https":
-            raise EgressReplyError(_unverifiable_proxy_leg(self._connector))
+        url = request.url or ""
+        if _scheme_of(url) != "https":
+            if pool.scheme == "https":
+                raise EgressReplyError(_unverifiable_proxy_leg(self._connector))
+            # BACKLOG #2317: a non-https request carries the token in cleartext unless it stays
+            # on the box. Checked at construction too; this catches a proxy that appeared since.
+            _refuse_a_cleartext_vault_hop(
+                url, requests.utils.select_proxy(url, proxies), connector=self._connector
+            )
         return pool
 
     def send(
@@ -458,16 +471,75 @@ def _unverifiable_proxy_leg(connector: str) -> str:
     )
 
 
-def _refuse_an_unverifiable_proxy_leg(
+#: The fixed text of the cleartext refusal. It names no part of the address, so a refusal that
+#: reaches a log or a CLI never echoes a host, a port or credentials an operator put in the URL.
+_CLEARTEXT_VAULT_HOP = (
+    "the Vault address is not https://, so the Vault token would cross the network in cleartext. "
+    "Only a loopback Vault reached with no proxy may use http://. Use an https:// Vault address; "
+    "refusing (BACKLOG #2317)"
+)
+
+
+def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str) -> None:
+    """Refuse a Vault hop whose token would cross the network in cleartext (BACKLOG #2317).
+
+    ``url`` is the Vault address and ``proxy`` the proxy requests would send it through, or
+    ``None``. An ``https://`` address returns at once: its token rides inside TLS to Vault, with or
+    without a proxy in front, and :func:`_narrowed_pool_classes` covers both legs. Anything else
+    goes to the shared cleartext-hop authority, ``tls_policy.insecure_hop_disposition``, which
+    ALLOWs only an on-box hop. Here that means an ``http://`` address whose host is proven loopback
+    with no DNS (``tls_policy.is_loopback_hop_host``) AND that requests would reach with no proxy.
+    A loopback address sent through a proxy is not on the box: the proxy reads the request, token
+    and all. A host-less address is not counted as loopback, because it names no hop at all.
+
+    **So the authority reduces to "on the box, or refused".** This hop has no posture in scope:
+    the providers are built from the environment and hold no ``[security]`` section (see
+    ``tls_policy.vault_client_verify_kwargs``), and it has no attestation or acceptance field. So
+    a non-loopback ``http://`` Vault is refused under every ``[security].enforcement`` setting,
+    like this hop's two older refusals (an ``https://`` proxy in front of an ``http://`` Vault, and
+    ``verify=False``), neither of which has an escape. The HTTP-family sibling is
+    ``transports.rest``'s ``_hop_guard_host``; it echoes the host and has no proxy arm, so it is
+    not reused here.
+
+    Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a ``ValueError``, with
+    fixed text."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        scheme, host = parts.scheme.lower(), parts.hostname or ""
+    except ValueError:  # a malformed IPv6 literal: not provably anything, so it is refused
+        scheme, host = "", ""
+    if scheme == "https":
+        return
+    on_box = scheme == "http" and not proxy and bool(host) and is_loopback_hop_host(host)
+    enforce_insecure_hop(
+        insecure_hop_disposition(
+            enforcing=True,  # no posture in scope (docstring); fail closed
+            is_loopback_hop=on_box,
+            hop_attested=False,
+            cleartext_accepted=False,
+        ),
+        message=_CLEARTEXT_VAULT_HOP,
+        cell=connector,
+    )
+
+
+def _refuse_an_insecure_vault_hop(
     session: requests.Session, url: object, *, connector: str
 ) -> None:
-    """Refuse at construction the one proxy shape whose TLS leg cannot be verified (BACKLOG #300).
+    """Refuse at construction a Vault hop that would send its token unprotected.
 
     Asks requests which proxy it would pick for ``url``, with the same two calls
     ``Session.request`` makes: the environment and, on Windows, the Internet Settings proxy, minus
-    ``NO_PROXY``, which override the session's own proxies. An ``https://`` proxy in front of an
-    ``http://`` Vault is refused, for the reason :func:`_unverifiable_proxy_leg` gives. An
-    ``https://`` Vault needs no check here; :func:`_narrowed_pool_classes` covers its proxy leg.
+    ``NO_PROXY``, which override the session's own proxies. Then two refusals, in this order:
+
+    * An ``https://`` proxy in front of an ``http://`` Vault, for the reason
+      :func:`_unverifiable_proxy_leg` gives (BACKLOG #300).
+    * Any other non-``https://`` Vault that is not loopback reached directly, which
+      :func:`_refuse_a_cleartext_vault_hop` refuses (BACKLOG #2317). That covers a direct
+      ``http://`` address and one behind an ``http://`` proxy.
+
+    An ``https://`` Vault needs no check here; :func:`_narrowed_pool_classes` covers its proxy leg.
+    Both refusals raise :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`.
 
     The proxy settings can change after this runs, so the adapter checks again before each send.
     A ``url`` that is not a string is left to that check."""
@@ -476,7 +548,8 @@ def _refuse_an_unverifiable_proxy_leg(
     settings = session.merge_environment_settings(url, {}, None, None, None)
     proxy = requests.utils.select_proxy(url, settings["proxies"])
     if proxy and _scheme_of(proxy) == "https":
-        raise ValueError(_unverifiable_proxy_leg(connector))
+        raise InsecureHopRefused(_unverifiable_proxy_leg(connector))
+    _refuse_a_cleartext_vault_hop(url, proxy, connector=connector)
 
 
 def mount_strict_reply_adapter(
@@ -500,8 +573,11 @@ def mount_strict_reply_adapter(
     ``limit`` is the reply ceiling. The Transit client passes :data:`MAX_VAULT_REPLY_BYTES`; the KV
     client reads small secrets and keeps the shared egress ceiling.
 
-    Also raises :class:`ValueError` when requests would send an ``http://`` Vault address through
-    an ``https://`` proxy, whose TLS leg requests would not verify (BACKLOG #300).
+    Also raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a
+    :class:`ValueError`, when the Vault address is not ``https://``, unless it is loopback and
+    reached with no proxy (BACKLOG #2317), and when requests would send an ``http://`` Vault
+    address through an ``https://`` proxy, whose TLS leg requests would not verify (BACKLOG #300).
+    All three Vault clients call this, so it is the one place each of them is checked.
     """
     session = getattr(getattr(client, "adapter", None), "session", None)
     if not isinstance(session, requests.Session):
@@ -509,7 +585,7 @@ def mount_strict_reply_adapter(
             f"{connector}: cannot mount the strict reply reader, because the Vault client exposes "
             f"no requests session at client.adapter.session"
         )
-    _refuse_an_unverifiable_proxy_leg(
+    _refuse_an_insecure_vault_hop(
         session, getattr(client.adapter, "base_uri", None), connector=connector
     )
     adapter = StrictReplyAdapter(

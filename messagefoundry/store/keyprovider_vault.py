@@ -159,6 +159,8 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     # are still the ones the hop uses. The adapter also gives every connection a context from the
     # factory (BACKLOG #300). crypto_transit.py shares this function, so its per-cell client gets
     # the strict reader and the narrowing too, and so this client takes the larger Transit ceiling.
+    # The mount also refuses an address that would send the token in cleartext (BACKLOG #2317), so
+    # both clients built here are checked before any I/O.
     from messagefoundry.transports.strict_requests import (
         MAX_VAULT_REPLY_BYTES,
         mount_strict_reply_adapter,
