@@ -303,7 +303,10 @@ reads is not documented, so this is checked rather than assumed. The check runs 
 `connect`, which still refuses if a later urllib3 renames that hook.
 
 A direct `http://` Vault address is not refused by this amendment. It carries the token in plain
-text, and whether to refuse it is a separate decision.
+text, and whether to refuse it is a separate decision. **UPDATED 2026-09-30:** that decision was
+taken as BACKLOG #2317. All three Vault clients now refuse any address that is not `https://`,
+direct or behind an `http://` proxy, except a loopback address reached with no proxy.
+`docs/CONFIGURATION.md`, section `[secrets]`, states the rule.
 
 **An `http://` Vault through an `https://` proxy is refused.** requests clears the CA and sets
 `CERT_NONE` for an `http://` URL, so that connection's only TLS leg, the one to the proxy that

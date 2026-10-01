@@ -402,8 +402,22 @@ All notable changes to MessageFoundry are documented here. The format follows
   Vault hop's anchor and the proxy's host name. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
   proxy is refused when the client is built, and again before each send. requests does not verify
   that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
-  nobody. Use an `https://` Vault address. A direct `http://` Vault address is still not refused.
+  nobody. Use an `https://` Vault address. A direct `http://` Vault address was not refused by
+  this change; the next entry refuses it.
   (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
+- **BREAKING: the three Vault clients refuse a Vault address that is not `https://`.** The KV
+  secret provider, the store key provider and the Transit cipher took an `http://` address with no
+  scheme check, so on a first deployment with one the `X-Vault-Token` would have crossed the
+  network in cleartext, directly or through an `http://` proxy. Each now refuses such an address
+  when its client is built, and again before each send in case a proxy appeared since. That
+  includes an address from hvac's own `VAULT_ADDR` fallback. The one `http://` address allowed is
+  a loopback Vault (`127.0.0.0/8`, `::1` or `localhost`) reached with no proxy, the shared
+  cleartext-hop rule's on-box case; hvac's built-in default, `http://localhost:8200`, is one. The
+  refusal is an `InsecureHopRefused` with fixed text that names no part of the address.
+  `[security].enforcement` does not relax it, since this hop has no posture in scope and no way to
+  declare an accepted risk. An `https://` Vault behind an `http://` proxy is unchanged: the token
+  rides inside the TLS tunnel. The `https://`-proxy refusal above now raises the same type.
+  (`BACKLOG #2317`, ASVS 12.3.1)
 - **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
   `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a
   site proxy would have taken the loopback probe off the host and read a running engine as down.
