@@ -14,13 +14,16 @@ REST/SOAP arm — see wiring_runner ``_allowlist_for``/``check_egress_allowed``)
 - Media type ``application/fhir+json`` on both ``Content-Type`` and ``Accept`` (JSON-only MVP; FHIR-XML
   is deferred — ADR 0022 Options #5).
 - Interaction → method + path off the FHIR service **base** ``url`` (e.g. ``https://host/fhir``): a
-  ``create`` is ``POST {base}/{ResourceType}``, an ``update`` is ``PUT {base}/{ResourceType}/{id}``, and
-  a ``transaction``/``batch`` is ``POST {base}`` with a ``Bundle`` body (the server applies it). The
+  ``create`` is ``POST {base}/{ResourceType}``, and a ``transaction``/``batch`` is ``POST {base}`` with a
+  ``Bundle`` body (the server applies it). An ``update`` is a ``PUT {ResourceType}/{id}`` carried as the
+  one entry of a ``transaction`` ``Bundle`` POSTed to ``{base}``, so the message-derived id is in the
+  body and never in the request URL (vault BACKLOG #1965, ASVS 14.2.1, owner ruling R3). The
   ResourceType/id are read from the outgoing body with the cheap :class:`FhirPeek` (no typed parse).
 - The three opt-in conditional knobs (idempotency/concurrency levers, off by default): ``if-none-exist``
   (conditional create — ``If-None-Exist`` header), ``conditional-update`` (search-based ``PUT
-  {base}/{ResourceType}?<query>``), and ``if-match`` (version-aware ``PUT`` with an ``If-Match`` ETag
-  derived from the resource's ``meta.versionId``).
+  {base}/{ResourceType}?<query>``), and ``if-match`` (a version-aware update: the same one-entry
+  ``transaction`` as ``update``, with the ETag derived from the resource's ``meta.versionId`` in the
+  entry's ``request.ifMatch``).
 - ``OperationOutcome`` classification refines the HTTP-status retry model: 2xx → delivered (a returned
   OperationOutcome is captured, never an error); 5xx → transient retry; a 4xx whose OperationOutcome
   carries a FHIR *transient* IssueType code (lock-error/throttled/timeout/incomplete) → transient retry;
@@ -47,7 +50,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -112,16 +115,17 @@ _CONDITIONALS = ("if-none-exist", "conditional-update", "if-match")
 
 #: The SMART v2 permission letters each declared shape can actually spend, keyed the way
 #: :meth:`FhirDestination._resolve_request` dispatches — ``conditional`` FIRST, then ``interaction``.
-#: That order is the whole point: ``conditional-update`` and ``if-match`` both return PUT even when
-#: ``interaction`` is the default ``"create"``, so keying on ``interaction`` alone would compute ``c``
-#: for a connection that only ever issues PUT. Kept HERE, beside the dispatch it mirrors, so a change
-#: to the method table is visibly a change to the letter table (#1159).
+#: That order is the whole point: ``conditional-update`` and ``if-match`` both issue an update even
+#: when ``interaction`` is the default ``"create"``, so keying on ``interaction`` alone would compute
+#: ``c`` for a connection that only ever updates. Kept HERE, beside the dispatch it mirrors, so a change
+#: to the method table is visibly a change to the letter table (#1159). An update's one-entry
+#: ``transaction`` (vault BACKLOG #1965) still spends ``u``: a server authorizes entry by entry.
 _CONDITIONAL_SCOPE_LETTERS = {
     # search-based PUT: the server searches on the client's behalf, then updates
     "conditional-update": frozenset("us"),
     # POST with If-None-Exist: the server searches on the client's behalf, then creates
     "if-none-exist": frozenset("cs"),
-    # version-aware PUT: the ETag comes from the outgoing body's meta.versionId, so no search
+    # version-aware update: the ETag comes from the outgoing body's meta.versionId, so no search
     "if-match": frozenset("u"),
 }
 _INTERACTION_SCOPE_LETTERS = {"create": frozenset("c"), "update": frozenset("u")}
@@ -198,11 +202,16 @@ def _classify_fhir(status: int, body: str) -> DeliveryError | None:
     """``None`` if delivered (2xx), else the classified failure. Refines the HTTP-status base with the
     ``OperationOutcome`` issue codes, but the HTTP status wins when in doubt (a 5xx stays transient).
     PHI-safe: only the status is named, never the OperationOutcome body."""
+    return _classify_status(status, _operation_outcome(body))
+
+
+def _classify_status(status: int, outcome: dict[str, Any] | None) -> DeliveryError | None:
+    """:func:`_classify_fhir` over an ``OperationOutcome`` that is already parsed, or ``None``.
+    A transaction-response entry carries its outcome parsed, so it is classified here directly."""
     if 200 <= status < 300:
         return None
     if 500 <= status < 600:
         return DeliveryError(f"FHIR server returned HTTP {status}")  # 5xx always transient
-    outcome = _operation_outcome(body)
     transient_issue = outcome is not None and any(
         code in _TRANSIENT_ISSUE_CODES for code in _issue_field(outcome, "code")
     )
@@ -278,6 +287,123 @@ def _validate_path_token(value: str, pattern: re.Pattern[str], field: str) -> st
             permanent=True,
         )
     return value
+
+
+class _FhirRequest(NamedTuple):
+    """What :meth:`FhirDestination._resolve_request` derives from one outgoing body.
+
+    ``transaction`` is ``False`` when the body goes out as-is to ``url``. When ``True`` (an update,
+    vault BACKLOG #1965), ``method`` and ``url`` describe the ENTRY (``PUT`` and a relative
+    ``{type}/{id}``), and :func:`_as_transaction` turns them, plus the conditional headers, into a
+    one-entry ``transaction`` Bundle POSTed to the base. That is how an update keeps its message-derived
+    id out of the request URL: the id lives in ``request.url`` inside the body."""
+
+    method: str
+    url: str
+    headers: dict[str, str]
+    transaction: bool = False
+
+
+#: The FHIR conditional request headers and their ``Bundle.entry.request`` fields
+#: (https://hl7.org/fhir/R4B/bundle-definitions.html#Bundle.entry.request). On a wrapped update each
+#: one qualifies the entry, as it qualified the PUT; on the outer POST to the base it would not.
+_ENTRY_CONDITIONAL_FIELDS = {
+    "if-match": "ifMatch",
+    "if-none-match": "ifNoneMatch",
+    "if-modified-since": "ifModifiedSince",
+    "if-none-exist": "ifNoneExist",
+}
+
+#: The reply headers a single PUT would have carried, and the ``Bundle.entry.response`` fields a
+#: transaction-response carries them in instead.
+_ENTRY_RESPONSE_HEADERS = {"ETag": "etag", "Location": "location", "Last-Modified": "lastModified"}
+
+_BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
+
+
+def _as_transaction(
+    base: str, entry: _FhirRequest, headers: Mapping[str, str], payload: str
+) -> tuple[str, dict[str, str], str]:
+    """Wrap one resource as the single entry of a ``transaction`` Bundle (vault BACKLOG #1965).
+
+    Returns the request URL (the base), the headers left for the outer POST, and the Bundle text.
+    Every conditional header in ``headers`` moves into the entry's ``request``. ``headers`` lists the
+    per-message headers before the connector's own, so the connector's value wins, as it did on the PUT.
+
+    The resource text is spliced in VERBATIM rather than re-serialized. A JSON round-trip would rewrite
+    a FHIR ``decimal`` such as ``1.50`` to ``1.5``, and FHIR requires a decimal's precision to be
+    preserved (https://hl7.org/fhir/R4B/datatypes.html#decimal). ``payload`` has already passed
+    :class:`FhirPeek`, so it is exactly one JSON object; only the BOM ``FhirPeek`` tolerates is removed,
+    because a BOM inside a JSON document is not valid JSON.
+
+    No ``fullUrl`` is written: it is optional for a transaction ``PUT`` entry, and it would be one more
+    copy of the id."""
+    request = {"method": entry.method, "url": entry.url}
+    outer: dict[str, str] = {}
+    for name, value in headers.items():
+        field = _ENTRY_CONDITIONAL_FIELDS.get(name.lower())
+        if field is None:
+            outer[name] = value
+        else:
+            request[field] = value
+    bundle = "".join(
+        (
+            '{"resourceType":"Bundle","type":"transaction","entry":[{"resource":',
+            payload.lstrip(_BOM),
+            ',"request":',
+            json.dumps(request, separators=(",", ":")),
+            "}]}",
+        )
+    )
+    return base, outer, bundle
+
+
+def _unwrap_transaction_reply(
+    body: str, headers: dict[str, str], allowlist: frozenset[str]
+) -> dict[str, str]:
+    """Read a transaction-response reply to a wrapped update; return the captured headers.
+
+    Raises the classified failure when the entry's ``response.status`` failed. A conformant server
+    fails a whole transaction with an error HTTP status, which ``_post`` already classifies; this
+    covers a server that answers 2xx while the entry itself failed, which would otherwise record a
+    rejected update as delivered. The status is an HTTP code by specification
+    (https://hl7.org/fhir/R4B/bundle-definitions.html#Bundle.entry.response.status). PHI-safe: only
+    the code is named, never the entry's ``outcome``.
+
+    The entry's ``etag``/``location``/``lastModified`` are offered to the #154 allow-list as the
+    headers a PUT reply would have carried. A real reply header wins, and a value carrying a control
+    character is dropped: it came from a JSON body, which, unlike an HTTP header line, can hold one.
+    A reply that is not a transaction-response with an entry is left alone, as any 2xx was before."""
+    try:
+        peek = FhirPeek.parse(body)
+    except FhirPeekError:
+        return headers
+    entries = peek.obj.get("entry") if peek.resource_type == "Bundle" else None
+    first = entries[0] if isinstance(entries, list) and entries else None
+    response = first.get("response") if isinstance(first, dict) else None
+    if not isinstance(response, dict):
+        return headers
+    status = response.get("status")
+    code = status.strip()[:3] if isinstance(status, str) else ""
+    if code.isdigit():
+        outcome = response.get("outcome")
+        failure = _classify_status(
+            int(code),
+            outcome
+            if isinstance(outcome, dict) and outcome.get("resourceType") == "OperationOutcome"
+            else None,
+        )
+        if failure is not None:
+            raise failure
+    present = {name.lower() for name in headers}
+    offered = {
+        name: value
+        for name, field in _ENTRY_RESPONSE_HEADERS.items()
+        if name.lower() not in present
+        and isinstance(value := response.get(field), str)
+        and not has_control_char(value)
+    }
+    return {**capture_response_headers(offered, allowlist), **headers}
 
 
 class FhirDestination(DestinationConnector):
@@ -522,15 +648,27 @@ class FhirDestination(DestinationConnector):
                 "outgoing FHIR body is not parseable JSON", code="bad-body", permanent=True
             ) from exc
 
-    def _resolve_request(self, payload: str) -> tuple[str, str, dict[str, str]]:
-        """Derive (method, url, extra per-request headers) from the interaction/conditional + the body.
+    def _resolve_request(self, payload: str) -> _FhirRequest:
+        """Derive the method, url, extra per-request headers and any transaction wrapping from the
+        interaction/conditional + the body.
 
         ResourceType/id/versionId are read from the outgoing body via FhirPeek. A missing required field
         is a permanent failure (retrying re-sends the same body). PHI-safe: errors name only the missing
-        field, never the body."""
+        field, never the body.
+
+        **An update never puts the resource id in the request URL** (vault BACKLOG #1965, ASVS 14.2.1,
+        owner ruling R3). A RESTful update is ``PUT [base]/[type]/[id]``, so the id is in the path by
+        specification, and from there it reaches the receiving server's access logs. The update and
+        if-match interactions are therefore sent as the one entry of a ``transaction`` Bundle POSTed to
+        ``[base]``; the entry's ``request`` carries ``PUT {type}/{id}`` and, for if-match, the
+        ``ifMatch`` ETag. A transaction entry with method ``PUT`` is processed as that update
+        (https://hl7.org/fhir/R4B/http.html#transaction), so the semantics hold. ``create`` and
+        ``conditional-update`` put no id in the URL and are unchanged; ``conditional-update``'s search
+        stays in the query, from operator configuration rather than the message."""
         base = self.base_url.rstrip("/")
         if self.interaction in ("transaction", "batch"):
-            return "POST", base, {}  # the body is itself a Bundle; the server applies it
+            # The body is itself a Bundle; the server applies it.
+            return _FhirRequest("POST", base, {})
 
         peek = self._peek(payload)
         resource_type = peek.resource_type
@@ -545,9 +683,9 @@ class FhirDestination(DestinationConnector):
         type_seg = urllib.parse.quote(resource_type, safe="")  # defense-in-depth percent-encode
 
         if self.conditional == "conditional-update":
-            return "PUT", f"{base}/{type_seg}?{self.conditional_query}", {}
+            return _FhirRequest("PUT", f"{base}/{type_seg}?{self.conditional_query}", {})
         if self.conditional == "if-none-exist":
-            return (
+            return _FhirRequest(
                 "POST",
                 f"{base}/{type_seg}",
                 {"If-None-Exist": self.conditional_query or ""},
@@ -560,17 +698,19 @@ class FhirDestination(DestinationConnector):
                     code="no-version-id",
                     permanent=True,
                 )
-            _reject_control_chars(version_id, "meta.versionId")  # it flows into the If-Match header
+            _reject_control_chars(version_id, "meta.versionId")  # it flows into the entry's ifMatch
             # versionId is an id-typed FHIR value: gate it to the id grammar so it can't break out of
-            # the W/"..." ETag (quoting is wrong for a header value, so reject rather than encode).
+            # the W/"..." ETag (an ETag is not a place to encode, so reject rather than encode).
             _validate_path_token(version_id, _FHIR_ID_RE, "meta.versionId")
             id_seg = urllib.parse.quote(self._require_id(peek), safe="")
-            return "PUT", f"{base}/{type_seg}/{id_seg}", {"If-Match": f'W/"{version_id}"'}
+            return _FhirRequest(
+                "PUT", f"{type_seg}/{id_seg}", {"If-Match": f'W/"{version_id}"'}, transaction=True
+            )
 
         if self.interaction == "update":
             id_seg = urllib.parse.quote(self._require_id(peek), safe="")
-            return "PUT", f"{base}/{type_seg}/{id_seg}", {}
-        return "POST", f"{base}/{type_seg}", {}  # create (default)
+            return _FhirRequest("PUT", f"{type_seg}/{id_seg}", {}, transaction=True)
+        return _FhirRequest("POST", f"{base}/{type_seg}", {})  # create (default)
 
     @staticmethod
     def _require_id(peek: FhirPeek) -> str:
@@ -578,7 +718,9 @@ class FhirDestination(DestinationConnector):
             raise NegativeAckError(
                 "FHIR update requires the resource id", code="no-id", permanent=True
             )
-        _reject_control_chars(peek.id, "resource id")  # it flows into the URL path
+        # It flows into the entry's request.url, which the SERVER resolves as a path relative to the
+        # base, so the same path gates apply as when it was the HTTP request path.
+        _reject_control_chars(peek.id, "resource id")
         # Grammar-gate the message-derived id so '../$reindex'-style traversal can't redirect the write.
         return _validate_path_token(peek.id, _FHIR_ID_RE, "resource id")
 
@@ -594,14 +736,15 @@ class FhirDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:
-        method, url, extra_headers = self._resolve_request(payload)
+        request = self._resolve_request(payload)
         # #68: fold this message's dynamic http.header.* entries into the per-request headers, MERGED
         # OVER the static ones but UNDER the connector's interaction headers (If-Match/If-None-Exist),
         # which are semantically required and must win. Pure; None → {} → byte-identical.
-        extra_headers = {**outbound_headers_from_metadata(metadata), **extra_headers}
-        # urllib is blocking — keep it off the event loop (the delivery worker awaits this).
+        extra_headers = {**outbound_headers_from_metadata(metadata), **request.headers}
+        # urllib is blocking — keep it off the event loop (the delivery worker awaits this). The
+        # transaction wrap and its reply parse ride the same thread: both scale with the body.
         body, status, headers = await asyncio.to_thread(
-            self._post, payload, method, url, extra_headers
+            self._exchange, payload, request, extra_headers
         )
         # A non-2xx already raised inside _post (transient retry / permanent dead-letter). Here status is
         # 2xx: FHIR treats a 2xx as delivered (a returned OperationOutcome is captured, not an error).
@@ -614,6 +757,19 @@ class FhirDestination(DestinationConnector):
         return DeliveryResponse(
             body=body, outcome=_capture_outcome(body), detail=f"HTTP {status}", headers=headers
         )
+
+    def _exchange(
+        self, payload: str, request: _FhirRequest, extra_headers: dict[str, str]
+    ) -> tuple[str, int, dict[str, str]]:
+        """Send one resolved request. An update goes out as a one-entry ``transaction`` (vault
+        BACKLOG #1965) and its reply is unwrapped; everything else goes to ``_post`` as resolved."""
+        if not request.transaction:
+            return self._post(payload, request.method, request.url, extra_headers)
+        url, outer, bundle = _as_transaction(
+            self.base_url.rstrip("/"), request, extra_headers, payload
+        )
+        body, status, headers = self._post(bundle, "POST", url, outer)
+        return body, status, _unwrap_transaction_reply(body, headers, self.capture_response_headers)
 
     async def test_connection(self) -> None:
         await asyncio.to_thread(self._probe)
@@ -708,9 +864,9 @@ class FhirDestination(DestinationConnector):
             # boundary so a retry re-mints it (re-run purity holds).
             headers = {**headers, **self._signer.signature_headers(data)}
         # ASVS 4.2.5: FHIR is the one destination whose URL is genuinely per-message -- _resolve_request
-        # builds it from the resource type and id, and _FHIR_TYPE_RE bounds that grammar but not its
-        # LENGTH. The construction gate only ever saw base_url, so without this a crafted resourceType
-        # ships an unbounded request line. Placed before the try below because these raise
+        # builds it from the resource type (the id left the URL with vault BACKLOG #1965; the type did
+        # not), and _FHIR_TYPE_RE bounds that grammar but not its LENGTH. The construction gate only
+        # ever saw base_url, so without this a crafted resourceType ships an unbounded request line. Placed before the try below because these raise
         # NegativeAckError/DeliveryError, which its handlers deliberately do not catch.
         try:
             enforce_send_time_length_limits(
@@ -877,6 +1033,11 @@ def _resolve_read_url(
     passing message-derived data. A ``?``-query in ``query`` is **refused**: the flat author-encoded
     form was removed rather than gated behind a setting, because a setting leaves the unencoded sink one
     config edit away and closes the requirement on a default instead of on the absence of the sink.
+
+    **A read-by-id keeps the id in the path, and that is outside owner ruling R3.** A RESTful read is
+    ``GET [base]/[type]/[id]`` by specification (https://hl7.org/fhir/R4B/http.html#read). Vault
+    BACKLOG #1965 moved the id out of the URL for the update and if-match WRITES only, which is all R3
+    names; that row records that it does not decide this read site.
 
     Raises a PHI-safe ``ValueError`` (it names only the offending shape/segment, never the query's
     parameter values)."""
