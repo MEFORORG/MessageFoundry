@@ -838,7 +838,12 @@ def _scan_root(root: Path) -> _RootScan:
 
 def test_no_engine_module_puts_an_unencodable_character_on_a_console() -> None:
     """The engine gate: a console-bound literal stays cp1252-safe unless its file hardens stdout."""
+    # An emptied or renamed root would scan clean over nothing, so each must hold modules.
+    for root in _ENGINE_GATE_ROOTS:
+        assert _modules_under(root), f"the engine gate walks no modules under {root}"
     scans = [_scan_root(root) for root in _ENGINE_GATE_ROOTS]
+    # The count the vacuous-absence lint reads as this walk's guard; it pins only the tuple's length.
+    assert len(scans) >= 2, f"the engine gate scanned {len(scans)} root(s): {_ENGINE_GATE_ROOTS}"
     exempted = [e for scan in scans for e in scan.exempted]
     print(f"console-bound and hardened, therefore allowed: {exempted or 'none'}")
     offenders = [o for scan in scans for o in scan.offenders]
@@ -851,6 +856,9 @@ def test_every_engine_module_decodes_as_utf8_and_parses() -> None:
     """Never a silent skip, for both reasons: a file that will not decode is the likeliest to carry
     the bytes this gate hunts, and a file that will not parse would make _printed_unencodable return
     an empty list that is indistinguishable from a clean one."""
+    for root in _ENGINE_GATE_ROOTS:
+        assert _modules_under(root), f"the readability scan walks no modules under {root}"
+    assert len(_ENGINE_GATE_ROOTS) >= 2, f"the engine gate names only {_ENGINE_GATE_ROOTS}"
     broken = [b for root in _ENGINE_GATE_ROOTS for b in _scan_root(root).unreadable]
     assert not broken, "engine modules the scan could not read:\n  " + "\n  ".join(broken)
 

@@ -240,6 +240,8 @@ def test_sbom_scan_venv_is_created_without_a_seeded_pip(workflow: str, runner: s
     assert scanned, f"{workflow}'s {runner} SBOM step no longer names the venv interpreter it scans"
     venv = scanned.group(1)
     code = [ln.strip() for ln in shell.splitlines()]
+    # Implied by the interpreter match above; stated on `code`, which the own-pip walk below reads.
+    assert code, f"{workflow}'s {runner} SBOM step has no shell lines to check"
     creates = [ln for ln in code if _venv_create_re(venv).search(ln)]
     assert len(creates) == 1, (
         f"{workflow}'s SBOM step should create {venv} exactly once, found {creates}"

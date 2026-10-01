@@ -1260,9 +1260,11 @@ def test_no_file_imports_the_upstream_defusedxml_package() -> None:
 
     So an import of it works only where that extra happens to be installed. Everything in these
     roots parses through the vendored copy instead."""
+    files = _py_files(*_XML_ROOTS)
+    assert files, f"no python files under {_XML_ROOTS}; the walk would pass over nothing"
     offenders = sorted(
         path.relative_to(_REPO).as_posix()
-        for path in _py_files(*_XML_ROOTS)
+        for path in files
         if "defusedxml" in (text := path.read_text(encoding="utf-8"))
         and "defusedxml" in _xml_parser_imports(text, _package_of(path))
     )

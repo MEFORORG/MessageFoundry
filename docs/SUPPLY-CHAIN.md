@@ -20,7 +20,12 @@ decision record is [ADR 0149](adr/0149-multi-ecosystem-sbom-vex-and-sbom-quality
 | PEP 740 attestations | PyPI-side provenance (Trusted Publishing) | PyPI |
 | SLSA build provenance | in-toto attestation binding each artifact (incl. both SBOMs + VEX) to the source commit | GitHub attestations / Sigstore bundle |
 
-Every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
+The toolkit wheel (`messagefoundry-toolkit`, ADR 0201) is built in the engine's release job. That
+job also signs it and writes its SLSA provenance, and attaches the wheel and its `.sigstore.json`
+bundle to the GitHub release (BACKLOG #1192). So both verification commands below work on it too. It
+has no SBOM of its own.
+
+Apart from that, every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
 job in `release.yml` sets `attestations: true`. So the web console wheel (`messagefoundry-webconsole`)
 and the harness wheel get a PyPI-side attestation whenever their PyPI publish runs. Both of those
 publishes are gated on a repository variable. That is all they get: their release jobs have no
@@ -94,9 +99,9 @@ engine version. Both commands should pass. A failure on either file means you sh
 
 ### GitHub release artifacts (Sigstore + SLSA)
 
-`gh attestation verify` checks the GitHub attestations the engine release job writes: the engine
-sdist, the engine wheel, the two SBOMs and the VEX. For the console, use the PyPI check above. Verify the
-SLSA build provenance of one of those five files:
+`gh attestation verify` checks the GitHub attestations the engine release job writes. They cover at
+least the engine sdist, the engine wheel, the two SBOMs, the VEX and the toolkit wheel. For the
+console, use the PyPI check above. Verify the SLSA build provenance of one of those files:
 
 ```bash
 gh attestation verify messagefoundry-<version>.tar.gz --repo MEFORORG/MessageFoundry \
@@ -106,6 +111,10 @@ gh attestation verify messagefoundry-<version>.tar.gz --repo MEFORORG/MessageFou
 
 Keep the last two flags. With `--repo` alone, the command accepts an attestation from any workflow
 in the repository, on any ref, and at least one attestation exists that no release wrote.
+
+Write `<version>` in the TAG's spelling, in this command and in the Sigstore one below. A
+pre-release tag is `v0.5.0-rc1`, while its wheel's filename says `0.5.0rc1`. The wheel's spelling
+names a ref no release was built from, so the check fails on a genuine file.
 
 Or verify a Sigstore bundle directly (both SBOMs and the VEX are signed too; for the Windows SBOM,
 name `messagefoundry-sbom-windows.cdx.json` instead):

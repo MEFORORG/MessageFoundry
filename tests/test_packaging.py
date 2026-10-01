@@ -914,6 +914,15 @@ def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> 
 _TOOLKIT_PYPROJECT = _REPO / "packaging" / "messagefoundry-toolkit" / "pyproject.toml"
 
 
+def _toolkit_project() -> dict[str, Any]:
+    """The toolkit pyproject's ``[project]`` table, parsed fresh on each call (a small file), so a
+    test that mutates it cannot change what a later test reads."""
+    project: dict[str, Any] = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))[
+        "project"
+    ]
+    return project
+
+
 def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     """The harness pin test's twin. ``messagefoundry-toolkit`` is lockstep too, and more tightly: its
     handlers call engine internals with no stable seam, so any other engine is a wrong engine.
@@ -921,13 +930,12 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     It also pins that the toolkit names NO extra and NOTHING ELSE: its third-party imports are core
     engine dependencies, so the exact pin makes the engine's set the toolkit's (ADR 0201 section 1).
     """
-    toolkit = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))
     root = version_path(_TOOLKIT_PYPROJECT)
     assert root == (_REPO / "messagefoundry" / "__init__.py").resolve(), (
         f"the toolkit takes its version from {root}, which is not the engine's __init__.py - the "
         f"lockstep premise this pin rests on is gone, so re-derive the pin before trusting it"
     )
-    deps: list[str] = toolkit["project"]["dependencies"]
+    deps: list[str] = _toolkit_project()["dependencies"]
     shipped = _version_literal(root)
     assert _engine_pin(deps) == shipped, (
         f"the toolkit must pin the engine at the version it ships with (ADR 0201 AC-7).\n"
@@ -942,12 +950,29 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     assert len(deps) == 1, f"the toolkit declares more than the engine pin: {deps}"
 
 
+def test_the_toolkit_wheel_ships_the_license_and_notice() -> None:
+    """BACKLOG #1192: the toolkit wheel carried no LICENSE or NOTICE, unlike the engine and console.
+
+    It declares both as PEP 639 ``license-files`` from its own directory, and its LICENSE is a copy
+    of the root one, so this pins the copy byte-identical: a license text edited in one place only
+    would ship two different licenses under one project name.
+    """
+    toolkit_dir = _TOOLKIT_PYPROJECT.parent
+    declared = _toolkit_project().get("license-files")
+    assert declared == ["LICENSE", "NOTICE"], declared
+    # LICENSE needs no is_file() check: the byte compare below raises if it is missing.
+    assert (toolkit_dir / "NOTICE").is_file(), f"NOTICE is declared but missing from {toolkit_dir}"
+    assert (toolkit_dir / "LICENSE").read_bytes() == (_REPO / "LICENSE").read_bytes(), (
+        "packaging/messagefoundry-toolkit/LICENSE differs from the root LICENSE"
+    )
+
+
 def test_the_toolkit_console_script_is_its_main() -> None:
     """``messagefoundry-toolkit`` must run the same entry as ``python -m messagefoundry_toolkit``,
     and that entry must exist, or a fresh install gets a console script that dies on import."""
     import messagefoundry_toolkit.__main__ as toolkit_cli
 
-    scripts = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))["project"]["scripts"]
+    scripts = _toolkit_project()["scripts"]
     assert scripts == {"messagefoundry-toolkit": "messagefoundry_toolkit.__main__:main"}
     assert callable(toolkit_cli.main)
 
