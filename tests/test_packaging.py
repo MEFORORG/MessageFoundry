@@ -977,7 +977,11 @@ def test_each_separate_wheel_ships_the_license_and_notice(distribution: str) -> 
     declared = _project(distribution).get("license-files")
     assert declared == ["LICENSE", "NOTICE"], declared
     # LICENSE needs no is_file() check: the byte compare below raises if it is missing.
-    assert (project_dir / "NOTICE").is_file(), f"NOTICE is declared but missing from {project_dir}"
+    # A NOTICE copied from a sibling would name the wrong distribution, so the first line must name
+    # this one, and the license it states must be the project's.
+    notice = (project_dir / "NOTICE").read_text(encoding="utf-8")
+    assert notice.startswith(f"{distribution} ("), f"{distribution} NOTICE opens {notice[:80]!r}"
+    assert "AGPL-3.0-or-later" in notice, f"{distribution} NOTICE does not state the license"
     assert (project_dir / "LICENSE").read_bytes() == (_REPO / "LICENSE").read_bytes(), (
         f"packaging/{distribution}/LICENSE differs from the root LICENSE"
     )

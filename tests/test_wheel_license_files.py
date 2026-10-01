@@ -9,9 +9,11 @@ ci.yml's packaging-build job and in the release.yml job that builds it.
 
 from __future__ import annotations
 
+import re
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -80,36 +82,59 @@ def test_main_passes_a_good_wheel_and_refuses_a_bad_one(tmp_path: Path) -> None:
     assert main([str(bad / "*.whl")]) == 1
 
 
-def _step_runs(workflow: str, job: str) -> list[str]:
+def _jobs(workflow: str) -> dict[str, Any]:
     data = yaml.safe_load((_REPO / ".github" / "workflows" / workflow).read_text(encoding="utf-8"))
-    return [str(s.get("run") or "") for s in data["jobs"][job]["steps"] if isinstance(s, dict)]
+    jobs: dict[str, Any] = data["jobs"]
+    return jobs
+
+
+def _step_runs(job: dict[str, Any]) -> list[str]:
+    return [str(s.get("run") or "") for s in job["steps"] if isinstance(s, dict)]
 
 
 _SCRIPT = "python scripts/release/wheel_license_files.py "
 
+#: Every separate distribution under packaging/, derived so a new one is checked on arrival.
+_DISTRIBUTIONS = sorted(p.parent.name for p in _REPO.glob("packaging/*/pyproject.toml"))
 
-@pytest.mark.parametrize(
-    ("workflow", "job", "wheels"),
-    [
-        ("ci.yml", "packaging-build", "toolkit-dist/*.whl"),
-        ("ci.yml", "packaging-build", "webconsole-dist/*.whl"),
-        ("ci.yml", "packaging-build", "harness-dist/*.whl"),
-        ("release.yml", "release", "toolkit-dist/*.whl"),
-        ("release.yml", "release-webconsole", "webconsole-dist/*.whl"),
-        ("release.yml", "release-harness", "harness-dist/*.whl"),
-    ],
+_BUILD = re.compile(
+    r"python -m build --wheel \./packaging/(?P<dist>[\w-]+) --outdir (?P<out>[\w-]+)"
 )
-def test_each_workflow_checks_the_wheels_it_built(workflow: str, job: str, wheels: str) -> None:
-    """The script guards nothing unless a workflow runs it on each separate wheel it built.
 
-    The toolkit (BACKLOG #1192), web console and harness (BACKLOG #2513) wheels, in CI's
-    packaging-build job and in the release job that builds each one.
-    """
-    calls = [
-        line.strip()
-        for run in _step_runs(workflow, job)
-        for line in run.splitlines()
-        if line.strip().startswith(_SCRIPT)
+
+def _builds(workflow: str) -> list[tuple[str, str, str]]:
+    """Every separate-wheel build in ``workflow``, as ``(job, distribution, output directory)``."""
+    return [
+        (name, m["dist"], m["out"])
+        for name, job in _jobs(workflow).items()
+        for run in _step_runs(job)
+        for m in _BUILD.finditer(run)
     ]
-    naming = [call for call in calls if f"'{wheels}'" in call]
-    assert len(naming) == 1, f"{workflow} `{job}` checks {wheels!r} in {len(naming)} calls: {calls}"
+
+
+@pytest.mark.parametrize("workflow", ["ci.yml", "release.yml"])
+def test_every_wheel_a_workflow_builds_is_checked_in_the_job_that_built_it(workflow: str) -> None:
+    """The script guards nothing unless each job that builds a separate wheel runs it on that wheel.
+
+    The builds are read from the workflow, not listed here, and every distribution under
+    packaging/ must be among them, so a fourth wheel cannot ship unchecked. The toolkit is
+    BACKLOG #1192; the web console and harness are BACKLOG #2513.
+    """
+    builds = _builds(workflow)
+    # At least the three distributions known today, so an empty glob cannot pass this vacuously.
+    assert len(_DISTRIBUTIONS) >= 3, _DISTRIBUTIONS
+    built = {dist for _, dist, _ in builds}
+    assert set(_DISTRIBUTIONS) <= built, (
+        f"{workflow} never builds {sorted(set(_DISTRIBUTIONS) - built)}"
+    )
+    unchecked = []
+    for job, dist, out in builds:
+        calls = [
+            line.strip()
+            for run in _step_runs(_jobs(workflow)[job])
+            for line in run.splitlines()
+            if line.strip().startswith(_SCRIPT)
+        ]
+        if sum(f"'{out}/*.whl'" in call for call in calls) != 1:
+            unchecked.append(f"{job}: {dist} -> {out}/ ({calls})")
+    assert not unchecked, f"{workflow}: these wheels are not checked exactly once: {unchecked}"
