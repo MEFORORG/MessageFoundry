@@ -3110,9 +3110,10 @@ class AuthSettings(_Section):
     @field_validator("ad_connect_timeout", "ad_receive_timeout")
     @classmethod
     def _check_ad_timeout(cls, value: float) -> float:
-        # Must stay FINITE and positive (ASVS 13.1.3): ldap3 treats 0/None as "wait forever", which is
-        # exactly the unbounded wait these settings exist to remove, and inf/NaN are the same hole by
-        # another spelling. Rejected at config load, not discovered at bind time against a wedged DC.
+        # Must stay FINITE and positive (ASVS 13.1.3): ldap3 treats a None, or a 0 connect_timeout, as
+        # "wait forever", which is exactly the unbounded wait these settings exist to remove, and
+        # inf/NaN are the same hole by another spelling. (A 0 receive_timeout instead makes the socket
+        # non-blocking, so every read fails at once.) Rejected at config load, not at bind time.
         if not value > 0 or value == float("inf"):
             raise ValueError(
                 "ad_connect_timeout / ad_receive_timeout must be a finite number of seconds > 0 "

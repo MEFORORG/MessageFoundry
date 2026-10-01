@@ -205,10 +205,9 @@ def _assert_all_finite(rec: _Recorder) -> None:
         assert isinstance(value, int | float) and 0 < float(value) < float("inf"), (
             f"ldap3.Connection #{i} receive_timeout is not a finite positive number: {value!r}"
         )
-        # An INT, not merely a number: ldap3 packs it with struct.pack('LL', value, 0) on every
-        # non-Windows host, and a float raises struct.error there before the socket is used. These
-        # fakes never open a socket, so only this assertion sees the type in this file; the
-        # real-socket arm is tests/test_ldap_referrals.py, which went red on Linux CI over it.
+        # An INT, not merely a number; _ldap3_receive_timeout's docstring says why. These fakes never
+        # open a socket, so only this assertion sees the type in this file; the real-socket arm is
+        # tests/test_ldap_referrals.py, which went red on Linux CI over it.
         assert type(value) is int, (
             f"ldap3.Connection #{i} receive_timeout {value!r} is not an int; ldap3's POSIX branch "
             "struct.pack()s it, so a float breaks every AD connection on Linux"
