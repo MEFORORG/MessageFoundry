@@ -670,7 +670,7 @@ def _provision(argv):
 
 
 def _screen(username, db):
-    # The screen provision-admin runs before it opens the store: the same settings load (the working
+    # The screen provision-admin runs before it creates the store: the same settings load (the working
     # directory's messagefoundry.toml, the MEFOR_* environment, the --db override) and the same
     # PasswordPolicy call. Prints only the refused clauses, never the password. Exit 3 is a refusal.
     from messagefoundry.auth.policy import PasswordPolicy

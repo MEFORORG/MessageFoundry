@@ -16,9 +16,11 @@ the command it stands in for are compared rather than assumed equal.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -45,12 +47,14 @@ def _run_probe(
     probe = tmp_path / "probe.py"
     probe.write_text(match.group(1), encoding="ascii")
     # No inherited MEFOR_* setting may reach the settings load, so the result is the default policy
-    # plus exactly what each case adds. The two the smoke passes are set as it sets them.
+    # plus exactly what each case adds. The two the smoke passes are set as it sets them. The store
+    # key must be a real one, synthetic and per run like the smoke's `gen-key` draw: provision-admin
+    # resolves it before the prompt (BACKLOG #2081), so a placeholder is refused ahead of the password.
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MEFOR_")}
     env.update(
         {
             "MEFOR_W0_ADMIN_PASSWORD": password,
-            "MEFOR_STORE_ENCRYPTION_KEY": "unused-before-the-store-opens",
+            "MEFOR_STORE_ENCRYPTION_KEY": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
             "MEFOR_SECURITY_REQUIRE_MFA": "false",
         }
     )
@@ -130,7 +134,7 @@ def test_the_screen_refuses_what_provision_admin_refuses(
     assert clause in screened.stdout
     assert provisioned.returncode != 0, provisioned.stdout + provisioned.stderr
     assert clause in json.loads(provisioned.stdout)["error"]
-    # Refused before the open, so neither created the store.
+    # Refused before open_store(create=True), so neither created the store.
     assert not (tmp_path / "s" / "data").exists()
     assert not (tmp_path / "p" / "data").exists()
 
