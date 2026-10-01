@@ -205,3 +205,62 @@ export function buildLiveLenses(
   }
   return out;
 }
+
+// --- one reveal, one message (ASVS 14.2.6, vault BACKLOG #1187, ground e) -------------------------
+// A sample file may hold several messages, and the dry-run returns one entry per message in file order.
+// Owner ruling R15 reads a reveal as per message, so a reveal keeps exactly one entry: the one the user
+// picked from the last masked run's list, the way the Test Bench reveals one case per click (PR 1805).
+
+/** Which message one reveal shows: its index in the sample, and how many the sample held when picked. */
+export interface RevealFocus {
+  index: number; // 0-based, in the dry-run's (file) order
+  total: number;
+}
+
+/** A message of the last masked run, as the reveal pick lists it. Both fields are PHI-free. */
+export interface MaskedMessage {
+  source: string; // the CLI's `source`: the file name, plus " [i]" in a multi-message file
+  disposition: string;
+}
+
+/** The pick's view of a masked run: file-derived names and dispositions only, never a value. */
+export function maskedMessagesOf(entries: LiveTraceEntry[]): MaskedMessage[] {
+  return entries.map((e, i) => ({ source: e.source ?? `message ${i + 1}`, disposition: e.disposition }));
+}
+
+/** The quick-pick rows for choosing which message to reveal. `index` is the {@link RevealFocus} index. */
+export function revealPickItems(
+  messages: MaskedMessage[],
+): { label: string; description: string; index: number }[] {
+  return messages.map((m, index) => ({
+    label: `Message ${index + 1} of ${messages.length}`,
+    description: `${m.source} · ${m.disposition}`,
+    index,
+  }));
+}
+
+/**
+ * The ONE entry a revealed run may keep, or null when it cannot tell which. With no focus, only a
+ * one-message run qualifies. With one, the run must still hold as many messages as the pick listed,
+ * since a sample edited in between would shift every index onto a different message.
+ */
+export function revealedEntry(
+  entries: LiveTraceEntry[],
+  focus: RevealFocus | undefined,
+): LiveTraceEntry | null {
+  if (focus === undefined) {
+    return entries.length === 1 ? entries[0] : null;
+  }
+  if (entries.length !== focus.total || focus.index < 0 || focus.index >= entries.length) {
+    return null;
+  }
+  return entries[focus.index];
+}
+
+/** The label a revealed run's lenses and status item use, naming the message when there were several. */
+export function revealedLabel(sampleLabel: string, focus: RevealFocus | null): string {
+  if (!focus || focus.total <= 1) {
+    return sampleLabel;
+  }
+  return `${sampleLabel} message ${focus.index + 1} of ${focus.total}`;
+}

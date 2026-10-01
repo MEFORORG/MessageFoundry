@@ -9,7 +9,8 @@
 //
 // PHI (CLAUDE.md §9). The inline values are message-derived, hence PHI, and are screenshot-/screenshare-
 // capturable. They render as a redacted placeholder (`▸ ⋯`) BY DEFAULT. Real values appear ONLY for ONE
-// run the user asks for by name (`messagefoundry.revealValuesOnce`, ASVS 14.2.6, vault BACKLOG #1187):
+// run the user asks for by name (`messagefoundry.revealValuesOnce`, ASVS 14.2.6, vault BACKLOG #1187),
+// and for ONE message of that run: a multi-message sample asks which one first (owner ruling R15):
 // that run alone passes `--show-phi` to the CLI, and every later run is masked again. The reveal is never
 // a session state, so a run the user did not ask for never carries real values, and real values never
 // even leave the Python process otherwise. Samples must be synthetic (under messageSetsDir). The same
@@ -26,12 +27,18 @@ import { configDir, isExecGated, messageSetsDir, runJson, workspaceDir } from ".
 import { findElements, isConfigFile } from "./editorToolbar";
 import {
   buildLiveLenses,
+  maskedMessagesOf,
+  revealPickItems,
+  revealedEntry,
+  revealedLabel,
   rowsFromTrace,
   summarize,
   type LiveDryRunRow,
   type LiveLens,
   type LiveTraceEntry,
+  type MaskedMessage,
   type NamedElement,
+  type RevealFocus,
   type TraceInvocation,
   type TraceValue,
 } from "./liveDebugModel";
@@ -41,13 +48,19 @@ import {
 export {
   buildLiveLenses,
   inboundTooltip,
+  maskedMessagesOf,
+  revealPickItems,
+  revealedEntry,
+  revealedLabel,
   rowsFromTrace,
   summarize,
   type LiveDryRunRow,
   type LiveLens,
   type LiveSummary,
   type LiveTraceEntry,
+  type MaskedMessage,
   type NamedElement,
+  type RevealFocus,
   type TraceAnnotation,
   type TraceEvent,
   type TraceInvocation,
@@ -227,6 +240,17 @@ export function invocationsForFile(entries: LiveTraceEntry[], fsPath: string): T
   return out;
 }
 
+/** Ask which of a masked run's messages to reveal; the 0-based index, or undefined if dismissed. */
+export type MessagePicker = (messages: MaskedMessage[]) => Promise<number | undefined>;
+
+/** The production {@link MessagePicker}: a quick pick listing file names and dispositions only. */
+export const quickPickMessage: MessagePicker = async (messages) => {
+  const pick = await vscode.window.showQuickPick(revealPickItems(messages), {
+    placeHolder: "Reveal values for which message? One reveal shows one message (PHI; synthetic only).",
+  });
+  return pick?.index;
+};
+
 /**
  * The live-debug controller: owns the on/off state, the chosen sample, the last run's rows + trace and
  * whether that one run was revealed, a debounced save watcher, its CodeLens provider, and the inline
@@ -246,6 +270,18 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
   // A reveal run has started and not yet landed or been superseded. Lets Hide cancel it, and the status
   // item say so, before any value is shown.
   private revealPending = false;
+  // The messages of the last MASKED run, and the sample they came from: what a reveal picks among.
+  // PHI-free (file-derived names and dispositions). Kept while a revealed run shows, so a second
+  // reveal can pick again without a masked run first.
+  private maskedMessages: MaskedMessage[] | null = null;
+  private maskedFor: string | undefined;
+  // Which message the stored revealed run shows; null on a masked run.
+  private revealedFocus: RevealFocus | null = null;
+  // A reveal is choosing its message (a masked run to list them, or the pick) and has not started its
+  // --show-phi run. `revealIntent` is bumped by Hide and Live off, so a choice that finishes after
+  // either starts nothing.
+  private choosingReveal = false;
+  private revealIntent = 0;
   // The in-progress sample pick, shared so a double-click cannot open a second pick (BACKLOG #1187 QA).
   private enabling: Promise<boolean> | undefined;
   private rows: LiveDryRunRow[] | null = null;
@@ -262,11 +298,13 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
 
   /**
    * `workspace` defaults to the open folder; a test passes a fixed path, since the integration host
-   * opens no folder and every trigger path stops at "no workspace" without one.
+   * opens no folder and every trigger path stops at "no workspace" without one. `pickMessage` is
+   * the reveal's which-message question, a quick pick by default; a test answers it directly.
    */
   constructor(
     private readonly runner: TraceRunner = cliTraceRunner,
     private readonly workspace: () => string | undefined = workspaceDir,
+    private readonly pickMessage: MessagePicker = quickPickMessage,
   ) {}
 
   setStatusBar(item: vscode.StatusBarItem): void {
@@ -339,16 +377,21 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     } else {
       sb.hide();
     }
-    if (this.revealPending) {
+    if (this.revealPending || this.choosingReveal) {
       sb.text = "$(sync~spin) Values: Revealing…";
       sb.command = undefined;
       sb.tooltip =
         "A run with real values is in progress. Run *MessageFoundry: Hide Revealed Values* to cancel it.";
     } else if (this.shownRunRevealed) {
-      sb.text = "$(eye) Values: This Run";
+      const focus = this.revealedFocus;
+      sb.text =
+        focus && focus.total > 1
+          ? `$(eye) Values: Message ${focus.index + 1} of ${focus.total}`
+          : "$(eye) Values: This Run";
       sb.command = "messagefoundry.hideValues";
       sb.tooltip =
-        "Live-debug shows real values from ONE run (PHI, screenshot-capturable). Click to hide them now. " +
+        "Live-debug shows real values from ONE message of ONE run (PHI, screenshot-capturable). " +
+        "Click to hide them now. " +
         "The next run hides them anyway. Synthetic samples only.";
     } else {
       sb.text = "$(eye-closed) Values: Hidden";
@@ -385,11 +428,14 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       this.debounceTimer = undefined;
     }
     this.runToken += 1;
+    this.revealIntent += 1; // a reveal still choosing its message starts nothing
     this.running = false;
     this.revealPending = false;
     this.rows = null;
     this.entries = null;
     this.shownRunRevealed = false;
+    this.revealedFocus = null;
+    this.maskedMessages = null;
     this.updateStatus();
     this.updateRevealStatus();
     this.changed.fire();
@@ -432,7 +478,46 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       clearTimeout(this.debounceTimer);
       this.debounceTimer = undefined;
     }
-    await this.run(true);
+    const intent = ++this.revealIntent;
+    this.choosingReveal = true;
+    this.updateRevealStatus();
+    let focus: RevealFocus | undefined;
+    try {
+      focus = await this.chooseRevealFocus();
+    } finally {
+      this.choosingReveal = false;
+      this.updateRevealStatus();
+    }
+    if (focus && intent === this.revealIntent) {
+      await this.run(true, focus);
+    }
+  }
+
+  /**
+   * Which ONE message to reveal (ASVS 14.2.6, vault BACKLOG #1187, ground e; owner ruling R15). Lenses
+   * here summarize the whole sample, so nothing on screen singles one out: a one-message sample needs
+   * no choice, and a larger one asks, listing the last masked run's messages by file name and
+   * disposition. With no masked run of this sample yet, one runs first to learn the list. Undefined
+   * means reveal nothing: the pick was dismissed, Live went off, or there was no message.
+   */
+  private async chooseRevealFocus(): Promise<RevealFocus | undefined> {
+    if (!this.maskedMessages || this.maskedFor !== this.samplePath) {
+      await this.run(false);
+    }
+    const messages = this.maskedMessages;
+    if (!this.enabled || !messages || messages.length === 0) {
+      if (this.enabled) {
+        void vscode.window.showInformationMessage(
+          "MEFOR Live: the masked run gave no message to reveal. Fix the run, then reveal again.",
+        );
+      }
+      return undefined;
+    }
+    if (messages.length === 1) {
+      return { index: 0, total: 1 };
+    }
+    const index = await this.pickMessage(messages);
+    return index === undefined ? undefined : { index, total: messages.length };
   }
 
   /**
@@ -441,7 +526,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
    * in-memory mask, is what restores the CLI's own redaction of the per-message error text.
    */
   async hideValues(): Promise<void> {
-    if (!this.shownRunRevealed && !this.revealPending) {
+    if (!this.shownRunRevealed && !this.revealPending && !this.choosingReveal) {
       void vscode.window.showInformationMessage("MEFOR Live: no values are shown, so there is nothing to hide.");
       return;
     }
@@ -516,7 +601,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     return true;
   }
 
-  private async run(showPhi: boolean): Promise<void> {
+  private async run(showPhi: boolean, focus?: RevealFocus): Promise<void> {
     if (!this.enabled || this.enabling) {
       return; // off, or a sample pick is open: the run that pick leads to is the next one
     }
@@ -536,7 +621,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       return;
     }
     // this.samplePath is set by ensureSample above.
-    await this.runWith(this.samplePath as string, ws, showPhi);
+    await this.runWith(this.samplePath as string, ws, showPhi, focus);
   }
 
   /**
@@ -544,9 +629,16 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
    * reveal request, masked by default — the ONLY place --show-phi is (conditionally) requested. The
    * stored result records whether IT was revealed, so the next run decides afresh. A per-run token
    * discards a superseded run's late result, so a rapid save-storm always renders the newest run only.
+   * A revealed run keeps ONE message: `focus`'s, or the only one when there is no focus. When it
+   * cannot tell which, it keeps none and says so (vault BACKLOG #1187, ground e).
    * Public so a test can drive it with a canned runner (no sample-pick, no workspace).
    */
-  async runWith(samplePath: string, cwd: string, showPhi = false): Promise<void> {
+  async runWith(
+    samplePath: string,
+    cwd: string,
+    showPhi = false,
+    focus?: RevealFocus,
+  ): Promise<void> {
     const token = ++this.runToken;
     this.running = true;
     if (!showPhi) {
@@ -562,6 +654,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
         this.rows = null;
         this.error = null; // a failed reveal's error text is unredacted too
         this.shownRunRevealed = false;
+        this.revealedFocus = null;
         this.changed.fire();
         this.refreshDecorations();
       }
@@ -572,11 +665,23 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     let entries: LiveTraceEntry[] | null = null;
     let rows: LiveDryRunRow[] | null = null;
     let err: string | null = null;
+    let unmatched = false; // a revealed run that could not tell which message to keep
     try {
       entries = await this.runner(samplePath, cwd, showPhi);
+      if (showPhi) {
+        const one = revealedEntry(entries, focus);
+        if (one === null) {
+          unmatched = true;
+          throw new Error(
+            "the sample changed since its messages were listed, so nothing was revealed. Reveal again.",
+          );
+        }
+        entries = [one]; // every other message's values are dropped here, before anything renders
+      }
       rows = rowsFromTrace(entries); // inside the try: a skewed trace shape is this run's error
     } catch (e) {
       entries = null;
+      rows = null;
       err = e instanceof Error ? e.message : String(e);
     }
     if (token !== this.runToken) {
@@ -587,9 +692,16 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     this.samplePath = samplePath;
     this.sampleLabel = path.basename(samplePath);
     this.entries = entries;
-    // A failed reveal counts as shown too: the --show-phi CLI's error text is unredacted, so Hide must
-    // still be able to clear it.
-    this.shownRunRevealed = showPhi;
+    // A failed reveal counts as shown too: its error can be the --show-phi CLI's own {"error": ...}
+    // text, so Hide must still be able to clear it. A reveal that could not tell which message to
+    // keep stored nothing revealed, so it does not count.
+    this.shownRunRevealed = showPhi && !unmatched;
+    this.revealedFocus = this.shownRunRevealed && entries ? (focus ?? { index: 0, total: 1 }) : null;
+    if (!showPhi) {
+      // Only a masked run may refresh the reveal pick's list, and only one that produced entries.
+      this.maskedMessages = entries ? maskedMessagesOf(entries) : null;
+      this.maskedFor = samplePath;
+    }
     this.rows = rows;
     this.error = err;
     this.updateStatus();
@@ -674,7 +786,9 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     return buildLiveLenses(
       namedElements(text),
       summarize(this.rows),
-      this.sampleLabel ?? "",
+      this.shownRunRevealed
+        ? revealedLabel(this.sampleLabel ?? "", this.revealedFocus)
+        : (this.sampleLabel ?? ""),
       this.shownRunRevealed,
     );
   }

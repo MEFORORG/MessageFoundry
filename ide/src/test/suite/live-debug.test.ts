@@ -578,12 +578,102 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
     try {
       await controller.runWith(syntheticSample(), "/ws");
       await controller.toggle(); // Live on, masked
-      const reveal = controller.revealOnce(); // starts a --show-phi run that has not landed
+      const reveal = controller.revealOnce();
+      await waitFor(() => calls.length === 3, 5000); // the --show-phi run started, not landed
       await controller.hideValues();
       release();
       await reveal;
       assert.deepStrictEqual(calls, [false, false, true, false]);
       assert.strictEqual(controller.isShowingValues(), false, "a cancelled reveal must not land");
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a reveal over a multi-message sample shows only the message picked (ground e)", async () => {
+    // Three messages, each error carrying a different synthetic value. The reveal must keep one.
+    const three = [
+      traceEntry({ source: "adt.hl7 [1]", disposition: "ERROR", error: "SYNTH-ONE" }),
+      traceEntry({ source: "adt.hl7 [2]", disposition: "ERROR", error: "SYNTH-TWO" }),
+      traceEntry({ source: "adt.hl7 [3]", disposition: "ERROR", error: "SYNTH-THREE" }),
+    ];
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return three;
+    };
+    const offered: string[][] = [];
+    const picker = async (messages: { source: string }[]): Promise<number | undefined> => {
+      offered.push(messages.map((m) => m.source));
+      return 1; // the second message
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", picker);
+    try {
+      await controller.runWith(syntheticSample(), "/ws"); // masked: lists the three messages
+      await controller.revealOnce();
+      assert.deepStrictEqual(calls, [false, true]);
+      assert.deepStrictEqual(offered, [["adt.hl7 [1]", "adt.hl7 [2]", "adt.hl7 [3]"]]);
+      assert.strictEqual(controller.isShowingValues(), true);
+      assert.strictEqual(controller["entries"]?.length, 1, "a reveal keeps one message");
+      const inbound = controller.lensesForText(CONFIG_TEXT).find((l) => l.line === 2);
+      assert.strictEqual(inbound?.tooltip, "Errors: SYNTH-TWO");
+      assert.ok(inbound?.title.includes("adt.hl7 message 2 of 3"), inbound?.title);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("hideValues while the which-message pick is open starts no reveal", async () => {
+    let answer!: (index: number | undefined) => void;
+    const asked = new Promise<number | undefined>((r) => (answer = r));
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({ source: "a [1]" }), traceEntry({ source: "a [2]" })];
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", () => asked);
+    try {
+      await controller.runWith(syntheticSample(), "/ws");
+      await controller.toggle(); // Live on, masked
+      const reveal = controller.revealOnce(); // the pick is open
+      await controller.hideValues();
+      answer(0); // the user answers after Hide
+      await reveal;
+      assert.ok(!calls.includes(true), `no --show-phi run may start: ${JSON.stringify(calls)}`);
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("dismissing the which-message pick reveals nothing (control: the pick is the act)", async () => {
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({ source: "a [1]" }), traceEntry({ source: "a [2]" })];
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", async () => undefined);
+    try {
+      await controller.runWith(syntheticSample(), "/ws");
+      await controller.revealOnce();
+      assert.deepStrictEqual(calls, [false], "no --show-phi run without a picked message");
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a revealed run that cannot tell which message to keep stores none", async () => {
+    const runner: TraceRunner = async () => [traceEntry({ error: "SYNTH-ONE" }), traceEntry({ error: "SYNTH-TWO" })];
+    const controller = new LiveDebugController(runner);
+    try {
+      await controller.runWith("/synthetic/adt.hl7", "/ws", true); // no focus, two messages
+      assert.strictEqual(controller.isShowingValues(), false);
+      assert.strictEqual(controller["entries"], null);
+      const lenses = controller.lensesForText(CONFIG_TEXT);
+      assert.strictEqual(lenses.length, 1);
+      assert.ok(!lenses[0].title.includes("SYNTH"), lenses[0].title);
+      assert.ok(lenses[0].title.includes("nothing was revealed"), lenses[0].title);
     } finally {
       controller.dispose();
     }

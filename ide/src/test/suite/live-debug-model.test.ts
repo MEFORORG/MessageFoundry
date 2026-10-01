@@ -7,8 +7,13 @@ import * as assert from "assert";
 import {
   buildLiveLenses,
   inboundTooltip,
+  maskedMessagesOf,
+  revealPickItems,
+  revealedEntry,
+  revealedLabel,
   summarize,
   type LiveDryRunRow,
+  type LiveTraceEntry,
   type NamedElement,
 } from "../../liveDebugModel";
 
@@ -65,5 +70,58 @@ suite("liveDebugModel inbound tooltip (ASVS 14.2.6, vault BACKLOG #1187, ground 
     const want = "Live dry-run of adt.hl7 (1 message(s)).";
     assert.strictEqual(inboundLens(false, clean), want);
     assert.strictEqual(inboundLens(true, clean), want);
+  });
+});
+
+function entry(source: string, error: string | null): LiveTraceEntry {
+  return {
+    source,
+    inbound: "IB_ACME_ADT",
+    disposition: error ? "ERROR" : "PROCESSED",
+    handlers: [],
+    sends: [],
+    error,
+    invocations: [],
+  };
+}
+
+// Three messages from one sample file, each carrying a different synthetic value in its error.
+const THREE = [entry("adt.hl7 [1]", "SYNTH-ONE"), entry("adt.hl7 [2]", "SYNTH-TWO"), entry("adt.hl7 [3]", null)];
+
+suite("liveDebugModel one reveal, one message (vault BACKLOG #1187, ground e)", () => {
+  test("a focus keeps exactly the message it names", () => {
+    assert.strictEqual(revealedEntry(THREE, { index: 1, total: 3 }), THREE[1]);
+    assert.strictEqual(revealedEntry(THREE, { index: 0, total: 3 }), THREE[0]);
+  });
+
+  test("with no focus, only a one-message run is revealed", () => {
+    assert.strictEqual(revealedEntry([THREE[0]], undefined), THREE[0]); // control: one message
+    assert.strictEqual(revealedEntry(THREE, undefined), null);
+  });
+
+  test("a sample that changed since the pick reveals nothing", () => {
+    assert.strictEqual(revealedEntry(THREE, { index: 1, total: 2 }), null);
+    assert.strictEqual(revealedEntry(THREE.slice(0, 2), { index: 1, total: 3 }), null);
+    assert.strictEqual(revealedEntry(THREE, { index: 3, total: 3 }), null);
+    assert.strictEqual(revealedEntry(THREE, { index: -1, total: 3 }), null);
+  });
+
+  test("the pick lists file names and dispositions, never a value", () => {
+    const items = revealPickItems(maskedMessagesOf(THREE));
+    assert.deepStrictEqual(
+      items.map((i) => [i.label, i.description, i.index]),
+      [
+        ["Message 1 of 3", "adt.hl7 [1] · ERROR", 0],
+        ["Message 2 of 3", "adt.hl7 [2] · ERROR", 1],
+        ["Message 3 of 3", "adt.hl7 [3] · PROCESSED", 2],
+      ],
+    );
+    assert.ok(!JSON.stringify(items).includes("SYNTH"));
+  });
+
+  test("a revealed label names the message only when the sample held several", () => {
+    assert.strictEqual(revealedLabel("adt.hl7", { index: 1, total: 3 }), "adt.hl7 message 2 of 3");
+    assert.strictEqual(revealedLabel("adt.hl7", { index: 0, total: 1 }), "adt.hl7");
+    assert.strictEqual(revealedLabel("adt.hl7", null), "adt.hl7");
   });
 });
