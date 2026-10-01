@@ -43,6 +43,7 @@ from messagefoundry.config.settings import (
     EgressSettings,
     ReferenceSettings,
 )
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, current_hop_posture
 from messagefoundry.config.wiring import ReferenceSpec, resolve_env_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -112,14 +113,24 @@ def _cell(value: Any) -> Any:
 
 
 async def _load_database_source(
-    settings: Mapping[str, Any], egress: EgressSettings | None
+    settings: Mapping[str, Any],
+    egress: EgressSettings | None,
+    *,
+    posture: HopPosture | None = None,
 ) -> dict[str, Any]:
     """Materialize a SQL-backed reference source (ADR 0006 increment 2) into ``{key: value}``.
 
     Runs the operator's read-only ``statement``; ``key_column`` is the key; ``value_column`` (if set)
     is the value, else the value is a dict of the other columns. The dial-out is gated by the
     fail-closed ``[egress].allowed_db`` allowlist (like a DATABASE poll source). Reuses
-    ``transports/database.py`` for the DSN/pool (the SQL-Server ``[sqlserver]`` extra)."""
+    ``transports/database.py`` for the DSN/pool (the SQL-Server ``[sqlserver]`` extra).
+
+    ``posture`` is the instance hop posture (vault BACKLOG #2354). A sync runs after start, outside
+    every ``active_hop_posture`` scope, so without it the weakened-TLS refusal in ``_build_dsn`` read
+    no posture and fell back to the UNCLAMPED ``MEFOR_ALLOW_INSECURE_TLS`` escape. Under ``enforce``
+    that let a DatabaseRef with ``encrypt=false`` cross in the clear, where the ``db_lookup`` twin
+    refuses the same hop. ``None`` keeps the ambient posture, so a caller already inside a scope is
+    unchanged."""
     from messagefoundry.transports.database import _build_dsn, _login_timeout, _make_pool
 
     server = str(settings.get("server", ""))
@@ -147,8 +158,10 @@ async def _load_database_source(
     # dials the same customer DB through the same weakened-TLS gate, so dropping the attestation
     # refused a hop the operator had attested.
     attested = hop_attestation_from_settings(settings)
-    # fail-loud on weakened TLS / bad auth, before dialing
-    dsn = _build_dsn(dict(settings), attested=attested)
+    # fail-loud on weakened TLS / bad auth, before dialing. Stamped so the escape is clamped exactly as
+    # the db_lookup executor's is (wiring_runner._build_lookup_executor).
+    with active_hop_posture(posture if posture is not None else current_hop_posture()):
+        dsn = _build_dsn(dict(settings), attested=attested)
     pool = await _make_pool(
         dsn,
         int(settings.get("pool_max", 5)),
@@ -205,12 +218,16 @@ class ReferenceSyncRunner:
         alert_sink: AlertSink | None = None,
         coordinator: ClusterCoordinator | None = None,
         clock: Callable[[], float] = time.time,
+        hop_posture: HopPosture | None = None,
     ) -> None:
         self._store = store
         self._specs = specs
         self._settings = settings
         self._env_values = dict(env_values or {})
         self._egress = egress
+        # The instance hop posture, so a DATABASE source's weakened-TLS refusal clamps the global
+        # escape (vault BACKLOG #2354). None (embedding/tests) keeps the pre-#2354 unclamped read.
+        self._hop_posture = hop_posture
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         # Cluster coordination seam (Track B Step 6). None → the no-op NullCoordinator, whose
         # is_leader() is always True, so single-node materializes from source every pass EXACTLY as
@@ -390,7 +407,9 @@ class ReferenceSyncRunner:
                 _load_file_source, settings
             )  # blocking file I/O off-loop
         elif kind == "database":
-            rows = await _load_database_source(settings, self._egress)  # async aioodbc dial
+            rows = await _load_database_source(  # async aioodbc dial
+                settings, self._egress, posture=self._hop_posture
+            )
         else:
             raise ReferenceSyncError(
                 f"reference set {spec.name!r}: unknown source kind {kind!r} (file, database)"

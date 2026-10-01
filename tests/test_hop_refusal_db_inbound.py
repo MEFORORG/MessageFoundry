@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -261,6 +262,119 @@ def test_reference_source_prod_phi_unattested_still_refused(
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="weakened"):
         asyncio.run(_load_database_source(settings, None))
     assert seen == []  # refused BEFORE the pool was ever built
+
+
+# --- DB: the reference sync carries the posture itself (vault BACKLOG #2354) ----------------------
+#
+# The two tests above stamp the posture AROUND the call, which no production path does: a sync runs
+# after start, outside every active_hop_posture scope. So the refusal read no posture and fell back to
+# the unclamped escape, and under `enforce` a DatabaseRef with encrypt=false crossed in the clear. The
+# runner now passes the instance posture in. None of the tests below open an ambient scope.
+
+_WEAK_REF = {**_WEAK_DB, "statement": "SELECT code FROM t", "key_column": "code"}
+
+
+def test_reference_source_unstamped_was_unclamped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The defect's own shape, kept as the arm that proves the tests below discriminate: no posture
+    # anywhere, escape set, and the weakened DSN is built.
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    with pytest.raises(_StopBeforeDial):
+        asyncio.run(_load_database_source(dict(_WEAK_REF), None))
+    assert "Encrypt=no" in seen[0]
+
+
+def test_reference_source_enforcing_posture_clamps_the_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    with pytest.raises(ValueError, match="weakened"):
+        asyncio.run(_load_database_source(dict(_WEAK_REF), None, posture=PROD_PHI))
+    assert seen == []
+
+
+def test_reference_source_verifying_tls_passes_under_enforce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Control: the shipped default (encrypt=true, verification on) is not what the gate refuses.
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    settings = {
+        "server": "s",
+        "database": "d",
+        "statement": "SELECT code FROM t",
+        "key_column": "code",
+    }
+    with pytest.raises(_StopBeforeDial):
+        asyncio.run(_load_database_source(settings, None, posture=PROD_PHI))
+    assert "Encrypt=yes" in seen[0]
+    assert "TrustServerCertificate=no" in seen[0]
+
+
+def test_reference_source_non_enforcing_posture_honours_the_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Control: the clamp is keyed on the enforcement dial, so a `warn` instance keeps its escape.
+    from messagefoundry.pipeline.reference_sync import _load_database_source
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    with pytest.raises(_StopBeforeDial):
+        asyncio.run(_load_database_source(dict(_WEAK_REF), None, posture=STAGING_PHI))
+    assert "Encrypt=no" in seen[0]
+
+
+def test_reference_runner_threads_its_posture_into_the_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The wiring, not just the helper: a runner built with an enforcing posture refuses the hop.
+    from messagefoundry.config.settings import ReferenceSettings
+    from messagefoundry.config.wiring import ReferenceSourceSpec, ReferenceSpec
+    from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen: list[str] = []
+    _fail_at_dial(monkeypatch, seen)
+    spec = ReferenceSpec(name="codes", source=ReferenceSourceSpec("database", dict(_WEAK_REF)))
+    store: Any = object()  # never reached: the refusal comes before the snapshot write
+
+    def runner(posture: HopPosture | None) -> ReferenceSyncRunner:
+        return ReferenceSyncRunner(store, lambda: [spec], ReferenceSettings(), hop_posture=posture)
+
+    with pytest.raises(ValueError, match="weakened"):
+        asyncio.run(runner(PROD_PHI)._sync_one(spec))
+    assert seen == []
+    # Control arm: the same runner without a posture keeps the pre-#2354 unclamped read.
+    with pytest.raises(_StopBeforeDial):
+        asyncio.run(runner(None)._sync_one(spec))
+    assert "Encrypt=no" in seen[0]
+
+
+async def test_engine_hands_its_posture_to_the_reference_runner(tmp_path: Path) -> None:
+    # The last link: the engine builds the runner, so a runner that CAN carry a posture but is never
+    # given one would leave the clamp inert on every real serve.
+    from messagefoundry.pipeline.engine import Engine
+    from messagefoundry.store.store import MessageStore
+
+    store = await MessageStore.open(tmp_path / "ref.db")
+    try:
+        for posture in (PROD_PHI, None):
+            assert (
+                Engine(store, hop_posture=posture)._make_reference_runner()._hop_posture is posture
+            )
+    finally:
+        await store.close()
 
 
 # --- DB: the generic-ODBC dialect's cleartext hop, gated (BACKLOG #1178) -------------------------

@@ -230,6 +230,7 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/pipeline/sandbox.py": _EPHEMERAL,
     "messagefoundry/pipeline/alert_sinks.py": _POSTURE_ONLY,
     "messagefoundry/pipeline/engine.py": _POSTURE_ONLY,
+    "messagefoundry/pipeline/reference_sync.py": _POSTURE_ONLY,
     "messagefoundry/pipeline/security_notify.py": _POSTURE_ONLY,
     "messagefoundry/pipeline/wiring_runner.py": _POSTURE_ONLY,
     "messagefoundry/api/app.py": _POSTURE_ONLY,

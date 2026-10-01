@@ -496,7 +496,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
 | `db_lookup` | `transports/database.py` `DatabaseLookupExecutor` | ODBC, SQL Server preset, `ApplicationIntent=ReadOnly` | `_build_dsn`, posture stamped by `RegistryRunner._build_lookup_executor` | refuses | No |
-| `DatabaseRef` reference sync | `pipeline/reference_sync.py` `_load_database_source` | ODBC, SQL Server preset | `_build_dsn`, but a sync runs after start with no posture | the escape is **not** clamped: `MEFOR_ALLOW_INSECURE_TLS=1` plus `encrypt=false` crosses in the clear, where `db_lookup` refuses the same hop | No; needs two operator relaxations |
+| `DatabaseRef` reference sync | `pipeline/reference_sync.py` `_load_database_source` | ODBC, SQL Server preset | `_build_dsn`, posture passed in by the engine | refuses. Before vault BACKLOG #2354 a sync ran with no posture, so the escape was unclamped there | No |
 | Vault KV secrets | `config/secretprovider_vault.py` | hvac over whatever scheme the address names | none on the scheme | an `http://` address is used as given | Off by default; once on, `http://` crosses in the clear. Vault BACKLOG #2317 |
 | Vault store key provider | `store/keyprovider_vault.py` | as above | none on the scheme | as above | as above; #2317 |
 | Vault Transit cipher | `store/crypto_transit.py` | as above | none on the scheme | as above | as above; #2317 |
@@ -506,8 +506,8 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 **How the negatives were checked.** Each "no gate" or "not clamped" cell came from a search paired
 with a control that finds a gated site. Line counts, same files: `insecure_hop_disposition` is in 0
 lines of each Vault module and in 3 of `config/settings.py`. `ad_allow_insecure_ldap` is in 0 lines
-under `messagefoundry/auth/` and in 4 of `config/settings.py`. `active_hop_posture` is in 0 lines of
-`pipeline/reference_sync.py` and in 15 of `pipeline/wiring_runner.py`. The cluster modules hold 0
+under `messagefoundry/auth/` and in 4 of `config/settings.py`. `active_hop_posture` was in 0 lines of
+`pipeline/reference_sync.py` and is in 15 of `pipeline/wiring_runner.py`. The cluster modules hold 0
 lines matching `create_pool` or `connect(`, where `store/sqlserver.py` holds 20.
 
 **Still open after this census.** At least these:
@@ -516,7 +516,6 @@ lines matching `create_pool` or `connect(`, where `store/sqlserver.py` holds 20.
 - `ad_allow_insecure_ldap` needs a decision before it can be gated: either the posture clamp makes it
   inert under `enforce`, or it becomes a `cleartext_accepted`-style acceptance that warns and audits.
 - The CLI commands in the third row need the instance posture passed to `open_store`.
-- The `DatabaseRef` sync needs the engine's posture, as `db_lookup` already has.
 - The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
   one. `generic_odbc_no_tls_params` records that residual.
 

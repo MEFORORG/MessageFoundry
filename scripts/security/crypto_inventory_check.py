@@ -765,6 +765,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #1323 named as the worked example of a seam the store-only set could not match.
     "messagefoundry/pipeline/alert_sinks.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/engine.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # Vault BACKLOG #2354: stamps the instance hop posture around the DatabaseRef DSN build, so the
+    # weakened-TLS escape is clamped exactly as the db_lookup executor's is. Builds no context.
+    "messagefoundry/pipeline/reference_sync.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/security_notify.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/wiring_runner.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -813,6 +816,10 @@ IMPORT_ONLY: dict[str, str] = {
     ),
     "messagefoundry/pipeline/gcm_invocations.py": (
         "reads the AES-GCM invocation-bound constants and a cipher TYPE; performs no operation"
+    ),
+    "messagefoundry/pipeline/reference_sync.py": (
+        "INSTRUMENT LIMIT. Stamps the hop posture (active_hop_posture) so the DatabaseRef DSN's "
+        "weakened-TLS refusal reads it: a TLS posture decision with no crypto-shaped call in it"
     ),
     "messagefoundry/pipeline/security_notify.py": (
         "carries the trust-anchor policy through to the alert sink it constructs; the SMTP hop's "
