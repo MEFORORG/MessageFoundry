@@ -10,6 +10,11 @@ so a wedged pump never leaves a ghost icon (ADR 0113 §9/§10).
 
 from __future__ import annotations
 
+# PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). The first process
+# returns after relaunch_branded() and never takes the mutex. logscrub stays eager on purpose: it is
+# tray.log's PHI and credential filter, and the log-scrub chain is kept out of every lazy list.
+__lazy_modules__ = ["messagefoundry.tray.instance"]
+
 import logging
 import logging.handlers
 import sys

@@ -22,7 +22,7 @@ from messagefoundry.api.models import (
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
-from ._common import _pager, _seg
+from ._common import _pager, _reveal_cell, _seg
 from .approvals import approvals_link
 
 __all__ = [
@@ -470,18 +470,6 @@ def _resend_section(detail: MessageDetail) -> list[object]:
     ]
 
 
-def _reveal_cell(value: str | None, href: str, *, revealed: bool) -> object:
-    """A masked cell: the value as the engine sent it, plus a "Reveal" link to ``href`` while it is
-    masked (BACKLOG #2346, #2436; ASVS 14.2.6).
-
-    ``None`` (a caller without ``messages:view_summary``) and an empty value render as they always
-    did, with no link, because there is nothing to reveal. The masked value is still escaped by the
-    builder: masking is not sanitizing."""
-    if revealed or not value:
-        return value
-    return el("span", value, " ", el("a", "Reveal", href=href, class_="muted"))
-
-
 def message_detail(
     detail: MessageDetail,
     raw_body: str | None,
@@ -878,12 +866,15 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
     default would let a second render site omit them, and the page would still render while its
     links quietly widened the listing, which is the one failure this argument exists to prevent.
 
-    **THE BULK-REPLAY BUTTONS BELOW DO NOT TRACK EITHER ONE, and nothing here makes them.** They are
-    derived from the rows in the CURRENT WINDOW, so paging changes which per-channel and
-    per-destination buttons exist, and "Replay all dead (every channel)" re-queues channels the
-    filter excluded and the operator never saw. Deriving the replay set from the store instead of
-    from the rendered page is the other half of BACKLOG #1743 and is filed separately; this page
-    inherits that behaviour unchanged, which is why it is stated here rather than implied.
+    **The bulk-replay buttons come from ``data.replay_targets``, never from the rows drawn here**
+    (BACKLOG #1743 step 2; ``DeadLetterList`` says what the field holds). So paging never changes
+    which buttons exist. The per-destination buttons follow both filters. The per-channel buttons
+    replay every destination of their channel, so on a destination-filtered page they are left
+    out rather than reach past the filter.
+
+    "Replay all dead (every channel)" ignores the filters, by decision, and its label says so. It
+    shows whenever ``data.replayable_in_scope`` is true, even on a filtered page that matched
+    nothing. The engine refuses it for a channel-scoped caller (``_replay_in_scope``).
     """
     headers = ["Failed", "Channel", "Destination", "Type", "Attempts", "Last error", "Message"]
     body = [
@@ -908,10 +899,9 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
         noun="dead delivery(s)",
         filters={"channel_id": channel_id, "destination_name": destination_name},
     )
-    channels = sorted({d.channel_id for d in data.dead_letters})
-    pairs = sorted(
-        {(d.channel_id, d.destination_name) for d in data.dead_letters if d.destination_name}
-    )
+    pairs = [(t.channel_id, t.destination_name) for t in data.replay_targets]  # sorted by the store
+    # A per-channel button would replay destinations a destination filter excluded.
+    channels = [] if destination_name else sorted({ch for ch, _ in pairs})
     chan_forms = [
         el(
             "form",
@@ -933,7 +923,7 @@ def dead_letters(data: DeadLetterList, *, channel_id: str, destination_name: str
         for ch, dest in pairs
     ]
     actions: list[object] = []
-    if channels:
+    if data.replayable_in_scope:
         # L6b (#75 parity): one action to replay every dead delivery across ALL channels.
         actions += [
             el("h2", "Bulk replay — everything"),

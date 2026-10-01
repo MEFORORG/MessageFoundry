@@ -54,14 +54,25 @@ exclude = ["CLAUDE.md"]
 [tool.hatch.build.targets.sdist]
 only-include = ["messagefoundry", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"]
 
+# The engine WHEEL, made explicit (ADR 0201 section 4, BACKLOG #1192, ASVS 15.2.3). Before this table
+# the wheel's contents were hatchling's unconfigured default, which happened to pick the package named
+# after the project. The wheel packs `messagefoundry/` and nothing else, so a module moved into
+# `messagefoundry_toolkit/` leaves it: the physical move IS the exclusion, and no exclude list derived
+# from CLI_TIERS stands in for it. NO per-target `exclude` here: hatchling would REPLACE the global
+# `exclude = ["CLAUDE.md"]` above rather than extend it.
+[tool.hatch.build.targets.wheel]
+packages = ["messagefoundry"]
+
 [project]
 name = "messagefoundry"
 dynamic = ["version"]  # single-sourced from messagefoundry/__init__.py (see [tool.hatch.version])
 description = "Open-source healthcare integration engine — route, transform, and validate messages across many formats and connection types"
 readme = "README.md"
 requires-python = ">=3.14"
-license = "AGPL-3.0-or-later"
-license-files = ["LICENSE", "NOTICE"]  # ship the license + copyright/attribution NOTICE in sdist+wheel (PEP 639)
+# PSF-2.0 covers the two defusedxml modules vendored under messagefoundry/_vendor/defusedxml/, whose
+# licence requires its notice to travel with every copy -- hence the third license-files entry.
+license = "AGPL-3.0-or-later AND PSF-2.0"
+license-files = ["LICENSE", "NOTICE", "messagefoundry/_vendor/defusedxml/LICENSE"]  # ship the licences + attribution NOTICE in sdist+wheel (PEP 639)
 classifiers = [
     "Development Status :: 4 - Beta",  # Early Access
     "Intended Audience :: Healthcare Industry",
@@ -79,31 +90,31 @@ classifiers = [
 ]
 dependencies = [
     "hl7apy>=1.3",          # version-aware validation + profiles
-    "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing
     "pydantic>=2.6",        # channel config models / validation
-    # CONSTRAINT PIN (transitive, via pydantic/fhir-core): annotated-types 0.8.0 dropped `SLOTS`,
-    # which fhir-core/fhir.resources import — every FHIR test ImportErrors on it. The cap bounds the
-    # RESOLVER, the only place it CAN be bounded: `uv lock` would otherwise choose 0.8.0 and every
-    # downstream artifact inherits it (uv.lock -> constraints.lock -> ci.yml's `--constraint`), which
-    # is exactly how PR #66 went red. It also binds every resolve CI does not constrain — an end user's
-    # `pip install messagefoundry[fhir]`, the local dev venv behind pre-commit, the dispatch-only
-    # workflow legs. Drop it once fhir-core ships a 0.8-compatible release — NOT once CI installs from
-    # the hashed lock; the lock carries whatever the resolver already chose.
-    "annotated-types<0.8",
     "aiosqlite>=0.20",      # async SQLite for the message store/queue
     "fastapi>=0.137.1",     # localhost engine API
     "starlette>=1.3.1",     # explicit floor — fastapi's own pin allows an older Starlette; >=1.3.1 fixes the Host/path + form-DoS CVEs (CVE-2026-48710 @1.0.1, CVE-2026-54282 @1.3.0, CVE-2026-54283 @1.3.1)
     # Ceiling: api/protocol_headers.py overrides uvicorn internals, and serve refuses to start if one
     # moves. Raise it only after re-reading uvicorn's protocol modules (BACKLOG #1120).
-    "uvicorn[standard]>=0.29,<0.50",
+    # Plain uvicorn, not uvicorn[standard]: that extra also pulls watchfiles (--reload), python-dotenv
+    # (--env-file), PyYAML (a YAML log config) and colorama (Windows log colour). serve passes no
+    # reload, no env_file and log_config=None, so none of the four is ever imported. The three the
+    # engine does use are declared below with the extra's own markers.
+    "uvicorn>=0.29,<0.50",
+    # The HTTP protocol ``http="auto"`` picks when installed. protocol_headers.py floors both it and h11.
+    "httptools>=0.8.0",
+    # The legacy WebSocket server ``ws="auto"`` resolves to, which protocol_headers.py floors and
+    # /ws/stats runs on. Without a WebSocket library uvicorn serves no WebSocket route at all.
+    "websockets>=16.0",
+    # The event loop uvicorn's ``loop="auto"`` picks; mllp.py's TLS stop path accounts for it. Same
+    # marker as uvicorn[standard], because uvloop has no Windows, PyPy or Cygwin build.
+    "uvloop>=0.22.1; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'",
     "argon2-cffi>=23.1",    # argon2id password hashing (OWASP-recommended)
     "cryptography>=48.0.1", # AES-256-GCM PHI-at-rest encryption for the store (>=48.0.1: GHSA-537c-gmf6-5ccf)
     "ldap3>=2.9",           # Active Directory / LDAP authentication (pure-Python)
     "pyspnego>=0.10",       # SPNEGO/Kerberos negotiate for Windows SSO
     "tomlkit>=0.12",        # comment/format-preserving TOML writer for connections.toml (ADR 0007)
     "tzdata>=2024.1",       # IANA tz database for stdlib zoneinfo (Windows has no system tzdata)
-    "prometheus-client>=0.20",  # Prometheus /metrics exposition (BACKLOG #21)
-    "defusedxml>=0.7.1",    # hardened XML parse for RawMessage.xml() — XXE/DTD/entity-expansion safe (ADR 0004, BACKLOG #31)
     "psutil>=6.0",          # host CPU/mem gauges on the /metrics surface (BACKLOG #74)
     "httpx>=0.27",          # the shared apiclient HTTP client (messagefoundry.apiclient) — used by the bundled Windows tray's tokenless /health + /ui probes (messagefoundry.tray, ADR 0113, gui-scripts messagefoundry-tray) and the harness monitor; also the ASGI test client. Base (not an extra) so the tray works on every `pip install messagefoundry`.
     "truststore>=0.10",     # verify an https engine URL against the OS trust store (enterprise/AD-CS roots) — apiclient lazily imports it; base so the tray/monitor need no per-PC CA wrangling
@@ -157,14 +168,11 @@ otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp>=1.20"]
 # 7.0.0 and pydantic-v1 in 7.1.0); it drags fhir-core (BSD-3, the pydantic-v2 base model) + pydantic-core
 # (compiled). fhirpathpy is pure-Python (antlr4 runtime + python-dateutil). FHIR-XML rides fhir.resources'
 # optional lxml extra and is deferred (JSON-only MVP) — never bare-parsed (ADR 0022 §6, Options #5).
-# annotated-types is CAPPED <0.8: fhir-core (dragged in by fhir.resources) imports the `SLOTS`
-# constant that annotated-types 0.8.0 REMOVED, so any fhir.resources parse dies with
-# "ImportError: cannot import name 'SLOTS' from 'annotated_types'". Declared BOTH here and in
-# [project.dependencies]: this copy documents the consumer, the base copy is what bounds a plain
-# `pip install messagefoundry`. One Dependabot ignore entry covers both (it matches by package name,
-# not declaration site) — lift the ignore and both caps together.
-# Drop the bound once fhir-core ships a 0.8-compatible release.
-fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0", "annotated-types<0.8"]
+# fhir-core is FLOORED because fhir.resources accepts fhir-core>=1.1.9, and 1.1.9 and older import
+# the `SLOTS` constant annotated-types 0.8.0 removed, so a FHIR parse dies with
+# "ImportError: cannot import name 'SLOTS' from 'annotated_types'". 1.1.10 defines SLOTS itself;
+# 1.1.11 also stops negative unsignedInt/positiveInt validating.
+fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # DICOM (DIMSE C-STORE SCP/SCU) connectors + codec for parsing/dicom/ (ADR 0025, BACKLOG #24). Lazy-imported,
 # so SQLite-only installs skip it. pynetdicom (the DIMSE upper-layer) drags pydicom (the DICOM dataset/SR codec);
 # both pure-Python — HEADERS/SR ONLY, so NO numpy (numpy is pydicom's optional pixel-data dep, never used here).
@@ -178,8 +186,10 @@ dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<3.1"]
 # Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so
 # the tolerant X12Peek/X12Message hot path (the default) never needs it. pyx12 is the reference
 # implementation-guide validator (e.g. 005010X222A1 for 837P) and also emits the 997/999 ack as a
-# by-product. Its SOLE runtime dependency is defusedxml (already in tree, used to parse pyx12's bundled
-# TRUSTED map XML — not attacker input). >=4.0.0 is the first py3.12+/modern-typing release.
+# by-product. Its SOLE runtime dependency is the upstream defusedxml package, used to parse pyx12's
+# bundled TRUSTED map XML — not attacker input. The engine itself no longer depends on that package: it
+# parses through its own vendored copy (messagefoundry/_vendor/defusedxml/), so this extra is now the
+# only thing that installs upstream defusedxml. >=4.0.0 is the first py3.12+/modern-typing release.
 x12 = ["pyx12>=4.0.0"]
 # Optional XML/SOAP message accessor + schema validation + signature for parsing/xml/ (BACKLOG #31).
 # Lazy-imported, so installs that never touch XML skip it. lxml is the hardened XPath/serialize engine
@@ -259,7 +269,7 @@ fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64
 # second wheel (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin
 # in-process via mount_ui. That wheel IS on PyPI: the first webconsole-v* release claimed the name on
 # 2026-07-29. There is still no [webconsole] extra here, because re-adding it is an owner release step
-# (packaging/messagefoundry-webconsole/RELEASE.md step 1, with a compat range and a re-lock). Until
+# (packaging/messagefoundry-webconsole/RELEASE.md step 1, with a floor, no ceiling, and a re-lock). Until
 # then it installs as its own distribution; CI and a checkout use
 # `-e packaging/messagefoundry-webconsole`. With the package absent, serve refuses an explicit
 # serve_web_console=true and degrades a default-on console to JSON-only with a warning (__main__).
@@ -282,6 +292,17 @@ dev = [
     # cap in a deliberate PR that also clears the new findings.
     "ruff>=0.4,<0.16",
     "mypy>=1.10",
+    # Dozens of tests parse the CI workflows and .pre-commit-config.yaml with PyYAML. It used to reach
+    # every install through uvicorn[standard]; the base install dropped that extra, so the suite
+    # declares it here rather than riding on a runtime dependency it does not otherwise need.
+    "pyyaml>=6.0",
+    # The engine renders /metrics itself (messagefoundry/api/metrics.py). The metrics tests still
+    # parse the exposition with this library's parser, and tests/test_metrics_exposition.py renders
+    # through it to prove the engine's bytes match. Test-only, so it is not a runtime dependency.
+    # Floor 0.26.0: the golden files and the float-format comparison are that release's output, and
+    # earlier releases format some exponents differently, so an older one would fail those tests
+    # while blaming the engine.
+    "prometheus-client>=0.26.0",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
     # is no longer declared here.
 ]
@@ -478,7 +499,10 @@ target-version = "py313"
 # the exact scripts a published measurement was produced with; reformatting them edits the record, and
 # a number you cannot reproduce from the script filed beside it is worthless. New benchmark code lives
 # outside results/ and is linted normally. `extend-exclude` (not `exclude`) so ruff's defaults survive.
-extend-exclude = ["docs/benchmarks/results"]
+#
+# messagefoundry/_vendor/defusedxml is upstream's byte-pinned code (see its README); a formatter or a
+# fix-on-save would break the pin.
+extend-exclude = ["docs/benchmarks/results", "messagefoundry/_vendor/defusedxml"]
 
 [tool.ruff.lint]
 # Signal 10 (Code Quality & Anti-Slop rubric, docs/Code_Quality_Standards.md): broaden ruff beyond its
@@ -519,7 +543,14 @@ extend-immutable-calls = [
 python_version = "3.14"
 strict = true
 # Data, not modules: the config loader execs these with injected globals, and one has a hyphenated name.
-exclude = ['^tests/fixtures/']
+exclude = ['^tests/fixtures/', '^messagefoundry/_vendor/defusedxml/']
+
+# The vendored defusedxml copy is upstream's untyped, byte-pinned code (see its README). `exclude`
+# keeps it out of discovery and `skip` keeps imports from pulling it back in, so its names reach the
+# engine as Any -- exactly as the stub-less installed package did before it was vendored.
+[[tool.mypy.overrides]]
+module = ["messagefoundry._vendor.defusedxml", "messagefoundry._vendor.defusedxml.*"]
+follow_imports = "skip"
 
 # BACKLOG #1799. CI type-checks tests/ with `mypy --explicit-package-bases tests` (the ci.yml step says
 # why the scope is what it is). THE FLAG IS ON THE COMMAND LINE, NOT HERE, ON PURPOSE. tests/ has no
@@ -552,7 +583,7 @@ check_untyped_defs = true
 # installed (the CI `test` leg, since ADR 0180's assertion needs it) mypy still type-checks them for
 # real -- ignore_missing_imports only suppresses the not-found error on an install without the extra,
 # so a contributor running mypy on a base install is not reddened by a lazy import they never execute.
-module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*", "urllib3", "urllib3.*", "requests", "requests.*", "yaml", "yaml.*"]
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*", "urllib3", "urllib3.*", "requests", "requests.*", "yaml", "yaml.*"]
 # yaml (PyYAML) ships no stubs and types-PyYAML is not a dependency; only tests/ imports it.
 ignore_missing_imports = true
 

@@ -6,7 +6,214 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-01 — Early Access
+
 ### Added
+- **The `messagefoundry-toolkit` wheel is now signed, attested and licensed like the engine wheel.**
+  The release job signs it with Sigstore, attaches its `.sigstore.json` bundle to the GitHub
+  release, and adds it to the SLSA build-provenance subjects, so `gh attestation verify` works on
+  it. The wheel now ships `LICENSE` and `NOTICE`. See
+  [SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md). (`BACKLOG #1192`)
+- **Both engine SBOMs now list the vendored defusedxml.** The engine carries defusedxml 0.7.1 in
+  `messagefoundry/_vendor/`, so no installer pulls it, and the SBOM generator lists only installed
+  packages. `scripts/security/sbom_finalize.py` now adds a component for each vendored package, with
+  its version, `PSF-2.0` licence and purl `pkg:pypi/defusedxml@0.7.1`. Its `pedigree` records the
+  upstream sdist hash and each upstream file's SHA-256. A scanner reading either SBOM can now match
+  an advisory against the copy the engine runs. (`BACKLOG #2498`)
+- **A Windows-resolved engine SBOM ships with each release.** The new signed release asset
+  `messagefoundry-sbom-windows.cdx.json` lists the packages the engine installs on Windows, beside
+  `messagefoundry-sbom.cdx.json` for Linux. The two differ because the core lock picks some packages
+  by platform. It carries its own Sigstore bundle and SLSA provenance, so the checks in
+  [SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md) work on it too. A release now scores both engine SBOMs
+  with sbomqs even when one score fails. The nightly and manual `security.yml` runs now score the
+  Windows SBOM too, so a fault in it can show before a tag reaches it. (`BACKLOG #2521`)
+
+### Changed
+- **A new default limit on the MLLP listener: `max_inflight_frames` (32).** At most this many
+  complete frames of one listener are in the inbound handler (decode, parse, validate, ingress
+  commit) at once. The row measured about 64 MiB of handling cost per 16 MiB message, so the peak
+  was `max_connections` times that, 10 to 16 GiB across 256 frames; it is now a setting of its own.
+  A frame over the limit waits for a slot, first come first served, and is never refused, dropped
+  or NAK'd; once decoded it is always handled, as with the limit off, and a waiter still queued at
+  stop is cancelled past the shutdown grace like a slow handler. It still holds the bytes it arrived
+  in, so the raw buffer bound is unchanged. `None`/`0` turns it off. It is an inbound-only parameter of `MLLP()` and of a `connections.toml` MLLP inbound.
+  ([BACKLOG #1725](docs/BACKLOG.md), act 3)
+- **`messagefoundry generate` now gives every ORM^O01 an order detail.** The generator used to
+  leave ORDER_DETAIL out, because it emitted every required child of a group, and the order
+  detail's OBR/RQD/RQ1/RXO/ODS/ODT group is a choice. It now emits one alternative of a choice
+  group, OBR by default. Each generated ORM^O01 now ends ORC then OBR and passes strict
+  validation, so a corpus generated before this change differs in its ORM files.
+  (`BACKLOG #2497`)
+
+### Removed
+- **python-hl7 is no longer a dependency.** The engine's own tolerant parser (ADR 0054) has been the
+  default since it merged, and python-hl7 was only its fallback. The fallback is gone, and so are
+  the `parsing/_backend.py` switch and the logger silencer that existed for python-hl7. A fault
+  inside the parser is now refused as `HL7PeekError`, which the listener NAKs `AR` and records as
+  `ERROR`; before, it fell back to python-hl7. **BREAKING:** `Message.parse` on a body with no
+  leading `MSH`, `FHS` or `BHS`, or with a header too short to read, now raises `HL7PeekError`, a
+  `ValueError`, where it raised `hl7.ParseException` or an `IndexError`. A Handler that catches
+  `ValueError` around it now catches that refusal too.
+  The outbound MSH encoding-character override now re-encodes through the engine's parser too. A
+  field whose escape character is never closed now reads with that text kept: `SMITH\` reads as
+  `SMITH\`, where python-hl7 dropped it and read `SMITH` (upstream python-hl7 issue 84). The
+  parity suite holds the parser to python-hl7 0.4.5's answers, recorded once before it left. (ADR
+  0054 amendment)
+
+### Fixed
+- **A DATABASE connection's `connect_timeout` now bounds the SQL Server login.** The SQL Server
+  preset used to write it into the connection string as `Connection Timeout`, which ODBC Driver 18
+  ignores, so the setting did nothing. It now reaches the driver as its login timeout, at least on
+  `Database(...)`, `DatabasePoll(...)`, `DatabaseLookup(...)` and `DatabaseRef(...)`. The `generic`
+  dialect is unchanged and still gets no login timeout from the engine. The value must be a whole
+  number of seconds, at least 1. The first three refuse any other value when the connection is
+  built. `DatabaseRef` refuses a literal value when declared, but an `env()` value only at each sync,
+  so `messagefoundry check` does not catch that case. (`BACKLOG #2089`)
+- **The DICOM server (SCP) now answers a status that tells the sender whether to re-send.** An object
+  over the object or inflate cap was answered Out of Resources (`0xA700`), which senders retry, though
+  a re-send is refused again. It is now Cannot Understand `0xC010`, a final refusal. A commit that
+  raised was answered Cannot Understand (`0xC000`), though a store that is down may recover. It is now
+  Out of Resources (`0xA700`), as is a C-STORE that arrives after the engine's loop has stopped. A
+  negative `max_object_bytes` is still refused at build, but the message
+  no longer says `0` or `None` disables the cap; on the SCP both resolve to 16 MiB. See
+  `docs/DICOM.md` section 3 for the statuses. (`BACKLOG #2103`)
+- **The DICOM server (SCP) now refuses a small deflated object that inflates past 16 MiB.** It bounded
+  the inflate by `max_object_bytes`, 128 MiB at the shipped default, while the codec that parses the
+  object after commit refuses anything past a fixed 16 MiB. So such an object was answered Success
+  and could then only be recorded `ERROR`. The SCP's inflate bound is now the lesser of
+  `max_object_bytes` and 16 MiB, and the object is refused before commit. (`BACKLOG #2104`)
+- **A generated OBR now repeats its order's placer and filler numbers.** OBR-2 and OBR-3 drew
+  fresh numbers instead of copying ORC-2 and ORC-3, as HL7 requires. In generated OML, MDM and
+  ORU messages that carry an ORC then an OBR, only those two fields change, so a corpus
+  generated before this change differs there. (`BACKLOG #2497`)
+- **AD sign-in no longer fails on Linux over the receive timeout.** The engine passed
+  `[auth].ad_receive_timeout`, a float, straight to ldap3. On every non-Windows host ldap3 packs
+  that value as an integer. So each AD socket open would have raised `struct.error` after the TCP
+  connect and before the bind was sent. On a first Linux deployment, AD sign-in would have failed
+  for every user. Windows was not affected. The engine now passes ldap3 the timeout rounded up to
+  whole seconds, so it is never shorter than configured. Both AD timeouts are also refused at
+  config load above 3600 seconds. That cap keeps them far below the point where a socket timeout
+  overflows, which would fail sign-in outside the audited error path. (`BACKLOG #2546`)
+
+### Security
+- **On the stdlib event loop, an MLLP TLS listener now applies `source_ip_allowlist`,
+  `max_connections` and `max_connections_per_host` before the TLS handshake, not after it.** The
+  listener accepts plain TCP, runs those checks exactly as a plaintext listener does, and only then
+  starts TLS on the admitted socket. Before, a socket that never sent a ClientHello sat outside all
+  three for up to the 10 s handshake bound, so a peer could hold as many as its connect rate
+  allowed. Now each one holds a real slot, is refused with the same `at_capacity` or
+  `peer_not_allowlisted` event as a plaintext connection, and is closed by stop(). A socket refused
+  this way never starts a handshake. A handshake that fails or times out gives its slot back and,
+  as before, emits no connection event and logs at DEBUG only. `established` is emitted once the
+  handshake completes. **Under uvloop, which the engine's own `uvloop` dependency installs outside
+  Windows, nothing changes**: the loop still runs the handshake and the three checks apply after it,
+  because the listener's own upgrade could not be verified safe on uvloop. ([BACKLOG #1606](docs/BACKLOG.md))
+- **BREAKING: an alert rule's `control_action` now needs a connection-scoped `event_type`.** Config
+  load refuses a rule that sets `control_action` with `event_type = "any"` or with any type outside
+  `connection_stopped`, `connection_error`, `queue_buildup`, `message_stall`, `saturation` and
+  `lane_stuck`. Most other types put a stand-in in `connection`, and some stand-ins fit the
+  connection-name grammar, such as a bare username, `store` or a cert label. A catch-all rule could
+  therefore aim a restart at an unrelated connection with that name. Load also refuses a
+  `control_target` that is not a connection name, or one on a rule with no `control_action`. This
+  replaces the advice in the `approval_too_early` and `initial_credential_expiring` entries of this
+  release to scope such rules: those rules are now refused.
+  ([ADR 0128](docs/adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md),
+  `BACKLOG #1898`)
+- **BREAKING: a FHIR `update` or `if-match` no longer puts the resource id in the request URL.**
+  A RESTful update is `PUT {base}/{ResourceType}/{id}`, so on a first deployment a message-derived
+  id would have reached the receiving server's access logs. The `FHIR()` destination now sends both
+  as the one entry of a `transaction` Bundle, POSTed to `{base}`. The entry's `request` carries
+  `PUT {ResourceType}/{id}`, and the `If-Match` ETag moves into `request.ifMatch`. The resource is
+  spliced in byte for byte. The receiving server must support the `transaction` interaction, and for
+  `if-match` it must honor the entry's `ifMatch`. A 2xx reply whose entry status failed is
+  classified on that status, and `capture_response_headers` reads `ETag`, `Location` and
+  `Last-Modified` from the entry. A resource id made only of dots is now refused. A `fhir_lookup`
+  read-by-id still carries the id in its path, which is what a RESTful read is; owner ruling R3
+  names the two writes only. See [CONNECTIONS.md](docs/CONNECTIONS.md), "An update keeps the
+  resource id out of the URL". (vault `BACKLOG #1965`, ASVS 14.2.1)
+- **A connection event's or an alert's reason is masked until a per-item reveal** (ASVS 14.2.6,
+  owner ruling R12). `ConnectionEventInfo.reason` and `AlertInstanceInfo.reason` join the
+  per-property map on the `messages:view_summary` tier. `GET /events`,
+  `GET /connections/{name}/events` and `GET /alerts/active` return each reason as `****` to a
+  holder, and `null` to a caller without that permission, until a `reveal=<id>` query parameter
+  asks for one. That reveal charges the PHI-read budget and writes a `connection_event_reveal` or
+  `alert_reveal` audit row. The alert ack, resolve, suspend and resume replies mask the reason the
+  same way. Every other field stays readable under the route's monitoring permission. The web
+  console adds three reveal routes; its changelog has the console half. See
+  [SECURITY.md](docs/SECURITY.md) and [PHI.md](docs/PHI.md) section 3. (`BACKLOG #2443`)
+- **A connection's start-failure reason is masked until the operator reveals it** (ASVS 14.2.6,
+  owner ruling R12). `ConnectionRow.error` and `ConnectionMetadata.error` join the per-property
+  map on the `messages:view_summary` tier. `GET /connections` and
+  `GET /connections/{name}/metadata` return the error as `****` to a holder, and `null` to a caller
+  without that permission. `reveal=<connection name>` on the dashboard, or `reveal=true` on the
+  metadata route, returns it whole. That reveal needs `messages:view_summary`, is refused for a
+  connection outside a scoped caller's channels, charges the PHI-read budget, and writes a
+  `connection_error_reveal` audit row. The `status` word, the `errored` count and every other field
+  stay readable under `monitoring:read`. The metadata route gains an ungated `fault` field
+  (`failed` or `filtered`), so a role that sees `error` as `null` can still tell that the connection
+  is down. `EngineClient.connections()` takes the same `reveal`.
+- **Each gated response model now gets a serializer over its own gated properties only.** The
+  shared one covered every field with a gateable name, gated or not, so a model whose `metadata`
+  is a dict could not be gated. The published schema of every other model is unchanged. See
+  [SECURITY.md](docs/SECURITY.md) and [PHI.md](docs/PHI.md) section 2. (`BACKLOG #2443`)
+- **The AD hop follows no LDAP referral.** ldap3 follows one by default, and on a bound connection
+  it binds to the referred host with the same service-account password, over a TLS setup without the
+  pinned CA or the narrowed suites, or over plain `ldap://`. A first deployment would have sent that
+  password to whatever host one referral named. Every `ldap3.Connection` the engine builds now sets
+  `auto_referrals=False`, and its `ldap3.Server` sets `allowed_referral_hosts=[]`. A referral result
+  to a search or to the user bind is refused as a directory error naming only the referred hosts,
+  and one to the service-account bind fails that bind as before. Sign-in audits it as
+  `auth.login_error`, and the session reconciler never revokes on it. A site whose users or groups
+  span several domains of a forest would need a global catalog, or a search base in the bound
+  controller's own domain. The `BACKLOG #2494` TLS-context entry says a followed referral still gets
+  a plain ldap3 context. This supersedes that note: no referral is followed, so no referred hop is
+  opened. See [ADR 0180](docs/adr/0180-asserting-tls-suites-on-a-library-that-exposes-no-sslcontext.md)
+  Amendment F. (`BACKLOG #2530`)
+
+### Changed
+- **The `[fhir]` extra now needs `fhir-core>=1.1.11`, and annotated-types is no longer capped.**
+  `pyproject.toml` capped annotated-types below 0.8 because fhir-core 1.1.9 imported the `SLOTS`
+  constant that 0.8.0 removed. fhir-core 1.1.10 defines it itself, so the cap is gone from the core
+  dependencies and from `[fhir]`, and the lock moves to annotated-types 0.8.0. fhir-core 1.1.11 also
+  refuses negative `positiveInt` and `unsignedInt` values, which its own changelog says earlier releases let through.
+
+### Fixed
+- **Strict validation no longer rejects an order message for carrying one order detail.**
+  hl7apy 1.3.5 checks a `choice` group as if every alternative were required (upstream
+  crs4/hl7apy issue 151). A strict inbound would have NAKed every `ORM^O01` and `ORR^O02` with
+  an OBR or RXO order detail, with `Missing required child ORM_O01_CHOICE.RQD` or its per-version
+  name, and the same for any other structure with a choice group. The engine now carries the
+  upstream fix (PR 152, unmerged) at its own validation boundary: a choice group needs exactly
+  one alternative, and two in one group are still rejected. Sixteen groups that hl7apy's
+  v2.6+ tables label as choices are really sequences (RSP_E22_QUERY_ACK is QAK then QPD, for
+  one); the engine keeps validating them as sequences, where PR 152 as written would reject
+  every valid message of those structures. The shim stays on while
+  hl7apy itself gets any of three synthetic probe messages wrong, and a test goes red on the first hl7apy release
+  that fixes the bug, so the shim is removed with it.
+
+### Removed
+- **BREAKING: the `content_match` alert event type and the `content_label` rule filter are gone.**
+  Nothing outside the tests could ever fire them. An `[[alerts.rules]]` entry naming `event_type =
+  "content_match"` or setting `content_label` is now refused at load, like any unknown event type
+  or key. `GET /alerts/rules` no longer reports `content_label` on a rule, and an alert instance's
+  `reason` no longer falls back to an event `label`. ADR 0133 D3 is retracted and not planned, by
+  owner ruling 2026-09-30; the ADR's "Retraction of D3" bullet says why
+  ([ADR 0133](docs/adr/0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)).
+  D1 escalation tiers, D2 schedule-aware rules and the D4 `escalation_tier` column are unchanged.
+  The engine UI seam digest moved with the `AlertRuleInfo` field set, so the web console's
+  `SUPPORTED_ENGINE_SEAMS` moved with it. (`BACKLOG #1504`)
+
+### Added
+- **BREAKING: `adr-analyze` moved to a separate `messagefoundry-toolkit` command, and out of the
+  engine wheel.** ADR 0201 slice 2 adds a third sibling distribution, `messagefoundry-toolkit`,
+  released in lockstep with the engine and pinned to the engine's own version. It carries the
+  authoring and development commands, and `adr-analyze` is the first to move: its module is
+  `messagefoundry_toolkit/adr_analyze.py`, and the engine wheel no longer ships
+  `messagefoundry/adr_analyze.py`. `messagefoundry adr-analyze` now exits 2 with one line naming
+  `messagefoundry-toolkit adr-analyze`, as `{"error": ...}` on stdout under `--json`, and the engine's
+  `--help` names the moved commands in its epilog. In a checkout, run `python -m
+  messagefoundry_toolkit adr-analyze`. An installed toolkit refuses to run beside an engine of another
+  version. The other toolkit rows of `CLI_TIERS` move in later slices. (`BACKLOG #1192`, ASVS 15.2.3)
 - **Turning the sign-in limiter or the account lockout off is now warned, not silent.** While
   sign-in is on, `security_loosenings()` names `[auth].login_rate_limit_enabled = false`, a
   `login_rate_limit_per_ip` or `login_rate_limit_global` of `0`, a `login_rate_limit_window_seconds`
@@ -14,6 +221,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   NIST SP 800-63B allows, so each reaches the `serve` loosening warning, `messagefoundry security
   show` and `GET /security/posture`. The shipped defaults report nothing new. (`BACKLOG #1131`,
   ASVS 6.1.1)
+- **A sign-in rate limit, lockout setting, PHI-read or admin-write limit, sign-in or admin-write
+  time floor, session cap or OIDC flow-cache cap looser than its shipped default is now a named
+  security loosening, not only an off value.** A `1e-6` s window or a count of `1e9` used to pass
+  silently while the control was off in effect. `[api].trusted_proxies` ranges that cover every peer, such as `0.0.0.0/0` or `::/0`, are
+  named too, since they trust every peer as the refused `*` would. Stricter values and the defaults
+  report nothing. (`BACKLOG #1131`; ASVS 6.1.1, 6.3.1, 2.3.2, 2.4.1, 2.4.2, 7.1.2)
 - **Under the shipped `[security].require_mfa`, no local account can be locked by a stranger
   before its holder has a way past the lock.** ADR 0197 Amendment A, wave 1. With the requirement
   off or narrowed to administrators, an account with no TOTP keeps the fixed lock (residual 1), and
@@ -292,6 +505,20 @@ All notable changes to MessageFoundry are documented here. The format follows
   nothing; the store's existing recovery paths, at least a restart, still do. (`BACKLOG #1611`)
 
 ### Changed
+- **BREAKING: on SQL Server and PostgreSQL, the runtime login may only insert and read audit rows.**
+  Under the `external` schema default, the startup privilege probe now names `UPDATE` or `DELETE`
+  on `audit_log` or `audit_chain_meta` as an over-grant, a column `UPDATE` grant included. It also
+  names `ALTER`, `CONTROL` and `TAKE OWNERSHIP` on SQL Server, and `TRUNCATE` and `TRIGGER` on PostgreSQL, so the
+  start refuses under the shipped `enforce` dial. Without it, on a first
+  deployment the engine's own login could rewrite audit rows. `docs/DEPLOY-SERVER-DB.md` adds the
+  `DENY` (SQL Server) or `REVOKE` (PostgreSQL) to run once after the first `provision-schema`. The
+  engine's own writes no longer need those rights: opening a fresh keyed store and `rekey-audit`
+  insert the keying row and never replace one. The PostgreSQL grants check no longer asks for
+  `UPDATE` or `DELETE` on the two tables. A keying row that records no watermark is no longer
+  overwritten: `rekey-audit` and the open refuse it on both backends, and name the
+  statement that removes it. Two engines keying one fresh store at once now agree on the first
+  one's row on both backends, where the SQL Server loser used to fail its open on the primary key.
+  (owner ruling R16, ASVS 16.4.2)
 - **BREAKING: `cert import` now judges a PKCS#12 MAC even when the bundle's bags are not
   encrypted.** Before, the MAC was checked only when something in the bundle was encrypted. So an
   `openssl pkcs12 -export -keypbe NONE -certpbe NONE` bundle loaded with an MD5, SHA-1 or SHA-256
@@ -372,8 +599,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   Vault hop's anchor and the proxy's host name. **BREAKING:** an `http://` Vault address that requests would send through an `https://`
   proxy is refused when the client is built, and again before each send. requests does not verify
   that proxy for an `http://` address, so its TLS leg, which carries the Vault token, verified
-  nobody. Use an `https://` Vault address. A direct `http://` Vault address is still not refused.
+  nobody. Use an `https://` Vault address. A direct `http://` Vault address was not refused by
+  this change; the next entry refuses it.
   (`BACKLOG #300`, ASVS 12.1.2, 11.6.2)
+- **BREAKING: the Vault clients refuse a Vault address that is not `https://`.** At least the KV
+  secret provider, the store key provider and the Transit cipher took an `http://` address with no
+  scheme check, so on a first deployment with one the `X-Vault-Token` would have crossed the
+  network in cleartext, directly or through an `http://` proxy. Each now refuses such an address
+  when its client is built, and again before each send in case a proxy appeared since. That
+  includes an address from hvac's own `VAULT_ADDR` fallback, and an address that does not read as
+  one well-formed URL. The one `http://` address allowed is a loopback Vault reached with no
+  proxy, the shared cleartext-hop rule's on-box case, as `docs/CONFIGURATION.md` section
+  `[secrets]` states it; hvac's built-in default, `http://localhost:8200`, is one. At build, each client raises its provider's own fail-closed error (`SecretProviderError` or
+  `KeyProviderError`), caused by an `InsecureHopRefused` whose fixed text names no part of the
+  address. The `https://`-proxy refusal above now reaches callers the same way at build; it was a
+  bare `ValueError`. Before a send, the refusal is the `InsecureHopRefused` itself.
+  `provision-admin` prints the refusal's own text, not its canned line about the secret reference.
+  `[security].enforcement` does not relax it, since this hop has no posture in scope and no way to
+  declare an accepted risk. An `https://` Vault behind an `http://` proxy is unchanged: the token
+  rides inside the TLS tunnel. (`BACKLOG #2317`, ASVS 12.3.1)
 - **The tray's engine probe no longer goes through a web proxy.** It read `HTTPS_PROXY`,
   `ALL_PROXY` and, on Windows, the system proxy, without that proxy's local-address bypass, so a
   site proxy would have taken the loopback probe off the host and read a running engine as down.
@@ -633,7 +877,41 @@ All notable changes to MessageFoundry are documented here. The format follows
   guide give the `--db` the installed service uses. `docs/SECURITY.md` replaces its first-run account sections with one
   section on provisioning, and the other operator documents drop the account, its timer, its alert
   and its password file. No code changed. ADR 0183 Amendment A, Wave 4. (`BACKLOG #1136`)
+- **Changelog entries are now fragment files, assembled at release.** A pull request adds one
+  file, `changelog.d/<item>.<category>.md`, instead of editing the `[Unreleased]` section of
+  `CHANGELOG.md`, so two open pull requests no longer conflict there. The release pull request runs
+  `python scripts/release/changelog_fragments.py assemble`, which appends every fragment under
+  `[Unreleased]` and deletes it. CI refuses a malformed fragment, and refuses a release pull
+  request that still has fragments. A pull request that still edits `CHANGELOG.md`
+  gets a warning, not a failure. The release workflow refuses to publish a tag while a fragment is
+  left unassembled. `changelog.d/README.md` has the naming rules. (`BACKLOG #2080`)
 ### Fixed
+- **`provision-admin` now refuses before it prompts on a fresh install, and resolves directory
+  secrets the way `serve` does.** It builds its auth service once, before the password prompt and
+  before any store is created, with the `[secrets]` provider and hop posture `serve` passes, and
+  opens the store with that posture too. A trust-anchor refusal at `enforce` on a fresh install no
+  longer comes after the prompt and leaves an empty store. A store key that cannot be resolved,
+  such as `vault` with no Vault environment in the shell or a DPAPI key the shell cannot read, is
+  refused before the prompt with exit 2. An AD bind password or OIDC client secret held by a
+  `[secrets]` provider now resolves here. A secret provider, directory or missing-file failure is
+  refused in fixed words, with no text from the failure, instead of reaching the generic error
+  report. An unusable bundled breach corpus is refused before the prompt. At `warn` an anchor
+  warning now prints once, not twice. Two refusals `serve` already gives now apply here too, at
+  `enforce`: an off-box OIDC identity provider with no `[auth].oidc_tls_crl_file` (exit 1), and a
+  server store hop that `serve` would refuse, such as one with no revocation check (exit 2). The
+  first applies here even with `[auth].enabled = false`, where `serve` builds no auth service.
+  (`BACKLOG #2081`)
+- **`audit-anchor --json` now reports a bad service settings file as JSON on stdout.** A missing,
+  unparseable or invalid `--service-config` printed plain text to stderr whatever `--json` said, so
+  a caller piping to `jq` got an empty stdout. It now prints `{"error": ...}` on stdout, as the
+  command's other refusals do, and exits 2. A settings section that fails validation is now
+  reported without echoing the section's values, and a directory named as the settings file now
+  exits 2 rather than 1, which this command spends on a broken chain. (`BACKLOG #2094`)
+- **`GET /dead-letters` now says which channels a replay would act on, not only which rows fit on
+  the page.** The response gains `replay_targets` and `replayable_in_scope`; the `DeadLetterList`
+  model defines both. The web console builds its bulk-replay buttons from them, so a channel whose
+  dead deliveries are all past the first page still gets one. The store contract gains
+  `list_replay_targets` on all three backends. (`BACKLOG #1743`, step 2)
 - **A scheduled connection stopped by a pooled infra fault now stays stopped across its window.**
   The ADR 0070 T17 bound and the claimer-death bound stop a pooled lane inside the stage
   dispatcher, so the scheduler never saw a hold for them. A site would have seen the window close
@@ -729,15 +1007,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   trusted or not sent, that scheme is `http`, so the redirect would point a client at plaintext.
   `create_app` now sets `redirect_slashes=False`. Use `/ui`, not `/ui/`, in a bookmark or a proxy
   rule. (`BACKLOG #1968`)
-- **Correction to the 0.4.0 note on the load reconcile: the stranding budget caused the connscale
-  red it names.** That note said the
-  `tests/test_connscale_smoke.py::test_no_loss_reconciles_at_every_step` failure
-  (`engine_read 15 < confirmed sent 18`) was the exact-shortfall arm, with a different cause such as
-  absent rows. Both arms failed, and the budget is why the shortfall arm did. 15 unconfirmed sends
-  of 18 were over the budget of 13, so the connscale reconcile excused none of them and judged all
-  18 as confirmed. The per-message intake audit on that run found no accept-ACKed send without a
-  row. A new test in `tests/test_harness_reconcile.py` pins the arithmetic. Test and comment changes
-  only; no engine behaviour changes. (`BACKLOG #1866`)
 - **A store created by 0.3.2 now keeps its saved searches on upgrade, and user deletion works on it.**
   The upgrade renames `search_presets.owner` to `owner_user_id` on SQLite, PostgreSQL and SQL Server.
   It maps each 0.3.2 username to that account's user id first. A preset is mapped only when its
@@ -1337,6 +1606,31 @@ All notable changes to MessageFoundry are documented here. The format follows
   ([BACKLOG #1141](docs/BACKLOG.md))
 
 ### Security
+- **LDAPS to Active Directory would no longer fail closed on Python 3.15, and it narrows TLS 1.3.**
+  On an interpreter with `SSLContext.set_ciphersuites`, the approved list drops
+  `TLS_AES_128_GCM_SHA256`. ldap3 builds its own TLS context and could not narrow TLS 1.3, so the
+  engine refused to build the AD authenticator there. The engine now builds the LDAPS context
+  itself: a new `ldap3.Tls` subclass, `messagefoundry.auth.ldap_tls.NarrowedTls`, wraps each
+  connection with a context from `tls_policy.assert_ldap3_tls_suites`, which now returns a factory.
+  That context loads the CA as ldap3 did and carries the posture every engine-built client hop
+  has: the approved TLS 1.2 suites, the approved TLS 1.3 suites and the SHA-224-free signature
+  schemes where the interpreter allows them, the key-exchange pin and a TLS 1.2 floor. ldap3's own
+  host name check still runs after the handshake. `ciphers=` is no longer passed to ldap3.
+  Python 3.14 is unchanged on the wire: its TLS 1.3 gap is recorded, not closed. A followed
+  referral still gets a plain ldap3 context. (`BACKLOG #2494`, owner ruling R3 of
+  2026-09-27, ADR 0188 amendment of 2026-09-30)
+- **On Python 3.15 the engine stops offering SHA-224 TLS signature schemes.** Every context the
+  engine narrows drops `rsa_pkcs1_sha224`, `ecdsa_sha224` and `dsa_sha224` through
+  `SSLContext.set_server_sigalgs`. Read from the OpenSSL source, not yet measured on 3.15, that one
+  list covers client offers, server signatures and client certificate requests. The list is
+  OpenSSL's own catalogue minus SHA-224, with the three ML-DSA schemes that catalogue omits put
+  back at the front. Measured with the OpenSSL 3.5.7 command line (`-sigalgs`, not a CPython 3.15
+  run), the offer loses exactly the
+  three SHA-224 schemes; `rsa_pss_rsae_*` now comes before `rsa_pss_pss_*`. A build that refuses
+  the ML-DSA names still drops SHA-224, without ML-DSA, and logs a warning once. Python 3.14 is
+  unchanged. A 3.15
+  on an OpenSSL older than 3.4 pins nothing and logs a warning once. The LDAPS hop was not
+  reached; since BACKLOG #2494, above, it is. (`BACKLOG #1171`, ASVS 11.4.1, owner ruling 2026-09-29)
 - **A refused combined sign-in no longer names which factor was wrong in its `auth.login_failed`
   reason.** Every refused combined sign-in (password and TOTP code in one request) on a local
   account with TOTP enrolled now writes the same reason, `bad_credentials`, whether the password was
@@ -2191,11 +2485,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   release, tagged `webconsole-v0.3.0` beside engine 0.4.0, accepts only `75c4117d21fd0b98`. So
   with the console on, this engine refuses to start with that release installed
   (`UiSeamMismatch`). The version number alone does not tell a matching console apart, so check
-  the constant. This entry does not quote the new value, because it can move again before the
-  release. **Migration:** upgrade the web console together with the engine, to a release whose
-  `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` holds this engine's
-  `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. Or set `[security].serve_web_console = false` to
-  run the JSON API alone. (`BACKLOG #1141`)
+  the constant. Engine 0.5.0 ships `32ad621e6081555e`, which web console 0.4.0 accepts.
+  **Migration:** upgrade the web console to 0.4.0 together with the engine. Or set
+  `[security].serve_web_console = false` to run the JSON API alone. (`BACKLOG #1141`)
 - **BREAKING — the `403` for a session that must change its password is no longer always the exact
   string `password change required`.** When the engine can state the temporary password's
   deadline, the detail now reads `password change required; the temporary password stops working at
@@ -2346,6 +2638,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   `/auth/negotiate` legs revoke nothing, because they return a token without
   replacing one; ending the old token is the client's job there.
   ([BACKLOG #1146](docs/BACKLOG.md))
+- **A console release now refuses a wheel whose engine requirement has no floor.** The
+  `release-webconsole` job reads the built wheel's `Requires-Dist` and fails unless its
+  `messagefoundry` requirement has a lower bound and no environment marker. An upper bound is
+  allowed. The console's engine requirement is a floor with no ceiling, set at each console release;
+  `docs/WEBCONSOLE-PACKAGE.md` says why. A bare dependency let `pip` keep an older engine that
+  lacks the functions the console calls. ([BACKLOG #1585](docs/BACKLOG.md))
 
 ### Security
 - **BREAKING — OIDC sign-in now bounds how old the IdP's authentication may be.** A new setting,
@@ -2498,7 +2796,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   app fails without starting a response. It also covers uvicorn's WebSocket `500` and the legacy
   websockets server's own handshake answers. A step on a single response that errors logs a
   WARNING, once per response family and step, and leaves uvicorn's own response as it was. Those
-  steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 16.0,
+  steps rely on uvicorn and websockets internals, measured at uvicorn 0.49.0 and websockets 17.1,
   the versions `requirements.lock` pins. When one of those internals is missing, `serve` refuses
   to start; see the Security entry on the protocol header floor. (`BACKLOG #1120`)
 - **Passkey registration now requires real CBOR integers where the COSE key needs them.** Engine
@@ -4689,7 +4987,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.0...v0.3.1

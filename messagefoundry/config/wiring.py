@@ -58,6 +58,7 @@ from messagefoundry.config.code_sets import (
     code_set as _resolve_code_set,
 )
 from messagefoundry.config.models import (
+    DEFAULT_DB_CONNECT_TIMEOUT,
     AckAfter,
     AckMode,
     BatchConfig,
@@ -74,6 +75,7 @@ from messagefoundry.config.models import (
     _check_cleartext_acceptance,
     _check_hop_attestation,
     _check_revocation_attestation,
+    check_db_connect_timeout,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -470,26 +472,48 @@ def _reject_envref_in_lists(factory: str, **settings: Any) -> None:
 
     A whole-setting reference is scanned through its ``default``, because
     :func:`resolve_env_settings` hands that default over unchanged: a list default holding a reference
-    would otherwise arrive at the connector exactly as a list item written directly does. A list
-    that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
-    offenders: list[str] = []
+    would otherwise arrive at the connector exactly as a list item written directly does.
+
+    A default that is ITSELF a reference, in either spelling, is refused whole rather than followed.
+    :func:`resolve_env_settings` resolves one link only, so that inner reference is never resolved.
+    Wherever the outer key is unset, the connector gets the inner reference object instead of a list.
+    It gets it even when the environment sets the inner key. At least ``proxy_no_proxy`` then reads
+    as an empty list, and every host silently goes through the proxy. So the fallback link never
+    works, and there is no clean version of it to let through. Refusing at the first link also means
+    nothing walks a marker that is its own default. The ``connections.toml`` type check refuses this
+    shape first for at least the list settings it models, since it wants an array and finds a table.
+    A list that comes from the ENVIRONMENT exists only at resolve time and is not seen here."""
+    items: list[str] = []
+    chains: list[str] = []
     for name, value in settings.items():
         label = name
         if isinstance(value, EnvRef):
             label, value = f"{name} env() default", value.default
+            if _is_nested_envref(value):
+                chains.append(name)
+                continue
         if isinstance(value, list | tuple | set | frozenset):
-            offenders += [
+            items += [
                 f"{label} item {index}"
                 for index, item in enumerate(value)
                 if _contains_envref(item)
             ]
-    if offenders:
-        raise WiringError(
-            f"{factory} {', '.join(offenders)} may not be an env() reference - nested settings are "
-            "not env-resolved, so it would reach the connector as its repr with any default= inside "
-            "it. Write the items as static values, or let one env() reference stand for the whole "
-            "setting."
+    problems: list[str] = []
+    if items:
+        problems.append(
+            f"{', '.join(items)} may not be an env() reference - nested settings are not "
+            "env-resolved, so it would reach the connector unresolved, where a str() of it carries "
+            "any default= inside it. Write the items as static values, or let one env() reference "
+            "stand for the whole setting."
         )
+    if chains:
+        problems.append(
+            f"{', '.join(chains)} env() default may not itself be an env() reference - only one "
+            "link is resolved, so wherever the outer key is unset the connector gets the inner "
+            "reference, not a list. Give the outer env() a static list default instead."
+        )
+    if problems:
+        raise WiringError(f"{factory} " + f" {factory} ".join(problems))
 
 
 def parse_env_setting(value: Any) -> Any:
@@ -658,7 +682,7 @@ def DatabaseRef(
     port: int | EnvRef = 1433,
     encrypt: bool = True,
     trust_server_certificate: bool = False,
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
@@ -685,6 +709,14 @@ def DatabaseRef(
     database hop is secure by means the engine cannot see, so a weakened-TLS refusal ALLOWs it (ADR
     0092). It is reported as a loosening; see docs/SECURITY-LOOSENING.md."""
     attestation = _hop_attestation_entries("DatabaseRef", tls_hop_attested, tls_hop_attested_reason)
+    # Refused here, at declaration, because a reference set is first dialled at sync time, after
+    # start (BACKLOG #2089). The other DATABASE declarations are checked when their connector is built.
+    # An env() ref has no value yet; the sync checks it once resolved.
+    if not isinstance(connect_timeout, EnvRef):
+        try:
+            check_db_connect_timeout(connect_timeout, "DatabaseRef")
+        except ValueError as exc:
+            raise WiringError(str(exc)) from None
     return ReferenceSourceSpec(
         "database",
         {
@@ -778,7 +810,7 @@ def DatabaseLookup(
     port: int | EnvRef = 1433,
     encrypt: bool = True,
     trust_server_certificate: bool = False,
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     max_rows: int = 500,  # refuse a result larger than this; 0 = no ceiling (BACKLOG #1730)
@@ -1510,6 +1542,8 @@ def MLLP(
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
     max_frame_seconds: float | None = 60.0,  # cap one frame's life, start byte to end byte
+    max_inflight_frames: int
+    | None = 32,  # inbound: cap frames in the pre-ACK handling path at once, per listener
     # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
     # rather than accidental: a rate on a clinical interface is only safe at a number taken from a
     # real feed profile. Both are parameters of this factory, and a connections.toml inbound entry
@@ -1557,8 +1591,7 @@ def MLLP(
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
-    """An MLLP endpoint. Inbound uses port plus the resource caps max_connections,
-    max_connections_per_host, receive_timeout, max_frame_seconds and max_frame_bytes (the bind
+    """An MLLP endpoint. Inbound uses port plus the inbound resource caps described below (the bind
     interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
     applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
@@ -1570,11 +1603,13 @@ def MLLP(
     hosts. ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte
     received**, so ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its
     end byte — that is what reaches a peer trickling a byte at a time, which is never idle.
-    ``max_frame_bytes`` (16 MiB) bounds the same frame's size. Each is disabled by ``None``/``0``.
+    ``max_frame_bytes`` (16 MiB) bounds the same frame's size. ``max_inflight_frames`` (32, inbound
+    only) bounds how many complete frames the listener hands to its handler at once; a frame over
+    it waits for a slot and is never refused. Each is disabled by ``None``/``0``.
 
-    What the two #1725 caps do NOT cover, and when to change one, is stated **once** on
-    ``DEFAULT_MAX_CONNECTIONS_PER_HOST`` and ``DEFAULT_MAX_FRAME_SECONDS`` in
-    ``messagefoundry.transports.mllp`` — including the two cases an operator is most likely to meet:
+    What the #1725 caps do NOT cover, and when to change one, is stated **once** on
+    ``DEFAULT_MAX_CONNECTIONS_PER_HOST``, ``DEFAULT_MAX_FRAME_SECONDS`` and
+    ``DEFAULT_MAX_INFLIGHT_FRAMES`` in ``messagefoundry.transports.mllp`` — including the two cases an operator is most likely to meet:
     a listener behind a source-NAT proxy, and a feed carrying large embedded documents. Read those rather than a summary here; ``docs/CONNECTIONS.md`` carries the same two in
     operator form.
 
@@ -1701,6 +1736,7 @@ def MLLP(
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
             "max_frame_seconds": max_frame_seconds,
+            "max_inflight_frames": max_inflight_frames,
             "max_messages_per_second": max_messages_per_second,
             "message_burst": message_burst,
             "connect_timeout": connect_timeout,
@@ -2591,7 +2627,7 @@ def FHIR(
     format: Literal["json"] = "json",  # "json" (MVP); "xml" is deferred (ADR 0022 Options #5)
     interaction: Literal[
         "create", "update", "transaction", "batch"
-    ] = "create",  # "create" (POST) | "update" (PUT) | "transaction" | "batch" (Bundle POST)
+    ] = "create",  # "create" (POST) | "update" (PUT in a transaction) | "transaction" | "batch"
     conditional: Literal["if-none-exist", "conditional-update", "if-match"]
     | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
     conditional_query: str
@@ -2629,14 +2665,17 @@ def FHIR(
     """A FHIR REST endpoint (**outbound destination only** — the inbound FHIR server facade is ADR 0023).
     The Handler produces a FHIR-JSON resource (or transaction/batch ``Bundle``) body; this delivers it to
     the FHIR service ``url`` (the **base**, e.g. ``https://host/fhir``) using the FHIR HTTP interaction:
-    ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``PUT {base}/{ResourceType}/{id}``,
-    ``transaction``/``batch`` → ``POST {base}`` with the Bundle. ``application/fhir+json`` media type
-    (JSON-only MVP). The three opt-in conditional knobs are the idempotency/concurrency levers:
-    ``if-none-exist`` (conditional create, ``If-None-Exist`` header), ``conditional-update`` (search-based
-    ``PUT`` with ``conditional_query`` in the URL), ``if-match`` (version-aware ``PUT`` whose ``If-Match``
-    ETag is derived from the resource's ``meta.versionId``). A 2xx is delivered; 5xx / a transient
-    OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter. Redirects are refused
-    and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
+    ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``POST {base}`` with a one-entry
+    ``transaction`` Bundle whose entry is ``PUT {ResourceType}/{id}`` (so the message-derived id never
+    appears in the request URL; vault BACKLOG #1965), ``transaction``/``batch`` → ``POST {base}`` with the
+    Bundle. ``application/fhir+json`` media type (JSON-only MVP). The three opt-in conditional knobs are the
+    idempotency/concurrency levers: ``if-none-exist`` (conditional create, ``If-None-Exist`` header),
+    ``conditional-update`` (search-based ``PUT`` with ``conditional_query`` in the URL), ``if-match``
+    (version-aware update, sent like ``update``, whose ETag is derived from the resource's
+    ``meta.versionId`` and carried in the entry's ``request.ifMatch``). An ``update`` or ``if-match``
+    connection needs a server that supports the ``transaction`` interaction. A 2xx is delivered;
+    5xx / a transient OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter.
+    Redirects are refused and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
     (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
     (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022.
 
@@ -3128,7 +3167,7 @@ def Database(
     port: int | EnvRef = 1433,
     encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     trust_server_certificate: bool = False,  # SQL Server preset only
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",  # name the OS-installed driver for 'generic'
     odbc_params: dict[str, str | EnvRef]
@@ -3219,7 +3258,7 @@ def DatabasePoll(
     port: int | EnvRef = 1433,
     encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     trust_server_certificate: bool = False,  # SQL Server preset only
-    connect_timeout: int = 15,
+    connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",  # name the OS-installed driver for 'generic'
     odbc_params: dict[str, str | EnvRef]

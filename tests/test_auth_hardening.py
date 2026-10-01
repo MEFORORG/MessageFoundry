@@ -530,6 +530,7 @@ def test_nested_group_filter_escapes_user_dn() -> None:
 
     class _Conn:
         entries: list[object] = []
+        result: dict[str, object] | None = None  # no referral
 
         def search(self, **kw: object) -> None:
             captured.update(kw)
@@ -573,6 +574,7 @@ def test_find_user_rejects_disabled_ad_account() -> None:
     class _Conn:
         def __init__(self, entry: _Entry) -> None:
             self.entries = [entry]
+            self.result: dict[str, object] | None = None  # no referral
 
         def search(self, **kw: object) -> None:
             pass

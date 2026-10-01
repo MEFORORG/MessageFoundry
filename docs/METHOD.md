@@ -81,8 +81,10 @@ to the Lander for a second reading is retired too.
 paragraph used to end "A `reviewed` label now gates the merge, and no seat can merge without it."
 Measured 2026-09-05: that context was already absent from live branch protection while this file,
 `CLAUDE.md`, `docs/CI.md` and the vault all still asserted it was armed, so it gated nothing. The
-owner retired the label and the seat rather than restore the gate. **Nothing now requires that anyone
-read a PR before it merges.** What blocks a merge is the required check set and nothing else.
+owner retired the label and the seat rather than restore the gate. **CORRECTED 2026-09-29:** this
+paragraph read *"Nothing now requires that anyone read a PR before it merges."* Since an owner ruling
+that day, the Lander merges only on proof that code review ran, or sends the change to code review.
+CLAUDE.md section 5 carries the rule. No machine gate beyond the required check set blocks a merge.
 
 Nothing in this system gets pushed to anybody. Everything is polled.
 
@@ -176,9 +178,12 @@ replacement for it, and hooks get added.
 | forbidden-content | The leak guard found customer or PHI-shaped content. See below. |
 | push guard (`pre-push`) | You tried to push a protected branch directly. Branch and open a PR. |
 
-**mypy does not run at commit.** No pre-commit hook invokes it. mypy strict is a CI leg that reports
-after your process is gone, so run `mypy messagefoundry` and `mypy --explicit-package-bases tests`
-by hand before you commit.
+**mypy does not run at commit.** No pre-commit hook invokes it. mypy strict runs in CI and reports
+after your process is gone, so run the three legs `ci.yml` runs by hand before you commit:
+
+    mypy --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
+    mypy --platform win32 messagefoundry messagefoundry_toolkit
+    mypy --explicit-package-bases tests
 
 Never use `--no-verify`, and never rename a file to slip past a gate. A gate you bypassed is a gate
 nobody will re-run.

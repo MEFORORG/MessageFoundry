@@ -12,7 +12,7 @@ What sets it apart: **you can set it up visually** — guided wizards scaffold c
 
 > **The pitch in one line:** *The best of the legacy interface engines — their proven reliability, deep connector catalogs, and battle-tested handling of HL7 v2 plus JSON, X12, and other formats — with none of the lock-in: configuration you own and version-control (set up with guided wizards or in Python), a durable, broker-free queue (SQLite by default, or Postgres/SQL Server), and auth, RBAC, audit, and encryption-at-rest built in rather than bolted on.*
 
-**Stack:** python-hl7 (tolerant parsing) + hl7apy (strict validation), FastAPI/uvicorn (localhost engine API), SQLite/aiosqlite (message store; Postgres & SQL Server also supported), a browser web console (`/ui`, `messagefoundry_webconsole`) as the operator UI, and PySide6 (the standalone test harness). Python 3.14+, asyncio core.
+**Stack:** a built-in tolerant HL7 parser (ADR 0054) + hl7apy (strict validation), FastAPI/uvicorn (localhost engine API), SQLite/aiosqlite (message store; Postgres & SQL Server also supported), a browser web console (`/ui`, `messagefoundry_webconsole`) as the operator UI, and PySide6 (the standalone test harness). Python 3.14+, asyncio core.
 
 ## 2. The core model: a graph of four building blocks
 
@@ -213,7 +213,7 @@ ACK vs NAK timing: decode/parse/strict-validate failures **NAK synchronously** a
 
 ## 7. Parsing: two tiers, payload-agnostic
 
-- **Tolerant peek (hot path).** python-hl7 does fast, forgiving field peeks for routing/filtering. Real-world HL7 is frequently non-conformant, so the hot path tolerates it.
+- **Tolerant peek (hot path).** The built-in parser does fast, forgiving field peeks for routing/filtering. Real-world HL7 is frequently non-conformant, so the hot path tolerates it.
 
 - **Strict validation (opt-in, slow path).** hl7apy does version-aware validation, enabled per inbound (validation.strict). Don’t route everything through the hl7apy object model.
 
@@ -301,7 +301,7 @@ This engine carries PHI, so security is built, not bolted on:
 | config/ | Connector models (models.py) + code-first wiring (wiring.py) + service settings (settings.py). |
 | pipeline/ | engine.py (Engine), wiring_runner.py (RegistryRunner), dryrun.py. |
 | transports/ | Connector registry (base.py) + mllp.py, file.py, … — the pluggable connections. |
-| parsing/ | peek.py (python-hl7 hot path), tree.py, validate.py (hl7apy strict), x12/ codec. Pure library. |
+| parsing/ | peek.py + _builtin_hl7.py (tolerant hot path), tree.py, validate.py (hl7apy strict), x12/ codec. Pure library. |
 | store/ | Store protocol + open_store factory; SQLite WAL store; Postgres; SQL Server. |
 | auth/ | Authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, totp. |
 | api/ | FastAPI app + models + auth — the engine's only external surface (serves the `/ui` web console same-origin). |
@@ -331,7 +331,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 - **OS.** Windows Server 2022/2025 is the primary supported platform (Windows-service deploy via NSSM); Windows Server 2019 and Windows 10/11 are supported; the engine also runs on modern Linux (under systemd — no bundled installer); macOS is development only.
 
-- **Runtime.** Python 3.14+ (64-bit). No C compiler needed for the default install. The Windows service uses NSSM (registering it needs admin rights).
+- **Runtime.** Python 3.14+ (64-bit). Whether the default install needs a C compiler depends on the interpreter; see [SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md). The Windows service uses NSSM (registering it needs admin rights).
 
 - **Store.** SQLite (WAL) is the bundled, zero-setup default for single-node; **PostgreSQL 13+** or **SQL Server 2022/2025** for production (run the server DB on its own host; SQL Server also needs the OS-level ODBC Driver 18, RCSI recommended). MySQL/Oracle aren’t supported.
 
@@ -343,7 +343,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 ## 13. Deployment & operations
 
-- **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (pip install "messagefoundry==0.3.2"); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\], \[fhir\], \[dicom\], \[x12\], \[xml\], \[webauthn\], \[vault\], \[otel\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
+- **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (pip install "messagefoundry==0.5.0"); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\], \[fhir\], \[dicom\], \[x12\], \[xml\], \[webauthn\], \[vault\], \[otel\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
 
 - **Run headless:** python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev — API on https://127.0.0.1:8765 (GET /connections, /messages, /stats, WS /ws/stats).
 
@@ -472,16 +472,16 @@ MessageFoundry keeps its dependency surface deliberately small and stdlib-first 
 
 ### What it depends on
 
-The runtime core is around eighteen packages; everything past it is an **opt-in extra that’s lazy-imported**, so a default SQLite install pulls none of them:
+The runtime core is around twenty packages; everything past it is an **opt-in extra that’s lazy-imported**, so a default SQLite install pulls none of them:
 
 | **Group** | **Packages** | **What for** |
 |----|----|----|
-| **Core runtime** | hl7apy, python-hl7, pydantic, aiosqlite, fastapi, starlette, uvicorn\[standard\], argon2-cffi, cryptography, ldap3, pyspnego, tomlkit, tzdata, prometheus-client, defusedxml, psutil, httpx, truststore | HL7 validate/parse, config models, the SQLite store, the API (Starlette carries its own explicit floor), password hashing + AES-256-GCM PHI-at-rest, AD/Kerberos auth, TOML writing, tz data, the Prometheus /metrics surface + host gauges, hardened XML parsing, and the shared HTTP client (apiclient, tray, harness monitor, ASGI test client) with OS-trust-store verification. Always installed, plus one annotated-types\<0.8 constraint pin on a transitive. |
+| **Core runtime** | hl7apy, pydantic, aiosqlite, fastapi, starlette, uvicorn, httptools, websockets, uvloop (not on Windows), argon2-cffi, cryptography, ldap3, pyspnego, tomlkit, tzdata, psutil, httpx, truststore | HL7 validate/parse, config models, the SQLite store, the API (Starlette carries its own explicit floor), password hashing + AES-256-GCM PHI-at-rest, AD/Kerberos auth, TOML writing, tz data, host gauges for the Prometheus /metrics surface (the engine renders the exposition itself), and the shared HTTP client (apiclient, tray, harness monitor, ASGI test client) with OS-trust-store verification. Always installed. Hardened XML parsing is not a dependency: it is a vendored copy of defusedxml 0.7.1 in `messagefoundry/_vendor/defusedxml/`. |
 | \[harness\] | PySide6 | The standalone PySide6 test harness GUI. (Was `[console]` before the desktop console was retired — BACKLOG #103; its HTTP client, httpx + truststore, moved to the core runtime.) |
 | \[postgres\] | asyncpg | PostgreSQL store backend (no OS dependency; ships compiled wheels). |
 | \[sqlserver\] | aioodbc *+ OS ODBC Driver 18* | SQL Server store backend (the ODBC driver installs at the OS level, not via pip). |
 | \[sftp\] | paramiko | SFTP transport for the REMOTEFILE connector (FTP/FTPS use the stdlib). |
-| \[fhir\] | fhir.resources, fhirpathpy | The typed FHIR model + FHIRPath codec behind parsing/fhir/. |
+| \[fhir\] | fhir.resources, fhir-core, fhirpathpy | The typed FHIR model + FHIRPath codec behind parsing/fhir/. fhir-core is declared only to floor it. |
 | \[dicom\] | pynetdicom, pydicom | DICOM C-STORE SCP/SCU connectors + the headers/SR codec (no pixel data, so no numpy). |
 | \[x12\] | pyx12 | Opt-in *strict* X12 validation; the tolerant X12 peek/parse hot path needs nothing. |
 | \[xml\] | lxml, xmlschema, signxml | XML/SOAP accessors, XSD validation, and XML-DSig signatures. |

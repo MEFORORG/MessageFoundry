@@ -551,10 +551,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui", response_class=HTMLResponse)
     async def ui_dashboard(
+        request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
     ) -> HTMLResponse:
-        rows = await core.list_connections(engine=engine, identity=identity)
+        rows = await core.list_connections(request=request, engine=engine, identity=identity)
         # BACKLOG #1152: the landing page is where a fresh operator forms the impression that RBAC
         # is broken, so it is where the unprovisioned state gets a sentence. Read off the identity,
         # never off `not rows` — an estate with no connections configured yet is a different empty.
@@ -562,12 +563,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui/connections", response_class=HTMLResponse)
     async def ui_connections(
+        request: Request,
         engine: Any = Depends(deps.get_engine),
         # activity=False (ASVS 14.3.1): the dashboard's 5s live-table refresh is timer-driven, not
         # user activity — it must not keep an abandoned tab's session alive.
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ, activity=False)),
     ) -> HTMLResponse:
-        rows = await core.list_connections(engine=engine, identity=identity)
+        rows = await core.list_connections(request=request, engine=engine, identity=identity)
         return HTMLResponse(pages.connections_fragment(rows))
 
     @app.get("/ui/connection/{name}", response_class=HTMLResponse)
@@ -577,10 +579,32 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
     ) -> HTMLResponse:
+        return await _connection_details_page(name, request, engine, identity, reveal=None)
+
+    # The per-event reveal on this page (BACKLOG #2443, ASVS 14.2.6, owner ruling R12): the
+    # "Reveal" link beside a masked event reason. The request is the act, so it returns that one
+    # event's reason whole, the engine audits it as ``connection_event_reveal``, and the next bare
+    # load is masked again. messages:view_summary unlocks the reason, and phi=True charges the
+    # PHI-read budget the in-process handler call does not charge for itself.
+    @app.get("/ui/connection/{name}/events/{event_id}/reason", response_class=HTMLResponse)
+    async def ui_connection_event_reason(
+        name: str,
+        event_id: int,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(
+            require_ui(Permission.MONITORING_READ, Permission.MESSAGES_VIEW_SUMMARY, phi=True)
+        ),
+    ) -> HTMLResponse:
+        return await _connection_details_page(name, request, engine, identity, reveal=event_id)
+
+    async def _connection_details_page(
+        name: str, request: Request, engine: Any, identity: Identity, *, reveal: int | None
+    ) -> HTMLResponse:
         # Compose the detail view from existing monitoring handlers (no new PHI surface): find the row in
         # the (already channel-scoped) connection list, then its recent events. A singular /ui/connection/
         # path avoids colliding with the /ui/connections/{purge-confirm,...} action routes.
-        rows = await core.list_connections(engine=engine, identity=identity)
+        rows = await core.list_connections(request=request, engine=engine, identity=identity)
         row = next((r for r in rows if r.name == name), None)
         if row is None:
             raise HTTPException(404, "connection not found")
@@ -601,10 +625,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 since=None,
                 limit=50,
                 request=request,
+                reveal=reveal,
             )
         except HTTPException:
             events = []  # still show the connection's info + stats if events are RBAC-scoped out
-        return HTMLResponse(pages.connection_details(row, events))
+        return HTMLResponse(pages.connection_details(row, events, revealed=reveal))
 
     @app.get("/ui/messages", response_class=HTMLResponse)
     async def ui_messages(

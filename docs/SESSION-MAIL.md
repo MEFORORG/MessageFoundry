@@ -69,7 +69,7 @@ runs; this one used the shim verbatim from `~/.claude/settings.json`:
 | receipt written by the drain process | `disposition: shown-consumed`, `byHookEvent: Stop` |
 | box afterwards | `inbox 0`, `seen 1` -- consumed exactly once |
 
-⚠️ **What made it live was `git pull` in the primary checkout, not the merge** -- see the note below,
+**NOTE: What made it live was `git pull` in the primary checkout, not the merge** -- see the note below,
 which is the trap this section was wrong about for several hours.
 
 > **RETAINED AS A LESSON, NOT AS CURRENT STATE: for several hours the rows were live and the hook did

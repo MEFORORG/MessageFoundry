@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -65,7 +65,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "AUDIT_APPEND_ONLY_TABLES",
+    "POSTGRES_AUDIT_WRITE_PRIVILEGES",
     "POSTGRES_EXCESSIVE_ROLES",
+    "SQLSERVER_AUDIT_WRITE_PRIVILEGES",
     "SQLSERVER_DOCUMENTED_DATABASE_ROLES",
     "SQLSERVER_FIXED_DATABASE_ROLES",
     "SQLSERVER_FIXED_SERVER_ROLES",
@@ -78,6 +81,9 @@ __all__ = [
     "PrivilegeProbeStore",
     "StorePrivilegeError",
     "StorePrivilegeReport",
+    "audit_write_alias",
+    "audit_write_grant",
+    "classify_audit_writes",
     "postgres_excess",
     "preflight_outcome",
     "probe_failure",
@@ -145,6 +151,67 @@ def refusal_reason(*, require_least_privilege: bool) -> str:
     )
 
 
+# --- the audit tables are append-only for the runtime login (owner ruling R16, ASVS 16.4.2) -----
+#: The two tables the runtime login may only INSERT into and SELECT from. ``audit_log`` is the hash
+#: chain; ``audit_chain_meta`` is its single keying-watermark row, written once when keying starts and
+#: never changed after (a key rotation appends an ``audit_log`` row instead, BACKLOG #1904). So the
+#: engine's own write paths need no UPDATE or DELETE on either, and a login that holds one could
+#: rewrite or drop audit rows on a first deployment. Under ``[store].schema_management = external``
+#: each such right is excess. Under ``auto`` it is not counted: the Postgres login OWNS the tables
+#: there and may grant itself any right back, and the SQL Server login holds ``db_ddladmin``.
+AUDIT_APPEND_ONLY_TABLES: tuple[str, ...] = ("audit_log", "audit_chain_meta")
+
+#: The row-changing rights probed on each append-only table. This is at least the direct routes, not
+#: every route: Postgres ``TRUNCATE`` empties a table without ``DELETE``, and ``TRIGGER`` lets a role
+#: attach a trigger that rewrites each row as it is inserted; SQL Server's ``TRUNCATE TABLE`` and a
+#: trigger both need ``ALTER`` on it, and ``CONTROL`` or ``TAKE OWNERSHIP`` lets a login undo a ``DENY``.
+#: Postgres table ownership is the probe's separate ``OWNER of`` finding. ``UPDATE`` is read column by
+#: column too, since a column grant changes row content as well as a table grant does.
+POSTGRES_AUDIT_WRITE_PRIVILEGES: tuple[str, ...] = ("UPDATE", "DELETE", "TRUNCATE", "TRIGGER")
+SQLSERVER_AUDIT_WRITE_PRIVILEGES: tuple[str, ...] = (
+    "UPDATE",
+    "DELETE",
+    "ALTER",
+    "CONTROL",
+    "TAKE OWNERSHIP",
+)
+
+
+def audit_write_grant(privilege: str, table: str) -> str:
+    """The one wording both backends use for a row-changing right on an append-only audit table.
+
+    A two-word right is lower-cased: the log redaction scrubs two adjacent ALL-CAPS words as a
+    possible patient name, so ``TAKE OWNERSHIP`` would log as ``[redacted]``. The probe still passes
+    the exact T-SQL name from the tuple above. The SQL Server OBSERVED detail spells the list out by
+    hand, so a change here needs the same change there."""
+    label = privilege.lower() if " " in privilege else privilege
+    return f"{label} on table {table}"
+
+
+def audit_write_alias(table: str, privilege: str) -> str:
+    """The probe column that reads ``privilege`` on ``table``. Both come from the closed tuples above,
+    never from input, so the alias is a fixed identifier."""
+    return f"aw_{table}_{privilege.lower().replace(' ', '_')}"
+
+
+def classify_audit_writes(
+    row: Mapping[str, object], privileges: Sequence[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Read the probe's audit-table columns THREE ways, as ``_probed_grant`` reads a role: ``(held,
+    unread)``, each in :func:`audit_write_grant` wording. A NULL is a table the login cannot resolve,
+    so it is NOT READ and never folds into "not held". ``== 1`` accepts a driver's ``True`` or ``1``."""
+    held: list[str] = []
+    unread: list[str] = []
+    for table in AUDIT_APPEND_ONLY_TABLES:
+        for privilege in privileges:
+            value = row[audit_write_alias(table, privilege)]
+            if value is None:
+                unread.append(audit_write_grant(privilege, table))
+            elif value == 1:
+                held.append(audit_write_grant(privilege, table))
+    return tuple(held), tuple(unread)
+
+
 # --- SQL Server -------------------------------------------------------------------------------
 #: The closed set of SQL Server FIXED SERVER roles, probed by name rather than enumerated from
 #: ``sys.server_principals``: catalog visibility is permission-filtered, so an enumeration that comes
@@ -202,6 +269,7 @@ def sqlserver_excess(
     external: bool = False,
     create_table: bool = False,
     alter_schema: str | None = None,
+    audit_writes: Sequence[str] = (),
 ) -> tuple[str, ...]:
     """What an observed SQL Server principal holds BEYOND the documented least-privilege grant.
 
@@ -211,6 +279,14 @@ def sqlserver_excess(
     database) and ``alter_schema`` (the name of the default schema, when the login holds ``ALTER`` on
     it). Both are suppressed when ``db_ddladmin`` or ``db_owner`` is already named, since that role
     carries them. ``False`` keeps the auto-mode grant, where the login runs its own schema DDL.
+
+    ``audit_writes`` names the row-changing rights the login holds on the append-only audit tables
+    (:func:`audit_write_grant` wording, owner ruling R16). ``db_datawriter`` grants them on every table,
+    so the runbook takes them back with ``DENY``. Counted under ``external`` only, and suppressed when
+    ``sysadmin``, ``db_owner``, ``CONTROL SERVER`` or database ``CONTROL`` is already named: each one
+    already lets the login lift a ``DENY``, so naming it names the fix. Another server role does not
+    suppress them, because it carries no right on a user table. ``ALTER`` on a table is also
+    suppressed when ``db_ddladmin`` is named, since that role carries it on every table.
 
     Pure — no I/O — so both directions (over-granted and correctly-granted) are unit-testable without
     a database, and the live server legs assert the same function against a real login.
@@ -238,6 +314,17 @@ def sqlserver_excess(
             out.append(f"create table on database {database}")
         if alter_schema:
             out.append(f"ALTER on schema {alter_schema}")
+    owner_named = (
+        "db_owner" in database_roles
+        or "sysadmin" in server_roles
+        or control_database
+        or control_server
+    )
+    if external and not owner_named:
+        # ALTER on every table rides db_ddladmin, named above. ALTER on the default schema is not
+        # folded in: the audit tables may resolve to dbo instead, so it may not be the same grant.
+        ddladmin = "db_ddladmin" in database_roles
+        out.extend(w for w in audit_writes if not (ddladmin and w.startswith("ALTER ")))
     return tuple(out)
 
 
@@ -307,6 +394,7 @@ def postgres_excess(
     schema: str = "",
     create_on_schema: bool = False,
     owned_in_schema: int = 0,
+    audit_writes: Sequence[str] = (),
 ) -> tuple[str, ...]:
     """What an observed Postgres principal holds BEYOND the documented least-privilege grant.
 
@@ -316,6 +404,11 @@ def postgres_excess(
     excess: ``CREATE`` on the store's schema, and OWNERSHIP of objects in it (an owner may ``ALTER`` and
     ``DROP`` its tables whatever the schema ACL says). Under auto mode the role runs its own DDL, so
     both are prescribed and neither is reported.
+
+    ``audit_writes`` names the row-changing rights the role holds on the append-only audit tables
+    (:func:`audit_write_grant` wording, owner ruling R16), counted under ``external`` only. Under
+    ``auto`` the role owns those tables and can grant itself any right back, so no reading of its
+    grants there could show the tables are append-only.
 
     **Every attribute is read across every assumable role, not only the principal's own row** — see
     :class:`PostgresRoleFacts` for the measurement that settles why membership is enough. Reading the
@@ -357,6 +450,7 @@ def postgres_excess(
             out.append(f"CREATE on schema {schema}")
         if owned_in_schema:
             out.append(f"OWNER of {owned_in_schema} object(s) in schema {schema}")
+        out.extend(audit_writes)
     return tuple(out)
 
 

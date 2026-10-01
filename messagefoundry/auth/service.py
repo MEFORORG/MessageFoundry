@@ -291,12 +291,52 @@ _REPROOF_SESSION_PER_USER = 64
 #: fact the right value depends on is left unfixed by the argon2 parameters.
 _FAILURE_BUDGET_SECONDS = 0.5
 
+#: The share of the budget a refused sign-in's deferred audit writes are guaranteed before its answer
+#: (BACKLOG #2467, ASVS 6.3.8). The answer's deadline is fixed BEFORE those writes run, and it is the
+#: first slot boundary at least this far past the write point, so the writes cannot move it. Without
+#: the room, a caller who queues a second attempt on the name picks how close that boundary sits to
+#: the write point, and a branch that writes more rows than another would cross it. A quarter keeps
+#: an attempt that did not queue in slot 1: its write point is half a budget in, so it reaches only
+#: three quarters.
+_WRITE_ROOM_SHARE = 0.25
+
 #: Per-process, per-seam latch for the budget-overrun warning. Deliberately module-level and not
 #: per-instance: the warning reports that THIS DEPLOYMENT's budget is too small for its hardware,
 #: which is a fact about the process, not about one service object. One warning per seam per process
 #: — the login surface is unauthenticated, so warning on every overrun would be the same unbounded
 #: log amplifier the rate-limited audit paths already exist to avoid.
 _BUDGET_OVERRUN_WARNED: set[str] = set()
+
+
+def _warn_budget_overrun(seam: str, took: float, *, writes: bool = False) -> None:
+    """Warn, once per seam and cause per process, that a failure on ``seam`` answered a slot late.
+
+    The budget is then too small for this hardware. The answer still cannot fail open
+    (:func:`_failure_deadline` always rounds up), but a pair of branches straddling the slot boundary
+    would stay distinguishable. ``took`` is the work, leaving out any wait in the account's queue,
+    or with ``writes`` the deferred audit writes alone (BACKLOG #2467). The two causes latch apart,
+    so the first to fire does not hide the other."""
+    key = f"{seam}:writes" if writes else seam
+    if key in _BUDGET_OVERRUN_WARNED:
+        return
+    _BUDGET_OVERRUN_WARNED.add(key)
+    if writes:
+        _log.warning(
+            "auth: a failed %s challenge's audit writes took %.3fs, over the %.3fs room the pad "
+            "leaves them; responses are being padded to a later slot (further write overruns are "
+            "not logged)",
+            seam,
+            took,
+            _FAILURE_BUDGET_SECONDS * _WRITE_ROOM_SHARE,
+        )
+        return
+    _log.warning(
+        "auth: a failed %s challenge took %.3fs, over the %.3fs anti-enumeration budget; "
+        "responses are being padded to a later slot (further overruns are not logged)",
+        seam,
+        took,
+        _FAILURE_BUDGET_SECONDS,
+    )
 
 
 def _failure_deadline(started: float, now: float, budget: float | None = None) -> float:
@@ -1948,6 +1988,16 @@ class AuthService:
             return True
         return self._admin_write_limiter.allow(actor)
 
+    def attach_security_notifier(self, notifier: SecurityNotifier | None) -> None:
+        """Wire the out-of-band notice channel after construction (BACKLOG #2081).
+
+        For ``provision-admin`` alone, which builds this service before its password prompt so that
+        building it -- the anchor checks and the directory secrets -- can refuse first, but decides
+        whether it owes a takeover notice only at the write, against the store it writes to. The
+        API lifespan passes the notifier to the constructor and never calls this. Call it before
+        the first operation that could notify; it replaces whatever channel was wired."""
+        self._security_notifier = notifier
+
     @property
     def policy(self) -> PasswordPolicy:
         return self._policy
@@ -2396,7 +2446,14 @@ class AuthService:
     # --- login ---------------------------------------------------------------
 
     async def _equalize_failure(
-        self, outcome: LoginOutcome, started: float, *, seam: str, queued: float = 0.0
+        self,
+        outcome: LoginOutcome,
+        started: float,
+        *,
+        seam: str,
+        queued: float = 0.0,
+        writes: Sequence[Callable[[], Awaitable[None]]] = (),
+        write_room: bool = False,
     ) -> LoginOutcome:
         """Hold a FAILED ``outcome`` until this challenge's deadline, then return it unchanged.
 
@@ -2434,8 +2491,23 @@ class AuthService:
         branch. Half, not a whole budget, because an attempt leaves the queue just after the one
         ahead of it answered on a slot boundary: a whole budget from there would always cross the
         next boundary and double each queued attempt's wait.
+
+        **``writes`` are a refused sign-in's deferred audit rows (BACKLOG #1131), and the deadline is
+        fixed BEFORE they run (BACKLOG #2467).** Only :meth:`login` passes them, and it sets
+        ``write_room`` on every refusal, rows or none, so the room applies to every sign-in refusal
+        alike. The writes run at the floor, the write point, and with ``write_room`` the answer's
+        deadline is the first slot boundary at least :data:`_WRITE_ROOM_SHARE` of a budget past
+        it, whenever the work fits in the half budget the floor leaves. Read after the writes
+        instead, the clock carried their length into the slot, and a refusal by a live lock writes
+        more rows than an unknown name does. The room counts from the floor and not from ``now``,
+        so an attempt that did not queue still overruns only at a whole budget of work. Writes that
+        outrun their room still cannot fail open: the answer waits to the next slot boundary after
+        they finish, and the overrun warning fires, as it does for work over the budget.
         """
         if outcome.ok:
+            # No success defers a row today; one that did must still write it (count-and-log).
+            if writes:
+                await _write_through_cancellation(writes)
             return outcome
         now = time.monotonic()
         elapsed = now - started
@@ -2443,25 +2515,37 @@ class AuthService:
         # For an attempt that did not queue the floor sits inside slot 1, so it changes nothing.
         span = _FAILURE_BUDGET_SECONDS
         floor = started + queued + span / 2
+        # The earliest instant the answer may go out: the floor, plus the deferred writes' room.
+        earliest = floor + (span * _WRITE_ROOM_SHARE if write_room else 0.0)
         # Whether the work, and not the wait, decided the slot: ``now`` lies in a later slot than
-        # the floor. Worked out here rather than by a second ``_failure_deadline`` call, so the
+        # ``earliest``. Worked out here rather than by a second ``_failure_deadline`` call, so the
         # pad's arithmetic runs once per failure.
-        moved = now > floor and (now - started) // span != (floor - started) // span
-        deadline = _failure_deadline(started, max(now, floor))
-        if moved and seam not in _BUDGET_OVERRUN_WARNED:
-            # The work alone moved this failure to a later slot than its wait put it in, so the
-            # budget is too small for this hardware. It still cannot fail open (`_failure_deadline`
-            # always rounds up), but a pair of branches straddling the slot boundary would stay
-            # distinguishable. For an attempt that did not queue this is work over one budget; for
-            # a queued one, work over the half budget the floor leaves it.
-            _BUDGET_OVERRUN_WARNED.add(seam)
-            _log.warning(
-                "auth: a failed %s challenge took %.3fs, over the %.3fs anti-enumeration budget; "
-                "responses are being padded to a later slot (further overruns are not logged)",
-                seam,
-                work,
-                _FAILURE_BUDGET_SECONDS,
-            )
+        moved = now > earliest and (now - started) // span != (earliest - started) // span
+        deadline = _failure_deadline(started, max(now, earliest))
+        if moved:
+            # The work alone moved this failure to a later slot than its wait put it in. For an
+            # attempt that did not queue this is work over one budget; for a queued one, work over
+            # the half budget the floor leaves it, plus any write room.
+            _warn_budget_overrun(seam, work)
+        if writes:
+            try:
+                await _sleep_until_write_point(floor)
+            except asyncio.CancelledError:
+                # A caller who drops the request here does not drop the audit trail
+                # (count-and-log), and the account's queue is held until the rows are in. A write
+                # that fails is logged rather than raised, so the cancel still reaches the caller.
+                try:
+                    await _write_through_cancellation(writes)
+                except Exception:
+                    _log.exception("a refused sign-in's audit write failed after a cancel")
+                raise
+            writing = time.monotonic()
+            await _write_through_cancellation(writes)
+            written = time.monotonic()
+            if written >= deadline:
+                # The rows outran their room. Rounding up keeps the raw elapsed off the wire.
+                deadline = _failure_deadline(started, written)
+                _warn_budget_overrun(seam, written - writing, writes=True)
         await _sleep_until(deadline)
         return outcome
 
@@ -2510,10 +2594,11 @@ class AuthService:
           start, whatever branch it took. Padded outside the queue, the attempts' raw work would add
           up along it, and a burst's last answers would move to a later slot on a name whose branch
           does a little more work: a way to tell a real name from an unknown one. The cost is that
-          failures on one account are answered about a slot apart. With the floor below, an
-          attacker who spaces attempts can make each hold the queue for up to one and a half
-          slots, which is the most the owner waits per queued attempt; the sign-in limiter bounds
-          how many queue, and with it off nothing does.
+          failures on one account are answered about a slot apart. With the floor below and the
+          room left for the audit writes (BACKLOG #2467), an attacker who spaces attempts can make
+          each hold the queue for up to one and three quarter slots, which is the most the owner
+          waits per queued attempt; the sign-in limiter bounds how many queue, and with it off
+          nothing does.
         * **The queue is itself a signal, and the pad only partly hides it.** A probe that waits
           behind someone else answers later, and an unknown name never has anyone ahead of it. The
           pad absorbs a wait of up to half a slot. A longer one, such as the owner's own
@@ -2553,8 +2638,9 @@ class AuthService:
             # failure, and only a right candidate arms the second-step lock. The point is the
             # equalizer's own floor, half a budget past the attempt's turn in the queue, so the rows
             # land there on every branch whose work fits in half a budget (the same condition the
-            # answer's slot already rests on), and the answer still goes out on its slot: the
-            # writes run INSIDE the padded window, never after it, so they cannot delay it.
+            # answer's slot already rests on). The writes run INSIDE the padded window, and the
+            # answer's deadline is fixed before they start, with room left for them
+            # (:meth:`_equalize_failure`, BACKLOG #2467), so their length cannot move its slot.
             # Written after the pad instead, the answer would wait for the writes, and the branches
             # write different numbers of rows. The COUNT still runs before this, so counting is
             # unchanged.
@@ -2569,14 +2655,11 @@ class AuthService:
                 arrived=arrived,
                 after_pad=after_pad,
             )
-            if after_pad:
-                try:
-                    await _sleep_until_write_point(started + queued + _FAILURE_BUDGET_SECONDS / 2)
-                finally:
-                    # A caller who drops the request here does not drop the audit trail
-                    # (count-and-log), and the account's queue is held until the rows are in.
-                    await _write_through_cancellation(after_pad)
-            return await self._equalize_failure(outcome, started, seam="login", queued=queued)
+            # The room is set on every branch, whether it deferred rows or not, so every refusal
+            # answers on the same slot.
+            return await self._equalize_failure(
+                outcome, started, seam="login", queued=queued, writes=after_pad, write_room=True
+            )
 
     async def _dispatch_login(
         self,

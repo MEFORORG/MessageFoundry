@@ -3,7 +3,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """WP-L3-02 (ASVS 11.1.3): cryptographic-discovery gate.
 
-Enumerate every cryptographic call site across the five first-party roots (:data:`WALK_ROOTS`) via
+Enumerate every cryptographic call site across the six first-party roots (:data:`WALK_ROOTS`) via
 the AST and diff them against the maintained inventory below. The build **fails** when a module uses a
 crypto primitive it isn't documented to use — so a new (or moved) crypto usage can't slip in
 unreviewed, and the inventory below stays an accurate "where is crypto used" map (it is the
@@ -103,7 +103,7 @@ job runs, and what decides whether it blocks a merge, is stated once, at
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
-    python scripts/security/crypto_inventory_check.py            # scan the five real roots
+    python scripts/security/crypto_inventory_check.py            # scan the six real roots
     python scripts/security/crypto_inventory_check.py --package DIR   # scan an arbitrary package (tests)
     python scripts/security/crypto_inventory_check.py --list-operations   # also print every operation
     python scripts/security/crypto_inventory_check.py --non-python-operations   # TS/JS + PowerShell
@@ -128,7 +128,7 @@ if _HERE not in sys.path:
     sys.path.append(_HERE)
 import crypto_operations  # noqa: E402
 
-# The five first-party roots the gate walks — byte-identical (as basenames) to
+# The six first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
 # ``ide/`` is deliberately absent: it is the TypeScript VS Code extension and contains ZERO ``.py``
 # files, so THIS scanner — which rglobs ``*.py`` and walks the Python AST — has nothing to read there.
@@ -148,7 +148,7 @@ import crypto_operations  # noqa: E402
 # sites would stay invisible while the tree gained a green whose greenness is evidence of nothing.
 # ``ide/`` is covered by a SEPARATE arm instead (:data:`NON_PYTHON_WALK_ROOTS` below, BACKLOG #1172),
 # which reads ``.ts``/``.js`` by pattern rather than by AST and rides this same required context. So
-# this gate's green now means "no undocumented crypto in the PYTHON of five roots, AND no
+# this gate's green now means "no undocumented crypto in the PYTHON of six roots, AND no
 # undocumented or weak RANDOMNESS source in the non-Python roots". The randomness half is the only
 # non-Python claim the REQUIRED run supports. The extension's TLS floor is found by the operation arm
 # (:func:`check_non_python_operations`, BACKLOG #1164), which runs in its own CI job; see
@@ -160,7 +160,14 @@ import crypto_operations  # noqa: E402
 # ``_CRYPTO_ROOTS`` tuple likewise omits ``samples/`` and this walk-set is pinned byte-identical to it,
 # so adding ``samples/`` here would break that pin AND drag author-space into the ReDoS/XML static
 # guards that consume the same tuple.
-WALK_ROOTS = ("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "scripts")
+WALK_ROOTS = (
+    "messagefoundry",
+    "messagefoundry_webconsole",
+    "messagefoundry_toolkit",
+    "harness",
+    "tee",
+    "scripts",
+)
 
 # --------------------------------------------------------------------------------------------
 # The NON-PYTHON randomness arm (BACKLOG #1172, ASVS 11.5.1).
@@ -294,6 +301,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # used for one handshake, and never returned. Not a data path — do not reuse these settings.
     "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
     "messagefoundry/auth/ldap.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
+    # BACKLOG #2494: the engine ldap3.Tls. It wraps each LDAPS socket with a context that
+    # tls_policy.assert_ldap3_tls_suites built, narrowed and asserted.
+    "messagefoundry/auth/ldap_tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ADR 0142 (OIDC relying party, BACKLOG #274): the federated-SSO layer.
     #   claims.py — hmac.compare_digest for the constant-time nonce comparison; cryptography only for
     #     catching InvalidSignature (the verification itself is transports/signing.py, inventoried).
@@ -572,7 +582,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #300: the Vault clients' strict reply adapter gives each new verifying https connection
     # a context from the factory tls_policy.assert_hvac_tls_suites returned, which builds, narrows
     # and asserts it, and loads requests' CA onto it. It refuses a CERT_NONE connection.
-    "messagefoundry/transports/strict_requests.py": frozenset({"ssl"}),
+    # BACKLOG #2317 adds the tls_policy import: the cleartext-hop authority (is_loopback_hop_host,
+    # insecure_hop_disposition) refuses an http:// Vault that is not loopback reached directly. That
+    # is a posture decision on the scheme, and it calls no cipher or context.
+    "messagefoundry/transports/strict_requests.py": frozenset(
+        {"messagefoundry.config.tls_policy", "ssl"}
+    ),
     # ADR 0113 (2026-07-22 amendment): the tray's TOKENLESS /health + /ui probes must verify the
     # engine's server cert when the loopback bind serves https. BACKLOG #1276 part B: given the
     # engine's cert, it pins trust to exactly that PEM (ssl.create_default_context with cafile=);
@@ -911,8 +926,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.auth.trust_anchors",
-            "tls_context:via messagefoundry.config.tls_policy",
         }
+    ),
+    # BACKLOG #2494: the LDAPS context is built by tls_policy.assert_ldap3_tls_suites, and the socket
+    # is wrapped with it here, in place of ldap3's own wrap_socket.
+    "messagefoundry/auth/ldap_tls.py": frozenset(
+        {"tls_context:.wrap_socket()", "tls_context:via messagefoundry.config.tls_policy"}
     ),
     "messagefoundry/auth/oidc/claims.py": frozenset(
         {"compare:hmac.compare_digest", "sign_verify:via messagefoundry.transports.signing"}
@@ -1016,6 +1035,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.post_handshake_auth = True",
             "tls_context:.set_ciphers()",
             "tls_context:.set_ciphersuites()",
+            "tls_context:.set_server_sigalgs()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
             "tls_context:.verify_mode =",
@@ -2397,7 +2417,7 @@ def main(argv: list[str] | None = None) -> int:
         "--package",
         type=Path,
         default=None,
-        help="single package directory to scan (default: the five real WALK_ROOTS + built-in inventory)",
+        help="single package directory to scan (default: the six real WALK_ROOTS + built-in inventory)",
     )
     parser.add_argument(
         "--list-operations",

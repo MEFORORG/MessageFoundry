@@ -100,8 +100,10 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
             "--no-header",
         ]
         try:
+            # Output is captured only to keep the console quiet; results come from the JUnit file.
+            # Left as bytes, so no child line can fail a decode.
             subprocess.run(  # noqa: S603 — fixed argv, no shell
-                cmd, cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout
+                cmd, cwd=_REPO_ROOT, env=env, capture_output=True, timeout=timeout
             )
         except subprocess.TimeoutExpired:
             return {}  # caller marks all requested rows ERROR (nothing parsed back)

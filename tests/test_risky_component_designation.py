@@ -202,7 +202,7 @@ def test_the_closure_file_parses_and_is_not_empty() -> None:
         f"the closure parsed to {len(closure)} names, which is too few to be the real set; "
         "the parser and the file have diverged"
     )
-    assert "hl7" in closure and "cryptography" in closure, (
+    assert "tomlkit" in closure and "cryptography" in closure, (
         "two known core dependencies are missing from the parsed closure"
     )
 
@@ -255,7 +255,7 @@ def test_no_distribution_is_both_designated_and_excluded() -> None:
 def test_the_counts_printed_on_the_page_are_the_real_ones() -> None:
     """RED when: the prose keeps a count the tables no longer support.
 
-    The page states "Twenty-six of forty-one" and "26 plus 15 is 41". Those are load-bearing: a
+    The page states "Twenty-five of thirty-six" and "25 plus 11 is 36". Those are load-bearing: a
     reader uses them to check the set is closed without counting rows. A figure that drifts from its
     own tables is worse than no figure, because it invites the reader to stop checking.
     """
@@ -372,10 +372,10 @@ def test_the_core_lock_parses_to_a_real_closure() -> None:
     """
     pins = _core_lock_pins()
     assert len(pins) >= 20, f"{_CORE_LOCK.name} parsed to {len(pins)} pins, too few to be real"
-    # One transitive (cffi, via cryptography) and one reached only through an extra a core
-    # dependency requests (uvloop, via uvicorn[standard]).
-    assert {"hl7", "cryptography", "cffi", "uvloop"} <= pins.keys(), (
-        f"{_CORE_LOCK.name} misses a known transitive or extra-requested core package"
+    # One transitive (cffi, via cryptography) and one whose lock line carries a platform marker
+    # (uvloop, which no Windows install gets).
+    assert {"tomlkit", "cryptography", "cffi", "uvloop"} <= pins.keys(), (
+        f"{_CORE_LOCK.name} misses a known transitive or platform-marked core package"
     )
 
 
@@ -689,7 +689,7 @@ def test_the_readings_snapshot_parses_and_is_not_empty() -> None:
     data = _snapshot()
     readings = _readings(data)
     assert len(readings) >= 20, f"{_READINGS.name} parsed to {len(readings)} readings"
-    assert {"hl7", "cryptography", "pyodbc"} <= readings.keys()
+    assert {"tomlkit", "cryptography", "pyodbc"} <= readings.keys()
     dt.date.fromisoformat(data["snapshot_date"])
     assert data["criteria"] == component_readings.criteria(), (
         "the snapshot records different criteria from the generator's; a changed threshold "

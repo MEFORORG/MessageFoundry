@@ -3,19 +3,21 @@
 """End-to-end pin for every field-level redaction site (ASVS 8.1.2).
 
 ``docs/SECURITY.md`` states that the same disposition text gates on ``messages:view_summary`` on
-**every** surface that returns it, and names six. The map-level guards
+**every** surface that returns it, and names eleven. The map-level guards
 (``tests/test_field_authz.py``, ``tests/test_security_doc_drift.py``) prove the POLICY is complete and
 documented; they cannot prove it is APPLIED — a future PHI-bearing route that forgets the
 ``redact_unauthorized`` call passes all of them, because ``redact_unauthorized`` fails **open**.
 
-So this hits each of the six surfaces over HTTP with a caller who lacks the unlocking permission and
-asserts every documented gated property comes back ``null``. Two callers are needed, which is itself
+So this hits each of those surfaces over HTTP with a caller who lacks the unlocking permission and
+asserts every documented gated property comes back ``null``. Three callers are needed, which is itself
 the point:
 
 * **Viewer** (``monitoring:read`` + ``messages:read``) covers the five ``messages:read`` surfaces;
 * a **custom role** holding ``messages:view_raw`` *without* ``messages:view_summary`` covers
   ``GET /messages/{id}`` — and demonstrates that the doc's "the split is reachable" claim is real,
-  not theoretical (``view_raw`` is not a superset of ``view_summary``).
+  not theoretical (``view_raw`` is not a superset of ``view_summary``);
+* a **custom role** holding ``monitoring:diagnose`` *without* ``messages:view_summary`` covers
+  ``GET /alerts/active`` (BACKLOG #2443), since no built-in role holds that split.
 
 Synthetic HL7 only — the MRN and name below are invented.
 """
@@ -36,7 +38,9 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.wiring import ConnectionSpec, Registry, build_outbound_connection, env
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
 from tests._admin_account import create_local_user_chosen
@@ -46,7 +50,7 @@ PW = "a-strong-test-passphrase"  # >= 15 chars, satisfies the ASVS password poli
 #: Synthetic ADT — invented MRN/name, never real PHI.
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSGSEED|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
 
-#: The six surfaces the doc names, each with the caller that can reach it. ``{mid}`` is the seeded
+#: The surfaces the doc names, each with the caller that can reach it. ``{mid}`` is the seeded
 #: message id and ``{preset}`` that caller's own saved preset (layered search is owner-scoped).
 _SURFACES: tuple[tuple[str, str], ...] = (
     ("/dead-letters", "viewer"),
@@ -61,6 +65,17 @@ _SURFACES: tuple[tuple[str, str], ...] = (
     ("/messages/{did}", "rawonly"),
     ("/messages/{mid}/responses", "viewer"),
     ("/search/layered?presets={preset}", "viewer"),
+    # BACKLOG #2443: the event log and the alert list. Their routes need only monitoring:*, so the
+    # reason is gated on its own. No built-in role holds monitoring:diagnose without view_summary,
+    # so the alert list is reached by a custom role, as the detail open is above.
+    ("/events", "viewer"),
+    ("/connections/IB_SEED/events", "viewer"),
+    ("/alerts/active", "diagonly"),
+    # BACKLOG #2443 step 4: the connections dashboard. Its route needs only monitoring:read, so a
+    # failed connection's error is gated on its own; the seed starts one outbound that cannot build.
+    ("/connections", "viewer"),
+    # And the same error for one connection on its metadata route.
+    ("/connections/OB_BROKEN/metadata", "viewer"),
 )
 
 #: Every property the doc's read table gates, flattened — what must be null for a caller without
@@ -135,9 +150,16 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
             permissions=[Permission.MESSAGES_READ.value, Permission.MESSAGES_VIEW_RAW.value],
             actor="test",
         )
+        diagnose = await service.create_custom_role(
+            display_name="Diagnose only",
+            description="monitoring:diagnose WITHOUT messages:view_summary (BACKLOG #2443)",
+            permissions=[Permission.MONITORING_READ.value, Permission.MONITORING_DIAGNOSE.value],
+            actor="test",
+        )
         for username, roles in (
             ("viewer", [Role.VIEWER.value]),
             ("rawonly", [custom.id]),
+            ("diagonly", [diagnose.id]),
             ("boss", [Role.ADMINISTRATOR.value]),
         ):
             uid = await create_local_user_chosen(
@@ -200,12 +222,40 @@ async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
         dead = await engine.store.claim_ready(destination_name="OB_DEAD")
         assert dead, "the dead-letter seed did not claim its outbox row"
         await engine.store.dead_letter_now(dead[0].id, error="handler blew up on MRN9002")
+        # BACKLOG #2443: a scrubbed reason on an event and on an alert, each quoting the MRN.
+        await engine.store.record_connection_event(
+            connection="IB_SEED",
+            transport="mllp",
+            direction="inbound",
+            kind="handler_error",
+            reason="store refused frame for MRN9001",
+        )
+        await engine.store.upsert_alert_instance(
+            event_type="connection_error",
+            connection="IB_SEED",
+            severity="critical",
+            reason="delivery failed for MRN9001",
+        )
+        # BACKLOG #2443 step 4: an outbound whose env() cannot resolve fails to build (ADR 0031), so
+        # GET /connections carries a standalone "failed" row with a non-null error.
+        reg = Registry()
+        reg.add_outbound(
+            build_outbound_connection(
+                "OB_BROKEN",
+                ConnectionSpec(
+                    ConnectorType.FILE,
+                    {"directory": env("missing_dir"), "filename": "{MSH-10}.hl7"},
+                ),
+            )
+        )
+        engine.add_registry(reg)
+        await engine.start()
 
         # Layered search is OWNER-scoped, so every caller needs a preset of their own. The owner key
         # is the immutable Identity.user_id, never the reassignable username (BACKLOG #1225), so the
         # seed has to resolve the id -- seeding by name writes a row no route can reach.
         presets: dict[str, str] = {}
-        for username in ("viewer", "rawonly", "boss"):
+        for username in ("viewer", "rawonly", "diagonly", "boss"):
             seeded_user = await engine.store.get_user_by_username(username)
             assert seeded_user is not None, f"seed user {username!r} was not created"
             preset_id, _replaced = await engine.store.upsert_search_preset(
@@ -241,7 +291,7 @@ async def _login(client: httpx.AsyncClient, username: str) -> dict[str, str]:
 
 
 async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _Seed) -> None:
-    """No caller lacking ``messages:view_summary`` receives ANY gated property, on ANY of the six
+    """No caller lacking ``messages:view_summary`` receives ANY gated property, on ANY of the
     surfaces docs/SECURITY.md names.
 
     RULE: ``redact_unauthorized`` fails OPEN, so a PHI-bearing route that forgets to call it is
@@ -251,6 +301,7 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
         tokens = {
             "viewer": await _login(client, "viewer"),
             "rawonly": await _login(client, "rawonly"),
+            "diagonly": await _login(client, "diagonly"),
         }
         for template, who in _SURFACES:
             path = template.format(
@@ -277,7 +328,7 @@ async def test_view_summary_is_withheld_on_every_documented_surface(seeded: _See
 
 
 def test_every_mapped_model_has_a_distinct_field_signature() -> None:
-    """The attribution below is sound only while the six signatures are unique — assert it."""
+    """The attribution below is sound only while the model signatures are unique — assert it."""
     assert len(_MODEL_SIGNATURES) == len(PHI_FIELDS), (
         "two PHI_FIELDS models now share a field-name signature, so a JSON object cannot be "
         "attributed to its model. Re-key _attributed_pairs before trusting it."

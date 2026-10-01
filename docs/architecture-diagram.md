@@ -144,7 +144,7 @@ flowchart TB
   subgraph ENGINE["Engine — headless asyncio service (no GUI imports)"]
     PIPE["pipeline/ — RegistryRunner<br/>listener · router · transform · delivery workers"]:::engine
     TRANS["transports/ — connector registry<br/>MLLP · File · X12 (TCP/HTTP/DB planned)"]:::engine
-    PARSE["parsing/ — pure HL7/X12 library<br/>python-hl7 · hl7apy · X12 codec"]:::engine
+    PARSE["parsing/ — pure HL7/X12 library<br/>built-in HL7 parser · hl7apy · X12 codec"]:::engine
     STORE[("store/ — staged queue<br/>SQLite WAL · SQL Server · AES-256-GCM")]:::engine
     CFG["config/ — code-first wiring<br/>Connections · Routers · Handlers · environments/"]:::engine
   end

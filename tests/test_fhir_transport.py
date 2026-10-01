@@ -16,6 +16,7 @@ import io
 import json
 import urllib.error
 import urllib.request
+from typing import Any
 
 import pytest
 from _fhir_fixtures import (
@@ -34,7 +35,12 @@ from messagefoundry.config.wiring import FHIR, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
-from messagefoundry.transports.fhir import FhirDestination, _capture_outcome, _classify_fhir
+from messagefoundry.transports.fhir import (
+    FhirDestination,
+    _capture_outcome,
+    _classify_fhir,
+    _resolve_read_url,
+)
 
 BASE = "https://fhir.example.org/fhir"
 PATIENT = as_json(PATIENT_R4B)  # id "synthetic-001", no meta.versionId
@@ -55,9 +61,12 @@ def _http_error(code: int, body: bytes = b"") -> urllib.error.HTTPError:
 
 
 class _FakeResp:
-    def __init__(self, body: bytes = b"", status: int = 200) -> None:
+    def __init__(
+        self, body: bytes = b"", status: int = 200, headers: email.message.Message | None = None
+    ) -> None:
         self._body = body
         self.status = status
+        self.headers = headers if headers is not None else email.message.Message()
 
     def read(self, amt: int = -1) -> bytes:
         return self._body if amt < 0 else (self._body)[:amt]
@@ -72,17 +81,32 @@ class _FakeResp:
 class _FakeOpener:
     """Records the Request, then returns a chosen response or raises a chosen error."""
 
-    def __init__(self, exc: Exception | None = None, body: bytes = b"", status: int = 200) -> None:
+    def __init__(
+        self,
+        exc: Exception | None = None,
+        body: bytes = b"",
+        status: int = 200,
+        headers: email.message.Message | None = None,
+    ) -> None:
         self.exc = exc
         self.body = body
         self.status = status
+        self.headers = headers
         self.requests: list[urllib.request.Request] = []
 
     def open(self, req: urllib.request.Request, timeout: float | None = None) -> _FakeResp:
         self.requests.append(req)
         if self.exc is not None:
             raise self.exc
-        return _FakeResp(self.body, self.status)
+        return _FakeResp(self.body, self.status, self.headers)
+
+
+def _sent_bundle(req: urllib.request.Request) -> dict[str, Any]:
+    """The JSON body a request carried, parsed. Used on the wrapped-update requests."""
+    assert isinstance(req.data, bytes)
+    parsed = json.loads(req.data)
+    assert isinstance(parsed, dict)
+    return parsed
 
 
 # --- construction / validation ----------------------------------------------
@@ -191,43 +215,37 @@ def test_fhir_basic_auth_header() -> None:
 
 
 def test_resolve_create() -> None:
-    method, url, extra = _dest(interaction="create")._resolve_request(PATIENT)
-    assert (method, url, extra) == ("POST", f"{BASE}/Patient", {})
+    r = _dest(interaction="create")._resolve_request(PATIENT)
+    assert r == ("POST", f"{BASE}/Patient", {}, False)
 
 
 def test_resolve_update() -> None:
-    method, url, extra = _dest(interaction="update")._resolve_request(PATIENT)
-    assert (method, url, extra) == ("PUT", f"{BASE}/Patient/synthetic-001", {})
+    # vault BACKLOG #1965: an update resolves to a relative transaction ENTRY, never a request URL.
+    r = _dest(interaction="update")._resolve_request(PATIENT)
+    assert r == ("PUT", "Patient/synthetic-001", {}, True)
 
 
 def test_resolve_transaction_posts_to_base() -> None:
-    method, url, extra = _dest(interaction="transaction")._resolve_request(
-        as_json(BUNDLE_TRANSACTION)
-    )
-    assert (method, url, extra) == ("POST", BASE, {})
+    r = _dest(interaction="transaction")._resolve_request(as_json(BUNDLE_TRANSACTION))
+    assert r == ("POST", BASE, {}, False)
 
 
 def test_resolve_if_none_exist_header() -> None:
     dest = _dest(conditional="if-none-exist", conditional_query="identifier=sys|val")
-    method, url, extra = dest._resolve_request(PATIENT)
-    assert method == "POST"
-    assert url == f"{BASE}/Patient"
-    assert extra == {"If-None-Exist": "identifier=sys|val"}
+    r = dest._resolve_request(PATIENT)
+    assert r == ("POST", f"{BASE}/Patient", {"If-None-Exist": "identifier=sys|val"}, False)
 
 
 def test_resolve_conditional_update_query_in_url() -> None:
     dest = _dest(conditional="conditional-update", conditional_query="identifier=sys|val")
-    method, url, extra = dest._resolve_request(PATIENT)
-    assert method == "PUT"
-    assert url == f"{BASE}/Patient?identifier=sys|val"
-    assert extra == {}
+    r = dest._resolve_request(PATIENT)
+    assert r == ("PUT", f"{BASE}/Patient?identifier=sys|val", {}, False)
 
 
 def test_resolve_if_match_etag_from_version_id() -> None:
-    method, url, extra = _dest(conditional="if-match")._resolve_request(PATIENT_VERSIONED)
-    assert method == "PUT"
-    assert url == f"{BASE}/Patient/p-1"
-    assert extra == {"If-Match": 'W/"3"'}
+    # vault BACKLOG #1965: the ETag rides the entry; send() moves If-Match into request.ifMatch.
+    r = _dest(conditional="if-match")._resolve_request(PATIENT_VERSIONED)
+    assert r == ("PUT", "Patient/p-1", {"If-Match": 'W/"3"'}, True)
 
 
 def test_resolve_if_match_versionid_with_control_char_is_permanent() -> None:
@@ -371,8 +389,8 @@ def test_resolve_encodes_segments() -> None:
     # A benign id needing no encoding under the FHIR grammar produces the expected URL (no over-encoding),
     # proving the grammar gate + quote round-trips a valid id.
     body = json.dumps({"resourceType": "Patient", "id": "abc.123-DEF"})
-    method, url, extra = _dest(interaction="update")._resolve_request(body)
-    assert (method, url, extra) == ("PUT", f"{BASE}/Patient/abc.123-DEF", {})
+    r = _dest(interaction="update")._resolve_request(body)
+    assert r == ("PUT", "Patient/abc.123-DEF", {}, True)
     # An id that was previously accepted (control-char-free) but carries a path separator is now rejected,
     # confirming the grammar gate closed the redirection vector.
     redir = json.dumps({"resourceType": "Patient", "id": "p/../$op"})
@@ -494,6 +512,303 @@ async def test_send_4xx_with_transient_outcome_retries() -> None:
     assert not isinstance(ei.value, NegativeAckError)
 
 
+# --- vault BACKLOG #1965: update and if-match keep the id out of the URL (ASVS 14.2.1, ruling R3) ---
+
+#: A distinctive message-derived id, so "not in the URL" cannot pass by the URL happening to lack a
+#: short common substring.
+ID_1965 = "mf1965-msg-id"
+UPDATE_1965 = json.dumps(
+    {"resourceType": "Patient", "id": ID_1965, "meta": {"versionId": "7"}, "active": True}
+)
+
+
+def _transaction_response(status: str, **response: object) -> bytes:
+    return json.dumps(
+        {
+            "resourceType": "Bundle",
+            "type": "transaction-response",
+            "entry": [{"response": {"status": status, **response}}],
+        }
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    ("over", "extra"),
+    [({"interaction": "update"}, {}), ({"conditional": "if-match"}, {"ifMatch": 'W/"7"'})],
+    ids=["update", "if-match"],
+)
+async def test_update_and_if_match_url_carries_no_message_id(
+    over: dict[str, str], extra: dict[str, str]
+) -> None:
+    dest = _dest(**over)
+    opener = _FakeOpener(body=_transaction_response("200 OK"))
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965)
+    req = opener.requests[0]
+    assert req.method == "POST"
+    assert req.full_url == BASE
+    assert ID_1965 not in req.full_url
+    assert not req.has_header("If-match")
+    # Positive control: the id did go somewhere, so the absence above is not a lost id.
+    bundle = _sent_bundle(req)
+    assert (bundle["resourceType"], bundle["type"]) == ("Bundle", "transaction")
+    [entry] = bundle["entry"]
+    assert entry["request"] == {"method": "PUT", "url": f"Patient/{ID_1965}", **extra}
+    assert entry["resource"] == json.loads(UPDATE_1965)
+    # A PUT entry's fullUrl SHALL have a value; it carries the id in the body, never the URL.
+    assert entry["fullUrl"] == f"{BASE}/Patient/{ID_1965}"
+
+
+def test_read_site_still_carries_the_id_in_the_path() -> None:
+    # Control arm. R3 names update and if-match only; a RESTful read is GET [base]/[type]/[id] by
+    # specification, and vault BACKLOG #1965 leaves this site as it was.
+    url = _resolve_read_url(BASE, f"Patient/{ID_1965}")
+    assert url == f"{BASE}/Patient/{ID_1965}"
+
+
+async def test_create_is_not_wrapped() -> None:
+    # Control arm: create puts no id in the URL, so its body still goes out exactly as given.
+    dest = _dest(interaction="create")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965)
+    assert opener.requests[0].full_url == f"{BASE}/Patient"
+    assert opener.requests[0].data == UPDATE_1965.encode("utf-8")
+
+
+async def test_wrapped_resource_is_spliced_verbatim() -> None:
+    # A JSON round-trip would turn 1.50 into 1.5, and FHIR keeps a decimal's precision.
+    raw = '{"resourceType":"Observation","id":"obs-1","valueQuantity":{"value":1.50}}'
+    dest = _dest(interaction="update")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    # FhirPeek tolerates a leading BOM; the Bundle must not carry it.
+    await dest.send("\N{ZERO WIDTH NO-BREAK SPACE}" + raw)
+    data = opener.requests[0].data
+    assert isinstance(data, bytes)
+    assert raw.encode() in data
+    assert _sent_bundle(opener.requests[0])["entry"][0]["request"]["url"] == "Observation/obs-1"
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome", "permanent"),
+    [
+        ("412 Precondition Failed", None, True),
+        (
+            "409 Conflict",
+            {"resourceType": "OperationOutcome", "issue": [{"code": "lock-error"}]},
+            False,
+        ),
+    ],
+)
+async def test_failed_entry_in_a_2xx_reply_is_not_delivered(
+    status: str, outcome: dict[str, object] | None, permanent: bool
+) -> None:
+    # A conformant server fails the whole transaction with an error status. This pins the other
+    # case: a 2xx reply whose one entry failed must not be recorded as delivered.
+    extra = {"outcome": outcome} if outcome is not None else {}
+    dest = _dest(conditional="if-match")
+    dest._opener = _FakeOpener(body=_transaction_response(status, **extra))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send(UPDATE_1965)
+    assert isinstance(ei.value, NegativeAckError) is permanent
+    # The status came from the entry, not the HTTP reply, and the message says so.
+    assert "transaction entry status" in str(ei.value) and "HTTP" not in str(ei.value)
+
+
+async def test_successful_entry_is_delivered() -> None:
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=_transaction_response("201 Created"))  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None
+
+
+async def test_entry_etag_and_location_are_captured_as_headers() -> None:
+    # #154 capture keeps working for an update: the values a PUT reply carried as headers now come
+    # back in the entry. The entry describes the updated resource, so it wins over a reply header,
+    # which describes the Bundle. A reply header the entry lacks is kept; an unsafe value is dropped.
+    reply_headers = email.message.Message()
+    reply_headers["Etag"] = 'W/"bundle-level"'
+    reply_headers["Location"] = "from-the-real-header"
+    dest = _dest(
+        interaction="update",
+        capture_response=True,
+        capture_response_headers=["ETag", "Location", "Last-Modified"],
+    )
+    dest._opener = _FakeOpener(  # type: ignore[assignment]
+        body=_transaction_response("200 OK", etag='W/"8"', lastModified="x\r\ny"),
+        headers=reply_headers,
+    )
+    resp = await dest.send(UPDATE_1965)
+    assert resp is not None
+    assert resp.headers == {"ETag": 'W/"8"', "Location": "from-the-real-header"}
+
+
+async def test_overlong_entry_etag_is_not_captured_and_hides_the_bundle_etag() -> None:
+    # The entry named an ETag, so the reply's own ETag, which describes the Bundle, must not stand
+    # in for it when the entry's value is dropped.
+    reply_headers = email.message.Message()
+    reply_headers["ETag"] = 'W/"bundle-level"'
+    dest = _dest(interaction="update", capture_response=True, capture_response_headers=["ETag"])
+    dest._opener = _FakeOpener(  # type: ignore[assignment]
+        body=_transaction_response("200 OK", etag="x" * 9000), headers=reply_headers
+    )
+    resp = await dest.send(UPDATE_1965)
+    assert resp is not None and resp.headers == {}
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ({"resourceType": "OperationOutcome", "issue": [{"severity": "error"}]}, "rejected"),
+        ({"resourceType": "OperationOutcome", "issue": [{"severity": "warning"}]}, "accepted"),
+        (None, "accepted"),
+    ],
+)
+async def test_capture_outcome_comes_from_the_entry(
+    outcome: dict[str, object] | None, expected: str
+) -> None:
+    # A 2xx PUT whose body was an error OperationOutcome was captured as rejected. In a
+    # transaction-response that outcome sits in the entry, so it is read there.
+    extra = {"outcome": outcome} if outcome is not None else {}
+    dest = _dest(interaction="update", capture_response=True)
+    dest._opener = _FakeOpener(body=_transaction_response("200 OK", **extra))  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    assert resp is not None and resp.outcome == expected
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["HTTP/1.1 404 Not Found", "\N{SUPERSCRIPT TWO}" * 3, True, None],
+    ids=["prefixed", "non-ascii-digits", "bool", "missing"],
+)
+async def test_unreadable_entry_status_is_delivered_with_a_warning(
+    status: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The server answered 2xx, so the write most likely applied; a retry of an applied if-match
+    # update would 412 and dead-letter a message that landed. A non-ASCII digit must not reach
+    # int() and escape as an unclassified ValueError.
+    entry = {"response": {} if status is None else {"status": status}}
+    body = {"resourceType": "Bundle", "type": "transaction-response", "entry": [entry]}
+    dest = _dest(conditional="if-match")
+    dest._opener = _FakeOpener(body=json.dumps(body).encode())  # type: ignore[assignment]
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.fhir"):
+        assert await dest.send(UPDATE_1965) is None
+    assert "no readable status" in caplog.text
+
+
+@pytest.mark.parametrize("status", [404, 404.0], ids=["int", "float"])
+async def test_numeric_entry_status_is_read(status: float) -> None:
+    dest = _dest(interaction="update")
+    body = {"resourceType": "Bundle", "entry": [{"response": {"status": status}}]}
+    dest._opener = _FakeOpener(body=json.dumps(body).encode())  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError):
+        await dest.send(UPDATE_1965)
+
+
+async def test_too_deep_2xx_reply_captures_as_unparseable() -> None:
+    # A capture of a too-deep reply must classify, not escape as RecursionError.
+    for over in ({"interaction": "update"}, {"interaction": "create"}):
+        dest = _dest(capture_response=True, **over)
+        dest._opener = _FakeOpener(body=b"[" * 200_000)  # type: ignore[assignment]
+        resp = await dest.send(UPDATE_1965)
+        assert resp is not None and resp.outcome == "unparseable"
+
+
+async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:
+    # Control arm for the entry checks: a 2xx with no entry is delivered, as any 2xx was before.
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=b"")  # type: ignore[assignment]
+    assert await dest.send(UPDATE_1965) is None
+
+
+async def test_dynamic_if_match_on_plain_update_moves_into_the_entry() -> None:
+    # Before the wrap, a Handler-stamped If-Match qualified the PUT. On the outer POST it would
+    # qualify the Bundle, so it moves into the entry instead.
+    dest = _dest(interaction="update", dynamic_headers=True)
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965, metadata={"http.header.if-match": 'W/"5"'})
+    req = opener.requests[0]
+    assert not req.has_header("If-match")
+    assert _sent_bundle(req)["entry"][0]["request"]["ifMatch"] == 'W/"5"'
+
+
+async def test_static_if_match_moves_into_the_entry_and_a_dynamic_one_overrides_it() -> None:
+    dest = _dest(interaction="update", headers={"If-Match": 'W/"static"'})
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965)
+    await dest.send(UPDATE_1965, metadata={"http.header.If-Match": 'W/"dynamic"'})
+    for req, expected in zip(opener.requests, ('W/"static"', 'W/"dynamic"'), strict=True):
+        assert not req.has_header("If-match")
+        assert _sent_bundle(req)["entry"][0]["request"]["ifMatch"] == expected
+
+
+def test_static_if_match_stays_a_header_on_create() -> None:
+    # Control arm: only a connection whose writes are wrapped moves its static If-Match.
+    assert _dest(interaction="create", headers={"If-Match": "x"})._headers["If-Match"] == "x"
+
+
+async def test_connector_if_match_wins_over_every_other_case_spelling() -> None:
+    # The version check is the connector's. A static If-Match and a Handler-stamped if-match in
+    # another letter case must not displace it.
+    dest = _dest(conditional="if-match", headers={"If-Match": 'W/"static"'}, dynamic_headers=True)
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965, metadata={"http.header.if-match": 'W/"attacker"'})
+    assert _sent_bundle(opener.requests[0])["entry"][0]["request"]["ifMatch"] == 'W/"7"'
+
+
+@pytest.mark.parametrize(
+    ("header", "field"),
+    [
+        ("If-None-Match", "ifNoneMatch"),
+        ("If-Modified-Since", "ifModifiedSince"),
+        ("If-None-Exist", "ifNoneExist"),
+    ],
+)
+async def test_other_conditional_headers_move_into_the_entry(header: str, field: str) -> None:
+    # Each would have qualified the PUT; Bundle.entry.request has a field of the same meaning.
+    for static in (True, False):
+        dest = _dest(interaction="update", headers={header: "v"} if static else None)
+        opener = _FakeOpener()
+        dest._opener = opener  # type: ignore[assignment]
+        await dest.send(UPDATE_1965, metadata=None if static else {f"http.header.{header}": "v"})
+        req = opener.requests[0]
+        assert not req.has_header(header.capitalize())
+        assert _sent_bundle(req)["entry"][0]["request"][field] == "v"
+
+
+@pytest.mark.parametrize("dots", [".", "..", "..."])
+def test_resolve_rejects_a_dot_only_id(dots: str) -> None:
+    # The id grammar admits these, and a path resolver reads them as this level or the parent.
+    body = json.dumps({"resourceType": "Patient", "id": dots})
+    with pytest.raises(NegativeAckError) as ei:
+        _dest(interaction="update")._resolve_request(body)
+    assert ei.value.permanent is True
+
+
+async def test_deeply_nested_error_body_still_classifies() -> None:
+    # A 5xx is transient without reading its body, and a 4xx body too deep to parse classifies on
+    # the status rather than escaping as RecursionError.
+    nested = b"[" * 200_000
+    for code, permanent in ((503, False), (404, True)):
+        dest = _dest(interaction="create")
+        dest._opener = _FakeOpener(_http_error(code, nested))  # type: ignore[assignment]
+        with pytest.raises(DeliveryError) as ei:
+            await dest.send(PATIENT)
+        assert isinstance(ei.value, NegativeAckError) is permanent
+
+
+async def test_dynamic_if_match_on_create_stays_a_header() -> None:
+    # Control arm for the move above: an unwrapped request keeps the header where it was.
+    dest = _dest(interaction="create", dynamic_headers=True)
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(UPDATE_1965, metadata={"http.header.If-Match": 'W/"5"'})
+    assert opener.requests[0].get_header("If-match") == 'W/"5"'
+
+
 # --- registry + egress ------------------------------------------------------
 
 
@@ -555,13 +870,16 @@ async def test_fhir_per_message_header_overrides_static() -> None:
 
 
 async def test_fhir_dynamic_header_cannot_override_if_match() -> None:
-    # The connector's interaction header (If-Match) is semantically required and must win over a
-    # message-derived header of the same name.
+    # The connector's version check is semantically required and must win over a message-derived
+    # header of the same name. Since vault BACKLOG #1965 it lives in the entry's ifMatch, and the
+    # message-derived header must not ride the outer POST either.
     dest = _dest(interaction="update", conditional="if-match")
     opener = _FakeOpener()
     dest._opener = opener  # type: ignore[assignment]
     await dest.send(PATIENT_VERSIONED, metadata={"http.header.If-Match": 'W/"attacker"'})
-    assert opener.requests[0].get_header("If-match") == 'W/"3"'
+    req = opener.requests[0]
+    assert not req.has_header("If-match")
+    assert _sent_bundle(req)["entry"][0]["request"]["ifMatch"] == 'W/"3"'
 
 
 async def test_fhir_crlf_in_header_value_is_neutralized() -> None:

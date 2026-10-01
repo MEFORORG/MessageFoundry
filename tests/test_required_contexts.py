@@ -89,6 +89,10 @@ _MUST_NOT_BE_REQUIRED = (
     "Scorecard analysis",
     "kubeconform + HA policy lint",
     "freethread smoke (3.14t)",
+    # The Python 3.15 readiness canary. Advisory and allowed to go red; it has no merge_group
+    # trigger and runs on a pull request only when its own file changes.
+    "python 3.15 canary (ubuntu-latest)",
+    "python 3.15 canary (windows-latest)",
     "complexity triage (advisory)",
     "clone detection (advisory)",
     "diff-coverage (advisory)",
@@ -103,6 +107,9 @@ _MUST_NOT_BE_REQUIRED = (
     # The security.txt renewal reminder (BACKLOG #277). Schedule and dispatch only, so it never
     # reports on a pull request: required, it would wedge every one.
     "security.txt Expires is not near",
+    # The nightly mutation list over the invariant tests (BACKLOG #1746). Schedule and dispatch only,
+    # so it never reports on a pull request: required, it would wedge every one.
+    "invariant mutations (nightly)",
 )
 
 

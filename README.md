@@ -15,7 +15,7 @@ messages across many formats (HL7 v2, JSON, XML/SOAP, X12, database records) and
 guided tooling or extend it in Python; it runs on SQLite, PostgreSQL, or SQL Server with
 authentication, RBAC, audit logging, and encryption-at-rest built in.
 
-> Python import package: `messagefoundry`. Built with **hl7apy** + **python-hl7** (HL7 parsing/
+> Python import package: `messagefoundry`. Built with its own tolerant HL7 parser + **hl7apy** (HL7 parsing/
 > validation), **FastAPI** (engine API + the same-origin `/ui` web console), and **PySide6** (the
 > standalone test harness).
 
@@ -43,7 +43,7 @@ renders on GitHub and in the VS Code preview). The prose source of truth is
 - **Reliable by default.** A durable, transactional pipeline gives at-least-once delivery,
   automatic retries, replay, and dead-lettering — no separate message broker to run.
 - **Async core.** asyncio with per-connection workers for listeners, pollers, retries.
-- **Tolerant parsing first.** `python-hl7` for fast routing/peek; `hl7apy` for deep,
+- **Tolerant parsing first.** A built-in tolerant parser for fast routing/peek; `hl7apy` for deep,
   version-aware validation and profiles on demand (real-world HL7 is often non-conformant).
 - **Configure visually or in code.** Author connections and routes with guided wizards, or in
   Python (`inbound`/`outbound`/`@router`/`@handler`) for full control — always version-controlled.
@@ -120,19 +120,20 @@ pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP
 pip install "messagefoundry[harness]==<version>"     # the standalone PySide6 test harness GUI
 ```
 
-**Web console 0.3.0 is the one that pairs with engine 0.4.0.** The browser console (`/ui`) ships as
+**Web console 0.4.0 is the one that pairs with engine 0.5.0.** The browser console (`/ui`) ships as
 its own wheel, `messagefoundry-webconsole`, with its own version numbers. It does not share the
-engine's version, so `messagefoundry-webconsole==0.4.0` does not exist. The engine mounts a console
+engine's version, so `messagefoundry-webconsole==0.5.0` does not exist. The engine mounts a console
 only if it was built against this engine's UI seam, the version of the interface between the two.
-Console 0.3.0 was built against engine 0.4.0's seam. It is published alongside engine 0.4.0, under
-its own `webconsole-v0.3.0` tag. Pin the pair: `messagefoundry==0.4.0` with
-`messagefoundry-webconsole==0.3.0`. Without that console, engine 0.4.0 behaves like this:
+Console 0.4.0 was built against engine 0.5.0's seam. It is published alongside engine 0.5.0, under
+its own `webconsole-v0.4.0` tag. Pin the pair: `messagefoundry==0.5.0` with
+`messagefoundry-webconsole==0.4.0`. Without that console, engine 0.5.0 behaves like this:
 
 - **No console installed:** the engine serves the JSON API only and prints a warning at startup. If you
   set `[security].serve_web_console = true`, it refuses to start instead.
-- **Console 0.2.15 installed, console on:** the engine refuses to start. 0.2.15 was built for an older
-  engine, so startup stops with an import error or a seam mismatch. The console is on by default for a
-  loopback bind. Upgrade the console to 0.3.0, or set `[security].serve_web_console = false`.
+- **Console 0.3.0 or older installed, console on:** the engine refuses to start. Those consoles were
+  built for an older engine, so startup stops with an import error or a seam mismatch. The console is
+  on by default for a loopback bind. Upgrade the console to 0.4.0, or set
+  `[security].serve_web_console = false`.
 
 **What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
 the browser **web console** served same-origin at `/ui`, which ships as a separate wheel
@@ -146,15 +147,20 @@ different ecosystem); see *VS Code extension & test harness* below for where to 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow
 > and published with **PEP 740 attestations** — all three publish jobs set `attestations: true`.
 >
-> **Sigstore signing, SLSA build-provenance and the CycloneDX SBOM cover the ENGINE wheel only.** The
+> **Sigstore signing and SLSA build-provenance cover the ENGINE release files and the TOOLKIT wheel
+> only.** The engine files are its wheel, sdist, two SBOMs (Linux- and Windows-resolved) and VEX.
+> The CycloneDX SBOMs cover the engine only. The `messagefoundry-toolkit` wheel is built in the engine's release job, which signs and
+> attests it (BACKLOG #1192). The
 > `messagefoundry-webconsole` and `messagefoundry-harness` release jobs contain no signing, attestation
 > or SBOM step (BACKLOG #1193) — this note previously said "every release", which is why it is spelled
 > out per artifact rather than tightened in place. So `gh attestation verify` finds a GitHub
-> attestation for the engine wheel and **will not** find one for the console or harness wheel; those
-> carry the PyPI-side attestation only.
+> attestation for the engine and toolkit wheels and **will not** find one for the console or harness
+> wheel; those carry the PyPI-side attestation only.
 >
-> Verify a downloaded **engine** wheel against its source commit with
-> `gh attestation verify <wheel> --repo MEFORORG/MessageFoundry`, or pull the signed wheel + SBOM
+> Verify a downloaded **engine** or **toolkit** wheel against its source commit with
+> `gh attestation verify <wheel> --repo MEFORORG/MessageFoundry --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml --source-ref refs/tags/v<version>`
+> (keep the last two flags; [docs/SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md) says why). Use the TAG's
+> spelling of the version: a pre-release tag is `v0.5.0-rc1`, while its wheel says `0.5.0rc1`. Or pull the signed wheel + SBOM
 > from the [GitHub Release assets](https://github.com/MEFORORG/MessageFoundry/releases). For an
 > air-gapped site, mirror the wheel to a private index.
 >

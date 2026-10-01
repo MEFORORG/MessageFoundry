@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""``messagefoundry adr-analyze`` — advisory spec-driven coverage report over the ADRs.
+"""``messagefoundry-toolkit adr-analyze`` — advisory spec-driven coverage report over the ADRs.
 
 The **analyze** half of the Secure Development Standards §5 spec-driven recommendations (R3): scan the
 Architecture Decision Records and report, **advisory-only** (never blocks a commit by default):
@@ -8,6 +8,8 @@ Architecture Decision Records and report, **advisory-only** (never blocks a comm
 * **Acceptance-criteria coverage** — for each ADR carrying an ``## Acceptance Criteria`` block (EARS,
   per the ADR ``TEMPLATE.md`` / R1), the test/fixture each criterion links to (``→ tests/…``), and
   whether that file exists on disk. A *coverage gap* is a criterion whose linked test is missing.
+  A link whose path climbs out of the repository root with ``..``, or names a DOS device such as
+  ``NUL`` or ``nul.py``, is reported as outside the repository on every platform, never probed.
 * **Missing criteria** — an ``Accepted`` ADR with no acceptance-criteria block (recommended to add).
 * **Open clarifications** — unchecked ``- [ ]`` task items (the "clarify" step): questions that
   should be resolved before an ADR flips to ``Accepted``.
@@ -21,6 +23,7 @@ advisory — an absent corpus; :func:`analyze_adrs` defines it and says why.
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,8 +48,11 @@ _REF_RE = re.compile(
 _STATUS_RE = re.compile(
     r"status[^A-Za-z]*\b(Proposed|Accepted|Superseded|Rejected|Reserved|Dropped)\b", re.IGNORECASE
 )
-_UNCHECKED_RE = re.compile(r"^\s*[-*]\s+\[ \]\s+(.*\S)\s*$")
-_HEADING_RE = re.compile(r"^#{1,6}\s+(.*\S)\s*$")
+# Both run on an RSTRIPPED line, so the capture starts at a non-space and runs to the end. The old
+# forms, ``\s+(.*\S)\s*$`` on the raw line, retried every split of a whitespace-only tail and took
+# time quadratic in its length (BACKLOG #2516). ``rstrip`` and ``\s`` agree on what whitespace is.
+_UNCHECKED_RE = re.compile(r"^\s*[-*]\s+\[ \]\s+(\S.*)$")
+_HEADING_RE = re.compile(r"^#{1,6}\s+(\S.*)$")
 _BULLET_RE = re.compile(r"^\s*[-*]\s+\S")
 
 
@@ -57,11 +63,13 @@ class AcceptanceCriterion:
     text: str
     test_refs: list[str] = field(default_factory=list)
     missing_refs: list[str] = field(default_factory=list)
+    #: Refs whose path climbs out of the repository root. Never probed, so never in ``missing_refs``.
+    outside_refs: list[str] = field(default_factory=list)
 
     @property
     def covered(self) -> bool:
-        """Covered iff it links ≥1 test/fixture and none of them are missing on disk."""
-        return bool(self.test_refs) and not self.missing_refs
+        """Covered iff it links ≥1 test/fixture, none missing on disk and none outside the root."""
+        return bool(self.test_refs) and not self.missing_refs and not self.outside_refs
 
 
 @dataclass(frozen=True)
@@ -87,6 +95,10 @@ class AdrReport:
     def coverage_gaps(self) -> list[str]:
         return [ref for c in self.criteria for ref in c.missing_refs]
 
+    @property
+    def outside_refs(self) -> list[str]:
+        return [ref for c in self.criteria for ref in c.outside_refs]
+
     def to_json(self) -> dict[str, object]:
         return {
             "path": self.path,
@@ -94,7 +106,12 @@ class AdrReport:
             "title": self.title,
             "status": self.status,
             "criteria": [
-                {"text": c.text, "test_refs": c.test_refs, "missing_refs": c.missing_refs}
+                {
+                    "text": c.text,
+                    "test_refs": c.test_refs,
+                    "missing_refs": c.missing_refs,
+                    "outside_refs": c.outside_refs,
+                }
                 for c in self.criteria
             ],
             "open_clarifications": self.open_clarifications,
@@ -106,7 +123,8 @@ class AnalysisResult:
     """The whole-ADR-set report.
 
     ``error`` is a human-readable line naming the directory when there was no corpus to analyze,
-    and ``None`` otherwise; :func:`analyze_adrs` sets it and gives the reasoning.
+    or no repository root to check its links against, and ``None`` otherwise;
+    :func:`analyze_adrs` sets it and gives the reasoning.
     """
 
     reports: list[AdrReport]
@@ -118,6 +136,11 @@ class AnalysisResult:
         return [(r.adr_id, ref) for r in self.reports for ref in r.coverage_gaps]
 
     @property
+    def outside_refs(self) -> list[tuple[str, str]]:
+        """``(adr_id, ref)`` for every test link whose path leaves the repository root."""
+        return [(r.adr_id, ref) for r in self.reports for ref in r.outside_refs]
+
+    @property
     def accepted_without_criteria(self) -> list[str]:
         return [r.adr_id for r in self.reports if r.accepted and not r.has_criteria]
 
@@ -127,8 +150,8 @@ class AnalysisResult:
 
     @property
     def ok(self) -> bool:
-        """True iff a corpus was analyzed and it has no acceptance-criteria coverage gaps."""
-        return self.error is None and not self.coverage_gaps
+        """True iff a corpus was analyzed and every acceptance-criterion link was found inside it."""
+        return self.error is None and not self.coverage_gaps and not self.outside_refs
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -136,9 +159,18 @@ class AnalysisResult:
             "error": self.error,
             "adrs": [r.to_json() for r in self.reports],
             "coverage_gaps": [{"adr": a, "ref": ref} for a, ref in self.coverage_gaps],
+            "outside_refs": [{"adr": a, "ref": ref} for a, ref in self.outside_refs],
             "accepted_without_criteria": self.accepted_without_criteria,
             "open_clarifications": [{"adr": a, "item": i} for a, i in self.open_clarifications],
         }
+
+
+def _capture(pattern: re.Pattern[str], line: str) -> str | None:
+    """``pattern``'s capture over the rstripped ``line``, or None when it does not match.
+
+    The capture has no surrounding whitespace, so callers need not strip it."""
+    m = pattern.match(line.rstrip())
+    return m.group(1) if m else None
 
 
 def _sections(text: str) -> dict[str, list[str]]:
@@ -146,9 +178,9 @@ def _sections(text: str) -> dict[str, list[str]]:
     sections: dict[str, list[str]] = {}
     current: str | None = None
     for line in text.splitlines():
-        m = _HEADING_RE.match(line)
-        if m:
-            current = m.group(1).strip().lower()
+        heading = _capture(_HEADING_RE, line)
+        if heading is not None:
+            current = heading.lower()
             sections.setdefault(current, [])
         elif current is not None:
             sections[current].append(line)
@@ -162,10 +194,42 @@ def _status(text: str) -> str:
 
 def _title(text: str, fallback: str) -> str:
     for line in text.splitlines():
-        m = _HEADING_RE.match(line)
-        if m:
-            return m.group(1).strip()
+        heading = _capture(_HEADING_RE, line)
+        if heading is not None:
+            return heading
     return fallback
+
+
+#: The DOS device names. Windows opens the device for one of these wherever it sits in a path.
+#: ``_REF_RE`` admits ASCII only, so the superscript-digit ``COM`` and ``LPT`` forms and the ``$``
+#: names such as ``CONIN$`` cannot reach :func:`_inside`, and are not listed.
+_DOS_DEVICES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"{name}{n}" for name in ("COM", "LPT") for n in range(1, 10)}
+)
+
+
+def _inside(ref_path: str) -> str | None:
+    """A ref's path normalised, or None when it leaves the repository root.
+
+    Decided on the text alone, the same way on every host, so a ref that escapes is never probed.
+    ``_REF_RE`` admits only ``/`` as a separator and no drive, colon or leading slash, which leaves
+    two ways out. One is ``..``. The other is a component whose stem, the part before its first
+    dot with trailing dots and spaces dropped, is a DOS device name in any case: ``tests/NUL``,
+    ``tests/nul.py`` and ``fixtures/con.hl7`` are all outside. Windows itself disagrees by version
+    on a name with an extension -- windows-2022 opens the device for ``nul.py`` and newer releases
+    do not -- so the rule takes the older, wider reading rather than asking the host. A name that
+    only CONTAINS one stays inside: ``tests/null.py``, ``tests/console.py``, ``tests/com10.py``,
+    ``tests/my_nul.py``. The normalised form is what gets probed, so ``tests/sub/../x`` means the
+    same on every OS. A symbolic link inside the root is still followed; this reads the text, not
+    the tree.
+    """
+    norm = posixpath.normpath(ref_path)
+    if norm == ".." or norm.startswith("../"):
+        return None
+    for part in norm.split("/"):
+        if part.split(".", 1)[0].rstrip(". ").upper() in _DOS_DEVICES:
+            return None
+    return norm
 
 
 def _criteria(lines: list[str], repo_root: Path) -> list[AcceptanceCriterion]:
@@ -190,18 +254,26 @@ def _criteria(lines: list[str], repo_root: Path) -> list[AcceptanceCriterion]:
             ref = m.group(0)
             if ref not in refs:
                 refs.append(ref)
-        missing = [r for r in refs if not (repo_root / r.split("::", 1)[0]).exists()]
-        out.append(AcceptanceCriterion(text=text, test_refs=refs, missing_refs=missing))
+        outside: list[str] = []
+        missing: list[str] = []
+        for ref in refs:
+            ref_path = _inside(ref.split("::", 1)[0])
+            if ref_path is None:
+                outside.append(ref)
+            elif not (repo_root / ref_path).exists():
+                missing.append(ref)
+        out.append(
+            AcceptanceCriterion(
+                text=text, test_refs=refs, missing_refs=missing, outside_refs=outside
+            )
+        )
     return out
 
 
 def _clarifications(text: str) -> list[str]:
-    out: list[str] = []
-    for line in text.splitlines():
-        m = _UNCHECKED_RE.match(line)
-        if m:
-            out.append(m.group(1).strip())
-    return out
+    return [
+        item for line in text.splitlines() if (item := _capture(_UNCHECKED_RE, line)) is not None
+    ]
 
 
 def _parse_adr(path: Path, repo_root: Path) -> AdrReport:
@@ -221,6 +293,8 @@ def analyze_adrs(adr_dir: str | Path, repo_root: str | Path | None = None) -> An
 
     ``repo_root`` anchors the on-disk existence check for each ``→`` test/fixture reference; it
     defaults to two levels above ``adr_dir`` (i.e. the repo root for the standard ``docs/adr`` layout).
+    Where ``adr_dir`` has no such grandparent, the default is refused through
+    :attr:`AnalysisResult.error`, which then names ``--repo-root`` instead of the corpus.
 
     **AN ABSENT CORPUS IS AN ERROR, NOT AN EMPTY CLEAN RUN.** ``Path.glob`` yields nothing and
     raises nothing for a directory that does not exist, so a missing ADR directory -- or one left
@@ -252,5 +326,20 @@ def analyze_adrs(adr_dir: str | Path, repo_root: str | Path | None = None) -> An
         return AnalysisResult(
             reports=[], error=f"no file matching {_DISCOVERY_GLOB} found in {shown}"
         )
-    root = Path(repo_root) if repo_root is not None else adr_path.resolve().parents[1]
+    if repo_root is not None:
+        root = Path(repo_root)
+    else:
+        # An ADR dir directly under a drive or filesystem root has no grandparent, and indexing
+        # ``parents[1]`` there raised IndexError (BACKLOG #2516). No default is right for it, so
+        # refuse and name the flag rather than guess at a root to probe.
+        resolved = adr_path.resolve()
+        if len(resolved.parents) < 2:
+            # Name the resolved path too: through a link, it is the one with no grandparent.
+            via = "" if str(resolved) == shown else f" (resolved: {resolved})"
+            return AnalysisResult(
+                reports=[],
+                error=f"no directory two levels above {shown}{via} to use as the repository "
+                "root; pass --repo-root",
+            )
+        root = resolved.parents[1]
     return AnalysisResult(reports=[_parse_adr(f, root) for f in files])

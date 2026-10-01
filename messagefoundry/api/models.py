@@ -365,20 +365,43 @@ class DeadLetterRow(PhiGatedModel):
     summary: str | None = None  # PHI-bearing (MRN/name); display is audited
 
 
+class DeadLetterTarget(BaseModel):
+    """One ``(inbound, outbound)`` pair a dead-letter replay would re-queue rows for."""
+
+    channel_id: str
+    destination_name: str
+
+
 class DeadLetterList(BaseModel):
+    """One page of dead deliveries, plus the two facts a bulk-replay control needs that no page of
+    rows can supply (BACKLOG #1743 step 2). This docstring is the one statement of what they mean.
+
+    ``replay_targets`` is every distinct pair a replay would re-queue rows for, over the WHOLE
+    filtered set inside the caller's channel scope, not over ``dead_letters``. So a channel whose
+    dead rows sit past this page still appears, and a row whose body retention erased does not.
+    ``replayable_in_scope`` says whether any such pair exists across the caller's whole scope with
+    the ``channel_id`` and ``destination_name`` filters dropped. Both are REQUIRED, so a second
+    construction site cannot omit them and silently render no controls."""
+
     total: int
     limit: int
     offset: int
     dead_letters: list[DeadLetterRow]
+    replay_targets: list[DeadLetterTarget]
+    replayable_in_scope: bool
 
 
-class ConnectionEventInfo(BaseModel):
+class ConnectionEventInfo(PhiGatedModel):
     """One connection/transport event (Corepoint-style log, #46): the connection name, transport,
     direction, event kind, peer IP, and a scrubbed reason. Read via the ``monitoring:read``-gated
     ``GET /events`` / ``GET /connections/{name}/events`` routes.
 
     Not PHI-free. ``reason`` is free text, scrubbed at the source and again at the store, and
-    ``docs/PHI.md`` section 2 gives its column a protection level. Read the level there."""
+    ``docs/PHI.md`` section 2 gives its column a protection level. Read the level there. So
+    ``reason`` is gated on ``messages:view_summary`` and masked until a per-event reveal (BACKLOG
+    #2443); every other field stays readable under ``monitoring:read``."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"reason"})
 
     id: int
     ts: float
@@ -391,14 +414,18 @@ class ConnectionEventInfo(BaseModel):
     reason: str | None = None
 
 
-class AlertInstanceInfo(BaseModel):
+class AlertInstanceInfo(PhiGatedModel):
     """One resolvable operator-alert instance (ADR 0044, #56): the alert type, connection label,
     severity, lifecycle status (open/acknowledged/resolved), the first/last-seen window + occurrence
     count, a scrubbed reason, and the ack/resolve audit fields. Read via the
     ``monitoring:diagnose``-gated ``GET /alerts/active`` route.
 
     Not PHI-free. ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives its column a
-    protection level. Read the level there."""
+    protection level. Read the level there. So ``reason`` is gated on ``messages:view_summary`` and
+    masked until a per-alert reveal (BACKLOG #2443); the alert's type, state and window stay
+    readable."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"reason"})
 
     id: int
     event_type: str
@@ -567,11 +594,16 @@ class ConfigProvenance(BaseModel):
     drift: bool = False  # the on-disk config now differs from what was loaded
 
 
-class ConnectionRow(BaseModel):
+class ConnectionRow(PhiGatedModel):
     """One endpoint (a channel's source, or one of its destinations) for the connections
     dashboard. Fields are role-dependent: source rows carry read/inbound-errored/idle and the
     listen peer/port; destination rows carry queue/written/dead/backlog/delivered-age and the
     remote peer/port. Unused fields are None so the UI can render blanks.
+
+    Not PHI-free. ``error`` is live free text that ``docs/PHI.md`` section 2 rates, and the route
+    needs only ``monitoring:read``. So ``error`` is gated on ``messages:view_summary`` and masked
+    until a per-connection reveal (BACKLOG #2443); every other field, the ``errored`` count and
+    the ``status`` word included, stays readable under ``monitoring:read``.
 
     On a count, ``0`` means "measured as zero" and ``None`` means "not measured on this row". ``None``
     never stands in for a zero (BACKLOG #1817). A count is ``None`` in at least these cases: the field
@@ -581,6 +613,8 @@ class ConnectionRow(BaseModel):
     ``idle_seconds`` or ``delivered_age_seconds``, and on one ``backlog_seconds`` is ``0.0`` beside a
     measured zero and ``None`` beside ``None`` counts. On an edge row, ``backlog_seconds`` ``None``
     means queued with nothing draining, which can be a stall."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"error"})
 
     role: str  # "source" | "destination"
     channel_id: str
@@ -610,7 +644,8 @@ class ConnectionRow(BaseModel):
     paused: bool = False
     # Set when status == "failed" (why it failed to start, ADR 0031) or "filtered" (why the DR
     # run-profile parked it, #61 ADR 0048). Live free text that docs/PHI.md section 2 rates, which is
-    # why GET /connections is served no-store (BACKLOG #1185).
+    # why GET /connections is served no-store (BACKLOG #1185). Gated and masked (BACKLOG #2443):
+    # null without messages:view_summary, "****" with it, whole only on the reveal=<name> act.
     error: str | None = None
     # Destination-only, sharded deployments only (ADR 0073): the engine shard that owns claiming/
     # delivery for this outbound lane. None when unsharded (every lane is local) or for source rows.
@@ -1454,11 +1489,18 @@ class SecurityPosture(BaseModel):
     client_address_monoculture: bool = False
 
 
-class ConnectionMetadata(BaseModel):
+class ConnectionMetadata(PhiGatedModel):
     """Static metadata for one connection (operability Tier 4). ``metadata`` is the operator's
     free-form label table (owner / runbook / environment); ``settings`` is **secret-scrubbed**
     (``env()`` refs shown as ``{"env": key}``, inline credentials redacted). No live probe — use
-    ``POST /connections/{name}/test`` for reachability."""
+    ``POST /connections/{name}/test`` for reachability.
+
+    Not PHI-free. ``error`` carries the same live text as ``ConnectionRow.error``, on a route that
+    needs only ``monitoring:read``, so it is gated and masked the same way (BACKLOG #2443) and
+    revealed by ``reveal=true``. Only ``error`` is gated: ``metadata`` is the operator's own label
+    table, a dict, and the gate's serializer covers declared properties only."""
+
+    phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"error"})
 
     name: str
     direction: str  # "in" (inbound) | "out" (outbound)
@@ -1469,8 +1511,13 @@ class ConnectionMetadata(BaseModel):
     settings: dict[str, Any]  # secret-scrubbed view
     simulated: bool | None = None  # outbound only; True = egress-suppressed shadow lane (#15)
     # Why this connection failed to start (ADR 0031) or was DR-parked (ADR 0048). Rated in
-    # docs/PHI.md section 2 (BACKLOG #1185).
+    # docs/PHI.md section 2 (BACKLOG #1185). Gated and masked; see the class docstring.
     error: str | None = None
+    # WHICH of the two causes set ``error``: "failed" (start failed, ADR 0031) or "filtered"
+    # (DR-parked, ADR 0048); None when ``error`` is None. Not gated, so a role that sees ``error``
+    # as null can still tell a failed connection from a healthy one, as ``ConnectionRow.status``
+    # lets it on the dashboard (BACKLOG #2443).
+    fault: Literal["failed", "filtered"] | None = None
 
 
 class AlertRuleInfo(BaseModel):
@@ -1498,7 +1545,6 @@ class AlertRuleInfo(BaseModel):
     mute: bool = False  # #143 — static per-rule NOTIFICATION mute (still records state)
     escalate_tiers: int = 0  # #81 — number of occurrence-driven escalation tiers (0 = none)
     schedule_configured: bool = False  # #81 — whether the rule is schedule-gated (present-or-not)
-    content_label: str | None = None  # #81 — content_match label this rule routes by (None = any)
 
 
 class AlertsConfig(BaseModel):

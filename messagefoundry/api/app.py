@@ -41,7 +41,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 from uuid import uuid4
 
 from fastapi import (
@@ -128,6 +128,7 @@ from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     DeadLetterReplayResult,
     DeadLetterRow,
+    DeadLetterTarget,
     DrActionResult,
     DrActivateRequest,
     DrStatus,
@@ -205,6 +206,7 @@ from messagefoundry.api.security import (
     deadline_utc,
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
+    get_auth,
     optional_identity,
     pending_credential_deadline,
     require,
@@ -341,6 +343,7 @@ from messagefoundry.pipeline.cluster import (
     StepdownReleaseUnconfirmed,
     build_coordinator,
     has_promotable_sibling,
+    longest_promotable_sibling_delay,
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
@@ -460,6 +463,9 @@ _NO_STORE_ROUTE_PATHS = frozenset(
     }
 )
 _log = logging.getLogger(__name__)
+
+#: The two monitoring rows whose ``reason`` is masked until a per-item reveal (BACKLOG #2443).
+_ReasonInfo = TypeVar("_ReasonInfo", ConnectionEventInfo, AlertInstanceInfo)
 
 
 def _matched_route_path(request: Request) -> str | None:
@@ -2401,9 +2407,101 @@ def create_app(
 
     @app.get("/connections", response_model=list[ConnectionRow])
     async def list_connections(
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
+        # calls this handler in-process, and a call that leaves it out must get None.
+        reveal: Annotated[ConnectionName | None, Query()] = None,
     ) -> list[ConnectionRow]:
+        """The per-endpoint connections dashboard: one source row per inbound and one destination
+        row per traffic edge or degraded outbound.
+
+        Not PHI-free: ``error`` is live free text that ``docs/PHI.md`` section 2 rates. The route
+        is gated by ``monitoring:read``, so ``error`` is gated separately on
+        ``messages:view_summary``: null without it, the fixed mask with it (BACKLOG #2443).
+        ``reveal`` names ONE connection whose error this response returns whole, on every row of
+        that name; it needs ``messages:view_summary``, charges the PHI-read budget, and is audited
+        as ``connection_error_reveal``. The ``status`` word and the ``errored`` count stay
+        readable, so an operator can still tell that a connection failed."""
+        # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
+        # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
+        # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
+        # behind a 429. A scoped caller's dashboard carries no outbound rows at all.
+        if reveal is not None:
+            await _control_guard(engine, identity, reveal, client_ip(request))
+        await _admit_reveal(request, identity, reveal)
+        out = await _dashboard_rows(engine, identity, reveal=reveal)
+        if reveal is not None:
+            # The audit records what the response carried, not what was asked for: an in-scope
+            # name with no row on the dashboard, or no error, is recorded as revealing nothing.
+            shown = [r for r in out if _row_conn(r) == reveal]
+            await _audit_connection_error_reveal(
+                engine,
+                identity,
+                request,
+                reveal,
+                found=bool(shown),
+                directions=sorted({r.direction for r in shown if r.error}),
+            )
+        return out
+
+    async def _audit_connection_error_reveal(
+        engine: Engine,
+        identity: Identity,
+        request: Request,
+        name: str,
+        *,
+        found: bool,
+        directions: list[str],
+    ) -> None:
+        """The one writer of a ``connection_error_reveal`` row, for both routes that reveal a
+        connection's error (BACKLOG #2443). It records what the response carried: ``found`` is
+        whether any returned row stands for ``name``, and ``directions`` the ones whose error was
+        actually returned, so an empty one is not recorded as a disclosure."""
+        await engine.store.record_audit(
+            "connection_error_reveal",
+            actor=identity.username,
+            # The connection, so the row sits beside that channel's other audit rows.
+            channel_id=name if found else None,
+            detail=json.dumps(
+                {
+                    "reveal": name,
+                    "connection": name if found else None,
+                    "directions": directions,
+                    "revealed": ["error"] if directions else [],
+                }
+            ),
+            client=client_ip(request),
+        )
+
+    def _row_conn(row: ConnectionRow) -> str:
+        """The raw connection name a dashboard row stands for: the outbound name on a destination
+        row, the inbound name on a source row. A name can be both an inbound and an outbound, so a
+        reveal of it lifts the error on the rows of both."""
+        return row.destination if row.role == "destination" and row.destination else row.channel_id
+
+    async def _dashboard_rows(
+        engine: Engine, identity: Identity, *, reveal: str | None = None
+    ) -> list[ConnectionRow]:
+        """The dashboard rows, channel-scoped, with ``error`` gated and masked on every row and
+        lifted on the rows of the ONE connection ``reveal`` names (BACKLOG #2443). The caller has
+        already passed :func:`_admit_reveal` for any ``reveal``; the stats socket passes none."""
+        rows = await _connection_rows(engine, identity)
+        if reveal is None:  # the stats socket, every second, and every bare load
+            return [redact_unauthorized(r, identity) for r in rows]
+        lift = revealable(ConnectionRow, summary=False, error_text=True)
+        return [
+            redact_unauthorized(r, identity, revealed=lift)
+            if _row_conn(r) == reveal
+            # Every row the request did not name stays masked.
+            else redact_unauthorized(r, identity)
+            for r in rows
+        ]
+
+    async def _connection_rows(engine: Engine, identity: Identity) -> list[ConnectionRow]:
+        """The UNREDACTED dashboard rows, already channel-scoped. Only :func:`_dashboard_rows`
+        calls it, and it redacts every row before any caller sees one."""
         now = time.time()
         # Per-channel RBAC: a channel-scoped caller sees only the source rows of their own inbound
         # connections; shared-outbound (destination/degraded) rows are suppressed entirely, since an
@@ -2812,9 +2910,48 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        # A flag, not a name: the path already names the one connection, as the single-message
+        # open's ``reveal_errors`` flag does. Annotated for the same reason as there.
+        reveal: Annotated[bool, Query()] = False,
     ) -> ConnectionMetadata:
         """Static metadata for one connection (operability Tier 4): operator labels + a secret-scrubbed
-        settings view. No live probe — see ``POST /connections/{name}/test``."""
+        settings view. No live probe — see ``POST /connections/{name}/test``.
+
+        ``error`` is gated and masked as on ``GET /connections`` (BACKLOG #2443): null without
+        ``messages:view_summary``, the fixed mask with it. ``reveal=true`` returns it whole; that
+        needs ``messages:view_summary``, charges the PHI-read budget, and is audited as
+        ``connection_error_reveal``, checked after the per-channel scope so a refused connection
+        spends no budget."""
+        meta = await _connection_metadata_row(engine, identity, name, request)
+        if not reveal:
+            return redact_unauthorized(meta, identity)
+        await _admit_reveal(request, identity, name)
+        out = redact_unauthorized(
+            meta,
+            identity,
+            revealed=revealable(ConnectionMetadata, summary=False, error_text=True),
+        )
+        await _audit_connection_error_reveal(
+            engine,
+            identity,
+            request,
+            name,
+            found=True,
+            directions=[out.direction] if out.error else [],
+        )
+        return out
+
+    def _fault(failed: str | None, filtered: str | None) -> Literal["failed", "filtered"] | None:
+        """Which cause set a metadata row's ``error``, in the order the row reads them."""
+        if failed:
+            return "failed"
+        return "filtered" if filtered else None
+
+    async def _connection_metadata_row(
+        engine: Engine, identity: Identity, name: str, request: Request
+    ) -> ConnectionMetadata:
+        """The UNREDACTED metadata row for ``name``, after the per-channel scope check. Only
+        :func:`connection_metadata` calls it, and it redacts the row before returning it."""
         rr = engine.registry_runner
         if rr is None:
             raise HTTPException(503, "engine not started")
@@ -2833,6 +2970,7 @@ def create_app(
                 settings=redacted_settings(ic.spec.settings),
                 # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
                 error=rr.inbound_failed(name) or rr.inbound_filtered(name),
+                fault=_fault(rr.inbound_failed(name), rr.inbound_filtered(name)),
             )
         oc = rr.registry.outbound.get(name)
         if oc is not None:
@@ -2853,6 +2991,7 @@ def create_app(
                 simulated=rr.outbound_simulated(name),
                 # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
                 error=rr.outbound_failed(name) or rr.outbound_filtered(name),
+                fault=_fault(rr.outbound_failed(name), rr.outbound_filtered(name)),
             )
         raise HTTPException(404, f"no such connection: {name}")
 
@@ -3125,6 +3264,79 @@ def create_app(
             reason=e.reason,
         )
 
+    async def _admit_reveal(request: Request, identity: Identity, reveal: int | str | None) -> None:
+        """The gate a ``reveal`` request adds on top of its list route's ``monitoring:*`` gate.
+
+        Called at ADMISSION, before the route reads the store, as ``require_phi_read`` would be.
+        A reveal hands out one reason or one connection's error whole, which is
+        ``messages:view_summary`` data (BACKLOG #2443). ``reveal`` is an event or alert id, or a
+        connection name on ``GET /connections`` and, for its ``reveal=true`` flag, on
+        ``GET /connections/{name}/metadata``. A caller without that permission is refused,
+        and the refusal is audited as
+        ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
+        also a PHI read: it takes the serve-hop refusal and the per-actor PHI budget. The web
+        console's reveal routes already charged both through ``require_ui(..., phi=True)`` before
+        calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
+        route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
+        if reveal is None:
+            return
+        if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
+            auth = get_auth(request)
+            if auth is not None and auth.enabled:
+                await auth.audit_permission_denied(
+                    identity,
+                    Permission.MESSAGES_VIEW_SUMMARY,
+                    request.url.path,
+                    client=client_ip(request),
+                )
+            raise HTTPException(403, "a reveal needs messages:view_summary")
+        if not (_matched_route_path(request) or "").startswith("/ui/"):
+            enforce_phi_read_hop(request)
+            enforce_phi_read_pacing(request, identity)
+
+    async def _redact_reasons(
+        infos: list[_ReasonInfo],
+        *,
+        engine: Engine,
+        identity: Identity,
+        request: Request,
+        reveal: int | None,
+        audit_action: str,
+    ) -> list[_ReasonInfo]:
+        """Gate and mask each row's ``reason``, lifting the mask on the ONE row ``reveal`` names.
+
+        A caller without ``messages:view_summary`` gets ``reason`` null; a holder gets it as the
+        fixed mask (BACKLOG #2443, ASVS 14.2.6, owner ruling R12). ``reveal`` is the per-item act:
+        a request argument with nowhere to live between calls, so the next bare load is masked
+        again. Every reveal request writes one audit row naming the item and whether its text was
+        actually returned, so a reveal of an empty reason is not recorded as a disclosure. The
+        caller has already passed :func:`_admit_reveal`."""
+        out = [
+            redact_unauthorized(
+                i,
+                identity,
+                revealed=revealable(type(i), summary=False, error_text=i.id == reveal),
+            )
+            for i in infos
+        ]
+        if reveal is not None:
+            shown = next((i for i in out if i.id == reveal), None)
+            await engine.store.record_audit(
+                audit_action,
+                actor=identity.username,
+                # The connection, so the row sits beside that channel's message_view rows.
+                channel_id=shown.connection if shown is not None else None,
+                detail=json.dumps(
+                    {
+                        "id": reveal,
+                        "connection": shown.connection if shown is not None else None,
+                        "revealed": ["reason"] if shown is not None and shown.reason else [],
+                    }
+                ),
+                client=client_ip(request),
+            )
+        return out
+
     @app.get("/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events(
         request: Request,
@@ -3134,13 +3346,21 @@ def create_app(
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
+        # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
+        # calls this handler in-process, and a call that leaves it out must get None.
+        reveal: Annotated[int | None, Query(ge=1)] = None,
     ) -> list[ConnectionEventInfo]:
         """The Corepoint-style connection/transport event log (#46), newest first. Optionally filtered
         by ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp.
 
         Not PHI-free: ``reason`` is scrubbed free text, and ``docs/PHI.md`` section 2 gives it a
-        protection level. It is gated by ``monitoring:read`` rather than a PHI permission, and the
-        response is served ``no-store`` (``_NO_STORE_ROUTE_PATHS``)."""
+        protection level. The route is gated by ``monitoring:read``, so ``reason`` is gated
+        separately on ``messages:view_summary``: null without it, the fixed mask with it (BACKLOG
+        #2443). ``reveal`` names ONE event whose reason this response returns whole; it needs
+        ``messages:view_summary``, charges the PHI-read budget, and is audited as
+        ``connection_event_reveal``. The response is served ``no-store``
+        (``_NO_STORE_ROUTE_PATHS``)."""
+        await _admit_reveal(request, identity, reveal)
         # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
         # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
         if connection is not None and not identity.can_access_channel(connection):
@@ -3153,7 +3373,14 @@ def create_app(
             limit=limit,
             allowed_channels=_scope(identity),
         )
-        return [_conn_event_info(r) for r in rows]
+        return await _redact_reasons(
+            [_conn_event_info(r) for r in rows],
+            engine=engine,
+            identity=identity,
+            request=request,
+            reveal=reveal,
+            audit_action="connection_event_reveal",
+        )
 
     @app.get("/connections/{name}/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events_for(
@@ -3164,8 +3391,11 @@ def create_app(
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
+        reveal: Annotated[int | None, Query(ge=1)] = None,
     ) -> list[ConnectionEventInfo]:
-        """The connection/transport event log scoped to one connection (#46), newest first."""
+        """The connection/transport event log scoped to one connection (#46), newest first.
+        ``reason`` and ``reveal`` behave as on ``GET /events`` (BACKLOG #2443)."""
+        await _admit_reveal(request, identity, reveal)
         # Per-channel RBAC: 403 + audit an out-of-scope name (an outbound name isn't a channel a scoped
         # user can access, so this also denies shared-outbound topology); the store scope is defense-in-
         # depth on top of the guard.
@@ -3177,11 +3407,23 @@ def create_app(
             limit=limit,
             allowed_channels=_scope(identity),
         )
-        return [_conn_event_info(r) for r in rows]
+        return await _redact_reasons(
+            [_conn_event_info(r) for r in rows],
+            engine=engine,
+            identity=identity,
+            request=request,
+            reveal=reveal,
+            audit_action="connection_event_reveal",
+        )
 
     # --- operator alert-state (ADR 0044, #56) --------------------------------
 
-    def _alert_instance_info(a: Any) -> AlertInstanceInfo:
+    def _alert_instance_info(a: Any, identity: Identity) -> AlertInstanceInfo:
+        """One alert instance, ``reason`` gated and masked (BACKLOG #2443). The mutation echoes use
+        this and reveal nothing: acknowledging an alert is not the act of reading its reason."""
+        return redact_unauthorized(_alert_instance_row(a), identity)
+
+    def _alert_instance_row(a: Any) -> AlertInstanceInfo:
         return AlertInstanceInfo(
             id=a.id,
             event_type=a.event_type,
@@ -3200,24 +3442,36 @@ def create_app(
 
     @app.get("/alerts/active", response_model=AlertInstanceList)
     async def list_active_alerts(
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
         limit: int = Query(200, ge=1, le=1000),
+        reveal: Annotated[int | None, Query(ge=1)] = None,
     ) -> AlertInstanceList:
         """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen``
         first. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the ack/resolve tier),
         with the same per-channel RBAC scope as ``GET /events``. Not PHI-free: ``reason`` is scrubbed
         free text, ``docs/PHI.md`` section 2 gives it a protection level, and the response is served
-        ``no-store`` (``_NO_STORE_ROUTE_PATHS``).
+        ``no-store`` (``_NO_STORE_ROUTE_PATHS``). ``reason`` is gated and masked, and ``reveal``
+        names one alert to return whole, as on ``GET /events``; that act is audited as
+        ``alert_reveal`` (BACKLOG #2443).
 
         ``total``/``worst_severity`` aggregate EVERY active instance in that scope, not this page of
         them. One ``allowed_channels`` value feeds both reads, so the aggregate is scoped identically
         to the rows and can never report an alert the caller may not read."""
+        await _admit_reveal(request, identity, reveal)
         scope = _scope(identity)
         rows = await engine.store.list_active_alert_instances(limit=limit, allowed_channels=scope)
         summary = await engine.store.summarize_active_alert_instances(allowed_channels=scope)
         return AlertInstanceList(
-            alerts=[_alert_instance_info(r) for r in rows],
+            alerts=await _redact_reasons(
+                [_alert_instance_row(r) for r in rows],
+                engine=engine,
+                identity=identity,
+                request=request,
+                reveal=reveal,
+                audit_action="alert_reveal",
+            ),
             total=summary.total,
             worst_severity=summary.worst_severity,
         )
@@ -3308,7 +3562,7 @@ def create_app(
             detail=json.dumps({"alert_id": alert_id, "minutes": body.minutes}),
             client=client_ip(request),
         )
-        return _alert_instance_info(info)
+        return _alert_instance_info(info, identity)
 
     @app.post("/alerts/{alert_id}/resume", response_model=AlertInstanceInfo)
     async def resume_alert(
@@ -3330,7 +3584,7 @@ def create_app(
             detail=json.dumps({"alert_id": alert_id}),
             client=client_ip(request),
         )
-        return _alert_instance_info(info)
+        return _alert_instance_info(info, identity)
 
     @app.post("/alerts/test-email", response_model=AlertTestEmailResult)
     async def test_alert_email(
@@ -3487,7 +3741,7 @@ def create_app(
         a = await engine.store.get_alert_instance(alert_id, allowed_channels=_scope(identity))
         if a is None:  # vanished (e.g. concurrent retention purge of a just-resolved row)
             raise HTTPException(404, "alert instance not found")
-        return _alert_instance_info(a)
+        return _alert_instance_info(a, identity)
 
     @app.get("/dead-letters", response_model=DeadLetterList)
     async def list_dead_letters(
@@ -3513,6 +3767,16 @@ def create_app(
         total = await engine.store.count_dead(
             channel_id=channel_id, destination_name=destination_name, allowed_channels=allowed
         )
+        # The two replay fields are defined on DeadLetterList. Both reads carry the list's scope.
+        targets = await engine.store.list_replay_targets(
+            channel_id=channel_id, destination_name=destination_name, allowed_channels=allowed
+        )
+        # A filtered set is a subset of the scope, so a non-empty one already answers the flag.
+        replayable_in_scope = bool(targets)
+        if not replayable_in_scope and (channel_id is not None or destination_name is not None):
+            replayable_in_scope = bool(
+                await engine.store.list_replay_targets(allowed_channels=allowed)
+            )
         dead = [_dead_row(r) for r in rows]
         # Same centralized per-property PHI gate as /messages (WP-9): messages:view_summary unlocks the
         # patient-identifying `summary` and the delivery `last_error` (which can quote field values —
@@ -3525,7 +3789,14 @@ def create_app(
             await request.app.state.summary_auditor.note(
                 engine.store, identity.username, channel_id, exposed, time.time(), masked=masked
             )
-        return DeadLetterList(total=total, limit=limit, offset=offset, dead_letters=dead)
+        return DeadLetterList(
+            total=total,
+            limit=limit,
+            offset=offset,
+            dead_letters=dead,
+            replay_targets=[DeadLetterTarget(channel_id=c, destination_name=d) for c, d in targets],
+            replayable_in_scope=replayable_in_scope,
+        )
 
     @app.post(
         "/dead-letters/replay", response_model=DeadLetterReplayResult | PendingApprovalResponse
@@ -5800,7 +6071,7 @@ def create_app(
         # Per-channel RBAC (#76 review — SECURITY): a channel-scoped caller must NOT see shared-outbound
         # topology or its live status — an outbound spans channels, so its running/failed/filtered state
         # can reflect ANOTHER channel's downstream. This mirrors the connections dashboard EXACTLY, which
-        # shows a scoped user NO destination (outbound) rows at all (see list_connections: `if scoped:
+        # shows a scoped user NO destination (outbound) rows at all (see _connection_rows: `if scoped:
         # continue`). So a scoped user sees only the inbound → router → handler subgraph reachable from
         # their accessible inbound connections: the BFS never traverses INTO an outbound node (dropping
         # every shared-outbound node AND its handler→outbound edges), nor into a pass-through inbound the
@@ -5906,7 +6177,6 @@ def create_app(
                     escalate_tiers=len(r.escalate),  # #81 — occurrence-driven escalation tier count
                     schedule_configured=r.schedule
                     is not None,  # #81 — schedule-gated (present-or-not)
-                    content_label=r.content_label,  # #81 — content_match label this rule routes by
                 )
                 for r in alerts.rules
             ],
@@ -6415,7 +6685,8 @@ def create_app(
         the store is still failing it answers ``members-unreadable`` and re-sends nothing.
 
         **Each retry that releases the row re-arms the claim pause** for another two
-        ``heartbeat_seconds``, so a node an operator keeps retrying stays drained. That is the intent
+        ``heartbeat_seconds`` plus the longest promotable sibling's ``acquire_delay_seconds``
+        (BACKLOG #1986), so a node an operator keeps retrying stays drained. That is the intent
         of the call, and it does not slow a standby: the pause gates only this node's own claim.
         Either way the confirmation is the lease moving in ``GET /cluster/nodes``, not the status
         code.
@@ -6516,8 +6787,14 @@ def create_app(
         # leadership, and that returned value is the only thing audited or reported: a fence or a
         # lost-lease tick between a pre-read and the release would otherwise record was_leader=true for
         # an action that released nothing (ADR 0056, "Audit the return value, not a pre-read").
+        #
+        # The same membership read sizes the claim pause (BACKLOG #1986). The release stamps the
+        # lease expiry with the DB clock's now, so a delayed sibling may take it only after its delay,
+        # and this node must not reclaim before then.
         try:
-            outcome = await c.step_down_leadership()
+            outcome = await c.step_down_leadership(
+                sibling_acquire_delay_seconds=longest_promotable_sibling_delay(members, c.node_id)
+            )
         except StepdownLockTimeout as exc:
             # NOTHING RAN. No lease row was read or written, nothing was demoted, and — because the
             # handler takes no is_leader() pre-read — this node may lead nothing at all. So this arm
@@ -6814,7 +7091,9 @@ def create_app(
                 if history is not None:
                     history.record(time.time(), outbox_by_status)
                 if ui_connections_render is not None:
-                    rows = await list_connections(engine=engine_obj, identity=current)
+                    # Redacted like GET /connections, with no reveal: the console renders no
+                    # error text, and a push is not an act (BACKLOG #2443).
+                    rows = await _dashboard_rows(engine_obj, current)
                     frame["connections_html"] = str(ui_connections_render(rows))
                 await websocket.send_json(frame)
                 await asyncio.sleep(1.0)

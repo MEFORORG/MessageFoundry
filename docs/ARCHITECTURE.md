@@ -88,7 +88,7 @@ flowchart TB
   subgraph ENGINE["Engine — headless asyncio service (no GUI imports)"]
     PIPE["pipeline/ — RegistryRunner<br/>listener · router · transform · delivery workers"]:::engine
     TRANS["transports/ — connector registry<br/>MLLP · File · X12 · DICOM C-STORE SCP (TCP/HTTP/DB planned)"]:::engine
-    PARSE["parsing/ — pure HL7/X12/DICOM library<br/>python-hl7 · hl7apy · X12 codec · DICOM codec · base64 binary codec"]:::engine
+    PARSE["parsing/ — pure HL7/X12/DICOM library<br/>built-in HL7 parser · hl7apy · X12 codec · DICOM codec · base64 binary codec"]:::engine
     STORE[("store/ — staged queue<br/>SQLite WAL · SQL Server · AES-256-GCM")]:::engine
     CFG["config/ — code-first wiring<br/>Connections · Routers · Handlers · environments/"]:::engine
   end
@@ -241,7 +241,8 @@ before quiescing a healthy graph) — only startup degrades.
 
 ## Parsing: tolerant-first, strict-on-demand
 
-- **`python-hl7`** parses tolerantly and powers field *peek* for routing. Hot path.
+- The **built-in tolerant parser** (`parsing/_builtin_hl7.py`, ADR 0054) parses tolerantly and powers
+  field *peek* for routing. Hot path. It replaced `python-hl7`, which is retired.
 - **`hl7apy`** does version-aware + profile validation, opt-in per inbound connection
   (`validation.strict`). Slower; kept off the routing hot path.
 
@@ -321,7 +322,7 @@ three, and none of them is a guarantee:
 | Package / module | Responsibility |
 |---|---|
 | `messagefoundry.config` | Connector models (`models.py`) + code-first wiring registry/loader (`wiring.py`) + service settings (`settings.py`) |
-| `messagefoundry.parsing` | Tolerant peek (python-hl7) + strict validate (hl7apy); parse tree (`tree.py`) and the `Message` transform model (`message.py`); pure non-HL7 codecs — X12 EDI (`x12/`), DICOM headers/SR over pydicom (`dicom/`, ADR 0025), and the base64 binary-carriage codec (`binary.py`, ADR 0028) |
+| `messagefoundry.parsing` | Tolerant peek (the built-in parser, ADR 0054) + strict validate (hl7apy); parse tree (`tree.py`) and the `Message` transform model (`message.py`); pure non-HL7 codecs — X12 EDI (`x12/`), DICOM headers/SR over pydicom (`dicom/`, ADR 0025), and the base64 binary-carriage codec (`binary.py`, ADR 0028) |
 | `messagefoundry.store` | Durable message store / **staged queue** (one `queue` table, `stage` = ingress\|outbound), SQLite WAL; every receipt logged with a disposition that flows with the message. `Store` protocol + `open_store` factory in `base.py`; production SQL Server backend in `sqlserver.py` |
 | `messagefoundry.transports` | Inbound & outbound connections (MLLP, file, X12 raw-TCP, DICOM C-STORE SCP inbound over pynetdicom — ADR 0025, …), resolved through a registry (`base.py`) — never special-cased in `pipeline/` |
 | `messagefoundry.anon` | Deterministic, secret-per-dataset pseudonymization / de-identification (fail-closed; ADR 0030) — exposed to the tee (`anonymize-captures`) and the test harness |
@@ -356,11 +357,10 @@ hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`**
 
 **Runtime**
 
-- `hl7` (python-hl7) — fast, tolerant parsing for the routing hot path
 - `hl7apy` — version-aware validation + profiles (opt-in strict path)
 - `pydantic` — config / connector models and validation
 - `aiosqlite` — async SQLite for the message store / queue
-- `fastapi` + `uvicorn[standard]` — localhost engine API
+- `fastapi` + `uvicorn` (with `httptools`, `websockets` and, outside Windows, `uvloop`) — localhost engine API
 - `argon2-cffi` — argon2id password hashing
 - `cryptography` — AES-256-GCM at-rest encryption for the store
 - `ldap3` + `pyspnego` — Active Directory / LDAP auth and Windows SSO (Kerberos)

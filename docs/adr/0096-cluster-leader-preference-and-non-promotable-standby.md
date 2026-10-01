@@ -90,7 +90,10 @@ short-circuits, and the added `nodes` columns default to `0`/`TRUE`.
   → `tests/test_cluster_lease.py::test_delayed_node_cannot_claim_within_the_delay_window`
 - **AC-2** — WHEN a preferred (`delay = 0`) node and a delayed node both become eligible after a leader's
   lease expires, THE SYSTEM SHALL let the preferred node win the routine take-over race.
-  → `tests/test_cluster_lease.py::test_preferred_node_wins_routine_expired_lease_race`
+  → `tests/test_cluster_lease.py::test_preferred_node_wins_routine_expired_lease_race`.
+  [Amendment A](#amendment-a-2026-09-30--ac-2-binds-a-planned-stepdown-and-a-clean-stop) extends this
+  to a lease a leader released by a planned stepdown or a clean stop. Tested by
+  `tests/test_cluster_stepdown_preference.py`.
 - **AC-3** — WHILE a node is the current leader, THE SYSTEM SHALL renew its lease without the acquire
   delay.
   → `tests/test_cluster_lease.py::test_delay_does_not_delay_the_current_leaders_renew`
@@ -138,3 +141,48 @@ migrations, REL-1).
 **Out of scope** — automatic/health-probe-driven promotion (ADR 0048 `AUTO`, deferred); preempting a
 **live** lease; runtime mutation of the knobs (read once at construction — restart to change, like the
 other lease timings); a cold-bring-up (empty-lease) handicap.
+
+## Amendment A (2026-09-30) — AC-2 binds a planned stepdown and a clean stop
+
+**Owner ruling 2026-09-30, BACKLOG #1986:** a planned stepdown (`POST /cluster/stepdown`, ADR 0056)
+and a clean stop must honour leader preference, the way a crash failover does. **AC-2 therefore binds
+a leader's lease that expired because the leader released it, not only one that aged out.**
+
+**What was wrong.** Both release statements wrote `lease_expires_at = 0`. The take-over predicate adds
+the delay to that stored expiry, and `0 + delay` is before any real DB clock, so every promotable
+sibling could take a released lease at once and whichever ticked first won. The delay governed only a
+crash failover.
+
+**The change.**
+
+1. The release writes the DB clock's current time as the expiry: `EXTRACT(EPOCH FROM
+   clock_timestamp())` on Postgres and the coordinator's `SYSUTCDATETIME()` epoch expression on SQL
+   Server. Each is the clock that backend's take-over predicate reads, so node clock skew does not
+   enter. A sibling may then take a released lease only once its own delay has passed on that clock.
+   Both the stepdown and `stop()` send this release. It never moves an expiry later: a row that has
+   already aged out keeps its own expiry, so a release cannot restart the siblings' delays.
+2. The stepdown's claim pause grows by the longest finite `acquire_delay_seconds` among the other
+   promotable nodes with a fresh heartbeat, read from the membership read the endpoint already takes.
+   The drained node reclaims through the renew branch, which carries no delay term. Without the extra
+   term, a node whose siblings were all delayed past its two-heartbeat pause took its own lease back
+   first, which is the defect BACKLOG #1507 described. The pause can end early: the pause-lift
+   comment in `DbCoordinator._claim_or_renew_lease` is the source of record for when.
+3. `stop()` needs no pause. A stopped node has no maintenance task, so it cannot reclaim.
+
+**The no-two-leader argument is unchanged.** A later stored expiry only makes the take-over predicate
+match later, and the longer pause only makes the drained node claim later. Neither can make any node
+claim earlier.
+
+**Accepted cost.** Each planned handover now leaves the cluster leaderless for up to the smallest
+promotable sibling's delay, plus up to one heartbeat for that sibling to look. A cluster with a
+preferred (`delay = 0`) sibling pays about one heartbeat, as before. A cluster whose other promotable
+nodes are all delayed pays the delay on every planned handover, which is the same cost the Negative
+consequences above already accept for a routine crash transition.
+
+**Tests.** `tests/test_cluster_stepdown_preference.py` runs each case on both coordinators at a
+realistic DB clock: the preferred sibling wins after a stepdown and after a stop, a drained node with
+only delayed siblings does not reclaim, the pause lifts once a successor holds the row, a release
+never moves an aged-out expiry later, a delayed-only cluster gets a leader after the delay, and the
+endpoint passes the longest promotable sibling delay. `test_a_released_lease_honours_leader_preference`
+in `tests/test_cluster_failover_postgres.py` and `tests/test_cluster_failover_sqlserver.py` runs the
+real release statements against a live server.

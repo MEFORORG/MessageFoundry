@@ -235,7 +235,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_oidc_start(request: Request) -> Response:
         """Confirmed: mint the flow and hand the browser to the IdP.
 
-        ⚠️ **The rate-limit branch below must stay INSIDE this decorated handler.**
+        **WARNING: The rate-limit branch below must stay INSIDE this decorated handler.**
         ``tests/test_security_doc_rate_limits.py`` reads the console's throttle shapes by walking the
         AST of *decorated* route functions and looking for an ``allow_login_attempt`` branch. Hoisting
         this body into a plain helper — which the first draft of the 3.7.3 split did — leaves the

@@ -332,7 +332,9 @@ def _patch_pool(
 ) -> _RefPool:
     pool = _RefPool(_RefConn(_RefCursor(columns, rows)))
 
-    async def fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> _RefPool:
+    async def fake_make_pool(
+        dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
+    ) -> _RefPool:
         return pool
 
     import messagefoundry.transports.database as db
@@ -396,7 +398,9 @@ async def test_database_source_acquire_is_bounded(
     The outer ``wait_for`` is the assertion: pre-fix, ``sync_all()`` never returns."""
     pool = _HangingRefPool(_RefConn(_RefCursor(["provider_id", "npi"], [])))
 
-    async def fake_make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> _RefPool:
+    async def fake_make_pool(
+        dsn: str, pool_max: int, *, autocommit: bool, login_timeout: int | None
+    ) -> _RefPool:
         return pool
 
     import messagefoundry.transports.database as db

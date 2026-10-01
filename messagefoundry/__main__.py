@@ -21,7 +21,13 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 
 from __future__ import annotations
 
+# PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
+# open a store or read a service TOML use these. The rest below runs on every command or is the
+# logging chain, so it stays eager. The heavy import is deferred in config/__init__.py.
+__lazy_modules__ = ["sqlite3", "tomllib"]
+
 import argparse
+import functools
 import json
 import logging
 import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
@@ -31,18 +37,22 @@ from collections.abc import Mapping, Sequence
 from pathlib import (
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from messagefoundry import __version__
 from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR 0201 slice 1)
     Dispatch,
+    HelpFormatter,
     _emit_error,
     _load_operator_json,
     _OperatorJsonError,
     _print_json,
     _safe_print,
+    argv_wants_json,
+    first_command,
     run_cli,
 )
+from messagefoundry.cli_surface import CLI_TIERS, TOOLKIT_COMMAND  # pure data, stdlib-only imports
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
@@ -56,10 +66,12 @@ from messagefoundry.odbc_env import disable_driver_manager_pooling
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
-    from messagefoundry.store.base import Store
+    from messagefoundry.store.base import AdminStore, Store
 
 
 class _VersionAction(argparse.Action):
@@ -106,10 +118,14 @@ def main(argv: list[str] | None = None) -> int:
     # A PROCESS property too, and only honoured before pyodbc's first ODBC use in the process, so it
     # is set here, ahead of config loading and every subcommand (BACKLOG #2049; see odbc_env.py).
     disable_driver_manager_pooling()
-    # Everything else around dispatch is shared with the planned toolkit command (ADR 0201 slice 1):
+    args = sys.argv[1:] if argv is None else argv
+    moved = _moved_toolkit_command(args)
+    if moved is not None:
+        return _refuse_toolkit_command(moved, args)
+    # Everything else around dispatch is shared with the toolkit command (ADR 0201 slices 1 and 2):
     # the last-resort hooks, parsing, the redacting stderr log sink and the JSON error floor.
     return run_cli(
-        argv,
+        args,
         _build_parser,
         configures_own_logging=_CONFIGURES_OWN_LOGGING,
         floor_code=_floor_error_code,
@@ -128,6 +144,50 @@ def _floor_error_code(args: argparse.Namespace) -> str | None:
     return None
 
 
+@functools.cache
+def _moved_toolkit_commands() -> frozenset[str]:
+    """The top-level toolkit rows of ``CLI_TIERS`` that this engine does not register (ADR 0201).
+
+    Keyed on "not registered here", not on the tier alone. While a slice has moved some toolkit rows
+    and not others, the engine still runs the rows it carries. ``cli_surface`` is pure data with no
+    engine imports, so reading it here costs nothing and loads no toolkit code. Cached: both the
+    pre-parse check and the ``--help`` epilog read it, and neither the table nor the dispatch keys
+    change in a process.
+    """
+    return frozenset(
+        row
+        for row, tier in CLI_TIERS.items()
+        if tier == "toolkit" and " " not in row and row not in _DISPATCH
+    )
+
+
+def _moved_toolkit_command(argv: Sequence[str]) -> str | None:
+    """The moved toolkit command ``argv`` asks for, or None. Read before parsing, so a moved command
+    gets the line naming the toolkit command instead of argparse's "invalid choice"."""
+    command = first_command(argv)
+    return command if command in _moved_toolkit_commands() else None
+
+
+def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
+    """Refuse a toolkit command the engine does not carry, and exit 2 (ADR 0201 AC-3).
+
+    Exit 2, the argparse usage-error code, because the engine does not have this command at all.
+    ``_emit_error`` writes JSON to stdout or one line to stderr, never both, and its own return value
+    is 1, so it is not returned. ``argv_wants_json`` is the one pre-parse JSON rule both commands use.
+
+    The line names no install command. The toolkit distribution is not yet on PyPI, and
+    tests/test_install_instruction_provenance.py refuses shipped text that tells a user to install
+    an unclaimed name.
+    """
+    _emit_error(
+        f"`{command}` is not a messagefoundry command. It is an authoring command: run it as "
+        f"`{TOOLKIT_COMMAND} {command}`, from the separate {TOOLKIT_COMMAND} distribution at "
+        f"this engine's version, {__version__}.",
+        as_json=argv_wants_json(argv),
+    )
+    return 2
+
+
 def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     """Build the engine's argument parser, and return it with the dispatch map (ADR 0201 slice 1).
 
@@ -138,7 +198,17 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     The map returned is :data:`_DISPATCH` itself, not a copy, so a test that patches an entry in it
     still reaches ``main()``.
     """
-    parser = argparse.ArgumentParser(prog="messagefoundry", description=__doc__)
+    # The epilog NAMES the moved commands and the command that runs them. It exposes nothing: the
+    # engine registers none of them and loads no toolkit code (ADR 0201 section 3).
+    moved = ", ".join(sorted(_moved_toolkit_commands()))
+    parser = argparse.ArgumentParser(
+        prog="messagefoundry",
+        formatter_class=HelpFormatter,
+        allow_abbrev=False,  # the pre-parse refusal reads --help and --version by exact spelling
+        description=__doc__,
+        epilog=f"Authoring commands ({moved}) are not in this command. Run them as "
+        f"`{TOOLKIT_COMMAND} <command>`, from the separate {TOOLKIT_COMMAND} distribution.",
+    )
     parser.add_argument(
         "--version",
         action=_VersionAction,
@@ -330,29 +400,6 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "repeatable. Matches the import root, not the PyPI dist name (ADR 0144)",
     )
     check.add_argument("--json", action="store_true", help="emit JSON")
-
-    adr_analyze = sub.add_parser(
-        "adr-analyze",
-        help="advisory spec-driven ADR coverage: acceptance-criteria->test links, missing criteria, "
-        "open clarifications (Secure Development Standards section 5)",
-    )
-    adr_analyze.add_argument(
-        "--adr-dir",
-        default="docs/adr",
-        help="ADR directory (default: docs/adr). Exits 2, with or without --strict, if it is "
-        "missing, is not a directory, or holds no ADR",
-    )
-    adr_analyze.add_argument(
-        "--repo-root",
-        default=None,
-        help="root for resolving test/fixture refs (default: adr-dir/../..)",
-    )
-    adr_analyze.add_argument(
-        "--strict",
-        action="store_true",
-        help="exit 1 if any acceptance-criterion test ref is missing",
-    )
-    adr_analyze.add_argument("--json", action="store_true", help="emit JSON")
 
     connection = sub.add_parser(
         "connection",
@@ -6028,6 +6075,145 @@ def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifi
         return None
 
 
+class _ProvisionStore:
+    """The store ``provision-admin``'s one :class:`AuthService` reaches, whichever handle is open.
+
+    BACKLOG #2081. Why the command builds one service before any store is open is stated once, on
+    :func:`_build_provision_auth_service`. The service answers "is there an Administrator" against
+    the existing store, then makes the write against the store ``create=True`` opens.
+
+    Attribute access is forwarded to :attr:`current`. With no store open it raises
+    ``AttributeError``, so a service call outside the two windows the command opens fails loudly
+    rather than reading a closed handle, and ``hasattr`` and ``getattr`` with a default still work.
+
+    **The service spans two event loops**, one per ``run_guarded`` call, where the API lifespan's
+    spans one. That holds because the pre-check leg awaits only store calls: the service's own
+    asyncio primitives (the argon2 semaphore, the per-account locks) bind to a loop only when a
+    waiter first needs one, and nothing waits on them before the write. Anything that makes
+    ``provision_refusal`` contend on one of them would bind it to the first loop and break the write.
+    """
+
+    def __init__(self) -> None:
+        self.current: Store | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        current = self.__dict__.get("current")
+        if current is None:
+            raise AttributeError(f"provision-admin reached the store ({name}) with none open")
+        return getattr(current, name)
+
+
+class _ProvisionAuthRefused(RuntimeError):
+    """Building ``provision-admin``'s :class:`AuthService` was refused (BACKLOG #2081).
+
+    For a secret, directory or missing-file failure the text is fixed per cause and never the
+    underlying exception's, because those come from resolving directory and IdP secrets and must not
+    carry a secret or a provider's value to the terminal or to a ``--json`` body a script stores.
+    :func:`_build_provision_auth_service` says which one cause keeps its own text, and why."""
+
+
+#: The fixed refusal for each cause :func:`_build_provision_auth_service` names (BACKLOG #2081).
+_PROVISION_AUTH_REFUSALS = {
+    "provider": (
+        "the [secrets].provider could not be loaded: check its name, and that its optional extra "
+        "is installed in the environment that runs this command"
+    ),
+    "reference": (
+        "a secret the [auth] settings reference (the AD bind password or the OIDC client secret) "
+        "could not be resolved: check [secrets].provider, that its optional extra is installed, "
+        "and the reference, in the shell that runs this command"
+    ),
+    "ldap": (
+        "the [auth] Active Directory settings could not build the directory connection: check "
+        "ad_server, ad_user_search_base and the service-account bind, and that ad_tls_verify is "
+        "not turned off"
+    ),
+    "file": (
+        "a file the [auth] settings name does not exist: check ad_tls_ca_cert_file, "
+        "oidc_tls_ca_cert_file and oidc_tls_crl_file"
+    ),
+}
+
+
+#: What every #2081 refusal ends with: each comes before the store is created or written.
+_NOTHING_PROVISIONED = "Refusing to provision; nothing was written"
+
+
+def _sentence(message: object) -> str:
+    """``message`` as a sentence ending in one full stop, so a clause can follow it."""
+    return str(message).rstrip().rstrip(".") + "."
+
+
+def _build_provision_auth_service(
+    settings: ServiceSettings, store: _ProvisionStore, *, posture: HopPosture
+) -> AuthService:
+    """Build ``provision-admin``'s :class:`AuthService` with the inputs ``serve``'s lifespan passes.
+
+    BACKLOG #2081, and the one place that says why the command builds it this way. Building the
+    service checks the OIDC and AD trust anchors (#2034), resolves the directory secrets and applies
+    the OIDC revocation guard, so the command builds it ONCE, before the password prompt and before
+    any store is opened or created (ADR 0183 AC-15). Before this, a fresh install built it only for
+    the write, after the prompt and after ``open_store(create=True)``, so a refused anchor left an
+    empty store behind; an existing store built it twice, which at ``warn`` printed each anchor
+    warning twice; and only the enforcement dial was passed, so a secret held by a ``[secrets]``
+    provider failed here although ``serve`` resolved it. Now it gets the ``[secrets]`` provider,
+    the ``[security].enforcement`` dial and the instance hop ``posture``, as ``serve`` passes them.
+    One difference is older than this item: ``serve`` builds the service only when
+    ``[auth].enabled``, and this command always builds one, because it needs one to write.
+
+    No security notifier is passed. Whether the command owes a takeover notice is decided at the
+    write, against the store it writes to, and attached there.
+
+    :class:`~messagefoundry.auth.trust_anchors.TrustAnchorError` passes through, for the command's
+    existing anchor refusal. The others this function names become :class:`_ProvisionAuthRefused`,
+    raised outside the handler so the original is not carried along as its context. A
+    ``SecretProviderError`` loading the provider, a ``SecretProviderError`` resolving a reference,
+    an ``LdapError`` and a ``FileNotFoundError`` each get a fixed text. ``InsecureHopRefused``, a
+    refusal ``serve`` also gives (an off-box OIDC IdP with no revocation check, at ``enforce``),
+    keeps its own text, which names the hop, its host and the setting that clears it, and reads no
+    secret. Any other exception is not this function's to name and reaches the caller as it is.
+    """
+    from messagefoundry.auth.ldap import LdapError
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.ai_policy import SecurityEnforcement
+    from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    refusal: str | None = None
+    try:
+        secret_provider = resolve_secret_provider(settings.secrets)
+    except SecretProviderError:
+        refusal = _PROVISION_AUTH_REFUSALS["provider"]
+    if refusal is not None:
+        raise _ProvisionAuthRefused(refusal)
+    try:
+        return AuthService(
+            # The slot stands in for the store; it forwards every call the service makes.
+            cast("AdminStore", store),
+            settings.auth,
+            secret_provider=secret_provider,
+            enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
+            hop_posture=posture,
+        )
+    except SecretProviderError as exc:
+        # BACKLOG #2317: the Vault provider raises a cleartext-address refusal as its own type.
+        # Its text is fixed and names no part of the address, so it is shown, as the
+        # InsecureHopRefused arm below would show it.
+        cause = exc.__cause__
+        refusal = (
+            _sentence(cause)
+            if isinstance(cause, InsecureHopRefused)
+            else _PROVISION_AUTH_REFUSALS["reference"]
+        )
+    except LdapError:
+        refusal = _PROVISION_AUTH_REFUSALS["ldap"]
+    except FileNotFoundError:
+        refusal = _PROVISION_AUTH_REFUSALS["file"]
+    except InsecureHopRefused as exc:
+        refusal = _sentence(exc)
+    raise _ProvisionAuthRefused(refusal)
+
+
 def _provision_admin(args: argparse.Namespace) -> int:
     """Create the first administrator offline (BACKLOG #1136, ASVS 6.3.2).
 
@@ -6039,9 +6225,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
     the refusal: this one declines when an ENABLED ADMINISTRATOR exists rather than when the table is
     non-empty, because a directory sign-in can fill the table without producing an administrator.
 
-    **It refuses before it prompts wherever it can, and it creates the store last (AC-15).** The
-    length limits, the keyless gate and the "an Administrator exists" answer all come before the
-    password prompt; the password policy comes before the store is created. Two reasons. A refusal
+    **It refuses before it prompts wherever it can, and it creates the store last (ADR 0183 AC-15).**
+    The length limits, the keyless gate, the store key's resolution, the trust-anchor and directory
+    secret checks that building ``AuthService`` makes (BACKLOG #2081), and the "an Administrator
+    exists" answer all come before the password prompt; the password policy comes before the store
+    is created. Two reasons. A refusal
     that created the store first left a new store behind, and on a Windows service that store is
     secured to whoever opened it. And a scripted install step, like the IDE's Start flow, reads "an
     enabled Administrator exists" as go-ahead, which it can only do if no password is asked for first.
@@ -6060,7 +6248,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
         HOLDER_NOTICE_DISPATCHED,
         HOLDER_NOTICE_NO_CHANNEL,
         HOLDER_NOTICE_NO_PRIOR_ADDRESS,
-        AuthService,
         FirstAdministratorRefused,
         ProvisionedAdministrator,
     )
@@ -6137,17 +6324,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # BACKLOG #2034: the [security].enforcement dial `serve` hands the lifespan as
-    # trust_anchors_enforcing, derived the same way. AuthService checks the OIDC and AD trust anchors
-    # when it is built, and it enforces when no dial is passed. Without this, a weak anchor that
-    # `serve` only warns about at `warn` would make this command refuse.
-    from messagefoundry.config.ai_policy import SecurityEnforcement
+    # BACKLOG #2081: one AuthService for the whole command, built here, before the prompt and
+    # before any store is opened; `_build_provision_auth_service` says why.
+    from messagefoundry.auth.policy import _common_passwords
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
+    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
+    from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
+    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.keyprovider import KeyProviderError
 
-    trust_anchors_enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+    store_slot = _ProvisionStore()
+    # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
+    # below pass it, so a server store hop is clamped and guarded as `serve` opens it (#200, #201).
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
 
-    async def administrator_exists() -> str | None:
-        from messagefoundry.store.base import StoreNotFoundError
-
+    async def administrator_exists() -> tuple[bool, str | None]:
+        """``(absent, refusal)``: whether no store exists yet, and what the service refuses."""
         # Opened WITHOUT create, so asking cannot make a SQLite store: an absent one holds no
         # Administrator, and the write below creates it. An EXISTING store is opened as `serve`
         # opens it, migrations and file permissions included. The answer is asked of AuthService,
@@ -6159,34 +6353,76 @@ def _provision_admin(args: argparse.Namespace) -> int:
         try:
             store = await open_store(
                 settings.store,
+                posture=posture,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         except StoreNotFoundError:
-            return None
+            return True, None
+        store_slot.current = store
         try:
-            service = AuthService(store, settings.auth, enforcing=trust_anchors_enforcing)
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
             # and before an authenticator key is shown for an account that would then be refused.
-            return await service.provision_refusal(username)
+            return False, await service.provision_refusal(username)
         finally:
+            store_slot.current = None
             await store.close()
 
-    from messagefoundry.auth.trust_anchors import TrustAnchorError
-    from messagefoundry.store.crypto import StoreKeylessError
+    # The store key could not be resolved. The texts of these three name settings, environment
+    # variables and files, never a key (see store/keyprovider.py, secrets_dpapi.py). Exit 2, as
+    # `rotate-key` exits on the same three: the store could not be opened, so the command could not
+    # start. Before BACKLOG #2081 they escaped to the dispatch floor.
+    key_unresolved = (KeyProviderError, DpapiError, DpapiUnavailable)
 
     try:
-        exists = run_guarded(administrator_exists())
+        service = _build_provision_auth_service(settings, store_slot, posture=posture)
+        absent, exists = run_guarded(administrator_exists())
+        if absent and settings.store.backend is StoreBackend.SQLITE:
+            # `open_store` refuses an absent SQLite file before it resolves the key, so a key that
+            # cannot be resolved (Vault with no Vault environment in this shell) would otherwise
+            # first fail at the write, after the prompt. Resolved now and discarded; the write
+            # resolves it again, which costs a second Vault round trip. Nothing is created. A
+            # server backend resolved it inside the open, before it found no store.
+            build_store_cipher(settings.store)
     except StoreKeylessError as exc:
         return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
         return 2
+    except key_unresolved as exc:
+        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        return 2
+    except InsecureHopRefused as exc:
+        # The store hop, refused at the open as `serve` refuses it now that the posture is passed:
+        # a server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`.
+        # Its text names the hop and the setting that clears it. Exit 2: could not start.
+        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        return 2
     except TrustAnchorError as exc:
         return _emit_trust_anchor_refusal(exc, as_json=args.json)
+    except _ProvisionAuthRefused as exc:
+        # Exit 1, as the anchor refusal beside it: the auth settings refused, and 1 is this
+        # command's refusal code. 2 stays "the store could not be opened".
+        return _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if exists is not None:
         return _emit_error(exists, as_json=args.json)
+
+    def corpus_refusal(exc: BreachCorpusUnavailable) -> int:
+        return _emit_error(
+            f"{exc}; the password cannot be screened, so it is refused (ASVS 6.2.4). Reinstall the "
+            "messagefoundry wheel to repair the corpus, or set [auth].password_check_breached = "
+            "false in the service config to accept unscreened passwords deliberately",
+            as_json=args.json,
+        )
+
+    # BACKLOG #2081: an unusable bundled breach corpus refuses every password, so it is refused
+    # here rather than after the operator has typed one. The policy check below still asks.
+    if settings.auth.password_check_breached:
+        try:
+            _common_passwords()
+        except BreachCorpusUnavailable as exc:
+            return corpus_refusal(exc)
 
     try:
         password = _read_new_password("New administrator password: ")
@@ -6201,12 +6437,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             password, username=username
         )
     except BreachCorpusUnavailable as exc:
-        return _emit_error(
-            f"{exc}; the password cannot be screened, so it is refused (ASVS 6.2.4). Reinstall the "
-            "messagefoundry wheel to repair the corpus, or set [auth].password_check_breached = "
-            "false in the service config to accept unscreened passwords deliberately",
-            as_json=args.json,
-        )
+        return corpus_refusal(exc)
     if violations:
         return _emit_error("; ".join(violations), as_json=args.json)
 
@@ -6235,6 +6466,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         store = await open_store(
             settings.store,
             create=True,
+            posture=posture,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
@@ -6251,24 +6483,21 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # BACKLOG #1916: the account is written before its audit row, so a refused audit append
             # used to land AFTER the account existed -- an unaudited administrator and a traceback.
             _refuse_an_unauditable_write(store)
+            # BACKLOG #2081: the service the pre-check built, now reaching this store.
+            store_slot.current = store
             # BACKLOG #2019: a repair that takes over an existing account owes its earlier holder a
             # notice, so this command wires the same notifier `serve` does, from the same settings.
             # Started and drained here, because the loop ends when this command does. Built only when
-            # a row with the name exists, so a fresh install resolves no secret and prints nothing
-            # about a notice it does not owe.
-            existing = await store.get_user_by_username(args.username.strip())
+            # a row with the name exists, so a fresh install resolves no SMTP secret and prints
+            # nothing about a notice it does not owe. Attached, not passed to the build (#2081).
+            existing = await store.get_user_by_username(username)
             security_notifier = (
                 _offline_security_notifier(settings) if existing is not None else None
             )
+            service.attach_security_notifier(security_notifier)
             if security_notifier is not None:
                 security_notifier.start()
             try:
-                service = AuthService(
-                    store,
-                    settings.auth,
-                    security_notifier=security_notifier,
-                    enforcing=trust_anchors_enforcing,
-                )
                 outcome = await service.provision_first_administrator(
                     username=args.username,
                     password=password,
@@ -6292,8 +6521,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # touched on the two server backends.
             return (outcome, store.path)
         finally:
+            store_slot.current = None
             await store.close()
 
+    # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
     try:
         outcome, store_path = run_guarded(run())
     except FirstAdministratorRefused as exc:
@@ -6302,8 +6533,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it
         _emit_error(str(exc), as_json=args.json)
         return 2
-    except TrustAnchorError as exc:
-        return _emit_trust_anchor_refusal(exc, as_json=args.json)
+    except (*key_unresolved, InsecureHopRefused) as exc:
+        # Refused before the prompt already; one that changed since is refused the same way.
+        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
@@ -6581,7 +6814,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
 
 def _refuse_a_store_that_is_not_an_audit_log(
-    *, is_sqlite: bool, path: str, refusal: str, as_json: bool = False
+    *, is_sqlite: bool, path: str, refusal: str, as_json: bool
 ) -> int | None:
     """Exit code 2 when a SQLite ``--db`` cannot be a real audit log, else ``None`` (BACKLOG #1669).
 
@@ -6680,6 +6913,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         is_sqlite=settings.store.backend == StoreBackend.SQLITE,
         path=settings.store.path,
         refusal="refusing to create one and report a false 'verified 0 rows'",
+        as_json=False,  # audit-verify has no --json
     )
     if refused is not None:
         return refused
@@ -6715,7 +6949,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # The #1669 probe above already refuses a non-database at a SQLite `--db`, but it probes
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
         # still land in, so both guards stay live.
-        return _emit_store_open_error(exc, settings.store.path)
+        return _emit_store_open_error(exc, settings.store.path, as_json=False)
     print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
         return 1
@@ -6747,9 +6981,7 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     gets one. The anchor is a row count plus a digest — no PHI, no secret — so it is safe to store in
     a ticket, an object store, or a compliance job's own database.
     """
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -6760,10 +6992,16 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
         cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        # Through `_emit_error` like every other refusal here, so a --json caller gets its JSON object
+        # on stdout rather than an empty stdout and a text line on stderr (BACKLOG #2094). Loaded by
+        # `_load_service_settings`, whose docstring says why: its catch includes `OSError` (a
+        # directory named as the file), and it RENDERS a `ValidationError` rather than stringifying
+        # its `input_value=`, which would put a configured secret into this command's stdout -- the
+        # output its own docstring calls safe to keep in a ticket. Exit 2, not `_emit_error`'s 1:
+        # the command could not start, and 1 is a broken chain's code in the audit family.
+        _emit_error(detail or "could not load the service settings", as_json=args.json)
         return 2
 
     # The SAME guard as _audit_verify, and it matters MORE here: before the read-only open (#1780) a
@@ -6850,6 +7088,7 @@ def _rekey_audit(args: argparse.Namespace) -> int:
         is_sqlite=settings.store.backend == StoreBackend.SQLITE,
         path=settings.store.path,
         refusal="refusing to create one",
+        as_json=False,  # rekey-audit has no --json
     )
     if refused is not None:
         return refused
@@ -6872,7 +7111,7 @@ def _rekey_audit(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path)
+        return _emit_store_open_error(exc, settings.store.path, as_json=False)
     print(("OK: " if ok else "FAIL: ") + message)
     return 0 if ok else 1
 
@@ -7107,7 +7346,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path)
+        return _emit_store_open_error(exc, settings.store.path, as_json=False)
     done = (
         f"re-encrypted {count} value(s) under the active key"
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
@@ -7576,52 +7815,6 @@ def _check(args: argparse.Namespace) -> int:
             print(f"{line}: {r.detail}" if r.detail else line)
         print("PASS" if report.ok else "FAIL: a required check failed")
     return 0 if report.ok else 1
-
-
-def _adr_analyze(args: argparse.Namespace) -> int:
-    """Advisory spec-driven ADR coverage (Secure Development Standards §5). Reports acceptance-
-    criteria→test link coverage, Accepted ADRs missing criteria, and open ``- [ ]`` clarifications.
-
-    Two exit codes, and which one a condition gets is the point of the split. A *finding* is
-    advisory: a missing linked test/fixture exits 0, or 1 under ``--strict``. An *absent corpus* —
-    :attr:`~messagefoundry.adr_analyze.AnalysisResult.error`, defined at
-    :func:`~messagefoundry.adr_analyze.analyze_adrs` — exits **2 with or without ``--strict``**,
-    because the analyzer never ran. 2 and not 1 keeps "could not start" apart from "ran and
-    reported a problem", the same split :func:`_emit_store_open_error` spends 2 on; and not 0
-    because this subcommand is otherwise unfailable by default, so a withdrawn ADR set would
-    silently turn a failing report into a passing one.
-
-    That split is between this command's own codes. It does **not** separate 2 from argparse's own
-    usage-error 2, so a caller that must tell a withdrawn corpus from a mistyped flag has to read
-    the output, not the code. Every subcommand here inherits that, ``--json`` disambiguates it, and
-    widening it was not worth a third code."""
-    from messagefoundry.adr_analyze import analyze_adrs
-
-    result = analyze_adrs(args.adr_dir, repo_root=args.repo_root)
-    if args.json:
-        _print_json(result.to_json(), compact=True)
-    if result.error is not None:
-        # JSON on stdout XOR the human line on stderr. Emitting both would reorder under `2>&1`: a
-        # piped stdout is block-buffered and stderr is not, so the error line would land ahead of
-        # the JSON and break the parse it was meant to protect. The JSON body is the full report
-        # with `error` inside it, and so is NOT _emit_store_open_error's bare {"error": ...}: `ok`
-        # has to stay readable for a consumer that branches on it and nothing else.
-        if not args.json:
-            print(f"error: {result.error}", file=sys.stderr)  # not _safe_print; see its docstring
-        return 2
-    if not args.json:
-        with_criteria = sum(1 for r in result.reports if r.has_criteria)
-        _safe_print(
-            f"ADRs analyzed: {len(result.reports)} ({with_criteria} with acceptance criteria)"
-        )
-        for adr in result.accepted_without_criteria:
-            _safe_print(f"  recommend: {adr} is Accepted with no acceptance-criteria block")
-        for adr, ref in result.coverage_gaps:
-            _safe_print(f"  COVERAGE GAP: {adr} links a missing test/fixture: {ref}")
-        for adr, item in result.open_clarifications:
-            _safe_print(f"  clarify: {adr} - open item: {item}")
-        _safe_print("ok" if result.ok else "coverage gaps found (advisory)")
-    return 1 if args.strict and not result.ok else 0
 
 
 def _connection(args: argparse.Namespace) -> int:
@@ -8239,7 +8432,7 @@ def _paste_safe_option(option: str, value: str) -> str | None:
     return None if unsafe else f'{option}="{value}"'
 
 
-def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool = False) -> int:
+def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:
     """One line and exit 2 for a store that could not be opened (BACKLOG #1670).
 
     EXIT 2 AND NOT 1, DELIBERATELY. These subcommands already spend 1 on a negative *finding* --
@@ -8251,6 +8444,11 @@ def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bo
     ``sqlite3.OperationalError`` needs no separate clause: it subclasses ``DatabaseError``. That
     catches the typo'd path too (a directory at ``--db`` raises "unable to open database file"),
     which used to print a raw traceback.
+
+    ``as_json`` HAS NO DEFAULT, on purpose (BACKLOG #2094). A ``False`` default let a ``--json``
+    caller forget to pass it and print text to stderr with no type error, which is the #1922 shape;
+    each caller now says which mode it is in. The same holds for
+    :func:`_refuse_a_store_that_is_not_an_audit_log`.
     """
     message = f"cannot open the store at {path}: {exc}"
     if as_json:
@@ -8297,7 +8495,6 @@ _DISPATCH = {
     "graph": _graph,
     "dryrun": _dryrun,
     "check": _check,
-    "adr-analyze": _adr_analyze,
     "connection": _connection,
     "codeset": _codeset,
     "impact": _impact,

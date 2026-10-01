@@ -79,13 +79,15 @@ import pytest
 # One registry with PER-CLAUSE root tuples — deliberately not one flat list, so the two items that
 # share this edit cannot silently diverge and the differences are recorded rather than rediscovered:
 #
-# * ``_SOURCE_ROOTS`` — messagefoundry/ + messagefoundry_webconsole/ + harness/ + tee/, the
-#   first-party Python the ReDoS and single-parser clauses walk. ``tee/`` belongs here on the same
-#   footing as the rest: it parses untrusted HL7 off the wire (``tee/mllp.py``'s segment split over
+# * ``_SOURCE_ROOTS`` — messagefoundry/ + messagefoundry_webconsole/ + messagefoundry_toolkit/ +
+#   harness/ + tee/, the first-party Python the ReDoS and single-parser clauses walk. The toolkit
+#   joined before any code moved into it (ADR 0201 section 4): code that leaves messagefoundry/ must
+#   not leave these clauses, and ``corepoint_import`` parses untrusted Corepoint XML once it moves.
+#   ``tee/`` belongs here on the same footing as the rest: it parses untrusted HL7 off the wire (``tee/mllp.py``'s segment split over
 #   decoded MLLP frames, ``tee/anon/*`` over message fields), which is exactly the class these clauses
 #   score. Measured before adding: zero nested-quantifier offenders, zero unscannable patterns, no
 #   alternate JSON/URL/XML parser — so the coverage is free.
-# * ``_CRYPTO_ROOTS`` — those four plus ``scripts/``, the target of evaluation for the ASVS 11.1.3
+# * ``_CRYPTO_ROOTS`` — those five plus ``scripts/``, the target of evaluation for the ASVS 11.1.3
 #   cryptographic-discovery gate. Unchanged as a TUPLE (tee/ simply moved into the shared prefix):
 #   ``harness/`` and ``scripts/`` carry no crypto call site today and are walked pre-emptively, so a
 #   new one cannot appear outside the inventory — which ``test_crypto_roots_carry_no_unrecorded_call_site``
@@ -123,7 +125,13 @@ import pytest
 # would not fire on it — that rationale was measured false and removed.
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "messagefoundry"
-_SOURCE_ROOTS = (_PKG, _REPO / "messagefoundry_webconsole", _REPO / "harness", _REPO / "tee")
+_SOURCE_ROOTS = (
+    _PKG,
+    _REPO / "messagefoundry_webconsole",
+    _REPO / "messagefoundry_toolkit",
+    _REPO / "harness",
+    _REPO / "tee",
+)
 _CRYPTO_ROOTS = (*_SOURCE_ROOTS, _REPO / "scripts")
 _XML_ROOTS = _CRYPTO_ROOTS
 _CRYPTO_GATE = _REPO / "scripts" / "security" / "crypto_inventory_check.py"
@@ -721,13 +729,16 @@ def test_the_walk_actually_covers_the_widened_roots() -> None:
     assert tuple(p.name for p in _SOURCE_ROOTS) == (
         "messagefoundry",
         "messagefoundry_webconsole",
+        "messagefoundry_toolkit",
         "harness",
         "tee",
     )
     # Unchanged as a tuple across the tee/ move, which is what BACKLOG #282's gate widening consumes.
+    # The toolkit joined with ADR 0201 slice 2, and the gate's WALK_ROOTS joined it in the same change.
     assert tuple(p.name for p in _CRYPTO_ROOTS) == (
         "messagefoundry",
         "messagefoundry_webconsole",
+        "messagefoundry_toolkit",
         "harness",
         "tee",
         "scripts",
@@ -927,11 +938,15 @@ def test_single_url_parser() -> None:
 #: **pre-emptively**: stdlib ``pyexpat`` is directly importable and the others are one ``uv add`` away,
 #: so naming them now means an added dependency trips the gate instead of sliding past. The clause
 #: still matches *statically imported* module names only — see the docstring's blind-spot section.
+#: Entries match as dotted prefixes, which is what lets the engine's vendored defusedxml copy, whose
+#: top level is ``messagefoundry``, be one entry here.
+_VENDORED_DEFUSEDXML = "messagefoundry._vendor.defusedxml"
 _XML_PARSER_MODULES = frozenset(
     {
         "xml",
         "lxml",
         "defusedxml",
+        _VENDORED_DEFUSEDXML,
         "xmlschema",
         "signxml",
         "pyexpat",
@@ -958,11 +973,12 @@ _XML_PARSER_MODULES = frozenset(
 #: check below unenforceable.
 _XML_PARSER_ALLOWLIST = {
     "messagefoundry/parsing/message.py": (
-        "defusedxml.ElementTree.fromstring with forbid_dtd/forbid_entities/forbid_external in "
-        "RawMessage.xml(); the xml.etree import beside it is TYPE_CHECKING-only (Element, for hints)"
+        "the vendored defusedxml copy (messagefoundry/_vendor/defusedxml) ElementTree.fromstring with "
+        "forbid_dtd/forbid_entities/forbid_external in RawMessage.xml(); the xml.etree import beside it is TYPE_CHECKING-only (Element, for hints)"
     ),
     "messagefoundry/corepoint_import.py": (
-        "defusedxml.ElementTree.fromstring with forbid_dtd/forbid_entities/forbid_external, isolated "
+        "the vendored defusedxml copy's ElementTree.fromstring with forbid_dtd/forbid_entities/"
+        "forbid_external, isolated "
         "in _hardened_fromstring() so tests/test_xml_parser_consistency.py drives THAT surface "
         "directly rather than the whole import (a structural 'no <ActionList>' refusal would make the "
         "hostile-corpus leg vacuous); the xml.etree import beside it is the ParseError type plus a "
@@ -970,11 +986,22 @@ _XML_PARSER_ALLOWLIST = {
         "data (ADR 0086 §2(a'))"
     ),
     "messagefoundry/api/svg_sanitize.py": (
-        "defusedxml with forbid_entities/forbid_external (forbid_dtd OFF, so an entity-free SVG 1.1 "
+        "the vendored defusedxml copy with forbid_entities/forbid_external (forbid_dtd OFF, so an entity-free SVG 1.1 "
         "DOCTYPE parses) over an SVG attachment's bytes, for the download route's served copy only "
         "(ASVS 1.3.4, ADR 0105 amendment 2026-09-28); the xml.etree import beside it is the "
         "ParseError type plus the Element hint. tests/test_svg_sanitize.py drives the shared hostile "
         "corpus of tests/test_xml_parser_consistency.py through it and records the one accepted entry"
+    ),
+    "messagefoundry/_vendor/defusedxml/common.py": (
+        "the vendored defusedxml 0.7.1 itself (messagefoundry/_vendor/defusedxml/README.md): it imports "
+        "xml.parsers.expat only to check that pyexpat is present. It also builds the parse, "
+        "iterparse and fromstring wrappers ElementTree.py exports, and parses nothing itself"
+    ),
+    "messagefoundry/_vendor/defusedxml/ElementTree.py": (
+        "the vendored defusedxml 0.7.1 itself: DefusedXMLParser subclasses the stdlib pure-Python "
+        "XMLParser and installs the DTD, entity and external-reference handlers that raise. Its "
+        "bytes are pinned to upstream by tests/test_vendored_defusedxml.py, and the refusal each "
+        "caller relies on is pinned by tests/test_xml_refusal_guard.py"
     ),
     "messagefoundry/parsing/xml/_deps.py": (
         "the single lazy loader for the [xml] extra (lxml, xmlschema, signxml) — every consumer in "
@@ -996,7 +1023,7 @@ _XML_PARSER_ALLOWLIST = {
         "ASVS 1.2.10's, held by tests/test_csv_formula_consistency.py"
     ),
     "scripts/ci/tooling_receipt.py": (
-        "defusedxml.ElementTree.parse over pytest's junit.xml, written by the `tooling` job's own "
+        "the vendored defusedxml copy's ElementTree.parse over pytest's junit.xml, written by the `tooling` job's own "
         "pytest invocation seconds earlier in the same runner workspace — the same shape as "
         "harness/acceptance/runner.py above, and a CI surface no engine data reaches. defusedxml "
         "rather than the stdlib parser that entry uses: its parse() forbids entity expansion and "
@@ -1031,27 +1058,53 @@ _LXML_PARSE_CALLS = frozenset({"XMLParser", "fromstring", "parse", "XML"})
 _LXML_PARSE_HOME = "messagefoundry/parsing/xml/harden.py"
 
 
-def _xml_parser_imports(source: str) -> set[str]:
-    """Top-level XML-parser modules imported by ``source`` (AST, so indentation is irrelevant).
+def _xml_parser_imports(source: str, package: str = "") -> set[str]:
+    """XML-parser modules imported by ``source`` (AST, so indentation is irrelevant).
 
     An AST walk rather than a line-anchored regex on purpose: four of this tree's ten XML imports are
     indented — one inside ``if TYPE_CHECKING:`` and three inside function-local ``try`` blocks — and a
     ``^(?:import|from)`` matcher would miss every ``_deps.py`` loader while still reporting green.
+
+    Every name is matched as a dotted prefix, and a ``from X import Y`` also offers ``X.Y``. A dotted
+    entry such as the vendored defusedxml copy is also matched by an import of any package between
+    its top level and itself (``from messagefoundry import _vendor``), because attribute access
+    reaches the parser from there. Its bare top level (``messagefoundry``) is not, or every engine
+    module would match. ``package`` is the dotted package ``source`` sits in; a relative import is
+    resolved against it, and skipped when ``package`` is not given.
     """
-    found: set[str] = set()
+    names: set[str] = set()
+    #: What the import makes reachable by attribute access: the module an `import` names, or each
+    #: `X.Y` a `from X import Y` binds. Only these can lead on to a parser below them.
+    bound: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
-            found |= {a.name.split(".")[0] for a in node.names}
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            found.add(node.module.split(".")[0])
-    return found & _XML_PARSER_MODULES
+            bound |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and not package:
+                continue
+            base = package.rsplit(".", node.level - 1)[0] if node.level else ""
+            module = ".".join(p for p in (base, node.module or "") if p)
+            names.add(module)
+            bound |= {f"{module}.{a.name}" for a in node.names}
+    names |= bound
+    return {
+        entry
+        for entry in _XML_PARSER_MODULES
+        if any(name == entry or name.startswith(entry + ".") for name in names)
+        or any("." in name and entry.startswith(name + ".") for name in bound)
+    }
+
+
+def _package_of(path: Path) -> str:
+    """The dotted package a repository file sits in, for resolving its relative imports."""
+    return ".".join(path.relative_to(_REPO).parent.parts)
 
 
 def test_xml_parsers_are_confined_to_the_allowlist() -> None:
     offenders = sorted(
         f"{path.relative_to(_REPO).as_posix()}: {sorted(mods)}"
         for path in _py_files(*_XML_ROOTS)
-        if (mods := _xml_parser_imports(path.read_text(encoding="utf-8")))
+        if (mods := _xml_parser_imports(path.read_text(encoding="utf-8"), _package_of(path)))
         and path.relative_to(_REPO).as_posix() not in _XML_PARSER_ALLOWLIST
     )
     assert not offenders, (
@@ -1146,7 +1199,9 @@ def test_xml_allowlist_has_no_stale_entries() -> None:
         rel
         for rel in _XML_PARSER_ALLOWLIST
         if not (_REPO / rel).is_file()
-        or not _xml_parser_imports((_REPO / rel).read_text(encoding="utf-8"))
+        or not _xml_parser_imports(
+            (_REPO / rel).read_text(encoding="utf-8"), _package_of(_REPO / rel)
+        )
     )
     assert not stale, f"allowlisted file(s) no longer import an XML parser: {stale}"
     stale_deps = sorted(
@@ -1175,6 +1230,48 @@ def test_xml_import_scanner_sees_indented_imports() -> None:
     assert _xml_parser_imports("from html import escape\nimport htmlmin\n") == set()
 
 
+def test_xml_import_scanner_sees_the_vendored_defusedxml() -> None:
+    # Its top level is `messagefoundry`, so a top-level-only match would read these as no parser.
+    for planted, package in (
+        ("from messagefoundry._vendor.defusedxml.ElementTree import fromstring\n", ""),
+        ("import messagefoundry._vendor.defusedxml.common\n", ""),
+        ("from messagefoundry._vendor.defusedxml import ElementTree\n", ""),
+        ("from messagefoundry._vendor import defusedxml\n", ""),
+        ("from ._vendor.defusedxml.ElementTree import fromstring\n", "messagefoundry"),
+        ("from .._vendor import defusedxml\n", "messagefoundry.api"),
+        # The parent package: `_vendor.defusedxml.ElementTree` is then one attribute chain away.
+        ("from messagefoundry import _vendor\n", ""),
+        ("import messagefoundry._vendor\n", ""),
+        ("from . import _vendor\n", "messagefoundry"),
+    ):
+        assert _xml_parser_imports(planted, package) == {_VENDORED_DEFUSEDXML}, planted
+    # Control: the rest of the engine package is not a parser, including a sibling spelled alike,
+    # the bare top level every engine module imports, and a relative import that resolves elsewhere
+    # or that cannot be resolved because no package was given.
+    assert _xml_parser_imports("from messagefoundry._vendor import other\n") == set()
+    assert _xml_parser_imports("import messagefoundry._vendor.defusedxmlish\n") == set()
+    assert _xml_parser_imports("import messagefoundry\nfrom messagefoundry import x\n") == set()
+    assert _xml_parser_imports("from .xml import harden\n", "messagefoundry.parsing") == set()
+    assert _xml_parser_imports("from .xml import harden\n") == set()
+
+
+def test_no_file_imports_the_upstream_defusedxml_package() -> None:
+    """The engine no longer installs defusedxml; only the ``x12`` extra's ``pyx12`` does.
+
+    So an import of it works only where that extra happens to be installed. Everything in these
+    roots parses through the vendored copy instead."""
+    files = _py_files(*_XML_ROOTS)
+    assert files, f"no python files under {_XML_ROOTS}; the walk would pass over nothing"
+    offenders = sorted(
+        path.relative_to(_REPO).as_posix()
+        for path in files
+        if "defusedxml" in (text := path.read_text(encoding="utf-8"))
+        and "defusedxml" in _xml_parser_imports(text, _package_of(path))
+    )
+    assert not offenders, f"import messagefoundry._vendor.defusedxml instead: {offenders}"
+    assert _xml_parser_imports("from defusedxml.common import X\n") == {"defusedxml"}
+
+
 # --- WP-L3-02 (ASVS 11.1.3): cryptographic-discovery gate --------------------
 
 #: Crypto call sites in :data:`_CRYPTO_ROOTS` that live OUTSIDE ``messagefoundry/``, kept as a
@@ -1185,8 +1282,8 @@ def test_xml_import_scanner_sees_indented_imports() -> None:
 #: "does not cover" these paths "because the shipped CLI still defaults to" messagefoundry/ alone,
 #: and that BACKLOG #282 widening the walk would make this set redundant. #282 already landed --
 #: WALK_ROOTS is ``("messagefoundry", "messagefoundry_webconsole", "harness", "tee", "scripts")``
-#: today, and every entry below already has a matching entry in the gate's own INVENTORY (confirmed
-#: by grep, not assumed). So this set is not filling a gap the gate misses; it is a second,
+#: on that date (ADR 0201 slice 2 later added "messagefoundry_toolkit"), and every entry below
+#: already has a matching entry in the gate's own INVENTORY (confirmed by grep, not assumed). So this set is not filling a gap the gate misses; it is a second,
 #: independently-maintained copy of one slice of it -- the same redundant-check shape #1301's and
 #: #1338's banner guards use elsewhere in this ledger. Left as a TODO rather than deleted here: doing
 #: that properly means confirming every remaining entry really is duplicated (not just the one this

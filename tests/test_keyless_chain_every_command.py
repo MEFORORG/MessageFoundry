@@ -414,6 +414,7 @@ def _product_files() -> list[str]:
     roots = (
         "messagefoundry",
         "messagefoundry_webconsole",
+        "messagefoundry_toolkit",
         "packaging",
         "harness",
         "scripts",

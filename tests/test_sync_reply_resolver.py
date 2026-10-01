@@ -364,7 +364,7 @@ def test_the_three_series_reach_a_scrape_with_allowlisted_labels() -> None:
     )
     families = {f.name: f for f in _MetricsCollector(snapshot).collect()}
 
-    # prometheus_client strips a `_total` suffix from Metric.name while the EXPOSED sample keeps it,
+    # A counter family strips a `_total` suffix from its name while the EXPOSED sample keeps it,
     # so assert on the sample names — that is what a scrape actually shows.
     exposed = {sample.name for f in families.values() for sample in f.samples}
     assert "messagefoundry_http_sync_replies_total" in exposed

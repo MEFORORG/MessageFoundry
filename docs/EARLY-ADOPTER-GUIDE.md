@@ -86,7 +86,7 @@ use the table below alongside them when planning.
 | Validation & load tooling (`generate`, `check`, `dryrun`, the test harness, the load harness) | ✅ Built — see §8/§9 and [LOAD-TESTING.md](LOAD-TESTING.md) |
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
 | **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind without TLS is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
-| **Native MFA** (TOTP, local accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; a directory account is in scope like any other (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
+| **Native MFA** (TOTP and passkeys, local and directory accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; while it is on, a directory session that proved no factor owes one under either `require_mfa_scope` value (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
 | **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). Residual: the transport **default** is UDP, so TLS is a per-deployment opt-in — set it, or front the collector with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
 
@@ -98,7 +98,7 @@ use the table below alongside them when planning.
 | **`ack_after=delivered`** (defer the ACK until downstream delivery) | ❌ Not built — requesting it is rejected at config load. Only **ACK-on-receipt** exists, so a routing/transform/delivery failure happens **after** the sender was already told `AA` and will **not** NAK back. Operators rely on the message disposition + alerts, not the ACK. |
 | **De-identification framework** | ❌ Not built. The AI assistant's `deidentified` scope falls back to `code_only`. |
 | **In-place SQLite → server-DB migration** | ❌ Not built. Server-DB deployments are **greenfield only** — there is no automatic carry-over of SQLite history. Drain and cut over deliberately (§13). |
-| **A throughput guarantee for your hardware** | ⚠️ By design. A baseline + tuning method is **published** ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), Gate #3) as a two-tier gate — host-independent **conformance** invariants (hard) + **performance** numbers *"as measured on the reference config"*. Because the durable-write path is hardware-dependent, those msg/s are not a promise for your box. **Measure on your own hardware** (§9). |
+| **A throughput guarantee for your hardware** | **CAUTION:** By design. A baseline + tuning method is **published** ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), Gate #3) as a two-tier gate — host-independent **conformance** invariants (hard) + **performance** numbers *"as measured on the reference config"*. Because the durable-write path is hardware-dependent, those msg/s are not a promise for your box. **Measure on your own hardware** (§9). |
 
 **The early-adopter bargain, stated plainly:** you get a durable engine with native TLS, real auth,
 opt-in active-passive failover, and a real validation toolchain, in exchange for validating capacity on
@@ -151,16 +151,16 @@ version**, the same way you pin any other production dependency. Create a venv a
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install "messagefoundry==0.4.0"        # pin the exact engine version (core runtime only)
+pip install "messagefoundry==0.5.0"        # pin the exact engine version (core runtime only)
 ```
 
-`messagefoundry==0.4.0` pulls only the **core runtime** — what a headless engine needs. Add extras
+`messagefoundry==0.5.0` pulls only the **core runtime** — what a headless engine needs. Add extras
 (§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
 as its own `messagefoundry-webconsole` wheel.
 
-> ⚠️ **Early access.** `0.4.0` is an **Early Access** release on public PyPI — feature-complete and
+> **WARNING: Early access.** `0.5.0` is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
-> launch. The exact-pin command above (`==0.4.0`) resolves today; earlier releases, back to the `0.1.0rc1`
+> launch. The exact-pin command above (`==0.5.0`) resolves today; earlier releases, back to the `0.1.0rc1`
 > pre-release, remain installable. You can equally install from the engine's **GitHub Release assets** or your
 > organization's **private index**.
 
@@ -171,7 +171,7 @@ provenance** and a **Sigstore signature**; check both with the **GitHub CLI** (`
 optionally `sigstore` (`pip install sigstore`). Install **only** the file that passes:
 
 ```powershell
-$V = "0.4.0"   # the exact version you intend to install
+$V = "0.5.0"   # the exact version you intend to install
 
 # Download the wheel + its Sigstore bundle from that release's assets
 gh release download "v$V" --repo MEFORORG/MessageFoundry `
@@ -228,7 +228,7 @@ The table names the extras an operator reaches for first. The full list, includi
 `x12`, `xml`, `webauthn`, `vault` and `otel`, is `[project.optional-dependencies]` in the engine's
 `pyproject.toml`.
 
-> ⚠️ There is **no friendly preflight** for the `postgres` extra: if you set `backend=postgres` but
+> **WARNING:** There is **no friendly preflight** for the `postgres` extra: if you set `backend=postgres` but
 > forgot `pip install 'messagefoundry[postgres]'`, you get a raw `ImportError` at startup instead of a
 > clear message. Install the extra with the backend.
 
@@ -267,7 +267,7 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 `./messagefoundry.toml` if present), `--db`, `--host`, `--port`, `--log-level`, `--env`
 (a **free-form** environment name, ADR 0017), `--allow-insecure-bind`.
 
-> ⚠️ **The active environment is required.** `serve` refuses to start (exit 2) without `--env <name>`
+> **WARNING: The active environment is required.** `serve` refuses to start (exit 2) without `--env <name>`
 > (or `[ai].environment`) — there is no silent `prod` default, so a missing env can never resolve
 > another environment's values/secrets. Built-in names `dev`/`staging`/`prod` carry a default tier;
 > a custom name (e.g. `test`, `poc`) must declare `[security].production_instance`. There is nothing
@@ -311,7 +311,7 @@ the service, and (with `-ServiceAccount`) auto-grants config-read + data-dir-rea
 account. Service defaults: name `MessageFoundry`, data dir `C:\ProgramData\MessageFoundry`, store
 `<DataDir>\messagefoundry.db`, logs `<DataDir>\logs`, bind `127.0.0.1:8765`.
 
-> ⚠️ **Pinned-wheel operational model.** With a pinned-version install (§4.1), the running service
+> **WARNING: Pinned-wheel operational model.** With a pinned-version install (§4.1), the running service
 > loads the **installed wheel** — a known, pinned version, not a moving checkout. Picking up a new
 > engine version is a deliberate run of the §13 upgrade runbook, which pins the new version, so every
 > upgrade is an explicit, reviewable act. *(A contributor running the **editable** install instead
@@ -660,7 +660,7 @@ affecting any downstream system.
 a dedicated "shadow" outbound. Compare MEFOR's dispositions and transformed output against the
 incumbent's outcomes for the same messages.
 
-> ⚠️ **Do not dual-*write* to real partners in shadow.** At-least-once + non-idempotent downstreams
+> **WARNING: Do not dual-*write* to real partners in shadow.** At-least-once + non-idempotent downstreams
 > make a true dual-write dangerous. Keep shadow outbounds pointed at a sink unless the partner dedupes.
 
 **Exit criteria (→ Stage 2):**
@@ -769,7 +769,7 @@ for a clean drain. Always **drain → stop → back up → change → restart
 - **Engine rollback:** re-pin the prior version (`pip install "messagefoundry==<prev>"`) → restart
   (same runbook above). *(Contributors on the editable install: `git checkout` the prior commit/tag →
   reinstall → restart.)*
-- ⚠️ **Schema/store-level changes are not trivially reversible** against a populated store given the
+- **WARNING: Schema/store-level changes are not trivially reversible** against a populated store given the
   greenfield-only posture (no in-place migration). Plan code/config rollback as your primary path;
   use **dead-letter replay** to recover messages that a bad transform stranded before the rollback.
 
@@ -862,7 +862,8 @@ mode, an F5, a cloud **L4 / network** LB, …).
 Failover is **not instantaneous** — quantify *your* window from these drills; don't assume zero-downtime.
 
 - [ ] **Clean switchover** (planned): gracefully stop the primary's service. It **expires its lease**, so
-      a standby promotes on its next heartbeat (**≈ one `heartbeat_seconds`**). Watch `leader_node_id`
+      a standby promotes on its next heartbeat (**≈ one `heartbeat_seconds`**), or after its
+      `acquire_delay_seconds` if every standby has one. Watch `leader_node_id`
       move on `/cluster/nodes`, watch the VIP repoint, and keep synthetic traffic flowing throughout.
 - [ ] **Crash** (unplanned): hard-kill / power off the primary. Its lease **ages out**, so a standby
       promotes after **up to `leader_lease_ttl_seconds`** (~30 s default); a partitioned old primary

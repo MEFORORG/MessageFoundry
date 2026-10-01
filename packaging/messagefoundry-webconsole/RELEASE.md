@@ -8,17 +8,17 @@
 > [`.github/workflows/release.yml`](../../.github/workflows/release.yml) builds and publishes this wheel
 > on its own `webconsole-v*` tag, and `messagefoundry-webconsole` has been registered on PyPI since the
 > first such release on 2026-07-29. What is still unwired is the **engine** side: the engine
-> `pyproject.toml` declares no `webconsole` extra and the compat ranges are unset, so the pair cannot yet
-> be installed as one. From a checkout the console installs by path
+> `pyproject.toml` declares no `webconsole` extra and sets no floor on the console, so the pair cannot
+> yet be installed as one. The console sets a floor on the engine from 0.4.0 on (step 2). From a checkout the console installs by path
 > (`pip install -e packaging/messagefoundry-webconsole`), and the seam handshake is exercised in CI
 > against the source tree.
 
 Context: the console is a separately-versioned second distribution mounted same-origin onto the engine
 (Option B, [ADR 0065](../../docs/adr/0065-web-ops-dashboard.md)). Architecture, the seam, and the
 version-skew gate are documented in [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md).
-The **`ENGINE_UI_SEAM` handshake means the engine and console versions can move independently within a
-compat range** — you do not have to release them lockstep; you must only keep the range and the two
-seam digests honest. Nobody chooses a seam value: it is derived (BACKLOG #1220), and
+The **`ENGINE_UI_SEAM` handshake means the engine and console versions can move independently above a
+floor** — you do not have to release them lockstep; you must only keep the floors and the two seam
+digests honest. Nobody chooses a seam value: it is derived (BACKLOG #1220), and
 `docs/WEBCONSOLE-PACKAGE.md` carries the procedure for moving it.
 
 The console's own `release-webconsole` job already exists in
@@ -33,8 +33,11 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 - [ ] Confirm `SUPPORTED_ENGINE_SEAMS` equals `{ENGINE_UI_SEAM}` — one seam, the engine this
       build was released against (BACKLOG #279). A test enforces it; do not widen without also
       landing the cross-seam CI matrix.
-- [ ] Choose the PEP 508 **compat range** `A..B` for the pair (the console's `messagefoundry>=X,<Y` and
-      the engine's `messagefoundry-webconsole>=A,<B`). Bump `<Y`/`<B` only across a seam change.
+- [ ] Choose the two **floors** for the pair. X is the first engine release that carries the seam in
+      `SUPPORTED_ENGINE_SEAMS`; the console gets `messagefoundry>=X`. A is this console release; the
+      engine gets `messagefoundry-webconsole>=A`. Set **no ceiling** on either side.
+      [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md#the-engine-requirement-is-a-floor-with-no-ceiling) gives
+      the reasons (BACKLOG #1585).
 - [ ] Update [`CHANGELOG.md`](CHANGELOG.md) with the release entry.
 
 ## 1. Re-add the engine `[webconsole]` extra
@@ -43,17 +46,23 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       (mirroring `[harness]`/`[webauthn]`):
 
       ```toml
-      webconsole = ["messagefoundry-webconsole>=A,<B"]
+      webconsole = ["messagefoundry-webconsole>=A"]
       ```
 
       The wheel **is** on the index, so this dependency resolves. It was removed while the name was
       unclaimed; re-adding it is the point of this step, and step 3 re-locks to confirm the cycle
       resolves under both `uv lock` and plain `pip`.
 
-## 2. Set the package's engine dependency range
+## 2. Set the package's engine dependency floor
 
-- [ ] In [`pyproject.toml`](pyproject.toml), change `dependencies = ["messagefoundry"]` to the compat
-      range `["messagefoundry>=X,<Y"]` consistent with the supported seam(s).
+- [ ] In [`pyproject.toml`](pyproject.toml), set the engine dependency to the floor
+      `["messagefoundry>=X"]` from step 0, in the release commit. Engine X must already be on PyPI.
+      Add no upper bound and no environment marker.
+
+      Do not skip this step. The `release-webconsole` job reads the built wheel and refuses it unless
+      its `messagefoundry` requirement has a lower bound and no marker, so a first release that skips
+      it fails rather than shipping a bare dependency. The job cannot tell a current floor from one
+      left by an earlier release, so after the first floored release, raising X is on you.
 
 ## 3. Re-lock and audit (now resolvable)
 
@@ -88,8 +97,8 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 ## 6. Tag + publish (the button)
 
-- [ ] Tag the release using the console's own scheme (independent cadence — e.g. a
-      `webconsole-vA.B.C` tag, or lockstep with the engine tag initially; document the choice).
+- [ ] Tag the release `webconsole-vA.B.C`, the console's own scheme (independent cadence). The
+      `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job.
 
 ## 7. Post-publish verification
@@ -97,9 +106,10 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 - [ ] Confirm the tag matches the PyPI version. (The tag == PyPI == mirror checker was retired
       with the publish machinery at the MEFORORG cutover; there is no mirror to compare against.)
 - [ ] Once steps 1 and 2 have landed and been published, confirm `pip install
-      "messagefoundry[webconsole]"` resolves the pair inside the compat range. Until then the
+      "messagefoundry[webconsole]"` resolves the pair above both floors. Until then the
       published engine has no `[webconsole]` extra, so this command installs the engine alone.
-      The published console declares a bare `messagefoundry` dependency, so it sets no range.
+      Consoles published before this checklist set a floor declare a bare `messagefoundry`
+      dependency, so they set none.
 
 The operator key is `[security].serve_web_console`. The loader refuses the old `[api].serve_ui`
 spelling. [`docs/WEBCONSOLE-PACKAGE.md` section 4](../../docs/WEBCONSOLE-PACKAGE.md) states what
@@ -126,12 +136,12 @@ engine you pair this release with.
 - [ ] Confirm the startup handshake. Reinstall the console, pair it with an engine whose
       `ENGINE_UI_SEAM` is not in the console's `SUPPORTED_ENGINE_SEAMS`, and set
       `serve_web_console = true`. Startup must fail with `UiSeamMismatch`, which `assert_engine_seam`
-      raises. Today no install-time metadata refuses a mismatched pair; this startup check is what
-      does. A pair far enough apart fails one step earlier, at the engine's import of the console,
+      raises. Install metadata never refuses an engine newer than the console's seam, because the
+      floor has no ceiling; this startup check is what does. A pair far enough apart fails one step earlier, at the engine's import of the console,
       with a named refusal rather than `UiSeamMismatch`. [`docs/WEBCONSOLE-PACKAGE.md` section
       2](../../docs/WEBCONSOLE-PACKAGE.md) states what `serve` and `create_app` print then.
-- [ ] Once steps 1 and 2 have landed and been published, confirm an out-of-range pair also fails at
-      resolve (PEP 508). Until then no published metadata declares a range, so nothing fails at
+- [ ] Once steps 1 and 2 have landed and been published, confirm an engine older than X also fails
+      at resolve (PEP 508). Until then no published metadata declares a floor, so nothing fails at
       resolve.
 
 ---

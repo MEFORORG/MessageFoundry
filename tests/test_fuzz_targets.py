@@ -50,7 +50,6 @@ from fuzz.targets import (
     write_seed_corpus,
 )
 from messagefoundry.parsing import Peek
-from messagefoundry.parsing._backend import backend
 from messagefoundry.parsing.x12 import X12Peek
 from tests._bash_resolver import (
     BASH_HARNESS_FAILURE,
@@ -340,20 +339,18 @@ def test_every_known_finding_is_still_recognised_by_its_target() -> None:
         TARGETS_BY_NAME[finding.target].run(finding.reproducer)
 
 
-@pytest.mark.parametrize("builtin", [True, False], ids=["builtins", "python-hl7"])
-def test_the_blank_segment_seed_reads_cleanly_on_both_backends(builtin: bool) -> None:
+def test_the_blank_segment_seed_reads_cleanly() -> None:
     """BACKLOG #1594 regression: the old finding's reproducer now parses AND reads.
 
     This replaced the test that pinned the defect as live. It ran the reproducer through the raw
     parser and asserted ``IndexError``, so the fix turned it red, which was its instruction to drop
-    the carve-out. What is pinned now is the fixed behaviour, on both parser backends.
+    the carve-out. What is pinned now is the fixed behaviour.
     """
-    with backend(builtin=builtin):
-        peek = Peek.parse(BLANK_SEGMENT_HL7)
-        assert peek.control_id == "MSG1"
-        assert peek.routing()["message_type"] == "ADT^A01"
-        assert "" not in peek.segments()
-        TARGETS_BY_NAME["hl7_peek"].run(BLANK_SEGMENT_HL7)
+    peek = Peek.parse(BLANK_SEGMENT_HL7)
+    assert peek.control_id == "MSG1"
+    assert peek.routing()["message_type"] == "ADT^A01"
+    assert "" not in peek.segments()
+    TARGETS_BY_NAME["hl7_peek"].run(BLANK_SEGMENT_HL7)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:

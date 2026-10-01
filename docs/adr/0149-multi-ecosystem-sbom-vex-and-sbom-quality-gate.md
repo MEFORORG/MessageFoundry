@@ -63,7 +63,9 @@ artifacts — **no engine code changes**:
    same helper and retained as CI artifacts.
 3. **SBOM quality gate.** Score the Python engine and npm extension SBOMs with `sbomqs` (pinned `v2.0.11`,
    checksum-verified) — advisory (`sbomqs score -b` + NTIA breakdown), printed to the CI/release log, never
-   blocking. *Amended 2026-09-18 (BACKLOG #1698): "checksum-verified" now means two different things by
+   blocking. *Amended 2026-09-30 (owner ruling, BACKLOG #1698):* the SCORE stays advisory, but in
+   `release.yml` a failure to verify the sbomqs binary against its pin now blocks the release; see
+   Consequences. *Amended 2026-09-18 (BACKLOG #1698): "checksum-verified" now means two different things by
    workflow.* `security.yml` still verifies against the release's own `checksums.txt`, which is adequate in
    a job holding `contents: read`. `release.yml` verifies against a **SHA-256 literal held in this repo**,
    because that copy runs inside `id-token: write` — beside the identity that Sigstore-signs and publishes
@@ -131,9 +133,11 @@ questionnaires — a differentiator vs. Mirth/Corepoint, which ship no SBOM.
 sbomqs in `release.yml` is now **two coupled edits in one commit** — `VER` and `SBOMQS_SHA256` — and the
 new digest should be taken from **both** the release `checksums.txt` and GitHub's server-side asset
 `digest` field, two independent routes, which is what makes the literal evidence rather than a copied
-line. Moving only `VER` fails the `sha256sum -c`, and that step is `continue-on-error: true`, so the
-release still succeeds while shipping **no** sbomqs score. That degradation is silent by design of the
-advisory gate. What no offline test can catch is whether a digest is the RIGHT one for a version —
+line. Moving only `VER` fails the `sha256sum -c`. *Amended 2026-09-30 (owner ruling, BACKLOG #1698):*
+this sentence used to say that step was `continue-on-error: true`, so the release still succeeded while
+shipping no sbomqs score, silently. That no longer holds in `release.yml`. The download, the in-repo pin
+check and the install are now their own step with no `continue-on-error`, so a pin failure **blocks the
+release**; only the `sbomqs score` step stays advisory. `security.yml`'s copy is unchanged. What no offline test can catch is whether a digest is the RIGHT one for a version —
 that means fetching the asset, the network dependency the in-repo pin exists to remove. What a test
 *could* catch, and does not today, is the two literals moving apart at all: pinning the `(VER,
 SBOMQS_SHA256)` pair, and asserting release.yml's `VER` matches security.yml's, would force both edits
@@ -145,6 +149,53 @@ states the scope). The VEX is hand-maintained and must not drift into stale/fals
 **Out of scope** — SPDX dual-emit (option 3); publishing/pushing the container image or the `.vsix` to a
 registry/marketplace via CI (unchanged: operators build the image, the extension ships separately);
 promoting any of these gates to blocking; automated VEX generation.
+
+## Amendment 2026-09-30 — a second engine SBOM, resolved on Windows
+
+**Finding.** The core lock carries `sys_platform` markers. `colorama` and `sspilib` install only on
+`win32`; `uvloop` installs everywhere else. `cyclonedx-py environment` lists what is installed, so the one
+engine SBOM, built on `ubuntu-latest`, listed `uvloop` and left out the other two. The engine runs as a
+Windows service (`docs/SERVICE.md`) as well as in the Linux container. So a deploying site on Windows
+would have received an SBOM naming a package it does not run and missing two it does. Measured
+2026-09-30 on Windows, Python 3.14.6, `cyclonedx-bom` 7.3.1, from the same recipe: 40 components with no
+pip, each with a license, version and PackageURL, including `colorama` 0.4.6 and `sspilib` 0.5.0, and no
+`uvloop`.
+
+**Decision.** Ship two engine SBOMs: `messagefoundry-sbom.cdx.json` (Linux, unchanged) and
+`messagefoundry-sbom-windows.cdx.json` (Windows).
+
+- `release.yml` gains a `sbom-windows` job on `windows-latest`. It holds `contents: read` only, builds
+  the SBOM and uploads it as a workflow artifact. The `release` job `needs:` it, downloads the file,
+  and signs, SLSA-attests, scores and attaches it exactly as it does the Linux SBOM. Nothing from the
+  artifact executes in the privileged job. A release that cannot build the Windows SBOM does not ship,
+  rather than shipping without it.
+- `security.yml` gains a matching `sbom-windows` job, the pre-tag dry-run for the release job, as `sbom`
+  already is for the Linux step. `tests/test_ci_venv_pinning.py` holds each runner's pair of installs
+  byte-identical.
+- The Windows scratch venv takes the Linux step's shape: made with `--without-pip` and filled by the
+  outer interpreter's pip through `--python`, so the venv's seeded pip is not listed as an engine
+  component. Every path to it is absolute: a relative `--python` path fails on Windows with WinError 2.
+- `sbom_finalize.py --record-sys-platform` records the finalizing interpreter's own `sys.platform` in
+  each engine SBOM, as the `metadata.properties` entry `messagefoundry:resolved-for:sys_platform`
+  (`linux` or `win32`). The two files share a root component, so without it only the filename told
+  them apart. The helper runs in the same step as the install, so the value names the runner that
+  resolved the lock. It is not a check on the components.
+
+**Options considered.**
+
+| Option | Verdict |
+|---|---|
+| One SBOM listing the union, with a platform property per component | Rejected. CycloneDX has no standard field that scopes a component to a platform, and scanners such as `trivy sbom` would read the union as installed everywhere. A site would get findings for packages it does not run. It also needs a hand-written merge step beside the generator. |
+| Build the Windows set on Linux with `pip install --platform win_amd64` | Rejected. `--platform` changes which wheel tags pip accepts. pip still evaluates environment markers against the interpreter running it, so the markers this amendment is about would resolve as Linux. |
+| A Windows matrix leg of the `release` job | Rejected. That job holds `id-token: write`, so every signing and publishing step would need a platform guard, and the Windows leg would run beside the signing identity. |
+| A separate unprivileged Windows job, handed over as an artifact | **Chosen.** |
+
+**Costs.** One `windows-latest` job per release and per nightly `security.yml` run. This repository is
+public, so hosted runners cost no money, but each run takes a Windows runner from the shared pool. The
+release now also depends on a Windows runner being available.
+
+**Not changed.** The npm extension and container-image SBOMs. The container SBOM already covers the Linux
+image as a whole.
 
 ## To resolve on acceptance
 

@@ -637,7 +637,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `login_rate_limit_per_ip` | int | 10 | max attempts per client IP per window (`0` disables). **One number, two limiters:** it is also the per-**actor** budget of the credential-**ceremony** limiter (`/me/password`, `/me/reauth`, `/me/mfa/confirm` + the console re-auth routes) — the `_per_ip` name is historical, and retuning it retunes both |
 | `login_rate_limit_global` | int | 60 | max attempts across all clients per window (`0` disables). Sign-in window only — the ceremony limiter has **no** global dimension (`glob=0`) |
 | `login_rate_limit_window_seconds` | float | 60 | sliding-window length — shared by the sign-in window **and** the per-actor credential-**ceremony** limiter, exactly as `login_rate_limit_per_ip` is |
-| `phi_read_rate_limit_enabled` | bool | `true` | per-actor anti-automation throttle (ASVS 2.4.1) — bounds scripted PHI harvesting on top of pagination + access auditing. Charged on **8 JSON routes** via `require_phi_read`, on the **4 bulk-PHI step-up GETs** at admission (`/messages/search`, `/messages/export`, `/uploads/{file_id}/messages`, `/search/layered` — `require_step_up` paces NON-GET only, so these charge it themselves), and on the **8 `/ui` PHI views** via `require_ui(…, phi=True)` |
+| `phi_read_rate_limit_enabled` | bool | `true` | per-actor anti-automation throttle (ASVS 2.4.1) — bounds scripted PHI harvesting on top of pagination + access auditing. Charged on **8 JSON routes** via `require_phi_read`, on the **4 bulk-PHI step-up GETs** at admission (`/messages/search`, `/messages/export`, `/uploads/{file_id}/messages`, `/search/layered` — `require_step_up` paces NON-GET only, so these charge it themselves), and on the **11 `/ui` PHI views** via `require_ui(…, phi=True)` |
 | `phi_read_rate_limit_per_actor` | int | 120 | max PHI reads per user per window (generous — clears console/human use; `0` disables this dimension) |
 | `phi_read_rate_limit_global` | int | 0 | max PHI reads across all users per window (`0` = off) |
 | `phi_read_rate_limit_window_seconds` | float | 60 | sliding-window length |
@@ -665,8 +665,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_tls_ca_cert_file` | str | — | trust an internal CA for LDAPS without disabling verification |
 | `ad_tls_ca_cert_pin` | str | — | optional lowercase-hex SHA-256 pin over the corresponding CA anchor PEM (`ad_tls_ca_cert_file`); a mismatch refuses at load + reload (ASVS 6.7.1); unset = no pin (dormant); set but empty or whitespace refuses at load |
 | `ad_allow_insecure_ldap` | bool | `false` | explicit opt-in to a non-`ldaps://` bind (trusted-network dev only) |
-| `ad_connect_timeout` | float | `10.0` | seconds — bounds the LDAP/LDAPS **TCP connect** on every `ldap3` `Server` the authenticator builds (ASVS 13.1.3). Must be finite and `> 0`; `0`, negative, `inf` and `NaN` are refused at config load. `ldap3`'s own default is `None` (wait forever), so without this an unresponsive DC pinned a thread-pool worker indefinitely |
-| `ad_receive_timeout` | float | `10.0` | seconds — bounds **each LDAP response read** (both binds and every search) on every `ldap3` `Connection`. Same finite-positive validation |
+| `ad_connect_timeout` | float | `10.0` | seconds — bounds the LDAP/LDAPS **TCP connect** on every `ldap3` `Server` the authenticator builds (ASVS 13.1.3). Must be finite and `> 0`; `0`, negative, `inf` and `NaN` are refused at config load, and so is anything above `3600`. `ldap3`'s own default is `None` (wait forever), so without this an unresponsive DC pinned a thread-pool worker indefinitely |
+| `ad_receive_timeout` | float | `10.0` | seconds — bounds **each socket receive** during an LDAP response (both binds and every search) on every `ldap3` `Connection`. Same validation, up to `3600`. The engine rounds it up to whole seconds before handing it to `ldap3`, so `9.25` acts as `10` |
 | `ad_session_recheck_seconds` | int | `300` | **Directory session reconciliation** ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md) mechanism 2). How often to re-resolve directory principals holding **live** sessions and revoke those AD has disabled or deleted — without it, an AD disable does not take effect until the `[security].max_session_hours` cap (12 h). **`300` (five minutes) is the default** (ADR 0148 GIVEN 1 — the hardened path is the shipped path), floored at **60 s** (a pass costs one LDAP bind per signed-in directory user). `0` disables the loop and is a **loosening** once AD is on — `security_loosenings()` names it. The default is **inert without AD** (`should_reconcile()` also needs an LDAP client), so a non-AD deployment is unaffected; an **explicit** non-zero value without `ad_enabled` is still refused rather than left silently dead. |
 | `ad_session_recheck_strikes` | int | `2` | Consecutive passes a principal must fail to resolve before its sessions are revoked. *The search matched nothing* cannot tell *deleted* from *moved out of the search base*, so a single ambiguous result must never revoke; a set disabled bit and an unreadable `userAccountControl` strike the same way. A wave of unreadable answers is held instead of revoked, with no setting ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). Range 1–10. |
 | `ad_session_recheck_max_users` | int | `200` | Per-pass bind budget. Beyond this, remaining users are picked up by later passes (least-recently-probed first), so a large estate degrades to a longer effective interval instead of a bind storm. |
@@ -1167,13 +1167,11 @@ The engine raises it when a pause starts, and again every 300 seconds while the 
 does `queue_buildup`. That spacing is fixed. The notifier's throttle (`realert_seconds`, or a rule's
 `cooldown_seconds`) decides which of those raises pages, and escalation tiers and suspend windows
 count them. So a cooldown under 300 seconds does not page faster. A second pause soon after the first
-raises at once, but the throttle may hold its page; a later reminder in that pause sends it. A rule
-with a `control_action` fires it on every raise that the throttle passes, so a long pause repeats
-the action. With no `[alerts]` transport the engine raises no event; its own WARNING line records
-each pause. Its `connection` is
-`intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert. A rule's
-`control_action` sent to that name reaches no connection. A rule that sets `control_target` still
-restarts the connection it names.
+raises at once, but the throttle may hold its page; a later reminder in that pause sends it. With no
+`[alerts]` transport the engine raises no event; its own WARNING line records each pause. Its
+`connection` is `intake:staged_depth` or `intake:disk_floor`, so each bound is its own alert.
+A rule cannot attach a `control_action` to `intake_paused`, because it is not a connection-scoped
+event (see `control_action` in the rule table below).
 
 The payload holds `reason` (`staged_depth` or `disk_floor`), `value`, `limit` and `store_kind`
 (`sqlite`, `sqlserver` or `postgres`), plus a one-line `detail`. For `staged_depth`, `value` and
@@ -1221,13 +1219,15 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `content_match`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
 | `severity` | str | `warning` | `info` \| `warning` \| `critical` — tagged onto the event (webhook JSON + email subject) for downstream triage |
 | `transports` | list | _all_ | which transports fire: subset of `["webhook", "email"]`; **unset = all configured**; **`[]` = SUPPRESS** (drop silently) |
 | `cooldown_seconds` | num | _global_ | override `realert_seconds` for matching events (e.g. re-page a critical sooner) |
+| `control_action` | str | _unset_ | `restart_inbound` \| `restart_outbound` — restart a connection when the rule fires ([ADR 0128](adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md)). **Allowed only with a connection-scoped `event_type`** (BACKLOG #1898). The source of record is `_ALERT_CONTROL_EVENT_TYPES` in `messagefoundry/config/settings.py`; at the time of writing it holds `connection_stopped`, `connection_error`, `queue_buildup`, `message_stall`, `saturation` and `lane_stuck`. Config load refuses the action with `any` and with every other type. Those other types put a stand-in in `connection`, such as a bare username, `store` or a cert label. A restart aimed at a stand-in could hit an unrelated connection with the same name. With no `control_target`, the action aims at the event's own name, so pair `restart_outbound` with events from outbound connections and `restart_inbound` with events from inbound ones |
+| `control_target` | str | _the event's connection_ | the connection `control_action` restarts, when it is not the one that fired. Config load refuses a value that is not a connection name, and refuses it on a rule with no `control_action` |
 
 ```toml
 [alerts]
@@ -1360,8 +1360,18 @@ the TLS leg to the proxy uses the same approved suites as the Vault leg. It is v
 same anchor too: the CA file when one is set, so the proxy's certificate must chain to it, and the
 public bundle otherwise. An `http://` Vault address through an
 `https://` proxy is **refused**, because that leg could not be verified. Use an `https://` Vault
-address (BACKLOG #300). Do not read `NO_PROXY` as the remedy: it sends the token over plain `http://`
-the whole way, which is weaker still, and a direct `http://` Vault address is not refused.
+address (BACKLOG #300). `NO_PROXY` is not a way around it either: a remote `http://` Vault reached
+directly is refused too, as the next paragraph says.
+**Each Vault client refuses a Vault address that is not `https://`** (BACKLOG #2317). That holds
+for at least the KV secret provider here, the store key provider and the Transit cipher. It covers
+a direct `http://` address and one behind an `http://` proxy, including hvac's own `VAULT_ADDR`
+fallback. The one `http://` address allowed is a loopback Vault that the client reaches with no
+proxy, because that hop stays on the box. Loopback is decided without DNS: the name `localhost` or
+a loopback IP literal, and no other name, whatever it resolves to. An address that does not read as
+one well-formed URL is refused too. The refusal comes when the client is built, as the provider's
+own fail-closed error, and again before each send in case a proxy appeared since. Its text names no
+part of the address, and `[security].enforcement` does not relax it. An `https://` Vault behind an
+`http://` proxy is still allowed: the token rides inside the TLS tunnel to Vault.
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.

@@ -207,8 +207,8 @@ def _payload(raw: str | bytes, content_type: str) -> Message | RawMessage:
 
     Each call yields a **fresh** object. For ``hl7v2`` that isolation is load-bearing: a Handler
     *mutates* its :class:`Message`, so every consumer must get its own parse (one parse per consumer
-    is also cheaper than parse-once-then-deep-copy — python-hl7's parse beats deep-copying its nested
-    list tree). A :class:`RawMessage` is read-only, so it is safe to *share* across consumers of the
+    was measured cheaper than parse-once-then-deep-copy when python-hl7 was the parser; not re-measured
+    on the built-in parser, whose lazy split only makes a parse cheaper). A :class:`RawMessage` is read-only, so it is safe to *share* across consumers of the
     same message (see :func:`_shareable_payload`).
 
     The construction itself lives in :func:`~messagefoundry.pipeline._sandbox_codec.build_payload` so

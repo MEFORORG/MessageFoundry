@@ -534,6 +534,8 @@ def test_the_generated_alphabet_reaches_every_hazard() -> None:
     for parts in GENERATED:
         if any("path" in p for p in parts):
             seen.update(p["text"] for p in parts if "text" in p)
+    # BACKLOG #1746: an empty alphabet would pass the absence check below with nothing walked.
+    assert len(TEXT_ALPHABET) >= 20, f"the hazard alphabet shrank to {len(TEXT_ALPHABET)}"
     missing = [t for t in TEXT_ALPHABET if t and t not in seen]
     assert not missing, missing
 

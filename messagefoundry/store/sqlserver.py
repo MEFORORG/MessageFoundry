@@ -113,9 +113,13 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, ClaimPoolStatus, PoolStatus
 from messagefoundry.store.privilege import (
+    AUDIT_APPEND_ONLY_TABLES,
+    SQLSERVER_AUDIT_WRITE_PRIVILEGES,
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
     StorePrivilegeReport,
+    audit_write_alias,
+    classify_audit_writes,
     sqlserver_excess,
 )
 from messagefoundry.store.sealed_cache import (
@@ -131,6 +135,8 @@ from messagefoundry.store.store import (
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     AUDIT_ALL_ROWS,
+    AUDIT_CHAIN_META_ROW_CHANGED,
+    AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
@@ -182,6 +188,7 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     _alert_summary,
     _append_channel_scope,
+    _dead_target_pairs,
     _opt_float,
     _qmark_cutoff_case,
     _session_cap_groups,
@@ -189,6 +196,7 @@ from messagefoundry.store.store import (
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
+    audit_rekey_refused,
     audit_rekey_when_keyed,
     audit_row_hash,
     birth_notify_email,
@@ -428,14 +436,16 @@ _CLAIM_PROC_LANE_MAX = 256
 
 #: A queue row whose body is still THERE, and therefore still replayable (BACKLOG #1560). The SQL
 #: Server twin of ``store._REPLAYABLE_BODY``; the reasoning lives there and is not restated. Spliced
-#: into :meth:`SqlServerStore.replay` and :meth:`SqlServerStore.replay_dead` so neither re-queues a
-#: delivery whose content retention has erased.
+#: into at least :meth:`SqlServerStore.replay` and :meth:`SqlServerStore.replay_dead` so neither
+#: re-queues a delivery whose content retention has erased, and into
+#: :meth:`SqlServerStore.list_replay_targets`.
 _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 
 #: A queue row that is NOT a pass-through completion marker (BACKLOG #1580). The SQL Server twin of
-#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into
+#: ``store._NOT_PT_MARKER``; the reasoning lives there and is not restated. Spliced into at least
 #: :meth:`SqlServerStore.replay`, :meth:`SqlServerStore.replay_dead` and the source read of
-#: :meth:`SqlServerStore.resend_to`, so none of them turns a marker back into outbound work.
+#: :meth:`SqlServerStore.resend_to`, so none of them turns a marker back into outbound work, and into
+#: :meth:`SqlServerStore.list_replay_targets`.
 _NOT_PT_MARKER = "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@passthrough-marker')"
 
 #: The same exclusion over an aliased ``queue q``, DERIVED so the two cannot drift. Used by the
@@ -2303,6 +2313,38 @@ def _options_remedy(database: str | None, off: Sequence[str]) -> str:
     )
 
 
+#: The one statement that writes the audit chain's keying row (owner ruling R16): an INSERT that
+#: never replaces, so the runtime login needs INSERT and SELECT on ``audit_chain_meta`` and no more.
+#: Parameters are ``(keyed_from_id, key_id)``. UPDLOCK+HOLDLOCK make the existence test and the
+#: INSERT one step against a second process, where RCSI would otherwise read a snapshot; the live
+#: legs run it under the runbook's DENY. ``OUTPUT`` says whether a row went in, since a session
+#: under NOCOUNT reports a rowcount of -1.
+_AUDIT_META_GUARDED_INSERT = (
+    "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) OUTPUT INSERTED.id"
+    " SELECT 1, ?, ? WHERE NOT EXISTS (SELECT 1 FROM audit_chain_meta"
+    " WITH (UPDLOCK, HOLDLOCK) WHERE id=1)"
+)
+
+
+def _audit_write_probe(table: str, privilege: str) -> str:
+    """One privilege-probe column: does this login hold ``privilege`` on the append-only audit
+    ``table`` (owner ruling R16)?
+
+    The one-part name resolves as the store's own unqualified statements do, and ``HAS_PERMS_BY_NAME``
+    answers NULL for a table this login cannot see, which the probe reads as NOT READ. ``UPDATE`` is
+    read column by column: a column-level GRANT outranks a table-level DENY, so the table-level answer
+    alone would miss it. ``OBJECT_ID`` is NULL for a table the login cannot see, so no column row is
+    found and the MAX is NULL too. ``table`` and ``privilege`` come from closed tuples in
+    ``store.privilege``, never from input."""
+    alias = audit_write_alias(table, privilege)
+    if privilege == "UPDATE":
+        return (
+            f"(SELECT MAX(HAS_PERMS_BY_NAME('{table}', 'OBJECT', 'UPDATE', c.name, 'COLUMN'))"
+            f" FROM sys.columns c WHERE c.object_id = OBJECT_ID('{table}')) AS {alias}"
+        )
+    return f"HAS_PERMS_BY_NAME('{table}', 'OBJECT', '{privilege}') AS {alias}"
+
+
 def _probed_grant(value: Any) -> bool | None:
     """Classify one privilege-probe column THREE ways: ``True`` held, ``False`` not held, ``None`` **not
     read**. A NULL never becomes a boolean here, and that is the whole point (BACKLOG #1234).
@@ -3132,39 +3174,55 @@ class SqlServerStore:
     async def _load_audit_chain_meta(self) -> None:
         """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
         encrypted store (nothing to re-bless). An existing keyless chain stays keyless until the
-        explicit :meth:`rekey_audit_chain` migration — never silent (see the SQLite twin)."""
-        row = await self._fetchone("SELECT keyed_from_id, key_id FROM audit_chain_meta WHERE id=1")
-        if row is not None and row["keyed_from_id"] is not None:
-            self._audit_keyed_from = int(row["keyed_from_id"])
-            await settle_audit_ranges(self, row["key_id"])  # BACKLOG #1904
-            return
-        if not self._audit_keyed_capable():
-            return  # keyless store — the chain stays byte-identical to pre-#190
-        cnt = await self._fetchone("SELECT COUNT(*) AS n FROM audit_log")
-        if cnt is None:
-            return  # no count read: never key over rows that may exist
-        rows = int(cnt["n"])
-        if rows > 0:
-            self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
-            warn_unkeyed_audit_chain(log, rows)
-            return
-        if self._read_only:
-            return  # BACKLOG #1780: key nothing from a read-only handle
-        active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, 1, ?)",
-                    (active_id,),
+        explicit :meth:`rekey_audit_chain` migration — never silent (see the SQLite twin).
+
+        The watermark row is only ever INSERTed (owner ruling R16), by the guarded INSERT the rekey
+        uses too. When no row went in, or the chain already has rows, the row is read again: a peer
+        engine may have keyed the chain, and appended to it, since the first read, and this open then
+        adopts what the peer wrote rather than failing on the primary key."""
+        meta = "SELECT keyed_from_id, key_id FROM audit_chain_meta WHERE id=1"
+        row = await self._fetchone(meta)
+        if row is None or row["keyed_from_id"] is None:
+            if not self._audit_keyed_capable():
+                return  # keyless store — the chain stays byte-identical to pre-#190
+            cnt = await self._fetchone("SELECT COUNT(*) AS n FROM audit_log")
+            if cnt is None:
+                return  # no count read: never key over rows that may exist
+            rows = int(cnt["n"])
+            if rows == 0 and self._read_only:
+                return  # BACKLOG #1780: key nothing from a read-only handle
+            active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
+            inserted = False
+            if rows == 0:
+                async with self._acquire() as conn, self._cursor(conn) as cur:
+                    try:
+                        await cur.execute(_AUDIT_META_GUARDED_INSERT, (1, active_id))
+                        inserted = await cur.fetchone() is not None
+                        await self._commit(conn)
+                    except Exception:
+                        await conn.rollback()
+                        raise
+            if inserted:
+                self._audit_keyed_from = 1
+                self._audit_first_key_id = self._audit_range_key_id = active_id
+                self._audit_range_from = 1
+                self._audit_range_keys = [active_id] if active_id is not None else []
+                return
+            row = await self._fetchone(meta)
+            if row is None or row["keyed_from_id"] is None:
+                if rows > 0:
+                    self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
+                    warn_unkeyed_audit_chain(log, rows)
+                    return
+                reason = (
+                    AUDIT_CHAIN_META_ROW_CHANGED
+                    if row is None
+                    else AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK
                 )
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        self._audit_keyed_from = 1
-        self._audit_first_key_id = self._audit_range_key_id = active_id
-        self._audit_range_from = 1
-        self._audit_range_keys = [active_id] if active_id is not None else []
+                log.error("sqlserver: %s", reason)
+                raise RuntimeError(reason)
+        self._audit_keyed_from = int(row["keyed_from_id"])
+        await settle_audit_ranges(self, row["key_id"])  # BACKLOG #1904
 
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
@@ -3215,15 +3273,16 @@ class SqlServerStore:
                 await cur.execute("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
                 mrow = await cur.fetchone()
                 watermark = (int(mrow[0]) if mrow is not None else 0) + 1
-                # Single-row upsert (id=1 unique): update if present, else insert.
-                await cur.execute(
-                    "UPDATE audit_chain_meta SET keyed_from_id=?, key_id=? WHERE id=1",
-                    (watermark, active_id),
-                )
-                if cur.rowcount == 0:
-                    await cur.execute(
-                        "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) VALUES (1, ?, ?)",
-                        (watermark, active_id),
+                # INSERT only, never replace (owner ruling R16): the runtime login holds INSERT and
+                # SELECT on audit_chain_meta, and SQL Server checks an UPDATE's permission even when
+                # it would touch no row. A row already there is reported instead.
+                await cur.execute(_AUDIT_META_GUARDED_INSERT, (watermark, active_id))
+                if await cur.fetchone() is None:
+                    await cur.execute("SELECT keyed_from_id FROM audit_chain_meta WHERE id=1")
+                    held = await cur.fetchone()
+                    await conn.rollback()
+                    return False, audit_rekey_refused(
+                        held is not None, None if held is None else held[0]
                     )
                 await self._commit(conn)
             except Exception:
@@ -3675,6 +3734,11 @@ class SqlServerStore:
         db_cols = [
             f"IS_ROLEMEMBER(?) AS dbr_{i}" for i in range(len(SQLSERVER_FIXED_DATABASE_ROLES))
         ]
+        audit_cols = [
+            _audit_write_probe(table, privilege)
+            for table in AUDIT_APPEND_ONLY_TABLES
+            for privilege in SQLSERVER_AUDIT_WRITE_PRIVILEGES
+        ]
         row = await self._fetchone(
             "SELECT SUSER_SNAME() AS login_name, USER_NAME() AS db_user, DB_NAME() AS db_name,"
             " HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') AS control_server,"
@@ -3684,7 +3748,7 @@ class SqlServerStore:
             " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
             " SCHEMA_NAME() AS default_schema,"
             " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema, "
-            + ", ".join(server_cols + db_cols),
+            + ", ".join(server_cols + db_cols + audit_cols),
             SQLSERVER_FIXED_SERVER_ROLES + SQLSERVER_FIXED_DATABASE_ROLES,
         )
         if row is None:
@@ -3726,12 +3790,15 @@ class SqlServerStore:
                 unread.append(f"create table on database {database}")
             if alter_schema is None:
                 unread.append("ALTER on the default schema")
+        audit_writes, audit_unread = classify_audit_writes(row, SQLSERVER_AUDIT_WRITE_PRIVILEGES)
         server_roles = tuple(held_server)
         database_roles = tuple(held_database)
         if unread:
             probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
             held_labels = [f"server role {r}" for r in server_roles]
             held_labels += [f"database role {r}" for r in database_roles]
+            if external:  # owner ruling R16: a held audit-table right is a finding there
+                held_labels += list(audit_writes)
             # The catalog enumeration below is skipped deliberately: it is additive only, and widening
             # a report already saying the read was incomplete buys nothing an operator can act on.
             return StorePrivilegeReport(
@@ -3753,7 +3820,7 @@ class SqlServerStore:
         # Under external schema management `provision-schema` runs the DDL as another principal, so
         # db_ddladmin, and the same rights granted directly, are excess here.
         note = (
-            "fixed server + database role membership probed BY NAME (authoritative, catalog-visibility"
+            "fixed server + database role membership probed by name (authoritative, catalog-visibility"
             " independent); user-defined database roles added best-effort from sys.database_principals"
         )
         try:
@@ -3770,6 +3837,40 @@ class SqlServerStore:
             database_roles = tuple(
                 dict.fromkeys(database_roles + tuple(str(r["role_name"]) for r in extra))
             )
+        excess = sqlserver_excess(
+            server_roles=server_roles,
+            database_roles=database_roles,
+            # Narrowed to plain bools by the unread guard above — neither can still be None here.
+            control_server=bool(control_server),
+            control_database=bool(control_database),
+            database=database,
+            external=external,
+            create_table=bool(create_table),
+            alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
+            audit_writes=audit_writes,
+        )
+        if external and audit_unread:
+            # Owner ruling R16 counts these under external only, so only external needs them READ. A
+            # NULL is a table this login cannot resolve. With nothing else found the read is
+            # unobserved rather than clean; with an over-grant already found it stays OBSERVED, so the
+            # start still refuses on what WAS read.
+            note += (
+                f"; the audit-table grants read NULL for {', '.join(audit_unread)}, so whether this"
+                " login can change audit rows was not read"
+            )
+            if not excess:
+                return StorePrivilegeReport(
+                    backend=self.backend,
+                    status=StorePrivilegeStatus.UNOBSERVABLE,
+                    principal=str(row["login_name"] or ""),
+                    database=database,
+                    server_roles=server_roles,
+                    database_roles=database_roles,
+                    detail=(
+                        f"{note}; [store].schema_management is 'external', which requires INSERT and"
+                        " SELECT only on audit_log and audit_chain_meta"
+                    ),
+                )
         return StorePrivilegeReport(
             backend=self.backend,
             status=StorePrivilegeStatus.OBSERVED,
@@ -3777,21 +3878,16 @@ class SqlServerStore:
             database=database,
             server_roles=server_roles,
             database_roles=database_roles,
-            excess=sqlserver_excess(
-                server_roles=server_roles,
-                database_roles=database_roles,
-                # Narrowed to plain bools by the unread guard above — neither can still be None here.
-                control_server=bool(control_server),
-                control_database=bool(control_database),
-                database=database,
-                external=external,
-                create_table=bool(create_table),
-                alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
-            ),
+            excess=excess,
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
-                f"{'runtime (schema_management=external: no db_ddladmin)' if external else 'auto-mode'}"
-                " grant"
+                + (
+                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE, DELETE, "
+                    "ALTER, CONTROL or take ownership on audit_log or audit_chain_meta)"
+                    if external
+                    else "auto-mode"
+                )
+                + " grant"
             ),
         )
 
@@ -10496,6 +10592,24 @@ class SqlServerStore:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM queue o{where}", params)
         return int(row["n"]) if row else 0
+
+    async def list_replay_targets(
+        self,
+        *,
+        channel_id: str | None = None,
+        destination_name: str | None = None,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
+        narrowed by the two clauses :meth:`replay_dead` applies. The database collation decides
+        whether two names differing only in case are one pair, as it does for replay itself."""
+        where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
+        rows = await self._fetchall(
+            "SELECT DISTINCT o.channel_id, o.destination_name"
+            f" FROM queue o{where} AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
+            params,
+        )
+        return _dead_target_pairs((r["channel_id"], r["destination_name"]) for r in rows)
 
     @staticmethod
     def _dead_filter(

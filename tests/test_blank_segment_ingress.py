@@ -4,12 +4,12 @@
 
 A sender that ends segments with ``CRLF`` and adds a blank line produces ``\\r\\r`` once line endings
 are normalised. Before the fix, ``Peek.parse`` accepted that, then ``peek.control_id``,
-``summarize(peek)`` and ``build_ack`` each raised ``IndexError`` on both parser backends. The
+``summarize(peek)`` and ``build_ack`` each raised ``IndexError`` on both parser backends of the time. The
 listener caught only ``HL7PeekError``, so the message got no row, no ACK and no NAK, and the MLLP
 server dropped the connection. That broke the count-and-log invariant (CLAUDE.md section 2).
 
 **The fix is tolerant, as the ledger row asks.** ``Peek.parse`` and ``Message.parse`` drop empty
-lines before either backend parses, so the message is ACKed ``AA`` and committed ``RECEIVED`` with its
+lines before the parse, so the message is ACKed ``AA`` and committed ``RECEIVED`` with its
 routing fields, and a Handler can still edit it. The stored raw keeps the blank line: the engine
 records what the sender sent. A runner guard and a ``build_ack``
 guard back that up, so a field read that faults for any other reason still records ``ERROR`` and
@@ -28,13 +28,11 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import NoReturn
 
-import hl7
 import pytest
 
 import messagefoundry.pipeline.wiring_runner as wiring_runner
 from messagefoundry.config.models import ConnectorType, ContentType, Source
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
-from messagefoundry.parsing._backend import backend
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek, normalize
 from messagefoundry.parsing.summary import summarize
@@ -59,7 +57,6 @@ _SHAPES = {
     "crlf-crlf": f"{_HEADER}\r\n\r\n{_PID}\r\n",
     "control": f"{_HEADER}\r{_PID}\r",
 }
-_BACKENDS = pytest.mark.parametrize("builtin", [True, False], ids=["builtins", "python-hl7"])
 
 
 @pytest.fixture
@@ -99,59 +96,38 @@ async def _queue_depth(store: MessageStore) -> int:
 # --- the peek itself ------------------------------------------------------------------------------
 
 
-@_BACKENDS
 @pytest.mark.parametrize("shape", list(_SHAPES), ids=list(_SHAPES))
-def test_the_peek_reads_every_routing_field_across_a_blank_segment(
-    builtin: bool, shape: str
-) -> None:
-    with backend(builtin=builtin):
-        peek = Peek.parse(_SHAPES[shape])
-        assert peek.control_id == "CTRL1594"
-        assert peek.routing()["message_type"] == "ADT^A01"
-        assert peek.field("PID-3.1") == "100"
-        assert summarize(peek)  # the pre-ACK summary no longer raises
-        assert peek.segments() == ["MSH", "PID"]
-        # The peek drops the empty line for its own parse only; its raw is what was received.
-        assert peek.raw == normalize(_SHAPES[shape])
-        ack = build_ack(_SHAPES[shape])
-        assert "MSA|AA|CTRL1594" in ack
+def test_the_peek_reads_every_routing_field_across_a_blank_segment(shape: str) -> None:
+    peek = Peek.parse(_SHAPES[shape])
+    assert peek.control_id == "CTRL1594"
+    assert peek.routing()["message_type"] == "ADT^A01"
+    assert peek.field("PID-3.1") == "100"
+    assert summarize(peek)  # the pre-ACK summary no longer raises
+    assert peek.segments() == ["MSH", "PID"]
+    # The peek drops the empty line for its own parse only; its raw is what was received.
+    assert peek.raw == normalize(_SHAPES[shape])
+    ack = build_ack(_SHAPES[shape])
+    assert "MSA|AA|CTRL1594" in ack
 
 
-@_BACKENDS
-def test_a_field_that_only_starts_with_the_separator_is_not_a_blank_segment(builtin: bool) -> None:
+def test_a_field_that_only_starts_with_the_separator_is_not_a_blank_segment() -> None:
     # ``|stray`` has an empty id on the built-ins but is not an empty line. python-hl7 reads past it,
-    # and the built-ins used to raise on it anyway. Both must read it now.
+    # and the built-ins used to raise on it anyway. The parser must read it now.
     raw = f"{_HEADER}\r|stray\r{_PID}\r"
-    with backend(builtin=builtin):
-        assert Peek.parse(raw).control_id == "CTRL1594"
-
-
-def test_the_python_hl7_backend_maps_a_malformed_rich_text_count_to_none() -> None:
-    # DELTA-02's fallback half. The expansion budget refuses this body at Peek.parse, so the only way
-    # to reach the fallback's extractor with it is to build the Peek directly, as a fallback after an
-    # internal built-ins fault would.
-    text = f"{_HEADER}\rPID|1||100^^^H^MR||A\\.inX\\B^JANE\r"
-    with pytest.raises(ValueError):
-        hl7.parse(text).extract_field("PID", 1, 5, 1, 1, 1)  # the raw library still raises
-    peek = Peek(message=hl7.parse(text), raw=text)
-    assert peek.field("PID-5.1") is None
-    assert peek.field("PID-5.2") == "JANE"
+    assert Peek.parse(raw).control_id == "CTRL1594"
 
 
 # --- the listener, end to end ---------------------------------------------------------------------
 
 
-@_BACKENDS
 @pytest.mark.parametrize("shape", list(_SHAPES), ids=list(_SHAPES))
 async def test_the_mllp_listener_acks_and_commits_a_message_with_a_blank_segment(
-    builtin: bool,
     shape: str,
     runner: tuple[RegistryRunner, InboundConnection],
     store: MessageStore,
 ) -> None:
     rr, ic = runner
-    with backend(builtin=builtin):
-        ack = await rr._handle_inbound(ic, _SHAPES[shape].encode())
+    ack = await rr._handle_inbound(ic, _SHAPES[shape].encode())
 
     assert ack is not None and "MSA|AA|CTRL1594" in ack
     rows = await _rows(store)
@@ -164,17 +140,14 @@ async def test_the_mllp_listener_acks_and_commits_a_message_with_a_blank_segment
     assert await _queue_depth(store) == 1
 
 
-@_BACKENDS
 @pytest.mark.parametrize("shape", ["cr-cr", "crlf-crlf"])
 async def test_the_http_listener_commits_a_message_with_a_blank_segment(
-    builtin: bool,
     shape: str,
     runner: tuple[RegistryRunner, InboundConnection],
     store: MessageStore,
 ) -> None:
     rr, ic = runner
-    with backend(builtin=builtin):
-        mid = await rr._handle_inbound_http(ic, _SHAPES[shape].encode())
+    mid = await rr._handle_inbound_http(ic, _SHAPES[shape].encode())
 
     assert isinstance(mid, str) and mid
     rows = await _rows(store)
@@ -182,9 +155,8 @@ async def test_the_http_listener_commits_a_message_with_a_blank_segment(
     assert rows[0]["control_id"] == "CTRL1594"
 
 
-@_BACKENDS
 async def test_a_streaming_inbound_detaches_a_document_from_a_message_with_a_blank_segment(
-    builtin: bool, store: MessageStore
+    store: MessageStore,
 ) -> None:
     # The detach re-parses the body with Message and writes OBX-5.5 through a whole-field set. Had
     # only the peek dropped the empty line, that set would raise IndexError and escape the listener
@@ -206,8 +178,7 @@ async def test_a_streaming_inbound_detaches_a_document_from_a_message_with_a_bla
     )
     reg.add_router("r", lambda m: [])
     rr = RegistryRunner(reg, store)
-    with backend(builtin=builtin):
-        ack = await rr._handle_inbound(reg.inbound["IB_STREAM"], body.encode())
+    ack = await rr._handle_inbound(reg.inbound["IB_STREAM"], body.encode())
 
     assert ack is not None and "MSA|AA|CTRL1594" in ack
     rows = await _rows(store)
@@ -220,19 +191,16 @@ async def test_a_streaming_inbound_detaches_a_document_from_a_message_with_a_bla
 # --- the Message surface agrees with the peek -----------------------------------------------------
 
 
-@_BACKENDS
-def test_a_handler_can_edit_a_message_that_arrived_with_a_blank_segment(builtin: bool) -> None:
+def test_a_handler_can_edit_a_message_that_arrived_with_a_blank_segment() -> None:
     # Message.parse drops the empty line too. Kept, it would make every whole-field set raise on
-    # both backends, so a message the listener ACKed would then fail in every Handler that edits it.
-    with backend(builtin=builtin):
-        msg = Message.parse(_SHAPES["crlf-crlf"])
-        assert msg.segments() == Peek.parse(_SHAPES["crlf-crlf"]).segments() == ["MSH", "PID"]
-        msg.set("MSH-10", "EDITED")
-        msg.set("PID-3.1", "200")
-        assert (
-            msg.encode()
-            == f"{_HEADER.replace('CTRL1594', 'EDITED')}\r{_PID.replace('100', '200')}\r"
-        )
+    # the parser, so a message the listener ACKed would then fail in every Handler that edits it.
+    msg = Message.parse(_SHAPES["crlf-crlf"])
+    assert msg.segments() == Peek.parse(_SHAPES["crlf-crlf"]).segments() == ["MSH", "PID"]
+    msg.set("MSH-10", "EDITED")
+    msg.set("PID-3.1", "200")
+    assert (
+        msg.encode() == f"{_HEADER.replace('CTRL1594', 'EDITED')}\r{_PID.replace('100', '200')}\r"
+    )
 
 
 # --- defence in depth: a faulting field read on an accepted peek ----------------------------------

@@ -30,19 +30,27 @@ decision was made*, never *what it should be*. The permission policy stays in on
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any, ClassVar
+from typing import Annotated, Any, ClassVar, get_args, get_origin
 
 from pydantic import BaseModel, FieldSerializationInfo, PrivateAttr, field_serializer
 
 __all__ = ["GATEABLE_PROPERTIES", "PhiGatedModel"]
 
-#: Every property name a :class:`PhiGatedModel` may gate. The base class declares its field
-#: serializer over exactly these names (``check_fields=False``, because no single model has them
-#: all), so a gated property outside this set would never reach the serializer and would serialize
-#: ungated — the one way this gate could go quietly inert. ``__pydantic_init_subclass__`` refuses
-#: such a declaration at class-creation time rather than leaving it to review.
+#: Every property name a :class:`PhiGatedModel` may gate: the reviewed vocabulary of PHI-bearing
+#: response properties. ``__pydantic_init_subclass__`` refuses a declaration outside it at
+#: class-creation time, so a new gated name is added here, in review, rather than in passing.
+#:
+#: **CORRECTED (BACKLOG #2443 step 4).** This comment used to say the base class declares ONE field
+#: serializer over exactly these names, so a name outside the set would serialize ungated. That
+#: shared serializer is gone. It covered every field with one of these names on EVERY subclass,
+#: gated or not, and typed it ``str | None``, so a subclass with a non-string field of such a name
+#: (``ConnectionMetadata.metadata``, a dict) could not be gated without breaking that field's
+#: OpenAPI type and warning on every response. Each subclass now gets a serializer over its OWN
+#: ``phi_gated_properties`` (:meth:`PhiGatedModel.__init_subclass__`), so a declared name is
+#: covered by construction and an undeclared field is never touched.
 GATEABLE_PROPERTIES: frozenset[str] = frozenset(
-    {"summary", "error", "metadata", "last_error", "detail"}
+    # ``reason``: the connection-event and alert reasons (BACKLOG #2443).
+    {"summary", "error", "metadata", "last_error", "detail", "reason"}
 )
 
 
@@ -62,6 +70,22 @@ class PhiGatedModel(BaseModel):
     #: mark one OVER-reports the audit rather than hiding a disclosure.
     _phi_masked: frozenset[str] = PrivateAttr(default=frozenset())
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Give every gated subclass a serializer over its own ``phi_gated_properties``.
+
+        Runs inside class creation, before pydantic collects the class's serializers, so the
+        attribute set here is picked up like a decorated method. It reads the set as the class
+        RESOLVES it, so a set declared on the class, inherited, or brought in by a mixin is
+        covered alike. Set under one name, so each class replaces its parent's serializer rather
+        than stacking a second one on a field. Only the gated fields are covered, so a non-string
+        field that happens to share a gateable name is serialized by its own type, untouched.
+        :meth:`__pydantic_init_subclass__` then proves the coverage rather than trusting this."""
+        super().__init_subclass__(**kwargs)
+        declared = cls.phi_gated_properties
+        if declared:
+            serializer = field_serializer(*sorted(declared), when_used="json", check_fields=False)
+            setattr(cls, _SERIALIZER_ATTR, serializer(_withhold_unreleased_phi))
+
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
         super().__pydantic_init_subclass__(**kwargs)
@@ -69,16 +93,50 @@ class PhiGatedModel(BaseModel):
         uncovered = sorted(declared - GATEABLE_PROPERTIES)
         if uncovered:
             raise TypeError(
-                f"{cls.__name__}.phi_gated_properties names {uncovered}, which "
-                f"{__name__}.GATEABLE_PROPERTIES does not cover — the field serializer is declared "
-                "over that set, so these properties would serialize UNGATED. Add them to "
-                "GATEABLE_PROPERTIES in the same change."
+                f"{cls.__name__}.phi_gated_properties names {uncovered}, which are not in "
+                f"{__name__}.GATEABLE_PROPERTIES, the reviewed vocabulary of PHI-bearing "
+                "properties. Add them there in the same change, so the new name is reviewed."
             )
         missing = sorted(declared - set(cls.model_fields))
         if missing:
             raise TypeError(
                 f"{cls.__name__}.phi_gated_properties names {missing}, which are not fields of "
                 "the model — the declaration gates nothing."
+            )
+        # A subclass may add gated properties, never drop one. A subclass of a PHI-bearing model
+        # carries the same data, so a narrowed set would ungate it. Narrowed to EMPTY, no
+        # serializer of its own is attached and the parent's withholds the field for good, a
+        # silent functional break. Either way the declaration is a mistake, so refuse it.
+        for base in cls.__mro__[1:]:
+            if isinstance(base, type) and issubclass(base, PhiGatedModel):
+                dropped = sorted(base.phi_gated_properties - declared)
+                if dropped:
+                    raise TypeError(
+                        f"{cls.__name__} ungates {dropped}, which {base.__name__} gates. A "
+                        "subclass of a gated model may add gated properties, not remove them."
+                    )
+        # The serializer returns ``str | None``, so a gated field of any other type would be
+        # published as a string and warn on every dump (the ConnectionMetadata.metadata hazard).
+        untyped = sorted(
+            name for name in declared if not _is_optional_str(cls.model_fields[name].annotation)
+        )
+        if untyped:
+            raise TypeError(
+                f"{cls.__name__}.phi_gated_properties names {untyped}, which are not "
+                "``str | None`` fields; the gate's serializer is typed for those only."
+            )
+        # Coverage is PROVEN, not assumed: every gated property must reach the gate's serializer,
+        # read back from what pydantic actually collected. A set assigned to the class AFTER
+        # creation is outside this proof, as any monkeypatch of a built class is.
+        covered: set[str] = set()
+        for dec in cls.__pydantic_decorators__.field_serializers.values():
+            if dec.func is _withhold_unreleased_phi:
+                covered |= set(dec.info.fields)
+        unserialized = sorted(declared - covered)
+        if unserialized:
+            raise TypeError(
+                f"{cls.__name__}.phi_gated_properties names {unserialized}, which no gate "
+                "serializer covers, so they would serialize UNGATED."
             )
 
     def release_phi(self, properties: Iterable[str]) -> None:
@@ -99,14 +157,29 @@ class PhiGatedModel(BaseModel):
         """
         self._phi_masked = frozenset(properties) & type(self).phi_gated_properties
 
-    @field_serializer(*sorted(GATEABLE_PROPERTIES), when_used="json", check_fields=False)
-    def _withhold_unreleased_phi(
-        self, value: str | None, info: FieldSerializationInfo
-    ) -> str | None:
-        """Emit a gated property only once released. The return annotation is load-bearing: it is
-        what keeps the OpenAPI response schema typed (an ``Any``-returning serializer collapses the
-        property to an untyped one, and a model-level wrap serializer collapses the whole model)."""
-        name = info.field_name
-        if name not in type(self).phi_gated_properties:
-            return value  # covered by the shared decorator, but not gated on this model
-        return value if name in self._phi_released else None
+
+def _is_optional_str(annotation: object) -> bool:
+    """True for ``str`` or ``str | None``, the only field types the gate's serializer handles. A
+    constrained string (``Annotated[str, ...]``, as ``constr`` builds) counts as ``str``."""
+
+    def base(t: object) -> object:
+        return get_args(t)[0] if get_origin(t) is Annotated else t
+
+    if base(annotation) is str:
+        return True
+    return {base(a) for a in get_args(annotation)} == {str, type(None)}
+
+
+#: The class attribute each gated subclass's serializer is set under (see
+#: :meth:`PhiGatedModel.__init_subclass__`). One name, so a subclass replaces its parent's.
+_SERIALIZER_ATTR = "_withhold_unreleased_phi"
+
+
+def _withhold_unreleased_phi(
+    self: PhiGatedModel, value: str | None, info: FieldSerializationInfo
+) -> str | None:
+    """Emit a gated property only once released. The return annotation is load-bearing: it is
+    what keeps the OpenAPI response schema typed (an ``Any``-returning serializer collapses the
+    property to an untyped one, and a model-level wrap serializer collapses the whole model). It is
+    only ever attached over a model's own gated properties, all of which are ``str | None``."""
+    return value if info.field_name in self._phi_released else None

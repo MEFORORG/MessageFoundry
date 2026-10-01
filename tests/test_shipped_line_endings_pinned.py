@@ -41,6 +41,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: "the root files hatchling ships" -- pyproject.toml is the source of record for the list.
 SHIPPED_ROOT_FILES = ("LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "pyproject.toml")
 
+#: The toolkit wheel's license files, which its own `[project].license-files` ships (BACKLOG #1192).
+SHIPPED_TOOLKIT_FILES = (
+    "packaging/messagefoundry-toolkit/LICENSE",
+    "packaging/messagefoundry-toolkit/NOTICE",
+)
+
 #: The vendored HAPI fixtures carry their own `-text` pin in
 #: `samples/messages/hapi-hl7v2/.gitattributes`, because they are stored byte-verbatim and EOL
 #: normalization would break the MPL-2.0 "unmodified" basis. Four are bare-CR terminated and three
@@ -87,7 +93,13 @@ def _check_attr(paths: list[str]) -> dict[str, dict[str, str]]:
 
 @pytest.fixture(scope="module")
 def shipped_paths() -> list[str]:
-    paths = _tracked("messagefoundry") + list(SHIPPED_ROOT_FILES)
+    # The toolkit ships in its own wheel (ADR 0201), so its tree is shipped text on the same terms.
+    paths = (
+        _tracked("messagefoundry")
+        + _tracked("messagefoundry_toolkit")
+        + list(SHIPPED_ROOT_FILES)
+        + list(SHIPPED_TOOLKIT_FILES)
+    )
     assert len(paths) > 100, f"expected the package to have many tracked files, got {len(paths)}"
     return paths
 
@@ -151,6 +163,7 @@ def test_the_root_patterns_stay_anchored() -> None:
         for path in _tracked()
         if Path(path).name in SHIPPED_ROOT_FILES
         and path not in SHIPPED_ROOT_FILES  # not the root copy itself
+        and path not in SHIPPED_TOOLKIT_FILES  # pinned by their own anchored lines
         and not path.startswith("messagefoundry/")  # covered on purpose by the package glob
     ]
     assert len(candidates) > 10, (

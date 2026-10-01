@@ -91,7 +91,12 @@ param(
     [string]$AppExe,
     [int]$Port = 8765,
     [int]$MllpPort = 2699,
-    [int]$WaitSeconds = 120
+    [int]$WaitSeconds = 120,
+    # Handed to install-service.ps1, which checks the nssm.exe it keeps there against the pin and
+    # refuses one anybody but an administrator can replace. Every nssm call below runs that copy,
+    # never the one on PATH (BACKLOG #2442).
+    # An empty value would resolve to the current directory, so it is refused here.
+    [ValidateNotNullOrEmpty()][string]$NssmDir = "$env:ProgramFiles\MessageFoundry\nssm"
 )
 
 $ErrorActionPreference = "Stop"
@@ -99,6 +104,7 @@ $ErrorActionPreference = "Stop"
 # $PWD, while the operator's CLI runs from the repository root, so a relative path here would put
 # the two identities on two different stores.
 $DataDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataDir)
+$NssmDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($NssmDir)
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $ServiceIdentity = "NT SERVICE\$ServiceName"
 $Operator = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -163,11 +169,36 @@ function Get-Excerpt([string]$Text, [int]$Max = 400) {
 }
 
 function New-SyntheticPassword {
-    # Synthetic and per run: never a literal in the repository, never printed, never on argv.
-    $bytes = New-Object byte[] 48
+    <#
+      Synthetic and per run: never a literal in the repository, never printed, never on argv.
+      Each candidate goes through the probe's `screen` mode, which applies the policy provision-admin
+      applies, loaded the way it loads it. An unscreened random 32-character string holds a shipped
+      context word, almost always "hl7", in about one draw in 1,900, and provision-admin refuses it:
+      merge group 36766996620 went red that way on 2026-09-30. Exit 3 means the screen refused this
+      candidate, so draw again; any other failure means the screen itself broke, so stop.
+    #>
+    param([string]$ForUsername, [string]$ForDbPath, [hashtable]$Environment)
+    $maxAttempts = 16
+    $secrets = $Environment.Clone()
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    return (([Convert]::ToBase64String($bytes)) -replace "[^A-Za-z0-9]", "").Substring(0, 32)
+    try {
+        $bytes = New-Object byte[] 48
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            $rng.GetBytes($bytes)
+            $candidate = (([Convert]::ToBase64String($bytes)) -replace "[^A-Za-z0-9]", "").Substring(0, 32)
+            # Masked before the probe runs, since the probe's output is echoed to the log.
+            if ($env:GITHUB_ACTIONS -eq "true") { Write-Host "::add-mask::$candidate" }
+            $secrets["MEFOR_W0_ADMIN_PASSWORD"] = $candidate
+            $r = Invoke-OperatorCli -Arguments @("screen", $ForUsername, $ForDbPath) -Secrets $secrets
+            if ($r.Code -eq 0) { return $candidate }
+            if ($r.Code -ne 3) {
+                throw "the password screen failed (exit $($r.Code)): $(Get-Excerpt $r.Text)"
+            }
+        }
+    } finally { $rng.Dispose() }
+    # A clause no 32-character alphanumeric string can meet (a longer minimum, a symbol rule) lands
+    # here on every draw, so name what the last draw was refused for.
+    throw "no synthetic password cleared the policy in $maxAttempts attempts; the last: $(Get-Excerpt $r.Text)"
 }
 
 function Get-Sid([string]$Account) {
@@ -585,7 +616,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 if (-not $AppExe) { $AppExe = (Get-Command messagefoundry).Source }
 $Python = (Get-Command python).Source
-$Nssm = (Get-Command nssm).Source
+$Nssm = Join-Path $NssmDir "nssm.exe"
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
 $Work = Join-Path $TempRoot "w0-store-access-$Order"
 $ConfigDir = Join-Path $TempRoot "w0-store-access-config"
@@ -614,6 +645,8 @@ Set-Content -LiteralPath (Join-Path $ConfigDir "IB_W0_STORE_ACCESS.py") -Encodin
 # The probe. `provision` replaces ONLY _read_new_password, then runs the real CLI entry point, so
 # settings, the at-rest gate, open_store(create=True) and provision_first_administrator are the
 # shipped code path. `health` and `login` speak https pinned to the engine's own minted certificate.
+# `screen` runs provision-admin's password policy on a candidate and exits 3 on a refusal, which
+# New-SyntheticPassword reads as "draw again"; keep 3 for that meaning alone.
 $ProbeSource = @'
 import json
 import os
@@ -634,6 +667,23 @@ def _provision(argv):
 
     cli._read_new_password = _read_new_password
     return cli.main(["provision-admin", *argv])
+
+
+def _screen(username, db):
+    # The screen provision-admin runs before it creates the store: the same settings load (the working
+    # directory's messagefoundry.toml, the MEFOR_* environment, the --db override) and the same
+    # PasswordPolicy call. Prints only the refused clauses, never the password. Exit 3 is a refusal.
+    from messagefoundry.auth.policy import PasswordPolicy
+    from messagefoundry.config.settings import load_settings
+
+    password = os.environ.pop("MEFOR_W0_ADMIN_PASSWORD")
+    settings = load_settings(cli={"store": {"path": db}})
+    problems = PasswordPolicy.from_settings(settings.auth).violations(password, username=username)
+    if problems:
+        print("screen refused the candidate: " + "; ".join(problems))
+        return 3
+    print("screen passed")
+    return 0
 
 
 def _call(method, url, cafile, body=None, token=None):
@@ -691,6 +741,8 @@ def _login(base, cafile, username):
 
 if __name__ == "__main__":
     mode = sys.argv[1]
+    if mode == "screen":
+        sys.exit(_screen(sys.argv[2], sys.argv[3]))
     if mode == "provision":
         sys.exit(_provision(sys.argv[2:]))
     if mode == "health":
@@ -703,11 +755,10 @@ Set-Content -LiteralPath $Probe -Value $ProbeSource -Encoding Ascii
 
 $StoreKey = (& $AppExe gen-key).Trim()
 if (-not $StoreKey) { throw "messagefoundry gen-key produced no store key" }
-$Password = New-SyntheticPassword
 if ($env:GITHUB_ACTIONS -eq "true") {
-    # Both are synthetic and per run. Masked anyway, so no later echo can print either in clear.
+    # Synthetic and per run. Masked anyway, so no later echo can print it in clear. New-SyntheticPassword
+    # masks each password candidate the same way before anything can echo it.
     Write-Host "::add-mask::$StoreKey"
-    Write-Host "::add-mask::$Password"
 }
 $BaseUrl = "https://127.0.0.1:$Port"
 
@@ -715,9 +766,23 @@ Write-Host "===== ADR 0183 Wave 0: $Order, operator=$Operator, service=$ServiceI
 Write-Host "store: $DbPath"
 
 try {
+    # Drawn inside the try, so a broken screen reds through Add-Failure and the cleanup below like any
+    # other step. $ProvisionEnvironment is the one environment both the screen and every
+    # provision-admin call below run under, so both load the same settings. The password itself rides
+    # MEFOR_W0_ADMIN_PASSWORD, added per call.
+    $ProvisionEnvironment = @{
+        MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
+        # Not a secret; it rides the same inherited-environment channel so it is cleared after.
+        MEFOR_SECURITY_REQUIRE_MFA = "false"
+    }
+    $CurrentPhase = "operator password screen"
+    $Password = New-SyntheticPassword -ForUsername $Username -ForDbPath $DbPath `
+        -Environment $ProvisionEnvironment
+    $CurrentPhase = "setup"
+
     # --- install under the DEFAULT virtual account (no -ServiceAccount, no -AllowLocalSystem) ------
     & (Join-Path $PSScriptRoot "install-service.ps1") -ServiceName $ServiceName -AppExe $AppExe `
-        -Config $ConfigDir -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
+        -NssmDir $NssmDir -Config $ConfigDir -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
     $startName = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").StartName
     Add-Reading "SCM run-as account for '$ServiceName' is '$startName'"
     # The engine's store rule reads the data directory's OWNER as well as its DACL, so record it.
@@ -761,12 +826,9 @@ try {
     $provisionArgs = @(
         "provision", "--username", $Username, "--email", $Email, "--db", $DbPath, "--json", "--no-totp"
     )
-    $cliSecrets = @{
-        MEFOR_STORE_ENCRYPTION_KEY = $StoreKey
-        MEFOR_W0_ADMIN_PASSWORD = $Password
-        # Not a secret; it rides the same inherited-environment channel so it is cleared after.
-        MEFOR_SECURITY_REQUIRE_MFA = "false"
-    }
+    # The screen above ran under $ProvisionEnvironment, so provision-admin loads the same settings.
+    $cliSecrets = $ProvisionEnvironment.Clone()
+    $cliSecrets["MEFOR_W0_ADMIN_PASSWORD"] = $Password
 
     if ($Order -eq "ProvisionFirst") {
         # 1. The operator provisions the fresh store.

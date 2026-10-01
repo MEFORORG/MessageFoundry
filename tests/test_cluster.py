@@ -110,7 +110,9 @@ class _NotLeaderCoordinator:
         # suite. Present so this stand-in still structurally satisfies the ClusterCoordinator protocol.
         return (None, None)
 
-    async def step_down_leadership(self) -> StepdownOutcome:
+    async def step_down_leadership(
+        self, *, sibling_acquire_delay_seconds: float = 0.0
+    ) -> StepdownOutcome:
         # A follower holds no leadership to release (ADR 0056 slice 1), so the honest answer is the
         # same one NullCoordinator gives. Present so this stand-in still structurally satisfies the
         # ClusterCoordinator protocol.
@@ -242,7 +244,7 @@ def test_members_from_node_rows_derives_the_leader_and_fresh_from_one_verdict() 
         "standby": True,
     }
     assert [n for n, m in members.items() if m.is_leader] == ["leader"]
-    assert has_promotable_sibling(members.values(), "leader") is True
+    assert has_promotable_sibling(list(members.values()), "leader") is True
 
 
 _Rows = list[dict[str, object]]
@@ -1277,8 +1279,12 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
             self.executed.append(sql)
             return 1  # the owner-scoped release matched this node's row
 
-        async def _fetchone(self, *a: object, **k: object) -> object:
-            raise AssertionError("a paused node must not query the store to claim")
+        async def _fetchone(self, sql: str, *a: object, **k: object) -> object:
+            # Since BACKLOG #1986 a paused node READS the lease owner, to lift the pause once a
+            # successor holds the row. It must still never send the claim.
+            if sql == "SELECT owner FROM leader_lease WHERE lease_key = ?":
+                return {"owner": "N"}  # the row this node released still names it
+            raise AssertionError("a paused node must not send the claim")
 
     store = _Store()
     coord = SqlServerCoordinator(store, "N", heartbeat_seconds=10.0, monotonic=lambda: 0.0)
@@ -1295,8 +1301,10 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
     assert any("UPDATE leader_lease" in sql for sql in store.executed)
     assert fired == [1]
     assert coord._no_claim_until == 20.0  # two heartbeats
-    # Inside the pause the claim short-circuits before touching the store (_fetchone would raise).
+    # Inside the pause, with the row still naming this node, the claim is never sent (the fake
+    # raises on it), and the pause stays armed.
     assert await coord._claim_or_renew_lease() is False
+    assert coord._no_claim_until == 20.0
     # A second stepdown releases nothing and issues no further write.
     writes = len(store.executed)
     assert await coord.step_down_leadership() == (False, None, False)

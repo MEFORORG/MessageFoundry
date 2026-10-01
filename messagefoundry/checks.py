@@ -88,6 +88,7 @@ from __future__ import annotations
 import ast
 import functools
 import importlib.metadata
+import os
 import re
 import shutil
 import subprocess
@@ -1144,7 +1145,7 @@ def _normalize_dist(name: str) -> str:
 @functools.cache
 def _shipped_dep_import_roots() -> frozenset[str]:
     """Top-level import names of MessageFoundry's declared distribution dependencies, so a Handler
-    importing a shipped dep (e.g. ``hl7``, or a lazily-imported optional-extra dep like ``pydicom``)
+    importing a shipped dep (e.g. ``tomlkit``, or a lazily-imported optional-extra dep like ``pydicom``)
     is not mistaken for an operator-added package. **Install-independent:** an installed dep maps to
     its real import name(s); a declared-but-uninstalled dep falls back to a best-effort guess from the
     dist name, so vetting does not drift with which extras happen to be installed on the box running
@@ -2726,7 +2727,18 @@ def _run_tool(name: str, cmd: list[str]) -> CheckResult:
         return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
     try:
         # nosec: cmd[0] is a fixed tool name (ruff/mypy), no shell; args are repo paths (low-27).
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)  # nosec B603 B607
+        # ruff writes UTF-8. mypy writes its interpreter's stdout encoding, the locale code page on
+        # 3.14 and UTF-8 on 3.15, so PYTHONIOENCODING pins it to match the decode on both.
+        proc = subprocess.run(  # nosec B603 B607
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            check=False,
+            timeout=120,
+        )
     except subprocess.TimeoutExpired:
         # A wedged advisory tool must not block a commit forever — degrade to a skip (low-21).
         return CheckResult(name, ok=True, required=False, skipped=True, detail="timed out (120s)")

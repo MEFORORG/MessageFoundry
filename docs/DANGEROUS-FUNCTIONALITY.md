@@ -12,17 +12,29 @@ can shape. None of it is a defect. All of it is worth knowing about before you d
 
 ## What this page covers
 
-Four things:
+Five things:
 
 1. **The engine wheel** -- the `messagefoundry` distribution itself.
 2. **The deployment path the project documents** -- the container image in `docker/`, and the
    Windows service scripts in `scripts/service/` (section 8).
 3. **The VS Code extension** in `ide/` (section 9, and its parsers in section 7).
 4. **The web console**, `messagefoundry_webconsole`, which the engine serves at `/ui` (section 10).
+5. **The toolkit**, `messagefoundry_toolkit`, shipped as the `messagefoundry-toolkit` distribution.
+   It holds the authoring commands that ADR 0201 is moving out of the engine wheel, such as
+   `adr-analyze`. The scans in sections 4, 5 and 7 read it with the engine.
 
 The 2026-08-22 owner ruling on scope named the first two, and its purpose was to bring the
-deployment path in. It says nothing about the extension or the web console. Both ship to the same
-operators, so this page covers them too.
+deployment path in. It says nothing about the other three, so each is here for its own reason:
+
+- The web console runs inside the engine's own process.
+- The extension ships to the same operators.
+- The toolkit carries the engine's own commands. Each command it registers is a row in the
+  engine's command table, `CLI_TIERS` in `messagefoundry/cli_surface.py`, and ADR 0201 moves
+  those commands out of the engine wheel a slice at a time. A site must not leave this page by
+  moving between wheels.
+
+Shipping at the engine's version is not a reason on its own. See the test harness under "What is
+deliberately not here".
 
 It does not cover your Routers and Handlers. Those are yours, and section 1 explains why that
 matters more than anything else here.
@@ -39,7 +51,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a provider module by name | Two provider seams | Off unless you name an external provider |
 | 4 | Starting processes | 11 modules | Varies, see below |
-| 5 | Calling native libraries | 16 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 17 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -220,7 +232,7 @@ reach one:
 
 ## 5. Native library calls
 
-16 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+17 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
@@ -229,6 +241,10 @@ pure-Python equivalent:
 - Log path check: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether View Log's
   drive letter is a mapped network drive, so it can refuse one before opening the file
 - Process and job control: `pipeline/sandbox.py`
+- Drop-folder confinement: `transports/file.py`, which on Windows asks `kernel32`'s
+  `GetFinalPathNameByHandleW` where the file it opened really is, so the FILE source refuses a drop
+  reached through a link or junction out of its watch folder (BACKLOG #2507). POSIX needs no
+  `ctypes` for this; it opens each path part with `O_NOFOLLOW`
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`
@@ -274,7 +290,7 @@ this follows:
 **The HL7 parser is deliberately tolerant, and that is not a defect to fix.** Real clinical traffic
 is not conformant. A sending system that has worked for fifteen years will send a segment no
 specification allows, and refusing it drops patient data on the floor. So the fast path
-(`parsing/peek.py`, python-hl7) accepts what it is given, and strict validation (`parsing/validate.py`,
+(`parsing/peek.py`, the built-in parser of ADR 0054) accepts what it is given, and strict validation (`parsing/validate.py`,
 hl7apy) is opt-in per connection.
 
 **Nobody should reach a passing security grade by making the parser strict.** That would trade a
@@ -288,16 +304,21 @@ real clinical requirement for a paper control.
   cap can be disabled per connection, which is the operator's choice to make.
 - XML hardening in `parsing/xml/harden.py` against external-entity and entity-expansion attacks,
   with the lxml posture recorded in ADR 0015 and ADR 0122.
+- defusedxml's refusal of entity declarations, and of DTDs where the call site asks for that, at
+  the `xml.etree` parse sites: at least `RawMessage.xml()`, the Corepoint import and the SVG
+  sanitizer. It comes from a copy vendored in `_vendor/defusedxml/`. The SOAP gate in
+  `transports/soap.py` hardens its own `xml.sax` parser instead.
 - A pinned pydicom floor in ADR 0025 that excludes a known path-traversal issue.
 - Directory-listing names from a remote share checked as single safe path components before they
   are joined, so a partner cannot return a traversal sequence.
 
-**How the parser list is found.** A test reads the code, so the list comes from the tree rather
-than from memory. You can re-run the same scan over `messagefoundry/` and
+**How the parser list is found.** A test reads the code, so the list comes from the tree, not
+from memory. You can re-run the same scan over `messagefoundry/`, `messagefoundry_toolkit/` and
 `messagefoundry_webconsole/`. A module is a parse site when its syntax tree holds at least one of
 these:
 
-1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml`, `xml`,
+1. An import, at any depth, of a format library: `hl7`, `hl7apy`, `lxml`, `defusedxml` (or the
+   engine's vendored copy, `messagefoundry._vendor.defusedxml`), `xml`,
    `xmlschema`, `signxml`, `pydicom`, `pynetdicom`, `pyx12`, `fhir.resources`, `fhirpathpy`,
    `cbor2`, `webauthn`, `spnego` (the module the pyspnego package installs), `csv`,
    `email.parser`, `email.feedparser`, `pickle`, `marshal` or `shelve`.
@@ -340,9 +361,9 @@ the first table. The rule places at least these modules:
 The scan leaves some parsing out on purpose, and it has limits:
 
 - `tomllib` is not in pattern 1. It reads at least service settings, connection files, environment
-  value files, de-identification rules, the tray's settings and code sets. Of those, only a code set
-  is known to come from another system. `config/code_sets.py` is in the first table through its
-  `csv` import.
+  value files, de-identification rules, the tray's settings, code sets and a reference sync's file.
+  Of those, only the reference sync's file is known to come from another system. The code-set
+  loader, `config/code_sets.py`, parses it, and is in the first table through its `csv` import.
 - Libraries parse their own wire: uvicorn's HTTP server, the HTTP clients, TLS and `ldap3`. FastAPI
   decodes every other API request body as JSON, and checks it against a model before a route sees
   it. [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) covers those libraries. The engine's own HTTP
@@ -363,17 +384,16 @@ The scan leaves some parsing out on purpose, and it has limits:
 | The intake path | Every received body. `pipeline/wiring_runner.py` is the shared ingress code. It hands each body to the decode and size guards, and an HL7 body to the peek, then to the parsers below. The live router and transform workers call the routing and transform core in `pipeline/dryrun.py` (`route_only`, `transform_one`), which hands each body to the parser for its content type. | `pipeline/wiring_runner.py`, `pipeline/dryrun.py` |
 | Dry-run fixtures | The sample and batch files a dry run reads, such as the `--messages` files of `messagefoundry dryrun`. A fixture may be captured traffic. `read_fixture` reads each file, and `split_messages` hands a batch file to `parsing/split.py` to split. The scan's match in this module is different: a JSON decode of a value it encoded a moment before. | `pipeline/dryrun.py` |
 | A stored message body, when retention strips its documents | The body a sender delivered, decrypted from the store. Each backend's retention pass hands it to `parsing/binary.py`, in the hand-read table below, to strip its embedded documents. The scan's matches here are different: JSON the engine wrote itself. | `store/store.py`, `store/postgres.py`, `store/sqlserver.py` |
-| HL7 v2 | An inbound connection. Strict validation is opt-in. | `parsing/peek.py`, `parsing/_builtin_hl7.py`, `parsing/message.py`, `parsing/validate.py` |
+| HL7 v2 | An inbound connection. Strict validation is opt-in. The tolerant parser is hand-written, so it is in the hand-read table below. | `parsing/message.py`, `parsing/validate.py` |
 | MLLP frames and HL7 acknowledgements | An inbound sender, or the partner an outbound delivers to | `transports/mllp.py` |
 | JSON and FHIR payloads | An inbound whose content type is `json` or `fhir`. They are parsed when a Router or Handler asks, as with `RawMessage.json()`. | `parsing/message.py`, `parsing/fhir/` |
-| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply | `parsing/message.py`, `parsing/xml/`, `transports/soap.py` |
+| XML and SOAP | An inbound payload, a SOAP body fragment built from a message, or a partner's SOAP fault reply. `_vendor/defusedxml/` is the vendored defusedxml copy the stdlib-parser sites parse through. | `parsing/message.py`, `parsing/xml/`, `_vendor/defusedxml/common.py`, `_vendor/defusedxml/ElementTree.py`, `transports/soap.py` |
 | X12 | An inbound whose content type is `x12` | `parsing/x12/` |
 | DICOM | An inbound DICOM association or payload | `parsing/dicom/`, `transports/dicom.py` |
 | A JSON payload for a database outbound | What a Handler built from a message | `transports/database.py` |
-| Captured traffic | The messages the de-identification tools read | `anon/hl7.py` |
 | An SVG attachment inside a stored message | A sender, through the message. It is read when the attachment is downloaded. | `api/svg_sanitize.py` |
 | An uploaded file | The body of `POST /uploads`, or of `POST /ui/uploaded-logs/upload`, which the same handler serves. `api/multipart.py` is a hand-written `multipart/form-data` parser (ADR 0134), and its own comment calls each part's header block attacker-supplied. The route needs the files-upload permission and step-up authentication. | `api/app.py`, `api/multipart.py`, `uploads.py` |
-| Code sets | Files in the config directory, and the exports from another system that the reference sync re-reads | `config/code_sets.py` |
+| A reference sync's file source | A file another system exports. `pipeline/reference_sync.py` re-reads it on a schedule and hands it to the code-set loader, and a dry run's reference preview in `pipeline/dryrun.py` does too. The same loader reads the code sets in the config directory, which are operator input. | `config/code_sets.py` |
 | The sandbox child's replies | The child runs your Routers and Handlers, so the parent treats what it sends back as untrusted | `pipeline/sandbox.py`, `pipeline/_sandbox_codec.py` |
 | Partner and service replies | A partner's HTTP reply headers, a REST peer's Digest challenge, a FHIR server, a DICOMweb server, a SMART token endpoint, the AI provider | `transports/bounded_read.py`, `transports/rest.py`, `transports/fhir.py`, `transports/dicomweb.py`, `transports/smart.py`, `transports/ai_broker.py` |
 | Text a remote peer sizes | A reply field, a traceback or an error text, clamped and redacted before it is logged or shown | `redaction.py` |
@@ -393,21 +413,23 @@ The scan leaves some parsing out on purpose, and it has limits:
 |---|---|
 | It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py` |
-| It reads what an operator supplies: service settings, code-set edits, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
+| It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
-| It parses no input. It builds messages, reads `hl7apy`'s own schema tables or quiets a library logger. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py`, `phi_log_silencer.py` |
+| It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py` |
 
 **Hand-written parsers the patterns cannot see.**
 
 | What it parses | Modules |
 |---|---|
 | MLLP and TCP frames, before any other code sees the bytes | `framing.py`, `mllpcodec.py` |
+| HL7 v2, in the engine's own tolerant parser (ADR 0054). It reads every inbound HL7 body, and the de-identification tools read captured traffic through it. | `parsing/_builtin_hl7.py`, `parsing/peek.py`, `anon/hl7.py` |
 | HL7 batch files, split into messages | `parsing/split.py` |
 | The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
 | An inbound text body, decoded with its connection's declared character set and checked for NUL bytes and size, before the HL7 peek or a Router sees it. A binary body is only size-checked and base64-carried. | `pipeline/ingress_guards.py` |
 | Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
 | The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
+| Decision records, for `messagefoundry-toolkit adr-analyze`. It reads each `[0-9]*.md` file at the top of the `--adr-dir` folder, `docs/adr` by default. Regular expressions pick out each record's status, acceptance criteria and open items. For each `tests/`, `fixtures/`, `samples/` or `harness/` path a criterion names, it checks whether that path exists under `--repo-root`. A linked path that climbs out of that root with `..`, or has a part named for a DOS device such as `NUL` or `nul.py`, is reported and not checked, on every platform. A symbolic link inside that root is still followed. Nothing bounds a record's size, so a record is only as trusted as its author. | `messagefoundry_toolkit/adr_analyze.py` |
 
 The first two tables rest on a judgement about where each input comes from, and the test cannot
 check that judgement. Re-read a row when its module changes what it reads.
@@ -514,7 +536,7 @@ administrator rights. What each one grants or changes:
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
 | `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
-| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. |
+| `measure-store-access.ps1` | A CI measurement, not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke` runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
 least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `-AllowLocalSystem`
@@ -561,11 +583,14 @@ or disables the service when it cannot delete them. It points the registration a
 `nssm.exe`, quoted, and reads it back. It prints the helper's signature status without requiring
 one. It then starts the helper as LocalSystem.
 
-**At least these gaps remain.** An administrator who runs some other `nssm.exe` by hand, such as
-one on `PATH`, runs a copy nothing checked. `Start-Service` and `Restart-Service` need no NSSM.
-`-HelperSha256` is only as good as the channel the operator took it from. With `-AllowBroadAcl`,
-whoever can write the helper's folder can swap a binary, plant a library beside it, or edit its
-configuration file, both between runs and during one.
+**At least these gaps remain.** The hash check covers only the `nssm.exe` the two installers run
+and register. Nothing checks an `nssm.exe` an administrator runs by hand, such as one on `PATH`.
+`Start-Service` and `Restart-Service` need no NSSM. To run
+NSSM by hand, use the checked copy in `-NssmDir`, or in the helper's folder, by its full path. That
+copy was checked when it was installed, and it stays safe only while its folder is
+administrator-only. `-HelperSha256` is only as good as the channel the operator took it from. With
+`-AllowBroadAcl`, whoever can write the helper's folder can swap a binary, plant a library beside
+it, or edit its configuration file, both between runs and during one.
 
 It also runs the engine's `messagefoundry.exe`, from the repository's `.venv` unless `-AppExe`
 names another, to read the address settings. It checks no hash on that program, and it runs it
@@ -705,9 +730,11 @@ in your own documentation.
 **Third-party components.** [`RISKY-COMPONENTS.md`](RISKY-COMPONENTS.md) designates the risky ones.
 Per-library decisions that matter to a deploying operator are recorded in the ADRs cited above.
 
-**The published test harness.** `messagefoundry-harness` is a tool for testing an engine, not part
-of a deployment. It does start processes. It is out of this page's scope, which is a choice about
-this page rather than a claim that it holds none of these classes.
+**The published test harness.** `messagefoundry-harness` is a tool for testing an engine, and it
+does start processes. It ships at the engine's version, as the toolkit does. But none of its commands
+is a row in `CLI_TIERS`, it holds none of the code ADR 0201 moves out of the engine wheel, and it
+does not run inside the engine. The extension's reason, shipping to the same operators, would reach it. So
+leaving it out is a choice about this page, not a claim that it holds none of these classes.
 
 ## Keeping this page true
 

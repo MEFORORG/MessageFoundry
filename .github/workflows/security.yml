@@ -457,6 +457,52 @@ jobs:
           echo "   and track to the fix. To silence a triaged advisory here, add '--ignore-vuln <ID>'"
           echo "   to the pip-audit call in the previous step, with the reason."
 
+  cla-action-audit:
+    name: cla-action-audit (vendored CLA action's declared closure)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # BACKLOG #1578. The vendored CLA action is a compiled bundle, and the upstream lockfile it was
+    # built from sits beside it as `upstream-package-lock.json`. The audits above are scoped to
+    # Python locks and `ide/package-lock.json`, so before this job no scheduled audit read that
+    # lockfile, and a new advisory against it reached somebody only if a person went looking.
+    #
+    # BASELINED, BECAUSE THE TREE CANNOT BE FIXED HERE. It is a frozen 2021-era tree that does not
+    # audit clean, and moving a pin means rebuilding the bundle with a Node toolchain this repository
+    # does not carry. So the job fails only on an advisory NOT in
+    # scripts/security/cla-action-advisories.toml, or on an entry there the audit stops reporting.
+    # The script's docstring has the rest, including the false-clean reading it guards against and
+    # which checks are its live positive controls. timeout-minutes must stay above the script's
+    # worst-case retry ladder plus job setup; tests/test_cla_action_advisory_gate.py holds that.
+    #
+    # WHY security.yml AND NOT A WORKFLOW OF ITS OWN. security-txt-renewal.yml rejects this file for
+    # a reminder that stays red for weeks, because it would hold the shared "Security" issue open.
+    # This job's red is cleared by a baseline pull request rather than by a date passing, and
+    # released-line-audit above, whose red also waits on a person acting, already lives here. If
+    # these reds start masking each other on that shared issue, a workflow of its own is the fix.
+    #
+    # ADVISORY BY PLACEMENT, the released-line-audit posture: schedule/dispatch-only, no
+    # continue-on-error, and red on a finding. The frozen tree changes only when an advisory is
+    # published, which no pull request causes, so it has nothing to say on one. A red scheduled run
+    # of this workflow opens an issue through nightly-notice.yml, which is how it reaches somebody.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this job pushes or uploads the tree, so the git credential has no work to do.
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Audit the vendored CLA lockfile against its advisory baseline
+        # Stdlib only, so nothing is installed. The script copies the lockfile into a throwaway
+        # directory under the stock name npm needs, retries a registry that gives no verdict, and
+        # fails closed when the retries run out.
+        run: python scripts/security/audit_cla_action_lockfile.py
+
   sbom:
     name: SBOMs (CycloneDX, multi-ecosystem)
     runs-on: ubuntu-latest
@@ -506,15 +552,24 @@ jobs:
           # (PR 1039, corrected at BACKLOG #332): that PR's head reported this job `skipped`, and NOTHING in
           # PR CI executes this install line in any workflow. The earliest unattended run is the nightly
           # cron on `main` after merge.
+          # NO SEEDED PIP IN THE SCAN VENV. A plain `python -m venv` copies the interpreter's bundled
+          # (ensurepip) pip into it, and environment mode lists every installed dist, so the SBOM
+          # listed pip: the venv's installer, which `pip install messagefoundry` never pulls. Listing it
+          # at ANY version is inaccurate, and it draws scanner findings whenever the bundled pip lags a
+          # fix (a local Windows 3.14 build seeded pip 26.1.2, which scanners flag). So the fix is
+          # absence, not a bump. `--without-pip` leaves the venv empty and the OUTER pip installs into
+          # it via `--python` (pip >= 22.3; it must precede `install`). ensurepip seeds pip alone on
+          # 3.12+, so there is no setuptools or wheel to drop. Guarded by tests/test_ci_venv_pinning.py.
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
-          python -m venv /tmp/sbomenv
-          /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
+          python -m venv --without-pip /tmp/sbomenv
+          python -m pip --python /tmp/sbomenv/bin/python install --require-hashes -r docker/locks/requirements-core.lock
           python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
             --pyproject pyproject.toml --mc-type application \
             --output-format JSON --output-file sbom-python.cdx.json
           # Declare the SBOM lifecycle (CISA "Build" type) + backfill the hatchling-dynamic root version.
           python scripts/security/sbom_finalize.py sbom-python.cdx.json \
-            --phase build --set-version-from messagefoundry/__init__.py
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
       - name: Generate the VS Code extension SBOM (npm, install-free)
         # if: always() so a Python-SBOM failure above doesn't skip this independent generator.
         if: always()
@@ -528,8 +583,12 @@ jobs:
             --output-format JSON --output-file ../sbom-ide.cdx.json
           python ../scripts/security/sbom_finalize.py ../sbom-ide.cdx.json --phase build
       - name: Score SBOM quality (sbomqs — advisory)
-        # continue-on-error (matching the release.yml twin): sbomqs is advisory, so a download/checksum/parse
-        # hiccup here must never skip the SBOM-artifact upload below (the actual deliverable).
+        # continue-on-error: sbomqs is advisory HERE, so a download/checksum/parse hiccup must never skip
+        # the SBOM-artifact upload below (the actual deliverable). This no longer matches release.yml:
+        # there the install and pin check BLOCK and only the score is advisory (BACKLOG #1698).
+        # if: always(), like the IDE generator above: a failed Python SBOM must not leave the IDE one
+        # unscored (BACKLOG #2521).
+        if: always()
         continue-on-error: true
         run: |
           # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA
@@ -543,9 +602,12 @@ jobs:
           grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
-          sbomqs score -b sbom-python.cdx.json
-          sbomqs score -b sbom-ide.cdx.json
+          # Each score runs whatever the other did; the step still fails if either did (BACKLOG #2521).
+          rc=0
+          sbomqs score -b sbom-python.cdx.json || rc=1
+          sbomqs score -b sbom-ide.cdx.json || rc=1
           sbomqs compliance --ntia sbom-python.cdx.json || true
+          exit "$rc"
       - name: Upload the SBOM artifacts
         # if: always() + if-no-files-found: ignore so whichever SBOM(s) generated are retained even if a
         # sibling generator failed. SHA-pinned for supply-chain integrity, matching ci.yml's upload pin.
@@ -556,6 +618,70 @@ jobs:
           path: |
             sbom-python.cdx.json
             sbom-ide.cdx.json
+          if-no-files-found: ignore
+
+  sbom-windows:
+    name: SBOM (CycloneDX, engine resolved on Windows)
+    runs-on: windows-latest
+    # Two hash-locked installs and one SBOM render.
+    # Advisory and schedule-only, so a cap that fires here costs a nightly, not a merge.
+    timeout-minutes: 20
+    # The Windows twin of the engine SBOM above, and the pre-tag dry-run for release.yml's
+    # `sbom-windows` job, exactly as `sbom` is for the Linux step. Why the engine ships a second,
+    # Windows-resolved SBOM is ADR 0149's 2026-09-30 amendment. A separate job rather than a matrix
+    # leg of `sbom`, because that job's npm and sbomqs steps are Linux-only and would each need a
+    # platform guard.
+    continue-on-error: true
+    # Same gate as `sbom`, for the same reason: the SBOM derives from a committed lockfile.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Generate the Windows-resolved engine SBOM (license-complete, hash-locked core runtime)
+        shell: bash
+        run: |
+          # HASH-PINNED and BYTE-IDENTICAL to release.yml's sbom-windows install, enforced by
+          # tests/test_ci_venv_pinning.py. That job's step says why the venv has no pip and why every
+          # path is absolute; read it there rather than here, so the reasons cannot drift apart.
+          python -m pip install --require-hashes -r ci/locks/release-tools.lock
+          python -m venv --without-pip "$RUNNER_TEMP/sbomenv"
+          python -m pip --python "$RUNNER_TEMP/sbomenv/Scripts/python.exe" install --require-hashes -r docker/locks/requirements-core.lock
+          python -m cyclonedx_py environment "$RUNNER_TEMP/sbomenv/Scripts/python.exe" \
+            --pyproject pyproject.toml --mc-type application \
+            --output-format JSON --output-file sbom-python-windows.cdx.json
+          python scripts/security/sbom_finalize.py sbom-python-windows.cdx.json \
+            --phase build --set-version-from messagefoundry/__init__.py --record-sys-platform \
+            --vendored-from messagefoundry/_vendor
+      - name: Score the Windows SBOM's quality (sbomqs -- advisory)
+        # The pre-tag dry-run of release.yml's score of this file (BACKLOG #2521). It rehearses the FILE:
+        # the release uses sbomqs's Linux build, this runner its Windows build. Advisory, like `sbom`'s.
+        continue-on-error: true
+        shell: bash
+        run: |
+          # PINNED IN-REPO, as release.yml's sbomqs step is, rather than verified against a
+          # checksums.txt from the asset's own origin. Keep VER equal to release.yml's. Recorded
+          # 2026-09-30 from three routes that agreed: checksums.txt, the releases API `digest` field,
+          # and sha256sum over the downloaded tarball. Bump VER and the digest in one commit.
+          VER=2.0.11
+          SBOMQS_SHA256=55777d63d76805bef8ff7f59c41ebf7741cd601de508b00437c593cd3bfa2ebb
+          asset="sbomqs_${VER}_Windows_x86_64.tar.gz"
+          base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
+          curl -sSfL --retry 3 --retry-all-errors "${base}/${asset}" -o "${asset}"
+          echo "${SBOMQS_SHA256}  ${asset}" | sha256sum -c -
+          # A relative archive name: Git Bash's tar reads a `D:\...` path as a remote host.
+          tar -xzf "${asset}" sbomqs.exe
+          ./sbomqs.exe score -b sbom-python-windows.cdx.json
+          ./sbomqs.exe compliance --ntia sbom-python-windows.cdx.json || true
+      - name: Upload the Windows SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-cyclonedx-windows
+          path: sbom-python-windows.cdx.json
           if-no-files-found: ignore
 
   trivy:
@@ -797,9 +923,12 @@ jobs:
           #                           "hardcoded password" hits that are all literal test credentials
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          #   messagefoundry/_vendor/defusedxml — upstream bytes pinned by
+          #                           tests/test_vendored_defusedxml.py, so no `# nosec` can be added.
+          #                           Its findings are its own stdlib XML imports, which it hardens.
           # tests/test_lint_scope_parity.py fails if this and the hook drift apart again.
           bandit -r . --skip B101,B110,B404,B608 \
-            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./.venv,./node_modules
+            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./messagefoundry/_vendor/defusedxml,./.venv,./node_modules
 
   gitleaks:
     name: gitleaks (secret scan)
@@ -963,7 +1092,25 @@ jobs:
           # green PR for a reason that has nothing to do with its diff. Same posture as bandit==1.9.4
           # above and zizmor==1.5.2: bump deliberately, in a PR that also clears any new findings.
           # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
-          python -m pip install --upgrade pip "semgrep==1.172.0"
+          #
+          # RETRIED, because semgrep's transitive set resolves live from PyPI and one index read can
+          # come back empty. Merge-group run 36832387843 (2026-10-01) failed at this install, in the
+          # semgrep job, with ResolutionImpossible: pip saw "no matching distributions" for
+          # pydantic-core at ANY version. The same pin resolved pydantic-core 2.46.5 on the same runner
+          # image six minutes later, so it was a transient index read, not a new release. Still
+          # fail-closed: three failures exit 1, and nothing here touches the scan below. The `until`
+          # condition is exempt from `bash -e`. tests/test_semgrep_install_retry.py pins all of this.
+          attempt=1
+          until python -m pip install --upgrade pip "semgrep==1.172.0"
+          do
+            if [ "${attempt}" -ge 3 ]; then
+              echo "::error::semgrep did not install after 3 attempts. Failing closed: no scan ran."
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt}: semgrep install failed; retrying"
+            sleep "$((attempt * 15))"
+            attempt=$((attempt + 1))
+          done
           # --error: any finding fails the step — and the job, now that this gate is blocking.
           #
           # SCOPE = the whole repo minus the excludes below, which is the bandit exclude set in this
@@ -989,6 +1136,8 @@ jobs:
           #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          #   messagefoundry/_vendor/defusedxml — for PARITY WITH BANDIT, which cannot scan its
+          #                           byte-pinned upstream code; no rule here matches it today
           # The `./` prefix bandit uses is DROPPED on purpose: semgrep matches --exclude as a GLOB,
           # not a path, so `./tests` matches nothing and the flag would be inert — copying bandit's
           # string byte-for-byte yields an exclude list that excludes nothing. (Whether tests/ would
@@ -1006,6 +1155,7 @@ jobs:
           semgrep --config .semgrep --error --metrics off \
             --exclude tests --exclude harness --exclude samples --exclude ide \
             --exclude docs/benchmarks/results --exclude packaging/messagefoundry-webconsole/tests \
+            --exclude messagefoundry/_vendor/defusedxml \
             --exclude .venv --exclude node_modules \
             .
       - name: Handler-config taint rules — validate, regression gate, scan samples (ADR 0144 Inc 3)
@@ -1244,9 +1394,12 @@ jobs:
           #                           "hardcoded password" hits that are all literal test credentials
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          #   messagefoundry/_vendor/defusedxml — upstream bytes pinned by
+          #                           tests/test_vendored_defusedxml.py, so no `# nosec` can be added.
+          #                           Its findings are its own stdlib XML imports, which it hardens.
           # tests/test_lint_scope_parity.py fails if this and the hook drift apart again.
           bandit -r . --skip B101,B110,B404,B608 \
-            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./.venv,./node_modules
+            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./messagefoundry/_vendor/defusedxml,./.venv,./node_modules
       - name: Run the MessageFoundry rules
         if: ${{ !cancelled() }}
         run: |
@@ -1255,7 +1408,25 @@ jobs:
           # green PR for a reason that has nothing to do with its diff. Same posture as bandit==1.9.4
           # above and zizmor==1.5.2: bump deliberately, in a PR that also clears any new findings.
           # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
-          python -m pip install --upgrade pip "semgrep==1.172.0"
+          #
+          # RETRIED, because semgrep's transitive set resolves live from PyPI and one index read can
+          # come back empty. Merge-group run 36832387843 (2026-10-01) failed at this install, in the
+          # semgrep job, with ResolutionImpossible: pip saw "no matching distributions" for
+          # pydantic-core at ANY version. The same pin resolved pydantic-core 2.46.5 on the same runner
+          # image six minutes later, so it was a transient index read, not a new release. Still
+          # fail-closed: three failures exit 1, and nothing here touches the scan below. The `until`
+          # condition is exempt from `bash -e`. tests/test_semgrep_install_retry.py pins all of this.
+          attempt=1
+          until python -m pip install --upgrade pip "semgrep==1.172.0"
+          do
+            if [ "${attempt}" -ge 3 ]; then
+              echo "::error::semgrep did not install after 3 attempts. Failing closed: no scan ran."
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt}: semgrep install failed; retrying"
+            sleep "$((attempt * 15))"
+            attempt=$((attempt + 1))
+          done
           # --error: any finding fails the step — and the job, now that this gate is blocking.
           #
           # SCOPE = the whole repo minus the excludes below, which is the bandit exclude set in this
@@ -1281,6 +1452,8 @@ jobs:
           #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper
           #   ide/                  — TypeScript; no Python to scan
           #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          #   messagefoundry/_vendor/defusedxml — for PARITY WITH BANDIT, which cannot scan its
+          #                           byte-pinned upstream code; no rule here matches it today
           # The `./` prefix bandit uses is DROPPED on purpose: semgrep matches --exclude as a GLOB,
           # not a path, so `./tests` matches nothing and the flag would be inert — copying bandit's
           # string byte-for-byte yields an exclude list that excludes nothing. (Whether tests/ would
@@ -1298,6 +1471,7 @@ jobs:
           semgrep --config .semgrep --error --metrics off \
             --exclude tests --exclude harness --exclude samples --exclude ide \
             --exclude docs/benchmarks/results --exclude packaging/messagefoundry-webconsole/tests \
+            --exclude messagefoundry/_vendor/defusedxml \
             --exclude .venv --exclude node_modules \
             .
       - name: Handler-config taint rules — validate, regression gate, scan samples (ADR 0144 Inc 3)

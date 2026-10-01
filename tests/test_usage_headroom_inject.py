@@ -63,6 +63,10 @@ def _env() -> dict[str, str]:
     """
     env = os.environ.copy()
     env.pop("CLAUDE_CONFIG_DIR", None)
+    # THE ENTRYPOINT TOO (BACKLOG #1459). The hook names a non-terminal client in its UNKNOWN text, and
+    # this suite runs inside a Desktop session that sets it, so an inherited value would make every
+    # UNKNOWN assertion depend on which client launched pytest. Tests that care set it explicitly.
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     return env
 
 
@@ -96,6 +100,7 @@ def run_hook(
     tool: str | None = "Task",
     usage_script: Path | None = None,
     payload: str | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> tuple[int, str, str | None]:
     """Drive the hook exactly as the harness drives a PreToolUse hook: JSON on stdin, JSON on stdout.
 
@@ -115,7 +120,7 @@ def run_hook(
         text=True,
         timeout=TIMEOUT,
         check=False,
-        env=_env(),
+        env={**_env(), **(env_extra or {})},
     )
     out = proc.stdout.strip()
     context: str | None = None
@@ -234,6 +239,50 @@ def test_an_absent_source_is_unknown_and_never_a_number(tmp_path: Path) -> None:
     assert "nothing has ever published" in ctx, ctx
     assert re.search(r"\d+(\.\d+)?%", ctx) is None, f"a percentage was reported off no data: {ctx}"
     assert "not zero headroom" in ctx, "UNKNOWN must be distinguished from an empty pool"
+
+
+PUBLISHER_NOTE = "which never runs a statusLine"
+
+
+def test_an_unknown_names_a_client_that_can_never_publish_and_only_that_client(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #1459: A DESKTOP SESSION CAN NEVER REFRESH THE FILE, AND "UNKNOWN" ALONE HID THAT.
+
+    The collector is a statusLine, and a statusLine runs only in the terminal UI. Measured across six
+    config roots on 2026-09-30: every latest.json write lined up with an entrypoint-"cli" session and
+    none with the Desktop sessions carrying nearly all the traffic. So the note must appear for a
+    Desktop or SDK entrypoint, and must NOT appear for "cli", an unfamiliar value, or none at all -- a
+    note printed for every client would be decoration, and one printed for an unknown client a guess.
+    """
+    where = tmp_path / "never-published"
+    arms = {
+        "claude-desktop": {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"},
+        "sdk-cli": {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"},
+        "cli": {"CLAUDE_CODE_ENTRYPOINT": "cli"},
+        "unfamiliar": {"CLAUDE_CODE_ENTRYPOINT": "some-future-client"},
+        "unset": {},
+    }
+    seen = {}
+    for label, extra in arms.items():
+        code, out, ctx = run_hook(where, env_extra=extra)
+        assert code == 0 and ctx is not None, out
+        assert "UNKNOWN" in ctx, ctx
+        seen[label] = PUBLISHER_NOTE in ctx
+    assert seen == {
+        "claude-desktop": True,
+        "sdk-cli": True,
+        "cli": False,
+        "unfamiliar": False,
+        "unset": False,
+    }, seen
+
+    # A FRESH READING NEEDS NO EXCUSE. The note explains an UNKNOWN; beside a live number it is noise.
+    state = tmp_path / "fresh"
+    collect(state, reading())
+    _, _, fresh = run_hook(state, env_extra=arms["claude-desktop"])
+    assert fresh is not None and "verdict: OK" in fresh, fresh
+    assert PUBLISHER_NOTE not in fresh, fresh
 
 
 def test_a_stale_reading_is_unknown_and_the_threshold_is_stated(tmp_path: Path) -> None:

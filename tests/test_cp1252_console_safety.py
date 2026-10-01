@@ -723,6 +723,12 @@ def test_the_powershell_detector_discriminates_on_encodability_not_on_ascii() ->
 # =================================================================================================
 
 _ENGINE = _ROOT / "messagefoundry"
+# The toolkit takes code OUT of messagefoundry/ (ADR 0201), so it takes the engine gate with it:
+# a module that moves must not leave the walk. It ships a console entry point of its own. The gate
+# itself is the toolkit's `_REACH_ROOTS` row; this pair only feeds the entry-point rule, which
+# checks every __main__.py under these roots and harness/ calls the chokepoint.
+_TOOLKIT = _ROOT / "messagefoundry_toolkit"
+_ENGINE_GATE_ROOTS = (_ENGINE, _TOOLKIT)
 
 
 # THE REACH ROOTS ACCEPT ONE REMEDY: `_calls_the_chokepoint` (BACKLOG #1875). Before that item this
@@ -1135,9 +1141,10 @@ def _main(*body: str) -> tuple[str, ...]:
 
 
 def test_the_engine_hardening_signal_sees_the_real_entry_points() -> None:
-    """Proved against the real files rather than a reconstruction of them: the two entry points the
-    reach gate exempts today must be seen to call the chokepoint."""
-    for real in (_ENGINE / "__main__.py", _HARNESS / "__main__.py"):
+    """Proved against the real files rather than a reconstruction of them: the three shipped console
+    entry points must be seen to call the chokepoint. The reach gate exempts two of them today; the
+    toolkit's carries no glyph."""
+    for real in (_ENGINE / "__main__.py", _TOOLKIT / "__main__.py", _HARNESS / "__main__.py"):
         assert _calls_the_chokepoint(ast.parse(real.read_text(encoding="utf-8"))), real
 
 
@@ -1286,9 +1293,14 @@ _TESTS = _ROOT / "tests"
 #:
 #: harness/__main__.py and messagefoundry/__main__.py are the entry points whose hardening exempts
 #: them, and this module is the one file whose disappearance from the walk would make every result
-#: below meaningless.
+#: below meaningless. messagefoundry_toolkit/__main__.py is hardened too but carries no glyph, so
+#: nothing in it is exempted today; it is pinned as the toolkit's entry point.
 _REACH_ROOTS: tuple[tuple[str, Path, int, tuple[str, ...]], ...] = (
     ("messagefoundry", _ENGINE, 250, ("__main__.py", "pipeline/wiring_runner.py")),
+    # ADR 0201 moved engine tooling here, so it keeps the engine's gate. All three files are
+    # top-level; __main__.py is a console entry point hardened at the chokepoint, and
+    # adr_analyze.py is the module that moved.
+    ("messagefoundry_toolkit", _TOOLKIT, 3, ("__main__.py", "adr_analyze.py")),
     ("harness", _HARNESS, 60, ("__main__.py", "reconcile/__main__.py")),
     # Its ONLY nested file, measured 2026-09-29: 1 of 1,021. If it is ever legitimately removed,
     # the pin check below fails LOUDLY and points here rather than reporting a clean tree.
@@ -1422,6 +1434,9 @@ def test_every_root_holding_tracked_python_is_gated() -> None:
     # The census's own control: an instrument that cannot find these two proves nothing by
     # finding no ungated root.
     assert {"messagefoundry", "scripts"} <= roots, f"the census is blind: {sorted(roots)}"
+    # The control above already fails on an empty listing. This names `tracked`, which the absence
+    # check below walks, because that is the guard the vacuous-absence lint can read.
+    assert tracked, "git listed no tracked python at all -- the census read nothing"
     # A .py at the repository root has no row to go in: `_files_under` walks directories.
     at_root = sorted(rel for rel in tracked if "/" not in rel)
     assert not at_root, (
@@ -1541,7 +1556,8 @@ def test_the_extension_would_have_caught_both_sites_it_was_built_for() -> None:
 # echoed as backslash escapes on stderr, and no scan of any file can see the path. The only control
 # that covers a value nobody wrote down is a hardened stream, so the decision this section records is
 # WHERE that hardening lives: at one chokepoint, `messagefoundry.console_streams`, called from the top
-# of every `__main__.py` under the two roots that ship console entry points. Placed file by file, it
+# of every `__main__.py` under the roots that ship console entry points (messagefoundry/, its
+# toolkit sibling messagefoundry_toolkit/ from ADR 0201, and harness/). Placed file by file, it
 # decayed; `harness/reconcile/__main__.py` was the one that never got it.
 #
 # The rule is keyed on `__main__.py` -- what `python -m <package>` runs -- and that is a FLOOR. A
@@ -1569,7 +1585,7 @@ _ENTRY_POINTS_WITHOUT_A_CONSOLE = frozenset({"messagefoundry/tray/__main__.py"})
 def test_every_console_entry_point_hardens_at_the_chokepoint() -> None:
     found = {
         p.relative_to(_ROOT).as_posix(): p
-        for root in (_ENGINE, _HARNESS)
+        for root in (*_ENGINE_GATE_ROOTS, _HARNESS)
         for p in _files_under(root)
         if p.name == "__main__.py"
     }

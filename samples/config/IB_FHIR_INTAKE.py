@@ -9,7 +9,7 @@ against FHIR R4B (a non-conformant resource raises → ERROR/dead-letter, the co
 delivers the canonical JSON to a FHIR server with the ``FHIR()`` destination. The server is
 environment-specific, so it's authored with ``env()`` (resolved from ``environments/<env>.toml``).
 
-A real HL7 v2 → FHIR route would do the same, with the Handler mapping a python-hl7 ``Message`` into a
+A real HL7 v2 → FHIR route would do the same, with the Handler mapping an HL7 ``Message`` into a
 ``fhir.resources`` resource before ``Send`` — the mapping stays code-first here, never in the connector.
 
     python -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
@@ -30,7 +30,8 @@ inbound(
 # A FHIR REST destination. ``url`` is the service BASE (e.g. https://host/fhir); ``interaction="create"``
 # POSTs each resource to {base}/{ResourceType}. A SMART/OAuth deployment adds
 # ``bearer_token=env("fhir_bearer_token")`` (a secret → MEFOR_VALUE_FHIR_BEARER_TOKEN). For idempotent
-# re-sends, set interaction="update" (PUT by id) or a conditional knob (if-none-exist / conditional-update
+# re-sends, set interaction="update" (an update by id, sent as a one-entry transaction Bundle so the id
+# stays out of the URL) or a conditional knob (if-none-exist / conditional-update
 # / if-match) — see docs/CONNECTIONS.md.
 outbound("OB_FHIR_SERVER", FHIR(url=env("fhir_base_url"), interaction="create"))
 

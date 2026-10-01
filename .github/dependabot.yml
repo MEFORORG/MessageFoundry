@@ -57,21 +57,20 @@ updates:
       default-days: 5
       semver-major-days: 7
     # Dependabot WIDENS a declared cap instead of respecting it, so a load-bearing upper bound in
-    # pyproject.toml must be restated here as a version range or the cap is decorative. PR #66 rewrote
-    # `annotated-types<0.8` -> `<0.9` (BOTH declaration sites) and `ruff>=0.4,<0.16` -> `<0.17`; the
+    # pyproject.toml must be restated here as a version range or the cap is decorative, unless it is
+    # a named exemption (THE RULE, below). PR #66 rewrote
+    # `annotated-types<0.8` -> `<0.9` and `ruff>=0.4,<0.16` -> `<0.17`; the
     # resync then propagated 0.8.0/0.16.0 into constraints.lock, so ci.yml's `--constraint` pinned CI
-    # *to* the broken versions. `python-deps` groups on `*`, so those two red the WHOLE batch and hold
-    # every benign bump in it hostage. WHY each is capped lives beside the cap in pyproject.toml
-    # (annotated-types in [project.dependencies] and in the [fhir] extra; ruff in [dev]) — do not
-    # restate it here; lift a cap and delete its entry in the SAME PR. ONE entry covers BOTH
-    # annotated-types declarations: `ignore` filters a candidate VERSION by package name within this
-    # manifest, not by declaration site, so a second entry would describe nothing.
+    # *to* the broken versions. `python-deps` groups every minor and patch on `*`, and both of those
+    # bumps are minors, so they red the WHOLE batch and hold every benign bump in it hostage. Where
+    # pyproject.toml records WHY a package is capped, it sits beside the cap; do not restate it here.
+    # Lift a cap and delete its entry in the SAME PR.
     # TRADE-OFF, accepted: `ignore` suppresses the SECURITY track for the named RANGE as well as the
-    # routine one (`update-types` is the version-only knob and cannot express a range). A 0.7.x /
-    # 0.15.x advisory fix still flows. Detection is untouched — security.yml's REQUIRED
-    # `pip-audit -r requirements.lock` covers both on every PR and on the daily cron, so a withheld fix
-    # reds a merge-blocking gate within ~24h and a human lifts the cap. Note the ceiling is the
-    # pyproject CAP, not this entry: a human would have to lift it either way.
+    # routine one (`update-types` is the version-only knob and cannot express a range). A ruff
+    # 0.15.x or uvicorn 0.49.x advisory fix still flows. Detection is untouched — security.yml's
+    # REQUIRED `pip-audit -r requirements.lock` covers both on every PR and on the daily cron, so a
+    # withheld fix reds a merge-blocking gate within ~24h and a human lifts the cap. Note the
+    # ceiling is the pyproject CAP, not this entry: a human would have to lift it either way.
     # NOT IGNORED, deliberately: the exact `==` pins in `[dependency-groups]`, and no blanket
     # `versioning-strategy: lockfile-only`. Both would freeze the hash-pinned CI toolchain, which ADR
     # 0034 §3 wants moving THROUGH this machinery — a pinned toolchain outside it rots into
@@ -95,7 +94,7 @@ updates:
     # covered `requirements.lock`, `ci-scanners.lock` and `ci-quality.lock` but NOT
     # `ci/locks/release-tools.lock`, which a9354808e added to the export and byte-diff set without
     # adding to the audit set. That gap is closed in the same commit as this entry, so the
-    # annotated-types / ruff bargain — detection untouched, a withheld fix reds a required gate
+    # ruff bargain — detection untouched, a withheld fix reds a required gate
     # within ~24h, a human lifts the entry — now holds here too. If that audit line is ever removed,
     # REMOVE THIS ENTRY WITH IT.
     #
@@ -104,27 +103,68 @@ updates:
     # ship them (3.5.1, 3.6.7), so a 4.4.1 is possible. This range leaves the 4.4.x patch track open
     # and blocks only the minor bump the ruling declined.
     #
-    # `cyclonedx-bom` is the same WIDENED-CAP case as annotated-types and ruff, not a sigstore-style
+    # `cyclonedx-bom` is the same WIDENED-CAP case as ruff, not a sigstore-style
     # ruling. PR 1552 rewrote the release-tools `~=7.3.1` to `>=7.3.1,<7.5.0` and locked 7.4.0,
     # lifting a deliberate ceiling. test_floored_group_pins_stay_declared caught the spec and redded
-    # the whole batch, so this entry keeps benign bumps from being held behind it, as the two above
-    # do. Why the ceiling exists is the cyclonedx-bom note above `release-tools` in pyproject.toml;
+    # the whole batch, so this entry keeps benign bumps from being held behind it, as ruff's
+    # does. Why the ceiling exists is the cyclonedx-bom note above `release-tools` in pyproject.toml;
     # read it there. The range leaves the 7.3.x patch track open. The trade-off note above holds:
     # security.yml runs pip-audit over ci/locks/release-tools.lock. Lift this entry in the same PR
     # that moves the pyproject spec to a validated 7.4.
+    #
+    # `uvicorn` is the same WIDENED-CAP case. Dependabot proposed widening uvicorn's `<0.50` to
+    # `<0.54` in PR 1773, which the Lander closed on 2026-09-28: 0.50 and later pick a websockets
+    # protocol the protocol-header floor refuses (BACKLOG #1120 arm (b)), so serve exits 2. Why the
+    # cap exists is beside it in pyproject.toml; read it there. pyproject.toml declares plain
+    # `uvicorn`, not `uvicorn[standard]`, so the bare name here matches it as written. Lift this
+    # entry in the same PR that lifts the cap.
+    #
+    # `pydicom`, `webauthn` and `pynetdicom` are the same WIDENED-CAP case (BACKLOG #2505). A major
+    # cap needs its entry as much as a minor one: `python-deps-major` is one batch on `*`, so a
+    # widened major cap holds that batch hostage too. pyproject.toml's [dicom] comment gives
+    # pynetdicom's own pydicom>=3,<4 requirement but no reason for `pynetdicom<4` itself; the cap is
+    # already in 5fa6db9f42, the 2026-07-06 history-reset snapshot, so the entry mirrors it as-is.
+    #
+    # THE RULE (BACKLOG #2505): every upper bound in pyproject.toml has an entry here, exactly `>=`
+    # the version the test derives (a `<` cap's bound; for an exact `==` pin, the next minor), unless
+    # it is a NAMED exemption. A named exemption must NOT have an entry. The list, with each reason,
+    # is `_EXEMPT` in tests/test_dependabot_cap_ignores.py; it holds at least `hvac`, `hatchling` and
+    # the exact group pins under "NOT IGNORED, deliberately" above other than `sigstore`. The test
+    # also holds every entry here to a cap that still exists.
     ignore:
-      - dependency-name: "annotated-types"
-        versions: [">=0.8.0"]
       - dependency-name: "ruff"
         versions: [">=0.16.0"]
       - dependency-name: "sigstore"
         versions: [">=4.5.0"]
       - dependency-name: "cyclonedx-bom"
         versions: [">=7.4.0"]
+      - dependency-name: "uvicorn"
+        versions: [">=0.50.0"]
+      # Why: the comment above the [dicom] extra in pyproject.toml.
+      - dependency-name: "pydicom"
+        versions: [">=3.1.0"]
+      # Why: the comment above the [webauthn] extra in pyproject.toml.
+      - dependency-name: "webauthn"
+        versions: [">=4.0.0"]
+      # No reason for this cap is recorded in pyproject.toml; see the paragraph above.
+      - dependency-name: "pynetdicom"
+        versions: [">=4.0.0"]
     groups:
-      # Version-update grouping (applies-to defaults to version-updates).
+      # Version-update grouping (applies-to defaults to version-updates), SPLIT BY UPDATE TYPE (owner
+      # decision 2026-09-30) so one bad major cannot hold the routine minors and patches hostage.
+      # Keep the two lists covering all three levels: an update no group matches opens its own PR.
+      # Key and values checked 2026-09-30 against GitHub's dependabot-options-reference page.
+      # The level is read by version position, so a breaking 0.x release counts as a minor and
+      # still rides `python-deps`. The `ignore` caps above cover only the packages they name, so a
+      # breaking 0.x minor of any other package can still hold that batch. Cost, accepted:
+      # both groups rewrite uv.lock, so in a week with both PRs open the second must rebase and
+      # re-run CI after the first merges, and the two cannot share a merge-queue batch.
       python-deps:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
+      python-deps-major:
+        patterns: ["*"]
+        update-types: ["major"]
       # Security-update grouping: collapse multiple vulnerable-dep fixes into ONE PR so a single
       # review/merge clears them — faster remediation when several CVEs land together.
       python-security:
@@ -150,7 +190,7 @@ updates:
     groups:
       # One weekly PR for all action bumps instead of one PR per action (CI cost: every extra PR
       # buys a full required-check pass + a push-to-main run when it auto-merges). Mirrors the
-      # python-deps/ide-deps grouping above. A patch batched with a major rides the same PR —
+      # ide-deps grouping below. A patch batched with a major rides the same PR —
       # latency-only, auto-merge still gates on the full CI pass. Security updates keep their own
       # group so an advisory fix is never held behind a routine batch.
       actions-deps:
@@ -253,3 +293,8 @@ updates:
   # control resting on a false premise is the defect CLAUDE.md section 11 (SDS-3.7) forbids, so the
   # gap is recorded rather than papered over. Bounded by where the bundle runs: CI only, never
   # shipped in a wheel, sdist or deployment.
+  #
+  # CORRECTED 2026-09-29: "MANUAL AND UNSCHEDULED" above is no longer true. `security.yml`'s
+  # `cla-action-audit` job audits the lockfile on the daily cron and fails on any advisory not in
+  # `scripts/security/cla-action-advisories.toml` (BACKLOG #1578). It DETECTS; it does not
+  # remediate, so the reasons above for having no entry here still hold.

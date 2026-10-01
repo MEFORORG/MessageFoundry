@@ -11,10 +11,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
-from messagefoundry.api.metrics import _MetricsCollector, _read_host_metrics, _Snapshot
+from messagefoundry.api.metrics import _read_host_metrics, _render_snapshot, _Snapshot
 
 _HOST_METRICS = {
     "messagefoundry_host_cpu_percent",
@@ -53,9 +52,7 @@ def test_host_gauges_rendered_unlabeled() -> None:
         host_mem_total_bytes=4000.0,
         process_rss_bytes=500.0,
     )
-    reg = CollectorRegistry()
-    reg.register(_MetricsCollector(snap))
-    families = {f.name: f for f in text_string_to_metric_families(generate_latest(reg).decode())}
+    families = {f.name: f for f in text_string_to_metric_families(_render_snapshot(snap).decode())}
 
     for name in _HOST_METRICS:
         assert name in families, f"missing host gauge {name}"
@@ -66,8 +63,6 @@ def test_host_gauges_rendered_unlabeled() -> None:
 
 def test_host_gauges_absent_when_psutil_unavailable() -> None:
     # A snapshot with no host readings (psutil.Error path) emits none of the host gauges.
-    reg = CollectorRegistry()
-    reg.register(_MetricsCollector(_snapshot()))
-    rendered = generate_latest(reg).decode()
+    rendered = _render_snapshot(_snapshot()).decode()
     for name in _HOST_METRICS:
         assert name not in rendered
