@@ -398,6 +398,8 @@ def test_every_ldap3_construction_site_turns_referrals_off() -> None:
     ``ldap3.Server`` passes ``allowed_referral_hosts=[]``, both as literals. A new construction site
     that omits either goes red here even if no runtime test reaches it."""
     sites = _ldap3_construction_sites()
+    # The absence check below walks `sites`: at least three Connection sites and one Server site.
+    assert len(sites) >= 4, sites
     kinds = [attr for attr, _module, _line, _kw in sites]
     assert kinds.count("Server") >= 1 and kinds.count("Connection") >= 3, sites
 
