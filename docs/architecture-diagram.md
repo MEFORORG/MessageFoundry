@@ -14,8 +14,9 @@ The views in this file each answer a different question. More diagrams live in o
 5. **Receive to deliver**: the order of steps from receipt to delivery, when the sender gets its ACK, and what each failure does.
 6. **Message disposition**: every status a message can hold, and what moves it from one to the next.
 
-**Legend.** Solid/thick arrows = *depends on / calls*. Dotted arrows = *talks to over the API or wire*
+**Legend for sections 1 to 4.** Solid/thick arrows = *depends on / calls*. Dotted arrows = *talks to over the API or wire*
 (separate process). Cylinders = persisted stage/store. Hexagon = the single disposition authority.
+Sections 5 and 6 each carry their own legend.
 
 ---
 
@@ -363,16 +364,22 @@ sequenceDiagram
   DLW->>OBC: send
   OBC-->>DLW: accepted
   DLW->>MST: mark the outbound row done
-  Note over MST: The finalizer sets PROCESSED when no row is still in flight
+  Note over MST: The finalizer sets PROCESSED when no row is pending or in flight
 ```
 
 **Legend.** A solid arrow is a call. A dashed arrow is a reply. A note over the message store names
 the disposition the message holds at that point. Section 6 covers every disposition.
 
-The codes are those of an HL7 v2 inbound in the original acknowledgement mode. In enhanced mode
-the three codes are `CA`, `CE` and `CR`. An inbound with acknowledgements turned off sends no reply.
-An inbound of another content type skips HL7 parsing and the HL7 ACK, and its connector owns any
-reply to the sender.
+The diagram shows an MLLP inbound that carries HL7 v2, in the original acknowledgement mode. In
+enhanced mode the three codes are `CA`, `CE` and `CR`. With acknowledgements turned off, the inbound
+sends no reply. A source that answers in its own protocol sends no HL7 ACK. The HTTP listener is
+one: its receipt is its own status code, and it also waits for the ingress commit. A file inbound
+has no sender to answer. An inbound of another content type skips HL7 parsing.
+
+The diagram draws one Handler and one outbound Connection. At least three paths are not drawn. A
+Send into a pass-through inbound makes a new message on that inbound. A captured reply can enter
+again through a loopback inbound. An inbound can opt in to an inline path, where the router worker
+also runs the Handler and no routed row is written.
 
 ### When a step fails
 
@@ -394,7 +401,7 @@ sequenceDiagram
     LSN-->>SND: NAK with AR for a decode or parse failure, AE for a strict validation failure
   else A Router or a Handler raises, after the ACK
     WRK->>MST: dead-letter the row at its own stage
-    MST->>MST: the finalizer sets ERROR
+    MST->>MST: the finalizer sets ERROR when no other row is pending or in flight
     Note over SND,LSN: No NAK. The sender already holds its AA.
   else The engine stops before a handoff commits
     WRK->>MST: claim a row, which marks it in flight
@@ -407,14 +414,17 @@ sequenceDiagram
     DLW->>MST: put the outbound row back to pending, with a backoff
     Note over DLW,OBC: The worker tries again. A NAK with AR or CR skips the retries.
     DLW->>MST: dead-letter the outbound row when the attempts run out
-    MST->>MST: the finalizer sets ERROR
+    MST->>MST: the finalizer sets ERROR when no other row is pending or in flight
   end
 ```
 
+The table lists the main failures. It is not a full list.
+
 | Failure | What the sender sees | Where the message ends |
 |---|---|---|
-| The body cannot be decoded or parsed | NAK `AR` | `ERROR`, recorded with no ingress row |
+| The body cannot be decoded or parsed, or it holds a NUL character | NAK `AR` | `ERROR`, recorded with no ingress row |
 | Strict validation fails or times out | NAK `AE` | `ERROR`, recorded with no ingress row |
+| A streaming inbound cannot store a large document | NAK `AE` | `ERROR`, recorded with no ingress row |
 | The store cannot commit the message | NAK `AE` from the MLLP listener, then the connection closes | Nothing was ACKed, so the sender sends it again |
 | A Router or a Handler raises | The `AA` it already holds | `ERROR`, with the row dead-lettered at its own stage |
 | The engine stops before a handoff commits | The `AA` it already holds | The stage runs again after the restart |
@@ -430,9 +440,9 @@ on its own lanes. A clustered node recovers them when it becomes the leader, and
 [CLUSTERING.md](CLUSTERING.md) holds that detail.
 
 Two settings in `[delivery]` shape the failure paths, and [CONFIGURATION.md](CONFIGURATION.md) lists
-both. `retry_max_attempts` is the number of delivery attempts before the row is dead-lettered, 100 as
-shipped. `internal_error` decides what a worker does when a Router, a Handler or a send raises from a
-code error. The default, `continue`, dead-letters the row and moves on. The other value, `stop`,
+both. `retry_max_attempts` is the number of delivery attempts before the row is dead-lettered.
+`internal_error` decides what a worker does when a Router, a Handler or a send raises from a code
+error. The default, `continue`, dead-letters the row and moves on. The other value, `stop`,
 keeps the row, stops that lane and raises an alert.
 
 ---
@@ -449,18 +459,19 @@ stateDiagram-v2
   direction TB
   classDef moving fill:#fff3e0,stroke:#ef6c00,color:#3a1d00
   classDef settled fill:#e8f5e9,stroke:#2e7d32,color:#10240f
-  classDef failed fill:#ede7f6,stroke:#5e35b1,color:#22103f
+  classDef failed fill:#fce4ec,stroke:#c2185b,color:#3d0a1f
 
   [*] --> RECEIVED: raw message committed to the ingress stage
   [*] --> ERROR: refused before the ingress commit
   [*] --> ROUTED: an edited body sent straight to an outbound Connection
   RECEIVED --> ROUTED: the Router picked one or more Handlers
   RECEIVED --> UNROUTED: the Router picked no Handler
-  RECEIVED --> ERROR: the ingress row was dead-lettered
+  RECEIVED --> ERROR: a row is dead, none pending or in flight
+  RECEIVED --> PROCESSED: after a replay of a routed row, every outbound row resolved
   ROUTED --> PROCESSED: every outbound row resolved, none dead
   ROUTED --> FILTERED: every Handler ran and sent nothing
   ROUTED --> NOT_DEPLOYED: every Send was declined
-  ROUTED --> ERROR: a row was dead-lettered at any stage
+  ROUTED --> ERROR: a row is dead, none pending or in flight
   ERROR --> RECEIVED: replay of a dead ingress or routed row
   ERROR --> ROUTED: replay of dead outbound rows
   PROCESSED --> ROUTED: replay or resend
@@ -475,36 +486,45 @@ stateDiagram-v2
   class ERROR failed
 ```
 
-**Legend.** Orange states are still moving: a worker has more to do. Green states are settled with
-no failure. Purple is a failure. An arrow to the end mark means a message can rest in that state.
-The store holds each name in lower case, for example `not_deployed`.
+**Legend.** Orange states are in progress. Green states are settled with no failure. Pink is a
+failure. An arrow to the end mark means a message can rest in that state. The store holds each name
+in lower case, for example `not_deployed`.
+
+The diagram draws the main moves. The table says what causes each one, and the replay rule under it
+covers the moves that are not drawn.
 
 | From | To | What moves the message |
 |---|---|---|
 | start | `RECEIVED` | The listener commits the raw message to the ingress stage. |
-| start | `ERROR` | Decode, parse or strict validation fails. The listener records the message, and an HL7 inbound sends a NAK. |
+| start | `ERROR` | Decode, parse or strict validation fails. The listener records the message, and an MLLP inbound answers with a NAK. |
 | start | `ROUTED` | An operator edits a stored message and resends the edited body straight to an outbound Connection. The new message skips the Router and the Handlers. |
 | `RECEIVED` | `ROUTED` | The Router picks one or more Handlers. |
 | `RECEIVED` | `UNROUTED` | The Router picks no Handler. |
-| `RECEIVED` | `ERROR` | The ingress row is dead-lettered. For example, the Router raised, or the inbound Connection left the config. |
-| `ROUTED` | `PROCESSED` | No row is in flight, none is dead, and at least one outbound row exists. Each one was delivered, or an operator purged it from the queue. |
+| `RECEIVED` | `ERROR` | A row is dead, and no row is pending or in flight. Most often it is the ingress row: the Router raised, or the inbound Connection left the config. |
+| `RECEIVED` | `PROCESSED` | Only after a replay put a routed row back. The Handler runs again and its deliveries resolve. The message does not pass through `ROUTED` on this path. |
+| `ROUTED` | `PROCESSED` | No row is pending or in flight, none is dead, and at least one outbound row exists. Each one was delivered, or an operator purged it from the queue. |
 | `ROUTED` | `FILTERED` | Every Handler ran, and none of them sent anything. |
 | `ROUTED` | `NOT_DEPLOYED` | No delivery was queued, and at least one Send was declined because its target Connection is in the graph but not deployed. |
-| `ROUTED` | `ERROR` | A row is dead-lettered at any stage. For example, a Handler raised, a partner rejected the message for good, the delivery attempts ran out, or a Handler or an outbound Connection left the config. |
+| `ROUTED` | `ERROR` | A row is dead, and no row is pending or in flight. A row goes dead when a Handler raises, a partner rejects the message for good, or the delivery attempts run out. It also goes dead when its Handler or its outbound Connection has left the config. |
 | `ERROR` | `RECEIVED` | A message replay puts a dead ingress or routed row back in the queue. |
 | `ERROR` | `ROUTED` | A message replay or a dead-letter replay puts dead outbound rows back in the queue. A resend also moves the message to `ROUTED`, because it adds a new outbound row. |
 | `PROCESSED` | `ROUTED` | A message replay sends the delivered rows again. A resend queues the stored body to another outbound Connection. |
 
-**Dead-letter is a row state, not a disposition.** A queue row is pending, in flight, done, dead or
-cancelled. A dead row is a dead-letter, and its message shows `ERROR`. One dead row is enough: the
-message shows `ERROR` even when another Handler's delivery succeeded. A message stays `ROUTED` while
-a delivery waits to retry.
+A new message also starts at `RECEIVED` in at least two other cases: a Send into a pass-through
+inbound, and a captured reply that enters again through a loopback inbound.
 
-**Replay works on queue rows.** A message replay first looks for dead or waiting rows and puts only
-those back, so a row that was already delivered is not sent twice. If nothing is stuck, it sends the
-delivered rows again. An `ERROR` recorded before ingress has no queue row. Neither does an
-`UNROUTED`, `FILTERED` or `NOT_DEPLOYED` message. A replay of any of these changes nothing, and the
-API answers 409.
+**Dead-letter is a row state, not a disposition.** A queue row is pending, in flight, done, dead or
+cancelled. A dead row is a dead-letter. Its message shows `ERROR` once no other row of that message
+is pending or in flight. One dead row is enough: the message shows `ERROR` even when another
+Handler's delivery succeeded. While a delivery waits to retry, the message keeps the disposition it
+already has.
+
+**Replay works on queue rows.** A message replay first looks for dead or pending rows. If it finds
+any, it puts only those back and leaves the delivered rows alone. If it finds none, it sends the
+delivered rows again. The message then shows `RECEIVED` if an ingress or routed row is waiting, and
+`ROUTED` if only outbound rows are. An `ERROR` recorded before ingress has no queue row. Neither
+does an `UNROUTED`, `FILTERED` or `NOT_DEPLOYED` message. A replay of any of these changes nothing,
+and the API answers 409.
 
 **An edit and resubmit makes a new message.** By default the edited body enters as a new `RECEIVED`
 message and takes the whole path again. When the operator names a target outbound Connection, the
