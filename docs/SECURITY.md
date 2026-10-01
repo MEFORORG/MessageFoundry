@@ -3579,8 +3579,14 @@ inherited from another caller. It is surfaced on `GET /audit` and in the `audit:
 > rather than merely lossy. `audit_log.client` is the per-action address and is the one to trust.
 
 **Tamper-evidence (AUDIT-INTEGRITY).** Each `audit_log` row carries a `row_hash` that chains the
-previous row's hash with this row's content (SHA-256), so deleting, editing, or reordering any row is
-detectable. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
+previous row's hash with this row's content, so deleting, editing, or reordering any row is
+detectable. On a keyed chain the digest is HMAC-SHA-256 under a key derived from the store key, so
+someone who can write rows but does not hold the key cannot recompute it. Under
+`cipher_provider = "vault_transit"` the MAC is computed inside Transit instead. On a keyless chain
+the digest is plain SHA-256, which anyone who can write the table can recompute. A store that has a
+key can still hold a keyless chain:
+[ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, says when
+a chain is keyed. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
 surviving row was edited or reordered. **A scheduled job reads the exit code and nothing else, so
 these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
 path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an
