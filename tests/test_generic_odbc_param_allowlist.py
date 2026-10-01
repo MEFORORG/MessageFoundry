@@ -12,10 +12,10 @@ other places a keyword can come from, so this file pins all three:
   driver has its own spellings for a host, an address, a data source name or a socket, so a list of
   refused names would always trail the drivers.
 * ``odbc_user_key`` and ``odbc_password_key`` accept the credential keywords and nothing else.
-* A value may not hold the characters that end a connection-string value, in ASCII or in a
-  look-alike form. That covers every ``odbc_params`` value and the driver, database and user name.
-  A password may hold ``;`` and ``{`` but not ``}``.
-* A keyword given twice is refused, and a file keyword must name a path on this machine.
+* Every value must be printable ASCII. An ``odbc_params`` value, the driver, the database and the
+  user name also refuse the characters that end a connection-string value. A password keeps the
+  ODBC escape, so it may hold any printable ASCII character.
+* A keyword given twice is refused, and a file keyword must be a plain local path.
 
 Each refusal is paired with a control that must still build, and the control uses the same builder
 and the same settings. Nothing here opens a connection: the refusal is in the string builder, which
@@ -45,6 +45,7 @@ from messagefoundry.transports.base import build_destination, build_source
 from messagefoundry.transports.database import (
     _ODBC_PARAM_ALLOWLIST,
     _ODBC_PASSWORD_KEYS,
+    _ODBC_PATH_KEYS,
     _ODBC_USER_KEYS,
     DatabaseDestination,
     DatabaseSource,
@@ -81,7 +82,7 @@ _REFUSED_KEYWORDS = [
     "Address",
     "Addr",
     "addr",
-    "ADDRESS ",
+    "ADDRESS",
     "Network Address",
     "Servername",
     "Host",
@@ -138,9 +139,13 @@ def test_every_listed_keyword_still_builds(keyword: str) -> None:
     assert dsn.endswith(f"{keyword}={{1}};")
 
 
-@pytest.mark.parametrize("spelling", ["PORT", "Port", "port", "PORT ", "pOrT  "])
-def test_a_listed_keyword_matches_in_any_case_and_with_trailing_blanks(spelling: str) -> None:
+@pytest.mark.parametrize("spelling", ["PORT", "Port", "port", "pOrT"])
+def test_a_listed_keyword_matches_in_any_case(spelling: str) -> None:
     assert f"{spelling}={{5432}}" in _build(odbc_params={spelling: 5432})
+
+
+def test_every_path_keyword_is_a_listed_keyword() -> None:
+    assert _ODBC_PATH_KEYS <= _ODBC_PARAM_ALLOWLIST
 
 
 def test_the_list_holds_no_keyword_the_connector_emits_itself() -> None:
@@ -155,7 +160,11 @@ def test_the_list_is_stored_in_the_form_keywords_are_compared_in() -> None:
         assert keyword == _odbc_keyword_name(keyword)
 
 
-@pytest.mark.parametrize("keyword", ["PORT\n", " PORT", "SSL-MODE"])
+# The keyword is sent as spelled and not every driver trims it, so a spelling that needs trimming
+# is refused: the engine must not judge a keyword the driver would then ignore.
+@pytest.mark.parametrize(
+    "keyword", ["PORT\n", " PORT", "PORT ", "SSLmode  ", "Network  Address", "SSL-MODE"]
+)
 def test_a_keyword_of_the_wrong_shape_is_refused_and_names_the_connection(keyword: str) -> None:
     with pytest.raises(ValueError, match="not a valid ODBC keyword") as refused:
         _build(odbc_params={keyword: "5432"})
@@ -166,7 +175,7 @@ def test_a_keyword_of_the_wrong_shape_is_refused_and_names_the_connection(keywor
     "params",
     [
         {"PORT": 5432, "port": 5433},
-        {"SSLmode": "verify-full", "sslmode ": "verify-ca"},
+        {"SSLmode": "verify-full", "sslmode": "verify-ca"},
         {"Fetch": 1, "FETCH": 1},
     ],
 )
@@ -207,30 +216,21 @@ def test_the_credential_keywords_drivers_use_still_build(user_key: str, password
 
 # --- values --------------------------------------------------------------------------------------
 
-# A value is sent inside braces. These are the characters that could end it early in a driver that
-# reads the braces differently from the ODBC rule, plus the control characters no value needs. The
-# last four are look-alikes: a driver manager that converts the string to a narrow code page for the
-# driver can turn each into the ASCII character.
-_REFUSED_VALUE_CHARACTERS = [
-    ";",
-    "{",
-    "}",
-    "\n",
-    "\r",
-    "\x00",
-    "\x7f",
-    "\uff1b",
-    "\uff5b",
-    "\uff5d",
-    "\ufe54",
-]
+# A value is sent inside braces. The first three are the characters that could end it early in a
+# driver that reads the braces differently from the ODBC rule. Then the control characters. The rest
+# are not ASCII: a driver manager that converts the string for a narrow-interface driver can turn
+# such a character into an ASCII delimiter, and which ones depends on the platform and code page,
+# so every non-ASCII character is refused. The samples are a fullwidth form, a character whose low
+# byte is a delimiter, and an ordinary accented letter.
+_NON_ASCII = ["\uff1b", "\uff5d", "\u017d", "\u013b", "\u00e9"]
+_REFUSED_VALUE_CHARACTERS = [";", "{", "}", "\n", "\r", "\x00", "\x7f", *_NON_ASCII]
 
 
 @pytest.mark.parametrize("character", _REFUSED_VALUE_CHARACTERS)
 def test_a_value_holding_a_connection_string_delimiter_is_refused(character: str) -> None:
     value = f"{_VALUE}{character}{_VALUE}"
     with pytest.raises(
-        ValueError, match="odbc_params value for 'sslmode' must not contain"
+        ValueError, match="odbc_params value for 'sslmode' must hold only printable ASCII"
     ) as refused:
         _build(odbc_params={"SSLmode": value})
     message = str(refused.value)
@@ -239,33 +239,36 @@ def test_a_value_holding_a_connection_string_delimiter_is_refused(character: str
 
 
 @pytest.mark.parametrize("setting", ["odbc_driver", "database", "username"])
-@pytest.mark.parametrize("character", [";", "{", "}", "\n", "\uff5d"])
+@pytest.mark.parametrize("character", [";", "{", "}", "\n", *_NON_ASCII])
 def test_a_typed_setting_holding_a_delimiter_is_refused(setting: str, character: str) -> None:
-    with pytest.raises(ValueError, match=f"DATABASE {setting} must not contain") as refused:
+    with pytest.raises(ValueError, match=f"DATABASE {setting} must hold only printable") as refused:
         _build(**{setting: f"{_VALUE}{character}{_VALUE}"})
     message = str(refused.value)
     assert _CONNECTION in message
     assert _VALUE not in message
 
 
-@pytest.mark.parametrize("character", ["}", "\n", "\uff5d"])
-def test_a_password_holding_the_closing_brace_is_refused(character: str) -> None:
-    with pytest.raises(ValueError, match="DATABASE password must not contain") as refused:
+@pytest.mark.parametrize("character", ["\n", "\x00", *_NON_ASCII])
+def test_a_password_must_be_printable_ascii(character: str) -> None:
+    with pytest.raises(ValueError, match="DATABASE password must hold only printable") as refused:
         _build(username="svc", password=f"{_VALUE}{character}{_VALUE}")
     message = str(refused.value)
     assert _CONNECTION in message
     assert _VALUE not in message
+    assert "none of" not in message
 
 
-def test_a_password_may_hold_the_other_delimiters() -> None:
-    # Inside braces only `}` can end the value, so these stay legal in a password.
-    assert "PWD={p;w{d=1 x}" in _build(username="svc", password="p;w{d=1 x")
+def test_a_password_may_hold_any_printable_ascii_character() -> None:
+    # A password cannot be restricted the way the other values are, so it keeps the ODBC escape:
+    # a closing brace is doubled, and the other delimiters sit inside the braces.
+    assert "PWD={p;w{d=1 x}}y}" in _build(username="svc", password="p;w{d=1 x}y")
 
 
-@pytest.mark.parametrize("character", [";", "{", "}", "=", "\n", "\t", "\uff1b", "\uff1d"])
+@pytest.mark.parametrize("character", [";", "{", "}", "=", "\n", "\t", *_NON_ASCII])
 def test_a_server_holding_a_delimiter_is_refused(character: str) -> None:
-    with pytest.raises(ValueError, match="server must not contain"):
+    with pytest.raises(ValueError, match="server must not contain") as refused:
         _build(server=f"db.test{character}x")
+    assert _CONNECTION in str(refused.value)
 
 
 # --- file keywords -------------------------------------------------------------------------------
@@ -274,10 +277,16 @@ def test_a_server_holding_a_delimiter_is_refused(character: str) -> None:
 @pytest.mark.parametrize("keyword", ["sslca", "SSLCAPATH", "sslcert", "SSLKEY"])
 @pytest.mark.parametrize(
     "path",
-    [r"\\files.test\share\ca.pem", "//files.test/share/ca.pem", r" \\files.test\share\ca.pem"],
+    [
+        r"\\files.test\share\ca.pem",
+        "//files.test/share/ca.pem",
+        r" \\files.test\share\ca.pem",
+        r"\??\UNC\files.test\share\ca.pem",
+        r"\\?\UNC\files.test\share\ca.pem",
+    ],
 )
-def test_a_file_keyword_must_name_a_path_on_this_machine(keyword: str, path: str) -> None:
-    with pytest.raises(ValueError, match="must be a path on this machine") as refused:
+def test_a_file_keyword_must_be_a_plain_local_path(keyword: str, path: str) -> None:
+    with pytest.raises(ValueError, match="must be a plain local path") as refused:
         _build(odbc_params={keyword: path})
     message = str(refused.value)
     assert _CONNECTION in message

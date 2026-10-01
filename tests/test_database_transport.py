@@ -351,17 +351,11 @@ def test_build_odbc_dsn_requires_driver() -> None:
 
 
 def test_build_odbc_dsn_brace_quotes_values() -> None:
-    # A value is sent inside braces, so a delimiter in it stays part of the value.
+    # An injection attempt in a password can't close the brace early (the inner } is doubled).
     dsn = _build_odbc_dsn(
-        {"odbc_driver": "PostgreSQL Unicode", "server": "db.example", "password": "p;DROP=1"}
+        {"odbc_driver": "PostgreSQL Unicode", "server": "db.example", "password": "p};DROP"}
     )
-    assert "PWD={p;DROP=1}" in dsn
-    # The one character that can end a braced value is refused rather than escaped: not every
-    # driver is known to read the `}}` escape (vault BACKLOG #2577).
-    with pytest.raises(ValueError, match="password must not contain"):
-        _build_odbc_dsn(
-            {"odbc_driver": "PostgreSQL Unicode", "server": "db.example", "password": "p};DROP"}
-        )
+    assert "PWD={p}};DROP}" in dsn
 
 
 @pytest.mark.parametrize("bad", ["host;x", "host{x", "host=x", "host\nx"])

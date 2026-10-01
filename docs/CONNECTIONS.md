@@ -1422,7 +1422,7 @@ gate are identical to the SQL Server preset.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`. A name holding `;`, `{` or `}` is **refused** |
+| `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver` |
 | `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted. Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**, and so is a value holding a delimiter (see [*Values*](#values-on-the-generic-dialect)). An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`). One of `UID`, `USER`, `Username` or `User ID`, in any case; anything else is **refused** |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
@@ -1443,12 +1443,15 @@ each one sets a port, a TLS mode, a local file or a session option:
 | Session | `CHARSET`, `ReadOnly`, `READTIMEOUT`, `WRITETIMEOUT`, `Fetch`, `UseDeclareFetch`, `BoolsAsChar`, `KeepaliveTime`, `KeepaliveInterval` |
 <!-- odbc-params-allowlist:end -->
 
-Keywords match in any case, and blanks after one are ignored. A keyword given twice, in any
-spelling, is refused. The list says what the engine accepts. It does not say which keywords
-your driver reads, so check the driver's own manual.
+Keywords match in any case. Spell one with single blanks between words and none at the end: the
+keyword is sent as you wrote it, and not every driver trims it. A keyword given twice, in any
+case, is refused. The list says what the engine accepts. It does not say which keywords your
+driver reads, so check the driver's own manual.
 
-A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must name a path on this machine. A
-path that starts with two separators names another host, and it is refused.
+A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must be a plain local path: a drive
+letter, or one leading separator. A path that starts with two separators, or with a device
+prefix, is refused, because it can name another host. This reads the spelling only. It does
+not follow a mapped drive or a link, so keep those files on a local disk.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -1476,16 +1479,17 @@ Two limits follow from this:
 
 ##### Values on the generic dialect
 
-Every value is sent inside braces. A value that holds a delimiter is refused, not escaped, and
-the error names the setting and never the value:
+Every value is sent inside braces and must be printable ASCII. A value that breaks its rule is
+refused when the connection is built, and the error names the setting and never the value:
 
-| Setting | Refused characters |
+| Setting | Rule |
 |---|---|
-| `odbc_driver`, `database`, `username`, every `odbc_params` value | `;`, `{`, `}`, control characters |
-| `password` | `}`, control characters. A password may hold `;` or `{` |
-| `server` | `;`, `{`, `}`, `=`, control characters |
+| `odbc_driver`, `database`, `username`, every `odbc_params` value | printable ASCII, and none of `;`, `{`, `}` |
+| `server` | printable ASCII, and none of `;`, `{`, `}`, `=` |
+| `password` | printable ASCII. A `}` is sent with the ODBC `}}` escape, which the driver must read |
 
-A look-alike of one of these, such as a fullwidth semicolon or brace, is refused as well.
+ASCII only, because a driver manager may convert the string for the driver, and some
+conversions turn a non-ASCII character into a delimiter.
 
 To have a keyword added, open an issue that names the driver and what the keyword does.
 
