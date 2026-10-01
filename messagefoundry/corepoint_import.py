@@ -843,20 +843,23 @@ def _input_handle(action_list: Element) -> tuple[str, bool]:
     # it was passed, so with no input of the caller's own, a scratch handle that shares the called
     # list's input name would otherwise be read as msg. Both ways fail closed.
     called_inputs: set[str] = set()
-    called = {
-        id(inner)
-        for elem in _live_elements(action_list)
-        if _local(elem.tag).lower() == "call"
-        for inner in elem.iter()
-        if inner is not elem
-    }
+    # Everything beneath a call, whether a ``<Call>`` tag or any element whose verb the parse reads
+    # as a call (see :func:`_statement_kind`). Document order puts each call before its body.
+    called: set[int] = set()
+    # Role markup anywhere, a called list included, counts: it only ever makes a markup-free write
+    # decline rather than land on msg.
     marked = False
     for elem in _live_elements(action_list):
         data = _attr(elem, "Data")
         tokens = parse_roles(data) if data else ()
         marked = marked or bool(tokens)
         names = {t.text for t in tokens if t.source_class == "input-handle"}
-        (called_inputs if id(elem) in called else inputs).update(names)
+        inside = id(elem) in called
+        (called_inputs if inside else inputs).update(names)
+        tag = _local(elem.tag)
+        verb = _statement_verb(tokens, _split_verb(strip_markup(data))[0])
+        if not inside and (tag.lower() == "call" or _statement_kind(tag, verb) == "call"):
+            called.update(id(inner) for inner in elem.iter() if inner is not elem)
     one = next(iter(inputs)) if len(inputs) == 1 and called_inputs <= inputs else ""
     return one, marked
 
@@ -1890,6 +1893,33 @@ def _forget(env: _Env, deferred: _Deferred) -> None:
         env.unbind(handle)
 
 
+#: The only call line that may spare the input: the list name, then at most ``pass <one word>``.
+#: Any other word may be a result clause that writes the input (``returning %ADT``).
+_PLAIN_CALL = re.compile(r'ActionListCall\s+"[^"]*"(?:\s+pass\s+\S+)?', re.IGNORECASE)
+
+
+def _drops_statements(step: Control) -> bool:
+    """Whether a branch of ``step`` carries branches of its own. The walk and the render read only
+    each branch's body, so whatever those hold, a call or an overwrite included, is never seen:
+    nothing is vouched for after it (see :meth:`_Flow._step`)."""
+    return any(branch.branches for branch in step.branches)
+
+
+def _is_plain_log(step: Control) -> bool:
+    """Whether a statement is ``MsgLog <handle>`` and nothing more: the verb is its first word,
+    the one other word names a whole message tree, and it carries no qualifier or connective. Any
+    other shape might write what it names, or be a different verb misread as ``MsgLog``."""
+    deferred = step.deferred
+    if deferred is None or deferred.verb.lower() != "msglog":
+        return False
+    if deferred.qualified or deferred.words or len(deferred.operands) != 1:
+        return False
+    words = step.detail.split()
+    return (
+        len(words) == 2 and words[0].lower() == "msglog" and bool(_whole_tree(deferred.operands[0]))
+    )
+
+
 class _Flow:
     """Settle one handler's step tree in statement order, binding each message handle to a local.
 
@@ -1957,6 +1987,8 @@ class _Flow:
                 found.update(_handle_key(h) for h in _whole_written(step.deferred))
             if step.kind == "call":
                 found |= self._call_keys(step)  # what a call leaves unknown (see _call)
+            if _drops_statements(step):
+                found.add(_EVERY_HANDLE)
             found |= self._written(step.body)
             for branch in step.branches:
                 found |= self._written(branch.body)
@@ -2005,7 +2037,8 @@ class _Flow:
         elif kind in _LOOP_KINDS:
             # A later pass may start from what an earlier one overwrote, so a handle the body may
             # overwrite is unknown throughout it, and after it (the body may run no times at all).
-            written = self._written(step.body)
+            # A stray branch renders after the loop but was written inside it, so it counts too.
+            written = self._written((step,))
             for handle in list(env):
                 if _hit(written, handle, env[handle]):
                     env.unbind(handle)
@@ -2036,7 +2069,11 @@ class _Flow:
             body, changes = self._arm(step.body, env)
             env.narrow([changes])
             settled = replace(step, body=tuple(body))
-        return self._strays(settled, env)
+        settled = self._strays(settled, env)
+        if _drops_statements(step):
+            for handle in list(env):
+                env.unbind(handle)
+        return settled
 
     def _try(self, step: Control, env: _Env) -> Control:
         """Settle a ``Try``: its body, then each ``Catch`` from what the body cannot have changed."""
@@ -2091,18 +2128,18 @@ class _Flow:
         spelling, so no reading of its operands can rule that out. And an edit it makes in place
         is a TODO in the inlined body, so ``msg`` would go out without it. So the input survives
         only a call whose inlined list does nothing but read (see :meth:`_reads_only`), judged by
-        verb and never by a handle's name. A call whose list is not inlined may do anything."""
-        if self._reads_only(step.body) > 0:
+        verb and never by a handle's name, and whose line is plain (see :data:`_PLAIN_CALL`): a
+        result clause may write the input. A call whose list is not inlined may do anything."""
+        if _PLAIN_CALL.fullmatch(step.detail.strip()) and self._reads_only(step.body) > 0:
             return frozenset({_EVERY_LOCAL})
         return frozenset({_EVERY_HANDLE})
 
     def _reads_only(self, steps: tuple[Step, ...]) -> int:
-        """How many live statements ``steps`` holds when every one is a read-only verb (see
-        :data:`_READ_ONLY_VERBS`), nested constructs included; ``-1`` when any one may be more.
+        """How many statements ``steps`` holds when every one is a plain log (see
+        :func:`_is_plain_log`), nested constructs included; ``-1`` when any one may be more.
 
-        Deliberately narrow, as that set is: a field write, a clone, a ``MsgCreate``, an unread
-        verb, an element this module does not model, an exit and a nested call all count as more,
-        and so does a step with no statement at all. Memoized like :meth:`_written`."""
+        Deliberately narrow: anything else counts as more, a step with no statement at all and a
+        disabled one included. Memoized like :meth:`_written`."""
         cached = self._reads_memo.get(id(steps))
         if cached is not None:
             return cached[1]
@@ -2110,20 +2147,18 @@ class _Flow:
         for step in steps:
             if not isinstance(step, Control):
                 count = -1
-            elif step.kind == "disabled":
-                continue
-            elif step.kind in ("pending", "send"):
-                read_only = step.deferred is not None and step.deferred.verb.lower() in (
-                    _READ_ONLY_VERBS
-                )
-                count = count + 1 if read_only else -1
-            elif step.kind in ("block", "break", *_NESTING_KINDS):
+            elif step.kind == "pending":
+                count = count + 1 if _is_plain_log(step) else -1
+            elif step.kind in ("block", *_NESTING_KINDS) and not _drops_statements(step):
                 for nested in (step.body, *(branch.body for branch in step.branches)):
                     inner = self._reads_only(nested)
                     count = -1 if inner < 0 else count + inner
                     if count < 0:
                         break
             else:
+                # A send, an exit, a LoopExit (it would leave the CALLER's loop), a nested call, an
+                # unmodelled element, a step whose @Disabled spelling may not mean disabled, and a
+                # branch carrying branches of its own, whose statements the walk never reaches.
                 count = -1
             if count < 0:
                 break

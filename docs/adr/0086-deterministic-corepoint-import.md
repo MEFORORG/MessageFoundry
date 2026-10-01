@@ -255,19 +255,26 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   can make the caller's input ambiguous, because nothing establishes that a call passing nothing
   does not hand the caller's input over. A second name there leaves the caller with no input. Such a
   span never supplies the caller's input, though: with no `input-handle` of the caller's own, the
-  caller has none.
-- After an inlined call, every handle the caller has bound is unknown, whatever its name. No handle
-  name is matched. Every rule that matched names missed some spelling the export may carry,
-  including at least a `-`, a `.`, a non-ASCII letter, and a handle with no `%`.
-- The input, while it is still `msg`, survives a call only when the called list does nothing but
-  read: every live statement in it is `MsgSend` or `MsgLog`, and it holds at least one. That is
-  judged by verb alone. The called list names what it was passed by its own handle, so a write under
-  any spelling may replace the input, and no reading of operands can rule that out. An edit it makes
-  in place is a TODO in the inlined body, so sending `msg` would drop it. So a field write, a clone,
-  a `MsgCreate`, an unread verb, an unmodelled element, an exit, a nested call, or a step with no
-  statement all make the input unknown. A call whose list is not inlined renders a TODO marker,
-  counts unmapped, and leaves every handle unknown, the input included. A `<Call>` with no `@Data`
-  is never dissolved as a branch-group wrapper, so its list keeps its own scope.
+  caller has none. A call spelled on a `<Line>` or `<Block>` counts here as a `<Call>` does. Role
+  markup inside a called list does count toward whether the caller's list carries markup, which
+  only ever makes a markup-free write decline.
+- After an inlined call, every handle the caller has bound is unknown, whatever its name, except
+  the input in the one case below. No handle name is matched. Every rule that matched names missed
+  some spelling the export may carry, including at least a `-`, a `.`, a non-ASCII letter, and a
+  handle with no `%`.
+- The input, while it is still `msg`, survives a call only when the call line is plain (the list
+  name, then at most `pass <one word>`) and every statement in the called list is a plain
+  `MsgLog <handle>`, with at least one. That is judged by shape and verb, never by a handle's name.
+  The called list names what it was passed by its own handle, so a write under any spelling may
+  replace the input, and no reading of operands can rule that out. An edit it makes in place is a
+  TODO in the inlined body, so sending `msg` would drop it. A result clause on the call line may
+  write the input too. So anything else in the list makes the input unknown, a send, a `LoopExit`
+  and a disabled step included. A call whose list is not inlined renders a TODO marker, counts
+  unmapped, and leaves every handle unknown, the input included. A `<Call>` with no `@Data` is never
+  dissolved as a branch-group wrapper, so its list keeps its own scope.
+- A branch that carries branches of its own (a bodyless marker inside a branch's list) is never
+  walked or rendered past its body, so nothing is vouched for after its construct. A loop counts
+  what its stray branches may overwrite, because they render after the loop but ran inside it.
 - **The cost of that rule (Manager decision, #313 step 2 re-cut).** Any send of a clone or a
   `MsgCreate` message made before a call raises at that send, even when the called list never
   touches it. So does a send of the input after almost any call. A human finishes each one. That
@@ -275,7 +282,9 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   deliver the wrong message.
 - **Known gap, outside the call rule.** The whole-tree write rule above reads the handles a
   statement names. It cannot see at least a handle spelled with no `%` in a markup-free statement,
-  so a `MsgCreate ADT ...` there leaves a bound `ADT` bound. Closing that is open work.
+  so a `MsgCreate ADT ...` there leaves a bound `ADT` bound. An `ActionListCall` under another verb
+  spelling, and a `<Call>` whose `@Data` verb maps to another kind, are not read as calls either.
+  Closing those is open work.
 - A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
   its whole-tree writes. Nothing it binds is trusted after it.
 

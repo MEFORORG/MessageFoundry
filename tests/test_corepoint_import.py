@@ -2273,6 +2273,9 @@ def _call_shapes(handle: str) -> list[str]:
         _call_of("", _create(handle, _ADT_A04)),
         _call_of(f" pass {handle}", log),
         _call_of("", log),
+        # The only shape that spares the input: the clone must still be unknown after it.
+        _call_of(f" pass {handle}", _MSGLOG_P),
+        _call_of("", _MSGLOG_P),
         _call_of(f" ({handle})", _write("other-handle", handle, "SUB")),
         '<Line Data="ActionListCall &quot;Sub&quot;"/>',
     ]
@@ -2362,6 +2365,110 @@ def test_a_call_that_may_do_more_than_read_unbinds_the_input(call: str) -> None:
     body = _handler_body(_handler_source(write + call + send))
     assert 'Send("OB_IN"' not in body
     assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
+
+
+_ELSE = '<Line Data="Else"/>'
+
+
+def _else_hiding(*statements: str) -> str:
+    """An If whose Else list holds a second bodyless Else marker, so what follows it becomes a
+    branch of the Else branch: a shape the walk and the render never reach."""
+    return (
+        f'<Line Data="If (x)"><List>{_MSGLOG_P}</List></Line>'
+        f'<Line Data="Else"><List>{_MSGLOG_P}{_ELSE}' + "".join(statements) + "</List></Line>"
+    )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(_call_of(" returning %ADT", _MSGLOG_P), id="result-clause"),
+        pytest.param(_call_of(" pass %ADT", _else_hiding(_create("%Q", _ADT_A04))), id="hidden"),
+        pytest.param(
+            _call_of(
+                " pass %ADT",
+                _role_line(
+                    _span("keyword", "MsgLog")
+                    + " "
+                    + _span("other-handle", "%P")
+                    + " into "
+                    + _span("other-handle", "%ADT")
+                    + _span("path", "/")
+                ),
+            ),
+            id="log-with-a-second-handle",
+        ),
+        pytest.param(
+            _call_of(
+                " pass %ADT",
+                _role_line(
+                    "MsgCreate " + _span("keyword", "MsgLog") + " " + _span("other-handle", "%P")
+                ),
+            ),
+            id="verb-misread-as-msglog",
+        ),
+        pytest.param(
+            _call_of(
+                " pass %ADT",
+                _MSGLOG_P,
+                _create("%ADT", _ADT_A04).replace("<Line ", '<Line Disabled="off" ', 1),
+            ),
+            id="unrecognised-disabled-spelling",
+        ),
+        pytest.param(_call_of(" pass %ADT", _MSGLOG_P, '<Line Data="LoopExit"/>'), id="loop-exit"),
+        pytest.param(
+            _call_of(" pass %ADT", _role_send("other-handle", "%P", "OB_P")), id="send-in-the-list"
+        ),
+    ],
+)
+def test_round_two_call_shapes_unbind_the_input(call: str) -> None:
+    """Code review round 2 of the re-cut: each of these sent msg after a call that could replace or
+    edit it. The input now survives only a plain call line over a list of plain ``MsgLog`` lines."""
+    body = _handler_body(
+        _handler_source(_WRITE_INPUT + call + _role_send("input-handle", "%ADT", "OB_IN"))
+    )
+    assert 'Send("OB_IN"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_IN:' in body
+
+
+def test_a_call_hidden_in_a_branch_of_a_branch_unbinds_every_handle() -> None:
+    """The walk never reaches a branch's own branches, so a construct carrying one leaves nothing
+    vouched for after it: a call hidden there cannot leave a stale clone bound."""
+    call = _call_of(" pass %OUT", _create("%OUT", _ADT_A04))
+    body = _handler_body(_handler_source(_CLONE_OUT + _else_hiding(call) + _SEND_OUT))
+    assert 'Send("OB_OUT"' not in body
+    assert 'raise NotImplementedError("Corepoint import: MsgSend to OB_OUT:' in body
+
+
+def test_a_call_in_a_loops_stray_branch_unbinds_the_clone_inside_the_loop() -> None:
+    """A misplaced Catch moves the rest of a loop's list into a stray branch that renders after the
+    loop. In the source the call is still inside the loop, so a send early in the loop raises."""
+    loop = (
+        "<Foreach><List>"
+        + _SEND_OUT
+        + '<Line Data="Catch"/>'
+        + _call_of(" pass %OUT", _create("%P", _ADT_A04))
+        + "</List></Foreach>"
+    )
+    body = _handler_body(_handler_source(_CLONE_OUT + loop))
+    assert 'Send("OB_OUT"' not in body
+
+
+@pytest.mark.parametrize("tag", ["Line", "Block"])
+def test_a_call_on_a_line_or_block_never_supplies_the_callers_input(tag: str) -> None:
+    """A call spelled on a ``<Line>`` or ``<Block>`` is a call too: its list's input name never
+    becomes the caller's input, so a caller scratch handle with that name is not read as msg."""
+    log_input = _role_line(_span("keyword", "MsgLog") + " " + _span("input-handle", "%P"))
+    call = f'<{tag} Data="ActionListCall &quot;Sub&quot;"><Actions>{log_input}</Actions></{tag}>'
+    body = _handler_body(
+        _handler_source(
+            _write("other-handle", "%P", "BUILT")
+            + call
+            + _role_send("other-handle", "%P", "OB_OUT")
+        )
+    )
+    assert "set_field(msg" not in body
+    assert 'Send("OB_OUT"' not in body
 
 
 def test_a_called_lists_input_name_never_becomes_the_callers_input() -> None:
