@@ -360,7 +360,7 @@ def test_the_sizing_rule_is_ceil_minute_one_point_three_five_floored_at_five() -
     assert sized_cap_minutes(60) == 5  # the floor binds
     assert sized_cap_minutes(222) == 5  # 1.35 x 3:42 = 4:59.7
     assert sized_cap_minutes(223) == 6  # 1.35 x 3:43 = 5:01.05
-    assert sized_cap_minutes(305) == 7  # a 5:05 row sizes to 7 (6:52 rounded up)
+    assert sized_cap_minutes(305) == 7  # a 5:05 row sizes to 7 (6:51.75 rounded up)
     assert sized_cap_minutes(2800) == 63  # exactly 63:00; the raw float product ceils to 64
 
 
@@ -1121,10 +1121,10 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
     The cap and the row live in different files (BACKLOG #1842). A row raised without its cap, or a
     cap lowered past its row, leaves a leg whose worst KNOWN green run would red the gate -- the
     state #1842 was filed against, with 5 of 30 merge groups ejected. A cap raised by hand with no
-    new row is the other drift: a bound derived from another bound. So two assertions: the row is
-    not LOW at its cap, against the gate's own floor; and the cap is exactly the sizing rule that
-    `step_margin.sized_cap_minutes` holds, ceil_minute(1.35x the row), floored at 5:00. ci.yml's
-    "THE SECOND RE-DERIVATION" note states it and "THE THIRD RE-DERIVATION" applies it.
+    new row is the other drift: a bound derived from another bound. So the row must not be LOW at
+    its cap, against the gate's own floor; and the cap must be exactly the sizing rule,
+    ceil_minute(1.35x the row) floored at 5:00, as `step_margin.sized_cap_minutes` computes it. An
+    integer restatement of the rule beside it fails if that function's arithmetic moves.
 
     Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:43 row (7:00 /
     5:43 = 1.224x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
@@ -1311,8 +1311,8 @@ def test_the_web_console_suite_runs_under_xdist_fed_from_the_matrix() -> None:
         # step, whose own note in ci.yml offers 2 as "the conservative rung" when engine timing tests
         # flake. Taking that rung halves THIS step's workers, and every margin figure #1879 recorded
         # was measured at 4 -- 1.058x and 1.103x were what the two breaching legs needed at the caps
-        # then in force (every cap has moved since; see ci.yml's "THE THIRD RE-DERIVATION"), with no
-        # measurement at all at 2. A `> 1` bound stays green through exactly that change, so it would
+        # then in force (every cap has been re-derived since; see ci.yml's second and third
+        # re-derivation notes), with no measurement at all at 2. A `> 1` bound stays green through exactly that change, so it would
         # let the merge-group ejections come back while still reading as a parallelism guard.
         assert isinstance(count, int) and count >= 4, (
             f"{name} sets {knob.group(1)}={count!r}. The web console step's margin arithmetic was "

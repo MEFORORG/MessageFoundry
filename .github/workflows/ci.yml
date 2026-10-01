@@ -1613,17 +1613,16 @@ jobs:
       # 6:00 cap, above its 4:11 row, with every test passing, and the queue ejected engine PR 1778.
       # `step_margin.py` used to print RE-DERIVE as a note and exit 0. It now raises a `::warning`
       # annotation, on the run page and the checks tab, for any success run over its row, graded
-      # RE-DERIVE or RE-SIZE. The grades are defined once, in that
-      # script's `record_escalation`. It never changes the exit code; a red for a stale table would
-      # eject pull requests, which is the defect this item was filed for.
+      # RE-DERIVE or RE-SIZE, by that script's `record_escalation`. It never changes the exit code; a
+      # red for a stale table would eject pull requests, which is the defect this item was filed for.
       #
       # WHAT IT DOES NOT BUY, SO NOBODY RELIES ON IT FOR MORE. The lead time is set by the sizing rule,
-      # not the annotation: ceil_minute(1.35x) against a 1.30x floor puts the red line a few percent
-      # over the row. At the third re-derivation's rows that is about 22s on ubuntu, 29s on
-      # windows-2022 and 26s on windows-2025. A pull_request run shows the annotation first only when
-      # one pull request's growth crosses the row. Growth that crosses it only when several queued pull
-      # requests combine is first annotated on the merge-group run that ejects them. Widening that band
-      # means changing the sizing rule, which is a separate decision.
+      # not the annotation: ceil_minute(1.35x) against a 1.30x floor puts the red line under a tenth
+      # over the row; "THE THIRD RE-DERIVATION" note above gives each leg's. A pull_request run shows
+      # the annotation first only when one pull request's growth crosses the row. Growth that crosses
+      # it only when several queued pull requests combine is first annotated on a merge-group run,
+      # which may land or, past the red line, eject them. Widening that band means changing the
+      # sizing rule, which is a separate decision.
       - name: Web console tests (pytest)
         id: webconsole
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
