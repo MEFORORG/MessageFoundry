@@ -218,7 +218,8 @@ def test_check_expiry_line_stops_claiming_the_hostname_where_it_is_off(tmp_path:
     report = run_checks(_write_config(tmp_path, module=_HOSTNAME_MODULE), run_lint=False)
     detail = _result(report, "tls-allow-expired").detail
     assert "chain, hostname and key usage are still verified" not in detail
-    assert "the hostname is NOT on OB_BOTH" in detail
+    assert "the hostname may NOT be on OB_BOTH" in detail
+    assert "and is on the others" in detail  # OB_EXPIRED is the other, and it checks the name
 
 
 def test_check_surfaces_the_generic_db_hops_in_both_directions(tmp_path: Path) -> None:
@@ -267,7 +268,7 @@ def test_check_says_none_explicitly_when_there_is_nothing_to_report(tmp_path: Pa
         in _result(report, "tls-check-hostname").detail
     )
     assert (
-        "no outbound url carries a credential-like query parameter"
+        "no outbound or FhirLookup url carries a credential-like query parameter"
         in _result(report, "url-query-credential").detail
     )
 

@@ -91,7 +91,7 @@ section reference.
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening) |
-| | `url_query_credential` | no credential-like parameter in an outbound `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
+| | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
@@ -878,9 +878,11 @@ This section is kept rather than deleted, because the claim it used to make is t
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
 
 ### `tls_check_hostname = false` on a connection — any certificate from the trust anchor is accepted
-> **Connection-scoped**: a parameter on the `MLLP`, `Email` and `Direct` outbound factories, and a
-> `connections.toml` `[settings]` key. `Ftp()` does not take it, but the FTPS context honours it from a
-> hand-built spec or a `[settings]` table, so it is a loosening there too. ASVS 12.3.2.
+> **Connection-scoped**: a parameter on the `MLLP`, `Email` and `Direct` outbound factories. Only the
+> `MLLP` one is also a `connections.toml` `[settings]` key, because `Email` and `Direct` are not
+> `connections.toml` transports. `Ftp()` does not take it, so a `[settings]` table cannot set it on FTPS
+> either, but the FTPS context honours it from a hand-built `ConnectionSpec`, so it is a loosening
+> there too. ASVS 12.3.2.
 - **What you lose:** the check that the server certificate names the host the engine dialled. The
   chain is still verified, so the certificate must come from the hop's trust anchor. But any
   certificate from that anchor is accepted, whatever host it was issued to. On the public trust store
@@ -897,7 +899,8 @@ This section is kept rather than deleted, because the claim it used to make is t
   `tls-check-hostname` line in `messagefoundry check` naming every declaring connection and its peer;
   and a `tls_check_hostname` entry in `security_loosenings()`, and so in `GET /security/posture` on a
   running engine. The readers walk inbound and outbound, and inbound names are prefixed `inbound:`. An
-  `env()` value counts as declared, because it cannot be read before it resolves. CORRECTED (ASVS
+  `env()` value counts as declared, because it cannot be read before it resolves. They list what is
+  declared, so a key on a connection that dials nothing, such as an MLLP listener, is listed too. CORRECTED (ASVS
   12.3.2 re-read, 2026-10-01): before this, it was accepted with no line at all on MLLP, on Email and
   Direct without credentials, and on a hand-built FTPS spec, and the posture floor test exempted it as
   "gated by the ADR 0092 hop cell", which was false. **Not** the serve-time loosening warning, which
@@ -966,13 +969,15 @@ This section is kept rather than deleted, because the claim it used to make is t
   it. The construction WARNING and the `check` line are its only records today; adding it to the
   registry is owed work.
 
-### `url_query_credential` — a credential in an outbound `url`'s query string
+### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
-> outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) whose query string has a parameter named like a
-> credential: `key`, `sig`, `signature`, a name ending in `token`, `secret`, `password` or
-> `credential`, and the rest of the engine's credential vocabulary. ASVS 14.2.1.
+> outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) or a `FhirLookup` `url` whose query string has a
+> parameter named like a credential: `key`, `sig`, `signature`, a name ending in `token`, `secret`,
+> `password` or `credential` (as `access_token` or `accessToken`), and the rest of the engine's
+> credential vocabulary. ASVS 14.2.1.
 - **What you lose:** the credential rides the request line. The partner's access log holds it, and so
-  does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire.
+  does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire. The
+  engine's own log lines drop the query, and `GET /metadata` and `graph --json` mask the value.
 - **Why it is reported and not refused:** a credential in the URL's user part, `user:password@`, is
   refused at construction, because that shape never authenticated anything and its error text carried
   the password. A query credential does authenticate, and some partner APIs take it nowhere else, such
@@ -985,7 +990,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **It is never silent:** a WARNING at each construction naming the connection and the parameter
   names, never a value; a `url-query-credential` line in `messagefoundry check`; and a
   `url_query_credential` entry in `security_loosenings()`, and so in `GET /security/posture` on a
-  running engine. The construction WARNING reads the resolved URL. The `check` line and the registry
+  running engine. All three walk outbound connections and `FhirLookup` connections, whose names are
+  prefixed `fhir_lookup:`. The construction WARNING reads the resolved URL. The `check` line and the registry
   read a literal `url` only, so a URL supplied by `env()` is in the WARNING alone.
 - **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
   know, and it will name a parameter that only looks like one, such as `page_token`. OIDC's

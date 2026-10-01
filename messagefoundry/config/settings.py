@@ -7109,7 +7109,7 @@ def security_loosenings(
         out.append(
             (
                 "tls_allow_expired",
-                f"{len(expiry_relaxed_hops)} outbound connection(s) accept an EXPIRED server "
+                f"{len(expiry_relaxed_hops)} connection(s) accept an EXPIRED server "
                 f"certificate ({named}) — indefinitely, with nothing that expires the relaxation or "
                 "re-checks it; the chain signature and key usage are still fully verified, and so is "
                 "the hostname match unless the same connection also sets tls_check_hostname=false "
@@ -7124,10 +7124,11 @@ def security_loosenings(
         out.append(
             (
                 "tls_check_hostname",
-                f"{len(hostname_unchecked_hops)} connection(s) do NOT match the server certificate "
-                f"to the host they dial ({named}) — the chain is still verified, but any "
-                "certificate that chains to the trust anchor is accepted whatever host it names, "
-                "so anyone holding one could impersonate the peer and read the payload",
+                f"{len(hostname_unchecked_hops)} connection(s) declare tls_check_hostname=false "
+                f"({named}) — on a verifying hop that dials out, the chain is still verified, but "
+                "any certificate that chains to the trust anchor is accepted whatever host it "
+                "names, so anyone holding one could impersonate the peer and read the payload. An "
+                "env() value is listed because it cannot be read before it resolves",
             )
         )
     if query_credential_hops:
@@ -7135,10 +7136,11 @@ def security_loosenings(
         out.append(
             (
                 "url_query_credential",
-                f"{len(query_credential_hops)} outbound connection(s) carry a credential in the "
+                f"{len(query_credential_hops)} connection(s) carry a credential in the "
                 f"endpoint url's query string ({named}) — it rides the request line, so the "
                 "partner's and any proxy's access log holds it; the engine's own log lines drop the "
-                "query, and on an https hop TLS still encrypts it on the wire",
+                "query, its settings views mask the value, and on an https hop TLS still encrypts "
+                "it on the wire",
             )
         )
     if unverified_db_hops:

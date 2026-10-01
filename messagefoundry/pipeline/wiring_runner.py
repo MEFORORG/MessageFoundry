@@ -9245,6 +9245,7 @@ def check_fhir_lookup_allowed(
     ``[egress].allowed_proxy`` here too — outside the ``allowed_http`` guard below, because that list
     being empty says nothing about whether the proxy is permitted (BACKLOG #1659, DELTA-04 lockstep)."""
     _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
+    warn_url_query_credentials(f"FhirLookup {name!r}", settings)  # ASVS 14.2.1
     if egress.deny_by_default and not egress.allowed_http:
         raise WiringError(
             f"FhirLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
@@ -9821,9 +9822,10 @@ def warn_unbudgeted_streaming_inbound(ic: InboundConnection, *, budget: int) -> 
     return True
 
 
-def warn_url_query_credentials(dest: Destination) -> None:
-    """Log a WARNING when an outbound's resolved ``url`` carries a credential-like query parameter
-    (ASVS 14.2.1). Names the connection and the parameter NAMES, never a value or the URL.
+def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
+    """Log a WARNING when a connection's resolved ``url`` carries a credential-like query parameter
+    (ASVS 14.2.1). ``label`` names the connection (``"outbound 'OB_X'"``); the line carries it and
+    the parameter NAMES, never a value or the URL.
 
     WARN, not refuse, and the reason is the difference from the userinfo precedent.
     ``transports.rest.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
@@ -9835,21 +9837,22 @@ def warn_url_query_credentials(dest: Destination) -> None:
     lands in the partner's and every proxy's access log. The engine's own log lines already drop the
     query (``_peer_label``, ``rest._redact_url``).
 
-    Called from :func:`check_egress_allowed` because that is the one function every outbound build
-    path runs (check, start, operator start, test), and it runs on the env-resolved destination, so
-    it sees a URL that ``env()`` supplied. ``config.wiring.query_credential_hops`` is the graph-side
-    reader for ``check`` and the posture registry."""
-    url = dest.settings.get("url")
+    Called from :func:`check_egress_allowed`, the one function every outbound build path runs
+    (check, start, operator start, test), and from :func:`check_fhir_lookup_allowed`, its FhirLookup
+    twin. Both run on env-resolved settings, so this sees a URL that ``env()`` supplied.
+    ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
+    registry, and walks the same two tables."""
+    url = settings.get("url")
     if not isinstance(url, str):
         return
     names = credential_query_params(url)
     if names:
         log.warning(
-            "outbound %r: the endpoint url carries a credential in its query string (parameter(s) "
+            "%s: the endpoint url carries a credential in its query string (parameter(s) "
             "%s). It rides the request line, so the partner's and any proxy's access log will hold "
             "it. Move it to a header if the partner accepts one (bearer_token, basic auth, or a "
             "headers table supplied whole by env()); see docs/SECURITY-LOOSENING.md (ASVS 14.2.1).",
-            dest.name,
+            label,
             ", ".join(names),
         )
 
@@ -9869,7 +9872,8 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     # nothing about whether the proxy is permitted (BACKLOG #1659).
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
-    warn_url_query_credentials(dest)  # ASVS 14.2.1: a recorded loosening, never a silent one
+    # ASVS 14.2.1: a recorded loosening, never a silent one
+    warn_url_query_credentials(f"outbound {dest.name!r}", dest.settings)
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
         # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
         # to files, so this log line is a forensic surface an operator reads -- and "under

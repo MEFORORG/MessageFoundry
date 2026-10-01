@@ -296,6 +296,51 @@ def test_reader_lists_declarations_in_both_directions_and_an_env_reference() -> 
     assert names == ["OB_ENV", "OB_OFF", "inbound:IB_FTPS"]
 
 
+def test_expiry_reader_lists_an_inbound_ftps_poller() -> None:
+    """CORRECTED by the review: ``Ftp()`` is a source factory and the poller honours
+    ``tls_allow_expired``, yet the reader was outbound-only, so the poller was listed nowhere."""
+    from messagefoundry.config.wiring import expiry_relaxed_hops
+
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection(
+            "IB_FTPS",
+            ConnectionSpec(
+                type=ConnectorType.REMOTEFILE,
+                settings={
+                    "protocol": "ftps",
+                    "host": "e.example.invalid",
+                    "tls_allow_expired": True,
+                },
+            ),
+            router="r",
+        )
+    )
+    reg.add_inbound(  # control: the same poller without the flag
+        build_inbound_connection(
+            "IB_STRICT",
+            ConnectionSpec(
+                type=ConnectorType.REMOTEFILE,
+                settings={"protocol": "ftps", "host": "f.example.invalid"},
+            ),
+            router="r",
+        )
+    )
+    assert [name for name, _ in expiry_relaxed_hops(reg)] == ["inbound:IB_FTPS"]
+
+
+def test_ftps_relax_runs_after_the_hostname_is_set(caplog: pytest.LogCaptureFixture) -> None:
+    """The FTPS twin of the MLLP ordering test: the expiry line reads ``ctx.check_hostname``."""
+    from messagefoundry.transports.remotefile import _ftps_ssl_context
+
+    with caplog.at_level(logging.WARNING):
+        _ftps_ssl_context(
+            {"host": "h.example.invalid", "tls_allow_expired": True, "tls_check_hostname": False}
+        )
+    [line] = [r.getMessage() for r in caplog.records if "RELAXED" in r.getMessage()]
+    assert "the hostname is NOT" in line
+
+
 def test_reader_labels_the_peer_by_host_and_port() -> None:
     reg = Registry()
     reg.add_outbound(

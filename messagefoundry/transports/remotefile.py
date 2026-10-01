@@ -501,8 +501,8 @@ def _ftps_ssl_context(
     the internal CA never bypasses the ``tls_verify=false`` refusal above.
 
     ``name`` is the connection's, for the ``tls_check_hostname=false`` warning (ASVS 12.3.2). ``Ftp()``
-    does not take that key, but a hand-built spec or a ``connections.toml`` ``[settings]`` table can
-    carry it, and this context honours it, so the warning lives here rather than in the factory."""
+    does not take that key, so ``connections.toml`` cannot set it either, but a hand-built
+    ``ConnectionSpec`` can, and this context honours it, so the warning lives here."""
     # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
     # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
     # arm). Off the construction gate (posture unstamped) the escape is refused since vault BACKLOG
@@ -559,7 +559,8 @@ def _ftps_ssl_context(
     if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
         harden_verify_flags(ctx)
         # #129 (ADR 0094): opt-in granular expiry-only relaxation — accept an expired server cert while
-        # STILL validating chain + hostname (verify path only; default off = byte-identical).
+        # STILL validating the chain, and the hostname unless tls_check_hostname=false (verify path
+        # only; default off = byte-identical).
         if settings.get("tls_allow_expired"):
             relax_verify_expiry(ctx, host=str(settings.get("host", "")))
     return ctx

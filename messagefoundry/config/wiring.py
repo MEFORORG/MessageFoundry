@@ -87,7 +87,11 @@ from messagefoundry.connection_names import (
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.secretscrub import credential_query_params, scrub_credentials
+from messagefoundry.secretscrub import (
+    credential_query_params,
+    mask_credential_query,
+    scrub_credentials,
+)
 
 __all__ = [
     "ConnectionSpec",
@@ -1484,8 +1488,10 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         elif is_secret:
             out[name] = "***"
         elif isinstance(value, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
-            # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view.
-            out[name] = _mask_url_userinfo(value)
+            # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view. ASVS
+            # 14.2.1 -- and the value of a credential-like QUERY parameter, by the same name test
+            # the construction warning uses, or /metadata would serve the key it warns about.
+            out[name] = _mask_url_userinfo(mask_credential_query(value))
         elif name == "headers" and isinstance(value, dict):
             # Both axes: a header NAME is rendered through _redact_header_name before it is used as
             # the output key AND before it is handed to the value rule, so a reference in the name
@@ -1592,7 +1598,9 @@ def MLLP(
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
-    tls_allow_expired: bool = False,  # OUTBOUND: honour an EXPIRED server cert (chain+hostname still verified; #129)
+    # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
+    # too unless tls_check_hostname=False.
+    tls_allow_expired: bool = False,
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
@@ -3613,7 +3621,9 @@ def Ftp(
     host: str | EnvRef,  # the FTP server (may be env())
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
-    tls_allow_expired: bool = False,  # FTPS: honour an EXPIRED server cert (chain+hostname still verified; #129)
+    # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
+    # unless a hand-built spec sets tls_check_hostname=False.
+    tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
@@ -5057,18 +5067,25 @@ def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
     — ``MLLP``/``Rest``/``FHIR``/``DICOM``/``Soap``/``Ftp``) rather than in a typed
     ``OutboundConnection`` field like ``cleartext_accepted``, so this reads the dict.
 
-    **Outbound only, and that is a fact about the graph rather than a scoping choice.** ``FhirLookup``
-    exposes ``verify_tls`` but no ``tls_allow_expired``, and no inbound factory takes it (an inbound
-    verifies a CLIENT cert, which is a different question). Said here explicitly so that ADDING the
-    parameter to a lookup or an inbound later cannot silently escape this reader: whoever adds it must
-    extend this function, exactly as ``accepted_cleartext_hops`` had to grow its ``fhir_lookups`` arm.
+    **Inbound too.** ``Ftp()`` is a source factory as well, and a REMOTEFILE poller dials out over
+    FTPS through the same context, which honours the flag. Inbound names are prefixed ``inbound:``.
+    CORRECTED (ASVS 12.3.2 re-read review, 2026-10-01): this read *"Outbound only, and that is a fact
+    about the graph ... no inbound factory takes it"*, which was false for that poller, so an expired
+    certificate it accepted was logged at construction and listed nowhere. ``FhirLookup`` exposes
+    ``verify_tls`` but no ``tls_allow_expired``; whoever adds it there must extend this function.
 
     Pure — it reads the loaded graph and touches nothing else."""
-    return sorted(
+    out = [
         (oc.name, _peer_label(oc.spec.settings))
         for oc in registry.outbound.values()
         if oc.spec.settings.get("tls_allow_expired")
+    ]
+    out.extend(
+        (inbound_record_name(ic.name), _peer_label(ic.spec.settings))
+        for ic in registry.inbound.values()
+        if ic.spec.settings.get("tls_allow_expired")
     )
+    return sorted(out)
 
 
 def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
@@ -5090,9 +5107,9 @@ def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
 
     The flag keeps the chain check and drops the name check, so any certificate that chains to the
     hop's trust anchor is accepted whatever host it names. The ``MLLP``, ``Email`` and ``Direct``
-    factories take it; ``Ftp()`` does not, but the FTPS context honours it from a hand-built spec or
-    a ``connections.toml`` ``[settings]`` table, and that is why this reads the settings dict of
-    EVERY connection rather than a list of factories. Inbound is walked too, because a REMOTEFILE
+    factories take it, and the ``MLLP`` one is also a ``connections.toml`` ``[settings]`` key.
+    ``Ftp()`` does not take it, but the FTPS context honours it from a hand-built ``ConnectionSpec``,
+    and that is why this reads the settings dict of EVERY connection rather than a factory list. Inbound is walked too, because a REMOTEFILE
     poller dials out over FTPS; inbound names are prefixed ``inbound:``, as
     :func:`revocation_attested_hops` prefixes them.
 
@@ -5113,8 +5130,8 @@ def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
 
 
 def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every OUTBOUND whose endpoint ``url`` carries a credential-like query parameter, as
-    ``(name, parameter names)`` (ASVS 14.2.1).
+    """Every outbound and ``FhirLookup`` whose ``url`` carries a credential-like query parameter, as
+    ``(name, parameter names)`` (ASVS 14.2.1). Lookup names are prefixed ``fhir_lookup:``.
 
     The single reader, on the contract of :func:`expiry_relaxed_hops`, so ``messagefoundry check``,
     ``security_loosenings()`` and ``GET /security/posture`` cannot disagree. Sorted by name. The
@@ -5129,10 +5146,13 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
     construction WARNING in ``pipeline.wiring_runner`` reads the resolved one. Pure."""
     out: list[tuple[str, str]] = []
-    for oc in registry.outbound.values():
-        url = oc.spec.settings.get("url")
+    for name, settings in (
+        *((oc.name, oc.spec.settings) for oc in registry.outbound.values()),
+        *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
+    ):
+        url = settings.get("url")
         if isinstance(url, str) and (names := credential_query_params(url)):
-            out.append((oc.name, ", ".join(names)))
+            out.append((name, ", ".join(names)))
     return sorted(out)
 
 

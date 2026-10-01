@@ -363,8 +363,10 @@ an audit built from those columns alone has a hole:
 REST, SOAP, FHIR, DICOM C-STORE SCU, and RemoteFile FTPS** (a factory parameter, and therefore also a
 `connections.toml` `[settings]` key and a GUI field — the connection schema is derived from the factory
 signatures). It relaxes **only** the certificate validity-period check: an **expired** server
-certificate is accepted **indefinitely**, while the **chain, hostname and key usage are still fully
-verified** (ADR 0094). It is genuinely narrower than `tls_verify=false` — that is the point of it — but:
+certificate is accepted **indefinitely**, while the **chain and key usage are still fully verified**,
+and the **hostname** too unless the connection also sets `tls_check_hostname = false` (ADR 0094).
+CORRECTED 2026-10-01: this said the hostname is verified without condition, which is false on an MLLP
+or hand-built FTPS hop that also turns the name check off. It is genuinely narrower than `tls_verify=false` — that is the point of it — but:
 
 - it needs **no** `MEFOR_ALLOW_INSECURE_TLS`;
 - it is **not clamped** by `[security].enforcement` — `enforce` does not touch it;

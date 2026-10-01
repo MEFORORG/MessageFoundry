@@ -451,7 +451,8 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
     The granular alternative to the blunt ``tls_verify=false`` (which drops chain AND hostname AND expiry
     together via ``CERT_NONE``): this ORs :data:`_X509_V_FLAG_NO_CHECK_TIME` into ``ctx.verify_flags`` so a
     peer certificate whose ``notAfter`` has passed (or whose ``notBefore`` is in the future) is accepted
-    **while the chain and hostname are still fully validated**. It is a per-connection opt-in
+    **while the chain is still fully validated, and the hostname too unless the hop also sets
+    ``tls_check_hostname=false``**. It is a per-connection opt-in
     (``tls_allow_expired=true``) for a partner that has let its server cert lapse — a real-world
     operational reality — without opening the MITM hole ``tls_verify=false`` does.
 

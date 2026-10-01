@@ -670,7 +670,8 @@ def _mllp_ssl_context(
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
         # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has
-        # passed while STILL validating chain + hostname. Opt-in per connection (default False = byte-
+        # passed while STILL validating the chain, and the hostname unless tls_check_hostname=false
+        # (relax_verify_expiry's WARNING says which). Opt-in per connection (default False = byte-
         # identical); applied on the verify path only, so it composes with (never bypasses) the
         # tls_verify=false refusal above and the #200 cleartext/verify-off hop refusals.
         if s.get("tls_allow_expired"):

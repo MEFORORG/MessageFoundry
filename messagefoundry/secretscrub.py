@@ -106,7 +106,12 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["CREDENTIAL_PLACEHOLDER", "credential_query_params", "scrub_credentials"]
+__all__ = [
+    "CREDENTIAL_PLACEHOLDER",
+    "credential_query_params",
+    "mask_credential_query",
+    "scrub_credentials",
+]
 
 #: What a scrubbed credential VALUE is replaced with. Matches
 #: :class:`logging_setup.CredentialQueryScrubFilter`, so one log line cannot carry two spellings of
@@ -514,9 +519,22 @@ _QUERY_CREDENTIAL_TAILS = tuple(
     word.casefold() for word in _CREDENTIAL_WORDS + _TOKEN_WORDS + _QUERY_CREDENTIAL_WORDS
 )
 
-#: Key-material names, matched only as the whole name, for the reason :data:`_KEY_MATERIAL_WORDS`
-#: gives: a tail rule over them would reach ``private_key_file`` and other non-secrets.
+#: Key-material names, matched as the whole name. Most of them already end in ``_key``, which the
+#: ``key`` tail reaches; ``encryption_keys_retired`` and ``intake_api_key_next`` do not, and this set
+#: is what names those two.
 _QUERY_KEY_MATERIAL = frozenset(word.casefold() for word in _KEY_MATERIAL_WORDS)
+
+
+def _camel_tail(name: str, word: str) -> bool:
+    """Whether ``name`` ends in ``word`` as a camelCase segment, as ``accessToken`` ends in token.
+
+    The segment must open with a capital after a lower-case letter or a digit, so ``monkey`` is not
+    ``key`` and an all-capitals ``APIKEY`` is not split at all."""
+    n = len(word)
+    if len(name) <= n or name[-n:].casefold() != word:
+        return False
+    head, before = name[-n], name[-n - 1]
+    return head.isupper() and (before.islower() or before.isdigit())
 
 
 def _is_credential_param(name: str) -> bool:
@@ -524,9 +542,17 @@ def _is_credential_param(name: str) -> bool:
     if folded in _QUERY_KEY_MATERIAL:
         return True
     return any(
-        folded == word or folded.endswith((f"_{word}", f"-{word}", f".{word}"))
+        folded == word
+        or folded.endswith((f"_{word}", f"-{word}", f".{word}"))
+        or _camel_tail(name, word)
         for word in _QUERY_CREDENTIAL_TAILS
     )
+
+
+def _display_name(name: str) -> str:
+    """A parameter name safe to put in a log line. ``parse_qsl`` percent-decodes names, so a URL can
+    carry a newline in one; ``repr`` escapes it rather than let it forge a second line."""
+    return name if name.isprintable() else repr(name)
 
 
 def credential_query_params(url: str) -> list[str]:
@@ -538,8 +564,10 @@ def credential_query_params(url: str) -> list[str]:
     raising, because a parser error would quote the URL.
 
     A heuristic over names, from this module's own vocabulary plus :data:`_QUERY_CREDENTIAL_WORDS`.
-    It misses a credential under a name it does not know, and it will name a parameter that only
-    looks like one (``page_token``). Its callers WARN rather than refuse for that reason.
+    A name matches as a whole, as its last segment after ``.``, ``_`` or ``-``, or as a camelCase
+    tail (``accessToken``). It misses a credential under a name it does not know, and it will name
+    a parameter that only looks like one (``page_token``). Its callers WARN rather than refuse for
+    that reason.
 
     Not :class:`logging_setup.CredentialQueryScrubFilter`'s list. That one scrubs VALUES out of log
     text and carries ``code`` and ``state`` for the OIDC callback; neither is a credential name on a
@@ -553,7 +581,30 @@ def credential_query_params(url: str) -> list[str]:
         pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
     except ValueError:
         return []
-    return sorted({name for name, _ in pairs if _is_credential_param(name)})
+    return sorted({_display_name(name) for name, _ in pairs if _is_credential_param(name)})
+
+
+def mask_credential_query(url: str, *, placeholder: str = "***") -> str:
+    """``url`` with the VALUE of each credential-like query parameter replaced by ``placeholder``.
+
+    For display surfaces that show a configured URL (``config.wiring.redacted_settings``, which
+    serves ``GET /metadata`` and ``graph --json``). Everything else in the URL is kept as written,
+    including every other parameter, so the view stays useful. A parameter is judged by the same
+    name test as :func:`credential_query_params`; a name with no ``=`` has no value to mask."""
+    import urllib.parse  # noqa: PLC0415 -- see credential_query_params
+
+    head, question, rest = url.partition("?")
+    if not question:
+        return url
+    query, hash_mark, fragment = rest.partition("#")
+    parts = []
+    for part in query.split("&"):
+        name, equals, _value = part.partition("=")
+        if equals and _is_credential_param(urllib.parse.unquote_plus(name)):
+            parts.append(f"{name}={placeholder}")
+        else:
+            parts.append(part)
+    return f"{head}?{'&'.join(parts)}{hash_mark}{fragment}"
 
 
 def _run(text: str, placeholder: str, folded: str | None) -> str:

@@ -65,6 +65,43 @@ def test_detector_leaves_benign_parameters_alone(url: str) -> None:
     assert credential_query_params(url) == []
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # camelCase tails, the common partner spellings the first cut missed.
+        (
+            "https://p.example.invalid/x?accessToken=a&clientSecret=b",
+            ["accessToken", "clientSecret"],
+        ),
+        ("https://p.example.invalid/x?apiKey=a&authToken=b", ["apiKey", "authToken"]),
+        # Control: a lower-case run is not a camelCase boundary, and all-capitals is not split.
+        ("https://p.example.invalid/x?turkey=a&MONKEY=b&hotkeys=c", []),
+    ],
+)
+def test_detector_reads_camel_case_tails(url: str, expected: list[str]) -> None:
+    assert credential_query_params(url) == expected
+
+
+def test_detector_escapes_a_control_character_in_a_decoded_name() -> None:
+    """``parse_qsl`` decodes ``%0A``; the name reaches a log line, so it must not carry a raw newline."""
+    [name] = credential_query_params("https://p.example.invalid/x?x%0Afake_token=1")
+    assert "\n" not in name and name.isprintable()
+    assert "fake_token" in name  # still named, escaped rather than dropped
+
+
+def test_redacted_settings_masks_the_query_value_and_keeps_the_rest() -> None:
+    """``GET /metadata`` and ``graph --json`` serve settings through ``redacted_settings``. Before the
+    review fix it masked only the userinfo, so the key the WARNING named was served verbatim."""
+    from messagefoundry.config.wiring import redacted_settings
+
+    url = "https://u:pw@p.example.invalid/x?key=SYNTHETIC-5&fmt=json#frag"
+    shown = redacted_settings({"url": url})["url"]
+    assert shown == "https://u:***@p.example.invalid/x?key=***&fmt=json#frag"
+    # Control: a benign query is untouched.
+    benign = "https://p.example.invalid/x?fmt=json&keyword=lab"
+    assert redacted_settings({"url": benign})["url"] == benign
+
+
 def test_detector_returns_names_never_values() -> None:
     names = credential_query_params("https://p.example.invalid/x?token=SYNTHETIC-SECRET-1")
     assert names == ["token"]
@@ -133,6 +170,21 @@ def test_reader_lists_only_the_credentialed_url_and_no_value() -> None:
     assert query_credential_hops(_registry()) == [("OB_KEYED", "key")]
 
 
+def test_reader_and_build_cover_a_fhir_lookup(caplog: pytest.LogCaptureFixture) -> None:
+    """A FhirLookup dials its ``url`` too, through its own egress check, so both surfaces reach it."""
+    from messagefoundry.config.wiring import FhirLookupSpec
+    from messagefoundry.pipeline.wiring_runner import check_fhir_lookup_allowed
+
+    reg = _registry()
+    url = "https://fhir.example.invalid/R4?api_key=SYNTHETIC-6"
+    reg.add_fhir_lookup(FhirLookupSpec(name="LK", settings={"url": url}))
+    assert ("fhir_lookup:LK", "api_key") in query_credential_hops(reg)
+    with caplog.at_level(logging.WARNING):
+        check_fhir_lookup_allowed("LK", {"url": url}, EgressSettings())
+    [line] = [r.getMessage() for r in caplog.records if _MARK in r.getMessage()]
+    assert "FhirLookup 'LK'" in line and "SYNTHETIC" not in line
+
+
 _CONFIG = """
 from messagefoundry import MLLP, Rest, Send, handler, inbound, outbound, router
 
@@ -189,4 +241,4 @@ def test_check_says_none_on_a_clean_graph(tmp_path: Path) -> None:
     clean = _CONFIG.replace("?sig=SYNTHETIC-4", "?fmt=xml")
     report = run_checks(_write(tmp_path, clean), run_lint=False)
     r = next(x for x in report.results if x.name == "url-query-credential")
-    assert "no outbound url carries a credential-like query parameter" in r.detail
+    assert "no outbound or FhirLookup url carries a credential-like query parameter" in r.detail

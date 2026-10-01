@@ -2058,18 +2058,22 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
     # verified" for every listed hop, which was false on a hop that also set tls_check_hostname=false.
     unchecked = {name for name, _ in hostname_unchecked_hops(registry)}
     both = sorted(name for name, _ in relaxed if name in unchecked)
-    still = (
-        "chain and key usage are still verified; the hostname is NOT on "
-        f"{', '.join(both)} (tls_check_hostname=false), and is on the rest"
-        if both
-        else "chain, hostname and key usage are still verified"
-    )
+    if not both:
+        still = "chain, hostname and key usage are still verified"
+    else:
+        # "May": the reader counts an env() value it cannot read. "The others" only when there are.
+        still = (
+            "chain and key usage are still verified; the hostname may NOT be on "
+            f"{', '.join(both)}, which also declare tls_check_hostname=false or set it by env()"
+        )
+        if len(both) < len(relaxed):
+            still += ", and is on the others"
     return CheckResult(
         "tls-allow-expired",
         ok=True,
         required=False,
         detail=(
-            f"{len(relaxed)} outbound connection(s) accept an EXPIRED server certificate "
+            f"{len(relaxed)} connection(s) accept an EXPIRED server certificate "
             f"indefinitely — {listed} ({still})"
         ),
     )
@@ -2106,9 +2110,9 @@ def _check_hostname_unchecked(config_dir: str | Path) -> CheckResult:
         ok=True,
         required=False,
         detail=(
-            f"{len(unchecked)} connection(s) do not match the server certificate to the host they "
-            f"dial — {listed} (the chain is still verified; any certificate chaining to the trust "
-            "anchor is accepted whatever host it names)"
+            f"{len(unchecked)} connection(s) declare tls_check_hostname=false or set it by env() — "
+            f"{listed}. On a verifying hop that dials out, the chain is still verified, but any "
+            "certificate chaining to the trust anchor is accepted whatever host it names"
         ),
     )
 
@@ -2136,7 +2140,7 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
             name,
             ok=True,
             required=False,
-            detail="no outbound url carries a credential-like query parameter",
+            detail="no outbound or FhirLookup url carries a credential-like query parameter",
         )
     listed = "; ".join(f"{conn} ({params})" for conn, params in found)
     return CheckResult(
@@ -2144,7 +2148,7 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
         ok=True,
         required=False,
         detail=(
-            f"{len(found)} outbound connection(s) carry a credential in the endpoint url's query "
+            f"{len(found)} connection(s) carry a credential in the endpoint url's query "
             f"string — {listed}. It rides the request line, so the partner's and any proxy's access "
             "log holds it (ASVS 14.2.1)"
         ),
