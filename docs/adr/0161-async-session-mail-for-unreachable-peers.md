@@ -452,7 +452,14 @@ Two results, and the second is the one that matters:
       calling worktree, so a session on any branch runs the primary's copy once the primary has pulled
       it. The installer's own header is the source of record for that order. The installer also wires
       every config root it finds, not only the default one this box names. Whether that wider wiring
-      fits this approval is the owner's call. §"Status and what gates wiring" says wiring is gated on
+      fits this approval is the owner's call.
+      **RESOLVED 2026-09-30 by owner ruling (BACKLOG #1215).** The sentence just above, *"Whether that
+      wider wiring fits this approval is the owner's call"*, was an open question and is now answered:
+      *"Owner ruling 2026-09-30, given to the batch 183 Manager in session: the drain approval covers
+      every config root the installer wires."* So "Default config root only" above records the
+      approval as first given, and the wider wiring is within it. The ruling settles scope only. It
+      does not touch the #1028 gate below or the `mail-watch.ps1` contradiction above.
+      §"Status and what gates wiring" says wiring is gated on
       the work tracked as [BACKLOG #1028](../BACKLOG.md), and that no approval through that gate is
       recorded. This note does not decide whether the approval above meets it. That also stays the
       owner's.
