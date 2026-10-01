@@ -7,7 +7,7 @@ GitHub. The prose source of truth is [ARCHITECTURE.md](ARCHITECTURE.md); this fi
 The views in this file each answer a different question. More diagrams live in other docs, and
 [Every architecture diagram](#every-architecture-diagram) lists them all.
 
-1. **Top-level components**: every shipped component (engine, web console, IDE extension, Windows service, CLI, toolkit, test harness, tee relay) and how they relate.
+1. **Top-level components**: the main shipped components (engine, web console, IDE extension, Windows service, CLI, toolkit, test harness, tee relay) and how they relate.
 2. **System topology** — the engine's internal packages, process boundaries, and the one-way dependency rule.
 3. **Runtime message flow** — how a received message moves through the staged queue and earns a disposition.
 4. **Config wiring graph** — how Connections, Routers, and Handlers wire together by name (no "channel" object).
@@ -44,7 +44,7 @@ the block, because a copy drifts from its source.
 ## 1. Top-level components — the whole system
 
 MessageFoundry ships as a set of **independent, separately-buildable components**, not just the
-engine. This is everything at a glance — operator tools, dev/test tooling, the standalone tee relay,
+engine. This is the system at a glance — operator tools, dev/test tooling, the standalone tee relay,
 and the build/release path — and how each relates to the engine. Colour groups the *kind* of
 component (operator tool · runtime · author-time input · dev/test · standalone · external · build).
 
@@ -80,7 +80,7 @@ flowchart TB
   subgraph DEV["Dev / test tooling"]
     CLI["CLI: messagefoundry<br/>serve, check, dryrun, verify and more"]:::devtool
     TOOLKIT["Toolkit: messagefoundry-toolkit<br/>authoring and development tooling"]:::devtool
-    GEN["Synthetic HL7 generators<br/>generators/"]:::devtool
+    GEN["Synthetic HL7 generators<br/>messagefoundry/generators/"]:::devtool
     HARNESS["Test harness<br/>harness/ · PySide6 · MLLP send/receive"]:::devtool
   end
 
@@ -155,6 +155,10 @@ engine and the distributions under [`packaging/`](../packaging/), and publishes 
 Publishing on a version tag. [SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) describes that chain, with its tags
 and gates.
 
+Three shipped pieces are not drawn: the Windows tray service-manager
+([`messagefoundry/tray/`](../messagefoundry/tray/)), the `mefor-net-helper` network helper
+([`net-helper/`](../net-helper/)) and the container image ([`docker/`](../docker/)).
+
 ---
 
 ## 2. System topology — components & boundaries
@@ -211,10 +215,11 @@ flowchart TB
 The `transports/` label names connector families, not single connector types.
 [CONNECTIONS.md](CONNECTIONS.md) lists every connector, and is the one list to keep current.
 
-The API binds `127.0.0.1` by default and is served over TLS.
+The API binds `127.0.0.1` by default. The engine serves it over TLS, unless a declared reverse
+proxy terminates TLS in front of the engine. Clients speak HTTPS in both cases.
 [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
-says where the certificate comes from. The harness is a client in two ways: it calls the API through
-the shared `apiclient` library, and it sends and receives MLLP as a test partner.
+holds the detail. The harness is a client in two ways: it calls the API through the shared
+`apiclient` library, and it sends and receives MLLP as a test partner.
 
 ---
 
@@ -266,7 +271,7 @@ flowchart TB
 
   ING -.->|"records"| D1
   RW -.->|"records"| D2
-  TW -.->|"records a declined Send"| D3
+  TW -.->|"records when nothing is left to deliver"| D3
   DW -.->|"records"| D3
   D1 -.-> FIN
   D2 -.-> FIN

@@ -66,7 +66,7 @@ WebSocket API (FastAPI/uvicorn). The same API serves three deployments without c
 We deliberately did **not** start with two separate processes + hand-rolled IPC. The
 logical boundary (library API) comes first; physical split is a deployment choice.
 
-The topology diagram is section 2, System topology, of
+The topology diagram is in the System topology section of
 [architecture-diagram.md](architecture-diagram.md): clients are separate processes (or a browser)
 that reach the engine only through the API, and the engine packages never import `api`.
 
@@ -134,7 +134,7 @@ transactions/message for a single-handler message; +1 per extra handler) — rec
 per-inbound `ack_after=delivered` (defer the ACK until delivery succeeds) is planned but not built —
 the pipeline is ACK-on-receipt only.
 
-The staged flow diagram is section 3, Runtime message flow, of
+The staged flow diagram is in the Runtime message flow section of
 [architecture-diagram.md](architecture-diagram.md).
 
 ## Concurrency
@@ -181,7 +181,7 @@ Connections/Routers/Handlers are authored against the `messagefoundry` surface
 (`inbound`/`outbound`/`@router`/`@handler`/`Send`/`MLLP`/`File`/`Message`); a directory of such
 modules loads via `load_config` into a `Registry` that the engine's `RegistryRunner` runs.
 
-The configuration graph diagram is section 4, Config wiring graph, of
+The configuration graph diagram is in the Config wiring graph section of
 [architecture-diagram.md](architecture-diagram.md): the graph is wired by name, with no enclosing
 "channel" object.
 
