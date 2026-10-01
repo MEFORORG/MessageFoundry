@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -33,9 +32,12 @@ from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     DatabaseLookupSpec,
+    HandlerFn,
     InboundConnection,
     OutboundConnection,
+    Payload,
     Registry,
+    RouterFn,
     Send,
 )
 from messagefoundry.parsing.message import Message
@@ -52,8 +54,9 @@ ADT = (
     "PV1|1|I|^^^FAC||||MEDITECH123^SMITH^JOHN\r"
 )
 
-_Route = Callable[[Message], list[str]]
-_Handler = Callable[[Message], Send | None]
+# The registry's own signatures: a router or handler takes a Payload, a parsed Message by default.
+_Route = RouterFn
+_Handler = HandlerFn
 
 
 # --- a faked aioodbc pool/conn/cursor (no driver, no DB) ----------------------
@@ -132,7 +135,7 @@ def _patch_pool(
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
     yield s
     await s.close()
@@ -193,7 +196,7 @@ async def _until_status(
     raise AssertionError(f"no message reached {status} within {timeout}s")
 
 
-def _route_to_npi(msg: Message) -> list[str]:
+def _route_to_npi(msg: Payload) -> list[str]:
     return ["npi"]
 
 
@@ -201,7 +204,8 @@ def _npi_handler(seen_threads: list[bool]) -> _Handler:
     """A handler that substitutes PV1-7.1 with a live-looked-up NPI; drops (FILTERED) if the lookup
     returns nothing. ``seen_threads`` records whether it ran off the main thread (the off-loop proof)."""
 
-    def handle(msg: Message) -> Send | None:
+    def handle(msg: Payload) -> Send | None:
+        assert isinstance(msg, Message)  # no accepts= on this handler, so the runner parses
         seen_threads.append(threading.current_thread() is threading.main_thread())
         provider_id = msg["PV1-7.1"] or ""
         # Read-only SELECT (ADR 0010 carve-out; the _require_read_only statement gate refuses a
@@ -331,7 +335,7 @@ async def test_a_handler_can_catch_a_down_database_as_a_lookup_error(
     monkeypatch.setattr(database, "_make_pool", down)
     caught: list[str] = []
 
-    def fallback(msg: Message) -> Send | None:
+    def fallback(msg: Payload) -> Send | None:
         try:
             db_lookup(
                 "clarity", "SELECT npi FROM mmc.Provider WHERE meditech_id = :id", {"id": "1"}

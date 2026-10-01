@@ -30,12 +30,12 @@ ADT_A01 = (
 )
 
 
-def _out_json(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
-    return json.loads(capsys.readouterr().out)  # type: ignore[no-any-return]
+def _out_json(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    return json.loads(capsys.readouterr().out)
 
 
-def _check(report: dict[str, object], name: str) -> dict[str, object]:
-    return next(c for c in report["checks"] if c["name"] == name)  # type: ignore[union-attr,index]
+def _check(report: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(c for c in report["checks"] if c["name"] == name)
 
 
 def _run_count(detail: object) -> int:
@@ -261,9 +261,7 @@ def test_check_dryrun_unmapped_fixture_runs_every_inbound(tmp_path: Path) -> Non
     msgs = tmp_path / "messages"
     msgs.mkdir()
     (msgs / "x.hl7").write_bytes(BAD_HL7)
-    dr = next(
-        r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
-    )
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required and not dr.skipped
     assert "IB_HL7" in dr.detail  # the error names the inbound the unmapped fixture reached
 
@@ -324,7 +322,7 @@ def test_check_dryrun_fails_when_nothing_was_actually_run(tmp_path: Path) -> Non
     msgs = tmp_path / "messages"
     msgs.mkdir()
     (msgs / "x.hl7").write_bytes(ADT_A01.encode("utf-8"))  # top-level, so unmapped
-    dr = _run_dryrun(cfg, msgs)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required and not dr.skipped, dr.detail
     # Attributable to the zero, not merely to some failure: a flag-only assertion would also be
     # satisfied by the gate failing for an unrelated reason.
@@ -354,9 +352,7 @@ def test_check_dryrun_non_feed_subdir_falls_back_to_all(tmp_path: Path) -> None:
     msgs = tmp_path / "messages"
     (msgs / "misc").mkdir(parents=True)
     (msgs / "misc" / "x.hl7").write_bytes(BAD_HL7)
-    dr = next(
-        r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
-    )
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required and not dr.skipped
     assert "IB_HL7" in dr.detail
 
@@ -390,7 +386,9 @@ def test_read_message_sets_single_file_is_unmapped(tmp_path: Path) -> None:
 
 
 def test_run_checks_skips_lint_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(checks.shutil, "which", lambda _: None)
+    monkeypatch.setattr(
+        shutil, "which", lambda _: None
+    )  # the module object the checks module calls
     report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
     by_name = {r.name: r for r in report.results}
     for tool in ("ruff", "mypy", "ruff-security"):
@@ -526,7 +524,7 @@ def test_check_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
     main(["check", "--config", str(SAMPLES_CONFIG), "--no-lint", "--json"])
     report = _out_json(capsys)
     assert set(report.keys()) == {"ok", "checks"}
-    for c in report["checks"]:  # type: ignore[union-attr]
+    for c in report["checks"]:
         assert set(c.keys()) == {"name", "ok", "required", "skipped", "detail"}
 
 
@@ -567,6 +565,23 @@ def _run_dryrun(cfg: Path, msgs: Path) -> checks.CheckResult:
     return next(r for r in results if r.name == "dryrun")
 
 
+def _assert_the_gate_blocks_on_dryrun(cfg: Path, msgs: Path) -> checks.CheckResult:
+    """Assert the WHOLE GATE fails because of the dryrun check, and return that check.
+
+    Asserting only the dryrun check's own ``ok`` flag proves the check noticed, not that the gate
+    blocked: with ``CheckResult.blocking`` stubbed to ``False`` both ``.expect`` failure tests
+    stayed green (Fable packet 10, part 6, control C; BACKLOG #1746 limb 1), and so did three other
+    dryrun-failure tests that asserted only ``ok``, ``required`` and ``skipped``. Every dryrun test
+    that expects a failure goes through here. ``blocking`` and the report verdict are what
+    ``messagefoundry check`` turns into its exit code.
+    """
+    report = run_checks(cfg, messages_dir=msgs, run_lint=False)
+    dr = next(r for r in report.results if r.name == "dryrun")
+    assert dr.blocking, dr
+    assert report.ok is False, [r.name for r in report.results if r.blocking]
+    return dr
+
+
 def _feed_fixture(tmp_path: Path, body: bytes, expect: str | None) -> Path:
     msgs = tmp_path / "messages" / "IB_X"
     msgs.mkdir(parents=True)
@@ -587,7 +602,7 @@ def test_expect_received_matches_delivering_fixture(tmp_path: Path) -> None:
 def test_expect_mismatch_fails(tmp_path: Path) -> None:
     cfg = _delivering_config(tmp_path)  # actually RECEIVED
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "FILTERED\n")
-    dr = _run_dryrun(cfg, msgs)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required
     assert "expected FILTERED" in dr.detail and "RECEIVED" in dr.detail
 
@@ -617,7 +632,7 @@ def test_expect_processed_aliases_received(tmp_path: Path) -> None:
 def test_expect_invalid_value_fails(tmp_path: Path) -> None:
     cfg = _delivering_config(tmp_path)
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "BOGUS")
-    dr = _run_dryrun(cfg, msgs)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert not dr.ok and dr.required
     assert "invalid .expect" in dr.detail
 

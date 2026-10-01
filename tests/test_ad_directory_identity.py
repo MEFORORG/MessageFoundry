@@ -223,6 +223,7 @@ class _FakeConn:
     def __init__(self, entry: _FakeEntry) -> None:
         self.entries = [entry]
         self.kwargs: dict[str, Any] = {}
+        self.result: dict[str, Any] | None = None  # ldap3 sets it per operation; no referral
 
     def search(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -314,6 +315,7 @@ def _install_directory(
         def __init__(self, server: Any = None, **kwargs: Any) -> None:
             self.entries: list[_FakeEntry] = []
             self.user = str(kwargs.get("user"))
+            self.result: dict[str, Any] | None = None  # no referral
 
         def __enter__(self) -> FakeConnection:
             return self
@@ -1065,6 +1067,7 @@ class _RecordingConn:
         self._entry = entry
         self.entries: list[_FakeEntry] = [entry] if entry is not None else []
         self.searches: list[dict[str, Any]] = []
+        self.result: dict[str, Any] | None = None  # no referral
 
     def __enter__(self) -> _RecordingConn:
         return self

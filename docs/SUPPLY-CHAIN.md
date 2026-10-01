@@ -20,7 +20,12 @@ decision record is [ADR 0149](adr/0149-multi-ecosystem-sbom-vex-and-sbom-quality
 | PEP 740 attestations | PyPI-side provenance (Trusted Publishing) | PyPI |
 | SLSA build provenance | in-toto attestation binding each artifact (incl. both SBOMs + VEX) to the source commit | GitHub attestations / Sigstore bundle |
 
-Every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
+The toolkit wheel (`messagefoundry-toolkit`, ADR 0201) is built in the engine's release job. That
+job also signs it and writes its SLSA provenance, and attaches the wheel and its `.sigstore.json`
+bundle to the GitHub release (BACKLOG #1192). So both verification commands below work on it too. It
+has no SBOM of its own.
+
+Apart from that, every row but one covers the **engine** only. The exception is the PEP 740 row: every PyPI publish
 job in `release.yml` sets `attestations: true`. So the web console wheel (`messagefoundry-webconsole`)
 and the harness wheel get a PyPI-side attestation whenever their PyPI publish runs. Both of those
 publishes are gated on a repository variable. That is all they get: their release jobs have no
@@ -94,9 +99,9 @@ engine version. Both commands should pass. A failure on either file means you sh
 
 ### GitHub release artifacts (Sigstore + SLSA)
 
-`gh attestation verify` checks the GitHub attestations the engine release job writes: the engine
-sdist, the engine wheel, the two SBOMs and the VEX. For the console, use the PyPI check above. Verify the
-SLSA build provenance of one of those five files:
+`gh attestation verify` checks the GitHub attestations the engine release job writes. They cover at
+least the engine sdist, the engine wheel, the two SBOMs, the VEX and the toolkit wheel. For the
+console, use the PyPI check above. Verify the SLSA build provenance of one of those files:
 
 ```bash
 gh attestation verify messagefoundry-<version>.tar.gz --repo MEFORORG/MessageFoundry \
@@ -106,6 +111,10 @@ gh attestation verify messagefoundry-<version>.tar.gz --repo MEFORORG/MessageFou
 
 Keep the last two flags. With `--repo` alone, the command accepts an attestation from any workflow
 in the repository, on any ref, and at least one attestation exists that no release wrote.
+
+Write `<version>` in the TAG's spelling, in this command and in the Sigstore one below. A
+pre-release tag is `v0.5.0-rc1`, while its wheel's filename says `0.5.0rc1`. The wheel's spelling
+names a ref no release was built from, so the check fails on a genuine file.
 
 Or verify a Sigstore bundle directly (both SBOMs and the VEX are signed too; for the Windows SBOM,
 name `messagefoundry-sbom-windows.cdx.json` instead):
@@ -125,7 +134,11 @@ Attestations, and our releases, if you standardize on one tool across ecosystems
 The SBOM (CycloneDX 1.6) is a machine-readable inventory carrying at least a name, version, PackageURL and
 **license** for every component. It does **not** carry per-component file hashes — the generator we run does
 not emit them (see [How the SBOMs are generated](#how-the-sboms-are-generated-for-auditors)) — so use it as an
-inventory, not as an integrity check on the components it lists. "Hash-locked" elsewhere on this page refers
+inventory, not as an integrity check on the components it lists. The one exception is a vendored package
+(see [The one vendored Python source](#the-one-vendored-python-source-which-does-ship)): its component's
+`pedigree` records the SHA-256 of upstream's sdist and of each upstream file. Those digests describe
+upstream's bytes, not the vendored copy, which adds a header to each module, so they sit in the
+pedigree and not on the component. "Hash-locked" elsewhere on this page refers
 to the lock file the inventory is built from, not to a field inside the SBOM. Feed it to your own tooling:
 
 ```bash
@@ -148,8 +161,9 @@ have not, the document says nothing about that CVE and your scanner's finding st
 
 - **Python engine** — `cyclonedx-py environment` over an install of the hash-locked
   `docker/locks/requirements-core.lock` (environment mode populates licenses from installed metadata),
-  then `scripts/security/sbom_finalize.py` declares the lifecycle, backfills the dynamic version and
-  records the platform. This runs twice, once on a Linux runner and once on a Windows runner. Both
+  then `scripts/security/sbom_finalize.py` declares the lifecycle, backfills the dynamic version,
+  records the platform, and adds a component for each package vendored under `messagefoundry/_vendor/`,
+  which environment mode cannot see. This runs twice, once on a Linux runner and once on a Windows runner. Both
   runs build their scratch environment without pip, so pip is not listed: pip installs the engine
   but is not part of it. The broader all-extras dependency set is continuously audited by
   **pip-audit**.
@@ -160,11 +174,11 @@ have not, the document says nothing about that CVE and your scanner's finding st
 - **Container image** — `trivy image --format cyclonedx` over the built image (OS + Python layers).
   Continuously vuln-scanned by **Trivy** (with our VEX applied).
 
-Every generated SBOM declares `metadata.lifecycles = [{phase: build}]` (CISA "Build" SBOM Type). The
-Linux engine SBOM and the npm extension SBOM are quality-scored by **sbomqs** on each `security.yml`
-run, and a release scores both engine SBOMs. The Windows engine SBOM is retained unscored in
-`security.yml` (artifact `sbom-cyclonedx-windows`), and so is the container-image SBOM. Run
-`sbomqs score -b` against either on demand. Our format choice
+Every generated SBOM declares `metadata.lifecycles = [{phase: build}]` (CISA "Build" SBOM Type). Both
+engine SBOMs and the npm extension SBOM are quality-scored by **sbomqs** on each scheduled or manual `security.yml` run,
+and a release scores both engine SBOMs. `security.yml` scores the Windows engine SBOM on its Windows
+runner with the Windows build of sbomqs; a release scores it with the Linux build. The container-image
+SBOM is retained unscored (artifact `sbom-container-image`). Run `sbomqs score -b` against it on demand. Our format choice
 is **CycloneDX** (native VEX support); an SPDX rendering can be produced on request.
 
 ## The one vendored third-party binary, and what its record does not claim
@@ -246,11 +260,15 @@ The same two statements apply, scoped to this copy:
    pass it. Where upstream defusedxml is installed, which the CI test legs do through the `x12`
    extra, the same test also compares each module with the installed upstream file byte for byte,
    and it fails when the lock moves upstream off the vendored version.
-2. **What is not.** The Python engine SBOM is generated from installed distributions, and pip-audit
-   reads the locks. Neither sees a copy inside the engine package, so neither would list it or report
-   an advisory against it. Such an advisory needs someone to check this copy by hand. The `x12`
-   extra still installs upstream defusedxml for `pyx12`, so the all-extras lock and its audit do
-   carry the upstream package, but that says nothing about the copy the engine runs.
+2. **What is listed, and what is not.** The SBOM generator reads installed distributions, so it
+   cannot see this copy. `sbom_finalize.py --vendored-from messagefoundry/_vendor` adds it to both
+   engine SBOMs from the README's record, as `pkg:pypi/defusedxml@0.7.1`, so a scanner reading an
+   SBOM can match an advisory against it. `tests/test_vendored_defusedxml.py` fails when anything
+   under `_vendor/` is missing from the finalized SBOM. Nothing in this repository scans the SBOM
+   for advisories, and pip-audit reads only the locks, so an advisory against this copy still needs
+   someone here to check it by hand. The `x12` extra still installs upstream defusedxml for `pyx12`,
+   so the all-extras lock and its audit do carry the upstream package, but that says nothing about
+   the copy the engine runs.
 
 ## Related
 

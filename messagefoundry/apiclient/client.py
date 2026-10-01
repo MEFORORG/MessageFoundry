@@ -1114,8 +1114,12 @@ class EngineClient:
         """Inbound connections (id = connection name) — used by the Log Search filter."""
         return _decode_list(self._get("/channels"), ChannelInfo)
 
-    def connections(self) -> list[ConnectionRow]:
-        return _decode_list(self._get("/connections"), ConnectionRow)
+    def connections(self, *, reveal: str | None = None) -> list[ConnectionRow]:
+        """The per-endpoint connections dashboard. It needs only ``monitoring:read``, but it is not
+        PHI-free: each ``error`` is null without ``messages:view_summary`` and a fixed mask with it,
+        and ``reveal`` names ONE connection whose error comes back whole, an audited PHI read
+        (BACKLOG #2443)."""
+        return _decode_list(self._get("/connections", reveal=reveal), ConnectionRow)
 
     # --- code-first connection operations ------------------------------------
 

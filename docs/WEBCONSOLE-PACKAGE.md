@@ -38,9 +38,9 @@ how to develop and test it, and its **honest scope** (what the extraction does a
   engine's `__version__`), the console has its **own** `__version__`, tag, changelog, and PyPI cadence.
   It depends on the engine through a PEP 508 **floor with no ceiling** (`messagefoundry>=X`), not
   lockstep; [the next section](#the-engine-requirement-is-a-floor-with-no-ceiling) says why. **The
-  floor is raised at each console release, not as the engine moves.** No console release has set
-  one yet, so the package still declares a bare `messagefoundry` dependency. Step 2 of
-  [`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md) sets it, and the
+  floor is raised at each console release, not as the engine moves.** Console 0.4.0 set the first
+  one, `messagefoundry>=0.5.0`; 0.3.0 and earlier declared a bare `messagefoundry` dependency. Step 2
+  of [`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md) sets it, and the
   `release-webconsole` job refuses a console wheel whose engine requirement has no lower bound.
 - **Mounted same-origin, in-process.** `create_app` grafts the console onto its FastAPI app with a single
   call from the `serve_ui` tail: `mount_ui(app, deps)`. Because `create_managed_app` delegates to
@@ -143,8 +143,8 @@ fail loud:
 
 1. **Install-time** — the floor on the engine dependency makes `pip`/`uv` refuse an engine older
    than the console's seam. It has no ceiling, so it never refuses a newer engine; layer 2 does
-   that. It fires only for a console released with the floor, because the package on `main`
-   declares a bare dependency (see §1).
+   that. It fires only for a console released with the floor: 0.4.0 is the first, and 0.3.0 and
+   earlier declared a bare dependency (see §1).
 2. **Startup-time** — `create_app`'s `serve_ui` tail calls `assert_engine_seam(ENGINE_UI_SEAM)`
    **before** it builds the deps bundle, so a package that changed the bundle *shape* for a new seam
    surfaces as `UiSeamMismatch`, not a kwargs `TypeError`. A second identical assert at the top of

@@ -12,6 +12,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "security" / "sbom_finalize.py"
 
 
@@ -175,3 +177,212 @@ def test_no_sys_platform_flag_writes_no_label(tmp_path: Path):
     p = _write_bom(tmp_path)
     assert sbom_finalize.main([str(p)]) == 0
     assert "properties" not in _read(p)["metadata"]
+
+
+# --- vendored packages (BACKLOG #2498) -------------------------------------------------------------
+
+_REPO = _SCRIPT.parents[2]
+_VENDOR = _REPO / "messagefoundry" / "_vendor"
+
+
+def _vendored(doc: dict) -> list[dict]:
+    return [
+        c
+        for c in doc.get("components", [])
+        if str(c.get("bom-ref", "")).startswith(sbom_finalize.VENDORED_REF_PREFIX)
+    ]
+
+
+def _write_rooted_bom(tmp_path: Path) -> Path:
+    """A BOM shaped like cyclonedx-py's: a root bom-ref and a dependency graph hanging off it."""
+    return _write_bom(
+        tmp_path,
+        metadata={
+            "timestamp": "2026-07-21T00:00:00Z",
+            "tools": {"components": [{"name": "cyclonedx-py"}]},
+            "component": {"bom-ref": "root-component", "name": "messagefoundry"},
+        },
+        components=[{"bom-ref": "httpx==0.27.0", "name": "httpx", "version": "0.27.0"}],
+        dependencies=[
+            {"ref": "root-component", "dependsOn": ["httpx==0.27.0"]},
+            {"ref": "httpx==0.27.0"},
+        ],
+    )
+
+
+def test_vendoring_is_idempotent_and_hangs_off_the_root(tmp_path: Path):
+    """A re-run must leave one component and one edge, or a consumer counts the copy twice."""
+    p = _write_rooted_bom(tmp_path)
+    for _ in range(2):
+        assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 0
+    doc = _read(p)
+    refs = [c["bom-ref"] for c in _vendored(doc)]
+    assert len(refs) == len(set(refs)) == 1
+    [root] = [d for d in doc["dependencies"] if d["ref"] == "root-component"]
+    assert root["dependsOn"] == ["httpx==0.27.0", *refs]
+    assert [d for d in doc["dependencies"] if d["ref"] in refs] == [{"ref": r} for r in refs]
+    assert {"bom-ref": "httpx==0.27.0", "name": "httpx", "version": "0.27.0"} in doc["components"]
+
+
+def test_a_resolver_emitted_copy_of_the_same_package_is_kept(tmp_path: Path):
+    """An extra (x12's pyx12) can install upstream defusedxml too. That is a second, real copy, so
+    the vendored component sits beside it rather than replacing it."""
+    resolved = {"bom-ref": "defusedxml==0.7.1", "name": "defusedxml"}
+    p = _write_bom(tmp_path, components=[resolved])
+    assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 0
+    refs = [c.get("bom-ref") for c in _read(p)["components"] if c["name"] == "defusedxml"]
+    assert refs == ["defusedxml==0.7.1", "messagefoundry-vendored:defusedxml@0.7.1"]
+
+
+def test_no_vendored_flag_adds_no_component(tmp_path: Path):
+    """The npm and container SBOMs call this helper without the flag and must not gain one."""
+    p = _write_bom(tmp_path)
+    assert sbom_finalize.main([str(p)]) == 0
+    assert _vendored(_read(p)) == []
+
+
+def _fake_vendor(tmp_path: Path, readme: str | None) -> Path:
+    vendor = tmp_path / "_vendor"
+    pkg = vendor / "fakepkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    if readme is not None:
+        (pkg / "README.md").write_text(readme, encoding="utf-8")
+    return vendor
+
+
+_GOOD_README = (_VENDOR / "defusedxml" / "README.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("readme", "needle"),
+    [
+        (None, "no readable README.md"),
+        (_GOOD_README.replace("| Upstream version |", "| Version |"), "upstream"),
+        (_GOOD_README.replace("SPDX `PSF-2.0`", "PSF-2.0"), "licence"),
+        (_GOOD_README.replace("| sdist SHA-256 |", "| sdist hash |"), "sdist_sha256"),
+        (
+            "\n".join(ln for ln in _GOOD_README.splitlines() if not ln.startswith("| `")),
+            "per-file upstream SHA-256 rows",
+        ),
+    ],
+    ids=["no-readme", "no-version", "no-licence", "no-sdist-hash", "no-file-rows"],
+)
+def test_a_vendored_package_the_readme_cannot_describe_fails_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], readme: str | None, needle: str
+):
+    """Fail closed: a package missing from the SBOM must not be one README edit away from silent.
+    The BOM is left untouched, so a release step stops before it ships a partial one."""
+    p = _write_bom(tmp_path)
+    before = p.read_bytes()
+    rc = sbom_finalize.main([str(p), "--vendored-from", str(_fake_vendor(tmp_path, readme))])
+    assert rc == 1
+    assert needle in capsys.readouterr().err
+    assert p.read_bytes() == before
+
+
+def test_the_unedited_readme_is_accepted(tmp_path: Path):
+    """The positive control for the arms above: the same harness, the README unedited."""
+    p = _write_bom(tmp_path)
+    vendor = _fake_vendor(tmp_path, _GOOD_README)
+    assert sbom_finalize.main([str(p), "--vendored-from", str(vendor)]) == 0
+    [c] = _vendored(_read(p))
+    assert c["properties"] == [{"name": sbom_finalize.VENDORED_PROPERTY, "value": "fakepkg"}]
+
+
+def test_an_empty_or_missing_vendor_dir_fails(tmp_path: Path):
+    """A flag that claims vendored code and finds none is a broken call, not a clean result."""
+    p = _write_bom(tmp_path)
+    (tmp_path / "empty").mkdir()
+    assert sbom_finalize.main([str(p), "--vendored-from", str(tmp_path / "empty")]) == 1
+    assert sbom_finalize.main([str(p), "--vendored-from", str(tmp_path / "absent")]) == 1
+
+
+@pytest.mark.parametrize(("spec", "rc"), [("1.3", 1), ("1.4", 0), ("1.8", 0), ("2.0", 1)])
+def test_vendoring_needs_cyclonedx_1_4_to_1_x_compared_as_numbers(
+    tmp_path: Path, spec: str, rc: int
+):
+    """Every field --vendored-from writes is in the 1.4 schema. A LATER 1.x must pass: an allowlist of
+    known versions would fail a release the day the generator moved to one it had not seen. A 2.x may
+    move those fields, so it fails closed."""
+    p = _write_bom(tmp_path, specVersion=spec)
+    assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == rc
+
+
+@pytest.mark.parametrize(("spec", "lifecycles"), [("1.4", None), ("1.8", [{"phase": "build"}])])
+def test_the_lifecycle_gate_compares_numbers_too(tmp_path: Path, spec: str, lifecycles: object):
+    """The lifecycle gate once was an allowlist, so a 1.8 BOM silently lost its CISA Build type."""
+    p = _write_bom(tmp_path, specVersion=spec)
+    assert sbom_finalize.main([str(p)]) == 0
+    assert _read(p)["metadata"].get("lifecycles") == lifecycles
+
+
+def test_a_single_vendored_module_fails_the_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """A module dropped straight into _vendor/ is not a package, so it would have been skipped and
+    left out of the SBOM while the run exited 0."""
+    vendor = _fake_vendor(tmp_path, _GOOD_README)
+    (vendor / "six.py").write_text("", encoding="utf-8")
+    assert sbom_finalize.main([str(_write_bom(tmp_path)), "--vendored-from", str(vendor)]) == 1
+    assert "six.py" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("row_start", "needle"),
+    [
+        ("| `common.py`", "common.py more than once"),
+        ("| Upstream version |", "upstream more than once"),
+    ],
+    ids=["file-row", "version-row"],
+)
+def test_a_row_recorded_twice_fails_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], row_start: str, needle: str
+):
+    """A second row is usually a stale one left beside its replacement. The first match is not
+    necessarily the true one, so the run refuses rather than recording a stale version or digest."""
+    row = next(ln for ln in _GOOD_README.splitlines() if ln.startswith(row_start))
+    vendor = _fake_vendor(tmp_path, _GOOD_README.replace(row, f"{row}\n{row}"))
+    assert sbom_finalize.main([str(_write_bom(tmp_path)), "--vendored-from", str(vendor)]) == 1
+    assert needle in capsys.readouterr().err
+
+
+def test_two_packages_recording_one_release_fail_the_run(tmp_path: Path):
+    """They would share one bom-ref, which CycloneDX requires to be unique."""
+    vendor = _fake_vendor(tmp_path, _GOOD_README)
+    (vendor / "twin").mkdir()
+    (vendor / "twin" / "__init__.py").write_text("", encoding="utf-8")
+    (vendor / "twin" / "README.md").write_text(_GOOD_README, encoding="utf-8")
+    assert sbom_finalize.main([str(_write_bom(tmp_path)), "--vendored-from", str(vendor)]) == 1
+
+
+@pytest.mark.parametrize(
+    ("spdx", "licence"),
+    [
+        ("PSF-2.0", {"license": {"id": "PSF-2.0"}}),
+        ("MIT OR Apache-2.0", {"expression": "MIT OR Apache-2.0"}),
+        ("LicenseRef-Vendor", {"expression": "LicenseRef-Vendor"}),
+    ],
+)
+def test_an_spdx_expression_is_carried_as_an_expression(tmp_path: Path, spdx: str, licence: dict):
+    """CycloneDX's license.id holds one id from the SPDX list; a compound licence or a
+    ``LicenseRef-`` belongs in ``expression``."""
+    vendor = _fake_vendor(tmp_path, _GOOD_README.replace("SPDX `PSF-2.0`", f"SPDX `{spdx}`"))
+    p = _write_bom(tmp_path)
+    assert sbom_finalize.main([str(p), "--vendored-from", str(vendor)]) == 0
+    [c] = _vendored(_read(p))
+    assert c["licenses"] == [licence]
+
+
+def test_a_rerun_without_a_root_ref_leaves_no_edge_to_a_replaced_component(tmp_path: Path):
+    """A first run hangs an older vendored version off the root. If the root has since lost its
+    bom-ref, the re-run must still drop the old edges, or they point at a component it replaced."""
+    p = _write_rooted_bom(tmp_path)
+    assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 0
+    older = p.read_text(encoding="utf-8").replace("defusedxml@0.7.1", "defusedxml@0.6.0")
+    assert "defusedxml@0.6.0" in older
+    doc = json.loads(older)
+    del doc["metadata"]["component"]["bom-ref"]
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    assert sbom_finalize.main([str(p), "--vendored-from", str(_VENDOR)]) == 0
+    assert "defusedxml@0.6.0" not in p.read_text(encoding="utf-8")
+    [root] = [d for d in _read(p)["dependencies"] if d["ref"] == "root-component"]
+    assert root["dependsOn"] == ["httpx==0.27.0"]

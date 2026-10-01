@@ -384,7 +384,7 @@ async def test_engine_fire_pool_warm_is_clean_on_sqlite(tmp_path: Path) -> None:
     # End-to-end with a real SQLite store: warm_pool returns immediately, so the task completes without
     # error and stop() gathers the already-done task cleanly.
     store = await MessageStore.open(tmp_path / "warm.db")
-    engine = Engine(store)  # type: ignore[arg-type]
+    engine = Engine(store)
     try:
         await engine._fire_pool_warm()
         task = engine._warm_pool_task

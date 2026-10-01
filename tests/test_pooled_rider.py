@@ -79,7 +79,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -184,7 +184,7 @@ class _Recorder(DestinationConnector):
     def __init__(self) -> None:
         self.payloads: list[str] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         self.payloads.append(payload)
         return None
 
@@ -212,7 +212,7 @@ class _GateConnector(DestinationConnector):
         self.release = asyncio.Event()
         self.first_payload: str | None = None
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         if self.first_payload is None:
             self.first_payload = payload
         self.entered.set()
@@ -237,7 +237,7 @@ class _FlakyConnector(DestinationConnector):
         # honored the backoff schedule (the gap from the last failing attempt to success >= backoff).
         self.call_times: list[float] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         self.calls += 1
         self.call_times.append(asyncio.get_running_loop().time())
         if self.calls <= self.fail_times:

@@ -162,7 +162,14 @@ is `safe_exc()` text. The runner stores it through the `connection_stopped` aler
 copy is `alert_instance.reason`. **Both fields are rated PL-2, the level of `alert_instance.reason`.**
 The rating is on the FIELD, not only on the start-failure string. So both routes are served
 `Cache-Control: no-store`. `tests/test_no_store_phi_coverage.py` binds each field to
-`alert_instance.reason` and reads the level out of that column's row above.
+`alert_instance.reason` and reads the level out of that column's row above. Both routes need only
+`monitoring:read`, which is not a PHI permission. So `ConnectionRow.error` is gated on
+`messages:view_summary` (BACKLOG #2443, owner ruling R12): null without it, a fixed `****` with it,
+and whole only on the audited `reveal=<connection name>` act on `GET /connections`.
+`ConnectionMetadata.error` is gated and masked the same way, whole only on the audited
+`reveal=true` act on `GET /connections/{name}/metadata`. *Corrected 2026-10-01:* this said that
+field was not yet gated; the gate change that closed it is in [SECURITY.md](SECURITY.md)
+"Field-level (property) authorization".
 
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
 pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written
@@ -873,7 +880,7 @@ audit chain or be false.
 | MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or `serve --allow-insecure-bind`. | — |
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
 | Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. Upstream, the proxy-to-engine hop is plaintext unless `tls_cert_file` is set; the site secures it, and `serve` requires `plaintext_upstream_hop_acknowledged` (BACKLOG #1179). HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
-| AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]` | — |
+| AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]`. No LDAP referral is followed, so the bind credentials never leave this hop for a referred host; a referral refuses the sign-in (BACKLOG #2530, 2026-09-30). A multi-domain forest would need a global catalog or a search base in the bound controller's own domain. | — |
 | PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle, SQL Server ODBC 18.1+ `ServerCertificate` leaf-pin) **or** a Windows machine-store (`LocalMachine\Root`) CA import. | — |
 
 **Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without TLS in front

@@ -99,7 +99,9 @@ async def _row(store: MessageStore, outbox_id: str) -> dict:
     cur = await store._db.execute(
         "SELECT status, payload, body_ref FROM queue WHERE id=?", (outbox_id,)
     )
-    return dict(await cur.fetchone())
+    row = await cur.fetchone()
+    assert row is not None
+    return dict(row)
 
 
 async def _status(store: MessageStore, message_id: str) -> str:
@@ -164,7 +166,9 @@ async def test_replay_logs_no_replayed_event_for_a_fully_erased_message(
     cur = await store._db.execute(
         "SELECT COUNT(*) AS n FROM message_events WHERE message_id=? AND event='replayed'", (mid,)
     )
-    assert int((await cur.fetchone())["n"]) == 0
+    row = await cur.fetchone()
+    assert row is not None
+    assert int(row["n"]) == 0
 
 
 # --- replay: a MIXED batch skips, it does not raise ---------------------------
@@ -266,7 +270,9 @@ async def test_replay_dead_returns_zero_when_every_dead_row_is_erased(store: Mes
     cur = await store._db.execute(
         "SELECT COUNT(*) AS n FROM message_events WHERE message_id=? AND event='replayed'", (mid,)
     )
-    assert int((await cur.fetchone())["n"]) == 0
+    row = await cur.fetchone()
+    assert row is not None
+    assert int(row["n"]) == 0
 
 
 # --- the store-once arm: ``payload=''`` with a live ``body_ref`` is NOT erased --

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -183,18 +184,19 @@ def test_the_digest_does_not_depend_on_the_seam_it_produces() -> None:
 
     spec = importlib.util.spec_from_file_location("_seam_gen_circ", _SCRIPT)
     assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
+    # Any: a script loaded from a path, whose attributes mypy cannot know.
+    module: Any = importlib.util.module_from_spec(spec)
     sys.modules["_seam_gen_circ"] = module
     spec.loader.exec_module(module)
 
     before = module.contract_digest()
     original = seam_module.ENGINE_UI_SEAM
     try:
-        seam_module.ENGINE_UI_SEAM = "deadbeefdeadbeef"  # type: ignore[misc]
+        seam_module.ENGINE_UI_SEAM = "deadbeefdeadbeef"
         module.ENGINE_UI_SEAM = "deadbeefdeadbeef"
         assert module.contract_digest() == before
     finally:
-        seam_module.ENGINE_UI_SEAM = original  # type: ignore[misc]
+        seam_module.ENGINE_UI_SEAM = original
         module.ENGINE_UI_SEAM = original
 
 

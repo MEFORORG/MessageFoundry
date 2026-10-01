@@ -12,18 +12,20 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 
 import pytest
 
 import messagefoundry.service as service
 from messagefoundry.service import ServiceControlOutcome, control_service_ex
+from messagefoundry.service_status import _system_dir
 
 
 def test_rejects_unsafe_name_before_platform_check(monkeypatch: pytest.MonkeyPatch) -> None:
     # An unsafe name must raise on every OS (before the platform check) and never elevate.
     tripped: list[object] = []
     monkeypatch.setattr(service, "_runas_wait", lambda *a: tripped.append(a))
-    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", "linux")
     with pytest.raises(ValueError, match="unsafe service name"):
         control_service_ex("start", 'evil" & calc.exe & "')
     assert tripped == []
@@ -40,12 +42,12 @@ def test_rejects_unknown_action(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_off_windows_is_unsupported_without_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     tripped: list[object] = []
     monkeypatch.setattr(service, "_runas_wait", lambda *a: tripped.append(a))
-    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", "linux")
     assert control_service_ex("start", "MessageFoundry") is ServiceControlOutcome.UNSUPPORTED
     assert tripped == []  # never elevated
 
 
-_SYSDIR = service._system_dir()
+_SYSDIR = _system_dir()
 _CMD = os.path.join(_SYSDIR, "cmd.exe")
 _NET = os.path.join(_SYSDIR, "net.exe")
 
@@ -67,7 +69,7 @@ def test_builds_system32_command_and_delegates(
         return ServiceControlOutcome.DISPATCHED
 
     monkeypatch.setattr(service, "_runas_wait", fake_runas)
-    monkeypatch.setattr(service.sys, "platform", "win32")
+    monkeypatch.setattr(sys, "platform", "win32")
     tail = (
         f'"{_NET}" stop "MyEngine" & "{_NET}" start "MyEngine"'
         if action == "restart"
@@ -100,8 +102,8 @@ def test_runas_wait_pins_the_image_and_the_working_directory(
         def __init__(self, _name: str, **_kw: object) -> None:
             self.ShellExecuteExW = _Func()
 
-    monkeypatch.setattr(service.sys, "platform", "win32")
-    monkeypatch.setattr(service.ctypes, "WinDLL", _FakeDll, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "WinDLL", _FakeDll, raising=False)
 
     assert service._runas_wait(_CMD, "/s /c rem") is ServiceControlOutcome.DISPATCHED
     info = seen[0]
@@ -123,11 +125,11 @@ def test_outcome_passthrough(
     monkeypatch: pytest.MonkeyPatch, outcome: ServiceControlOutcome
 ) -> None:
     monkeypatch.setattr(service, "_runas_wait", lambda _f, _p: outcome)
-    monkeypatch.setattr(service.sys, "platform", "win32")
+    monkeypatch.setattr(sys, "platform", "win32")
     assert control_service_ex("start", "MyEngine") is outcome
 
 
 def test_control_service_bool_contract_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     # The original fire-and-forget control_service is untouched: still bool, still off-Windows False.
-    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", "linux")
     assert service.control_service("start", "MyEngine") is False

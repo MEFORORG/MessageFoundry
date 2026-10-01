@@ -35,7 +35,8 @@ Implements: BACKLOG #
       that does not exist, publishes nothing, was registered in the last 90 days, or is served under
       another project's canonical name — but it **cannot** tell that a real package is the wrong one
       (see the `[webauthn]` extra's note in `pyproject.toml`). That judgement is this checkbox.
-- [ ] Gates pass locally: `ruff check .`, `ruff format --check .`, `mypy messagefoundry`, `mypy --explicit-package-bases tests`, and
+- [ ] Gates pass locally: `ruff check .`, `ruff format --check .`, `mypy --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'`,
+      `mypy --platform win32 messagefoundry messagefoundry_toolkit`, `mypy --explicit-package-bases tests`, and
       `pytest -q` (`QT_QPA_PLATFORM=offscreen` for console tests). `python -m messagefoundry check` is green.
 - [ ] Uses **Connection / Router / Handler** vocabulary; no new declarative "channel" element; no
       GUI/web-framework imports in the engine packages; no Black.

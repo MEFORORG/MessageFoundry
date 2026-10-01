@@ -328,6 +328,7 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `receive_timeout` | in | `60.0` | close a client **idle** this many seconds (slowloris guard). Applied **per read**, so it resets on every byte received: it bounds silence, not a frame — see `max_frame_seconds`. `None`/`0` = no timeout. |
 | `max_frame_bytes` | both | `16 MiB` | reject a single MLLP frame larger than this before buffering it whole (OOM guard); applies to inbound frames and outbound ACKs. `None`/`0` = unlimited. |
 | `max_frame_seconds` | in | `60.0` | close a client whose frame takes longer than this from its **start byte to its end byte** (BACKLOG #1725). This is the bound on a peer that trickles one byte at a time: it is never idle, so `receive_timeout` never fires on it, and without this it would hold a slot and up to `max_frame_bytes` of reassembly buffer indefinitely. Runs **beside** `receive_timeout`, not instead of it — a peer that opens a socket and says nothing never opens a frame, so only the idle bound covers that. The clock restarts for **each** frame, so a pipelined sender is unaffected. **Raise this whenever you raise `max_frame_bytes`** — 16 MiB inside 60 s needs about 2.2 Mbps sustained on that one socket, so a large-document feed over a slower link will otherwise trip it on every message. The connection closes with a `closed` event whose reason reads `frame_deadline`. `None`/`0` = no deadline. |
+| `max_inflight_frames` | in | `32` | cap on complete frames this listener hands to its inbound handler **at once** (BACKLOG #1725). The handler is the pre-ACK path (decode, parse, validate, ingress commit), where one large message costs several times its own size, so without this the handling peak was `max_connections` times that cost. A frame over the cap **waits** for a slot, first come first served, and is never refused, dropped or NAK'd; it still holds the bytes it arrived in, so this bounds the handling cost, not the raw buffer. The bound is per listener. A frame, once decoded, is **always handled**, exactly as with the cap off: one still waiting when the listener stops is handled once a slot frees, inside the shutdown grace, and cancelled past it like a slow handler. With `[store].group_commit_window_ms` above zero, one listener at this default can never fill a 64-row group-commit batch, so raise it with that window if one listener carries most of the traffic. `None`/`0` = unlimited. |
 | `max_messages_per_second` | in | **off** | sustained message-rate ceiling per **connection** (ASVS 2.4.1 / 15.2.2). Over budget the listener **pauses reading**, so TCP back-pressures the sender — **no message is ever dropped, refused or NAK'd**, and none is reordered. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule: a guessed rate on a clinical interface throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
@@ -945,8 +946,19 @@ its own policy block below):
   content_type-aware pipeline (ADR 0004). The two declarations that carry no reliable leading signature
   — `binary` (opaque bytes) and `text` (arbitrary) — are accepted **unchecked** by explicit policy; the
   pipeline codec/parser stays the real validator that records `ERROR`.
-- **Maximum size.** `max_file_bytes` (default **16 MiB**, matching the MLLP frame cap). An oversize file
-  is rejected by a `stat()` **before** it is read into memory (OOM / DoS guard); `None`/`0` disables it.
+- **Maximum size.** `max_file_bytes` (default **16 MiB**, matching the MLLP frame cap). The cap is
+  charged on the handle the read opens, not on an earlier `stat()`: an oversize file is rejected by
+  its handle's size **before** it is read into memory, and the read itself stops at the cap plus one
+  byte, so a file that grows after it was listed is refused too (OOM / DoS guard, BACKLOG #2507).
+  `None`/`0` disables it.
+- **Links are refused at read and at move time.** A drop is read only if the opened handle is a
+  regular file at the listed name inside the watch directory, reached through no symbolic link or
+  junction. POSIX opens each path component with `O_NOFOLLOW`; Windows compares the handle's final
+  path. The same check runs again just before the file is archived, quarantined or deleted, and on
+  POSIX that act then names the file relative to its checked directory. A refused entry is logged (a
+  WARNING the first time) and left in place, never read or moved. So a link swapped in after the
+  listing cannot pull an outside file into the pipeline, `.processed` or `.error`. This includes a
+  link that points inside the watch directory: drop real files, not links.
 - **Decompression is off by default; opt-in single-stream gzip is bomb-guarded** (ADR 0123). With no
   `decompress=` set the connector performs no decompression itself, so it materialises nothing beyond
   `max_file_bytes` where that cap is set. An earlier revision went further and said there is "no
@@ -1972,8 +1984,8 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. |
 | `fhir_version` | `R4B` | `R4B` (default) / `R5` / `STU3` — explicit (no plain-R4 on pydantic-v2 wheels) |
 | `format` | `json` | `json` only; FHIR-XML is deferred to a hardened-`lxml` path |
-| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`PUT {base}/{ResourceType}/{id}`) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
-| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware PUT) |
+| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
+| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
@@ -1994,8 +2006,48 @@ entry); the engine never orchestrates cross-entry atomicity.
 **Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
 problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
 `If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
-is in the **URL** query), and `if-match` (optimistic lock on a known id via an `If-Match` ETag derived from
-the resource's `meta.versionId`).
+is in the **URL** query), and `if-match` (optimistic lock on a known id via an ETag derived from the
+resource's `meta.versionId`, sent as the entry's `request.ifMatch`).
+
+#### An update keeps the resource id out of the URL
+
+The engine never puts a message-derived resource id in the request URL of a write. A RESTful update is
+`PUT {base}/{ResourceType}/{id}` by specification, and an id in the path would reach the receiving server's
+access logs on a first deployment. So `update` and `if-match` send the resource as the one entry of a
+`transaction` `Bundle`, POSTed to `{base}`. The entry's `request` carries `PUT {ResourceType}/{id}` and, for
+`if-match`, the `ifMatch` ETag. The server processes that entry as the same update
+([FHIR http, transaction](https://hl7.org/fhir/R4B/http.html#transaction)). This is vault BACKLOG #1965,
+under ASVS 14.2.1 and owner ruling R3.
+
+What a site needs to know:
+
+- The server must support the `transaction` interaction, and for `if-match` it must honor an entry's
+  `request.ifMatch`. A server that accepts transactions but ignores `ifMatch` would apply the update
+  unconditionally, and nothing would fail. Check both before pointing an `update` or `if-match`
+  connection at a server.
+- The entry carries a `fullUrl` of `{base}/{ResourceType}/{id}`, because FHIR requires one on a `PUT`
+  entry. Like the rest of the entry, it is in the body.
+- The resource goes out byte for byte. It is spliced into the `Bundle` unchanged, so a decimal such as
+  `1.50` keeps its precision.
+- The reply is a `transaction-response` `Bundle`, and with `capture_response` that `Bundle` is what is
+  captured. The capture outcome comes from the entry's `response.outcome`.
+- If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
+  that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
+  logged as a warning, and the 2xx reply counts as delivered.
+- `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
+  entry, which describes the updated resource, and an entry field hides a reply header of the same
+  name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
+  `Location` is usually relative. A value with a control character, or longer than a header value may
+  be, is dropped.
+- An `If-Match`, `If-None-Match`, `If-Modified-Since` or `If-None-Exist` header moves into the entry's
+  matching field, whether it is static in `headers` or stamped by a Handler through `dynamic_headers`.
+  The connector's own `if-match` ETag wins over both, as it did on the `PUT`.
+- The resource type stays in the URL for `create`, `if-none-exist` and `conditional-update`, and so does
+  the operator-configured search of `conditional-update`. None of them is the message-derived id.
+
+The read site is outside this. A `fhir_lookup` read-by-id is `GET {base}/{ResourceType}/{id}`, which is what
+a RESTful read is by specification. Owner ruling R3 names the update and if-match writes only, and the
+vault row records that it does not decide the read site.
 
 **OperationOutcome & delivery semantics.** A 2xx is **delivered** (a returned `OperationOutcome` is captured,
 never an error). On an error status the HTTP code decides, refined by the `OperationOutcome`: 5xx → retry; a
@@ -2092,9 +2144,9 @@ table top to bottom and take the first row that matches:
 |---|---|
 | `conditional="conditional-update"` | `u`, `s` — a search-based `PUT` |
 | `conditional="if-none-exist"` | `c`, `s` — a `POST` the server searches for first |
-| `conditional="if-match"` | `u` — a version-aware `PUT`, no search |
+| `conditional="if-match"` | `u` — a version-aware update, no search |
 | `interaction="create"` (no conditional) | `c` |
-| `interaction="update"` (no conditional) | `u` |
+| `interaction="update"` (no conditional) | `u` — the one `transaction` entry is an update, and a server authorizes a transaction entry by entry |
 | `FhirLookup(...)` (structurally GET-only) | `r`, `s` |
 | `interaction="transaction"`/`"batch"` | the Bundle decides, so no fixed set |
 
@@ -3245,7 +3297,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). Until the handshake completes, `max_connections`, `max_connections_per_host` and `source_ip_allowlist` do not apply to the socket, so the handshake bound limits how long such a socket lives, not how many a peer can open. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake, which never reached the handler. That last step needs the event loop's server to offer `close_clients()`, and uvloop's does not. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. There, stop leaves a socket still in its handshake to the 10 s bound, and refuses it unread if it finishes the handshake after stop began. Stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound is aborted with no log line and no connection event; a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted with a DEBUG line only and no connection event, and gives its slot back; a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |

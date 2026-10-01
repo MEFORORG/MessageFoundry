@@ -17,8 +17,9 @@ come undone:
 A rename matters for the ratchet. An entry whose file was renamed away would hand the NEXT file to
 take that name a free pass, so every entry must resolve to a file today.
 
-What this file cannot see is a listed module that has become clean. Finding that needs a mypy run,
-which is too slow for a unit test; the pyproject comment asks whoever fixes a module to drop it.
+A listed module that has become clean needs a mypy run to see, which is too slow for a unit test.
+scripts/ci/mypy_ratchet_check.py does that run, and a ci.yml step runs it. This file pins that step
+and plants a clean and a dirty module against the script's parsing and verdict logic.
 """
 
 from __future__ import annotations
@@ -28,13 +29,14 @@ import shlex
 import tomllib
 from typing import Any
 
+from scripts.ci import mypy_ratchet_check as ratchet_check
 from tests._workflow_contexts import ROOT, jobs_of
 
 _PYPROJECT = ROOT / "pyproject.toml"
 
 #: The most modules the ratchet may list. LOWER it when you remove entries; never raise it. A ceiling
 #: rather than an exact count, so removing a module does not also require editing this file.
-_RATCHET_CEILING = 177
+_RATCHET_CEILING = 28
 
 #: The reviewed tests.* profile. pyproject.toml's comment says why each key is there.
 _PROFILE_KEYS = {
@@ -138,3 +140,55 @@ def test_every_ratchet_entry_resolves_to_a_file() -> None:
 def test_the_ratchet_is_sorted_and_unique() -> None:
     modules = _ratchet()
     assert modules == sorted(set(modules)), "keep the ratchet sorted and free of duplicates"
+
+
+def test_ci_fails_on_a_listed_module_that_is_already_clean() -> None:
+    runs = [str(s.get("run", "")).strip() for s in jobs_of("ci.yml")["test"].get("steps", [])]
+    hits = [r for r in runs if r == "python scripts/ci/mypy_ratchet_check.py"]
+    assert len(hits) == 1, "expected exactly one ci.yml step running the dead-entry check"
+    steps = jobs_of("ci.yml")["test"]["steps"]
+    step = next(s for s in steps if str(s.get("run", "")).strip() == hits[0])
+    assert "continue-on-error" not in step, "a soft-failing dead-entry check gates nothing"
+    tests_step = next(s for s, argv in _mypy_steps() if "tests" in argv[1:])
+    assert step.get("if") == tests_step.get("if"), (
+        "the dead-entry check must run whenever the tests pass does"
+    )
+
+
+def test_the_dead_entry_check_flags_a_planted_clean_module() -> None:
+    # Planted control: one listed module with an error on one platform only, one with none at all.
+    output_linux = "tests\\test_dirty.py:3: error: Incompatible types  [assignment]\n"
+    output_win32 = (
+        "tests/test_dirty.py:3:5: note: See docs\ntests/test_clean.py:9: note: only a note\n"
+    )
+    dirty = [ratchet_check.modules_with_errors(o) for o in (output_linux, output_win32)]
+    assert dirty == [{"tests.test_dirty"}, set()], "a note must not count as an error"
+    listed = ["tests.test_clean", "tests.test_dirty"]
+    assert ratchet_check.dead_entries(listed, dirty) == ["tests.test_clean"]
+    # A module dirty on ONE platform stays listed: the list is the union of both passes.
+    assert ratchet_check.dead_entries(["tests.test_dirty"], dirty) == []
+
+
+def test_the_dead_entry_check_flips_exactly_the_ratchet() -> None:
+    text = _PYPROJECT.read_text(encoding="utf-8")
+    assert ratchet_check.ratchet_modules(text) == _ratchet(), "the script must read the same list"
+    if not _ratchet():
+        return  # the list is gone, and the script exits 0 before it would flip anything
+    flipped = ratchet_check.flipped_config(text)
+    assert ratchet_check.ratchet_modules(flipped) == [], "the flipped config must hide no errors"
+    changed = [
+        (a, b) for a, b in zip(text.splitlines(), flipped.splitlines(), strict=True) if a != b
+    ]
+    assert len(changed) == 1, f"the flip must change one line only: {changed}"
+
+
+def test_the_flip_leaves_another_tools_same_named_key_alone() -> None:
+    # coverage.py's [tool.coverage.report] has its own `ignore_errors = true`. Planted beside a
+    # mypy ratchet, it must neither be flipped nor make the flip refuse.
+    text = (
+        '[tool.mypy]\nstrict = true\n\n[[tool.mypy.overrides]]\nmodule = ["tests.test_x"]\n'
+        "ignore_errors = true\n\n[tool.coverage.report]\nignore_errors = true\n"
+    )
+    flipped = ratchet_check.flipped_config(text)
+    assert ratchet_check.ratchet_modules(flipped) == []
+    assert flipped.endswith("[tool.coverage.report]\nignore_errors = true\n")

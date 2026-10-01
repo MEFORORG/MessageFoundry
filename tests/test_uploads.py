@@ -750,7 +750,7 @@ def test_store_settings_quota_defaults_are_on_and_enforced() -> None:
         "uploads_retention_days",
     ):
         with pytest.raises(pydantic.ValidationError):  # ge=1 floor: cannot be disabled with 0
-            StoreSettings(**{key: 0})
+            StoreSettings.model_validate({key: 0})
     us = UploadStore(Path("uploads"), make_cipher(None), max_bytes=1024)
     assert us.max_files_per_user == 100
     assert us.max_total_bytes_per_user == 250 * 1024 * 1024

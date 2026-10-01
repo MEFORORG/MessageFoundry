@@ -11,10 +11,13 @@ teeth — a reordered or dropped grouping does NOT equal the unbatched sequence.
 
 from __future__ import annotations
 
-import adr0075_batch_harness as h
+from typing import Any
+
 import pytest
 
+from messagefoundry.store import MessageStatus
 from messagefoundry.store import sqlserver as ss
+from tests import adr0075_batch_harness as h
 
 
 async def _run_pair(
@@ -27,7 +30,7 @@ async def _run_pair(
 
     # Unbatched (flag OFF): logical sequence == recorded executes.
     det.reset()
-    ss.uuid4 = det  # type: ignore[assignment]
+    h.swap_uuid4(det)
     un_cur, un_conn = h.AsyncRecCursor(scenario), h.RecConn()
     ok = await h.drive_async(
         h.bare_store(batch=False), method, cursor=un_cur, conn=un_conn, **kwargs
@@ -36,7 +39,7 @@ async def _run_pair(
 
     # Batched (flag ON): logical sequence via record_logical, round-trips via .calls.
     det.reset()
-    ss.uuid4 = det  # type: ignore[assignment]
+    h.swap_uuid4(det)
     ba_cur, ba_conn = h.BatchRecCursor(scenario), h.RecConn()
     ok2 = await h.drive_async(
         h.bare_store(batch=True), method, cursor=ba_cur, conn=ba_conn, **kwargs
@@ -48,9 +51,9 @@ async def _run_pair(
 
 @pytest.fixture(autouse=True)
 def _restore_uuid() -> object:
-    saved = ss.uuid4
+    saved = h.current_uuid4()
     yield
-    ss.uuid4 = saved  # type: ignore[assignment]
+    h.swap_uuid4(saved)
 
 
 async def test_route_batched_matches_unbatched_sequence() -> None:
@@ -87,7 +90,7 @@ async def test_transform_batched_matches_unbatched_sequence() -> None:
 async def test_transform_batched_with_state_and_multi_delivery_matches() -> None:
     # State MERGEs + 2 deliveries: the loops fold into the group ending at the finalize applock. Proves
     # the batched form preserves the shared sorted((namespace,key)) order and delivery order.
-    kwargs = dict(  # noqa: C408
+    kwargs: dict[str, Any] = dict(  # noqa: C408
         routed_id="rtd-9",
         message_id="m-9",
         channel_id="IB",
@@ -113,7 +116,7 @@ async def test_route_batch_applies_nocount_framing_on_the_read_group() -> None:
     # rendered round-trip that contains sp_getapplock also contains SET NOCOUNT ON.
     det = h.DetUUID()
     det.reset()
-    ss.uuid4 = det  # type: ignore[assignment]
+    h.swap_uuid4(det)
     cur, conn = h.BatchRecCursor(), h.RecConn()
     await h.drive_async(
         h.bare_store(batch=True), "route_handoff", cursor=cur, conn=conn, **h.ROUTE_KWARGS
@@ -165,14 +168,14 @@ class _BatchEmptyGuard(h.BatchRecCursor):
 async def test_batched_idempotent_noop_matches_unbatched() -> None:
     # When the guard-DELETE finds nothing (already consumed), BOTH forms must roll back and return False
     # after emitting ONLY the guard DELETE — one round-trip, no commit, identical no-op sequence.
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     un_cur, un_conn = _AsyncEmptyGuard(), h.RecConn()
     ok = await h.drive_async(
         h.bare_store(batch=False), "route_handoff", cursor=un_cur, conn=un_conn, **h.ROUTE_KWARGS
     )
     assert ok is False
 
-    ss.uuid4 = h.DetUUID()  # type: ignore[assignment]
+    h.swap_uuid4(h.DetUUID())
     ba_cur, ba_conn = _BatchEmptyGuard(), h.RecConn()
     ok2 = await h.drive_async(
         h.bare_store(batch=True), "route_handoff", cursor=ba_cur, conn=ba_conn, **h.ROUTE_KWARGS
@@ -190,12 +193,12 @@ async def test_batched_idempotent_noop_matches_unbatched() -> None:
 
 
 async def test_route_batched_multi_handler_matches() -> None:
-    kwargs = dict(  # noqa: C408
+    kwargs: dict[str, Any] = dict(  # noqa: C408
         ingress_id="ing-2",
         message_id="m-2",
         channel_id="IB",
         handlers=[("H1", "p1"), ("H2", "p2"), ("H3", "p3")],
-        disposition=ss.MessageStatus.ROUTED,
+        disposition=MessageStatus.ROUTED,
         now=100.0,
     )
     un_calls, ba_logical, ba_rt, un_commits, ba_commits = await _run_pair(
@@ -209,12 +212,12 @@ async def test_route_batched_multi_handler_matches() -> None:
 
 
 async def test_route_batched_unrouted_zero_handlers_matches() -> None:
-    kwargs = dict(  # noqa: C408
+    kwargs: dict[str, Any] = dict(  # noqa: C408
         ingress_id="ing-3",
         message_id="m-3",
         channel_id="IB",
         handlers=[],
-        disposition=ss.MessageStatus.UNROUTED,
+        disposition=MessageStatus.UNROUTED,
         now=100.0,
     )
     un_calls, ba_logical, ba_rt, un_commits, ba_commits = await _run_pair(
@@ -241,7 +244,7 @@ async def test_route_batched_unrouted_zero_handlers_matches() -> None:
 async def test_transform_batched_filtered_disposition_matches() -> None:
     # FILTERED: the transform delivered nothing and no queue rows remain -> the finalizer takes the
     # check_message branch and issues the EXTRA _SQL_SELECT_MESSAGE_STATUS read, then UPDATE=FILTERED.
-    kwargs = dict(  # noqa: C408
+    kwargs: dict[str, Any] = dict(  # noqa: C408
         routed_id="rtd-f",
         message_id="m-f",
         channel_id="IB",
@@ -267,7 +270,7 @@ async def test_transform_batched_filtered_disposition_matches() -> None:
 async def test_transform_batched_still_moving_disposition_matches() -> None:
     # still-moving: a PENDING queue row remains -> the finalizer returns WITHOUT an UPDATE (one fewer
     # statement). Batched must emit the identical (shorter) sequence.
-    kwargs = dict(  # noqa: C408
+    kwargs: dict[str, Any] = dict(  # noqa: C408
         routed_id="rtd-s",
         message_id="m-s",
         channel_id="IB",
@@ -289,7 +292,7 @@ async def test_transform_batched_still_moving_disposition_matches() -> None:
 
 async def test_transform_batched_error_disposition_matches() -> None:
     # ERROR: a DEAD queue row -> finalizer UPDATE=ERROR (no extra status read).
-    kwargs = dict(  # noqa: C408
+    kwargs: dict[str, Any] = dict(  # noqa: C408
         routed_id="rtd-e",
         message_id="m-e",
         channel_id="IB",

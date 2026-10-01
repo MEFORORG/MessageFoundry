@@ -170,7 +170,7 @@ async def test_post_body_enqueues_ingress(store: MessageStore) -> None:
     assert resp.status == 202
     # The body was durably committed to the ingress stage BEFORE the response (count-and-log).
     cur = await store._db.execute("SELECT id, status, raw FROM messages")
-    rows = await cur.fetchall()
+    rows = list(await cur.fetchall())
     assert len(rows) == 1
     assert rows[0]["status"] == MessageStatus.RECEIVED.value
     assert rows[0]["raw"] == JSON_BODY
@@ -190,6 +190,7 @@ async def test_respond_with_receipt_on_ingress(store: MessageStore) -> None:
     assert payload["status"] == "accepted"
     # The receipt carries the engine message_id (AC-2), returned the instant ingress committed.
     msg = await store.get_message(payload["message_id"])
+    assert msg is not None
     assert msg["status"] == MessageStatus.RECEIVED.value
 
 
@@ -231,7 +232,9 @@ async def test_a_body_refused_at_ingress_is_422_with_one_error_row(
     rows = await cur.fetchall()
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue")
-    assert (await cur.fetchone())["n"] == 0, "a refused body reached the ingress stage"
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0, "a refused body reached the ingress stage"
 
 
 async def test_post_ingress_failure_does_not_change_http_status(store: MessageStore) -> None:
@@ -268,6 +271,7 @@ async def test_content_type_selects_payload_object(store: MessageStore) -> None:
         await src.stop()
     assert resp.status == 202
     msg = await store.get_message(resp.json()["message_id"])
+    assert msg is not None
     assert msg["control_id"] == "MSG1" and msg["message_type"] == "ADT^A01"
 
     ic_json = build_inbound_connection(
@@ -279,6 +283,7 @@ async def test_content_type_selects_payload_object(store: MessageStore) -> None:
     finally:
         await src2.stop()
     msg2 = await store.get_message(resp2.json()["message_id"])
+    assert msg2 is not None
     assert msg2["raw"] == JSON_BODY  # routed verbatim as a RawMessage body (no HL7 parse)
     assert msg2["control_id"] is None
 
@@ -297,7 +302,9 @@ async def test_get_health_probe_no_ingress_row(store: MessageStore) -> None:
         await src.stop()
     assert resp.status == 200
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    assert (await cur.fetchone())["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
 
 
 # --- oversize / malformed refused + connection_event (AC-5 shape) ------------
@@ -321,7 +328,9 @@ async def test_oversize_body_refused_and_event(store: MessageStore) -> None:
         await src.stop()
     assert resp.status == 413
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    assert (await cur.fetchone())["n"] == 0  # refused BEFORE any ingress row
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # refused BEFORE any ingress row
     assert any(kind == "frame_oversize" for kind, *_ in events)
 
 
@@ -370,7 +379,9 @@ async def test_incomplete_declared_body_refused_and_event(store: MessageStore) -
     assert resp.status == 400
     assert any(kind == "framing_error" for kind, *_ in events)
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    assert (await cur.fetchone())["n"] == 0  # refused BEFORE any ingress row -- no handler ran
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # refused BEFORE any ingress row -- no handler ran
 
 
 # --- AC-5: peer-IP allowlist refuse + connection_event -----------------------
@@ -393,7 +404,9 @@ async def test_ip_allowlist_refuse_and_connection_event(store: MessageStore) -> 
         await src.stop()
     assert resp.status in (403, 0)  # 403 when it flushed; 0 = reset before flush (Windows Proactor)
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    assert (await cur.fetchone())["n"] == 0  # fail-closed: never reached ingress
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # fail-closed: never reached ingress
     assert any(kind == "peer_not_allowlisted" for kind, *_ in events)
 
 
@@ -928,7 +941,9 @@ async def test_a_framing_refusal_is_answered_logged_and_never_ingested(
     assert resp.headers.get("connection") == "close"
     assert any(kind == "framing_error" for kind, *_ in events)
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    assert (await cur.fetchone())["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
 
 
 # --- Host header: exactly one on HTTP/1.1, never two (RFC 9112 section 3.2, BACKLOG #1972) --------
@@ -1054,7 +1069,9 @@ async def test_a_host_refusal_is_answered_400_content_free_and_never_ingested(
     assert not any("SENTINEL" in str(event) for event in events)
     assert "SENTINEL" not in caplog.text
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-    assert (await cur.fetchone())["n"] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0
 
 
 def test_build_response_shape() -> None:
@@ -1194,7 +1211,8 @@ async def test_accepted_socket_disables_nagle(
     # the accepted socket would pass whether or not _on_client calls _set_tcp_nodelay — vacuous. Spy
     # instead, the same way tests/test_mllp_tcp_nodelay.py proves the outbound dial.
     calls: list[Any] = []
-    real_set = http_mod._set_tcp_nodelay
+    # http_listener imports it from mllp; the name is read at its home, then patched where it is used.
+    from messagefoundry.transports.mllp import _set_tcp_nodelay as real_set
 
     def spy(writer: Any) -> None:
         calls.append(writer)
@@ -1255,7 +1273,7 @@ async def test_respond_drain_is_bounded(
 # ingress row (status is asserted with the same (4xx, 0) tolerance the file already uses).
 
 
-async def _wait_for(predicate, timeout: float = 2.0) -> bool:  # type: ignore[no-untyped-def]
+async def _wait_for(predicate, timeout: float = 2.0) -> bool:
     """Poll ``predicate`` until true or ``timeout`` — mirrors the MLLP analog rather than sleeping."""
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -1292,13 +1310,17 @@ async def test_slow_loris_refused_and_listener_stays_live(store: MessageStore) -
         )  # 408 when flushed; 0 = reset before flush (Windows Proactor)
         assert await _wait_for(lambda: any(k == "idle_timeout" for k, *_ in events))
         cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-        assert (await cur.fetchone())["n"] == 0  # slow-loris refused pre-ingress: no row
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 0  # slow-loris refused pre-ingress: no row
 
         # Listener stays live: a follow-on well-formed POST is accepted + committed.
         ok = await _http(src.sockport, body=JSON_BODY.encode("utf-8"))
         assert ok.status == 202
         cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-        assert (await cur.fetchone())["n"] == 1  # only the good POST reached ingress
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 1  # only the good POST reached ingress
     finally:
         await asyncio.wait_for(src.stop(), timeout=8.0)
 
@@ -1333,7 +1355,9 @@ async def test_max_connections_flood_refused_and_event(store: MessageStore) -> N
         )  # 503 when flushed; 0 = reset before flush (Windows Proactor)
         assert await _wait_for(lambda: any(k == "at_capacity" for k, *_ in events))
         cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-        assert (await cur.fetchone())["n"] == 0  # capacity refusal never reaches ingress
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 0  # capacity refusal never reaches ingress
     finally:
         for writer in holders:
             writer.close()
@@ -1365,7 +1389,9 @@ async def test_body_flood_no_content_length_refused(store: MessageStore) -> None
         )  # 411 when flushed; 0 = reset before flush (Windows Proactor)
         assert await _wait_for(lambda: any(k == "framing_error" for k, *_ in events))
         cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
-        assert (await cur.fetchone())["n"] == 0  # refused before any ingress row
+        fetched_row = await cur.fetchone()
+        assert fetched_row is not None
+        assert fetched_row["n"] == 0  # refused before any ingress row
     finally:
         await asyncio.wait_for(src.stop(), timeout=8.0)
 

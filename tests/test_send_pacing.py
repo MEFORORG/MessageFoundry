@@ -12,7 +12,7 @@ independence, the already-elapsed path, the no-pacing default, and the wiring va
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -30,6 +30,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _resolve_send_pace
 from messagefoundry.store import MessageStore
+from messagefoundry.transports.base import DestinationConnector
 
 DEST = "OB_ADT"
 DEST2 = "OB_LAB"
@@ -39,13 +40,13 @@ def _msg(n: int) -> str:
     return f"MSH|^~\\&|A|B|C|D|20260101000000||ADT^A0{n}|MSG{n}|P|2.5.1\rPID|1||{n}00||DOE^P{n}\r"
 
 
-class _Recorder:
+class _Recorder(DestinationConnector):
     """A minimal non-capturing outbound (returns None → mark_done). Records each delivered payload."""
 
     def __init__(self) -> None:
         self.sent: list[str] = []
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         self.sent.append(payload)
         return None
 
@@ -117,7 +118,9 @@ def test_env_ref_send_pace_refused_at_build() -> None:
     """
     with pytest.raises(WiringError, match=_ENV_PACE_REFUSAL) as caught:
         build_outbound_connection(
-            "OB", MLLP(host="127.0.0.1", port=1234, send_min_interval_seconds=env("pace"))
+            "OB",
+            # The wrong type IS the input under test: the refusal is for a caller who passes one.
+            MLLP(host="127.0.0.1", port=1234, send_min_interval_seconds=env("pace")),  # type: ignore[arg-type]
         )
     assert "'pace'" in str(caught.value)  # names the key the operator has to go remove
 

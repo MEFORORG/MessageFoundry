@@ -93,7 +93,7 @@ async def test_stop_never_cancels_a_hand_off_in_progress(
     inbox.mkdir()
     (inbox / "one.hl7").write_bytes(_MSG.format(n=1).encode("ascii"))
     source = _source(inbox)
-    real_move = FileSource._move
+    real_move = source._move
 
     def slow_move(path: Path, dest_dir: Path) -> bool:
         # Longer than the 0.25 s window before stop() next looks, so a stop() that skips the grace

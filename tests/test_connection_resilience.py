@@ -13,6 +13,7 @@ decode failure: test_wiring_engine.py::test_inbound_decode_error_records_error_a
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
+from messagefoundry.transports.base import DestinationConnector
 from messagefoundry.transports.mllp import MLLPDestination
 
 ADT = (
@@ -37,13 +39,13 @@ ADT = (
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "resilience.db")
     yield s
     await s.close()
 
 
-class _HangingDestination:
+class _HangingDestination(DestinationConnector):
     """A connector whose send() hangs forever (until the delivery worker task is cancelled). Models
     a wedged downstream — the worst case for graceful stop."""
 
@@ -51,7 +53,7 @@ class _HangingDestination:
         self.entered = asyncio.Event()  # set the moment send() is first called
         self.closed = False
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
         self.entered.set()
         await asyncio.Event().wait()  # never returns; only a task cancellation unblocks it
 

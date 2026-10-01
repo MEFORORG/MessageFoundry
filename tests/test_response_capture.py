@@ -11,6 +11,7 @@ wiring-time validation, and the fail-closed runner-start capture-support gate.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -73,8 +74,11 @@ async def test_complete_with_response_persists_and_marks_done(store: MessageStor
     # The outbound row is DONE and the message finalized PROCESSED (the response table is invisible to
     # _maybe_finalize_message, which scans `queue` only).
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
-    assert (await cur.fetchone())["status"] == OutboxStatus.DONE.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.DONE.value
     msg = await store.get_message(mid)
+    assert msg is not None
     assert msg["status"] == MessageStatus.PROCESSED.value
     # correlate_response returns the decrypted reply.
     caps = await store.correlate_response(mid)
@@ -93,7 +97,9 @@ async def test_mark_done_writes_no_response_row_xor(store: MessageStore) -> None
     mid, item = await _enqueue_and_claim(store)
     await store.mark_done(item.id, now=101.0)  # non-capturing delivery
     assert await store.correlate_response(mid) == []
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_complete_with_response_writes_ledger_row_same_txn(store: MessageStore) -> None:
@@ -121,14 +127,18 @@ async def test_replay_resend_after_capture_appends_response_and_reseeds_ledger(
     requeued = await store.replay(mid, now=102.0)  # re-send → ledger entry dropped
     assert requeued == 1
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM delivered_keys")
-    assert (await cur.fetchone())["n"] == 0  # ledger cleared for the re-sent row (NOT deduped)
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 0  # ledger cleared for the re-sent row (NOT deduped)
     again = await store.claim_next_fifo("OB_Q", now=103.0)
     assert again is not None and again.id == item.id  # claimed normally, not skip-and-completed
     await store.complete_with_response(again.id, body="R2", outcome="accepted", now=104.0)
     caps = await store.correlate_response(mid)
     assert [(c.response_seq, c.body) for c in caps] == [(1, "R1"), (2, "R2")]
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM delivered_keys")
-    assert (await cur.fetchone())["n"] == 1  # one fresh ledger row for the re-delivery
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["n"] == 1  # one fresh ledger row for the re-delivery
 
 
 async def test_response_seq_is_replay_stable(store: MessageStore) -> None:
@@ -180,7 +190,9 @@ async def test_crash_between_send_and_commit_leaves_no_partial(
         await store.complete_with_response(item.id, body="R1", outcome="accepted", now=101.0)
     # Rolled back: the row is still INFLIGHT and there is NO partial response row.
     cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (item.id,))
-    assert (await cur.fetchone())["status"] == OutboxStatus.INFLIGHT.value
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row["status"] == OutboxStatus.INFLIGHT.value
     assert await store.correlate_response(mid) == []
     # Recovery: reset_stale_inflight → pending; re-claim; re-send commits exactly one response (seq=1).
     await store.reset_stale_inflight(now=102.0)
@@ -188,7 +200,9 @@ async def test_crash_between_send_and_commit_leaves_no_partial(
     await store.complete_with_response(items2[0].id, body="R2", outcome="accepted", now=104.0)
     caps = await store.correlate_response(mid)
     assert [(c.response_seq, c.body) for c in caps] == [(1, "R2")]  # exactly one committed capture
-    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    fetched = await store.get_message(mid)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.PROCESSED.value
 
 
 async def test_response_body_encrypted_at_rest(tmp_path: Any) -> None:
@@ -277,8 +291,8 @@ def test_mllp_unparseable_reply_capture_vs_retry() -> None:
 async def test_mllp_read_failure_is_delivery_error_not_capture() -> None:
     # A failure to READ a reply frame (peer closed) is a delivery failure that retries — never captured,
     # even for a capturing outbound.
-    class _EmptyReader:
-        async def read(self, _n: int) -> bytes:
+    class _EmptyReader(asyncio.StreamReader):
+        async def read(self, n: int = -1) -> bytes:
             return b""
 
     with pytest.raises(DeliveryError):
@@ -401,8 +415,8 @@ class _Resp:
     def __enter__(self) -> _Resp:
         return self
 
-    def __exit__(self, *a: object) -> bool:
-        return False
+    def __exit__(self, *a: object) -> None:
+        return None
 
 
 class _Opener:
@@ -420,7 +434,7 @@ def _rest(capture: bool) -> Any:
 
 async def test_rest_capture_2xx_body_and_empty() -> None:
     d = _rest(True)
-    d._opener = _Opener(_Resp(b'{"id":7}', 201))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(b'{"id":7}', 201))
     r = await d.send("{}")
     assert (
         r is not None
@@ -428,14 +442,14 @@ async def test_rest_capture_2xx_body_and_empty() -> None:
         and r.body == '{"id":7}'
         and r.detail == "HTTP 201"
     )
-    d._opener = _Opener(_Resp(b"", 204))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(b"", 204))
     r2 = await d.send("{}")
     assert r2 is not None and r2.outcome == "no_reply"
 
 
 async def test_rest_noncapture_returns_none() -> None:
     d = _rest(False)
-    d._opener = _Opener(_Resp(b"anything", 200))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(b"anything", 200))
     assert await d.send("{}") is None
 
 
@@ -457,18 +471,18 @@ def _soap(capture: bool) -> Any:
 
 async def test_soap_capture_clean_and_fault() -> None:
     d = _soap(True)
-    d._opener = _Opener(_Resp(_SOAP_OK.encode(), 200))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(_SOAP_OK.encode(), 200))
     r = await d.send("<req/>")
     assert r is not None and r.outcome == "accepted" and "Result" in r.body
     # A 2xx <Fault> is CAPTURED as 'rejected' (not raised) for a capturing outbound.
-    d._opener = _Opener(_Resp(_SOAP_FAULT.encode(), 200))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(_SOAP_FAULT.encode(), 200))
     r2 = await d.send("<req/>")
     assert r2 is not None and r2.outcome == "rejected"
 
 
 async def test_soap_noncapture_fault_still_raises() -> None:
     d = _soap(False)
-    d._opener = _Opener(_Resp(_SOAP_FAULT.encode(), 200))  # type: ignore[assignment]
+    d._opener = _Opener(_Resp(_SOAP_FAULT.encode(), 200))
     with pytest.raises((DeliveryError, NegativeAckError)):
         await d.send("<req/>")
 

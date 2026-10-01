@@ -17,15 +17,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 
 
-class _Coordinator:
+class _Coordinator(NullCoordinator):
     """A fake coordinator with configurable leader / reclaims-inflight answers and no-op lifecycle."""
 
     def __init__(self, *, leader: bool, reclaims: bool) -> None:
-        self.node_id = "fake"
+        super().__init__("fake")
         self._leader = leader
         self._reclaims = reclaims
         self.started = False

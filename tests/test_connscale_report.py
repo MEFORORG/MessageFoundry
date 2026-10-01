@@ -82,6 +82,7 @@ def test_herd_is_reported_separately_from_idle_poll() -> None:
     )
     d = rec.to_json_dict()
     w3 = d["wall3_empty_claims"]
+    assert isinstance(w3, dict)
     assert w3["total_per_s"] == 10.0
     assert w3["idle_poll_per_s"] == 4.0  # the steady poll-interval floor
     assert w3["wake_fanout_per_s"] == 6.0  # the per-commit thundering herd (read distinctly)

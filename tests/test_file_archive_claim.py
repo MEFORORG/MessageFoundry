@@ -101,7 +101,7 @@ def test_archive_move_removes_the_original(tmp_path: Path) -> None:
     dropped = inbox / "m.hl7"
     dropped.write_text("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5.1\r", encoding="ascii")
 
-    FileSource._move(dropped, processed)
+    _source(inbox)._move(dropped, processed)
 
     assert not dropped.exists(), "the archived file must not be left in the watch directory"
     assert (processed / "m.hl7").read_text(encoding="ascii").startswith("MSH|"), (
@@ -123,7 +123,7 @@ def test_archive_move_escalates_instead_of_clobbering_a_taken_name(tmp_path: Pat
     dropped = inbox / "m.hl7"
     dropped.write_text("newly-processed", encoding="ascii")
 
-    FileSource._move(dropped, processed)
+    _source(inbox)._move(dropped, processed)
 
     assert (processed / "m.hl7").read_text(encoding="ascii") == "already-archived"
     assert (processed / "m-1.hl7").read_text(encoding="ascii") == "newly-processed"

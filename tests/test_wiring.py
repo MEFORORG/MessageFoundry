@@ -21,6 +21,7 @@ from messagefoundry.config.wiring import (
     InboundConnection,
     PortConflictError,
     Registry,
+    Send,
     Sftp,
     WiringError,
     build_inbound_connection,
@@ -96,7 +97,8 @@ def test_load_config_populates_registry(tmp_path: Path) -> None:
     # the registered scripts actually run
     assert reg.routers["adt_router"](Message.parse(_MSG)) == ["archive"]
     send = reg.handlers["archive"](Message.parse(_MSG))
-    assert send is not None and send.to == "adt_archive"
+    assert isinstance(send, Send) and send.to == "adt_archive"
+    assert isinstance(send.message, Message)
     assert send.message["MSH-3"] == "FOUNDRY"  # handler transformed the message
 
 

@@ -665,8 +665,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `ad_tls_ca_cert_file` | str | — | trust an internal CA for LDAPS without disabling verification |
 | `ad_tls_ca_cert_pin` | str | — | optional lowercase-hex SHA-256 pin over the corresponding CA anchor PEM (`ad_tls_ca_cert_file`); a mismatch refuses at load + reload (ASVS 6.7.1); unset = no pin (dormant); set but empty or whitespace refuses at load |
 | `ad_allow_insecure_ldap` | bool | `false` | explicit opt-in to a non-`ldaps://` bind (trusted-network dev only) |
-| `ad_connect_timeout` | float | `10.0` | seconds — bounds the LDAP/LDAPS **TCP connect** on every `ldap3` `Server` the authenticator builds (ASVS 13.1.3). Must be finite and `> 0`; `0`, negative, `inf` and `NaN` are refused at config load. `ldap3`'s own default is `None` (wait forever), so without this an unresponsive DC pinned a thread-pool worker indefinitely |
-| `ad_receive_timeout` | float | `10.0` | seconds — bounds **each LDAP response read** (both binds and every search) on every `ldap3` `Connection`. Same finite-positive validation |
+| `ad_connect_timeout` | float | `10.0` | seconds — bounds the LDAP/LDAPS **TCP connect** on every `ldap3` `Server` the authenticator builds (ASVS 13.1.3). Must be finite and `> 0`; `0`, negative, `inf` and `NaN` are refused at config load, and so is anything above `3600`. `ldap3`'s own default is `None` (wait forever), so without this an unresponsive DC pinned a thread-pool worker indefinitely |
+| `ad_receive_timeout` | float | `10.0` | seconds — bounds **each socket receive** during an LDAP response (both binds and every search) on every `ldap3` `Connection`. Same validation, up to `3600`. The engine rounds it up to whole seconds before handing it to `ldap3`, so `9.25` acts as `10` |
 | `ad_session_recheck_seconds` | int | `300` | **Directory session reconciliation** ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md) mechanism 2). How often to re-resolve directory principals holding **live** sessions and revoke those AD has disabled or deleted — without it, an AD disable does not take effect until the `[security].max_session_hours` cap (12 h). **`300` (five minutes) is the default** (ADR 0148 GIVEN 1 — the hardened path is the shipped path), floored at **60 s** (a pass costs one LDAP bind per signed-in directory user). `0` disables the loop and is a **loosening** once AD is on — `security_loosenings()` names it. The default is **inert without AD** (`should_reconcile()` also needs an LDAP client), so a non-AD deployment is unaffected; an **explicit** non-zero value without `ad_enabled` is still refused rather than left silently dead. |
 | `ad_session_recheck_strikes` | int | `2` | Consecutive passes a principal must fail to resolve before its sessions are revoked. *The search matched nothing* cannot tell *deleted* from *moved out of the search base*, so a single ambiguous result must never revoke; a set disabled bit and an unreadable `userAccountControl` strike the same way. A wave of unreadable answers is held instead of revoked, with no setting ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md)). Range 1–10. |
 | `ad_session_recheck_max_users` | int | `200` | Per-pass bind budget. Beyond this, remaining users are picked up by later passes (least-recently-probed first), so a large estate degrades to a longer effective interval instead of a bind storm. |
@@ -1360,8 +1360,18 @@ the TLS leg to the proxy uses the same approved suites as the Vault leg. It is v
 same anchor too: the CA file when one is set, so the proxy's certificate must chain to it, and the
 public bundle otherwise. An `http://` Vault address through an
 `https://` proxy is **refused**, because that leg could not be verified. Use an `https://` Vault
-address (BACKLOG #300). Do not read `NO_PROXY` as the remedy: it sends the token over plain `http://`
-the whole way, which is weaker still, and a direct `http://` Vault address is not refused.
+address (BACKLOG #300). `NO_PROXY` is not a way around it either: a remote `http://` Vault reached
+directly is refused too, as the next paragraph says.
+**Each Vault client refuses a Vault address that is not `https://`** (BACKLOG #2317). That holds
+for at least the KV secret provider here, the store key provider and the Transit cipher. It covers
+a direct `http://` address and one behind an `http://` proxy, including hvac's own `VAULT_ADDR`
+fallback. The one `http://` address allowed is a loopback Vault that the client reaches with no
+proxy, because that hop stays on the box. Loopback is decided without DNS: the name `localhost` or
+a loopback IP literal, and no other name, whatever it resolves to. An address that does not read as
+one well-formed URL is refused too. The refusal comes when the client is built, as the provider's
+own fail-closed error, and again before each send in case a proxy appeared since. Its text names no
+part of the address, and `[security].enforcement` does not relax it. An `https://` Vault behind an
+`http://` proxy is still allowed: the token rides inside the TLS tunnel to Vault.
 **Fail-closed:** a reference with `provider = none`,
 an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
 never a blank credential; the value is never logged.

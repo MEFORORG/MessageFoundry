@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
@@ -347,6 +348,8 @@ def test_the_adr_sweep_is_invariant_under_the_console_code_page(
     started in the private console, just before the sweep's, report its page: without that, a launch
     that never reached the DBCS page would pass everywhere.
     """
+    if sys.platform != "win32":  # the skipif above already skips it; this line tells mypy
+        pytest.skip("Windows only")
     repo = _checkout(tmp_path / f"cp{codepage}", {"0100-primer.md": "# Primer\n"})
 
     body, oid = _body_whose_blob_id_ends_in_a_lead_byte(repo)

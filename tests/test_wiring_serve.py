@@ -8,7 +8,7 @@ import asyncio
 import textwrap
 from pathlib import Path
 
-from messagefoundry.config.wiring import load_config
+from messagefoundry.config.wiring import Send, load_config
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline import Engine
 
@@ -73,7 +73,7 @@ def test_sample_config_loads_and_routes() -> None:
     assert reg.routers["adt_router"](a01) == ["archive"]
     assert reg.routers["adt_router"](oru) == []  # non-ADT routed nowhere (UNROUTED)
     send = reg.handlers["archive"](a01)
-    assert send is not None and send.to == "FILE-OUT_Test_ADT"
+    assert isinstance(send, Send) and send.to == "FILE-OUT_Test_ADT"
     assert reg.handlers["archive"](a99) is None  # non-A01/04/08 ADT filtered
 
 

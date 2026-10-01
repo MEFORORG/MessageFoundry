@@ -213,11 +213,57 @@ def test_the_gate_does_not_untype_the_published_response_schema() -> None:
             )
 
 
-def test_declaring_a_property_the_serializer_does_not_cover_is_refused() -> None:
-    """The one way this gate could go quietly inert: a gated property outside the set the base
-    class's field serializer is declared over would never reach the serializer at all.
+def test_the_gate_leaves_every_ungated_field_typed_by_its_own_annotation() -> None:
+    """BACKLOG #2443 step 4. The gate's serializer used to cover every field with a gateable name
+    on every gated model, gated or not, and type it ``str | None``. ``ConnectionMetadata.metadata``
+    is a dict, so it could not be gated without publishing it as a string and warning on every
+    response. Now each model's serializer covers only its own gated properties. So on every mapped
+    model, an ungated field's serialization schema equals its validation schema, and a dict
+    ``metadata`` dumps with no serializer warning. A gated field is the control: it differs only in
+    being the serializer's ``str | None``, pinned by the test above."""
+    import warnings
 
-    So class creation refuses it. Proven by construction, not by review.
+    from messagefoundry.api.models import ConnectionMetadata
+
+    for model_cls in PHI_FIELDS:
+        assert issubclass(model_cls, PhiGatedModel)
+        ser = model_cls.model_json_schema(mode="serialization")["properties"]
+        val = model_cls.model_json_schema(mode="validation")["properties"]
+        for field in set(model_cls.model_fields) - model_cls.phi_gated_properties:
+            assert ser[field] == val[field], (
+                f"{model_cls.__name__}.{field} is ungated but its published type changed: "
+                f"{ser[field]} != {val[field]}"
+            )
+    assert (
+        ConnectionMetadata.model_json_schema(mode="serialization")["properties"]["metadata"][
+            "anyOf"
+        ][0]["type"]
+        == "object"
+    )
+    meta = ConnectionMetadata(
+        name="OB",
+        direction="out",
+        method="file",
+        running=False,
+        metadata={"owner": "team", "tier": 1},
+        settings={},
+        error="boom",
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        dumped = json.loads(meta.model_dump_json())
+    assert dumped["metadata"] == {"owner": "team", "tier": 1}
+    assert dumped["error"] is None  # unreleased, so withheld: the gate still fires
+
+
+def test_declaring_a_property_the_serializer_does_not_cover_is_refused() -> None:
+    """A gated name outside ``GATEABLE_PROPERTIES``, the reviewed vocabulary, is refused at class
+    creation, and so is a gated name that is not a field (a typo that would gate nothing).
+
+    **CORRECTED (BACKLOG #2443 step 4).** This said the base class's ONE field serializer covers
+    that set, so an outside name would never reach it. Each model now gets a serializer over its
+    own declared names, so coverage holds by construction; the vocabulary check remains so a new
+    PHI-bearing name is added in review rather than in passing.
     """
     with pytest.raises(TypeError, match="phi_gated_properties"):
 
@@ -241,3 +287,55 @@ def test_declaring_a_property_the_serializer_does_not_cover_is_refused() -> None
 
     assert Fine(summary=_SUMMARY).model_dump(mode="json")["summary"] is None
     assert "summary" in GATEABLE_PROPERTIES
+
+
+def test_a_set_brought_in_by_a_mixin_is_still_gated() -> None:
+    """The per-model serializer reads the set as the class resolves it, so a declaration that
+    arrives through a plain mixin is covered like one on the class itself (review finding on
+    BACKLOG #2443 step 4: keyed on the class's own namespace, this serialized the MRN in full)."""
+
+    class GatedMixin:
+        phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"summary"})
+
+    class Mixed(GatedMixin, PhiGatedModel):
+        summary: str | None = None
+
+    assert json.loads(Mixed(summary=_SUMMARY).model_dump_json())["summary"] is None
+    released = Mixed(summary=_SUMMARY)
+    released.release_phi({"summary"})  # the positive control: release lets it through
+    assert json.loads(released.model_dump_json())["summary"] == _SUMMARY
+
+
+def test_a_subclass_may_not_ungate_a_parent_property_or_gate_a_non_string() -> None:
+    """Two shapes the per-model serializer cannot serve, each refused at class creation. Dropping
+    a parent's gated property would leave the parent's ``str | None`` serializer on a field that
+    is no longer gated. Gating a dict field would publish it as a string and warn on every dump,
+    which is the ``ConnectionMetadata.metadata`` hazard. The well-formed subclass is the control."""
+    with pytest.raises(TypeError, match="ungates"):
+
+        class Lite(MessageSummary):
+            phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"summary", "error"})
+
+    with pytest.raises(TypeError, match=r"str \| None"):
+
+        class DictGated(PhiGatedModel):
+            phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"metadata"})
+
+            metadata: dict[str, Any] | None = None
+
+    # A constrained string is still a string: it is accepted, and gated.
+    from typing import Annotated
+
+    from pydantic import StringConstraints
+
+    class Capped(PhiGatedModel):
+        phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"error"})
+
+        error: Annotated[str, StringConstraints(max_length=500)] | None = None
+
+    assert json.loads(Capped(error="boom").model_dump_json())["error"] is None
+
+    class Wider(MessageSummary):
+        pass
+
+    assert Wider.phi_gated_properties == MessageSummary.phi_gated_properties

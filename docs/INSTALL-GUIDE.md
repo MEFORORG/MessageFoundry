@@ -52,10 +52,10 @@ On each host, create a virtual environment and install the engine at a **pinned 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1                 # Linux/macOS: . .venv/bin/activate
-pip install "messagefoundry==0.4.0"          # pin the exact version (core runtime only)
+pip install "messagefoundry==0.5.0"          # pin the exact version (core runtime only)
 ```
 
-> **CAUTION: early access.** `0.4.0` is an **Early Access** release on public PyPI — feature-complete and
+> **CAUTION: early access.** `0.5.0` is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
 > launch. Earlier releases, back to the `0.1.0rc1` pre-release, remain installable. You can equally
 > install from the engine's **GitHub Release assets** or your organization's **private index**.
@@ -85,7 +85,7 @@ the **GitHub CLI** (`gh` ≥ 2.49), and optionally `sigstore` (`pip install sigs
 file that passes.
 
 ```powershell
-$V = "0.4.0"   # the exact version you intend to install
+$V = "0.5.0"   # the exact version you intend to install
 
 # Download the wheel + its Sigstore bundle from that release's assets
 gh release download "v$V" --repo MEFORORG/MessageFoundry `
@@ -120,7 +120,7 @@ re-resolve the package name against the folder at install time, or `pip` could s
 different file than the one you just checked:
 
 ```powershell
-$V = "0.4.0"
+$V = "0.5.0"
 pip download "messagefoundry==$V" --no-deps -d .\verify
 if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit $LASTEXITCODE)" }
 
@@ -170,7 +170,7 @@ my-config-repo/
 ├─ environments/prod.toml
 ├─ messages/sets/example_adt.hl7   # a synthetic fixture (NO real PHI) that gates `check`
 ├─ messagefoundry.toml             # THIS instance's settings (environment + posture + store + API + egress)
-├─ requirements.txt                # pins the engine:  messagefoundry==0.4.0
+├─ requirements.txt                # pins the engine:  messagefoundry==0.5.0
 ├─ .github/workflows/check.yml     # CI: install the pinned engine + run `messagefoundry check` on every PR
 ├─ .vscode/settings.json           # points the VS Code extension at config/ + messages/
 ├─ .gitignore  .gitattributes      # excludes stores, secrets, captures, venvs, caches
@@ -297,7 +297,7 @@ release built for the engine version you pinned. The console is **on by default*
 instance installing it is all you need:
 
 ```powershell
-pip install "messagefoundry-webconsole==0.3.0"    # the /ui web console for engine 0.4.0, into the same venv
+pip install "messagefoundry-webconsole==0.4.0"    # the /ui web console for engine 0.5.0, into the same venv
 # then (re)start the engine — there is no switch to turn on. To turn the console OFF, set
 # [security].serve_web_console = false (the old [api].serve_ui spelling is refused at config load)
 ```

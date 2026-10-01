@@ -278,7 +278,9 @@ async def test_reset_temp_password_expires_when_unclaimed() -> None:
         assert not out.ok  # expired → refused, even with the CORRECT temp password
         assert out.error == "invalid credentials"  # generic — not distinguishable from a wrong pw
         # the account is NOT disabled — an admin can re-issue a fresh temp
-        assert (await store.get_user_by_username("alice")).disabled is False
+        fetched = await store.get_user_by_username("alice")
+        assert fetched is not None
+        assert fetched.disabled is False
     finally:
         await store.close()
 
@@ -292,6 +294,7 @@ async def test_claimed_temp_password_is_not_gated() -> None:
         await service.initialize()
         await _make_reset_temp(store, service)
         alice = await store.get_user_by_username("alice")
+        assert alice is not None
         await store.set_password(
             alice.id,
             password_hash=hash_password("the-users-own-chosen-passphrase"),
@@ -315,6 +318,7 @@ async def test_initial_password_expiry_zero_disables_the_gate() -> None:
         await service.initialize()
         temp = (await _make_reset_temp(store, service)).password
         alice = await store.get_user_by_username("alice")
+        assert alice is not None
         await store._db.execute(
             "UPDATE users SET password_changed_at=? WHERE id=?",
             (time.time() - 9999 * 3600, alice.id),
@@ -607,7 +611,7 @@ async def test_notifier_failure_is_isolated_from_the_auth_op() -> None:
         # and this test is about the rotation's own effects.
         service = AuthService(
             store, AuthSettings(require_mfa=False), security_notifier=_BoomNotifier()
-        )  # type: ignore[arg-type]
+        )
         await _local_user(store)
         out = await service.login("bob", GOOD_PASSWORD)
         assert out.ok and out.identity is not None
@@ -635,7 +639,7 @@ async def test_a_failed_notice_logs_the_kind_the_account_and_the_exception_class
     address or an EMAIL_CHANGED ``detail``."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(), security_notifier=_AddressQuotingNotifier())  # type: ignore[arg-type]
+        service = AuthService(store, AuthSettings(), security_notifier=_AddressQuotingNotifier())
         await _local_user(store)
         with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
             await service.update_user(
@@ -664,7 +668,7 @@ async def test_the_two_notice_warnings_escape_a_line_break_in_the_username(
     escape them at the call site, and an unknown kind is logged as ``unrecognised``, not echoed."""
     store = await _store()
     try:
-        service = AuthService(store, AuthSettings(), security_notifier=notifier)  # type: ignore[arg-type]
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
         with caplog.at_level(logging.WARNING, logger=_AUTH_LOGGER):
             await service._notify_security(PASSWORD_CHANGED, username="bob\r\nforged", email=None)
             await service._notify_security("free-form kind", username="bob", email=None)

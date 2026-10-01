@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from pydantic import ValidationError
+from starlette.types import Message as AsgiMessage
+from starlette.websockets import WebSocket
 
 from messagefoundry.api import create_app
 from messagefoundry.api.models import DeadLetterReplayRequest
@@ -98,10 +100,20 @@ def test_configure_logging_uses_utc_timestamps() -> None:
 # --- WP-2: WebSocket Origin allowlist ---------------------------------------
 
 
-def _fake_ws(origin: str | None, allowed: tuple[str, ...]) -> SimpleNamespace:
+async def _no_receive() -> AsgiMessage:
+    raise AssertionError("the origin check never reads the socket")
+
+
+async def _no_send(message: AsgiMessage) -> None:
+    raise AssertionError("the origin check never writes the socket")
+
+
+def _fake_ws(origin: str | None, allowed: tuple[str, ...]) -> WebSocket:
+    """A real WebSocket over a hand-built scope: its headers and its app's state are all the check reads."""
     state = SimpleNamespace(ws_allowed_origins=allowed)
-    headers: dict[str, str] = {} if origin is None else {"origin": origin}
-    return SimpleNamespace(headers=headers, app=SimpleNamespace(state=state))
+    headers = [] if origin is None else [(b"origin", origin.encode())]
+    scope = {"type": "websocket", "headers": headers, "app": SimpleNamespace(state=state)}
+    return WebSocket(scope, receive=_no_receive, send=_no_send)
 
 
 def test_ws_origin_allows_native_client_without_origin() -> None:
@@ -192,7 +204,7 @@ def test_webhook_rejects_host_outside_allowlist() -> None:
 def test_webhook_no_redirect_handler_refuses_redirects() -> None:
     handler = _NoRedirectHandler()
     req = urllib.request.Request("http://a/x")
-    assert handler.redirect_request(req, None, 302, "Found", {}, "http://b/y") is None  # type: ignore[arg-type]
+    assert handler.redirect_request(req, None, 302, "Found", {}, "http://b/y") is None
 
 
 # --- WP-7c: file content sniff ----------------------------------------------

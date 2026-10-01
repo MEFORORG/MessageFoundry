@@ -67,7 +67,7 @@ def _ca_pem(tmp_path: Path, cn: str = "mefor-internal-ca") -> str:
 def test_connection_ca_wins_verbatim_over_every_mode() -> None:
     # A connection that names its own tls_ca_file is authoritative regardless of the instance policy.
     for mode in ("system", "augment", "pinned"):
-        policy = TrustAnchorPolicy(internal_ca_file="/org/internal-ca.pem", mode=mode)  # type: ignore[arg-type]
+        policy = TrustAnchorPolicy(internal_ca_file="/org/internal-ca.pem", mode=mode)
         anchor = resolve_trust_anchor(
             connection_ca_file="/conn/own-ca.pem", host="pacs.internal", policy=policy
         )
@@ -294,7 +294,7 @@ def test_augment_mode_without_internal_ca_is_allowed() -> None:
 
 def _opener_context(opener: urllib.request.OpenerDirector) -> ssl.SSLContext | None:
     """The ``SSLContext`` ``opener``'s https handler will hand every connection it opens."""
-    for handler in opener.handlers:
+    for handler in opener.handlers:  # type: ignore[attr-defined]  # typeshed omits it
         if hasattr(handler, "https_open"):
             ctx = getattr(handler, "_context", None)
             if isinstance(ctx, ssl.SSLContext):
@@ -307,9 +307,9 @@ def _ca_subjects(ctx: ssl.SSLContext) -> set[str]:
     names: set[str] = set()
     for cert in ctx.get_ca_certs():
         for rdn in cert.get("subject", ()):
-            for attr, value in rdn:
-                if attr == "commonName":
-                    names.add(value)
+            for pair in rdn:  # (attribute, value); typeshed also admits a bare str here
+                if pair[0] == "commonName":
+                    names.add(pair[1])
     return names
 
 
@@ -425,13 +425,13 @@ def test_anchored_https_handler_trusts_only_the_internal_ca(tmp_path: Path) -> N
     handler = build_anchored_https_handler(
         anchor=TrustAnchor(cafile=ca, load_system_roots=False), connector="test"
     )
-    ctx = handler._context
+    ctx = handler._context  # type: ignore[attr-defined]  # a private stdlib attribute
     assert _ca_subjects(ctx) == {"mefor-only-anchor"}
     # Verification is NEVER turned off by anchoring — it only chooses which roots do the verifying.
     assert ctx.verify_mode == ssl.CERT_REQUIRED
     assert ctx.check_hostname is True
     # and the handshake deltas urllib applies are replayed, not silently dropped.
-    stock = urllib.request.HTTPSHandler()._context
+    stock = urllib.request.HTTPSHandler()._context  # type: ignore[attr-defined]
     assert ctx.post_handshake_auth == stock.post_handshake_auth
 
 
@@ -443,8 +443,8 @@ def test_anchored_https_handler_augment_keeps_the_public_roots(tmp_path: Path) -
     ca = _ca_pem(tmp_path, "mefor-augmenting-ca")
     ctx = build_anchored_https_handler(
         anchor=TrustAnchor(cafile=ca, load_system_roots=True), connector="test"
-    )._context
-    stock = urllib.request.HTTPSHandler()._context
+    )._context  # type: ignore[attr-defined]  # a private stdlib attribute
+    stock = urllib.request.HTTPSHandler()._context  # type: ignore[attr-defined]
     assert "mefor-augmenting-ca" in _ca_subjects(ctx)
     assert len(ctx.get_ca_certs()) == len(stock.get_ca_certs()) + 1
     assert ctx.post_handshake_auth == stock.post_handshake_auth

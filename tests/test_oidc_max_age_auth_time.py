@@ -148,7 +148,11 @@ def test_the_url_builder_refuses_a_non_positive_max_age(bad: int) -> None:
 
 async def test_the_service_sends_the_configured_max_age(rsa_key: rsa.RSAPrivateKey) -> None:
     """The setting reaches the wire, not just the builder: default, then an operator value."""
-    for over, expected in (({}, str(DEFAULT_MAX_AGE)), ({"oidc_max_age_seconds": 900}, "900")):
+    cases: tuple[tuple[dict[str, Any], str], ...] = (
+        ({}, str(DEFAULT_MAX_AGE)),
+        ({"oidc_max_age_seconds": 900}, "900"),
+    )
+    for over, expected in cases:
         store = await MessageStore.open(":memory:")
         try:
             service = await svc._service(store, rsa_key, **over)
@@ -228,7 +232,8 @@ def test_a_non_finite_time_claim_is_refused(
     """json.loads accepts NaN, Infinity and ints of any size. NaN compares False against every
     bound, so a NaN exp used to pass the expiry check and then, inside the service's min(), drop the
     auth_time cap. An int too big for a float raised OverflowError, an unmapped 500."""
-    assert _refusal(rsa_key, ladder._good_claims(**{claim: bad})) == "claim_not_numeric"
+    over: dict[str, Any] = {claim: bad}
+    assert _refusal(rsa_key, ladder._good_claims(**over)) == "claim_not_numeric"
 
 
 def test_the_policy_refuses_to_be_built_without_a_bound() -> None:
