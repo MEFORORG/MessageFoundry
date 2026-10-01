@@ -136,8 +136,28 @@ def _chokepoint_names(tree: ast.Module) -> tuple[frozenset[str], frozenset[str]]
     return frozenset(names), frozenset(modules)
 
 
+def _imports_only_the_chokepoint(stmt: ast.stmt) -> bool:
+    """Is ``stmt`` an import that binds the chokepoint and nothing else?
+
+    A function-local import of the chokepoint runs no code the module-level form would not also
+    have run before ``main()``, so it may precede the call. ``harness/__main__.py`` needs it: its
+    wheel is smoke-imported without the engine installed, so its top level imports nothing from
+    ``messagefoundry``. Any other import still counts as the first statement and fails the rule.
+    """
+    if isinstance(stmt, ast.ImportFrom):
+        return (
+            stmt.level == 0
+            and stmt.module == _CHOKEPOINT_MODULE
+            and all(a.name == _CHOKEPOINT for a in stmt.names)
+        )
+    if isinstance(stmt, ast.Import):
+        return all(a.name == _CHOKEPOINT_MODULE for a in stmt.names)
+    return False
+
+
 def _first_statement_of_main(tree: ast.Module) -> ast.stmt | None:
-    """The first statement of a module-level ``def main``, skipping a docstring; else None."""
+    """The first statement of a module-level ``def main``, skipping a docstring and any local
+    import of the chokepoint itself; else None."""
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == "main":
             body = node.body
@@ -147,6 +167,8 @@ def _first_statement_of_main(tree: ast.Module) -> ast.stmt | None:
                 and isinstance(body[0].value, ast.Constant)
                 and isinstance(body[0].value.value, str)
             ):
+                body = body[1:]
+            while body and _imports_only_the_chokepoint(body[0]):
                 body = body[1:]
             return body[0] if body else None
     return None
@@ -1168,6 +1190,16 @@ def test_the_structural_exemption_accepts_only_a_real_imported_call() -> None:
     assert _calls_the_chokepoint(
         _tree(f"import {_CHOKEPOINT_MODULE} as cs", *_main(f"cs.{_CHOKEPOINT}()"))
     )
+    # Accepted: the import made LOCAL to main(), as harness/__main__.py does, so its top level
+    # imports no engine code. The import runs nothing the module-level form would not.
+    assert _calls_the_chokepoint(_tree(*_main(imp, call)))
+    assert _calls_the_chokepoint(_tree(*_main('"""Docstring."""', imp, call)))
+    # Rejected: any OTHER statement first, an import included -- only the chokepoint's own
+    # import may precede the call -- and a local import with no call after it.
+    assert not _calls_the_chokepoint(_tree(*_main("import os", imp, call)))
+    assert not _calls_the_chokepoint(_tree(*_main(f"{imp}, sys", call)))
+    assert not _calls_the_chokepoint(_tree(*_main(imp, "print('x')", call)))
+    assert not _calls_the_chokepoint(_tree(*_main(imp)))
     # Rejected: a mention in a comment, a docstring or a string, even beside the real import.
     assert not _calls_the_chokepoint(_tree(imp, *_main(f"# {call}", "pass")))
     assert not _calls_the_chokepoint(_tree(imp, *_main(f'"""Calls {call} on sys.stdout."""')))

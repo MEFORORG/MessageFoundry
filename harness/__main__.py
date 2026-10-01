@@ -88,8 +88,11 @@ import argparse
 import sys
 from datetime import UTC
 
-from messagefoundry.api_tls_source import GENERATED_CERT_NAME
-from messagefoundry.console_streams import harden_console_streams
+# NOTHING FROM `messagefoundry` AT MODULE SCOPE. The release job's harness smoke installs this wheel
+# with --no-deps, so no engine, and imports this module to prove the wheel carries its package tree.
+# Two top-level engine imports made that import fail and blocked harness 0.5.0 from publishing
+# (release run 36877774902). Engine imports go inside the function that uses them;
+# tests/test_harness_entry_imports_no_engine.py fails if one returns to the top level.
 
 #: What `--insecure` actually does, printed beside the three two-box drives' ApiError exits.
 #:
@@ -125,6 +128,9 @@ def main(argv: list[str] | None = None) -> int:
     # Scenario text uses arrows (U+2192); a legacy Windows console (cp1252) would otherwise raise
     # UnicodeEncodeError when --list-scenarios / --scenario prints them, breaking the documented
     # CI use. Force UTF-8 on the CLI streams, through the one shared chokepoint (BACKLOG #1875).
+    # Imported here, not at module scope: see the note above the module constants.
+    from messagefoundry.console_streams import harden_console_streams
+
     harden_console_streams(encoding="utf-8")
 
     # `multishard` / `shardcert` (+ the WS-C two-box `shardcert-engine`/`shardcert-driver`) are positional
@@ -164,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_batch_engine(raw[1:])
     if raw and raw[0] == "batch-driver":
         return _run_batch_driver(raw[1:])
+
+    from messagefoundry.api_tls_source import GENERATED_CERT_NAME
 
     parser = argparse.ArgumentParser(prog="harness", description="MessageFoundry test harness")
     parser.add_argument(
