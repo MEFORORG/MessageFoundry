@@ -323,6 +323,18 @@ def test_a_subclass_may_not_ungate_a_parent_property_or_gate_a_non_string() -> N
 
             metadata: dict[str, Any] | None = None
 
+    # A constrained string is still a string: it is accepted, and gated.
+    from typing import Annotated
+
+    from pydantic import StringConstraints
+
+    class Capped(PhiGatedModel):
+        phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"error"})
+
+        error: Annotated[str, StringConstraints(max_length=500)] | None = None
+
+    assert json.loads(Capped(error="boom").model_dump_json())["error"] is None
+
     class Wider(MessageSummary):
         pass
 

@@ -315,7 +315,17 @@ _MAPPED_MODEL_NON_PHI_FIELDS: dict[str, frozenset[str]] = {
     # The same ``error`` for one connection, on its metadata route. ``metadata`` is the operator's
     # own label table and ``settings`` is credential-scrubbed for every role; neither is message data.
     "ConnectionMetadata": frozenset(
-        {"direction", "metadata", "method", "name", "router", "running", "settings", "simulated"}
+        {
+            "direction",
+            "fault",
+            "metadata",
+            "method",
+            "name",
+            "router",
+            "running",
+            "settings",
+            "simulated",
+        }
     ),
 }
 

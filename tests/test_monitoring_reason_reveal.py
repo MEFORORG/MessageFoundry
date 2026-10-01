@@ -326,12 +326,24 @@ async def dash(tmp_path: Path) -> AsyncIterator[Engine]:
         from messagefoundry.config.wiring import (
             ConnectionSpec,
             build_inbound_connection,
+            build_outbound_connection,
             env,
         )
 
         reg = Registry()
         reg.add_outbound(_broken_outbound("OB_A"))
         reg.add_outbound(_broken_outbound("OB_B"))
+        # A HEALTHY outbound, so a reveal has a case that returns nothing.
+        (tmp_path / "ok").mkdir()
+        reg.add_outbound(
+            build_outbound_connection(
+                "OB_OK",
+                ConnectionSpec(
+                    ConnectorType.FILE,
+                    {"directory": str(tmp_path / "ok"), "filename": "{MSH-10}.hl7"},
+                ),
+            )
+        )
         # A failed INBOUND too, so a channel-scoped caller has one in-scope connection to reveal.
         reg.add_inbound(
             build_inbound_connection(
@@ -668,6 +680,10 @@ async def test_a_monitoring_only_role_gets_no_metadata_error_and_its_reveal_is_r
         h = await _login(c, "mon")
         bare = (await c.get("/connections/OB_A/metadata", headers=h)).json()
         assert bare["error"] is None and bare["name"] == "OB_A"
+        # THAT it failed stays visible without the text (review finding, round 2).
+        assert bare["fault"] == "failed"
+        healthy = (await c.get("/connections/OB_OK/metadata", headers=h)).json()
+        assert healthy["fault"] is None and healthy["error"] is None
         refused = await c.get("/connections/OB_A/metadata", params={"reveal": "true"}, headers=h)
         assert refused.status_code == 403
     assert await _reveal_audits(dash, "connection_error_reveal") == []
@@ -677,6 +693,29 @@ async def test_a_monitoring_only_role_gets_no_metadata_error_and_its_reveal_is_r
         if dict(a)["action"] == "auth.permission_denied" and dict(a)["actor"] == "mon"
     ]
     assert {"path": "/connections/OB_A/metadata", "permission": "messages:view_summary"} in denials
+
+
+async def test_a_metadata_reveal_of_a_healthy_connection_is_audited_as_revealing_nothing(
+    dash: Engine,
+) -> None:
+    """The audit records what the response carried. A healthy connection has no error, so its
+    reveal is recorded with nothing revealed rather than as a disclosure."""
+    service = await _service(dash)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(dash, service) as c:
+        h = await _login(c, "op")
+        shown = await c.get("/connections/OB_OK/metadata", params={"reveal": "true"}, headers=h)
+        assert shown.status_code == 200 and shown.json()["error"] is None
+    assert await _reveal_audits(dash, "connection_error_reveal") == [
+        {
+            "actor": "op",
+            "channel": "OB_OK",
+            "reveal": "OB_OK",
+            "connection": "OB_OK",
+            "directions": [],
+            "revealed": [],
+        }
+    ]
 
 
 async def test_a_metadata_reveal_charges_the_phi_read_budget_and_a_bare_open_does_not(

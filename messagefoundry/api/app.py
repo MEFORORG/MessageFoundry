@@ -2941,6 +2941,12 @@ def create_app(
         )
         return out
 
+    def _fault(failed: str | None, filtered: str | None) -> Literal["failed", "filtered"] | None:
+        """Which cause set a metadata row's ``error``, in the order the row reads them."""
+        if failed:
+            return "failed"
+        return "filtered" if filtered else None
+
     async def _connection_metadata_row(
         engine: Engine, identity: Identity, name: str, request: Request
     ) -> ConnectionMetadata:
@@ -2964,6 +2970,7 @@ def create_app(
                 settings=redacted_settings(ic.spec.settings),
                 # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
                 error=rr.inbound_failed(name) or rr.inbound_filtered(name),
+                fault=_fault(rr.inbound_failed(name), rr.inbound_filtered(name)),
             )
         oc = rr.registry.outbound.get(name)
         if oc is not None:
@@ -2984,6 +2991,7 @@ def create_app(
                 simulated=rr.outbound_simulated(name),
                 # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
                 error=rr.outbound_failed(name) or rr.outbound_filtered(name),
+                fault=_fault(rr.outbound_failed(name), rr.outbound_filtered(name)),
             )
         raise HTTPException(404, f"no such connection: {name}")
 

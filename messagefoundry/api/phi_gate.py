@@ -30,7 +30,7 @@ decision was made*, never *what it should be*. The permission policy stays in on
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any, ClassVar, get_args
+from typing import Annotated, Any, ClassVar, get_args, get_origin
 
 from pydantic import BaseModel, FieldSerializationInfo, PrivateAttr, field_serializer
 
@@ -103,8 +103,10 @@ class PhiGatedModel(BaseModel):
                 f"{cls.__name__}.phi_gated_properties names {missing}, which are not fields of "
                 "the model — the declaration gates nothing."
             )
-        # A subclass may add gated properties, never drop one: a dropped property would keep the
-        # parent's serializer on it, published as ``str | None`` while no longer gated.
+        # A subclass may add gated properties, never drop one. A subclass of a PHI-bearing model
+        # carries the same data, so a narrowed set would ungate it. Narrowed to EMPTY, no
+        # serializer of its own is attached and the parent's withholds the field for good, a
+        # silent functional break. Either way the declaration is a mistake, so refuse it.
         for base in cls.__mro__[1:]:
             if isinstance(base, type) and issubclass(base, PhiGatedModel):
                 dropped = sorted(base.phi_gated_properties - declared)
@@ -157,10 +159,15 @@ class PhiGatedModel(BaseModel):
 
 
 def _is_optional_str(annotation: object) -> bool:
-    """True for ``str`` or ``str | None``, the only field types the gate's serializer handles."""
-    if annotation is str:
+    """True for ``str`` or ``str | None``, the only field types the gate's serializer handles. A
+    constrained string (``Annotated[str, ...]``, as ``constr`` builds) counts as ``str``."""
+
+    def base(t: object) -> object:
+        return get_args(t)[0] if get_origin(t) is Annotated else t
+
+    if base(annotation) is str:
         return True
-    return set(get_args(annotation)) == {str, type(None)}
+    return {base(a) for a in get_args(annotation)} == {str, type(None)}
 
 
 #: The class attribute each gated subclass's serializer is set under (see

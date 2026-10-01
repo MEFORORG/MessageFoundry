@@ -1511,9 +1511,13 @@ class ConnectionMetadata(PhiGatedModel):
     settings: dict[str, Any]  # secret-scrubbed view
     simulated: bool | None = None  # outbound only; True = egress-suppressed shadow lane (#15)
     # Why this connection failed to start (ADR 0031) or was DR-parked (ADR 0048). Rated in
-    # docs/PHI.md section 2 (BACKLOG #1185). Gated and masked (BACKLOG #2443): null without
-    # messages:view_summary, "****" with it, whole only with reveal=true.
+    # docs/PHI.md section 2 (BACKLOG #1185). Gated and masked; see the class docstring.
     error: str | None = None
+    # WHICH of the two causes set ``error``: "failed" (start failed, ADR 0031) or "filtered"
+    # (DR-parked, ADR 0048); None when ``error`` is None. Not gated, so a role that sees ``error``
+    # as null can still tell a failed connection from a healthy one, as ``ConnectionRow.status``
+    # lets it on the dashboard (BACKLOG #2443).
+    fault: Literal["failed", "filtered"] | None = None
 
 
 class AlertRuleInfo(BaseModel):

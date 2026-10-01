@@ -6,7 +6,9 @@
   metadata route, returns it whole. That reveal needs `messages:view_summary`, is refused for a
   connection outside a scoped caller's channels, charges the PHI-read budget, and writes a
   `connection_error_reveal` audit row. The `status` word, the `errored` count and every other field
-  stay readable under `monitoring:read`. `EngineClient.connections()` takes the same `reveal`.
+  stay readable under `monitoring:read`. The metadata route gains an ungated `fault` field
+  (`failed` or `filtered`), so a role that sees `error` as `null` can still tell that the connection
+  is down. `EngineClient.connections()` takes the same `reveal`.
 - **Each gated response model now gets a serializer over its own gated properties only.** The
   shared one covered every field with a gateable name, gated or not, so a model whose `metadata`
   is a dict could not be gated. The published schema of every other model is unchanged. See
