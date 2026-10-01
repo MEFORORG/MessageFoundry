@@ -221,7 +221,13 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
     cfg.mkdir()
     (cfg / "feed.py").write_text("this is not python(", encoding="utf-8")
     report = run_checks(cfg, run_lint=False)
-    for name in ("tls-allow-expired", "generic-db-tls", "tls-revocation-attested"):
+    # vault BACKLOG #2550's FHIR path-form line shares the convention, so it rides this arm.
+    for name in (
+        "tls-allow-expired",
+        "generic-db-tls",
+        "tls-revocation-attested",
+        "fhir-update-path-form",
+    ):
         r = _result(report, name)
         assert r.skipped and r.ok and "config did not load" in r.detail
 

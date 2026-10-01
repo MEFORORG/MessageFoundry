@@ -265,6 +265,9 @@ def run_checks(
         # ADR 0173: the per-connection revocation attestation, same shape and same reason. Its only
         # report was the WARNING logged where it suppresses a refusal. Advisory — see the check.
         _check_revocation_attested(config_dir),
+        # vault BACKLOG #2550: every FHIR connection that puts the update id back in the URL, a
+        # listed loosening of owner ruling R3. Advisory, as tls_allow_expired is -- see the check.
+        _check_fhir_update_path_form(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -2046,6 +2049,45 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(relaxed)} outbound connection(s) accept an EXPIRED server certificate "
             f"indefinitely — {listed} (chain, hostname and key usage are still verified)"
+        ),
+    )
+
+
+def _check_fhir_update_path_form(config_dir: str | Path) -> CheckResult:
+    """Name every ``FHIR()`` outbound that sets ``update_url_form="path"`` (vault BACKLOG #2550).
+
+    The path form sends an update as ``PUT {base}/{ResourceType}/{id}``, so each message's resource id
+    is in the request URL, which owner ruling R3 (ASVS 14.2.1) keeps out of it by default. A site
+    takes it for a server with no ``transaction`` interaction. Advisory (``required=False``) on the
+    precedent of ``tls_allow_expired``: an interoperability relaxation is reported, not refused, under
+    any ``[security].enforcement``. The construction WARNING is its other record.
+
+    SKIPs when the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, load_config, path_form_fhir_updates
+
+    name = "fhir-update-path-form"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    path_form = path_form_fhir_updates(registry)
+    if not path_form:
+        return CheckResult(
+            name,
+            ok=True,
+            required=False,
+            detail="no FHIR connection sets update_url_form='path'",
+        )
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(path_form)} FHIR connection(s) send updates in the path form, so each message's "
+            f"resource id is in the request URL — {', '.join(path_form)} (a listed loosening of "
+            "owner ruling R3, ASVS 14.2.1)"
         ),
     )
 

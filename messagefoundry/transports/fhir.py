@@ -17,7 +17,9 @@ REST/SOAP arm — see wiring_runner ``_allowlist_for``/``check_egress_allowed``)
   ``create`` is ``POST {base}/{ResourceType}``, and a ``transaction``/``batch`` is ``POST {base}`` with a
   ``Bundle`` body (the server applies it). An ``update`` is a ``PUT {ResourceType}/{id}`` carried as the
   one entry of a ``transaction`` ``Bundle`` POSTed to ``{base}``, so the message-derived id is in the
-  body and never in the request URL (vault BACKLOG #1965, ASVS 14.2.1, owner ruling R3). The
+  body and never in the request URL (vault BACKLOG #1965, ASVS 14.2.1, owner ruling R3). A connection
+  may opt back into the plain ``PUT {base}/{ResourceType}/{id}`` with ``update_url_form="path"``, for
+  a server with no ``transaction`` interaction; that is a listed loosening (vault BACKLOG #2550). The
   ResourceType/id are read from the outgoing body with the cheap :class:`FhirPeek` (no typed parse).
 - The three opt-in conditional knobs (idempotency/concurrency levers, off by default): ``if-none-exist``
   (conditional create — ``If-None-Exist`` header), ``conditional-update`` (search-based ``PUT
@@ -113,6 +115,9 @@ logger = logging.getLogger(__name__)
 
 _INTERACTIONS = ("create", "update", "transaction", "batch")
 _CONDITIONALS = ("if-none-exist", "conditional-update", "if-match")
+#: How an update reaches the server. ``transaction`` (the default) keeps the resource id out of the
+#: request URL (vault BACKLOG #1965); ``path`` is the plain RESTful PUT, a listed loosening (#2550).
+_UPDATE_URL_FORMS = ("transaction", "path")
 
 #: The SMART v2 permission letters each declared shape can actually spend, keyed the way
 #: :meth:`FhirDestination._resolve_request` dispatches — ``conditional`` FIRST, then ``interaction``.
@@ -506,6 +511,34 @@ class FhirDestination(DestinationConnector):
                 f"FHIR destination conditional={self.conditional!r} is incompatible with "
                 f"interaction={self.interaction!r}; set per-entry Bundle.entry.request fields instead"
             )
+        # Whether this connection's writes are updates by id. Conditional first, as _resolve_request
+        # dispatches: if-match is an update whatever the interaction says.
+        self._is_update = self.conditional == "if-match" or (
+            self.conditional is None and self.interaction == "update"
+        )
+        self.update_url_form: str = str(s.get("update_url_form") or "transaction")
+        if self.update_url_form not in _UPDATE_URL_FORMS:
+            raise ValueError(
+                f"FHIR destination update_url_form must be one of {_UPDATE_URL_FORMS}, "
+                f"got {self.update_url_form!r}"
+            )
+        self._path_form = self.update_url_form == "path"
+        if self._path_form and not self._is_update:
+            # Nothing else carries an id in the URL, so the setting would do nothing. Refused
+            # rather than ignored, as the conditional/transaction combination above is.
+            raise ValueError(
+                "FHIR destination update_url_form='path' applies only to interaction='update' "
+                "or conditional='if-match'"
+            )
+        if self._path_form:
+            # vault BACKLOG #2550, a listed loosening. Named by connection only: the ids are per message.
+            logger.warning(
+                "FHIR destination %s sends updates in the PATH form (update_url_form='path'): each "
+                "message's resource id appears in the request URL, PUT {base}/{type}/{id}, and so in "
+                "the receiving server's access logs. This is a listed loosening of owner ruling R3 "
+                "(ASVS 14.2.1); see docs/SECURITY-LOOSENING.md",
+                config.name,
+            )
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the FHIR server reply (assigned resource / ETag / OperationOutcome). Default
@@ -541,17 +574,14 @@ class FhirDestination(DestinationConnector):
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
         self._headers = self._build_headers(s)
-        # vault BACKLOG #1965: whether this connection's writes are updates, sent as a transaction
-        # entry. Decided once here, conditional first as _resolve_request reads it, which branches
-        # on this flag. A static conditional header, which qualified every PUT, moves into the entry
-        # with the rest; on the outer POST it would qualify the Bundle.
-        self._wraps_update = self.conditional == "if-match" or (
-            self.conditional is None and self.interaction == "update"
-        )
+        # vault BACKLOG #1965: on an update sent as a transaction entry, a static conditional header,
+        # which qualified every PUT, moves into the entry with the rest; on the outer POST it would
+        # qualify the Bundle. The path form (#2550) is a plain PUT, so its headers stay where they are.
+        wraps_update = self._is_update and not self._path_form
         self._static_conditionals = {
             name: self._headers.pop(name)
             for name in list(self._headers)
-            if self._wraps_update and name.lower() in _ENTRY_CONDITIONAL_FIELDS
+            if wraps_update and name.lower() in _ENTRY_CONDITIONAL_FIELDS
         }
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
@@ -712,7 +742,9 @@ class FhirDestination(DestinationConnector):
         and :meth:`_exchange` sends it as a one-entry ``transaction`` Bundle POSTed to the base, which
         the server processes as that update (https://hl7.org/fhir/R4B/http.html#transaction). The
         reasons and the site-facing consequences are stated once, in docs/CONNECTIONS.md, "An update
-        keeps the resource id out of the URL"."""
+        keeps the resource id out of the URL". The one exception is ``update_url_form="path"``, an
+        operator's listed loosening (vault BACKLOG #2550), which resolves to the plain
+        ``PUT {base}/{type}/{id}`` with any ETag in the ``If-Match`` header."""
         base = self.base_url.rstrip("/")
         if self.interaction in ("transaction", "batch"):
             # The body is itself a Bundle; the server applies it.
@@ -738,7 +770,7 @@ class FhirDestination(DestinationConnector):
                 f"{base}/{type_seg}",
                 {"If-None-Exist": self.conditional_query or ""},
             )
-        if self._wraps_update:  # update, or if-match; decided once in __init__
+        if self._is_update:  # update, or if-match; decided once in __init__
             interaction_headers: dict[str, str] = {}
             if self.conditional == "if-match":
                 version_id = self._version_id(peek)
@@ -753,10 +785,10 @@ class FhirDestination(DestinationConnector):
                 # out of the W/"..." ETag (an ETag is not a place to encode, so reject).
                 _validate_path_token(version_id, _FHIR_ID_RE, "meta.versionId")
                 interaction_headers["If-Match"] = f'W/"{version_id}"'
-            id_seg = urllib.parse.quote(self._require_id(peek), safe="")
-            return _FhirRequest(
-                "PUT", f"{type_seg}/{id_seg}", interaction_headers, transaction=True
-            )
+            entry_url = f"{type_seg}/{urllib.parse.quote(self._require_id(peek), safe='')}"
+            if self._path_form:  # vault BACKLOG #2550: the plain PUT, a listed loosening
+                return _FhirRequest("PUT", f"{base}/{entry_url}", interaction_headers)
+            return _FhirRequest("PUT", entry_url, interaction_headers, transaction=True)
         return _FhirRequest("POST", f"{base}/{type_seg}", {})  # create (default)
 
     @staticmethod
@@ -766,7 +798,8 @@ class FhirDestination(DestinationConnector):
                 "FHIR update requires the resource id", code="no-id", permanent=True
             )
         # It flows into the entry's request.url, which the SERVER resolves as a path relative to the
-        # base, so the same path gates apply as when it was the HTTP request path.
+        # base, or, in the path form (vault BACKLOG #2550), into the HTTP request path itself. The same
+        # path gates serve both.
         _reject_control_chars(peek.id, "resource id")
         # Grammar-gate the message-derived id so '../$reindex'-style traversal can't redirect the write.
         _validate_path_token(peek.id, _FHIR_ID_RE, "resource id")
@@ -925,11 +958,11 @@ class FhirDestination(DestinationConnector):
             # boundary so a retry re-mints it (re-run purity holds).
             headers = {**headers, **self._signer.signature_headers(data)}
         # ASVS 4.2.5: FHIR is the one destination whose URL is genuinely per-message -- _resolve_request
-        # builds it from the resource type (the id left the URL with vault BACKLOG #1965; the type did
-        # not), and _FHIR_TYPE_RE bounds that grammar but not its LENGTH. The construction gate only
-        # ever saw base_url, so without this a crafted resourceType ships an unbounded request line.
-        # Placed before the try below because these raise
-        # NegativeAckError/DeliveryError, which its handlers deliberately do not catch.
+        # builds it from the resource type (the id left the URL with vault BACKLOG #1965, bar #2550's
+        # path form), and _FHIR_TYPE_RE bounds the type's grammar but not its LENGTH. The construction
+        # gate only ever saw base_url, so without this a crafted resourceType ships an unbounded
+        # request line. Placed before the try below because these raise NegativeAckError/DeliveryError,
+        # which its handlers deliberately do not catch.
         try:
             enforce_send_time_length_limits(
                 url,

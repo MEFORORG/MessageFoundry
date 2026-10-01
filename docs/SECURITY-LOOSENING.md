@@ -88,6 +88,7 @@ section reference.
 | | `tls_hop_attested` | `false` on every inbound / outbound / `FhirLookup` / `DatabaseLookup` / `DatabaseRef` (*connection-scoped*) |
 | | generic-ODBC `DATABASE` TLS | a verifying `odbc_params` keyword (*connection-scoped*; inbound **and** outbound) |
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
+| | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
 `[store].allow_unmarked_ciphertext`, `[auth].ad_session_recheck_seconds`,
@@ -97,18 +98,20 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies` and
 `[api].plaintext_upstream_hop_acknowledged` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
-settings at all. They are listed and reported here anyway, because the rule is *one shipped
+settings at all. They are listed here anyway, and all but `update_url_form` are reported, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
 `[store]`/`[auth]`/`[secret_rotation]`/`[api]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
-exactly which surfaces see them, and which cannot).
+exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
+yet: `update_url_form`, whose entry names the two records it does have.
 
 > **Scope, stated plainly.** The registry covers *every* `[security]` switch (a completeness floor in
 > `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one), the connection
 > factories' TLS-shaped parameters (a second floor in the same file censuses the factory signatures,
 > because a per-connection deviation is outside `model_fields`' reach by construction) and the
-> enumerated deviations above. It is **not yet** an exhaustive register of every security-relevant
+> enumerated deviations above, except `update_url_form` (its entry says which records it has). It is
+> **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
 > `[auth].enabled` / `require_mfa` / `ad_tls_verify` / `ad_allow_insecure_ldap` /
 > `oidc_require_mfa_claim` are gated by their own serve-time refusals and are **not** reported here.
@@ -878,6 +881,34 @@ This section is kept rather than deleted, because the claim it used to make is t
   serve-time loosening warning, which fires before the graph is loaded, exactly as for
   `cleartext_accepted`. Where it is NOT reported is the same list as `cleartext_accepted` above:
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
+
+### `update_url_form = "path"` on a FHIR connection — the resource id in the request URL
+> **Connection-scoped**, like `tls_allow_expired` above: a keyword on one `FHIR()` outbound, which
+> applies only to `interaction="update"` or `conditional="if-match"`. FHIR is not a `connections.toml`
+> transport, so there is no data-authored form. Vault BACKLOG #2550, relaxing owner ruling R3 under
+> ASVS 14.2.1 (vault BACKLOG #1965).
+- **What you lose:** the shipped form sends an update as the one entry of a `transaction` `Bundle`, so
+  no message-derived id appears in a request URL. The path form sends `PUT {base}/{ResourceType}/{id}`.
+  Each message's resource id is then in the request line, and so in the receiving server's access logs
+  and in any proxy log on the path. An id can be a medical record number or another identifier.
+- **What you keep:** the id must still match the FHIR id grammar and must not be only dots, or the
+  message is dead-lettered and nothing is sent. The hop's TLS, egress allow-list, redirect refusal and
+  authentication are unchanged. Only update and if-match change form; `create` and the conditional
+  searches never carried the id.
+- **When acceptable:** the receiving server has no `transaction` interaction, so the shipped form cannot
+  work there. On 2026-10-01 that was true of at least Epic and Oracle Health (Millennium);
+  [CONNECTIONS.md](CONNECTIONS.md#vendor-compatibility-and-the-path-form-opt-in) gives the readings and
+  sources. Set it on the one connection that needs it.
+- **Compensating controls:** treat the server's access logs as PHI-bearing, with the access control and
+  retention that implies, and confirm who can read any proxy log on the path.
+- **It is never silent:** a WARNING at every construction naming the connection, never an id, and a
+  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it.
+- **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
+  `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
+  and `[security].enforcement = enforce` does not refuse it. It is **not yet** in
+  `security_loosenings()`, so `GET /security/posture` and the serve-time loosening warning do not name
+  it. The construction WARNING and the `check` line are its only records today; adding it to the
+  registry is owed work.
 
 ### A generic-ODBC `DATABASE` hop with TLS unenforced
 > **Connection-scoped**, and unlike the flag entries above it is not a flag anyone sets — it is the *absence* of a
