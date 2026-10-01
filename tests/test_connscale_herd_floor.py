@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import csv
 import functools
+import json
 import random
 import re
+import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -266,12 +269,12 @@ def _readings() -> tuple[ch.BaseReading, ...]:
     """The committed readings, typed as the harvest script types them.
 
     The writer routes every cell through the spreadsheet formula rule, which prefixes an apostrophe
-    to text it quotes. No cell this decision keys on should ever need that, so one that carries it
+    to text it quotes. No cell of this file should ever need that, so one that carries it
     is refused here rather than read as a different leg or lane.
     """
     with _HARVEST.open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    quoted = [r for r in rows if any(r[k].startswith("'") for k in ("population", "leg", "lane"))]
+    quoted = [r for r in rows if any(cell.startswith("'") for cell in r.values())]
     assert not quoted, (
         f"readings.csv holds escaped key cells; unescape before reading: {quoted[:3]}"
     )
@@ -387,24 +390,45 @@ def test_an_armed_leg_says_enforced_in_both_emitters() -> None:
     assert payload_enforced(True) is True and payload_enforced(False) is False
 
 
-@pytest.mark.timeout(30)
-@pytest.mark.parametrize(
-    "hostile",
-    [
-        "a" * 200_000 + "-py",  # no version after the separator
-        "a" * 200_000 + "-py" + "1." * 100_000 + "x",  # a long version that fails at the very end
-        "-py" * 100_000,  # separators all the way down
-        "a-" * 100_000 + "py3.14x",  # a letter in the version, at the very end
-    ],
-    ids=["no-version", "long-version-bad-tail", "separators-only", "letter-in-version"],
-)
-def test_a_hostile_long_leg_is_refused(hostile: str) -> None:
-    # Refused with the leg error, under the timeout marker rather than a wall-clock assertion, so a
-    # pattern that ever starts to backtrack on these shapes fails here instead of hanging a leg.
-    with pytest.raises(ConnScaleProfileError, match="empty_claims_herd_floor_legs"):
+_HOSTILE_LEGS = {
+    "no-version": "a" * 200_000 + "-py",
+    "long-version-bad-tail": "a" * 200_000 + "-py" + "1." * 100_000 + "x",
+    "every-separator-walked": "a" + "-py" * 100_000,
+    "letter-in-version": "a-" * 100_000 + "py3.14x",
+}
+_SHAPE_ERROR = "must name a CI leg"
+
+
+@pytest.mark.parametrize("name", sorted(_HOSTILE_LEGS))
+def test_a_hostile_long_leg_is_refused_with_the_shape_error(name: str) -> None:
+    with pytest.raises(ConnScaleProfileError, match=_SHAPE_ERROR):
         load_connscale_profile_text(
-            _profile_text_with(f"empty_claims_herd_floor_legs = ['{hostile}']"), where="<unit>"
+            _profile_text_with(f"empty_claims_herd_floor_legs = ['{_HOSTILE_LEGS[name]}']"),
+            where="<unit>",
         )
+
+
+def test_the_hostile_legs_cannot_hang_the_leg_pattern() -> None:
+    # A running regex holds the GIL, so a pytest thread timeout cannot interrupt one. The matches run
+    # in a CHILD process instead, and the parent's own timeout kills it: a pattern that ever starts
+    # to backtrack on these shapes fails here rather than hanging the CI leg.
+    child = (
+        "import json, sys\n"
+        "from harness.load.connscale.profile import _LEG\n"
+        "legs = json.load(sys.stdin)\n"
+        "print(json.dumps([bool(_LEG.fullmatch(v)) for v in legs]))\n"
+    )
+    done = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv: this interpreter and a literal
+        [sys.executable, "-c", child],
+        input=json.dumps(list(_HOSTILE_LEGS.values())),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == [False] * len(_HOSTILE_LEGS)
 
 
 #: The pattern the nested-quantifier gate flagged, kept here so "the language is unchanged" is a
@@ -437,7 +461,7 @@ def test_the_leg_pattern_decides_each_case_as_before(leg: str, ok: bool) -> None
             text, where="<unit>"
         ).slo.empty_claims_herd_floor_legs == (leg,)
     else:
-        with pytest.raises(ConnScaleProfileError, match="empty_claims_herd_floor_legs"):
+        with pytest.raises(ConnScaleProfileError, match=_SHAPE_ERROR):
             load_connscale_profile_text(text, where="<unit>")
 
 

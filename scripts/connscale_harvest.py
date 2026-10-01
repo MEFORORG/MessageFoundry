@@ -106,7 +106,7 @@ if _ROOT not in sys.path:
 
 # ASVS 1.2.10: the --csv-dir writer is a recorded spreadsheet writer, and its cells go through the
 # one canonical formula-injection rule (tests/test_csv_formula_consistency.py), never a local copy.
-from messagefoundry.spreadsheet import spreadsheet_safe as spreadsheet_safe  # noqa: E402
+from messagefoundry.spreadsheet import spreadsheet_safe  # noqa: E402
 
 DEFAULT_REPO = "MEFORORG/MessageFoundry"
 DEFAULT_WORKFLOW = "ci.yml"

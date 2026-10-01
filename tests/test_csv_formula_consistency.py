@@ -164,12 +164,45 @@ def test_the_connscale_harvest_writer_emits_the_canonical_rule_cell_for_cell(
         )
         for vector in vectors
     ]
-    result = harvest.Harvest("r", "w", None, "s", "u", readings=rows)
+    jobs = [
+        harvest.JobOutcome(
+            leg=vector,
+            conclusion="success",
+            status="harvested",
+            reason=vector,
+            population=None,
+            run_id=1,
+            run_attempt=1,
+            job_id=1,
+            artifact_id=None,
+            per_lane_wake=vector,
+        )
+        for vector in vectors
+    ]
+    unjoined = [
+        {"run_id": 1, "artifact_id": 2, "name": vector, "reason": vector} for vector in vectors
+    ]
+    result = harvest.Harvest(
+        "r", "w", None, "s", "u", readings=rows, jobs=jobs, unjoined_artifacts=unjoined
+    )
     harvest.write_csvs(result, tmp_path)
-    with (tmp_path / "readings.csv").open(encoding="utf-8", newline="") as handle:
-        written = list(csv.DictReader(handle))
-    assert [r["lane"] for r in written] == [engine_rule.spreadsheet_safe(v) for v in vectors]
-    assert {r["value"] for r in written} == {"-1.5"}, "a number is never quoted"
+
+    def column(name: str, key: str) -> list[str]:
+        with (tmp_path / name).open(encoding="utf-8", newline="") as handle:
+            return [row[key] for row in csv.DictReader(handle)]
+
+    expected = [engine_rule.spreadsheet_safe(v) for v in vectors]
+    # Every text column the record names as CI-artifact text, in all three files.
+    for name, key in (
+        ("readings.csv", "lane"),
+        ("jobs.csv", "leg"),
+        ("jobs.csv", "reason"),
+        ("jobs.csv", "per_lane_wake"),
+        ("unjoined.csv", "name"),
+        ("unjoined.csv", "reason"),
+    ):
+        assert column(name, key) == expected, (name, key)
+    assert set(column("readings.csv", "value")) == {"-1.5"}, "a number is never quoted"
 
 
 def test_engine_and_harness_mirrors_agree() -> None:
@@ -216,7 +249,7 @@ _RECORDED_SPREADSHEET_WRITERS = {
     "scripts/connscale_harvest.py": (
         "--csv-dir: every cell of readings/jobs/unjoined goes through the engine's canonical "
         "messagefoundry.spreadsheet.spreadsheet_safe (lane, reason and name come from CI artifacts), "
-        "checked on its output over the shared vectors; "
+        "checked on its output over the shared vectors for the CI-artifact text columns; "
         "numbers and None pass through it untouched (BACKLOG #1415)"
     ),
     "scripts/security/vuln_metrics.py": (
