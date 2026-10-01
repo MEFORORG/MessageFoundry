@@ -916,8 +916,14 @@ class ConnScaleReport:
             f"{1.0 - tolerance:.2f}. For this metric it is RECORDED AND NO LONGER ENFORCED -- an "
             f"OUTSIDE BAND row here fails nothing. The width is left untouched, but the VALUES "
             f"changed window at BACKLOG #1420: readings harvested before that change are not "
-            f"comparable with these (the JSON copy carries `rate_window`). What IS asserted, and "
-            f"the predicted floor that is not, are below."
+            f"comparable with these (the JSON copy carries `rate_window`)."
+            + (
+                ""
+                if base_count is None
+                else " The predicted herd floor below IS ENFORCED on this leg (BACKLOG #1415)."
+                if enforced
+                else " The predicted herd floor below is recorded and not enforced on this leg."
+            )
         )
         head.append("")
         if not rows:

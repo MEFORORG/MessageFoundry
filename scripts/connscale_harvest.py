@@ -3,11 +3,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Harvest the connscale empty-claims BASE READINGS from CI, joined to each job's conclusion.
 
-BACKLOG #1415, build 1 of 2. **This is a scan, not a gate.** It computes no floor, proposes no
-threshold and applies no arming rule. Build 2 does that, once post-#1420 data exists and the owner
-has ruled. What this script owes build 2 is a distribution a reader can audit and re-run, which the
-#1211 harvest was not: that one was drawn by a script outside the tree, into a scratchpad, against
-artifacts that expire.
+BACKLOG #1415's instrument. **This is a scan, not a gate.** It computes no floor, proposes no
+threshold and applies no arming rule. Build 2 applied #1415's rule to its post_2024 cells, and the
+decision is in ``harness/load/profiles/README.md`` (section dated 2026-10-01). What this script owes
+that decision is a distribution a reader can audit and re-run, which the #1211 harvest was not: that
+one was drawn by a script outside the tree, into a scratchpad, against artifacts that expire.
+
+ONCE A FLOOR IS ARMED ON A LEG, ITS PASSING DISTRIBUTION IS CENSORED. A job whose base reading
+falls below the floor now fails BECAUSE of it, and leaves the passing cells. A re-harvest of an armed
+leg must read its non-passing readings for floor breaches, or it understates the gate's own fires.
 
 WHAT IT READS. Every ``test (<os>, py<ver>)`` job of the CI workflow uploads its connscale readings
 as an artifact named ``connscale-readings-<os>-py<ver>``, holding ``empty_claims.json``. The base
@@ -508,12 +512,10 @@ _UNJOINED_FIELDS = ("run_id", "artifact_id", "name", "reason")
 
 
 def _unjoined(run_id: int, artifact: dict[str, Any], reason: str) -> dict[str, Any]:
-    return {
-        "run_id": run_id,
-        "artifact_id": artifact["id"],
-        "name": artifact["name"],
-        "reason": reason,
-    }
+    # Built from _UNJOINED_FIELDS, so the row and the CSV header are one definition.
+    return dict(
+        zip(_UNJOINED_FIELDS, (run_id, artifact["id"], artifact["name"], reason), strict=True)
+    )
 
 
 def harvest_run(api: Api, repo: str, run: dict[str, Any], acc: Harvest) -> None:
@@ -1037,6 +1039,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.from_json:
+        # A re-render shows the saved selection, so a selection flag here would be silently ignored
+        # and its numbers read as the filtered view they are not.
+        selecting = [
+            flag
+            for flag, value in (
+                ("--since", args.since),
+                ("--until", args.until),
+                ("--branch", args.branch),
+                ("--event", args.event),
+                ("--max-runs", args.max_runs),
+                ("--with-tail-until", args.with_tail_until),
+            )
+            if value is not None
+        ]
+        if selecting:
+            parser.error(f"{', '.join(selecting)} cannot narrow a --from-json re-render")
         try:
             result = from_json_dict(json.loads(args.from_json.read_text(encoding="utf-8")))
         except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -1064,14 +1082,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         except HarvestError as exc:
             print(f"harvest failed: {exc}", file=sys.stderr)
             return 2
-    if args.csv_dir:
-        write_csvs(result, args.csv_dir)
-    # The JSON first, so a console that cannot print the report does not lose the data.
+    # The JSON first, so a console that cannot print the report, or a CSV directory that cannot be
+    # written, does not lose a scan that cost hundreds of API calls against expiring artifacts.
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
             json.dumps(to_json_dict(result), indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+    if args.csv_dir:
+        try:
+            write_csvs(result, args.csv_dir)
+        except OSError as exc:
+            print(f"cannot write CSVs to {args.csv_dir}: {exc}", file=sys.stderr)
+            return 2
     text = render_markdown(result) + "\n"
     encoding = sys.stdout.encoding or "utf-8"
     sys.stdout.write(text.encode(encoding, "replace").decode(encoding))

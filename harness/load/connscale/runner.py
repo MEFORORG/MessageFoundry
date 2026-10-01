@@ -2305,9 +2305,10 @@ def _not_graded_reasons(readings: list[HerdFloorReading]) -> str:
 
 
 #: The CI leg a run is on, as ``<matrix os>-py<python version>`` -- the same suffix the readings
-#: artifact carries, so a harvest cell and an armed leg are spelled one way. ci.yml's
-#: ``Tests (pytest)`` step exports it; nothing else does, so a local run, the py3.15 canary and the
-#: coverage job read no leg and are never graded.
+#: artifact name carries. The harvest report prints the same leg with a space in place of the last
+#: hyphen, which the profile parser refuses. ci.yml's ``Tests (pytest)`` step exports it; nothing
+#: else does, so a local run, the py3.15 canary and the coverage job read no leg and are never
+#: graded. ``tests/test_connscale_herd_floor.py`` pins the ci.yml line that sets it.
 CONNSCALE_LEG_ENV = "MEFOR_CONNSCALE_LEG"
 
 

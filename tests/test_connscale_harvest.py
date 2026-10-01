@@ -1013,3 +1013,28 @@ def test_main_reports_an_unreadable_saved_harvest(
     bad.write_text("{not json", encoding="utf-8")
     assert ch.main(["--from-json", str(bad)]) == 2
     assert "cannot read" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flag", [["--branch", "main"], ["--since", "2026-09-01T00:00:00Z"], ["--max-runs", "3"]]
+)
+def test_a_selection_flag_cannot_narrow_a_re_render(tmp_path: Path, flag: list[str]) -> None:
+    saved = tmp_path / "h.json"
+    saved.write_text(json.dumps(ch.to_json_dict(_harvest(_fixture()))), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        ch.main(["--from-json", str(saved), *flag])
+    assert exc.value.code == 2
+
+
+def test_the_json_is_written_before_a_csv_directory_that_cannot_be(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(ch, "GhApi", _fixture)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    out = tmp_path / "h.json"
+    argv = ["--since", "2026-09-01T00:00:00Z", "--quiet", "--json-out", str(out)]
+    rc = ch.main([*argv, "--csv-dir", str(blocker)])
+    assert rc == 2
+    assert "cannot write CSVs" in capsys.readouterr().err
+    assert json.loads(out.read_text(encoding="utf-8"))["jobs"], "the scan must survive"

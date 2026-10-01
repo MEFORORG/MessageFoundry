@@ -44,13 +44,13 @@ _HARVEST = (
     Path(__file__).resolve().parents[1]
     / "docs/benchmarks/results/2026-10-01-connscale-herd-floor-harvest/readings.csv"
 )
-#: Read off the profile CI runs, so a change to its base count or rates cannot leave this module
-#: grading the old numbers while the armed legs drift from the evidence.
-_SMOKE: ConnScaleProfile = _smoke_profile(20000)  # type: ignore[assignment]
-_BASE = min(_SMOKE_COUNTS)
-_RATE = {
-    lane: _SMOKE.aggregate_rate_for(lane, _BASE) for lane in ("fixed_aggregate", "fixed_per_conn")
-}
+#: The point the harvest MEASURED: base count N=12, and per lane the offered aggregate rate there.
+#: readings.csv records neither, so they are pinned as literals rather than read off the profile,
+#: and ``test_the_ci_profile_still_runs_at_the_harvested_point`` reds when the profile moves away
+#: from them. A floor recomputed from a moved profile against old readings would be armed at a
+#: point no harvest measured.
+_BASE = 12
+_RATE = {"fixed_aggregate": 24.0, "fixed_per_conn": 12.0}
 #: #1415 clause (a): min(passing base readings) / F must reach this.
 _MARGIN = 1.25
 #: #1415 clause (c), as the owner set it on 2026-10-01: run 36797223259, job 110163384729,
@@ -102,11 +102,33 @@ def _herd_gone() -> list[ConnScaleRecord]:
     per_conn = predict_herd_levels(_BASE, _RATE["fixed_per_conn"])
     assert agg is not None and per_conn is not None
     return [
-        _rec("fixed_aggregate", 12, per_msg=agg.idle),
-        _rec("fixed_aggregate", 24, per_msg=60.0),
-        _rec("fixed_per_conn", 12, per_msg=per_conn.idle, rate=_RATE["fixed_per_conn"]),
-        _rec("fixed_per_conn", 24, per_msg=60.0, rate=24.0),
+        _rec("fixed_aggregate", _BASE, per_msg=agg.idle, rate=_RATE["fixed_aggregate"]),
+        _rec("fixed_aggregate", 2 * _BASE, per_msg=60.0),
+        _rec("fixed_per_conn", _BASE, per_msg=per_conn.idle, rate=_RATE["fixed_per_conn"]),
+        _rec("fixed_per_conn", 2 * _BASE, per_msg=60.0, rate=24.0),
     ]
+
+
+def test_the_ci_profile_still_runs_at_the_harvested_point() -> None:
+    smoke: ConnScaleProfile = _smoke_profile(20000)  # type: ignore[assignment]
+    assert min(_SMOKE_COUNTS) == _BASE, "the base count moved: re-harvest before arming any leg"
+    offered = {lane: smoke.aggregate_rate_for(lane, _BASE) for lane in _RATE}
+    assert offered == _RATE, "the offered rates moved: re-harvest before arming any leg"
+
+
+def test_ci_exports_the_leg_in_the_form_the_profile_names_it() -> None:
+    # Without this line the armed check reads no leg, reports NOT GRADED with ok=True, and the
+    # smoke test's unarmed branch passes it: the only armed gate would go dark with nothing red.
+    ci_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+    ci = ci_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    step = ci[ci.index("      - name: Tests (pytest)\n") :]
+    step = step[: step.index("\n      - name:", 1)]
+    expected = f"{CONNSCALE_LEG_ENV}: ${{{{ matrix.os }}}}-py${{{{ matrix.python-version }}}}"
+    assert expected in step, step[:400]
+    for leg in _HERD_FLOOR_LEGS:
+        os_name, _, version = leg.rpartition("-py")
+        assert f"'{os_name}'" in ci or f'"{os_name}"' in ci or f" {os_name}" in ci, os_name
+        assert version in ci, version
 
 
 # --- clause (d): the deliberate negative control -------------------------------------------------
@@ -180,7 +202,9 @@ def test_the_floor_is_off_unless_a_leg_is_named() -> None:
     assert _profile(_ARMED, f" {_ARMED} ").slo.empty_claims_herd_floor_legs == (_ARMED,)
 
 
-@pytest.mark.parametrize("bad", ['"ubuntu-latest-py3.14"', "[1]", '[""]'])
+@pytest.mark.parametrize(
+    "bad", ['"ubuntu-latest-py3.14"', "[1]", '[""]', '["ubuntu-latest py3.14"]', '["ubuntu"]']
+)
 def test_a_malformed_leg_list_is_refused(bad: str) -> None:
     text = _profile_text_with(f"empty_claims_herd_floor_legs = {bad}")
     with pytest.raises(ConnScaleProfileError, match="empty_claims_herd_floor_legs"):
@@ -271,3 +295,42 @@ def test_the_armed_legs_are_exactly_the_legs_whose_every_cell_clears_the_rule() 
     assert cleared == set(_HERD_FLOOR_LEGS) == {_ARMED}, by_leg
     # And the two Windows legs fail on EVERY cell, so no lane-level arming is being left on the table.
     assert not any(v for leg, vs in by_leg.items() if leg != _ARMED for v in vs), by_leg
+
+
+def test_an_armed_leg_says_enforced_in_both_emitters() -> None:
+    # The summary and the artifact are what a later harvest and a reader of a red job see. On an
+    # armed leg both must say the floor is enforced; by default both must say it is not.
+    from tests.test_connscale_empty_claims_per_msg import _report
+
+    report = _report(*_herd_gone())
+
+    def render(enforced: bool) -> str:
+        return report.render_readings_markdown(
+            "empty_claims_per_msg",
+            lambda r: r.empty_claims_per_msg,
+            tolerance=0.25,
+            base_count=_BASE,
+            enforced=enforced,
+        )
+
+    def payload_enforced(enforced: bool) -> object:
+        payload = report.readings_payload(
+            "empty_claims_per_msg",
+            lambda r: r.empty_claims_per_msg,
+            tolerance=0.25,
+            base_count=_BASE,
+            enforced=enforced,
+        )
+        block = payload["herd_floor"]
+        assert isinstance(block, dict)
+        return block["enforced"]
+
+    armed, unarmed = render(True), render(False)
+    assert "(ENFORCED on this leg -- BACKLOG #1415)" in armed
+    assert "a BELOW FLOOR row fails the run" in armed
+    assert "IS ENFORCED on this leg" in armed and "not enforced" not in armed
+    assert (
+        "(recorded, not enforced -- BACKLOG #1415)" in unarmed
+        and "ENFORCED on this leg" not in unarmed
+    )
+    assert payload_enforced(True) is True and payload_enforced(False) is False

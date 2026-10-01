@@ -96,6 +96,11 @@ lost its reading. Those 30 jobs are among the 59 counted adverse.
 
 The wake pin reads VERIFIED for the fitted population: all 480 of its harvested jobs record
 `per_lane_wake = false`. The older population records no pin, because it predates BACKLOG #2013.
+Read VERIFIED for what it is. Each payload records the value the engine's own settings parser
+derives from the environment the runner hands the engine, where the runner pins it to false. It is
+not read back from the running engine, which vault BACKLOG #2013 records as still open. So the pin
+is in force by construction on every counted run, and the record proves the harness pinned it,
+not what the engine did with it.
 
 The control that must be non-zero held: the same scan harvested 641 older-population jobs from the
 same window. The branch fix is what made the counts reachable. Over this window the runs listing
@@ -113,7 +118,7 @@ the herd-gone level. Neither was chosen against a reading.
 | ubuntu-latest | fixed_per_conn | 137 | 31.69 | 34.63 | 36.82 | 39.25 | 23.24 | 12 | 1.364 | **Armed** |
 | windows-2022 | fixed_aggregate | 142 | 14.36 | 14.50 | 20.35 | 26.74 | 15.30 | 6 | 0.939 | Recorded only |
 | windows-2022 | fixed_per_conn | 142 | 27.58 | 27.65 | 33.92 | 38.47 | 23.24 | 12 | 1.187 | Recorded only |
-| windows-2025 | fixed_aggregate | 144 | 13.65 | 14.85 | 21.04 | 27.44 | 15.30 | 6 | 0.893 | Recorded only |
+| windows-2025 | fixed_aggregate | 144 | 13.65 | 14.85 | 21.04 | 27.44 | 15.30 | 6 | 0.892 | Recorded only |
 | windows-2025 | fixed_per_conn | 144 | 26.76 | 28.56 | 34.60 | 38.67 | 23.24 | 12 | 1.152 | Recorded only |
 
 The median is the lower median, and every percentile is nearest-rank, so each figure is a recorded
@@ -145,6 +150,14 @@ is the fitted-threshold defect BACKLOG #1211 measured, and #1415's rule forbids 
 - `ubuntu-latest` is a moving image label. A runner image change is a new leg in all but name.
 - One cancelled windows-2022 job (run 36913644165) read 5.36 on fixed_per_conn, below that lane's
   herd-gone level. Nothing establishes that run as bad, so it is not used as a true positive.
+- The readings span every event. A pull_request run tests that PR's code, which may never merge,
+  and one commit can be read up to three times, as a PR, a merge_group and a push run. Each is a
+  separate engine run on a separate runner, but the cell is not 137 commits.
+- Arming censors the next harvest of an armed leg. A job whose base reading falls below `F` now
+  fails because of it, and leaves the passing cells. Read that leg's non-passing readings for floor
+  breaches before re-applying the rule, or the gate's own fires will not show.
+- The floor is armed at the point measured: N=12, offering 24 msg/s (fixed_aggregate) and 12 msg/s
+  (fixed_per_conn). `tests/test_connscale_herd_floor.py` reds if the CI profile moves off it.
 
 ### Re-checking any number here
 
@@ -152,9 +165,12 @@ The readings are committed under
 [../../../docs/benchmarks/results/2026-10-01-connscale-herd-floor-harvest/](../../../docs/benchmarks/results/2026-10-01-connscale-herd-floor-harvest/):
 `harvest.md` is the script's own report, and the three CSVs hold every reading, job and unjoined
 artifact. `tests/test_connscale_herd_floor.py` recomputes clauses (a) to (c) from `readings.csv` on
-every run and requires the armed legs to equal the legs that clear them.
+every run and requires the armed legs to equal the legs that clear them. It also asserts clause
+(c) by run id, job id and value.
 
-To regenerate the scan while its artifacts last (they expire about 2026-12-30), in PowerShell 7:
+To regenerate the scan while its artifacts last (they expire about 2026-12-30), in PowerShell 7.
+A re-run scans 412 runs, not 408: the 4 that were still running at harvest time were created inside
+the window and have since finished, so its counts will differ by those runs.
 
 ```powershell
 python scripts/connscale_harvest.py --since 2026-09-30T12:00:00Z --until 2026-10-01T20:10:00Z --json-out out/harvest.json

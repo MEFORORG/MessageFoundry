@@ -19,6 +19,7 @@ so a broken profile is rejected before any engine is spawned. All numbers are ge
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -425,14 +426,21 @@ def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
         raise ConnScaleProfileError(f"{where}: 'empty_claims_herd_floor_legs' must be a list")
     out: list[str] = []
     for item in raw:
-        if not isinstance(item, str) or not item.strip():
+        # The shape is checked, not just non-emptiness: the harvest report prints a leg with a SPACE
+        # ("ubuntu-latest py3.14"), and a leg copied from it would parse, never match, and disarm the
+        # floor with nothing reporting it.
+        if not isinstance(item, str) or not _LEG.fullmatch(item.strip()):
             raise ConnScaleProfileError(
-                f"{where}: every 'empty_claims_herd_floor_legs' entry must be a non-empty string "
-                f"naming a CI leg as '<os>-py<version>', got {item!r}"
+                f"{where}: every 'empty_claims_herd_floor_legs' entry must name a CI leg as "
+                f"'<os>-py<version>' with no spaces, e.g. 'ubuntu-latest-py3.14'; got {item!r}"
             )
         if item.strip() not in out:
             out.append(item.strip())
     return tuple(out)
+
+
+#: A CI leg as ci.yml spells it in MEFOR_CONNSCALE_LEG: ``<matrix os>-py<python version>``.
+_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py\d+(?:\.\d+)*")
 
 
 def _claim_modes_from(raw: Any, where: str) -> tuple[str, ...]:
