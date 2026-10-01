@@ -1348,9 +1348,9 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
 - **`dialect="sqlserver"`** (default) — the **SQL Server preset** over the Microsoft ODBC Driver 18.
   **Status: production / supported** — the live aioodbc round-trip is exercised by the CI SQL Server
   service-container job.
-- **`dialect="generic"`** — a **generic ODBC path** for any other ODBC-reachable database (PostgreSQL,
-  Oracle, MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
-  and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql) below.
+- **`dialect="generic"`** — a **generic ODBC path** for another ODBC-reachable database (PostgreSQL,
+  MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
+  and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--mysql) below.
 
 (The SQL Server *store* backend is a **separate** layer, also production; the connector doesn't depend on
 it.) The **inbound** direction is the DB poll source below (`DatabasePoll(...)`).
@@ -1363,7 +1363,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `server` | — (required) | DB host (the `[egress].allowed_db` allowlist key). Use `env()` for a DEV/PROD-specific host. |
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
-| `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql)) |
+| `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--mysql)) |
 | `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port |
@@ -1412,18 +1412,18 @@ outbound(
 )
 ```
 
-#### Generic ODBC (PostgreSQL / Oracle / MySQL)
+#### Generic ODBC (PostgreSQL / MySQL)
 
 `dialect="generic"` (#66) targets **any ODBC-reachable database** without a new Python dependency: the
 connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
-the OS level** (e.g. psqlODBC, Oracle Instant Client ODBC, MySQL Connector/ODBC) and name it in
+the OS level** (e.g. psqlODBC, MySQL Connector/ODBC) and name it in
 `odbc_driver`. The parameterized-`:name` binding, error classification, pooling and `[egress].allowed_db`
 gate are identical to the SQL Server preset.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`, `Oracle in instantclient_21_13` |
-| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted; a value holding `;`, `{`, `}` or a control character is **refused**. Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**. An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
+| `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`. A name holding `;`, `{` or `}` is **refused** |
+| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted. Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**, and so is a value holding a delimiter (see [*Values*](#values-on-the-generic-dialect)). An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`). One of `UID`, `USER`, `Username` or `User ID`, in any case; anything else is **refused** |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
@@ -1431,20 +1431,27 @@ The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};]
 
 ##### Accepted `odbc_params` keywords
 
-**`server` is the only setting that tells the driver where to connect**, and it is the host
-`[egress].allowed_db` checks (vault BACKLOG #2577). To keep that true, `odbc_params` takes a fixed
-list of keywords. Each one sets a port, a TLS mode, a local file or a session option:
+`[egress].allowed_db` checks the host in `server`. **No `odbc_params` keyword can give the
+driver another host** (vault BACKLOG #2577): `odbc_params` takes a fixed list of keywords, and
+each one sets a port, a TLS mode, a local file or a session option:
 
 <!-- odbc-params-allowlist:start -->
 | Group | Keywords |
 |---|---|
 | Port | `PORT` |
-| TLS mode and files | `SSLmode`, `SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`, `sslpassword`, `SSLCIPHER`, `Encrypt`, `TrustServerCertificate` |
+| TLS mode and files | `SSLmode`, `SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`, `sslpassword`, `SSLCIPHER`, `Encrypt` |
 | Session | `CHARSET`, `ReadOnly`, `READTIMEOUT`, `WRITETIMEOUT`, `Fetch`, `UseDeclareFetch`, `BoolsAsChar`, `KeepaliveTime`, `KeepaliveInterval` |
 <!-- odbc-params-allowlist:end -->
 
-Keywords match in any case, and blanks around one are ignored. The list says what the engine
-accepts. It does not say which keywords your driver reads, so check the driver's own manual.
+Keywords match in any case, and blanks after one are ignored. A keyword given twice, in any
+spelling, is refused. The list says what the engine accepts. It does not say which keywords
+your driver reads, so check the driver's own manual.
+
+A file keyword (`SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`) must name a path on this machine. A
+path that starts with two separators names another host, and it is refused.
+
+This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
+reads `SERVER` as its target.
 
 Any other keyword is refused when the connection is built, and the error names the keyword and
 the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`
@@ -1454,16 +1461,31 @@ these kinds:
 - another name for the host, address, service, data source or socket;
 - a keyword that passes the driver a whole option string, such as psqlODBC's `pqopt`;
 - a keyword with a typed setting of its own: the driver, server, database and credentials go in
-  `odbc_driver`, `server`, `database`, `username` and `password`.
+  `odbc_driver`, `server`, `database`, `username` and `password`;
+- a keyword whose only use is to stop certificate verification, such as `TrustServerCertificate`.
 
 Two limits follow from this:
 
 - **A driver that takes its target under another keyword cannot be configured here.** The engine
   sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
   target, and `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested.
-- **psqlODBC takes libpq options, such as a CA file path, through `pqopt`, which is refused.**
-  With `SSLmode=verify-full`, libpq still reads its CA from its default location or from the
-  `PGSSLROOTCERT` environment variable of the service.
+- **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
+  file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
+  libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
+  variable of the service.
+
+##### Values on the generic dialect
+
+Every value is sent inside braces. A value that holds a delimiter is refused, not escaped, and
+the error names the setting and never the value:
+
+| Setting | Refused characters |
+|---|---|
+| `odbc_driver`, `database`, `username`, every `odbc_params` value | `;`, `{`, `}`, control characters |
+| `password` | `}`, control characters. A password may hold `;` or `{` |
+| `server` | `;`, `{`, `}`, `=`, control characters |
+
+A look-alike of one of these, such as a fullwidth semicolon or brace, is refused as well.
 
 To have a keyword added, open an issue that names the driver and what the keyword does.
 
@@ -1471,7 +1493,7 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > `Encrypt`/`TrustServerCertificate` to *refuse* a weakened DB hop, but it cannot introspect an arbitrary
 > driver's TLS posture — so the weakened-TLS refusal does **not** apply here. Configure **verifying** TLS
 > via the driver's own keyword in `odbc_params` (psqlODBC `SSLmode=verify-full`, MySQL
-> `SSLMODE=VERIFY_IDENTITY`, Oracle wallet). Never point PHI at an unverified generic hop. So the
+> `SSLMODE=VERIFY_IDENTITY`). Never point PHI at an unverified generic hop. So the
 > delegation is never *silent*, a generic connection logs a **WARNING** at construction, naming itself,
 > when `odbc_params` carries **no** ssl/tls/encrypt keyword **or** carries one set to a no-TLS value
 > (`SSLmode=disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt=no`/`0`/`false`/`off`) —
@@ -1501,8 +1523,7 @@ To have a keyword added, open an issue that names the driver and what the keywor
 
 > **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
 > **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
-> runs `SELECT 1` (works on PostgreSQL / MySQL / SQL Server; Oracle needs `SELECT 1 FROM DUAL`, so its
-> probe reports an error even though delivery works). Read-only `db_lookup` (ADR 0010) stays SQL-Server-only.
+> runs `SELECT 1` (works on PostgreSQL / MySQL / SQL Server). Read-only `db_lookup` (ADR 0010) stays SQL-Server-only.
 
 #### Give `db_lookup` a read-only login
 
@@ -1651,7 +1672,8 @@ One case is deliberately **not** reported: a `dialect="generic"` hop that sets n
 `username`/`password`. `odbc_params` accepts no login-name or password keyword (see
 [*Accepted `odbc_params` keywords*](#accepted-odbc_params-keywords)), so such a hop carries
 neither in its connection string. It may still sign in with a client certificate (`SSLCERT` and
-`SSLKEY`) or as the service's own account, and this report classifies neither.
+`SSLKEY`, on a driver that reads them) or as the service's own account, and this report
+classifies neither.
 
 ```python
 from messagefoundry import outbound, Database, env
@@ -1691,7 +1713,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `poll_seconds` | `5.0` | interval between polls |
 | `poll_max_rows` | `500` | most rows one poll will **hand off** from `poll_statement`'s result set. The rest are left in the table — not read, not marked, not errored — and the next poll selects them again. Still charged at the **fetch**, so a long-unattended table is not materialised whole into memory; a row the source cannot turn into a body does not spend a slot, and the poll asks the driver for the shortfall instead (at most 64 such rows per poll, then it defers the rest). Progress needs `mark_statement` to take a handled row out of the `poll_statement` predicate, which is the shape this connector already requires. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `encoding` | `utf-8` | charset for the body bytes handed to the pipeline |
-| `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql) |
+| `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls an OS-installed ODBC driver (PostgreSQL / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--mysql) |
 | `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `pool_max` | — | identical to the `Database(...)` destination above |
 
 **Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:

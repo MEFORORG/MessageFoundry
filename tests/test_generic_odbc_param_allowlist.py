@@ -12,7 +12,10 @@ other places a keyword can come from, so this file pins all three:
   driver has its own spellings for a host, an address, a data source name or a socket, so a list of
   refused names would always trail the drivers.
 * ``odbc_user_key`` and ``odbc_password_key`` accept the credential keywords and nothing else.
-* An ``odbc_params`` value may not hold the characters that end a connection-string value.
+* A value may not hold the characters that end a connection-string value, in ASCII or in a
+  look-alike form. That covers every ``odbc_params`` value and the driver, database and user name.
+  A password may hold ``;`` and ``{`` but not ``}``.
+* A keyword given twice is refused, and a file keyword must name a path on this machine.
 
 Each refusal is paired with a control that must still build, and the control uses the same builder
 and the same settings. Nothing here opens a connection: the refusal is in the string builder, which
@@ -37,6 +40,7 @@ from messagefoundry.config.wiring import (
     build_outbound_connection,
 )
 from messagefoundry.pipeline.wiring_runner import build_check_registry
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import build_destination, build_source
 from messagefoundry.transports.database import (
     _ODBC_PARAM_ALLOWLIST,
@@ -101,6 +105,7 @@ _REFUSED_KEYWORDS = [
     "Database",
     "UID",
     "PWD",
+    "TrustServerCertificate",
     "SomeFutureKeyword",
 ]
 
@@ -110,13 +115,19 @@ def test_a_keyword_off_the_list_is_refused(keyword: str) -> None:
     with pytest.raises(ValueError, match="must not set") as refused:
         _build(odbc_params={"SSLmode": "verify-full", keyword: _VALUE})
     message = str(refused.value)
-    assert repr(keyword) in message
+    named = f"'{_odbc_keyword_name(keyword)}'"
+    assert named in message
     assert _CONNECTION in message
     assert _VALUE not in message
     # The log scrub reads `<credential word>: x` as a credential pair, and a refused keyword may end
     # in such a word, so the refusal must not put either separator after the keyword.
-    assert f"{keyword!r}:" not in message
-    assert f"{keyword!r}=" not in message
+    assert f"{named}:" not in message
+    assert f"{named}=" not in message
+    # A failed lane stores the scrubbed, shortened form. It must still say which keyword to remove
+    # and where the list is.
+    stored = safe_exc(refused.value)
+    assert named in stored
+    assert "docs/CONNECTIONS.md" in stored
 
 
 # `sslkey` names a file the builder opens to check its passphrase wrap, so a placeholder value cannot
@@ -144,9 +155,28 @@ def test_the_list_is_stored_in_the_form_keywords_are_compared_in() -> None:
         assert keyword == _odbc_keyword_name(keyword)
 
 
-def test_a_keyword_with_a_trailing_line_break_is_not_a_keyword() -> None:
-    with pytest.raises(ValueError, match="not a valid ODBC keyword"):
-        _build(odbc_params={"PORT\n": "5432"})
+@pytest.mark.parametrize("keyword", ["PORT\n", " PORT", "SSL-MODE"])
+def test_a_keyword_of_the_wrong_shape_is_refused_and_names_the_connection(keyword: str) -> None:
+    with pytest.raises(ValueError, match="not a valid ODBC keyword") as refused:
+        _build(odbc_params={keyword: "5432"})
+    assert _CONNECTION in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"PORT": 5432, "port": 5433},
+        {"SSLmode": "verify-full", "sslmode ": "verify-ca"},
+        {"Fetch": 1, "FETCH": 1},
+    ],
+)
+def test_a_keyword_given_twice_is_refused(params: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="more than once") as refused:
+        _build(odbc_params=params)
+    assert _CONNECTION in str(refused.value)
+    # Control: either copy alone builds.
+    for keyword, value in params.items():
+        assert f"{keyword}={{{value}}}" in _build(odbc_params={keyword: value})
 
 
 # --- the keyword each credential is sent under ---------------------------------------------------
@@ -158,7 +188,7 @@ def test_a_credential_keyword_off_its_list_is_refused(setting: str, keyword: str
     with pytest.raises(ValueError, match=f"{setting} must be one of") as refused:
         _build(username=_VALUE, password=_VALUE, **{setting: keyword})
     message = str(refused.value)
-    assert repr(keyword) in message
+    assert f"'{_odbc_keyword_name(keyword)}'" in message
     assert _CONNECTION in message
     assert _VALUE not in message
 
@@ -175,23 +205,83 @@ def test_the_credential_keywords_drivers_use_still_build(user_key: str, password
     assert f"{password_key}={{pw}}" in dsn
 
 
-# --- odbc_params values ------------------------------------------------------------------------
+# --- values --------------------------------------------------------------------------------------
 
 # A value is sent inside braces. These are the characters that could end it early in a driver that
-# reads the braces differently from the ODBC rule, plus the control characters no keyword value needs.
-_REFUSED_VALUE_CHARACTERS = [";", "{", "}", "\n", "\r", "\x00", "\x7f"]
+# reads the braces differently from the ODBC rule, plus the control characters no value needs. The
+# last four are look-alikes: a driver manager that converts the string to a narrow code page for the
+# driver can turn each into the ASCII character.
+_REFUSED_VALUE_CHARACTERS = [
+    ";",
+    "{",
+    "}",
+    "\n",
+    "\r",
+    "\x00",
+    "\x7f",
+    "\uff1b",
+    "\uff5b",
+    "\uff5d",
+    "\ufe54",
+]
 
 
 @pytest.mark.parametrize("character", _REFUSED_VALUE_CHARACTERS)
 def test_a_value_holding_a_connection_string_delimiter_is_refused(character: str) -> None:
     value = f"{_VALUE}{character}{_VALUE}"
     with pytest.raises(
-        ValueError, match="odbc_params value for 'SSLmode' must not contain"
+        ValueError, match="odbc_params value for 'sslmode' must not contain"
     ) as refused:
         _build(odbc_params={"SSLmode": value})
     message = str(refused.value)
     assert _CONNECTION in message
     assert _VALUE not in message
+
+
+@pytest.mark.parametrize("setting", ["odbc_driver", "database", "username"])
+@pytest.mark.parametrize("character", [";", "{", "}", "\n", "\uff5d"])
+def test_a_typed_setting_holding_a_delimiter_is_refused(setting: str, character: str) -> None:
+    with pytest.raises(ValueError, match=f"DATABASE {setting} must not contain") as refused:
+        _build(**{setting: f"{_VALUE}{character}{_VALUE}"})
+    message = str(refused.value)
+    assert _CONNECTION in message
+    assert _VALUE not in message
+
+
+@pytest.mark.parametrize("character", ["}", "\n", "\uff5d"])
+def test_a_password_holding_the_closing_brace_is_refused(character: str) -> None:
+    with pytest.raises(ValueError, match="DATABASE password must not contain") as refused:
+        _build(username="svc", password=f"{_VALUE}{character}{_VALUE}")
+    message = str(refused.value)
+    assert _CONNECTION in message
+    assert _VALUE not in message
+
+
+def test_a_password_may_hold_the_other_delimiters() -> None:
+    # Inside braces only `}` can end the value, so these stay legal in a password.
+    assert "PWD={p;w{d=1 x}" in _build(username="svc", password="p;w{d=1 x")
+
+
+@pytest.mark.parametrize("character", [";", "{", "}", "=", "\n", "\t", "\uff1b", "\uff1d"])
+def test_a_server_holding_a_delimiter_is_refused(character: str) -> None:
+    with pytest.raises(ValueError, match="server must not contain"):
+        _build(server=f"db.test{character}x")
+
+
+# --- file keywords -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("keyword", ["sslca", "SSLCAPATH", "sslcert", "SSLKEY"])
+@pytest.mark.parametrize(
+    "path",
+    [r"\\files.test\share\ca.pem", "//files.test/share/ca.pem", r" \\files.test\share\ca.pem"],
+)
+def test_a_file_keyword_must_name_a_path_on_this_machine(keyword: str, path: str) -> None:
+    with pytest.raises(ValueError, match="must be a path on this machine") as refused:
+        _build(odbc_params={keyword: path})
+    message = str(refused.value)
+    assert _CONNECTION in message
+    assert "files.test" not in message
 
 
 @pytest.mark.parametrize(
@@ -263,7 +353,7 @@ def test_the_documented_generic_example_builds_as_a_poll_source() -> None:
 
 def test_the_destination_seam_refuses_a_keyword_off_the_list() -> None:
     config = _documented_destination(_DOCUMENTED_PARAMS | {"Servername": _VALUE})
-    with pytest.raises(ValueError, match="must not set 'Servername'") as refused:
+    with pytest.raises(ValueError, match="must not set 'servername'") as refused:
         build_destination(config)
     assert "DB-OUT_ACME_PG" in str(refused.value)
     assert _VALUE not in str(refused.value)
@@ -271,7 +361,7 @@ def test_the_destination_seam_refuses_a_keyword_off_the_list() -> None:
 
 def test_the_poll_source_seam_refuses_a_keyword_off_the_list() -> None:
     config = _documented_source(_DOCUMENTED_PARAMS | {"Servername": _VALUE})
-    with pytest.raises(ValueError, match="must not set 'Servername'") as refused:
+    with pytest.raises(ValueError, match="must not set 'servername'") as refused:
         build_source(config)
     assert "DB-IN_ACME_PG" in str(refused.value)
     assert _VALUE not in str(refused.value)
@@ -302,7 +392,7 @@ def _check_build(params: dict[str, Any]) -> None:
 
 
 def test_the_build_check_refuses_a_keyword_off_the_list() -> None:
-    with pytest.raises(WiringError, match="must not set 'Servername'") as refused:
+    with pytest.raises(WiringError, match="must not set 'servername'") as refused:
         _check_build(_DOCUMENTED_PARAMS | {"Servername": _VALUE})
     assert "DB-OUT_ACME_PG" in str(refused.value)
     assert _VALUE not in str(refused.value)

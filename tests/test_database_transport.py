@@ -351,11 +351,17 @@ def test_build_odbc_dsn_requires_driver() -> None:
 
 
 def test_build_odbc_dsn_brace_quotes_values() -> None:
-    # An injection attempt in a param value can't close the brace early (the inner } is doubled).
+    # A value is sent inside braces, so a delimiter in it stays part of the value.
     dsn = _build_odbc_dsn(
-        {"odbc_driver": "PostgreSQL Unicode", "server": "db.example", "password": "p};DROP"}
+        {"odbc_driver": "PostgreSQL Unicode", "server": "db.example", "password": "p;DROP=1"}
     )
-    assert "PWD={p}};DROP}" in dsn
+    assert "PWD={p;DROP=1}" in dsn
+    # The one character that can end a braced value is refused rather than escaped: not every
+    # driver is known to read the `}}` escape (vault BACKLOG #2577).
+    with pytest.raises(ValueError, match="password must not contain"):
+        _build_odbc_dsn(
+            {"odbc_driver": "PostgreSQL Unicode", "server": "db.example", "password": "p};DROP"}
+        )
 
 
 @pytest.mark.parametrize("bad", ["host;x", "host{x", "host=x", "host\nx"])
@@ -381,7 +387,7 @@ def test_build_odbc_dsn_rejects_reserved_param_key(reserved: str) -> None:
 
 
 def test_generic_destination_builds_without_database() -> None:
-    # The generic dialect may omit `database` (e.g. Oracle service name) — the destination still builds.
+    # The generic dialect may omit `database` (not every driver takes one) — the destination still builds.
     d = build_destination(
         Destination(
             name="OB_DB_GEN",
