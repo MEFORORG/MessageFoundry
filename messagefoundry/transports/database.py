@@ -11,8 +11,10 @@ parameters. The transport rides **``aioodbc``** (ADR 0003) — the ``[sqlserver]
 Driver 18, T-SQL-flavoured DSN with the ``Encrypt``/``TrustServerCertificate`` TLS posture and its
 weakened-TLS refusal (:func:`_build_dsn`); **production / supported**, exercised by the CI SQL Server
 job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T-SQL: the operator names
-any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) + supplies driver-specific keywords via
-``odbc_params`` (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. On the generic
+any OS-installed ODBC driver (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
+(:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. ``odbc_params`` takes a fixed
+list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`), so ``server`` is the only setting that tells the driver
+where to connect, which is what ``[egress].allowed_db`` checks (vault BACKLOG #2577). On the generic
 path TLS is the operator's responsibility (configured through the driver's own keyword) — MessageFoundry
 cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply.
 Construction logs the delegation as a fail-safe (a WARNING when no TLS keyword is set — see
@@ -72,6 +74,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.connection_names import inbound_record_name
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import refuse_weak_key_file
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import safe_exc
@@ -247,9 +250,58 @@ def _build_dsn(
 # (the VALUES are additionally brace-quoted), so message-influenced data can't smuggle extra keywords.
 _ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
 
-# odbc_params must not re-declare a keyword the connector emits from its own settings (driver/server/
-# database/the credential keys) — that would silently duplicate/conflict a keyword.
-_ODBC_RESERVED_KEYS = frozenset({"driver", "server", "database"})
+# The ONLY keywords ``odbc_params`` may set on the generic dialect (vault BACKLOG #2577), in the form
+# :func:`_odbc_keyword_name` compares them in.
+#
+# WHY A LIST OF WHAT IS ACCEPTED. ``[egress].allowed_db`` is checked against the ``server`` setting, so
+# that check means something only while ``server`` is the one setting that tells the driver where to
+# connect. Every ODBC driver has its own keywords for a host, an address, a data source name, a socket
+# or a whole option string, and a new driver release can add another. A list of refused names would
+# always trail the drivers. This list instead names what the engine knows to carry no connection
+# target, and :func:`_build_odbc_dsn` refuses everything else when the connection is built.
+#
+# WHAT EARNS A PLACE. A keyword whose value is a port, a TLS mode, a local file the driver verifies or
+# authenticates with, or a session setting. Nothing that names a host, a service, a data source or a
+# socket, and nothing that hands the driver an option string, SQL to run or a library to load. The
+# connector's own typed settings (driver, server, database, the two credentials) are absent as well:
+# a second copy here would leave the driver to choose between the two.
+#
+# ``port`` is here because the generic dialect has no other way to send one. It moves the port and
+# never the host.
+#
+# docs/CONNECTIONS.md prints this list, and tests/test_generic_odbc_param_allowlist.py fails when the
+# two differ. Adding a keyword is a reviewed code change, on purpose.
+_ODBC_PARAM_ALLOWLIST = frozenset(
+    {
+        "port",
+        # TLS mode, and the local files a driver verifies or authenticates with.
+        "sslmode",
+        "sslca",
+        "sslcapath",
+        "sslcert",
+        "sslkey",
+        "sslpassword",
+        "sslcipher",
+        "encrypt",
+        "trustservercertificate",
+        # Session behaviour.
+        "charset",
+        "readonly",
+        "readtimeout",
+        "writetimeout",
+        "fetch",
+        "usedeclarefetch",
+        "boolsaschar",
+        "keepalivetime",
+        "keepaliveinterval",
+    }
+)
+
+# The keywords ``odbc_user_key`` / ``odbc_password_key`` may name. Those two settings choose the
+# keyword a credential is sent under, so a free name there would be a free keyword with an
+# operator-chosen value, which is what the list above exists to refuse.
+_ODBC_USER_KEYS = frozenset({"uid", "user", "username", "user id"})
+_ODBC_PASSWORD_KEYS = frozenset({"pwd", "password"})
 
 # A best-effort hint that the operator configured driver-level TLS via an odbc_params keyword (anything
 # ssl/tls/encrypt-ish — psqlODBC `SSLmode`, MySQL `SSLMODE`, some drivers' `Encrypt`). Used ONLY to tune
@@ -361,11 +413,36 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
 
 
 def _odbc_keyword(key: str, *, what: str) -> str:
-    """Validate an ODBC keyword token (STORE-5) and return it, or raise a clear ValueError."""
-    if not _ODBC_KEY_RE.match(key):
+    """Validate an ODBC keyword token (STORE-5) and return it, or raise a clear ValueError.
+
+    ``fullmatch``, not ``match``: ``$`` also matches before a trailing line break, so ``match`` let a
+    keyword ending in one through."""
+    if not _ODBC_KEY_RE.fullmatch(key):
         raise ValueError(
             f"DATABASE {what} {key!r} is not a valid ODBC keyword "
             "(letters, digits, spaces, underscores; must start with a letter)"
+        )
+    return key
+
+
+def _odbc_keyword_name(key: str) -> str:
+    """``key`` in the form the keyword lists are compared in: lower case, with the blanks around it
+    dropped and a run of blanks inside it read as one. ODBC keywords are case-insensitive and a
+    connection-string parser ignores the blanks around one, so two spellings a driver reads as the
+    same keyword must not get two answers here."""
+    return " ".join(key.split()).lower()
+
+
+def _odbc_credential_keyword(
+    value: object, setting: str, allowed: frozenset[str], *, connection: str | None
+) -> str:
+    """The keyword ``setting`` names for a credential, or a ValueError when it is not one of
+    ``allowed`` (vault BACKLOG #2577). Returned as the operator spelled it."""
+    key = _odbc_keyword(str(value), what=setting)
+    if _odbc_keyword_name(key) not in allowed:
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE {setting} must be one of "
+            f"{', '.join(sorted(allowed))} (in any case), got {key!r}"
         )
     return key
 
@@ -403,16 +480,24 @@ def _refuse_weak_driver_key(params: Mapping[str, Any], *, connection: str | None
 
 def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     """Build a GENERIC ODBC connection string (``dialect='generic'``, #66) — decoupled from the ODBC
-    Driver 18 / T-SQL preset so any ODBC-reachable DB (PostgreSQL / Oracle / MySQL via that DB's own ODBC
-    driver) works. The operator installs the target ODBC driver at the OS level and names it here.
+    Driver 18 / T-SQL preset so a DB reached through its own ODBC driver (PostgreSQL, MySQL) works. The
+    operator installs the target ODBC driver at the OS level and names it here.
 
-    The operator supplies the ODBC ``odbc_driver`` name + an ``odbc_params`` mapping of driver-specific
-    keywords (PORT, SSLmode, …). ``server`` (the ``[egress].allowed_db`` allowlist key) is emitted as the
+    The operator supplies the ODBC ``odbc_driver`` name + an ``odbc_params`` mapping of driver keywords
+    (PORT, SSLmode, …). ``server`` (the ``[egress].allowed_db`` allowlist key) is emitted as the
     near-universal ``SERVER`` keyword and ``database`` as ``DATABASE`` when set; credentials come from the
     top-level ``username``/``password`` settings (``env()``-resolved + secret-redacted) under the
-    operator-chosen ``odbc_user_key``/``odbc_password_key`` keyword names (default ``UID``/``PWD``). Every
-    ``odbc_params`` value is brace-quoted (STORE-5 injection guard) and its key validated to a safe ODBC
-    keyword, so message-influenced data can never inject an extra connection keyword.
+    ``odbc_user_key``/``odbc_password_key`` keyword names (default ``UID``/``PWD``).
+
+    **``server`` is the only setting that tells the driver where to connect** (vault BACKLOG #2577). An
+    ``odbc_params`` keyword must be on :data:`_ODBC_PARAM_ALLOWLIST`, and the two credential keywords on
+    their own short lists, or the build is refused with the keyword and the connection named. A driver
+    that takes its target under another keyword cannot be configured on this path. The egress check
+    itself is the caller's (``pipeline.wiring_runner``); this builder keeps what that check read true.
+
+    Every ``odbc_params`` value is brace-quoted (STORE-5 injection guard). A value holding ``;``, a brace
+    or a control character is refused rather than escaped: a driver that reads braces differently from
+    the ODBC rule must not be handed a value that could end early and start a second keyword.
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
     driver's TLS posture the way it reads SQL Server's ``Encrypt``/``TrustServerCertificate``, so the
@@ -442,24 +527,45 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
         parts.append(f"DATABASE={_odbc_brace(str(s['database']))}")
     username = s.get("username")
     if username:
-        user_key = _odbc_keyword(str(s.get("odbc_user_key", "UID")), what="odbc_user_key")
+        user_key = _odbc_credential_keyword(
+            s.get("odbc_user_key", "UID"), "odbc_user_key", _ODBC_USER_KEYS, connection=connection
+        )
         parts.append(f"{user_key}={_odbc_brace(str(username))}")
     password = s.get("password")
     if password:
-        pwd_key = _odbc_keyword(str(s.get("odbc_password_key", "PWD")), what="odbc_password_key")
+        pwd_key = _odbc_credential_keyword(
+            s.get("odbc_password_key", "PWD"),
+            "odbc_password_key",
+            _ODBC_PASSWORD_KEYS,
+            connection=connection,
+        )
         parts.append(f"{pwd_key}={_odbc_brace(str(password))}")
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
         raise ValueError("DATABASE odbc_params must be a mapping of ODBC keyword -> value")
-    _refuse_weak_driver_key(params, connection=connection)
+    where = hop_name_prefix(connection)
     for key, value in params.items():
         k = _odbc_keyword(str(key), what="odbc_params key")
-        if k.lower() in _ODBC_RESERVED_KEYS:
+        if _odbc_keyword_name(k) not in _ODBC_PARAM_ALLOWLIST:
             raise ValueError(
-                f"DATABASE odbc_params must not set {k!r} — use the 'odbc_driver' / 'server' / "
-                "'database' settings instead"
+                # `;` after the keyword, never `:` or `=`: the log scrub reads `<credential word>: x`
+                # as a credential pair, and a refused keyword may end in such a word.
+                f"{where}DATABASE odbc_params must not set {k!r}; it is not a keyword this dialect "
+                "accepts. The 'server' setting alone tells the driver where to connect, and "
+                "[egress].allowed_db is checked against it. The driver, server, database and "
+                "credentials go in 'odbc_driver', 'server', 'database', 'username' and 'password'. "
+                "docs/CONNECTIONS.md (Generic ODBC) lists the accepted keywords."
             )
-        parts.append(f"{k}={_odbc_brace(str(value))}")
+        text = str(value)
+        # The refusal names the keyword and never the value, which may be a passphrase.
+        if any(ch in ";{}" for ch in text) or has_control_char(text):
+            raise ValueError(
+                f"{where}DATABASE odbc_params value for {k!r} must not contain ';', '{{', '}}' or "
+                "a control character"
+            )
+        parts.append(f"{k}={_odbc_brace(text)}")
+    # After the loop on purpose: this opens the key file, so the keywords are settled first.
+    _refuse_weak_driver_key(params, connection=connection)
     _warn_generic_tls_unenforced(params, connection=connection)
     return ";".join(parts) + ";"
 
@@ -1084,7 +1190,7 @@ class DatabaseDestination(DestinationConnector):
     def __init__(self, config: Destination) -> None:
         s = config.settings
         # `database` is required only for the SQL Server preset; the generic ODBC dialect (#66) may omit
-        # it (Oracle names a service, not a DATABASE keyword) and carries it via odbc_params if needed.
+        # it: not every driver takes a DATABASE keyword.
         self._dialect = str(s.get("dialect", "sqlserver")).lower()
         required = (
             ("server", "statement")

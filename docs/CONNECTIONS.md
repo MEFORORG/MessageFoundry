@@ -1423,11 +1423,49 @@ gate are identical to the SQL Server preset.
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`, `Oracle in instantclient_21_13` |
-| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted (injection-safe); keys must be valid ODBC keywords and may not re-set `DRIVER`/`SERVER`/`DATABASE`. An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
-| `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`) |
-| `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`) |
+| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted; a value holding `;`, `{`, `}` or a control character is **refused**. Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**. An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
+| `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`). One of `UID`, `USER`, `Username` or `User ID`, in any case; anything else is **refused** |
+| `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
-The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};][<user>={username};<pwd>={password};]<odbc_params…>`. `server` is emitted as the near-universal `SERVER` keyword (it is still the egress key); everything else driver-specific goes in `odbc_params`.
+The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};][<user>={username};<pwd>={password};]<odbc_params…>`. `server` is emitted as the near-universal `SERVER` keyword.
+
+##### Accepted `odbc_params` keywords
+
+**`server` is the only setting that tells the driver where to connect**, and it is the host
+`[egress].allowed_db` checks (vault BACKLOG #2577). To keep that true, `odbc_params` takes a fixed
+list of keywords. Each one sets a port, a TLS mode, a local file or a session option:
+
+<!-- odbc-params-allowlist:start -->
+| Group | Keywords |
+|---|---|
+| Port | `PORT` |
+| TLS mode and files | `SSLmode`, `SSLCA`, `SSLCAPATH`, `SSLCERT`, `SSLKEY`, `sslpassword`, `SSLCIPHER`, `Encrypt`, `TrustServerCertificate` |
+| Session | `CHARSET`, `ReadOnly`, `READTIMEOUT`, `WRITETIMEOUT`, `Fetch`, `UseDeclareFetch`, `BoolsAsChar`, `KeepaliveTime`, `KeepaliveInterval` |
+<!-- odbc-params-allowlist:end -->
+
+Keywords match in any case, and blanks around one are ignored. The list says what the engine
+accepts. It does not say which keywords your driver reads, so check the driver's own manual.
+
+Any other keyword is refused when the connection is built, and the error names the keyword and
+the connection. That fails `messagefoundry check`, a reload and a `connection` edit. At `serve`
+start the connection is not built, so it never connects. The refused set includes at least
+these kinds:
+
+- another name for the host, address, service, data source or socket;
+- a keyword that passes the driver a whole option string, such as psqlODBC's `pqopt`;
+- a keyword with a typed setting of its own: the driver, server, database and credentials go in
+  `odbc_driver`, `server`, `database`, `username` and `password`.
+
+Two limits follow from this:
+
+- **A driver that takes its target under another keyword cannot be configured here.** The engine
+  sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
+  target, and `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested.
+- **psqlODBC takes libpq options, such as a CA file path, through `pqopt`, which is refused.**
+  With `SSLmode=verify-full`, libpq still reads its CA from its default location or from the
+  `PGSSLROOTCERT` environment variable of the service.
+
+To have a keyword added, open an issue that names the driver and what the keyword does.
 
 > **TLS is the operator's responsibility on the generic path.** MessageFoundry reads SQL Server's
 > `Encrypt`/`TrustServerCertificate` to *refuse* a weakened DB hop, but it cannot introspect an arbitrary
@@ -1610,9 +1648,10 @@ It covers **four** factories, because four of them dial a database with a creden
 > [`docs/SECURITY.md`](SECURITY.md) for the delegation boundary.
 
 One case is deliberately **not** reported: a `dialect="generic"` hop that sets no top-level
-`username`/`password`. A credential may still ride in `odbc_params` under an arbitrary driver keyword,
-and the engine cannot enumerate an arbitrary driver's keywords — the same limit the generic-ODBC TLS
-note above records. Classifying it would be guessing, and a guess belongs in no security report.
+`username`/`password`. `odbc_params` accepts no login-name or password keyword (see
+[*Accepted `odbc_params` keywords*](#accepted-odbc_params-keywords)), so such a hop carries
+neither in its connection string. It may still sign in with a client certificate (`SSLCERT` and
+`SSLKEY`) or as the service's own account, and this report classifies neither.
 
 ```python
 from messagefoundry import outbound, Database, env

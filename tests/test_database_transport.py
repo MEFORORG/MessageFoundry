@@ -461,12 +461,14 @@ def test_a_sentinel_sslpassword_never_appears_in_the_captured_log(
     for params in (
         {"SSLmode": "disable", "sslpassword": sentinel},
         {"sslpassword": sentinel},
-        {"PWD_SSL": "off", "Encrypt": "no"},
     ):
         logged = _generic_dsn_logs(dict(params), caplog)
         reason = generic_odbc_tls_unenforced(params) or ""
         assert caplog.records, "the probe logged nothing, so an absence would prove nothing"
         assert sentinel not in logged and sentinel not in reason
+    # The classifier alone. `PWD_SSL` is not an accepted odbc_params keyword, so the builder refuses
+    # it before anything is logged (vault BACKLOG #2577) and only the classifier can be handed it.
+    reason = generic_odbc_tls_unenforced({"PWD_SSL": "off", "Encrypt": "no"}) or ""
     assert "PWD_SSL" not in reason and "Encrypt=no" in reason
 
 
