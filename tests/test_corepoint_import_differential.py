@@ -1100,11 +1100,12 @@ def _oracle_violations(shape: Shape, xml: str) -> list[str]:
         if h_at is not None and s_at is not None and h_at < s_at:
             found.append(f"(ii) {dest} sits at indent {h_at} in the head, {s_at} in step 1")
 
-    # The narrowing: a local other than msg is bound and sent only at the handler's own level.
+    # The gate admits no construct: a local other than msg is bound and sent only at the handler's
+    # own level.
     for line in out_head.src.split("@handler")[-1].splitlines():
         found_local = _LOCAL_LINE.match(line)
         if found_local and len(found_local.group(1)) != 4:
-            found.append(f"(narrowing) a local is bound or sent below the handler level: {line}")
+            found.append(f"(level) a local is bound or sent below the handler level: {line}")
 
     # Every live send line of the head, on every path.
     step1_live = {(d, local) for _, d, local in _live_sends(out_step1.src)}
@@ -1660,9 +1661,9 @@ def _seed_shapes() -> Iterator[Shape]:
             SendS(_OUT, "OB_OUT"),
         ),
     )
-    # Under the narrowing nothing binds inside a construct, so what a ForEach or Catch line may
-    # bind matters most for the INPUT before the first bind: a loop that rebinds it, then a clone of
-    # it, would copy the message that arrived instead of what the loop left there.
+    # From the narrowing rounds, kept as seeds: what a ForEach or Catch line may bind mattered most
+    # for the INPUT before the first bind, since a loop that rebinds it, then a clone of it, would
+    # copy the message that arrived. Under the whole-list gate any ForEach or Catch closes the gate.
     for name in ("ADT", "%ADT", "%adt"):
         for cls in ("", "plain", "verbless", "variable", "literal", "handle"):
             over = H(name, cls)

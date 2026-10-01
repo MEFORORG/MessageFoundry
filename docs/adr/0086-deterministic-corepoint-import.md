@@ -199,287 +199,121 @@ At least these gaps remain:
 
 Building the other tree, and the flow the scan cannot see, is step 2 of #313.
 
-**(b‴) AMENDMENT 2026-09-30 — each handle becomes a Python local, settled in statement order
-(BACKLOG #313, step 2).** The owner ruled on 2026-09-26 for an importer-only fix: no engine change and
-no change to ADR 0001. A Handler can already build and send a second `Message`
-(`samples/config/IB_RADIOLOGY_SR.py` does). This step closes both gaps (b″) names.
+**(b‴) AMENDMENT 2026-09-30, REVISED 2026-10-01 — each handle becomes a Python local, in a fully
+understood list only (BACKLOG #313, step 2).** The owner ruled on 2026-09-26 for an importer-only fix:
+no engine change and no change to ADR 0001. A Handler can already build and send a second `Message`
+(`samples/config/IB_RADIOLOGY_SR.py` does).
 
-The importer now parses the whole step tree first. Then it walks the tree in the order the generated
-Python runs, tracking which local each Corepoint handle holds at each point:
+**The whole-list gate (Manager decision, 2026-10-01).** Before a list renders, the importer decides
+once whether the WHOLE list is fully understood. It is only when every element in it, at every
+depth, is on this allow-list and reads in exactly one shape, with no word, span, attribute, marker
+or text left unread:
 
-| Corepoint statement | Generated Python | Condition |
+| Element | The one shape it is read in |
+|---|---|
+| `MsgTreeCopy` (a plain clone) | keyword verb, handle, path `/`, the word `to`, handle, path `/` |
+| `MsgCreate` | keyword verb, handle, `as`, a caret-form type literal, `version`, a `2.x` or `2.x.y` literal |
+| `ItemCopy`, `ItemAppend` | keyword verb, a quoted literal, `to`, handle, a writable HL7 field path |
+| `ItemClear` | keyword verb, handle, a writable HL7 field path |
+| `MsgLog` | keyword verb, one handle |
+| `MsgSend` | keyword verb, one handle, `to connection`, a non-blank destination literal |
+| `<Block>` | a label of letters, digits and spaces, no word of which is a Corepoint verb, begins like one (`msg`, `item`, `seg`, `env`, `var`, `actionlist`), or has a capital past its first letter |
+| a surely disabled step | a `<Line>` or `<Block>` above with `@Disabled` of `1`, `true` or `yes` |
+| `<List>` | no attribute; flattened |
+
+Each statement is a `<Line>` whose only attribute is `@Data`. The verb is a `keyword` span spelled
+exactly so, and connectives are unstyled words. A handle is an `input-handle` or `other-handle`
+span matching `%` plus up to 40 ASCII letters, digits and underscores. A field path is `/SEG-F`,
+optionally with up to two more `-n` coordinates and a `(label)`, or the dotted form, on a
+single-occurrence segment and never MSH-1 or MSH-2. Spans carry only plain text: no nesting, no
+entity, no attribute but `class`. Across the list, no two handle spellings may differ only in case,
+each handle carries one span class everywhere, there is at most one input handle, and no clone or
+`MsgCreate` writes the input. The `<ActionList>` carries only `Name` and `Desc`. Tags are matched
+exactly, so a namespaced or differently cased tag is not understood.
+
+**No construct is on the list:** no `If`, `ElseIf`, `Else`, `Case`, `ChooseFrom`, `Matching`,
+`ForEach`, `Loop`, `While`, `Try`, `Catch`, `Call`, `ActionListExit` or other exit, and no
+unmodelled element, anywhere in the list. A lowercase or variant verb, a `description`, `comment` or
+`detail` span on a statement line, any unread attribute (`Enabled`, `Comment`, unknown names), a
+markup-free statement, and a path such as `//ADT` each make the list NOT fully understood. When in
+doubt, it is not.
+
+**A list that is not fully understood renders exactly as step 1 renders it,** byte for byte, with the
+same summary counts: the importer runs step 1's code path on it, untouched, so there is no partial
+binding. The gaps (b″) names stay as they are for such a list.
+
+**In a fully understood list,** the importer walks the statements in order:
+
+| Corepoint statement | Generated Python | When |
 |---|---|---|
-| the input handle | `msg` | exactly one distinct `input-handle` in the list |
-| `MsgTreeCopy <src>/ to <dst>/` | `<dst>_msg = <src local>.copy()` | `<src>` holds a known message here |
-| `MsgCreate <handle> "ADT^A04" "2.5.1"` | `<handle>_msg = Message.parse("MSH\|^~\\&\|...")` | exactly one type and one version, nothing else |
-| `ItemCopy`/`ItemClear`/`ItemAppend` on `<handle>/path` | `set_field(<local>, ...)` | the (b′) rules, against that handle's local |
-| `MsgSend <handle>` | `sends.append(Send(dest, <local>))` | `<handle>` holds a known message here |
+| the input handle | `msg` | the list's one `input-handle` |
+| `MsgTreeCopy <src>/ to <dst>/` | `<dst>_msg = <src local>.copy()` | `<src>` holds a local here; else a TODO, and `<dst>` is unknown |
+| `MsgCreate <handle> as "ADT^A04" version "2.5.1"` | `<handle>_msg = Message.parse("MSH\|^~\\&\|...")` | always (the gate checked the type and version) |
+| `ItemCopy`/`ItemClear`/`ItemAppend` on `<handle>/path` | `set_field(<local>, ...)` | `<handle>` holds a local here; else a TODO |
+| `MsgSend <handle>` | `sends.append(Send(dest, <local>))` | `<handle>` holds a local here; else the step 1 raise |
 
-Each local name comes from the handle, folded to ASCII and suffixed `_msg`. It stays fixed for the
-whole handler, so a handle bound again inside a branch rebinds the same variable.
+Each local is the handle's name, lower-cased, without the `%`, suffixed `_msg`. The skeleton holds
+the default encoding characters, the type in MSH-9 and the version in MSH-12, and nothing else. It
+is built through the `Message` API and emitted as one literal. A write to a built message maps only
+onto its MSH; a write to another segment is a TODO, because `Message.set` raises on a segment the
+skeleton lacks. **A write to a handle after a send of it is a TODO, and the handle is unknown from
+there,** so a later send of it raises. A `Send` holds the object, so the write would otherwise change
+the message already sent. `[pipeline].snapshot_on_send` (ADR 0104) defaults to on in service settings
+and would snapshot it, but it can be turned off and a handler called directly holds the live object,
+so the importer does not rely on it. That was the one fail-open of round 3 inside the open gate.
 
-**The `MsgCreate` skeleton.** The importer builds it through the `Message` API at import time and
-emits the encoded result as one literal. It holds the default encoding characters (`|^~\&`), the
-message type in MSH-9 and the version in MSH-12, and nothing else. Every other header field is
-whatever the action-list writes. The export must name the type in caret form (`ADT^A04`, with an
-optional structure) and the version as `2.x` or `2.x.y`, each exactly once, with no other operand.
-The only words it may carry besides its operands are `as` and `version`; any other word may change
-what is built. A field write to the built message maps only onto its MSH. A write to any other segment
-becomes a TODO marker, because `Message.set` raises on a segment the skeleton does not have.
-An underscore form such as `ADT_A04` is refused, because HL7 also spells a message structure that way.
-Anything else renders a TODO marker and `raise NotImplementedError(...)` at the `MsgCreate`, because
-a message whose header the importer cannot build would be guessed. The `MsgCreate` grammar is not yet
-validated against an export, so this rule was written from the HL7 shapes alone.
+**The cost.** Any list holding a construct, or anything the gate does not read, is finished by hand
+exactly as under step 1: a send it cannot prove is `msg` raises, and a send of a clone may still send
+`msg` where step 1's flow-insensitive scan holds the clone. Step 2 helps only straight-line lists.
+That is deliberate.
 
-**Flow rules.** These keep the step 1 raise wherever they cannot say what a handle holds:
+**History: why a gate, after six rounds.** Step 2 first walked every construct, tracking which local
+each handle held on each path and joining the paths. Each of six review rounds on PR 1900 built a
+shape in which the handler sent a message Corepoint never sent, and most were introduced by the
+previous round's repair: a call that stopped unbinding a handle it passed (9b8f13481); name matching
+that missed `-`, `.`, non-ASCII and `%`-free handles (d401cdb5b); a branch that came loose from its
+construct and ran for every message (d26545d6f, a HIGH); span classes trusted on a `ForEach` line
+(db8873d19e); six shapes past the first narrowing; and seven past the second (6fa49a9d5): a loose
+`Catch` or `Matching` line, an unread statement that never stopped binding, a lowercase verb label,
+a write after a send, prose spans on `MsgTreeCopy` and `MsgCreate`, an unread attribute, and a
+`//ADT` path. Each repair added a rule, and the rule set grew past what a reviewer could hold. The
+gate replaces all of it with one question asked of the whole list, and deletes the join, loop, `Try`,
+call scope, branch adoption and lost-scope machinery.
 
-- A handle bound only inside a branch is unknown after the branch ends. This holds even when every
-  branch binds it, because every condition is a dead placeholder until a human writes it. It holds
-  too for a handle bound before the branch and bound again inside it: a local keeps one name for the
-  whole handler, so the join judges which handles a path touched, never which name each holds.
-  *Corrected 2026-10-01:* the join compared local names, read such a rebind as no change, and sent
-  the local after the branch. Under the narrowing nothing binds inside a branch, so this can no
-  longer happen; the join keeps the touched rule because it is the correct one.
-- A handle that any path overwrites with something unknown is unknown after the join.
-- Inside a loop body, and in a `Catch`, a handle the body may overwrite is unknown throughout. A
-  `Try` with no `Catch` re-raises, so after it the body's own bindings hold.
-- The input handle is never rebound. A whole-tree write into it makes it unknown from that point.
-- Only a plain clone is read as one: two operands, a whole-tree destination, no qualifier, and no
-  word but `to`, styled or not. A mode word, a `from` that reverses the direction, or a third
-  operand makes it an unread statement. Field writes are judged on the same words, so a mode word
-  styled as a keyword declines a write just as an unstyled one does. A field write whose verb itself
-  is unstyled still declines, as it did before step 2.
-- The flow reads a statement only when its verb is one it models (`ItemCopy`, `ItemClear`,
-  `ItemAppend`, `MsgTreeCopy`, `MsgCreate`, `MsgLog`; `MsgSend` is a send), that verb is the
-  statement's first word, every other word is one that verb may carry, no span falls out of both
-  readings (`block`, `pass`, `custom`), and its operands take the verb's one read shape: a plain
-  clone, a `MsgCreate` whose skeleton the import can build, an unqualified `MsgLog` of one whole
-  tree, or a field write whose target is an HL7 field path of a named handle or a `$variable`, with
-  every other operand a field, a `$variable` or a quoted literal. A markup-free statement
-  must also spell every handle with a `%`, because a bare word may be a handle no operand reading
-  sees (`MsgCreate ADT as ...`). **Any other statement leaves every handle unknown, the input
-  included (Manager decision, #313 step 2).** That covers at least an unread verb (`MsgLoad`,
-  `EnvLogText`), an `ActionListCall` under another verb spelling, a verb misread from a later span,
-  a span class the role layer does not list, a handle in a literal or variable span, and a
-  whole-tree path not spelled `/` (`%ADT/*`).
-- Markers that leave every handle unknown bracket, before and after, at least: a `<Call>` whose
-  `@Data` verb is not `ActionListCall` (it keeps its own construct, so an `If` stays under its
-  placeholder and a `MsgSend` still raises, never filters), a `<Call>` carrying an attribute other
-  than `Data`, `Comment` or `Disabled`, a control or send whose verb is not its first word, a send
-  naming more than one message or carrying a word other than `to` and `connection`, a step whose
-  `@Disabled` value is not `1`, `true` or `yes`, and a `<Line>` carrying a statement outside
-  `@Data`. A construct or a branch is never bracketed by markers (see the next rule). Such a step's
-  `input-handle` names may make the input ambiguous but never supply it. A `<Call>` with no `@Data`
-  never reads its `@Comment` as its call line. An unread statement never binds a local and never
-  maps a write. Every element this module does not model leaves every handle unknown. An element
-  carrying two attributes that fold to one name with different values is refused outright.
-- **The narrowing (Manager decision, #313 step 2, 2026-10-01).** A local other than `msg` is
-  bound only by a statement at the top level of the list, a `<Block>`'s body included, and only
-  while the list is still straight-line. Inside any construct nothing binds: a clone or a
-  `MsgCreate` there renders a TODO, and its handle is unknown from there on. Once a local other than
-  `msg` is bound, any top-level step but a statement, a send, a `<Block>` or a disabled step
-  unbinds every handle, the input included, and turns binding off for the rest of the handler.
-  Every later send then raises, a send of the input included. Step 1 sent `msg` there, so that
-  part is a fail-closed cost. Before any such local is bound, a top-level step that may not
-  complete turns binding off too: what follows it may never run in Corepoint, while the render runs
-  it for every message. That covers at least an exit, a `LoopExit` anywhere, an unmodelled element
-  or marker (a step whose `@Disabled` value may mean enabled is bracketed by one), a call whose list
-  is not inlined, a branch marker with no construct or a branch its construct cannot continue, a
-  construct line that owns nothing, a branch carrying branches of its own, and any construct holding
-  one of these. Why: every review round of step 2 found a shape in which a local bound or kept under
-  a construct went out with a tree Corepoint never sent, and each repair of the join, loop, call or
-  scope rules opened another. Under the narrowing, a live send of a local other than `msg` sits on
-  the straight-line path, where the guard executes it and compares the tree it delivers, and where
-  nothing before it may stop the list. **The cost:** a message built or cloned inside a construct,
-  or sent after the first construct that follows a bind, raises and is finished by hand. The join,
-  loop, `Try`, call and scope rules in this section still decide what the input holds, and they
-  bind nothing else.
-- **A `<List>` or `<Actions>` wrapper carrying `@Disabled` renders its statements as an unmodelled
-  element's body.** Whether Corepoint runs them is not known, so nothing there binds and no handle
-  is vouched for after it. *Corrected 2026-10-01:* the wrapper was flattened into its parent, so
-  its statements bound and sent as straight-line code.
-- **A construct or a branch whose own line the flow cannot trust carries the reason itself and keeps
-  its place in its chain.** That covers at least a construct whose line names a whole message (`If
-  %ADT exists`), and a `ForEach` or `Catch` line carrying a word not known to name something other
-  than a whole tree. The flow vouches for no handle in any arm of that chain or after it, and the
-  render writes one TODO line ahead of the construct for each such line. *Corrected 2026-10-01:*
-  markers used to bracket the line itself. A marker after an `If` hid it from the `Else` that
-  followed, and a marker around an `Else`, `ElseIf` or `Catch` hid it from its construct, so in the
-  export's wrapper and sibling forms the branch came loose and its body ran for every message (the
-  Lander's HIGH on d26545d6f, PR 1900). Under the narrowing that body can no longer bind, but a send
-  of `msg` in it still needs the branch kept under its placeholder.
-- **A condition is read as reading; a `ForEach` or a `Catch` may bind.** An `If`, `ElseIf`, `Loop`,
-  `ChooseFrom` or `Matching` line is read as reading the handles it names, never writing them. That
-  is an assumption, not a measurement of Corepoint, and the differential guard below makes the same
-  one. The import still treats such a line that names a whole message as untrusted, the rule above:
-  that fails closed, and costs a raise at a later send of the input. A `ForEach` or `Catch` line may
-  bind the handle it names, in any spelling. So it is read only when its first word is its own verb
-  and every later word is `in`, `into`, a path into a named handle that addresses an HL7 segment or
-  field, a `$variable`, a quoted literal or a number (`ForEach %ADT/OBX $obx`). Each word is judged
-  by its text and never by its span class: a `literal`, `variable` or `numeral` span is judged like
-  any word, and so is prose (`description`, `comment`, `detail`), except a path's own `(...)` label
-  holding no `%` or `$`. A path such as `/.`, `/*` or `//x` may still mean the whole tree, so it
-  does not pass. *Corrected 2026-10-01:* those span classes passed whatever their text said, and
-  prose was skipped (the Lander's MEDIUM and LOW on db8873d19e, PR 1900).
-  Any other word may be a handle spelled without a `%`, or text in a span class neither reading
-  lists. This matters most for the input before the first bind: a loop that rebinds it, then a
-  clone of it, would copy the message that arrived.
-- **A statement `<Line>` that carries a nested list renders as an unmodelled element.** Its verb is
-  no construct (`Otherwise`, say), so its scope is not modelled: the body is inlined under a TODO,
-  and no handle is vouched for after it. A nested list holding only comments and empty lines stays
-  in line, because nothing in it runs. *Corrected 2026-10-01:* the body was flattened into the
-  parent list, so the flow walked it as straight-line code and could bind and send there.
-- **A `<Block>` whose label may be a statement leaves every handle unknown, before and after it.**
-  A label may be a statement when it carries any span beyond prose, or when any run of its text, a
-  `block` span's included, holds a `%` or `$` word or opens with a word shaped like a verb
-  (`MsgTreeCopy %NEW/ to %OUT/`). Telling a label from a statement is not modelled, so this is
-  deliberately broad. Step 1's scan read such a label as a
-  write and raised; the head kept the local and sent it.
-- A statement the flow does read may still overwrite every handle it names as a whole tree, in
-  either reading of its markup, such as a `MsgCreate` whose handle is not its first operand. Each
-  such handle is unknown afterwards. Only `MsgSend` and `MsgLog` are read-only. That read-only list
-  is kept small on purpose: a missing verb costs a raise, while a wrongly listed one would deliver
-  the wrong message.
-- **Handle case.** Whether Corepoint handle names are case-sensitive is unverified, so the import
-  assumes the worst. Every unbind ignores case, compatibility forms, a trailing `/`, and letters
-  that fold only after upper-casing (a dotless `i`): a write to `%adt` makes `%ADT` unknown, and a clone
-  or `MsgCreate` into a handle whose name case-folds to the input's is a whole write of the input.
-  Every ambiguity test keeps case: two `input-handle` spellings that differ only in case leave the
-  list with no input. How a local is named is unchanged.
-- An inlined `ActionListCall` runs in its own scope, because nothing ties the handle names inside a
-  called list to the caller's. The called list starts knowing no handle, so its writes and sends of
-  any handle it did not bind there decline or raise. An `input-handle` span inside the called list
-  can make the caller's input ambiguous, because nothing establishes that a call passing nothing
-  does not hand the caller's input over. A second name there leaves the caller with no input. Such a
-  span never supplies the caller's input, though: with no `input-handle` of the caller's own, the
-  caller has none. A call spelled on a `<Line>` or `<Block>` counts here as a `<Call>` does. Role
-  markup inside a called list does count toward whether the caller's list carries markup, which
-  only ever makes a markup-free write decline.
-- After an inlined call, every handle the caller has bound is unknown, whatever its name, except
-  the input in the one case below. No handle name is matched. Every rule that matched names missed
-  some spelling the export may carry, including at least a `-`, a `.`, a non-ASCII letter, and a
-  handle with no `%`.
-- The input, while it is still `msg`, survives a call only when the call line is plain (the list
-  name, then at most `pass <one word>`) and every statement in the called list is a plain
-  `MsgLog <handle>`, with at least one. That is judged by shape and verb, never by a handle's name.
-  The called list names what it was passed by its own handle, so a write under any spelling may
-  replace the input, and no reading of operands can rule that out. An edit it makes in place is a
-  TODO in the inlined body, so sending `msg` would drop it. A result clause on the call line may
-  write the input too. So anything else in the list makes the input unknown, a send, a `LoopExit`
-  and a disabled step included. A call whose list is not inlined renders a TODO marker, counts
-  unmapped, and leaves every handle unknown, the input included. A `<Call>` with no `@Data` is never
-  dissolved as a branch-group wrapper, so its list keeps its own scope.
-- A branch that carries branches of its own (a bodyless marker inside a branch's list) is never
-  walked or rendered past its body, so nothing is vouched for after its construct. A loop counts
-  what its stray branches may overwrite, because they render after the loop but ran inside it.
-- **The cost of that rule (Manager decision, #313 step 2 re-cut).** Any send of a clone or a
-  `MsgCreate` message made before a call raises at that send, even when the called list never
-  touches it. So does a send of the input after almost any call. A human finishes each one. That
-  is the importer's fail-closed contract: a raise costs a hand edit, while a stale local would
-  deliver the wrong message.
-- **The cost of the unread-statement rule.** Any send after a statement the flow does not read
-  raises, a send of the input included, even when that statement only logs (`EnvLogText`).
-  *Corrected:* the re-cut first listed a markup-free `MsgCreate ADT ...`, an `ActionListCall` under
-  another verb spelling, and a `<Call>` carrying another verb as an open gap. The rule above closes
-  all three.
-- A statement in a branch its construct cannot continue still counts its whole-tree writes, and an
-  unmodelled element leaves every handle unknown. Nothing either binds is trusted after it.
-- **Still open.** An `<If>`, `<Loop>`, `<Try>` or `<Case>` whose `@Data` is itself a writing
-  statement is read as a condition, so nothing is unbound by it. A `<Block>` and a `<Foreach>` are
-  no longer in this list (see the label rule and the word rule above). Telling a statement from a label's prose is open work. Each marker also
-  counts as one more unmapped step and renders as an unmodelled element, so the summary overstates
-  unmapped work for a bracketed step. A construct or branch line the flow cannot trust counts as
-  one unmapped step for its TODO line, and not as mapped control flow as well.
+**The differential guard.** `tests/test_corepoint_import_differential.py` imports every shape of a
+battery twice: with the head, and with the step 1 importer, vendored byte for byte from main at
+`bca583f2a` and pinned by its git blob id (once step 2 merges, main is the head). It asserts the
+gate's invariant directly. EITHER the head's module and summary counts equal step 1's byte for byte,
+OR the guard's own allow-list walker, written apart from the importer and never calling its gate,
+finds the list fully understood AND every oracle check passes. The oracle is an abstract interpreter
+over the shape, in a case-sensitive and a case-insensitive reading of handle names. It says which
+trees the export may send at each `MsgSend`, and which literals each tree held at the send. Both
+handlers run against one synthetic input, past every refusal, and the guard fails when the head
+delivers a tree the oracle cannot prove, sends `msg` for another handle, sends a message carrying a
+literal its tree did not hold at the send, lifts a send out of a branch, or binds a local below the
+handler's level.
 
-**The differential guard (2026-10-01).** `tests/test_corepoint_import_differential.py` checks
-every repair against a battery instead of one shape. A grammar generates action-lists: clones,
-`MsgCreate`, field writes, logs, sends, unread statements and exits, inside every ordered pair of 26
-construct kinds. Those include at least `If`, `Else` and `ElseIf` in five export spellings and with
-a disabled branch line, `ChooseFrom`, `ForEach` in several spellings of what it binds, `Loop`, `Try`
-and `Catch` in three spellings, a `Block` with a prose or a statement label, inlined and bare calls,
-an unmodelled tag, a `<Line>` carrying a nested list, a disabled `<List>` wrapper, a flat-form
-construct line, `@Disabled` sure and unsure on a whole construct or on one branch marker, an orphan
-marker, a stray branch, and something that may stop the list ahead of a build. Role markup is
-present, absent or mixed, and handle spellings are hostile. Every repro from every review of PR
-1900 is a fixed seed. The seed is fixed, so a failure reproduces.
+The battery holds 7,746 shapes, measured 2026-10-01: 290 fixed seeds (every repro from every review
+of PR 1900 and every Lander repro, the 23 round-3 shapes among them), 4,056 ordered construct pairs,
+1,000 random shapes and 2,400 drawn from the allow-list alone, a quarter of those carrying one
+spoiler just off it. The guard's walker finds 1,842 fully understood, the head binds a local in
+1,231 of them, and the head's output differs from step 1 in 1,810. At this head it fails none. Six
+mutation arms each fail it: dropping the write-after-send rule (41 shapes), tolerating prose spans
+(68), folding verb case (33), accepting any `<Block>` label (80), ignoring `Enabled` and `Comment`
+attributes (80), and sending `msg` for an unknown handle (1,030). Against the previous head,
+6fa49a9d5, it fails 5,937, including 20 of the 23 round-3 seeds.
 
-Each shape is imported by the head and by the step 1 importer, vendored byte for byte from main at
-`bca583f2a` and pinned by its git blob id. A vendored copy, because once step 2 merges, main is the
-head. An abstract interpreter over the shape itself, in both a case-sensitive and a case-insensitive
-reading of handle names, says which trees the export may send at each `MsgSend`, and whether some
-path may stop before it: an exit ends a path, and an unmodelled element, a call whose list is not
-inlined, a `LoopExit` with no loop or an orphan marker may. Both generated handlers run against one
-synthetic input, past every refusal, as if a human had deleted each `raise NotImplementedError`.
-Sends made before any other exception are read too. Their source is read as well. The guard fails
-when the head:
-
-1. delivers, where step 1 raised or filtered, a message the interpreter cannot prove;
-2. puts a live send at a shallower indent than step 1 puts that send, or runs a send the interpreter
-   places in a branch on the path where every placeholder is false;
-3. sends `msg` for a handle that is not the input, or where the export sends another tree;
-4. renders any live send, on any path, of a tree that is not the one known tree the export sends
-   there, or renders one, not live in step 1, where the import lost the scope or where Corepoint may
-   stop before it;
-5. binds or sends a local other than `msg` anywhere but the handler's own level. With the execution
-   past every refusal, that puts every such send on the executed path, so (1) compares the very
-   tree it delivers.
-
-The battery holds 5,320 shapes: 264 fixed seeds, 4,056 paired shapes and 1,000 random ones. At this
-head it fails none, and offline sweeps of about 110,000 more shapes on eleven other seeds found
-nothing further. It fails 1,591 at d26545d6f, including every seed of the HIGH, 1,403 at the first
-repair of this branch, and 37 at the first narrowing. Check 5 is most of the first two, because a
-head that binds inside constructs fails it by design. The guard's first version, without check 4's
-reach half and check 5, failed 500 of 3,325 at d26545d6f, and code review then built six shapes that
-passed it yet failed open; a second review built six more that passed the next version. Each is a
-seed now. Undoing any one of 14 rules above fails between 1 and 305 shapes. Two more, the chain
-placement of an untrusted branch line and the touched join, guard shapes the narrowing already
-closes, so named unit tests in `tests/test_corepoint_import.py` pin what they keep.
-
-- **A branch-group wrapper is a container whose children are all its own branch lines.** A `<Try>`
-  or `<If>` with no `@Data` dissolves into its chain only when every child is a live `<Line>`, or an
-  element of its own tag, whose `@Data` carries the construct's verb or one of its branch verbs.
-  *Corrected 2026-10-01:* it dissolved whenever its body held any construct of the same kind, so a
-  `<Try>` holding a nested `<Try>` element came apart, its `Catch` arms rendered with no enclosing
-  construct, and a clone in its body read as made on every path. The guard's wider sweep found it;
-  step 1 had the same rule. A `@Disabled` child keeps the wrapper whole, or an `Else` after a
-  disabled `If` line would render for every message.
-
-**Markup-free `MsgSend` (gap 2).** A send with no role markup is judged by the handle its first
-operand names (`%NAME` or `%NAME/`). If that handle holds a known message, the send delivers it.
-Otherwise it raises, as a role-parsed send does. This was the Manager's decision in the #313 step 2
-brief.
-
-A list with no role markup at all names no input handle, so no handle in it is known. **Every send in
-a wholly markup-free list therefore raises**, even `MsgSend %ADT [OB]`. Its field writes keep the
-superseded model's reading and still land on `msg`. That is how the synthetic fixture changed: its
-markup-free list ends `MsgSend $out [OB_ACME_ADT]`, which now raises where it used to send `msg`. The
-fixture's import summary moves from 21 mapped and 8 unmapped to 20 and 9.
-
-In a list with any role markup, a markup-free field write maps only as the role layer would (no
-`copy_field`, no repeating segment, no MSH-1/MSH-2, nothing inside a branch or loop), and lands on the
-local of the one handle its paths address. A markup-free list never writes MSH-1/MSH-2 either. In a
-wholly markup-free list, a called list's writes still land on `msg`, as all its writes do. If that handle holds no known message, the write declines to a TODO marker
-rather than land on `msg`. A markup-free whole-tree write makes the handles it names unknown, as
-above.
+**Unverified assumptions, shared by the importer and the oracle.** That `MsgTreeCopy %A/ to %B/`
+makes B a copy of A; that `MsgSend` leaves its handle holding the message it sent; that a `<Block>`
+label written in plain prose is never run as a statement; and that a `@Disabled` value of `1`,
+`true` or `yes` means the step never runs. Each was read from the validated export, not measured in
+Corepoint.
 
 **What the Steps lens shows.** `set_field(out_msg, ...)` projects as an `action` row that looks the
-same as `set_field(msg, ...)`. The row carries no field naming the message it writes. A send row lists
-only its outbound, not the message it sends. The `.copy()` and `Message.parse(...)` lines are plain
-`code` rows. A lens edit splices bytes, so it keeps the receiver it does not show. The module still
-round-trips with no whole-file refusal, which AC-4 requires. The lens semantics were left alone here;
-showing the receiver is a follow-up for ADR 0076/0089.
-
-At least these still refuse or stay out of scope:
-
-- A `$variable` operand, and `MsgLoad`, keep their TODO markers. Neither is modelled.
-- A partial `MsgTreeCopy` (a sub-node into another tree) stays a TODO marker.
-- A field write inside a branch or loop is still declined, as (b′) says. A clone or a send there
-  renders in place.
-- A list with two or more distinct `input-handle` names still refuses every send of the input.
-
-A write to a local after it was sent does not reach the earlier send in the engine:
-`[pipeline].snapshot_on_send` (ADR 0104, on by default) snapshots each `Send` as it is built. A
-handler called outside a transform run, as the tests call it, holds the live reference instead.
+same as `set_field(msg, ...)`. The row carries no field naming the message it writes. A send row
+lists only its outbound. The `.copy()` and `Message.parse(...)` lines are plain `code` rows. The
+module still round-trips with no whole-file refusal, which AC-4 requires. Showing the receiver is a
+follow-up for ADR 0076/0089.
 
 ### (c) Unmapped actions are never silently dropped (count-and-log)
 
