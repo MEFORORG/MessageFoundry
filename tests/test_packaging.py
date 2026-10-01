@@ -914,13 +914,16 @@ def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> 
 _TOOLKIT_PYPROJECT = _REPO / "packaging" / "messagefoundry-toolkit" / "pyproject.toml"
 
 
-def _toolkit_project() -> dict[str, Any]:
-    """The toolkit pyproject's ``[project]`` table, parsed fresh on each call (a small file), so a
-    test that mutates it cannot change what a later test reads."""
-    project: dict[str, Any] = tomllib.loads(_TOOLKIT_PYPROJECT.read_text(encoding="utf-8"))[
-        "project"
-    ]
+def _project(distribution: str) -> dict[str, Any]:
+    """``packaging/<distribution>/pyproject.toml``'s ``[project]`` table, parsed fresh on each call
+    (a small file), so a test that mutates it cannot change what a later test reads."""
+    pyproject = _REPO / "packaging" / distribution / "pyproject.toml"
+    project: dict[str, Any] = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
     return project
+
+
+def _toolkit_project() -> dict[str, Any]:
+    return _project(_TOOLKIT_PYPROJECT.parent.name)
 
 
 def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
@@ -950,10 +953,18 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     assert len(deps) == 1, f"the toolkit declares more than the engine pin: {deps}"
 
 
-@pytest.mark.parametrize(
-    "distribution",
-    ["messagefoundry-toolkit", "messagefoundry-webconsole", "messagefoundry-harness"],
-)
+#: Every separate distribution under packaging/, derived so a new one is covered on arrival.
+_SEPARATE_DISTRIBUTIONS = sorted(p.parent.name for p in _REPO.glob("packaging/*/pyproject.toml"))
+
+
+def test_the_separate_distributions_are_all_found() -> None:
+    """Liveness for the parametrize below: an empty glob would run it zero times and pass."""
+    assert {"messagefoundry-toolkit", "messagefoundry-webconsole", "messagefoundry-harness"} <= set(
+        _SEPARATE_DISTRIBUTIONS
+    ), _SEPARATE_DISTRIBUTIONS
+
+
+@pytest.mark.parametrize("distribution", _SEPARATE_DISTRIBUTIONS)
 def test_each_separate_wheel_ships_the_license_and_notice(distribution: str) -> None:
     """The toolkit (BACKLOG #1192) and harness (BACKLOG #2513) wheels carried no LICENSE or NOTICE.
 
@@ -963,9 +974,7 @@ def test_each_separate_wheel_ships_the_license_and_notice(distribution: str) -> 
     checkout the compare also fails if a copy lost its ``eol=lf`` pin, as the console's had.
     """
     project_dir = _REPO / "packaging" / distribution
-    declared = tomllib.loads((project_dir / "pyproject.toml").read_text(encoding="utf-8"))[
-        "project"
-    ].get("license-files")
+    declared = _project(distribution).get("license-files")
     assert declared == ["LICENSE", "NOTICE"], declared
     # LICENSE needs no is_file() check: the byte compare below raises if it is missing.
     assert (project_dir / "NOTICE").is_file(), f"NOTICE is declared but missing from {project_dir}"

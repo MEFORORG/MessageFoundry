@@ -111,6 +111,5 @@ def test_each_workflow_checks_the_wheels_it_built(workflow: str, job: str, wheel
         for line in run.splitlines()
         if line.strip().startswith(_SCRIPT)
     ]
-    assert calls, f"{workflow} `{job}` never runs {_SCRIPT.strip()}"
     naming = [call for call in calls if f"'{wheels}'" in call]
     assert len(naming) == 1, f"{workflow} `{job}` checks {wheels!r} in {len(naming)} calls: {calls}"

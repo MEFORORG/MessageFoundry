@@ -84,11 +84,8 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # WP-BL3-07: a fail-closed engine-provenance verify gate runs before the check job, skippable via a
     # repo variable for indexes that strip attestations; the check job gates on it (never on verify failure)
     assert "verify-engine:" in ci
-    # BACKLOG #2534: --repo alone accepts any workflow on any ref, so the gate pins both. The step's
-    # behaviour is executed by test_the_scaffolded_verify_step_pins_the_release_workflow_and_tag.
-    assert "gh attestation verify" in ci and "--repo MEFORORG/MessageFoundry" in ci
-    assert "--signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml" in ci
-    assert '--source-ref "refs/tags/$tag"' in ci
+    # The verify step's command (BACKLOG #2534) is executed, not read, by
+    # test_the_scaffolded_verify_step_pins_the_release_workflow_and_tag.
     # The scaffolded gate must name the repo that BUILDS the release — attestations are minted by the
     # public repo's release workflow, so a private-vault slug here verifies against something no
     # adopter can read. Pin the negative too: the retired slug must never creep back in.

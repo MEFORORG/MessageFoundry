@@ -593,36 +593,46 @@ def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_pr
 #: A `gh attestation verify` COMMAND rather than the bare tool name in prose: it names `--repo`.
 _VERIFY_COMMAND = re.compile(r"gh attestation verify\b.*--repo\b")
 
-#: Released history records what shipped then, and is not rewritten to match today's command.
-_HISTORY = ("CHANGELOG.md", "changelog.d/")
+#: The flag value every verify command must carry: the engine's release workflow.
+_SIGNER_WORKFLOW = "--signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml"
 
 
-def _verify_commands() -> list[tuple[str, str]]:
-    """Every tracked ``gh attestation verify ... --repo`` command, as ``(path:line, command)``.
+def _verify_commands() -> list[tuple[str, int, str]]:
+    """Every tracked ``gh attestation verify ... --repo`` command, as ``(path, line, command)``.
 
-    A command continued onto the next line with a PowerShell backtick or a shell backslash is joined
-    first, so a flag on a continuation line counts.
+    ``git grep`` narrows the walk to the few files naming the tool. Released history is left out,
+    because it records what shipped then, and so are tests, which may quote the old command as the
+    shape they refuse. A command continued with a PowerShell backtick or a shell backslash is
+    joined first, so a flag on a continuation line counts.
     """
-    tracked = subprocess.run(
-        ["git", "ls-files", "-z"], cwd=_ROOT, capture_output=True, check=True
+    hits = subprocess.run(
+        [
+            "git",
+            "grep",
+            "-l",
+            "-z",
+            "-I",
+            "gh attestation verify",
+            "--",
+            ".",
+            ":!CHANGELOG.md",
+            ":!changelog.d",
+            ":!tests",
+        ],
+        cwd=_ROOT,
+        capture_output=True,
+        check=True,
     ).stdout.decode("utf-8")
-    found: list[tuple[str, str]] = []
-    for rel in tracked.split("\0"):
-        if not rel or rel.startswith(_HISTORY) or rel.startswith("tests/"):
-            continue
-        try:
-            lines = (_ROOT / rel).read_text(encoding="utf-8").splitlines()
-        except (UnicodeDecodeError, OSError):
-            continue  # a binary, or a path this checkout does not hold
+    found: list[tuple[str, int, str]] = []
+    for rel in filter(None, hits.split("\0")):
+        lines = (_ROOT / rel).read_text(encoding="utf-8").splitlines()
         for i, line in enumerate(lines):
             if not _VERIFY_COMMAND.search(line):
                 continue
-            command = [line]
-            j = i
-            while command[-1].rstrip().endswith(("`", "\\")) and j + 1 < len(lines):
-                j += 1
-                command.append(lines[j])
-            found.append((f"{rel}:{i + 1}", " ".join(command)))
+            end = i
+            while lines[end].rstrip().endswith(("`", "\\")) and end + 1 < len(lines):
+                end += 1
+            found.append((rel, i + 1, " ".join(lines[i : end + 1])))
     return found
 
 
@@ -630,11 +640,10 @@ def test_every_attestation_verify_command_pins_the_release_workflow_and_ref() ->
     """BACKLOG #2534: ``--repo`` alone accepts an attestation from any workflow on any ref.
 
     So every verify command an operator or the scaffolded CI gate would run must also carry
-    ``--signer-workflow`` naming the release workflow, and ``--source-ref``. Tests are skipped
-    because a test may quote the old command as the shape it refuses.
+    ``--signer-workflow`` naming the release workflow, and ``--source-ref``.
     """
     commands = _verify_commands()
-    files = {where.rsplit(":", 1)[0] for where, _ in commands}
+    files = {rel for rel, _, _ in commands}
     # POSITIVE CONTROL: the sweep finds the sites #2534 named, so a silent match is not a pass.
     expected = {
         "README.md",
@@ -647,10 +656,9 @@ def test_every_attestation_verify_command_pins_the_release_workflow_and_ref() ->
     }
     assert expected <= files, f"the sweep missed {sorted(expected - files)}; found {sorted(files)}"
     missing = [
-        where
-        for where, command in commands
-        if "--signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml" not in command
-        or "--source-ref" not in command
+        f"{rel}:{line}"
+        for rel, line, command in commands
+        if _SIGNER_WORKFLOW not in command or "--source-ref" not in command
     ]
     assert not missing, (
         f"these verify commands lack --signer-workflow (the release workflow) or --source-ref: "

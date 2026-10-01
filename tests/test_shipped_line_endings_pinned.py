@@ -58,7 +58,7 @@ def _packaging_license_files() -> tuple[str, ...]:
     return tuple(paths)
 
 
-#: The toolkit, web console and harness wheels each ship a LICENSE and a NOTICE.
+#: The license files every separate wheel under `packaging/` ships.
 SHIPPED_PACKAGING_FILES = _packaging_license_files()
 
 #: The vendored HAPI fixtures carry their own `-text` pin in
