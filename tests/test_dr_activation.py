@@ -7,6 +7,8 @@ listener, stays passive, and records a dr_activation_aborted audit row (AC-6). A
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -18,8 +20,9 @@ from messagefoundry.config.settings import (
     DrSettings,
     StoreSettings,
 )
+from messagefoundry.pipeline import dr as dr_module
 from messagefoundry.pipeline.dr import DrActivationError, DrCoordinator
-from messagefoundry.pipeline.dr_backup import BackupRunner
+from messagefoundry.pipeline.dr_backup import BackupRunner, VerifyResult, run_restore_verify
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
 from tests import _fs_spy
@@ -219,6 +222,9 @@ async def test_a_request_archive_outside_seed_dir_is_refused_untouched(
     RED when ``activate`` hands a request path to the restore-verify unconfined: the spy records
     calls naming the refused path. The control is the last block: the archive inside ``seed_dir``
     still activates through the same argument, and the spy records calls naming it.
+
+    That block also pins WHICH path the restore-verify opens: the resolved one, so the file that
+    was checked is the file that is read, however the request spelled it.
     """
     store, archive, ss = await _seed(tmp_path)
     seed_dir = Path(archive).parent
@@ -242,11 +248,23 @@ async def test_a_request_archive_outside_seed_dir_is_refused_untouched(
         assert "probe" not in messages.pop()
         assert _fs_spy.naming(calls, "probe") == []
         assert not coord.active and not state["active"]
-        assert (await _actions(store)).count("dr_activation_aborted") == len(refused)
+        # The audit row alone carries what was asked for, so the refusals can be told apart later.
+        aborted = await store.list_audit(action="dr_activation_aborted")
+        assert sorted(json.loads(a["detail"])["requested"] for a in aborted) == sorted(refused)
 
-        result = await coord.activate(archive=archive, actor="alice")
-        assert result.active and result.archive == Path(archive).name
-        assert _fs_spy.naming(calls, Path(archive).name)
+        verified: list[str] = []
+
+        async def recording_verify(path: str, *, store_settings: object) -> VerifyResult:
+            verified.append(path)
+            return await run_restore_verify(path, store_settings=store_settings)
+
+        monkeypatch.setattr(dr_module, "run_restore_verify", recording_verify)
+        name = Path(archive).name
+        roundabout = os.path.join(str(seed_dir), "..", seed_dir.name, name)
+        result = await coord.activate(archive=roundabout, actor="alice")
+        assert result.active and result.archive == name
+        assert verified == [str(Path(archive).resolve())]
+        assert _fs_spy.naming(calls, name)
     finally:
         await store.close()
 
@@ -272,6 +290,28 @@ async def test_a_request_archive_is_refused_while_no_seed_dir_is_configured(
         configured, _state = _coord(store, ss, seed_archive=archive)
         assert (await configured.activate(actor="alice")).active
         assert _fs_spy.naming(calls, name)
+    finally:
+        await store.close()
+
+
+async def test_a_seed_dir_that_cannot_be_resolved_is_an_audited_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unreachable seed_dir (a share that is down during the failover, say) makes the resolve
+    # raise. That must leave through the one abort path, with its audit row, like any refusal.
+    store, archive, ss = await _seed(tmp_path)
+
+    def unreachable(_archive: str, _seed_dir: str) -> Path | None:
+        raise OSError("the network location cannot be reached")
+
+    try:
+        coord, _state = _coord(store, ss, seed_dir=str(Path(archive).parent))
+        monkeypatch.setattr(dr_module, "_confined_archive", unreachable)
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(archive=archive, actor="alice")
+        assert exc.value.kind == "seed"
+        assert not coord.active
+        assert (await _actions(store)).count("dr_activation_aborted") == 1
     finally:
         await store.close()
 

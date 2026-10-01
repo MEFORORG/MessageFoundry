@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -392,6 +393,27 @@ async def test_a_refused_reload_path_is_never_touched(
             assert _fs_spy.naming(calls, "allowed-sub")
     finally:
         await eng.stop()
+
+
+async def test_the_engines_own_reload_of_its_startup_dir_is_never_refused(tmp_path: Path) -> None:
+    """The DR profile reload and the convergence loop hand the engine its own RESOLVED startup dir.
+    That path is a root by definition, so the text check must pass it however it is spelled.
+
+    The Windows arm starts the engine on a device-prefixed spelling of the directory, which the
+    resolve keeps. RED there when the text check refuses a device-prefixed path outright."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    spellings = [str(cfg)]
+    if os.name == "nt":
+        spellings.append("\\\\?\\" + str(cfg))
+    for spelling in spellings:
+        eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=spelling)
+        try:
+            assert eng.config_dir is not None
+            registry = await eng.reload(eng.config_dir, dry_run=True)
+            assert len(registry.inbound) == 1, spelling
+        finally:
+            await eng.stop()
 
 
 async def test_a_link_inside_a_root_that_leaves_it_is_still_refused(tmp_path: Path) -> None:

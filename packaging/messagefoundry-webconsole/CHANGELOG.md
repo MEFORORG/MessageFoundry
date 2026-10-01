@@ -24,8 +24,9 @@ this line.**
 
 - **Activate DR and Release DR ask for a fresh sign-in proof.** `POST /ui/dr/activate` and
   `POST /ui/dr/release` now sit behind `require_ui_step_up`, like the stepdown control. A session
-  whose step-up window has lapsed is sent to `/ui/reauth` and the action runs once the operator
-  has re-verified. Both were reachable on the session alone. (vault BACKLOG #2581)
+  whose step-up window has lapsed is sent to `/ui/reauth`, then back to the status page to press
+  the button again. The action is never re-sent for the operator. Both were reachable on the
+  session alone. (vault BACKLOG #2581)
 
 ## [0.4.0] — 2026-10-01 — Early Access
 

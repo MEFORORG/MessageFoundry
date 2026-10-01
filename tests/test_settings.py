@@ -1691,6 +1691,7 @@ def test_invalid_priority_and_dr_settings_rejected(tmp_path: Path) -> None:
         "[dr]\ntakeover_timeout_seconds = 0\n",  # non-positive timeout
         "[dr]\nseed_archive = 's3://bucket/seed.mfbak'\n",  # cloud seed source
         "[dr]\nseed_dir = 's3://bucket/seeds'\n",  # vault BACKLOG #2581: cloud seed directory
+        "[dr]\nseed_dir = 'seeds'\n",  # a relative directory would hang off the working directory
         "[dr]\nrestore_token = 'https://x/token.json'\n",  # BACKLOG #223: cloud restore-token source
     ]
     for i, body in enumerate(bad_configs):
@@ -1717,6 +1718,12 @@ def test_dr_seed_dir_parses_and_defaults_off(tmp_path: Path) -> None:
     assert DrSettings().seed_dir == ""
     cfg = _write(tmp_path / "dr_seed_dir.toml", "[dr]\nenabled = true\nseed_dir = 'D:/dr/seeds'\n")
     assert load_settings(config_path=cfg, environ={}).dr.seed_dir == "D:/dr/seeds"
+    # Either platform's absolute form parses, and a share does too.
+    assert DrSettings(seed_dir="/srv/dr/seeds").seed_dir == "/srv/dr/seeds"
+    assert DrSettings(seed_dir="//nas/mefor/seeds").seed_dir == "//nas/mefor/seeds"
+    # Blank-but-present reads as off. It must never reach the engine as a path, where it would
+    # resolve to the working directory.
+    assert DrSettings(seed_dir="   ").seed_dir == ""
 
 
 def test_auth_mfa_secure_defaults_and_totp_skew_validation() -> None:

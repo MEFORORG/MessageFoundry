@@ -275,6 +275,12 @@ from typing import Any
 #: still fails at import rather than with ``UiSeamMismatch`` until BACKLOG #1907 lands, because the
 #: console's route modules import these names eagerly.
 #:
+#: Vault BACKLOG #2581: ``dr_activate`` and ``dr_release`` moved to ``require_step_up``. A gate is
+#: a route ``Depends``, and the console calls these handlers directly, so the console re-asserts
+#: it on its own routes. The digest did not move: it records a handler's name, not its gate. A
+#: console built before this change passes the handshake against this engine and would keep its
+#: two DR routes on the session alone.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

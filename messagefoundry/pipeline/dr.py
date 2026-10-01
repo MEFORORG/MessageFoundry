@@ -60,11 +60,7 @@ from typing import NoReturn
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
-from messagefoundry.pipeline.path_confine import (
-    lexical_roots,
-    lexically_within,
-    resolves_within,
-)
+from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
@@ -210,7 +206,7 @@ class DrCoordinator:
             seed = archive or self._settings.seed_archive
             now = self._clock()
             if archive:
-                await self._confine_request_archive(archive, actor, now)
+                seed = await self._confine_request_archive(archive, actor, now)
 
             # (1) Cold-seed restore-verify — FAIL-CLOSED, BEFORE any VIP step (AC-9/AC-14). A missing
             # seed path is itself an abort: a DR box must never promote onto an unverified store.
@@ -373,23 +369,37 @@ class DrCoordinator:
 
     # --- internals -----------------------------------------------------------
 
-    async def _confine_request_archive(self, archive: str, actor: str, now: float) -> None:
-        """Refuse a request-named ``archive`` that is not under ``[dr].seed_dir`` (vault BACKLOG
-        #2581). Deny by default: with ``seed_dir`` unset, a request may name no archive.
+    async def _confine_request_archive(self, archive: str, actor: str, now: float) -> str:
+        """The resolved path of a request-named ``archive``, or an abort if it is not under
+        ``[dr].seed_dir`` (vault BACKLOG #2581). Deny by default: with ``seed_dir`` unset, a
+        request may name no archive.
 
-        The two lines of :mod:`~messagefoundry.pipeline.path_confine`: the text of ``archive``
-        first, with no filesystem call on it, then the resolve, off the event loop. Either
-        refusal aborts with one message through :meth:`_record_aborted`."""
+        :func:`~messagefoundry.pipeline.path_confine.confine` judges the text of ``archive`` first,
+        with no filesystem call on it, then resolves, off the event loop. The caller verifies the
+        RESOLVED path, so the file that was checked is the file that is opened. Every refusal
+        aborts with one message, and the audit row alone records the path that was asked for."""
         seed_dir = self._settings.seed_dir
-        if (
-            not seed_dir
-            or not lexically_within(archive, lexical_roots([seed_dir]))
-            or not await asyncio.to_thread(_resolves_under, archive, seed_dir)
-        ):
-            log.warning(
-                "DR activation: refused a request archive outside [dr].seed_dir: %r", archive
+        resolved: Path | None = None
+        if seed_dir:
+            try:
+                resolved = await asyncio.wait_for(
+                    asyncio.to_thread(_confined_archive, archive, seed_dir),
+                    timeout=self._settings.takeover_timeout_seconds,
+                )
+            except OSError as exc:
+                # A seed_dir this box cannot resolve (an unreachable share, say) or that does not
+                # answer in time (TimeoutError is an OSError) is a refusal like any other, so it
+                # still leaves its abort row.
+                log.warning(
+                    "DR activation: could not resolve the request archive against "
+                    "[dr].seed_dir: %s",
+                    safe_exc(exc),
+                )
+        if resolved is None:
+            await self._record_aborted(
+                "seed", _REQUEST_ARCHIVE_REFUSED, actor, now, requested=archive
             )
-            await self._record_aborted("seed", _REQUEST_ARCHIVE_REFUSED, actor, now)
+        return str(resolved)
 
     async def _verify_seed(self, archive: str, actor: str, now: float) -> VerifyResult:
         """Restore-verify the #60 cold-seed archive, FAIL-CLOSED. Reuses ADR 0049's owned primitive
@@ -777,15 +787,21 @@ class DrCoordinator:
                 )
         return True
 
-    async def _record_aborted(self, kind: str, message: str, actor: str, now: float) -> NoReturn:
+    async def _record_aborted(
+        self, kind: str, message: str, actor: str, now: float, *, requested: str | None = None
+    ) -> NoReturn:
         """Record a ``dr_activation_aborted`` audit row (PHI-free) + raise :class:`DrActivationError`. The
         single fail path for every refused activation, so an aborted promotion always leaves an audit
-        trail and the caller gets the failing phase. Never returns (always raises)."""
+        trail and the caller gets the failing phase. Never returns (always raises). ``requested`` is
+        a refused request path: it goes in the audit row and never in the raised message."""
+        detail = {"kind": kind, "reason": message}
+        if requested is not None:
+            detail["requested"] = requested
         try:
             await self._store.record_audit(
                 _ACTION_ABORTED,
                 actor=actor,
-                detail=json.dumps({"kind": kind, "reason": message}, sort_keys=True),
+                detail=json.dumps(detail, sort_keys=True),
                 now=now,
             )
         except Exception:
@@ -822,10 +838,17 @@ async def _run_command(command: str) -> bool:
     return proc.returncode == 0
 
 
-def _resolves_under(path: str, root: str) -> bool:
-    """Does ``path`` resolve to somewhere at or under ``root``? Resolves both, so the caller runs
-    it off the event loop and only after the text check has passed."""
-    return resolves_within(path, [Path(root).resolve()]) is not None
+def _confined_archive(archive: str, seed_dir: str) -> Path | None:
+    """``archive`` resolved, if it lies under ``seed_dir``; ``None`` if not. Resolves ``seed_dir``
+    first, which is operator configuration, so run this off the event loop. ``archive`` may spell
+    the directory as configured or as it resolves."""
+    root = Path(seed_dir).resolve()
+    return confine(
+        archive,
+        lexical=lexical_roots([seed_dir, root]),
+        resolved=[root],
+        what="DR request archive",
+    )
 
 
 def _basename(path: str) -> str:

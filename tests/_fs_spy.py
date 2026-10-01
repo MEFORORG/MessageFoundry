@@ -2,8 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A spy on the calls that touch the filesystem, for tests that must prove a path was NOT touched.
 
-``install`` wraps the calls a path resolve or an open goes through and records each one with the
-path it was handed. A test then asks which recorded calls name its own marker.
+``install`` wraps the calls in ``_TARGETS`` and records each one with the path it was handed. A
+test then asks which recorded calls name its own marker. That list is "at least", not every way
+to touch a path: it covers a resolve, a stat and a Python-level open, and it cannot see an open
+made below Python, such as ``sqlite3.connect``. A zero means none of THOSE calls was made.
 
 Two rules keep a zero honest:
 
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import builtins
 import functools
+import io
 import ntpath
 import os
 from collections.abc import Callable
@@ -33,6 +36,7 @@ UNREACHABLE_HOST = "host.invalid"
 #: A network share on that host, and the device-namespace spellings, for a refused-path test. Every
 #: one names ``probe``, so ``naming(calls, "probe")`` finds any call made on it.
 SHARE = rf"\\{UNREACHABLE_HOST}\share\probe"
+#: The Win32 device forms. Each is under a root only when that root is spelled the same way.
 DEVICE_SHAPES = (
     r"\\?\C:\probe",
     r"\\.\pipe\probe",
@@ -40,10 +44,11 @@ DEVICE_SHAPES = (
     "//./pipe/probe",
     r"\/?\C:/probe",
     rf"\\?\UNC\{UNREACHABLE_HOST}\share\probe",
-    r"\??\C:\probe",
 )
+#: The NT object prefix, which no root admits however the root is spelled.
+NT_OBJECT_SHAPES = (r"\??\C:\probe", "/??/C:/probe", r"\??")
 #: The share in both separators, then every device shape: what no local root admits.
-NON_LOCAL_SHAPES = (SHARE, SHARE.replace("\\", "/"), *DEVICE_SHAPES)
+NON_LOCAL_SHAPES = (SHARE, SHARE.replace("\\", "/"), *DEVICE_SHAPES, *NT_OBJECT_SHAPES)
 
 _TARGETS: tuple[tuple[Any, str], ...] = (
     (Path, "resolve"),
@@ -61,8 +66,10 @@ _TARGETS: tuple[tuple[Any, str], ...] = (
     (os, "readlink"),
     (os, "scandir"),
     (os, "listdir"),
+    (os, "access"),
     (os, "open"),
     (builtins, "open"),
+    (io, "open"),  # what Path.open, read_text and read_bytes call
     # What the Windows resolve calls underneath. Absent elsewhere, and skipped there.
     (ntpath, "_getfinalpathname"),
 )

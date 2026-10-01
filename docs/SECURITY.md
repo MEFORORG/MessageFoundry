@@ -1336,10 +1336,10 @@ the same permission set on the same method reds CI until it is listed here.
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
 > the server's startup `--config` dir or an entry in `[api].config_reload_roots` — otherwise it is
-> rejected (403). The route reads the path as text first: one that is not under a root as written
-> is refused before any filesystem call on it, so a refused path is never opened. The resolve and
-> the second comparison then catch a link inside a root that points out of it (vault BACKLOG
-> #2581). An omitted `config_dir` reloads the startup dir. Every reload (and every denial)
+> rejected (403). The engine reads the path as text first: one that is not under a root as written
+> is refused before any filesystem call on it. A path that passes is then resolved and compared
+> again, which catches a link inside a root that points out of it; that second refusal comes after
+> the resolve (vault BACKLOG #2581). An omitted `config_dir` reloads the startup dir. Every reload (and every denial)
 > is audited with the acting user; error responses are generic so a holder can't probe the
 > filesystem via reload errors. Lock down the config/staging directories' ACLs accordingly
 > (see [SERVICE.md](SERVICE.md#security-hardening-recommended)).

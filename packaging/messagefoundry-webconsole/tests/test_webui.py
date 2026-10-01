@@ -2648,9 +2648,12 @@ async def test_dr_routes_send_a_stale_step_up_to_reauth(engine: Engine, path: st
     RED when the route goes back to ``require_ui``: the stale session then reaches the handler and
     answers 503 (this engine is not a DR standby) in place of the redirect.
 
+    The re-auth lands on the status page, never back on the POST: a promotion or a release is not
+    re-POSTed across a re-auth, so a link to ``/ui/reauth`` cannot carry one.
+
     require_mfa=False takes the MFA leg out, so the stale window is what redirects (BACKLOG #1851).
     """
-    from messagefoundry_webconsole import is_safe_ui_action
+    from messagefoundry_webconsole import is_safe_ui_action, is_unlock_action
 
     service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
@@ -2661,10 +2664,9 @@ async def test_dr_routes_send_a_stale_step_up_to_reauth(engine: Engine, path: st
         assert await service.has_recent_step_up(tok) is False
         r = await c.post(path, headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303
-        assert r.headers["location"] == f"/ui/reauth?next={path}"
-        # The continuation is one the re-auth page may re-POST: body-less, no parameters.
-        assert is_safe_ui_action(path)
-        assert not is_safe_ui_action(path + "?archive=x")
+        assert r.headers["location"] == "/ui/reauth?next=/ui/status"
+        assert is_unlock_action("/ui/status")
+        assert not is_safe_ui_action(path) and not is_unlock_action(path)
 
 
 @pytest.mark.parametrize("path", ["/ui/dr/activate", "/ui/dr/release"])

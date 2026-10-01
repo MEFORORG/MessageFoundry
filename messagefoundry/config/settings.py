@@ -44,7 +44,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -5259,7 +5259,8 @@ class DrSettings(_Section):
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
-    # which is operator configuration and is not confined. A cloud URL is rejected, like seed_archive.
+    # which is operator configuration and is not confined. Must be absolute. A cloud URL is
+    # rejected, like seed_archive.
     seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
     # JSON token the DBA/operator places on the DR box recording the EXPECTED source-backup anchor of a
@@ -5298,6 +5299,20 @@ class DrSettings(_Section):
                 f"[dr].{info.field_name} must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
             )
+        return value
+
+    @field_validator("seed_dir")
+    @classmethod
+    def _seed_dir_absolute(cls, value: str) -> str:
+        # "" switches request-named archives off. A blank-but-present or relative value would
+        # instead resolve against the service's working directory and quietly open that. So blank
+        # reads as "" and relative fails at load. Either platform's absolute form is accepted: this
+        # file may be validated on another OS than the DR box.
+        value = value.strip()
+        if value and not (
+            PureWindowsPath(value).is_absolute() or PurePosixPath(value).is_absolute()
+        ):
+            raise ValueError(f"[dr].seed_dir must be an absolute path, or omitted ({value!r})")
         return value
 
     @field_validator("restore_token")

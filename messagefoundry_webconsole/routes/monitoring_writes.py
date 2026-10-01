@@ -37,11 +37,12 @@ _BAD_SUSPEND_WINDOW = (
     f"at most {ALERT_SUSPEND_MINUTES_MAX} (30 days)"
 )
 
-# The DR pair is step-up-gated like its JSON twin (vault BACKLOG #2581). Both are body-less POSTs with
-# no path parameters, so the /ui/reauth flow may re-POST them once the operator has re-verified, as
-# it does /ui/config/reload. The stepdown control maps back to a confirm page instead; DR has none.
-register_ui_action(r"^/ui/dr/activate$", Permission.DR_OPERATE)
-register_ui_action(r"^/ui/dr/release$", Permission.DR_OPERATE)
+# The DR pair is step-up-gated like its JSON twin (vault BACKLOG #2581). Neither POST is registered,
+# so a promotion or a release is never re-POSTed across a re-auth: a stale POST maps back to the
+# status page that holds both buttons (_DR_PAGE), and the operator presses again inside
+# the fresh window. That is the stepdown shape, with the status page standing in for a confirm page.
+_DR_PAGE = "/ui/status"
+register_ui_action(r"^/ui/status$", Permission.DR_OPERATE, auto_retry=False, unlock=True)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -50,9 +51,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     redirecting back to its page.
 
     The DR pair is the exception to the rest of this module: its JSON twin is require_step_up, so it
-    takes require_ui_step_up and is registered above. Every other route here is plain require_ui,
-    like its twin. Those never route through /ui/reauth, so they call no register_ui_action(): that
-    registry only gates the step-up re-auth AUTO-RETRY allow-list (is_safe_ui_action)."""
+    takes require_ui_step_up, and its re-auth lands on the page registered above. Every other route
+    here is plain require_ui, like its twin. Those never route through /ui/reauth, so they call no
+    register_ui_action(): that registry only gates what the step-up re-auth may hand control back to."""
     core = deps.core
 
     @app.post("/ui/alerts/{alert_id}/ack")
@@ -233,7 +234,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_dr_activate(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui_step_up(Permission.DR_OPERATE)),
+        identity: Identity = Depends(
+            require_ui_step_up(Permission.DR_OPERATE, reauth_next=lambda _r: _DR_PAGE)
+        ),
     ) -> Response:
         assert_same_origin(request)
         await core.dr_activate(engine=engine, identity=identity, body=None)
@@ -243,7 +246,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_dr_release(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui_step_up(Permission.DR_OPERATE)),
+        identity: Identity = Depends(
+            require_ui_step_up(Permission.DR_OPERATE, reauth_next=lambda _r: _DR_PAGE)
+        ),
     ) -> Response:
         assert_same_origin(request)
         await core.dr_release(engine=engine, identity=identity)

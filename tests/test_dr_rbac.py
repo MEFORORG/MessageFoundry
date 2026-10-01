@@ -8,6 +8,7 @@ ADMINISTRATOR is allowed. GET /dr/status reports the posture. A custom role may 
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -199,5 +200,6 @@ async def test_a_refused_request_archive_is_not_echoed(engine: Engine, tmp_path:
         assert r.status_code == 422, r.text
         assert "probe-archive" not in r.text
         assert "seed_dir" in r.json()["detail"]  # names the setting, never the path
+        # The audit row alone records what was asked for, so repeated refusals can be told apart.
         rows = await engine.store.list_audit(action="dr_activation_aborted")
-        assert len(rows) == 1 and "probe-archive" not in (rows[0]["detail"] or "")
+        assert [json.loads(row["detail"])["requested"] for row in rows] == [named]
