@@ -204,6 +204,47 @@ def _allow_insecure_config_source_in_tests() -> Iterator[None]:
             os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = prev
 
 
+#: The env gates that put a session against a live server-DB container. CI sets one of them together
+#: with ``MEFOR_ALLOW_INSECURE_TLS`` because the container serves a self-signed certificate.
+_SERVER_DB_GATES = ("MEFOR_TEST_SQLSERVER", "MEFOR_TEST_POSTGRES")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _warn_posture_for_the_server_db_legs() -> Iterator[None]:
+    """Stamp a NON-enforcing hop posture for a session run against a live server-DB container.
+
+    Vault BACKLOG #2354 made a weakened-TLS check with no posture fail closed: ``MEFOR_ALLOW_INSECURE_TLS``
+    is honoured only where a ``[security].enforcement = warn`` posture is known. The CI store legs
+    connect to a container with a self-signed certificate (``trust_server_certificate=true``) and
+    open stores directly, with no ``serve`` to derive a posture. This is the explicit posture those
+    legs need, stated once here rather than at every call site. It is session-scoped so a
+    module-scoped store fixture sees it too, and it fires only when BOTH the escape and a server-DB
+    gate are set, so an ordinary local run keeps the fail-closed default. A test that passes its own
+    posture, or opens its own ``active_hop_posture`` scope, still wins. Subprocess children do not
+    inherit a contextvar, so each child source passes the posture itself."""
+    from messagefoundry.config.settings import insecure_tls_allowed
+    from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+
+    if not (insecure_tls_allowed() and any(os.environ.get(g) for g in _SERVER_DB_GATES)):
+        yield
+        return
+    with active_hop_posture(HopPosture(enforcing=False)):
+        yield
+
+
+@pytest.fixture
+def escape_at_warn(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``MEFOR_ALLOW_INSECURE_TLS`` set on a known ``[security].enforcement = warn`` posture, the only
+    shape in which the escape is honoured since vault BACKLOG #2354. For a test of what the escape
+    PERMITS: the escape alone, with no posture, is now refused."""
+    from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
+    from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with active_hop_posture(HopPosture(enforcing=False)):
+        yield
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
     """The trust-anchor path check (BACKLOG #1142, directory arm) reads every directory from the volume

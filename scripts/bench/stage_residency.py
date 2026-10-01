@@ -140,7 +140,11 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from messagefoundry.config.settings import keyless_opt_out_refusal, load_settings  # noqa: E402
+from messagefoundry.config.settings import (  # noqa: E402
+    hop_posture_from_ai,
+    keyless_opt_out_refusal,
+    load_settings,
+)
 from messagefoundry.store.base import open_store  # noqa: E402
 
 _EVENTS = ("received", "routed", "transformed", "delivered")
@@ -716,6 +720,9 @@ async def _collect(
     store = await open_store(
         settings.store,
         keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        # The instance's own dial, so MEFOR_ALLOW_INSECURE_TLS behaves as under serve (vault
+        # BACKLOG #2354: with no posture it would be refused whatever the dial says).
+        posture=hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
     )
     try:
         extent = await _query(store, _extent_sql())

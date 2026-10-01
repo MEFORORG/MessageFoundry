@@ -120,7 +120,9 @@ def test_client_verify_false_refused_without_escape(monkeypatch: pytest.MonkeyPa
         _mllp_ssl_context({"tls": True, "tls_verify": False}, server=False)
 
 
-def test_client_verify_false_allowed_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_client_verify_false_allowed_with_escape(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     ctx = _mllp_ssl_context({"tls": True, "tls_verify": False}, server=False)
     assert ctx is not None

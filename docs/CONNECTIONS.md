@@ -2665,7 +2665,7 @@ construction. An attested hop is recorded as secure, so a false attestation hide
 with its reason, and `GET /security/posture` names them in a `tls_hop_attested` loosening. At least
 the inbound bind gates and the raw-TCP/MLLP hop guard also log a WARNING with the reason when they
 suppress a refusal. Not every cell does: the database weakened-TLS audit line omits the reason, and a
-`DatabaseRef` sync logs nothing. So those two reports are the complete record. The risk entry is in
+`DatabaseRef` source writes that same line. So those two reports are the complete record. The risk entry is in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). It does not reach a revocation refusal, which is
 `tls_revocation_attested`, or SMTP `AUTH` over cleartext, which is refused outright.
 

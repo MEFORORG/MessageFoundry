@@ -201,7 +201,9 @@ def test_internal_ca_never_bypasses_the_verify_off_refusal() -> None:
         )
 
 
-def test_verify_off_path_is_cert_none_regardless_of_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verify_off_path_is_cert_none_regardless_of_policy(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # With the dev escape set, verify-off is permitted — and stays CERT_NONE; the internal CA is inert
     # on that path (it never turns an unverified hop into a verified one, and vice-versa).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")

@@ -30,6 +30,8 @@ from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
     AuthSettings,
+    SecurityEnforcement,
+    SecuritySettings,
 )
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.pipeline import Engine
@@ -108,8 +110,9 @@ def test_ldaps_verifyoff_clamped_prod_phi_even_with_escape(
     with caplog.at_level(logging.WARNING):
         LdapAuthenticator(s, posture=STAGING_PHI)
     assert any("DISABLED" in r.getMessage() for r in caplog.records)
-    # Unstamped posture (a direct/test construction) falls back to the unclamped escape — byte-identical.
-    LdapAuthenticator(s, posture=None)
+    # No posture fails closed (vault BACKLOG #2354): the escape needs a known non-enforcing posture.
+    with pytest.raises(LdapError, match="ad_tls_verify=false"):
+        LdapAuthenticator(s, posture=None)
 
 
 async def test_ldaps_authservice_threads_posture(
@@ -117,8 +120,8 @@ async def test_ldaps_authservice_threads_posture(
 ) -> None:
     # Seam: AuthService must thread hop_posture into the LdapAuthenticator it builds. With an enforcing
     # PHI posture + the escape set, constructing the service raises LdapError — proof the posture reaches
-    # the cell. If the seam dropped it (posture=None), the escape would be unclamped and the build would
-    # succeed.
+    # the cell. If the seam dropped it (posture=None), the STAGING arm below would now refuse, since a
+    # missing posture fails closed (vault BACKLOG #2354).
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with pytest.raises(LdapError, match="ad_tls_verify=false"):
         AuthService(store, _ldaps_verifyoff(), hop_posture=PROD_PHI)
@@ -151,9 +154,10 @@ def test_webhook_cleartext_clamped_prod_phi_even_with_escape(
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     with pytest.raises(ValueError, match="plaintext http"):
         WebhookTransport("http://hooks.example/x", posture=PROD_PHI)
-    # Non-enforcing PHI and unstamped both cross with the escape (byte-identical to before).
+    # Non-enforcing PHI crosses with the escape; no posture fails closed (vault BACKLOG #2354).
     WebhookTransport("http://hooks.example/x", posture=STAGING_PHI)
-    WebhookTransport("http://hooks.example/x", posture=None)
+    with pytest.raises(ValueError, match="plaintext http"):
+        WebhookTransport("http://hooks.example/x", posture=None)
 
 
 def test_webhook_notifier_threads_posture(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -209,7 +213,8 @@ def test_ai_broker_cleartext_clamped_prod_phi_even_with_escape(
     with pytest.raises(AiBrokerError, match="cleartext http"):
         _build(PROD_PHI)
     _build(STAGING_PHI)  # crosses with the escape on non-enforcing PHI
-    _build(None)  # unstamped falls back to the unclamped escape — byte-identical
+    with pytest.raises(AiBrokerError, match="cleartext http"):
+        _build(None)  # no posture fails closed (vault BACKLOG #2354)
 
 
 def test_ai_broker_factory_threads_posture(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -267,6 +272,24 @@ async def test_ai_chat_route_refuses_cleartext_under_enforcing_phi(
     async with _client(app) as c:
         r = await c.post("/ai/chat", json={"prompt": "hi"})
     assert r.status_code == 503  # broker refused by the clamp through the real route
+
+
+async def test_ai_chat_route_allows_cleartext_with_the_escape_at_warn(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, stub_chat: None
+) -> None:
+    # Restores the FALSIFY above (vault BACKLOG #2354). A None posture now refuses too, so the 503
+    # alone no longer proves the route passes its posture. At warn with the escape, http is honoured
+    # and the route answers 200; dropping `posture=_phi_read_posture` would refuse it with a 503.
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    app = create_app(
+        engine,
+        ai_settings=_managed_ai(endpoint=_HTTP_ENDPOINT),
+        security_settings=SecuritySettings(enforcement=SecurityEnforcement.WARN),
+        allow_no_auth=True,
+    )
+    async with _client(app) as c:
+        r = await c.post("/ai/chat", json={"prompt": "hi"})
+    assert r.status_code == 200
 
 
 async def test_ai_chat_route_allows_https_under_enforcing_phi(

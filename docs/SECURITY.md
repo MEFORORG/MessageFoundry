@@ -475,6 +475,65 @@ marks the `store_privilege_preflight` audit row `over_grant_accepted`, and is na
 `enforcement = warn` every arm only warns. The key is the dial alone: since ADR 0186 every instance
 is a PHI instance. SQLite has no login, so nothing here applies to it.
 
+### Data-layer hops refuse cleartext on their defaults, except the Vault hops (ASVS 12.3.1 census)
+
+This census was read at engine commit `bca583f2a7` on 2026-09-30, under vault BACKLOG #2354. Two
+rows then changed in the same work, and each says so: the CLI row and the `DatabaseRef` row. At
+`bca583f2a7` both opened their hop with no posture, so `MEFOR_ALLOW_INSECURE_TLS` was unclamped
+there, and `messagefoundry check` never built a `DatabaseRef` DSN. The table names at least the sites that open a database,
+directory, secrets-store or log-collector connection.
+A hop missing from it is not thereby gated. A 2026-08-22 re-scoping counted 14 such sites in 11
+modules but never recorded the list, so this table does not try to match that count.
+
+"Under `enforce`" is the shipped `[security].enforcement`. "Shipped default" asks whether the hop
+crosses in the clear with every setting at its default once the feature is turned on. A cleartext
+crossing that needs an operator relaxation is a recorded delta, not the default (owner ruling R5 of
+2026-09-24).
+
+| Hop | Module and symbol | Transport | Gate | Under `enforce` | Cleartext on the shipped default |
+|---|---|---|---|---|---|
+| Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
+| Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rekey_audit`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
+| Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
+| `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
+| `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
+| `db_lookup` | `transports/database.py` `DatabaseLookupExecutor` | ODBC, SQL Server preset, `ApplicationIntent=ReadOnly` | `_build_dsn`, posture stamped by `RegistryRunner._build_lookup_executor` | refuses | No |
+| `DatabaseRef` reference sync | `pipeline/reference_sync.py` `database_source_dsn`, from `_load_database_source` and from `build_check` | ODBC, SQL Server preset | `_build_dsn`, with the engine's posture at sync time | refuses at `messagefoundry check`, dry-run, reload and every sync. `serve` start does not stop: its first sync fails and the set stays unloaded. CORRECTED: at `bca583f2a7` a sync read no posture and the escape was unclamped | No |
+| Vault KV secrets | `config/secretprovider_vault.py` | hvac over whatever scheme the address names | none on the scheme | an `http://` address is used as given | Off by default; once on, `http://` crosses in the clear. Vault BACKLOG #2317 |
+| Vault store key provider | `store/keyprovider_vault.py` | as above | none on the scheme | as above | as above; #2317 |
+| Vault Transit cipher | `store/crypto_transit.py` | as above | none on the scheme | as above | as above; #2317 |
+| AD (LDAP) binds | `auth/ldap.py` `LdapAuthenticator` | LDAPS through `NarrowedTls`; plain LDAP for an `ldap://` address | verify-off refusal through `weakened_tls_escape_permitted`; an `ldap://` address is refused at settings load unless `[auth].ad_allow_insecure_ldap = true` | verify-off refuses. `ad_allow_insecure_ldap = true` is honoured with no posture check, no audit line and no `security_loosenings()` entry | Off by default; `ldap://` needs the opt-in |
+| Off-box log and audit forwarder (the audit tee in `store/audit_tee.py` writes through it) | `logging_setup.py` `_build_syslog_handler`; decided by `config/settings.py` `forward_hop_disposition` in `serve` | UDP, TCP or TLS syslog | the shared `insecure_hop_disposition` gradient | refuses a non-loopback UDP, TCP or verify-off collector unless `forward_hop_attested` | Off by default; the `udp` default is refused off loopback |
+
+**How the negatives were checked.** Each "no gate" or "not clamped" cell came from a search paired
+with a control that finds a gated site. Line counts, same files: `insecure_hop_disposition` is in 0
+lines of each Vault module and in 3 of `config/settings.py`. `ad_allow_insecure_ldap` is in 0 lines
+under `messagefoundry/auth/` and in 4 of `config/settings.py`. At `bca583f2a7`, `active_hop_posture`
+was in 0 lines of `pipeline/reference_sync.py` and in 15 of `pipeline/wiring_runner.py`. The cluster modules hold 0
+lines matching the extended pattern `create_pool|connect\(`, where `store/sqlserver.py` holds 10.
+
+**The shared cause is closed (vault BACKLOG #2354).** `weakened_tls_escape_permitted` and
+`_weakened_tls_permitted` now fail closed when no posture is known. CORRECTED: this paragraph read
+that both *"fall back to the unclamped escape when no posture is set"*, so each new caller outside
+the construction gate had to remember to pass one. Now a caller that forgets is refused, and one that
+needs the escape on a `warn` instance passes that posture.
+
+**Still open after this census.** At least these:
+
+- The three Vault hops need a scheme gate. That is vault BACKLOG #2317.
+- `ad_allow_insecure_ldap` is to be clamped inert under `enforce`, like every other weakened-TLS
+  escape. That waits on engine PR 1877, which rewrites `auth/ldap.py`.
+- The CLI commands in the third row refuse a weakened store even at `enforcement = warn`, because
+  they pass no posture. At least `provision-admin`, `store provision-schema` and `check-privileges`
+  pass one and keep the escape at `warn`. A site that needs the others on a dev store gives it a
+  verifying certificate, or the command is changed to pass its posture.
+- The generic `DATABASE` dialect cannot tell an encrypted-but-unverified driver value from a verified
+  one. `generic_odbc_no_tls_params` records that residual.
+
+Backups and the support bundle write to a path. If that path is a network share, the operating
+system makes the connection, and the engine opens no socket of its own for it.
+
 ---
 
 ## Roles & permissions

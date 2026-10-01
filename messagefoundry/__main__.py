@@ -2376,7 +2376,8 @@ def _serve(args: argparse.Namespace) -> int:
     # later — per connection — by the connector's own construction-time WARN (the ADR 0153 acceptance
     # with its reason and an audit record; the #333 generic-ODBC TLS reminder naming the connection;
     # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal; at least the
-    # bind gates' and raw-TCP guard's tls_hop_attested line, though a DatabaseRef sync logs nothing),
+    # bind gates' and raw-TCP guard's tls_hop_attested line, and the database weakened-TLS line that a
+    # DatabaseRef source also writes, without the reason),
     # and all of them completely by `messagefoundry check` and GET /security/posture, which both have
     # the graph.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
@@ -3675,7 +3676,8 @@ def _serve(args: argparse.Namespace) -> int:
     # on-path attacker read all of it. The connectors (EMAIL/DIRECT, layers 1-2) key their refusal on the
     # CLAMPED weakened_tls_escape_permitted_here(), but that mechanism is INERT here — this notifier is
     # built in the API lifespan, outside build_check_registry's active_hop_posture scope, so
-    # current_hop_posture() is None and the clamp degrades to the unclamped escape. Hence an explicit
+    # current_hop_posture() is None. The clamp degraded to the unclamped escape there; since vault
+    # BACKLOG #2354 it fails closed instead, and neither can express an acknowledgment. Hence an explicit
     # acknowledgment switch at this gate instead, in the shape of the keyless-PHI second ack (ADR 0140).
     #
     # IT COVERS BOTH UNAUTHENTICATED SHAPES, DELIBERATELY. email_use_tls=false (no TLS at all) is

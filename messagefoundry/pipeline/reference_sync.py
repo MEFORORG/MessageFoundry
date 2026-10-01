@@ -43,6 +43,7 @@ from messagefoundry.config.settings import (
     EgressSettings,
     ReferenceSettings,
 )
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, current_hop_posture
 from messagefoundry.config.wiring import ReferenceSpec, resolve_env_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -111,16 +112,48 @@ def _cell(value: Any) -> Any:
     return _json_default(value)  # date/Decimal/bytes -> iso/str/base64
 
 
+def reference_connection_name(name: str) -> str:
+    """How a reference set names itself in an alert, a hop refusal or an audit line:
+    ``reference:<name>``. One spelling, so an alert and the hop record it relates to name the set
+    the same way. Reference names are not checked against ``CONNECTION_NAME_PATTERN``, so a name
+    holding a credential-shaped ``key=`` can still be scrubbed out of a record."""
+    return f"reference:{name}"
+
+
+def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None = None) -> str:
+    """Build a DATABASE reference source's DSN, refusing weakened TLS under the AMBIENT hop posture.
+
+    The one place both callers build it: the sync, just before it dials, and ``build_check``, so
+    weakened TLS that every sync would refuse also fails ``messagefoundry check``, dry-run and
+    reload (vault BACKLOG #2354). The source is always the SQL Server preset, since ``DatabaseRef`` takes no
+    ``dialect``. The per-connection attestation is read and validated here too (#200)."""
+    from messagefoundry.transports.database import _build_dsn
+
+    attested = hop_attestation_from_settings(settings)
+    return _build_dsn(dict(settings), attested=attested, connection=connection)
+
+
 async def _load_database_source(
-    settings: Mapping[str, Any], egress: EgressSettings | None
+    settings: Mapping[str, Any],
+    egress: EgressSettings | None,
+    *,
+    posture: HopPosture | None = None,
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Materialize a SQL-backed reference source (ADR 0006 increment 2) into ``{key: value}``.
 
     Runs the operator's read-only ``statement``; ``key_column`` is the key; ``value_column`` (if set)
     is the value, else the value is a dict of the other columns. The dial-out is gated by the
     fail-closed ``[egress].allowed_db`` allowlist (like a DATABASE poll source). Reuses
-    ``transports/database.py`` for the DSN/pool (the SQL-Server ``[sqlserver]`` extra)."""
-    from messagefoundry.transports.database import _build_dsn, _login_timeout, _make_pool
+    ``transports/database.py`` for the DSN/pool (the SQL-Server ``[sqlserver]`` extra).
+
+    ``posture`` is the instance hop posture (vault BACKLOG #2354). A sync runs after start, outside
+    every ``active_hop_posture`` scope, so without it the weakened-TLS refusal in ``_build_dsn`` read
+    no posture and fell back to the UNCLAMPED ``MEFOR_ALLOW_INSECURE_TLS`` escape. Under ``enforce``
+    that let a DatabaseRef with ``encrypt=false`` cross in the clear, where the ``db_lookup`` twin
+    refuses the same hop. ``None`` keeps the ambient posture, so a caller already inside a scope is
+    unchanged. ``name`` is the reference set, so a refusal or an attestation line names it."""
+    from messagefoundry.transports.database import _login_timeout, _make_pool
 
     server = str(settings.get("server", ""))
     if egress is not None:
@@ -143,12 +176,12 @@ async def _load_database_source(
     statement = str(settings.get("statement", ""))
     if not key_col or not statement:
         raise ReferenceSyncError("DATABASE reference source requires 'statement' and 'key_column'")
-    # Per-connection insecure-hop attestation (#200), the twin of the db_lookup executor's: this sync
-    # dials the same customer DB through the same weakened-TLS gate, so dropping the attestation
-    # refused a hop the operator had attested.
-    attested = hop_attestation_from_settings(settings)
-    # fail-loud on weakened TLS / bad auth, before dialing
-    dsn = _build_dsn(dict(settings), attested=attested)
+    # Fail loud on weakened TLS or bad auth, before dialing; why the posture is stamped is in the
+    # docstring. Unlike wiring_runner._build_lookup_executor, a None posture keeps the ambient one.
+    with active_hop_posture(posture if posture is not None else current_hop_posture()):
+        dsn = database_source_dsn(
+            settings, connection=None if name is None else reference_connection_name(name)
+        )
     pool = await _make_pool(
         dsn,
         int(settings.get("pool_max", 5)),
@@ -205,12 +238,15 @@ class ReferenceSyncRunner:
         alert_sink: AlertSink | None = None,
         coordinator: ClusterCoordinator | None = None,
         clock: Callable[[], float] = time.time,
+        hop_posture: HopPosture | None = None,
     ) -> None:
         self._store = store
         self._specs = specs
         self._settings = settings
         self._env_values = dict(env_values or {})
         self._egress = egress
+        # Handed to every DATABASE source load; see _load_database_source (vault BACKLOG #2354).
+        self._hop_posture = hop_posture
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         # Cluster coordination seam (Track B Step 6). None → the no-op NullCoordinator, whose
         # is_leader() is always True, so single-node materializes from source every pass EXACTLY as
@@ -390,7 +426,9 @@ class ReferenceSyncRunner:
                 _load_file_source, settings
             )  # blocking file I/O off-loop
         elif kind == "database":
-            rows = await _load_database_source(settings, self._egress)  # async aioodbc dial
+            rows = await _load_database_source(  # async aioodbc dial
+                settings, self._egress, posture=self._hop_posture, name=spec.name
+            )
         else:
             raise ReferenceSyncError(
                 f"reference set {spec.name!r}: unknown source kind {kind!r} (file, database)"
@@ -410,7 +448,7 @@ class ReferenceSyncRunner:
         # The AlertSink has no reference-specific event yet; use connection_stopped as the generic
         # "a named component degraded" signal (never raises — be defensive anyway).
         try:
-            self._alert_sink.connection_stopped(f"reference:{name}", detail=detail)
+            self._alert_sink.connection_stopped(reference_connection_name(name), detail=detail)
         except Exception:
             log.warning("reference sync alert sink failed", exc_info=True)
 

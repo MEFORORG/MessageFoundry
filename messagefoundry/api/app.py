@@ -7731,8 +7731,9 @@ def create_managed_app(
         # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
         # current_hop_posture() is None there and their weakened-TLS escape would ship UNCLAMPED (green
         # and inert) without an explicit posture; threading this makes the ADR-0092 clamp apply on first
-        # deployment. None when the instance declares no [ai] (SQLite/test) → the unclamped escape,
-        # byte-identical. Reuses the same hop_posture_from_ai derivation the store hop and the runner use.
+        # deployment. None only for an embedding that passes no [ai] (serve always passes it); since
+        # vault BACKLOG #2354 a None posture fails closed, so there the escape is NOT honoured. Reuses
+        # the same hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
             hop_posture_from_ai(
                 ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
@@ -7742,7 +7743,7 @@ def create_managed_app(
         )
         # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
         # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
-        # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
+        # never relax a production-PHI store hop. None (no [ai]) fails closed (vault BACKLOG #2354).
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this

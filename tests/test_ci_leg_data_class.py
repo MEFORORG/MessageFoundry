@@ -51,9 +51,10 @@ def _serve_steps_with_env(workflow: str) -> list[tuple[str, str, dict]]:
     Scoped to ``messagefoundry serve`` deliberately, and this scoping is the whole correctness of the
     module. The posture clamp only exists when the engine builds one: ``api/app.py``'s lifespan threads
     ``hop_posture_from_ai(...)`` into ``open_store``, so a served instance gets a real ``HopPosture``.
-    A **pytest** step calls ``open_store`` directly with ``posture=None``, which
-    ``weakened_tls_escape_permitted`` documents as the *unclamped* fallback — byte-identical to
-    pre-#200.
+    A **pytest** step calls ``open_store`` directly with ``posture=None``. Since vault BACKLOG #2354
+    that fails closed, so those steps get their warn posture from ``tests/conftest.py``
+    (``_warn_posture_for_the_server_db_legs``), not from the engine. CORRECTED: this read that
+    ``posture=None`` was *the unclamped fallback*.
 
     Without this narrowing the first draft of this test flagged six `sqlserver-store` steps that set
     ``MEFOR_STORE_TRUST_SERVER_CERTIFICATE=true`` and are perfectly green — they run the pytest suites,

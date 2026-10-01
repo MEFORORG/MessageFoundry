@@ -234,6 +234,7 @@ def test_use_tls_false_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_use_tls_false_allowed_with_escape_but_no_credentials(
+    escape_at_warn: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
@@ -241,15 +242,15 @@ def test_use_tls_false_allowed_with_escape_but_no_credentials(
     assert d.use_tls is False
 
 
-def test_credentials_over_cleartext_refused_even_with_escape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with pytest.raises(ValueError, match="credentials"):
+def test_credentials_over_cleartext_refused_even_with_escape(escape_at_warn: None) -> None:
+    # On a warn posture the escape passes the cleartext gate, so the credential arm is what refuses.
+    with pytest.raises(ValueError, match="authentication credentials over cleartext"):
         EmailDestination(_dest(use_tls=False, username="svc", password="pw"))
 
 
-async def test_cleartext_send_path_when_escaped(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cleartext_send_path_when_escaped(
+    escape_at_warn: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     _install_fake(monkeypatch)
     d = EmailDestination(_dest(use_tls=False))
@@ -351,10 +352,16 @@ def test_synthetic_cleartext_smtp_now_refused(monkeypatch: pytest.MonkeyPatch) -
         EmailDestination(_cleartext_dest())
 
 
-def test_unstamped_posture_is_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Built outside the construction gate (a live serve build after the pre-flight, or an embedding):
-    # the guard no-ops, so no existing lane that already carried the escape breaks.
+def test_unstamped_posture_refuses_the_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Built outside the construction gate with no posture: the escape alone no longer crosses
+    # (vault BACKLOG #2354). It used to, byte-identical to pre-#200. Live serve builds are stamped.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with active_hop_posture(None), pytest.raises(ValueError, match="cleartext SMTP"):
+        EmailDestination(_cleartext_dest())
+
+
+def test_warn_posture_still_honours_the_escape(escape_at_warn: None) -> None:
+    # The control arm for the test above.
     d = EmailDestination(_cleartext_dest())
     assert d.use_tls is False
 
@@ -542,6 +549,7 @@ def test_tls_verify_false_refused_without_escape(monkeypatch: pytest.MonkeyPatch
 
 
 def test_tls_verify_false_refuses_credentials_even_with_escape(
+    escape_at_warn: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # An unverified session is as bad as cleartext for an AUTH exchange: an on-path attacker
@@ -577,6 +585,7 @@ def test_credentials_over_a_fully_verified_hop_still_construct() -> None:
 
 
 async def test_tls_verify_false_with_escape_builds_an_unverified_context(
+    escape_at_warn: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
