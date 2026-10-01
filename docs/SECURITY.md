@@ -2436,6 +2436,126 @@ Cross-links: function-level rules are the
 
 ---
 
+## Sign-in and the permission check at a glance
+
+These two diagrams answer one question: how does a request get from a person to a permitted
+action. The first shows sign-in for each kind of account. The second shows the check that every
+later request passes. Both show the default, `[security].require_mfa = true`. The sections that
+follow hold the detail.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as Person with a browser or API client
+  participant E as Engine API and web console
+  participant D as Directory services
+  participant S as Message store
+  participant A as Audit trail
+
+  alt Local account
+    P->>E: Username and password over HTTPS
+    Note over E: Sign-in rate limit and lockout check, then argon2id verify
+    E->>S: Save the SHA-256 of a new random session token
+    E-->>P: Opaque session token, second factor still owed
+    P->>E: TOTP code, recovery code, or a passkey in the browser
+    E->>S: Mark the second factor met and replace the session token
+    E-->>P: New session token
+  else Directory account with Windows SSO
+    P->>E: Kerberos ticket over HTTPS
+    E->>D: Find the user and the groups over LDAPS
+    E->>S: Set roles from the group map, save a session that owes a factor
+    E-->>P: Opaque session token
+    P->>E: Engine factor, as for a local account
+    E->>S: Mark the second factor met and replace the session token
+    E-->>P: New session token
+  else Directory account with OIDC in the browser
+    P->>D: Sign in at the identity provider
+    P->>E: Authorization code
+    E->>D: Trade the code for an ID token, verify it, then find the groups over LDAPS
+    E->>S: Set roles from the group map, save a session with the factor met by the MFA claim
+    E-->>P: Session cookie
+  end
+  E->>A: Sign-in success and refusal rows, with the user and the client address
+```
+
+Reading the sign-in diagram:
+
+- **A local account** proves a password, which the engine checks against an argon2id hash. Its
+  second factor is a TOTP code, a single-use recovery code, or a WebAuthn passkey in the web
+  console. A local account that has TOTP may also send the password and the code in one request.
+- **A directory account** never gives the engine its directory password at sign-in. It signs in
+  with Windows SSO (Kerberos) or, in the browser, with OIDC (authorization code with PKCE). Both
+  are off by default. The engine reads the user's groups over LDAPS and sets roles from the
+  [AD-group to role map](#ad-group--role-mapping) at each sign-in.
+- **The second factor differs by path.** A Kerberos ticket says nothing about a second factor, so
+  that session owes one of the engine's own factors. An OIDC session meets the requirement when
+  the verified ID token carries the configured MFA claim, and the engine refuses a token without
+  it.
+- **The session is opaque.** The client holds a random token, and the store keeps only its
+  SHA-256. The engine replaces the token when the second factor is proven. The web console keeps
+  the token in a cookie, and an API client sends it as a bearer header. See [Sessions](#sessions).
+
+```mermaid
+flowchart TB
+  classDef client fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
+  classDef engine fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+
+  REQ["Request with a session token"]:::client
+  SESS{"Does the token hash match a live session<br/>of an enabled user?"}:::api
+  PWD{"Is a password change still owed?"}:::api
+  MFA{"Is the second factor met,<br/>or is none owed?"}:::api
+  ADDR{"Is a notice address still owed?"}:::api
+  PERM{"Does the identity hold each permission<br/>the route names?"}:::api
+  RUN["The route runs"]:::engine
+  R401["401, not authenticated"]:::ext
+  R403P["403, change the password first"]:::ext
+  R403M["403 with the X-MFA-Required header"]:::ext
+  R403A["403, set a notice address first"]:::ext
+  R403D["403, missing permission"]:::ext
+  AUD["Audit trail"]:::store
+
+  REQ --> SESS
+  SESS -->|"no"| R401
+  SESS -->|"yes"| PWD
+  PWD -->|"yes"| R403P
+  PWD -->|"no"| MFA
+  MFA -->|"no"| R403M
+  MFA -->|"yes"| ADDR
+  ADDR -->|"yes"| R403A
+  ADDR -->|"no"| PERM
+  PERM -->|"no"| R403D
+  PERM -->|"yes"| RUN
+  R403M -->|"auth.mfa_denied"| AUD
+  R403D -->|"auth.permission_denied"| AUD
+  RUN -->|"auth.permission_granted.<br/>A PHI read writes its own row"| AUD
+```
+
+Reading the request diagram:
+
+- **Diamonds are checks, and they run in this order.** The three account checks come before the
+  permission check, so a caller that has not finished signing in cannot learn which permissions it
+  holds. Each account check lets a short list of self-service routes through, so a person can
+  change the password, prove the factor or set the address.
+- **A live session** is one that is not revoked and is inside both its idle limit and its absolute
+  limit. The engine looks the session up by the hash of the token.
+- **The permission check denies by default.** An identity's permissions are the union of what its
+  roles grant, and a role the engine does not know grants nothing. The six built-in roles are
+  fixed, and a custom role can only bundle permissions from the same catalogue. See
+  [Roles & permissions](#roles--permissions).
+- **Routes that act on a Connection** also check the identity's connection scope. That scope
+  starts empty for every role except Administrator.
+- **The audit rows name the acting user and the client address.** Sensitive routes add a
+  step-up re-check on top of this flow. See
+  [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753).
+- **The web console** runs the same checks on its cookie session. Where the API answers 401, the
+  console sends the browser to the sign-in page, and it has its own change-password and
+  second-factor pages.
+
+---
+
 ## Local vs Active Directory
 
 Both kinds of user share one identity model (`users.auth_provider` is `local` or `ad`).
