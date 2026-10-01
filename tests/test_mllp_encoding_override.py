@@ -91,7 +91,7 @@ def test_reencode_to_alt_delimiters_preserves_logical_fields() -> None:
 
 
 def test_reencode_preserves_non_ascii_names() -> None:
-    # python-hl7's unescape/escape corrupt code points above U+007F; the override must not, or it would
+    # python-hl7's unescape/escape corrupted code points above U+007F; the override must not, or it would
     # silently mangle accented/CJK patient names (PHI). The accented ZNM-3 names must survive verbatim.
     out = reencode_delimiters(ADT_DEFAULT, parse_encoding_characters(ALT_OVERRIDE))
     assert "Österreich" in out
@@ -123,14 +123,49 @@ def test_reencode_to_same_delimiters_is_byte_identical() -> None:
     assert out == Message.parse(ADT_DEFAULT).encode()
 
 
-# "MSH\rPID|1" and "MSH|\rPID|1" trip python-hl7's header AssertionError, which used to escape the
-# promised ValueError and so the sender's DeliveryError mapping as well (BACKLOG #1601).
+# "MSH\rPID|1" and "MSH|\rPID|1" tripped python-hl7's header AssertionError, which used to escape the
+# promised ValueError and so the sender's DeliveryError mapping as well (BACKLOG #1601). The
+# built-in parser refuses them as HL7ParseError, mapped the same way. The last entry repeats a
+# separator in MSH-2, which python-hl7 refused and the rewrite still refuses.
 @pytest.mark.parametrize(
-    "garbage", ["not hl7 at all", "", "PID|1|2", "MSH|", "MSH\rPID|1", "MSH|\rPID|1", "MSH"]
+    "garbage",
+    [
+        "not hl7 at all",
+        "",
+        "PID|1|2",
+        "MSH|",
+        "MSH\rPID|1",
+        "MSH|\rPID|1",
+        "MSH",
+        "MSH|^^\\&|A|B|1||X^Y|1|P\rPID|a^b\r",
+    ],
 )
 def test_reencode_rejects_unparseable_payload(garbage: str) -> None:
     with pytest.raises(ValueError, match="not parseable HL7"):
         reencode_delimiters(garbage, parse_encoding_characters(ALT_OVERRIDE))
+
+
+# The re-encoder walks the built-in parse; before python-hl7 left, it was compared with python-hl7's
+# tree walk over 1,870 input and delimiter pairs and none differed. These pin the shapes that
+# comparison covered and the corpus tests do not: an FHS/BHS header, whose raw MSH-1/MSH-2 leaves
+# change only their escape character, and a blank segment line, which survives the rewrite.
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            "BHS|^~\\&|A|B\\E\\x\rMSH|^~\\&|A|B|C|D|1||ADT^A01|1|P|2.5.1\r"
+            "PID|1|a\\E\\b^c~d&e\rBTS|1\r",
+            "BHS#|#^~^&#A#B^E^x\rMSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\rPID#1#a^E^b@c$d%e\rBTS#1\r",
+        ),
+        (
+            "MSH|^~\\&|A|B|C|D|1||ADT^A01|1|P|2.5.1\r\rPID|1||a^b~c&d\\F\\x\r",
+            "MSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\r\rPID#1##a@b$c%d^F^x\r",
+        ),
+    ],
+    ids=["batch-header", "blank-line"],
+)
+def test_reencode_batch_header_and_blank_line(payload: str, expected: str) -> None:
+    assert reencode_delimiters(payload, parse_encoding_characters("#@$^%")) == expected
 
 
 # --- MLLP() factory ----------------------------------------------------------
@@ -255,7 +290,8 @@ async def test_send_non_hl7_raises_before_any_io() -> None:
 
 async def test_send_truncated_header_fails_as_a_delivery_error() -> None:
     # BACKLOG #1601: a Handler output whose header has no field separator reached python-hl7's
-    # AssertionError, which escaped send() as an untyped exception rather than a DeliveryError.
+    # AssertionError, which escaped send() as an untyped exception rather than a DeliveryError. The
+    # built-in parser refuses it as HL7ParseError, a header too short to read.
     dest = MLLPDestination(
         Destination(
             name="out",
@@ -270,5 +306,5 @@ async def test_send_truncated_header_fails_as_a_delivery_error() -> None:
     )
     with pytest.raises(DeliveryError, match="encoding-character override failed") as excinfo:
         await dest.send("MSH\rPID|1")
-    # The recorded error names the cause; python-hl7's AssertionError has no message of its own.
-    assert "AssertionError" in str(excinfo.value)
+    # The recorded error names the cause.
+    assert "HL7ParseError" in str(excinfo.value)

@@ -155,5 +155,5 @@ and came out with its carve-out. Its reproducer stays on as the `hl7_peek` seed 
 ## Not covered
 
 ADR 0191 has the full list and the reasoning. In short: the strict validators (`hl7apy`, `pyx12`),
-the XML, FHIR, compression and binary-carriage codecs, the legacy `python-hl7` tolerant backend, and
+the XML, FHIR, compression and binary-carriage codecs (the legacy `python-hl7` backend is retired), and
 everything needing a live endpoint -- the MLLP listener, the HTTP API, ZAP and Schemathesis.

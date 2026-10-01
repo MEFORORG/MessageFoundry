@@ -39,7 +39,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from harness.load.connscale.profile import FUSE_OFF, FUSE_ON
-from harness.load.connscale.report import ConnScaleRecord
+from harness.load.connscale.report import ConnScaleRecord, records_rate_window
 
 BASELINE_MODE = "per_lane"
 CANDIDATE_MODE = "pooled"
@@ -158,6 +158,9 @@ class ClaimModeComparison:
     idle_floor_per_s: float
     rows: list[ComparisonRow] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # The window every rate in `rows` was computed over, read off the records (BACKLOG #2012). An A/B
+    # from before #1420 or #2024 read a different window, so it does not compare with this one.
+    rate_window: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -212,6 +215,7 @@ class ClaimModeComparison:
             "kind": "claim_mode_ab",
             "baseline": self.baseline_mode,
             "candidate": self.candidate_mode,
+            "rate_window": self.rate_window,
             "guards": {
                 "throughput_tolerance": self.throughput_tolerance,
                 "collapse_material_ratio": self.collapse_material_ratio,
@@ -404,6 +408,7 @@ def build_comparison(
         idle_floor_per_s=idle_floor_per_s,
         rows=rows,
         notes=notes,
+        rate_window=records_rate_window(records),
     )
 
 
@@ -760,6 +765,8 @@ class FuseModeComparison:
     # uncomputable. Folded into overall_verdict/ok so a swallowed baseline can never let a GO on the
     # surviving counts mask it (ADR 0071 §6.4b).
     baseline_missing: list[tuple[str, str, int]] = field(default_factory=list)
+    # The window every rate in `rows` was computed over, read off the records (BACKLOG #2012).
+    rate_window: str | None = None
 
     @property
     def overall_verdict(self) -> str:
@@ -808,6 +815,7 @@ class FuseModeComparison:
             "kind": self.axis_kind,
             "baseline": self.baseline_label,
             "candidate": self.candidate_label,
+            "rate_window": self.rate_window,
             "guards": {
                 "min_lift_pct": self.min_lift_pct,
                 "sigma_multiple": self.sigma_multiple,
@@ -1040,6 +1048,7 @@ def build_fuse_comparison(
         guards_ref=guards_ref,
         baseline_label=baseline_label,
         candidate_label=candidate_label,
+        rate_window=records_rate_window(records),
     )
 
 

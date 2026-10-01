@@ -25,6 +25,19 @@ from urllib.parse import quote, urlencode
 from .._html import Markup, el, text
 
 
+def _reveal_cell(value: str | None, href: str, *, revealed: bool) -> object:
+    """A masked cell: the value as the engine sent it, plus a "Reveal" link to ``href`` while it is
+    masked (BACKLOG #2346, #2436, #2443; ASVS 14.2.6). Shared by the message pages and the event
+    and alert pages, which mask the same tier of error text.
+
+    ``None`` (a caller without ``messages:view_summary``) and an empty value render as they always
+    did, with no link, because there is nothing to reveal. The masked value is still escaped by the
+    builder: masking is not sanitizing."""
+    if revealed or not value:
+        return value
+    return el("span", value, " ", el("a", "Reveal", href=href, class_="muted"))
+
+
 def _deadline_stamp(ts: float) -> str | None:
     """A credential deadline as the console's usual UTC stamp, or ``None`` if it cannot render.
 

@@ -1292,11 +1292,12 @@ def test_the_page_states_the_patterns_the_detector_uses() -> None:
 def test_the_parse_site_scan_reaches_the_sites_it_must() -> None:
     # The multipart parser is the site that first showed the page's list was not derived. It is
     # hand-written, so only pattern 4 reaches it. The HTTP listener is reached only by pattern 5,
-    # and the HL7 fast path is the product's main parser.
+    # and the HL7 message surface is the product's main parser API. (The HL7 fast path, parsing/peek.py,
+    # stood here until python-hl7 retired: the built-in parser imports no library, so it is hand-read.)
     must = {
         "api/multipart.py",
         "transports/http_listener.py",
-        "parsing/peek.py",
+        "parsing/message.py",
         "parsing/fhir/",
         f"{_CONSOLE_PREFIX}routes/core.py",
     }
@@ -1392,9 +1393,7 @@ def test_parser_table_drift_is_reported() -> None:
     )
     # One site in both tables.
     assert _parser_drift(
-        _replace_once(
-            text, "`phi_log_silencer.py` |", "`phi_log_silencer.py`, `api/multipart.py` |"
-        ),
+        _replace_once(text, "`hl7structures.py` |", "`hl7structures.py`, `api/multipart.py` |"),
         live,
     )
     # A planted parser the page does not name.

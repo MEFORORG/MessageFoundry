@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import time
+from urllib.parse import urlencode
 
 from messagefoundry.api.models import (
     AlertInstanceInfo,
@@ -31,7 +32,7 @@ from messagefoundry.api.models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
-from ._common import _failed_inbound_reason, _window_note
+from ._common import _failed_inbound_reason, _reveal_cell, _window_note
 
 __all__ = [
     "alerts",
@@ -164,7 +165,12 @@ def _alert_controls(a: AlertInstanceInfo, *, now: float) -> Markup:
 
 
 def alerts(
-    instances: AlertInstanceList, config: AlertsConfig | None, *, limit: int, error: str = ""
+    instances: AlertInstanceList,
+    config: AlertsConfig | None,
+    *,
+    limit: int,
+    error: str = "",
+    revealed: int | None = None,
 ) -> Markup:
     """The operator-alerts page: active (open + acknowledged) instances + the loaded rules (ADR 0044/0014).
 
@@ -180,6 +186,11 @@ def alerts(
     write is refused rather than substituted (BACKLOG #1744). ``config`` is None for a caller that holds
     ``monitoring:diagnose`` but not ``monitoring:read``: the rules half is read-gated, so that caller
     gets the instance list and no Rules section rather than a refusal that widens what it can read.
+
+    ``revealed`` is the one alert whose reason this request asked the engine to return whole
+    (BACKLOG #2443). Every other masked reason carries a "Reveal" link to its own
+    ``/ui/alerts/{id}/reason``. A null reason, for a caller without ``messages:view_summary``,
+    renders empty with no link.
     """
     now = time.time()
     inst_rows = [
@@ -191,7 +202,7 @@ def alerts(
             a.count,
             _ts(a.first_seen),
             _ts(a.last_seen),
-            a.reason,
+            _reveal_cell(a.reason, f"/ui/alerts/{a.id}/reason", revealed=a.id == revealed),
             _opt(a.acked_by),
             # #143: show the active NOTIFICATION-mute window end (— when not suspended / already elapsed).
             _ts(a.suspended_until)
@@ -336,11 +347,19 @@ def _event_filter(connection: str, kind: str = "") -> Markup:
 
 
 def events(
-    rows: list[ConnectionEventInfo], *, connection: str = "", kind: str = "", error: str = ""
+    rows: list[ConnectionEventInfo],
+    *,
+    connection: str = "",
+    kind: str = "",
+    error: str = "",
+    revealed: int | None = None,
 ) -> Markup:
     """The connection/transport event log (Corepoint-style, #46), newest first. The Reason column is
     scrubbed free text that ``docs/PHI.md`` section 2 gives a protection level, so the page is not
-    PHI-free.
+    PHI-free. It arrives masked, and ``revealed`` is the one event whose reason this request asked
+    for whole (BACKLOG #2443). Each other masked reason links to its own reveal, carrying the two
+    filters so the operator lands back on this list. The kind and the rest of each row stay visible
+    to every ``monitoring:read`` holder.
 
     ``error`` renders a refusal banner above the table, the shape ``pages.messages`` uses: the filter
     form comes back carrying what the operator typed and the route answers 400 rather than querying
@@ -348,6 +367,10 @@ def events(
     line, which would otherwise read as the result of a filter that was never applied.
     """
     headers = ["When", "Connection", "Transport", "Dir", "Kind", "Peer", "Reason"]
+    # The filters ride the reveal link as query values, never as path segments, so urlencode
+    # escapes them; a blank one is left off, as the filter form's own GET would send it.
+    back = urlencode({k: v for k, v in (("connection", connection), ("kind", kind)) if v})
+    suffix = f"?{back}" if back else ""
     body = [
         [
             _ts(e.ts),
@@ -356,7 +379,7 @@ def events(
             e.direction,
             el("span", e.kind, class_=f"evt evt-{e.kind}"),
             _opt(e.peer_host),
-            e.reason,
+            _reveal_cell(e.reason, f"/ui/events/{e.id}/reason{suffix}", revealed=e.id == revealed),
         ]
         for e in rows
     ]
