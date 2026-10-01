@@ -237,9 +237,10 @@ cloud, an L4 load balancer passes the traffic to the leader of the HA engine
 ([section 3](#3-mllp-exposure--an-operator-built-l4-load-balancer-that-follows-failover) and
 [`CLUSTERING.md`](CLUSTERING.md) hold that detail).
 
-**Legend.** A dotted arrow is a network hop. A solid arrow stays inside the relay and its store. Each
-arrow follows the message. A cylinder is a message store. Green is MessageFoundry, orange is a store,
-and grey is a system that is not part of MessageFoundry.
+**Legend.** A dotted arrow is a network hop between systems. A solid arrow is a read or a write
+between the relay's workers and its message store. An arrow points the way the message moves, and the
+ACKs that travel back are not drawn. A cylinder is a message store. Green is MessageFoundry, orange
+is a store, and grey is a system that is not part of MessageFoundry.
 
 ```mermaid
 flowchart TB
@@ -276,19 +277,19 @@ flowchart TB
   CLOUD_ENGINE -.->|"commits each message"| CLOUD_STORE
 ```
 
-Either connector can carry the hop to the cloud, and they complete a row at different points. An
-outbound `MLLP()` completes a row when the cloud engine's ACK arrives. An outbound `Tcp()` gets no
-reply from the cloud engine, because a `Tcp()` inbound writes nothing back, so it completes a row on
-the write.
+Two other docs own the settings behind these hops. [`CONNECTIONS.md`](CONNECTIONS.md) lists, for
+`MLLP()` and for `Tcp()`, when the connector counts a send as delivered. [`DEPLOYMENT.md`](DEPLOYMENT.md),
+in its TLS posture matrix, says which hops the engine refuses to start in plaintext off loopback.
+[Attesting a hop secure](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested) covers a hop that
+is secure by means the engine cannot see.
 
-The buffer has a bound. A delivery that fails for a transient reason, such as a link that is down,
-retries under the outbound Connection's retry policy. The default policy is finite: a row that uses
-up its attempts moves to the dead-letter queue, and an operator can replay it from there. The lane
-then moves on to the next row, so a replayed row arrives out of order. The "Retry strategy" paragraph
-under [Resource management & limits](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326)
-in `CONNECTIONS.md` gives the numbers and how to change them.
-
-### 5.2 The relay is an ordinary engine with a forwarding graph
+Each row in the buffer has its own retry budget. A delivery that fails for a transient reason, such
+as a link that is down, retries under the outbound Connection's retry policy. The default policy is
+finite: a row that uses up its attempts moves to the dead-letter queue, and an operator can replay it
+from there. The lane then moves on to the next row, so a replayed row arrives out of order. The
+"Retry strategy" paragraph under
+[Resource management & limits](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326) in
+`CONNECTIONS.md` gives the numbers and how to change them.
 
 **The edge relay is the SAME engine image — no new code** (ADR 0047 ratification). It is just an
 on-prem MessageFoundry instance (the container image, or the Windows-service install) whose graph is:
