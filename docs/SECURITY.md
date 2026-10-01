@@ -1308,6 +1308,11 @@ the same permission set on the same method reds CI until it is listed here.
 > rather than relabelled — its dashboard row, its graph node and its live status all disappear, because
 > an outbound spans channels and its state can reflect another channel's downstream.
 > `GET /connections/{name}/events` and `GET /connections/{name}/metadata` answer 403 outside the scope.
+> A scoped caller cannot learn which names exist from the routes that look a name up:
+> `GET /connections/{name}/metadata`, `POST /connections/{name}/test` and `/test-credential` give one
+> 403, one body and one `auth.channel_denied` row for an inbound outside the scope, a shared outbound,
+> and a name that exists nowhere (BACKLOG #2551). An unknown name inside the caller's own scope still
+> answers 404.
 > What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
 > whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
