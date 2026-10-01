@@ -1226,6 +1226,25 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
+- **With `overwrite = false`, the rename refuses a name taken since the listing (BACKLOG #2553).**
+  The upload lists `remote_dir` to pick a free name before it writes. A partner can write that name
+  while the temp uploads, so the publish checks again on its own connection. If the name is taken
+  it moves on to the next free one on the same connection, up to `PUBLISH_NAME_ATTEMPTS` names
+  (`transports/remotefile.py`), then fails as a transient error and retries with a fresh listing.
+  The log names the upload only through `safe_name`. How far each protocol holds:
+  - **SFTP:** it publishes with the plain SFTP `RENAME`, not `posix-rename`, after an `lstat` check.
+    The SFTP version 3 draft says `RENAME` fails when the target exists. OpenSSH's server does this
+    with a hard link, which refuses an existing name atomically. On a filesystem without hard links
+    it falls back to a check then a rename, which is not atomic. A server that implements `RENAME`
+    as a replace leaves a gap of one round trip after the `lstat` check.
+  - **FTP and FTPS: not atomic.** RFC 959 does not say what `RNTO` does to an existing name; some
+    servers refuse it and some replace it. The publish lists the directory then sends `RNFR`/`RNTO`
+    on one connection. On a server that replaces, a partner file written in that one round trip is
+    still replaced. Before #2553 the gap spanned the whole upload. The check costs one more
+    directory listing per delivery.
+
+  With `overwrite = true`, nothing changes: the rename replaces any entry of the same name, on SFTP
+  with `posix-rename`.
 - **Mostly the same file policy as `File(...)`.** A remote source is one of the *directory sources* the
   [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
   content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is

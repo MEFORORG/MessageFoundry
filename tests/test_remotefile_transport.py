@@ -18,6 +18,7 @@ import ipaddress
 import logging
 import posixpath
 import ssl
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -131,6 +132,18 @@ class _FakeClient(_RemoteClient):
         if self._rename_exc is not None:
             raise self._rename_exc
         self.files[dst] = self.files.pop(src)
+
+    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
+        # BACKLOG #2553: the overwrite-off publish. Refuses a taken name, as the SFTP RENAME does,
+        # and records each try as a rename so the ordering and injected-failure tests read it.
+        for dst in candidates:
+            self.ops.append(("rename", f"{src}->{dst}"))
+            if self._rename_exc is not None:
+                raise self._rename_exc
+            if dst not in self.files:
+                self.files[dst] = self.files.pop(src)
+                return dst
+        return None
 
     def remove(self, path: str) -> None:
         self.ops.append(("remove", path))
