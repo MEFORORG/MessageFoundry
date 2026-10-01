@@ -89,6 +89,10 @@ breaks a line at a lone CR. So ``X-A: a<CR>Content-Length: 5`` reaches the engin
 either sees one field and no length. :func:`reply_framing_fault` cannot see this, because the raw
 bytes are gone by the time it runs. :class:`StrictHTTPResponse` sees them as each line is read, and
 :func:`build_strict_opener` puts it on every opener the engine reads a partner reply through.
+
+**A loopback hop is never sent through a web proxy** (vault BACKLOG #2579, ASVS 12.2.1). This rule
+is about the request, not the reply. It lives here because :func:`build_strict_opener` is the one
+place every engine urllib opener is built. See :class:`LoopbackDirectProxyHandler`.
 """
 
 from __future__ import annotations
@@ -99,9 +103,12 @@ import functools
 import http.client
 import logging
 import re
+import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
+from messagefoundry.config.tls_policy import is_loopback_hop_host
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.transports.base import DeliveryError
 
@@ -110,6 +117,7 @@ __all__ = [
     "MAX_TOKEN_RESPONSE_BYTES",
     "AmbiguousFramingError",
     "EgressReplyError",
+    "LoopbackDirectProxyHandler",
     "MalformedReplyHeadError",
     "ResponseTooLargeError",
     "StrictHTTPHandler",
@@ -119,6 +127,7 @@ __all__ = [
     "build_strict_opener",
     "drain_bounded",
     "hop_identity",
+    "is_never_proxied_host",
     "read_bounded",
     "read_bounded_text",
     "read_reply_body",
@@ -660,10 +669,55 @@ def _tls_context_of(handler: urllib.request.HTTPSHandler) -> Any:
     return context
 
 
-#: The handler types that may open an ``http`` or ``https`` URL on a strict opener. A
-#: ``ProxyHandler`` rewrites the request to go through its proxy and hands it back, so the
-#: connection is still opened by one of the two strict handlers.
-_OPENS_STRICTLY = (StrictHTTPHandler, StrictHTTPSHandler, urllib.request.ProxyHandler)
+def is_never_proxied_host(host: str | None) -> bool:
+    """Whether a hop to ``host`` is on the box, so no web proxy may carry it (vault BACKLOG #2579).
+
+    The cleartext-hop guards' own predicate,
+    :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host`, with no rule added and no DNS
+    lookup. Which hosts that is, is stated there. Why it matters is on
+    :class:`LoopbackDirectProxyHandler`.
+
+    Pass the host as ``urlsplit(url).hostname`` gives it, which is how the guards read it. A missing
+    or empty host is not on the box. The shared predicate reads ``""`` as loopback, but the guards
+    refuse a URL that names no host before they ask it (``transports.rest._hop_guard_host``).
+    """
+    if not host:
+        return False
+    return is_loopback_hop_host(host)
+
+
+class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
+    """urllib's proxy handler, except that a loopback hop is dialled direct (vault BACKLOG #2579).
+
+    The stock handler takes its proxies from the caller, or from ``HTTP_PROXY``, ``HTTPS_PROXY``
+    and the system's own proxy settings. It sends a request direct only when urllib's own bypass list
+    names the host, and with no ``NO_PROXY`` that list is empty. So a request to ``127.0.0.1``
+    would go to the proxy, on a hop the cleartext guards allowed because it stays on the box. For
+    an ``http`` URL the proxy would then read the request, body and credentials included.
+
+    This handler leaves a request alone when :func:`is_never_proxied_host` accepts its host, for a
+    proxy from the environment and for one the operator configured alike. Every other request is
+    handled as urllib handles it, so an off-box hop still reaches the proxy. The alert webhook, the
+    OIDC legs and the AI broker have no proxy setting of their own and depend on that.
+
+    :func:`build_strict_opener` puts this on every opener it builds, in place of the stock class.
+    """
+
+    def proxy_open(self, req: urllib.request.Request, proxy: str, type: str) -> Any:  # noqa: A002
+        try:
+            host = urllib.parse.urlsplit(req.full_url).hostname
+        except ValueError:
+            # A URL the guards could not read either. Leave it to urllib's own handling.
+            host = None
+        if is_never_proxied_host(host):
+            return None  # not rewritten, so the scheme's own handler dials the host itself
+        return super().proxy_open(req, proxy, type)
+
+
+#: The handler types that may open an ``http`` or ``https`` URL on a strict opener. The proxy
+#: handler rewrites the request to go through its proxy and hands it back, so the connection is
+#: still opened by one of the two strict handlers.
+_OPENS_STRICTLY = (StrictHTTPHandler, StrictHTTPSHandler, LoopbackDirectProxyHandler)
 
 #: The methods through which a handler can open an ``http`` or ``https`` URL. ``OpenerDirector``
 #: tries ``default_open`` on every handler before the scheme's own method.
@@ -674,7 +728,7 @@ def build_strict_opener(
     *handlers: urllib.request.BaseHandler | type[urllib.request.BaseHandler],
 ) -> urllib.request.OpenerDirector:
     """``urllib.request.build_opener(*handlers)``, reading every reply with
-    :class:`StrictHTTPResponse`.
+    :class:`StrictHTTPResponse` and never sending a loopback hop through a proxy.
 
     Each engine opener that reads a partner's reply is built here. A plain ``HTTPHandler``, class or
     instance, becomes a :class:`StrictHTTPHandler`. A plain ``HTTPSHandler`` instance becomes a
@@ -683,6 +737,13 @@ def build_strict_opener(
     handler, a strict one is added, built as ``build_opener`` would build its default. Any other
     handler that could open an ``http`` or ``https`` URL is refused with :class:`TypeError`, so a
     new handler type cannot quietly bring back the stock response class.
+
+    A plain ``ProxyHandler``, class or instance, becomes a :class:`LoopbackDirectProxyHandler` with
+    the same proxies (vault BACKLOG #2579). Where the caller supplies none, one is added that reads
+    the environment, as ``build_opener`` would add its own. So every opener built here dials a
+    loopback host direct. A ``ProxyHandler`` subclass that does not derive from the loopback-direct
+    handler is refused with :class:`TypeError`.
+    To build an opener that uses no proxy at all, pass ``ProxyHandler({})``.
     """
     built: list[urllib.request.BaseHandler | type[urllib.request.BaseHandler]] = []
     for handler in handlers:
@@ -692,11 +753,22 @@ def build_strict_opener(
             handler = StrictHTTPSHandler()
         elif type(handler) is urllib.request.HTTPSHandler:
             handler = StrictHTTPSHandler(context=_tls_context_of(handler))
+        elif handler is urllib.request.ProxyHandler:
+            handler = LoopbackDirectProxyHandler()
+        elif type(handler) is urllib.request.ProxyHandler:
+            handler = LoopbackDirectProxyHandler(_proxies_of(handler))
+        elif _is_a(handler, urllib.request.ProxyHandler) and not _is_a(
+            handler, LoopbackDirectProxyHandler
+        ):
+            raise TypeError(
+                f"{_name_of(handler)} could send a loopback hop through its proxy; "
+                "build_strict_opener takes only urllib's own ProxyHandler or the loopback-direct one"
+            )
         elif not _is_a(handler, _OPENS_STRICTLY) and any(
             callable(getattr(handler, m, None)) for m in _OPEN_METHODS
         ):
             raise TypeError(
-                f"{getattr(handler, '__name__', type(handler).__name__)} would open an http or https URL "
+                f"{_name_of(handler)} would open an http or https URL "
                 "with the stock response class; build_strict_opener takes only urllib's own "
                 "HTTP handlers or the strict ones"
             )
@@ -706,7 +778,31 @@ def build_strict_opener(
         built.append(StrictHTTPHandler())
     if not any(_is_a(h, StrictHTTPSHandler) for h in built):
         built.append(StrictHTTPSHandler())
+    # Supplied, so build_opener does not add the stock handler. Built with no argument it reads the
+    # same environment that one would.
+    if not any(_is_a(h, LoopbackDirectProxyHandler) for h in built):
+        built.append(LoopbackDirectProxyHandler())
     return urllib.request.build_opener(*built)
+
+
+def _proxies_of(handler: urllib.request.ProxyHandler) -> dict[str, str]:
+    """The scheme-to-proxy map ``handler`` was built with, or refuse.
+
+    urllib keeps it on ``proxies``, as whatever mapping the caller passed. A runtime that drops
+    the attribute must stop the opener being built, not build one that reads the environment in
+    place of what the caller configured.
+    """
+    proxies = vars(handler).get("proxies")
+    if not isinstance(proxies, Mapping):
+        raise TypeError(
+            "cannot read the proxies this ProxyHandler carries, so a loopback-direct handler "
+            "cannot take them over; refusing to build the opener"
+        )
+    return dict(proxies)
+
+
+def _name_of(handler: object) -> str:
+    return str(getattr(handler, "__name__", type(handler).__name__))
 
 
 def _is_a(handler: object, kinds: type | tuple[type, ...]) -> bool:

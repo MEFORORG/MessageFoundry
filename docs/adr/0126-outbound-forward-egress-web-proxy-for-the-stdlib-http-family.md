@@ -206,6 +206,59 @@ permissive-when-empty and cannot be the gate for a new credential-bearing egress
 Filed as BACKLOG #1659. The row's own closing step said to add `proxy_url` to
 `_CREDENTIAL_EGRESS_URL_KEYS`; that was not built, for the reason above.
 
+### Amendment B (2026-10-01) — a loopback host is never proxied
+
+The Context above records that urllib's default `ProxyHandler` reads the environment proxy on every
+opener that names none, and the Decision left that behaviour untouched. It did not weigh one case.
+The cleartext-hop authority ([ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md))
+allows an `http://` hop to a loopback host because that hop stays on the box. urllib's handler does
+not know that rule. With a proxy in the environment and no `NO_PROXY` entry, it would send a
+loopback request to the proxy like any other. So a hop the engine judged on-box would leave the
+host, and the ECH sidecar hop ([ADR 0139](0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md)),
+which says it uses no proxy, would use one.
+
+**The rule: a loopback hop is never proxied.** It is enforced where every engine urllib opener is
+built, `transports/bounded_read.py::build_strict_opener`. That function replaces urllib's proxy
+handler with `LoopbackDirectProxyHandler`, which leaves a request alone when its host is one the
+cleartext guards accept as loopback. It asks their own predicate, `tls_policy.is_loopback_hop_host`,
+so the guard and the handler cannot disagree. The rule covers a proxy from the environment, the
+operating system's own proxy settings, `proxy_url = "default"` and an explicit `proxy_url` alike.
+
+**What the rule does not claim.** It reads the host as the guards read it, from the URL, with no DNS
+lookup. So it covers exactly the hosts the guards call on-box, and a host they call off-box is left
+to the proxy. The guards refuse a cleartext hop to such a host, so none is a hop the engine judged
+on-box. It is also a rule of the engine's `urllib` openers only. A client built on another HTTP
+library is outside it: the operator API client and the `tee` tool follow the environment proxy even
+for a loopback address.
+
+- **`ProxyConfig.for_host` returns `None` for a loopback target**, as it does for a `proxy_no_proxy`
+  match. The opener would dial that host direct anyway, so the pre-emptive `Proxy-Authorization`
+  header must not be attached: on a direct request it would go to the destination. This narrows
+  the #128 bypass text above by one case that needs no list entry. The skipped proxy is logged at
+  INFO. **Not covered:** urllib's own bypass list (`NO_PROXY`, or the system's override list) can
+  also send a request direct, and `for_host` does not read that list. A proxy credential header
+  can still accompany such a request. That predates this amendment and is a follow-up recorded
+  for the maintainer ledger.
+- **The ECH sidecar opener passes `ProxyHandler({})`**, so that hop uses no proxy at all. The
+  token-endpoint hop is re-addressed to the same sidecar on the token provider's opener, which
+  does read the environment, so there the loopback rule is what keeps it direct. For that to hold,
+  `ech_sidecar_url_from_settings` now reads the sidecar address with the same predicate. The
+  check it replaces accepted any name that starts with `127.`, which the rule would not cover.
+- **An off-box hop is unchanged.** It still follows the environment proxy where it did before.
+
+**Rejected: read no proxy the engine was not given** (`ProxyHandler({})` on every opener). It removes
+the same defect, but `proxy_url` covers only the HTTP family and its token endpoints. The alert
+webhook, the OIDC legs and the AI broker have no proxy setting. On a network whose only route out
+is a corporate proxy, that change would cut all three off with no setting to restore them. It
+needs those settings first, each gated by `allowed_proxy`, and is left as a later step.
+
+- **AC-11** — WHERE a request's host is a loopback host, THE SYSTEM SHALL dial it direct on every
+  engine urllib opener, whatever proxy the environment or the connection names; an off-box host
+  SHALL still be routed as before.
+  → `tests/test_loopback_hop_never_proxied.py`
+
+Vault BACKLOG #2579.
+
 ## Deviations from the phase doc
 
 - **Proxy-auth dispatch lives in `transports/rest.py`, not `transports/http_auth.py`.** `smart.py`'s token
