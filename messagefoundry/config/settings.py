@@ -3117,15 +3117,17 @@ class AuthSettings(_Section):
         if not value > 0 or value == float("inf"):
             raise ValueError(
                 "ad_connect_timeout / ad_receive_timeout must be a finite number of seconds > 0 "
-                "(0, a negative value, inf or NaN would restore an unbounded LDAP wait)"
+                "(inf, NaN or a None connect timeout would mean an unbounded LDAP wait; 0 or a "
+                "negative value would fail every LDAP read or connect)"
             )
-        # A huge finite value overflows socket.settimeout / setsockopt (and ldap3's POSIX
-        # struct.pack) with OverflowError or struct.error. Those are not ldap3 errors, so they would
-        # skip the LdapError mapping and the auth.login_error audit on every sign-in.
+        # A huge finite value overflows socket.settimeout / setsockopt (measured from about 3e6 s on
+        # Windows) with OverflowError or TypeError. Those are not ldap3 errors, so they would skip
+        # the LdapError mapping and the auth.login_error audit. The cap sits far below that point.
         if value > _AD_TIMEOUT_MAX_SECONDS:
             raise ValueError(
                 f"ad_connect_timeout / ad_receive_timeout must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
-                f"seconds (got {value:g}); a larger value overflows the socket timeout"
+                f"seconds (got {value:g}); the cap keeps the value far below where a socket "
+                "timeout overflows"
             )
         return value
 

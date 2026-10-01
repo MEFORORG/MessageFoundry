@@ -24,8 +24,9 @@ Two complementary guards, because either alone has a hole:
   module other than ``auth/ldap.py`` (a reconciler path, a future SPNEGO/LDAP helper, a new
   federation module), which a single-file walk would have missed entirely while advertising full
   coverage. The static half also rejects an explicitly unbounded literal (``receive_timeout=None``
-  or ``=0``), which a keyword-presence check alone would accept; a non-literal value (a settings
-  attribute) is covered by the runtime half's finiteness assertions.
+  or ``=0``), which a keyword-presence check alone would accept. It also requires every
+  ``Connection``'s ``receive_timeout`` to be a ``_ldap3_receive_timeout(...)`` call, so a raw
+  settings float is refused statically too.
 
   *Disclosed limit:* an aliased module import (``import ldap3 as l3``) or a factory that returns a
   ``Connection`` from elsewhere is not resolved. Those forms do not exist at HEAD and the runtime
@@ -479,7 +480,7 @@ def test_every_ldap3_construction_site_passes_a_timeout() -> None:
     # Sanity: the package walk must still find the three known auth/ldap.py sites, or it has gone
     # vacuously green (a moved file, a renamed package, a broken walker).
     kinds = [attr for attr, _module, _line, _kw in sites]
-    assert kinds.count("Server") >= 1 and kinds.count("Connection") >= 2, (
+    assert kinds.count("Server") >= 1 and kinds.count("Connection") >= 3, (
         f"AST walk found an unexpected ldap3 construction set: {sites}"
     )
     assert any(module.endswith("auth/ldap.py") for _a, module, _l, _k in sites), (
@@ -495,8 +496,8 @@ def test_every_ldap3_construction_site_passes_a_timeout() -> None:
         f"controller would block the login thread forever (ASVS 13.1.3): {untimed}"
     )
     # Keyword PRESENCE is not enough: `receive_timeout=None` (or `=0`) satisfies a presence check and
-    # restores the unbounded wait. Reject a literal None/0 statically; a non-literal (a settings
-    # attribute) is covered by the finiteness assertions in the runtime fakes above.
+    # restores the unbounded wait. Reject a literal None/0 statically; the next check refuses a raw
+    # settings attribute on a Connection.
     unbounded = [
         f"{attr} at {module}:{line} passes {_REQUIRED_KWARG[attr]}={ast.unparse(kwargs[_REQUIRED_KWARG[attr]])}"
         for attr, module, line, kwargs in sites
@@ -510,17 +511,23 @@ def test_every_ldap3_construction_site_passes_a_timeout() -> None:
     # A Connection's receive_timeout must go through _ldap3_receive_timeout. A raw settings float
     # passes every check above and still raises struct.error on every non-Windows host, and the
     # runtime fakes see only the sites a test happens to drive.
-    unconverted = [
+    unconverted = _unconverted_receive_timeouts(sites)
+    assert not unconverted, (
+        "ldap3.Connection site(s) passing receive_timeout without _ldap3_receive_timeout(); ldap3 "
+        f"struct.pack()s it on POSIX, so a float breaks every AD connection on Linux: {unconverted}"
+    )
+
+
+def _unconverted_receive_timeouts(
+    sites: list[tuple[str, str, int, dict[str, ast.expr]]],
+) -> list[str]:
+    return [
         f"Connection at {module}:{line} passes receive_timeout={ast.unparse(value)}"
         for attr, module, line, kwargs in sites
         if attr == "Connection"
         and (value := kwargs.get("receive_timeout")) is not None
         and not _is_receive_timeout_call(value)
     ]
-    assert not unconverted, (
-        "ldap3.Connection site(s) passing receive_timeout without _ldap3_receive_timeout(); ldap3 "
-        f"struct.pack()s it on POSIX, so a float breaks every AD connection on Linux: {unconverted}"
-    )
 
 
 def _is_receive_timeout_call(node: ast.expr) -> bool:
@@ -540,10 +547,18 @@ def _is_receive_timeout_call(node: ast.expr) -> bool:
 def test_the_receive_timeout_guard_discriminates() -> None:
     """Control for the guard above: it must refuse the raw settings attribute the engine used to
     pass, and accept the wrapped form, or its green on the real tree measures nothing."""
-    raw = ast.parse("self._s.ad_receive_timeout", mode="eval").body
-    wrapped = ast.parse("_ldap3_receive_timeout(self._s.ad_receive_timeout)", mode="eval").body
-    assert not _is_receive_timeout_call(raw)
-    assert _is_receive_timeout_call(wrapped)
+
+    def site(arg: str) -> tuple[str, str, int, dict[str, ast.expr]]:
+        call = ast.parse(f"ldap3.Connection(s, receive_timeout={arg})", mode="eval").body
+        assert isinstance(call, ast.Call)
+        return ("Connection", "snippet.py", 1, {kw.arg: kw.value for kw in call.keywords if kw.arg})
+
+    raw = site("self._s.ad_receive_timeout")
+    wrapped = site("_ldap3_receive_timeout(self._s.ad_receive_timeout)")
+    assert _unconverted_receive_timeouts([raw]) == [
+        "Connection at snippet.py:1 passes receive_timeout=self._s.ad_receive_timeout"
+    ]
+    assert _unconverted_receive_timeouts([wrapped]) == []
 
 
 def test_static_walker_sees_the_bare_import_call_form() -> None:

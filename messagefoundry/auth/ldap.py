@@ -139,8 +139,8 @@ def _ldap3_receive_timeout(seconds: float) -> int:
 
     ldap3 sets ``SO_RCVTIMEO`` with ``struct.pack('LL', receive_timeout, 0)`` on every non-Windows
     host, and ``struct.pack`` refuses a float. The setting is a float (default ``10.0``), so passing
-    it straight through made EVERY ldap3 socket open raise ``struct.error`` on Linux before a single
-    byte reached the domain controller: AD sign-in could not work there at all. Windows hides it,
+    it straight through made EVERY ldap3 socket open raise ``struct.error`` on Linux after the TCP
+    connect and before the bind was sent: AD sign-in could not work there at all. Windows hides it,
     because ldap3 converts with ``int(1000 * t)`` on that branch.
 
     Rounds UP, never to nearest, so the result is never shorter than the operator configured. The
