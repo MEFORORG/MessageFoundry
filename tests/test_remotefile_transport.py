@@ -18,6 +18,7 @@ import ipaddress
 import logging
 import posixpath
 import ssl
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -132,6 +133,19 @@ class _FakeClient(_RemoteClient):
             raise self._rename_exc
         self.files[dst] = self.files.pop(src)
 
+    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
+        # BACKLOG #2553: the overwrite-off publish. Refuses a taken name, as the SFTP RENAME does,
+        # and records each try as a publish, so a test can tell it from the replacing rename. It
+        # takes the injected rename failure, since it is the rename on this path.
+        for dst in candidates:
+            self.ops.append(("publish", f"{src}->{dst}"))
+            if self._rename_exc is not None:
+                raise self._rename_exc
+            if dst not in self.files:
+                self.files[dst] = self.files.pop(src)
+                return dst
+        return None
+
     def remove(self, path: str) -> None:
         self.ops.append(("remove", path))
         self.files.pop(path, None)
@@ -228,10 +242,12 @@ async def test_destination_uploads_store_then_rename(monkeypatch: pytest.MonkeyP
     client = _FakeClient()
     dest = _dest(monkeypatch, client, filename="msg.hl7")
     await dest.send("MSH|^~\\&|A|B")
-    # The final file exists with the payload, and store happened BEFORE the rename (atomic publish).
+    # The final file exists with the payload, and store happened BEFORE the publish (atomic). With
+    # overwrite off that is the refusing publish, never the replacing rename (BACKLOG #2553).
     assert client.files["/in/msg.hl7"] == b"MSH|^~\\&|A|B"
     op_names = [op for op, _ in client.ops]
-    assert op_names.index("store") < op_names.index("rename")
+    assert op_names.index("store") < op_names.index("publish")
+    assert "rename" not in op_names
     # The stored path was a .part temp, renamed to the final name.
     store_path = next(p for op, p in client.ops if op == "store")
     assert store_path.endswith(".part") and "/in/" in store_path
@@ -2844,6 +2860,7 @@ class _DropBoxFtp:
         self.renamed: list[tuple[str, str]] = []
         self.made: list[str] = []
         self.listed = 0
+        self._rnfr = ""
         _DropBoxFtp.connections.append(self)
 
     def connect(self, host: str, port: int) -> None:
@@ -2869,8 +2886,16 @@ class _DropBoxFtp:
     def storbinary(self, cmd: str, fp: Any) -> None:
         self.stored.append(cmd.removeprefix("STOR "))
 
-    def rename(self, src: str, dst: str) -> None:
-        self.renamed.append((src, dst))
+    def sendcmd(self, cmd: str) -> str:
+        # The publish sends RNFR and RNTO itself rather than through ftplib's rename (BACKLOG #2553).
+        assert cmd.startswith("RNFR "), cmd
+        self._rnfr = cmd.removeprefix("RNFR ")
+        return "350 Ready for RNTO"
+
+    def voidcmd(self, cmd: str) -> str:
+        assert cmd.startswith("RNTO "), cmd
+        self.renamed.append((self._rnfr, cmd.removeprefix("RNTO ")))
+        return "250 Rename successful"
 
     def quit(self) -> None:
         pass

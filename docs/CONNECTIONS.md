@@ -1226,6 +1226,23 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 - **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
   the far side never sees a partial file; a failed rename removes the temp before the delivery is
   classified (transient → retry, permanent → dead-letter).
+- **With `overwrite = false`, the rename refuses a name taken since the listing (BACKLOG #2553).**
+  The upload lists `remote_dir` to pick a free name before it writes, and a partner can write that
+  name while the temp uploads. So the publish checks again, and if the name is taken it moves on to
+  the next free one, on the same connection. After `PUBLISH_NAME_ATTEMPTS` names it fails as a
+  transient error and retries with a fresh listing. The log names the upload only through
+  `safe_name`.
+  - **SFTP:** atomic where the server honours the SFTP `RENAME`, which refuses an existing name.
+    OpenSSH's server does, on a filesystem with hard links. `_SftpClient.publish` in
+    `transports/remotefile.py` states where it does not hold, and two costs: on OpenSSH the final
+    name appears by a hard link, so a partner watching for a move event does not see it, and a
+    server that refuses `RENAME` outright fails every delivery. Either site sets
+    `overwrite = true` with a per-message `filename`.
+  - **FTP and FTPS: not atomic.** A partner file written in the few round trips between the
+    publish's own listing and `RNTO` is still replaced on a server whose `RNTO` replaces.
+    `_FtpClient.publish` states why. The check costs one more directory listing per delivery.
+
+  With `overwrite = true`, nothing changes: the rename replaces any entry of the same name.
 - **Mostly the same file policy as `File(...)`.** A remote source is one of the *directory sources* the
   [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
   content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is

@@ -22,7 +22,7 @@ import inspect
 import logging
 import posixpath
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -337,6 +337,9 @@ class _FakeRemoteClient(_RemoteClient):
 
     def rename(self, src: str, dst: str) -> None:
         self.files[dst] = self.files.pop(src)
+
+    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
+        raise AssertionError("the poll path never publishes; only the destination does")
 
     def remove(self, path: str) -> None:
         self.files.pop(path, None)
