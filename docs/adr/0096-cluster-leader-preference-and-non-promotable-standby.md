@@ -165,9 +165,8 @@ crash failover.
    promotable nodes with a fresh heartbeat, read from the membership read the endpoint already takes.
    The drained node reclaims through the renew branch, which carries no delay term. Without the extra
    term, a node whose siblings were all delayed past its two-heartbeat pause took its own lease back
-   first, which is the defect BACKLOG #1507 described. The pause ends early once a claim tick reads
-   the lease row naming another node, because the renew branch it guards can no longer match. So a
-   long pause does not stop the drained node taking over a successor that crashes inside it.
+   first, which is the defect BACKLOG #1507 described. The pause can end early: the pause-lift
+   comment in `DbCoordinator._claim_or_renew_lease` is the source of record for when.
 3. `stop()` needs no pause. A stopped node has no maintenance task, so it cannot reclaim.
 
 **The no-two-leader argument is unchanged.** A later stored expiry only makes the take-over predicate

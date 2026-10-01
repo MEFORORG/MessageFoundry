@@ -33,6 +33,7 @@ from messagefoundry.pipeline.cluster import (
     ClusterMember,
     DbCoordinator,
     StepdownOutcome,
+    has_promotable_sibling,
     longest_promotable_sibling_delay,
     stepdown_pause_seconds,
 )
@@ -239,6 +240,22 @@ async def test_the_pause_lifts_once_a_successor_holds_the_row(backend: str) -> N
 
 
 @BACKENDS
+async def test_a_missing_lease_row_keeps_the_pause(backend: str) -> None:
+    # Only a row naming ANOTHER node lifts the pause. With no row at all the claim would take the
+    # INSERT arm, which has no delay term, and the drained node would jump every delayed sibling.
+    cluster = _Cluster(backend)
+    a = cluster.node("A")
+    await _lead(a)
+    await a.step_down_leadership(sibling_acquire_delay_seconds=60.0)
+
+    cluster.db.row = None  # e.g. the table was recreated during the pause
+    cluster.advance(_HEARTBEAT)
+    await a._maintain_leadership()
+    assert a.is_leader() is False and cluster.db.row is None
+    assert a._no_claim_until == 80.0
+
+
+@BACKENDS
 async def test_a_release_never_moves_an_aged_out_expiry_later(backend: str) -> None:
     # A node whose lease has already aged out (a hung pool, a self-fence) is then stopped. Its forced
     # release must not restart the siblings' delays by stamping a later expiry. The row expired at
@@ -347,6 +364,10 @@ def test_the_longest_delay_counts_only_the_siblings_that_could_take_the_lease() 
     ]
     assert longest_promotable_sibling_delay(members, "node-a") == 45.0
     assert longest_promotable_sibling_delay(members[:1], "node-a") == 0.0
+    # The same set decides the 412: a sibling that can never take over does not count as one.
+    only_endless = [members[0], _with_delay(_member("node-g"), math.inf)]
+    assert has_promotable_sibling(only_endless, "node-a") is False
+    assert has_promotable_sibling(members, "node-a") is True
 
 
 class _RecordingCoordinator(_StandinCoordinator):

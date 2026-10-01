@@ -394,7 +394,7 @@ POST /cluster/stepdown        # body: {}, or {"force": true} to drain the last p
   reports for each node as `fresh`. If it
   finds none, stepping down would leave no node able to take the lease, so it refuses and changes
   nothing. That covers a clustered install running one node, and one whose only sibling is
-  `promotable = false` or has stopped heartbeating. The check is a snapshot: a sibling that dies just
+  `promotable = false`, has stopped heartbeating, or has an infinite `acquire_delay_seconds`. The check is a snapshot: a sibling that dies just
   after it still counted.
 - **`force` drains the node anyway, and waives nothing else.** Send `{"force": true}` to step down the
   last promotable node on purpose. It does not turn a `400` or a `409` into a success. **It does not keep
@@ -490,8 +490,8 @@ promotable nodes with a fresh heartbeat. It reads those delays from the membersh
 already takes. The delay term matters: the drained node reclaims through its own renew, which carries
 no delay, so without it a node whose siblings are all delayed would take its lease back before any of
 them could ([BACKLOG #1507](BACKLOG.md)). At the shipped default and with no delayed sibling the pause
-is 20 seconds. The pause ends early once the drained node sees the lease row name another node, so it
-can still take over if that successor fails during the pause. On a cluster with no other promotable node that window is leaderless, which is why
+is 20 seconds. The pause ends early when the drained node sees the lease name another node. After
+that it can take over again if its successor fails. On a cluster with no other promotable node that window is leaderless, which is why
 such a call is refused with `412` unless you send `force`. Give every node the same
 `heartbeat_seconds`: the pause is counted in the drained node's own heartbeats, so a sibling with a
 longer one can miss it. A clean stop needs no pause, because a stopped node does not claim.

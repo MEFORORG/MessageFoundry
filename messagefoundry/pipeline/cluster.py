@@ -223,18 +223,19 @@ def has_promotable_sibling(members: Sequence[ClusterMember], node_id: str) -> bo
 
     The check behind the stepdown's no-promotable-sibling refusal (BACKLOG #1509), and the value its
     ``new_leader_eligible`` reports. A member counts when it is another node, ``active`` (not a
-    clean-shutdown ``left`` tombstone), ``promotable`` (ADR 0096) and ``fresh``. No window is chosen
-    here: ``fresh`` is the rule :meth:`ClusterCoordinator.cluster_members` already applied.
+    clean-shutdown ``left`` tombstone), ``promotable`` (ADR 0096), ``fresh``, and has a finite
+    ``acquire_delay_seconds``. No window is chosen here: ``fresh`` is the rule
+    :meth:`ClusterCoordinator.cluster_members` already applied.
 
-    **A point-in-time read, not a promise.** A sibling that dies after the read still counted.
-    ``acquire_delay_seconds`` is not weighed here: a delayed sibling can still take the lease, only
-    later. How much later is what :func:`longest_promotable_sibling_delay` reads, from the same set
-    of members, so the stepdown pause can wait for it (BACKLOG #1986)."""
+    **A point-in-time read, not a promise.** A sibling that dies after the read still counted. A
+    finite delay is not weighed here: a delayed sibling can still take the lease, only later. How
+    much later is what :func:`longest_promotable_sibling_delay` reads, from the same set of members,
+    so the stepdown pause can wait for it (BACKLOG #1986)."""
     return any(True for _ in _promotable_siblings(members, node_id))
 
 
 def longest_promotable_sibling_delay(members: Sequence[ClusterMember], node_id: str) -> float:
-    """The largest finite ``acquire_delay_seconds`` among the siblings :func:`has_promotable_sibling`
+    """The largest ``acquire_delay_seconds`` among the siblings :func:`has_promotable_sibling`
     counts, or ``0.0`` when there are none. The stepdown adds it to its claim pause
     (:func:`stepdown_pause_seconds`, BACKLOG #1986).
 
@@ -243,29 +244,29 @@ def longest_promotable_sibling_delay(members: Sequence[ClusterMember], node_id: 
     AC-2). The drained node's reclaim goes through the renew arm, which has no delay term. So the
     pause must outlast every delay that could still be waiting, or the drained node takes its own
     lease back from a sibling that was one tick away. The shortest would do only while the preferred
-    sibling stays alive. Same point-in-time caveat as :func:`has_promotable_sibling`.
-
-    A non-finite delay is skipped. Such a sibling can never take over an expired lease, so there is
-    nothing to wait for, and counting it would make the pause infinite and leave the cluster with no
-    leader until a restart. The settings validator rejects only a negative delay."""
+    sibling stays alive. Same point-in-time caveat as :func:`has_promotable_sibling`."""
     return max(
-        (
-            m.acquire_delay_seconds
-            for m in _promotable_siblings(members, node_id)
-            if math.isfinite(m.acquire_delay_seconds)
-        ),
-        default=0.0,
+        (m.acquire_delay_seconds for m in _promotable_siblings(members, node_id)), default=0.0
     )
 
 
 def _promotable_siblings(members: Sequence[ClusterMember], node_id: str) -> Iterator[ClusterMember]:
     """The one predicate both functions above apply, so they cannot count different sets. Both take
     a ``Sequence``, not an ``Iterable``: the endpoint calls them on one object in turn, and a one-shot
-    iterator would be part-consumed by the first."""
+    iterator would be part-consumed by the first.
+
+    A sibling with a non-finite delay is not counted. Its take-over predicate (expiry + delay < now)
+    can never hold, so it cannot take the lease, and counting its delay would make the stepdown pause
+    endless. The settings validator rejects only a negative delay. A huge finite delay has the same
+    effect and is not caught here; that is the validator's to bound."""
     return (
         m
         for m in members
-        if m.node_id != node_id and m.status == "active" and m.promotable and m.fresh
+        if m.node_id != node_id
+        and m.status == "active"
+        and m.promotable
+        and m.fresh
+        and math.isfinite(m.acquire_delay_seconds)
     )
 
 
@@ -489,9 +490,8 @@ def stepdown_pause_seconds(
     takes its own lease back when the pause ends, which is the defect #1507 described. The caller
     passes :func:`longest_promotable_sibling_delay`; the default ``0.0`` is the no-sibling case, where
     only the two heartbeats apply. A negative or non-finite value counts as zero, so it can neither
-    shorten the pause below two heartbeats nor make it endless. The pause ends early once a claim tick reads the lease row naming
-    another node, because the renew arm it guards can no longer match; so a long delay term does not
-    stop the drained node taking over a successor that crashes inside it.
+    shorten the pause below two heartbeats nor make it endless. The pause can end early; the pause
+    lift in :meth:`DbCoordinator._claim_or_renew_lease` says when.
 
     Two limits remain. The pause is measured in THIS node's heartbeat and monotonic clock, so a
     sibling configured with a longer heartbeat can miss the window. And the sibling delays are the
@@ -940,7 +940,8 @@ class DbCoordinator:
         self._promotable = promotable
         # ADR 0056 slice 1: monotonic instant before which this node declines to claim or renew, set by
         # step_down_leadership() so a voluntarily-drained node does not immediately re-arm itself via the
-        # renew branch. 0.0 = no pause, which is every path but a stepdown.
+        # renew branch. 0.0 = no pause. Only a stepdown sets it, and only _claim_or_renew_lease clears
+        # it early, once the row names another node (BACKLOG #1986).
         self._no_claim_until: float = 0.0
         # ADR 0056 slice 1: a lease-expiring write did not return, so this node may still own a live
         # lease row it has already stopped claiming in memory. _release_leadership ARMS it before the
@@ -1438,21 +1439,26 @@ class DbCoordinator:
             # write no DB row, report not-held — and strictly stricter than the base predicate, so it
             # can only delay a claim, never advance one.
             #
-            # The pause guards ONE arm: the undelayed `owner = me` renew of the row this node released.
-            # Once a read shows the row naming another node, that arm cannot match any more, so the
-            # pause has done its job and is lifted (BACKLOG #1986). Without that, the pause, which now
-            # includes the longest sibling delay, would also bar this node from taking over a
-            # successor that crashed inside it, and the cluster could sit leaderless for that delay.
-            # Lifting it only lets the ordinary predicate run, under this node's own delay. Nothing
-            # can make the row name this node again in between, except this node's own claim.
+            # THE PAUSE LIFT (BACKLOG #1986), the one place it is described. The pause guards one arm:
+            # the undelayed `owner = me` renew of the row this node released. Once a read shows the row
+            # naming another node, that arm cannot match, so the pause is lifted. Without the lift, a
+            # pause that includes the longest sibling delay would also bar this node from taking over
+            # a successor that crashed inside it. After the lift only the ordinary predicate runs,
+            # under this node's own delay; only this node's own claim could make the row name it again.
+            #
+            # A missing row keeps the pause: the INSERT arm has no delay term, so lifting there would
+            # let this node jump every delayed sibling. The lift tick sends no claim either. That keeps
+            # each paused tick to one round trip under the lock, and the next tick's fence baseline
+            # is taken before its own claim, as _maintain_leadership expects. The cost is up to one
+            # heartbeat before this node may take over a crashed successor.
             row = await self._pool.fetchrow(
                 "SELECT owner FROM leader_lease WHERE lease_key = $1",
                 self._lease_key,
                 timeout=self._renew_timeout,
             )
-            if row is not None and row["owner"] == self.node_id:
-                return False
-            self._no_claim_until = 0.0
+            if row is not None and row["owner"] != self.node_id:
+                self._no_claim_until = 0.0
+            return False
         row = await self._pool.fetchrow(
             "INSERT INTO leader_lease (lease_key, owner, lease_expires_at, leader_epoch) "
             "VALUES ($1, $2, EXTRACT(EPOCH FROM clock_timestamp()) + $3, 1) "
@@ -1648,8 +1654,8 @@ class DbCoordinator:
                 # acquire() carries no timeout and `[store].command_timeout` (30s by default) is the
                 # only ceiling on the statement, already longer than the 20s pause at the shipped
                 # heartbeat. The window that matters starts when the row becomes takeable, which is the
-                # commit, not the call: measuring from before it would hand a sibling (2 * heartbeat -
-                # write duration), which can reach zero, and the drained node's own queued tick — which
+                # commit, not the call: measuring from before it would hand a sibling (the pause - write
+                # duration), which can reach zero, and the drained node's own queued tick — which
                 # waits on this lock for the whole call — would then fall straight through the pause
                 # gate and renew itself back in through the unfenced `owner = me` branch, milliseconds
                 # after the endpoint answered 200.

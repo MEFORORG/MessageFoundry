@@ -244,7 +244,7 @@ def test_members_from_node_rows_derives_the_leader_and_fresh_from_one_verdict() 
         "standby": True,
     }
     assert [n for n, m in members.items() if m.is_leader] == ["leader"]
-    assert has_promotable_sibling(members.values(), "leader") is True
+    assert has_promotable_sibling(list(members.values()), "leader") is True
 
 
 _Rows = list[dict[str, object]]

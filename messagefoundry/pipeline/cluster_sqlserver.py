@@ -476,9 +476,9 @@ class SqlServerCoordinator:
             current = await self._store._fetchone(
                 "SELECT owner FROM leader_lease WHERE lease_key = ?", (self._lease_key,)
             )
-            if current is not None and current["owner"] == self.node_id:
-                return False
-            self._no_claim_until = 0.0
+            if current is not None and current["owner"] != self.node_id:
+                self._no_claim_until = 0.0
+            return False
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
             f" DECLARE @now FLOAT = {_DB_NOW};"
@@ -621,11 +621,11 @@ class SqlServerCoordinator:
                 # The expiry is the DB clock's now, read by the same _DB_NOW expression the MERGE's
                 # take-over predicate reads, so each sibling waits its own acquire_delay (BACKLOG
                 # #1986), and never later than the row's own expiry. DbCoordinator._release_leadership
-                # carries the reasoning. A CASE, because LEAST needs SQL Server 2022.
+                # carries the reasoning. MIN over VALUES, because LEAST needs SQL Server 2022, and a
+                # CASE would read the clock twice, so its test and its result could disagree.
                 rows = await self._store._execute(
                     "UPDATE leader_lease SET lease_expires_at ="
-                    f" CASE WHEN lease_expires_at < {_DB_NOW} THEN lease_expires_at"
-                    f" ELSE {_DB_NOW} END"
+                    f" (SELECT MIN(v) FROM (VALUES (lease_expires_at), ({_DB_NOW})) AS x(v))"
                     " WHERE lease_key = ? AND owner = ?",
                     (self._lease_key, self.node_id),
                 )

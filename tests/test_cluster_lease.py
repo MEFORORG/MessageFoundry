@@ -100,7 +100,8 @@ class _FakeLeaseDB:
         a DB clock that starts at 0.0 the two readings cannot be told apart**: most tests here start
         there, so the preference tests use a realistic epoch clock. The predicate is strict, so a
         sibling needs the DB clock to move past the release before even a delay of 0 matches. Never
-        later than the row's own expiry: a row that already aged out keeps it (LEAST / CASE)."""
+        later than the row's own expiry: a row that already aged out keeps it (LEAST, or MIN over
+        VALUES on SQL Server)."""
         row = self.row
         if row is not None and row["owner"] == owner:
             row["lease_expires_at"] = min(float(row["lease_expires_at"]), self._db_clock())  # type: ignore[arg-type]
@@ -1328,8 +1329,9 @@ class _FakeSqlLeaseStore:
             raise RuntimeError("partitioned from db")
         assert "leader_lease" in sql and "UPDATE" in sql, "not the release statement"
         assert (
-            f"SET lease_expires_at = CASE WHEN lease_expires_at < {_SQLSERVER_DB_NOW}"
-            f" THEN lease_expires_at ELSE {_SQLSERVER_DB_NOW} END " in sql
+            "SET lease_expires_at ="
+            f" (SELECT MIN(v) FROM (VALUES (lease_expires_at), ({_SQLSERVER_DB_NOW})) AS x(v)) "
+            in sql
         ), "the release must write the DB clock's now, never later (BACKLOG #1986)"
         _lease_key, owner = params
         return self._db.release(owner)  # the store's _execute returns the driver's row count
