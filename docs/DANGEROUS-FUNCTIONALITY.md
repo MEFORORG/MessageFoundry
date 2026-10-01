@@ -20,7 +20,7 @@ Five things:
 3. **The VS Code extension** in `ide/` (section 9, and its parsers in section 7).
 4. **The web console**, `messagefoundry_webconsole`, which the engine serves at `/ui` (section 10).
 5. **The toolkit**, `messagefoundry_toolkit`, shipped as the `messagefoundry-toolkit` distribution.
-   It holds the authoring commands that ADR 0201 moved out of the engine wheel, such as
+   It holds the authoring commands that ADR 0201 is moving out of the engine wheel, such as
    `adr-analyze`. The scans in sections 4, 5 and 7 read it with the engine.
 
 The 2026-08-22 owner ruling on scope named the first two, and its purpose was to bring the
@@ -727,9 +727,9 @@ in your own documentation.
 Per-library decisions that matter to a deploying operator are recorded in the ADRs cited above.
 
 **The published test harness.** `messagefoundry-harness` is a tool for testing an engine, and it
-does start processes. It ships at the engine's version, as the toolkit does. But it registers none
-of the engine's commands, the engine wheel does not contain its `harness/` package, and it does not
-run inside the engine. The extension's reason, shipping to the same operators, would reach it. So
+does start processes. It ships at the engine's version, as the toolkit does. But none of its commands
+is a row in `CLI_TIERS`, it holds none of the code ADR 0201 moves out of the engine wheel, and it
+does not run inside the engine. The extension's reason, shipping to the same operators, would reach it. So
 leaving it out is a choice about this page, not a claim that it holds none of these classes.
 
 ## Keeping this page true
