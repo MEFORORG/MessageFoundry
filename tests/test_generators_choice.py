@@ -52,6 +52,39 @@ def test_generated_orm_o01_has_one_order_detail_and_is_strictly_valid(
     assert ok, errors
 
 
+def test_an_obr_takes_its_orc_numbers_once() -> None:
+    """The ORC hands its numbers to the next OBR only; a second OBR draws its own."""
+    rng = random.Random(0)
+    ctx = _core.Ctx("OML", "O21", "OML_O21", "CID", _core.BASE_DT, "A", "F", "B", "G")
+    orc = _core._build_orc(rng, ctx).split("|")
+    first = _core._build_obr(rng, ctx).split("|")
+    second = _core._build_obr(rng, ctx).split("|")
+    assert first[2:4] == orc[2:4]
+    assert second[2:4] != orc[2:4]
+
+
+def test_handing_over_order_numbers_moves_no_other_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The OBR still draws its own numbers when an ORC supplies them, so the random stream, and
+    every later value of OML, MDM and ORU messages, stays where it was. Only OBR-2/3 move."""
+    real_orc = _core.SHARED_BUILDERS["ORC"]
+    now = _core.generate_message("OML", "O21", 1)
+
+    def orc_handing_nothing(rng: random.Random, ctx: _core.Ctx) -> str:
+        text = real_orc(rng, ctx)
+        ctx.order_numbers = None
+        return text
+
+    monkeypatch.setitem(_core.SHARED_BUILDERS, "ORC", orc_handing_nothing)
+    before = _core.generate_message("OML", "O21", 1)
+    changed = [
+        (a.split("|"), b.split("|"))
+        for a, b in zip(now.split("\r"), before.split("\r"), strict=True)
+        if a != b
+    ]
+    assert [a[0] for a, _ in changed] == ["OBR"]  # the control: the hand-over did change it
+    assert [a[:2] + a[4:] for a, _ in changed] == [b[:2] + b[4:] for _, b in changed]
+
+
 def test_obr_is_picked_without_drawing_from_the_seed() -> None:
     """OBR leaves the random stream alone, so adding a choice moves no other generated value."""
     rng = random.Random("seed")

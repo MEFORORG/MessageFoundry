@@ -6,7 +6,8 @@ Each message type (ADT, ORM, …) registers a :class:`MessageSpec` describing it
 trigger→structure map, its segment builders, and which optional segments to sprinkle in.
 Generation walks hl7apy's own 2.5.1 reference tree (``MESSAGES[structure]``): for each
 structure we emit required segments in order plus a valid random subset of allow-listed
-optionals, then gate every message through the engine's strict validator before it counts.
+optionals, and one alternative of each choice group, then gate every message through the
+engine's strict validator before it counts.
 
 A type module contributes builders only for its *own* segments; the broadly shared ones
 (MSH/EVN/PID/PV1/…) live here in :data:`SHARED_BUILDERS`. All data is synthetic — no real PHI.

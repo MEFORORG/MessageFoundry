@@ -48,7 +48,7 @@ from messagefoundry.parsing.peek import (
     normalize,
 )
 
-__all__ = ["ValidationResult", "validate"]
+__all__ = ["ValidationResult", "is_choice_group", "validate"]
 
 logger = logging.getLogger(__name__)
 
