@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,14 +29,14 @@ def test_build_version_info_is_self_consistent() -> None:
 def test_is_branded_process(monkeypatch: pytest.MonkeyPatch) -> None:
     # Forward slashes so pathlib extracts the basename on any OS (Linux PosixPath does not split
     # on backslashes) — this pure test runs on every CI leg.
-    monkeypatch.setattr(branding.sys, "executable", "/opt/app/MessageFoundryTray.exe")
+    monkeypatch.setattr(sys, "executable", "/opt/app/MessageFoundryTray.exe")
     assert branding.is_branded_process() is True
-    monkeypatch.setattr(branding.sys, "executable", "/opt/app/pythonw.exe")
+    monkeypatch.setattr(sys, "executable", "/opt/app/pythonw.exe")
     assert branding.is_branded_process() is False
 
 
 def test_off_windows_is_fail_soft(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(branding.sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", "linux")
     assert branding.ensure_branded_launcher() is None
     assert branding.read_file_description(Path("nope.exe")) is None
 
@@ -76,7 +77,7 @@ def test_relaunch_falls_back_when_child_dies_immediately(
         def wait(self, timeout: float | None = None) -> int:
             return 9  # already exited
 
-    monkeypatch.setattr(branding.subprocess, "Popen", lambda *a, **k: _Dead())
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Dead())
     assert branding.relaunch_branded() is False  # child died → parent must run unbranded
 
 
@@ -91,9 +92,9 @@ def test_relaunch_returns_true_when_child_survives(
         returncode = None
 
         def wait(self, timeout: float | None = None) -> int:
-            raise branding.subprocess.TimeoutExpired("cmd", timeout or 0)
+            raise subprocess.TimeoutExpired("cmd", timeout or 0)
 
-    monkeypatch.setattr(branding.subprocess, "Popen", lambda *a, **k: _Alive())
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Alive())
     assert branding.relaunch_branded() is True  # still alive → the child owns the tray
 
 

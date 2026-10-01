@@ -124,15 +124,16 @@ def test_real_guard_runs_from_current_claude_settings(bridge, tmp_path):
         tmp_path,
         [{"type": "command", "command": "pwsh", "args": ["-NoProfile", "-File", str(script)]}],
     )
+    tool_input = {"command": "gh run watch 123"}
     payload = {
         "session_id": "x",
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "tool_input": {"command": "gh run watch 123"},
+        "tool_input": tool_input,
     }
     result = bridge.dispatch(tmp_path, payload)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-    payload["tool_input"]["command"] = "gh run view 123"
+    tool_input["command"] = "gh run view 123"
     assert bridge.dispatch(tmp_path, payload) == {}
 
 

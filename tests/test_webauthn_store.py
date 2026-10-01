@@ -77,12 +77,14 @@ async def test_webauthn_public_key_plaintext_under_cipher(tmp_path: Path) -> Non
                 "SELECT public_key FROM webauthn_credentials WHERE credential_id_hash='h1'"
             )
             row = await cur.fetchone()
+        assert row is not None
         assert row["public_key"] == "cose-public-key-b64url"  # raw at rest, no mfenc: envelope
         # The cipher-covered column next door IS encrypted (the contrast pin).
         await store.set_totp_secret("u1", secret="JBSWY3DPEHPK3PXP", now=3.0)
         async with store._read() as conn:  # noqa: SLF001
             cur = await conn.execute("SELECT totp_secret FROM users WHERE id='u1'")
             row = await cur.fetchone()
+        assert row is not None
         assert row["totp_secret"] != "JBSWY3DPEHPK3PXP"  # encrypted at rest
     finally:
         await store.close()

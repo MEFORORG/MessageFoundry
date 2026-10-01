@@ -39,6 +39,13 @@ THE THREE TRAPS, each of which has already cost this repo a wrong number:
    split for this reason -- ci.yml's "THE RULER AND THE WALL" note is the source of record. The
    ENGINE leg is still wired that way, which is a known, unfixed instance rather than an oversight.
 
+A RUN THAT OUTGROWS ITS RECORD IS ANNOTATED, NOT REDDENED (BACKLOG #1842). The gate compares a run
+with its cap; the record in ``step_margin_baseline.toml`` is what the cap was sized from. When a
+success run exceeds the record, this script raises a GitHub ``::warning`` annotation -- RE-DERIVE when
+the cap still meets its sizing rule, RE-SIZE when it no longer does -- and keeps the exit code the
+margin alone decides. That note used to go only to the step log, and a record rotted unread until the
+queue ejected a healthy pull request. :func:`record_escalation` carries the reasoning.
+
 WHAT THE INSTRUMENT ACTUALLY MEASURES, so it is not read as more (SDS-3.8). Elapsed is the interval
 between two ``--mark`` calls made in the steps ADJACENT to the one being measured. That is the step's
 own duration PLUS the two step transitions around it, i.e. an UPPER bound on the step. So the margin
@@ -57,12 +64,13 @@ Stdlib only, and no network: it must run identically on a hosted runner and on a
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import tempfile
 import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final
 
@@ -77,6 +85,18 @@ _OUTCOMES: Final[frozenset[str]] = frozenset({"success", "failure", "cancelled",
 #: the per-leg ratios), so it fires when a run has moved toward its cap rather than every time a
 #: runner has a slow morning.
 DEFAULT_MIN_MARGIN: Final[float] = 1.30
+
+#: The rule a cap is SIZED by, and the rule the escalation below measures a run against: a cap is
+#: ``ceil_minute(SIZING_MULTIPLE x the worst passing run)``, floored at ``SIZING_FLOOR_MINUTES``. The
+#: 1.35 is #131's and the 5:00 floor is #344's; ci.yml's web console sizing notes apply both. One copy
+#: here, so the check, its tests and the escalation cannot disagree about it.
+SIZING_MULTIPLE: Final[float] = 1.35
+SIZING_FLOOR_MINUTES: Final[int] = 5
+
+#: Escalation levels for a run that has outgrown its recorded maximum (BACKLOG #1842). Neither moves
+#: the exit code -- see :func:`record_escalation` for why that is deliberate.
+RE_DERIVE: Final[str] = "RE-DERIVE"
+RE_SIZE: Final[str] = "RE-SIZE"
 
 _BASELINE: Final[Path] = Path(__file__).resolve().parent / "step_margin_baseline.toml"
 
@@ -124,6 +144,11 @@ class Verdict:
     exit_code: int
     headline: str
     notes: list[str] = field(default_factory=list)
+    #: ``None``, :data:`RE_DERIVE` or :data:`RE_SIZE`. Orthogonal to ``code``: it is a finding about
+    #: the RECORD, and it never moves ``exit_code``.
+    escalation: str | None = None
+    #: The one-line reason for ``escalation``, which ``main`` raises as a workflow annotation.
+    escalation_message: str = ""
 
 
 def parse_clock(text: str) -> int:
@@ -142,6 +167,16 @@ def format_clock(seconds: float) -> str:
     """Seconds to ``mm:ss``, which is how every measurement of this in the repo is written."""
     whole = int(round(seconds))
     return f"{whole // 60}:{whole % 60:02d}"
+
+
+def sized_cap_minutes(max_passing_seconds: float) -> int:
+    """The cap the sizing rule gives for a worst passing run: ``ceil_minute(1.35x)``, floored at 5.
+
+    Rounded to a microminute before the ceiling, because 1.35 has no exact float: 1.35 x 46:40 is
+    exactly 63:00, and the raw product rounds up to 64.
+    """
+    minutes = round(SIZING_MULTIPLE * max_passing_seconds / 60, 6)
+    return max(SIZING_FLOOR_MINUTES, math.ceil(minutes))
 
 
 def load_baselines(path: Path = _BASELINE) -> list[Baseline]:
@@ -255,6 +290,9 @@ def decide(
             ],
         )
 
+    escalation, escalation_message = record_escalation(
+        elapsed_seconds, cap_seconds, baseline, min_margin=min_margin
+    )
     margin = cap_seconds / elapsed_seconds
     pct = 100.0 * elapsed_seconds / cap_seconds
     shape = (
@@ -279,8 +317,81 @@ def decide(
                 "instead of on the day a green suite is killed with zero failing assertions.",
                 *notes,
             ],
+            escalation=escalation,
+            escalation_message=escalation_message,
         )
-    return Verdict(code="OK", exit_code=0, headline=f"margin OK: {shape}", notes=notes)
+    return Verdict(
+        code="OK",
+        exit_code=0,
+        headline=f"margin OK: {shape}",
+        notes=notes,
+        escalation=escalation,
+        escalation_message=escalation_message,
+    )
+
+
+def record_escalation(
+    elapsed_seconds: float,
+    cap_seconds: int,
+    baseline: Baseline,
+    *,
+    min_margin: float = DEFAULT_MIN_MARGIN,
+) -> tuple[str | None, str]:
+    """Whether a SUCCESS-concluded run says the record has rotted, and how loudly (BACKLOG #1842).
+
+    THE DEFECT THIS CLOSES. The RE-DERIVE note was printed on every run that outgrew its row, and it
+    exited 0 into a step log nobody opens. A record re-derived on 2026-09-26 rotted within three days.
+    The first seat to hear of it was the merge queue: the gate reddened a windows-2022 leg whose 809
+    tests had passed, and ejected a healthy pull request. Green pull_request runs had said so earlier.
+
+    TWO LEVELS, BOTH RAISED AS A WORKFLOW ANNOTATION BY ``main``, NEITHER A RED:
+
+    * :data:`RE_DERIVE` -- the run exceeds the recorded maximum, the gate passed it, and the sizing
+      rule applied to it gives no larger cap. The record is stale; the cap is not yet wrong.
+    * :data:`RE_SIZE` -- the run exceeds the record and either the rule applied to it gives a larger
+      cap than the one in force, or the gate reddened it. A slightly slower run reds the queue, or
+      this one already did.
+
+    THE LEAD TIME IS SHORT, AND THE SIZING RULE SETS IT, NOT THIS FUNCTION. A cap of
+    ``ceil_minute(1.35x the row)`` against a 1.30x floor puts the red line only a few percent above
+    the row. When one pull request's growth crosses the row, its own pull_request run shows the
+    annotation before the queue. When several queued pull requests cross it only together, the first
+    annotation is on the merge-group run that ejects them, where it at least names the cause.
+    Widening the band is a change to the sizing rule, which is a separate decision.
+
+    A CENSORED ROW NEVER ESCALATES. It is a lower bound by definition, so a run above it is expected
+    and says nothing new; the caveat and the percent line say what there is to say.
+
+    WHY NOT A RED. A failing exit for "slightly over the record" would eject pull requests over a
+    finding about a table, which is the #1842 defect moved one step earlier.
+
+    THE CLOCKS DIFFER BY A SECOND OR SO, AND IN THE SAFE DIRECTION. ``elapsed`` is mark-to-mark and runs
+    high (see the module docstring); a row is an API step duration. A run at exactly the recorded
+    maximum can therefore read a second over it and be annotated. That errs toward a warning.
+    """
+    recorded = baseline.max_passing_seconds
+    if baseline.censored or elapsed_seconds <= recorded:
+        return None, ""
+    implied = sized_cap_minutes(elapsed_seconds)
+    rule = f"ceil_minute({SIZING_MULTIPLE:.2f}x), floored at {SIZING_FLOOR_MINUTES}:00"
+    census = (
+        "Re-measure the row over a pool that keeps the runs that did not land (merge_group and "
+        "pull_request), never over pushes to main alone. Move the cap only with that new row, by the "
+        f"rule, never by hand. Recorded {baseline.source}"
+    )
+    red_line = cap_seconds / min_margin
+    if implied * 60 > cap_seconds or elapsed_seconds > red_line:
+        return RE_SIZE, (
+            f"{RE_SIZE}: this run took {elapsed_seconds:.1f}s ({format_clock(elapsed_seconds)}), "
+            f"over the recorded maximum of {format_clock(recorded)}. The sizing rule ({rule}) "
+            f"applied to it gives a cap of {implied}:00, against the {format_clock(cap_seconds)} in "
+            f"force, and the gate reds a run over {red_line:.1f}s. {census}"
+        )
+    return RE_DERIVE, (
+        f"{RE_DERIVE}: this run took {format_clock(elapsed_seconds)}, over the recorded maximum "
+        f"of {format_clock(recorded)}. The cap still meets its sizing rule ({rule}) against this "
+        f"run, so only the record is due. {census}"
+    )
 
 
 def _baseline_notes(
@@ -288,9 +399,8 @@ def _baseline_notes(
 ) -> list[str]:
     """What this run says about the RECORD, which is a different question from the cap.
 
-    A run that exceeds the recorded maximum has not necessarily used up its margin -- it has aged the
-    record. Saying so here is the mechanism the item asks for: the table was published wrong twice
-    because nothing read it.
+    The censoring caveat, and where a run sits against the record. A success run that exceeds the
+    record is reported by :func:`record_escalation` instead, because that finding has to leave the log.
     """
     notes: list[str] = []
     recorded = baseline.max_passing_seconds
@@ -299,13 +409,9 @@ def _baseline_notes(
             f"the recorded maximum {format_clock(recorded)} is RIGHT-CENSORED, so it is a lower "
             f"bound and any ratio against it flatters itself. Censored by: {baseline.censored_by}"
         )
-    if elapsed_seconds > recorded and not censored_observation:
-        notes.append(
-            f"RE-DERIVE: this run took {format_clock(elapsed_seconds)}, which EXCEEDS the recorded "
-            f"maximum of {format_clock(recorded)} for this leg. The record has rotted, and a cap "
-            f"sized against it is sized against a smaller suite. Recorded {baseline.source}"
-        )
-    else:
+    # A success run over an uncensored record is `record_escalation`'s to report, as RE-DERIVE or
+    # RE-SIZE, in `Verdict.escalation_message`. A second copy here would be the note nobody read.
+    if censored_observation or baseline.censored or elapsed_seconds <= recorded:
         notes.append(
             f"recorded maximum for this leg: {format_clock(recorded)}"
             f"{' (censored)' if baseline.censored else ''}; this run is "
@@ -326,6 +432,9 @@ _CONTROL_BASELINE: Final[Baseline] = Baseline(
     censored_by="",
     source="a fixed synthetic pair compiled into this script; it measures nothing about any leg.",
 )
+
+#: The record-escalation arms' quiet twin: the same synthetic row, recording a maximum no arm exceeds.
+_CONTROL_RECORD_ABOVE: Final[Baseline] = replace(_CONTROL_BASELINE, max_passing_seconds=1200)
 
 
 def self_check(min_margin: float = DEFAULT_MIN_MARGIN) -> list[str]:
@@ -355,16 +464,56 @@ def self_check(min_margin: float = DEFAULT_MIN_MARGIN) -> list[str]:
             f"1.111x, under the {min_margin:.2f}x floor, and it returned {red.code!r} "
             f"(exit {red.exit_code}). The gate cannot go red, so its green means nothing."
         )
-    if green.code != "OK" or green.exit_code != 0:
+    if green.code != "OK" or green.exit_code != 0 or green.escalation is not None:
         raise MarginError(
             f"the margin check's POSITIVE control did not pass: 1:00 against a 10:00 cap is 10.000x "
-            f"and it returned {green.code!r}. The gate reds unconditionally, which is the same as "
+            f"under a 10:00 record, and it returned {green.code!r} with escalation "
+            f"{green.escalation!r}. The gate reds or escalates unconditionally, which is the same as "
             "no gate."
         )
+    # The escalation is a control too (BACKLOG #1842): unless it can be shown to speak, a green run
+    # with no annotation is a claim. 11:30 over the 10:00 record makes the rule give 16:00. Under a
+    # 20:00 cap that is RE-DERIVE; under a 15:00 cap it is RE-SIZE (1.304x, just over the default
+    # floor). Each arm is paired with the same run under a record it does not exceed, and the two
+    # must exit alike: that is the proof the escalation never reds a leg on its own.
+    arms: list[tuple[str, Verdict]] = []
+    for cap_s, want in ((1200, RE_DERIVE), (900, RE_SIZE)):
+        got = decide(
+            elapsed_seconds=690,
+            cap_seconds=cap_s,
+            outcome="success",
+            baseline=_CONTROL_BASELINE,
+            min_margin=min_margin,
+        )
+        quiet = decide(
+            elapsed_seconds=690,
+            cap_seconds=cap_s,
+            outcome="success",
+            baseline=_CONTROL_RECORD_ABOVE,
+            min_margin=min_margin,
+        )
+        if got.escalation != want or quiet.escalation is not None:
+            raise MarginError(
+                f"the {want} control did not escalate as designed: 11:30 against a "
+                f"{format_clock(cap_s)} cap returned escalation {got.escalation!r} over a 10:00 "
+                f"record and {quiet.escalation!r} under a 20:00 one, wanting {want!r} and None. A "
+                "record that rots would then reach nobody, which is BACKLOG #1842."
+            )
+        if got.exit_code != quiet.exit_code:
+            raise MarginError(
+                f"the {want} control changed the exit code ({quiet.exit_code} -> {got.exit_code}). "
+                "The escalation is a finding about the record and must never red a leg by itself."
+            )
+        arms.append((format_clock(cap_s), got))
     return [
         f"control (negative): 9:00 against a 10:00 cap -> 1.111x -> {red.code}, exit {red.exit_code}",
         f"control (positive): 1:00 against a 10:00 cap -> 10.000x -> {green.code}, "
         f"exit {green.exit_code}",
+        *(
+            f"control (record): 11:30 over a 10:00 record, {cap} cap -> {got.escalation}, "
+            f"{got.code}, exit {got.exit_code} (unchanged from the same run under the record)"
+            for cap, got in arms
+        ),
     ]
 
 
@@ -377,12 +526,12 @@ def summary_block(
     a bare verdict, because a summary that says only "OK" is indistinguishable from a summary that
     scanned nothing.
     """
-    lines = [
-        f"### CI step margin -- `{step}` on `{leg}`",
-        "",
-        f"**{verdict.code}** -- {verdict.headline}",
-        "",
-    ]
+    lines = [f"### CI step margin -- `{step}` on `{leg}`", ""]
+    if verdict.escalation is not None:
+        # Above the verdict, because an OK run carrying this is the one a skimmer must not pass over.
+        # The message opens with its own level, so the banner needs no label of its own.
+        lines += ["> [!WARNING]", f"> {verdict.escalation_message}", ""]
+    lines += [f"**{verdict.code}** -- {verdict.headline}", ""]
     lines += [f"- {n}" for n in verdict.notes]
     lines += [
         "",
@@ -392,8 +541,9 @@ def summary_block(
     lines += [f"- {c}" for c in controls]
     lines += [
         "",
-        "These two run on every invocation. The first is the check refusing on demand: without it a "
-        "green line here would be a claim rather than a measurement.",
+        "These run on every invocation. The first is the check refusing on demand: without it a "
+        "green line here would be a claim rather than a measurement. The two record arms show the "
+        "escalation speaking on demand, and never redding a leg.",
         "</details>",
         "",
     ]
@@ -445,6 +595,29 @@ def read_mark(label: str, directory: Path) -> float:
         ) from exc
     except ValueError as exc:
         raise MarginError(f"mark {label!r} at {path} is not a timestamp") from exc
+
+
+def annotation(verdict: Verdict, *, step: str, leg: str) -> str | None:
+    """The workflow command that raises ``verdict.escalation`` as a GitHub annotation, or ``None``.
+
+    A ``warning``, never an ``error``: the measured step concluded success, and the finding is about
+    the record. When the gate also reds the leg, its own exit already says so; an error annotation on
+    an OK verdict would read as a failure somebody missed. GitHub lists the annotation on the run page,
+    on the pull request's checks tab and in ``gh run view``. A step log is on none of those.
+    """
+    if verdict.escalation is None:
+        return None
+    title = _escape_property(f"step-margin {verdict.escalation}: {step} @ {leg}")
+    return f"::warning title={title}::{_escape_data(verdict.escalation_message)}"
+
+
+def _escape_data(text: str) -> str:
+    # The workflow-command encoding. `%` goes first, or the escapes after it would be escaped again.
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _escape_property(text: str) -> str:
+    return _escape_data(text).replace(":", "%3A").replace(",", "%2C")
 
 
 def _emit(text: str, destination: Path | None) -> None:
@@ -539,10 +712,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2  # never 0, never confused with a clean result, never 1 (which means LOW)
 
     print(f"step-margin [{args.step} @ {args.leg}] {verdict.code}: {verdict.headline}")
+    if verdict.escalation_message:
+        print(f"  {verdict.escalation_message}")
     for note in verdict.notes:
         print(f"  {note}")
     for control in controls:
         print(f"  {control}")
+    # Only on a runner. Anywhere else the line is noise, and under pytest a failing test replays its
+    # captured stdout into the job log, where GitHub would parse it as a real annotation on a real leg.
+    command = annotation(verdict, step=args.step, leg=args.leg)
+    if command is not None and os.environ.get("GITHUB_ACTIONS") == "true":
+        print(command)
     _emit(
         summary_block(
             step=args.step,

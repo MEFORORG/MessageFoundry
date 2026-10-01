@@ -106,7 +106,9 @@ async def test_resend_creates_pending_tail_row_on_origin(store: MessageStore) ->
     async with store._read() as db:  # rowid IS the seq (ADR 0059)
         for i in ids:
             cur = await db.execute("SELECT rowid FROM queue WHERE id=?", (i,))
-            seqs[i] = (await cur.fetchone())["rowid"]
+            fetched_row = await cur.fetchone()
+            assert fetched_row is not None
+            seqs[i] = fetched_row["rowid"]
     assert seqs[new_row["id"]] == max(seqs.values())
 
 
@@ -237,6 +239,7 @@ async def test_resend_derefs_a_shared_body(store: MessageStore) -> None:
             (mid, "OB1"),
         )
         src = await cur.fetchone()
+        assert src is not None
     assert src["body_ref"] is not None and src["payload"] == ""
     out = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1", from_="OB1")
     assert out.status == "resent"
@@ -375,11 +378,11 @@ async def test_resend_endpoint_retention_nulled_source_is_409(tmp_path: Path) ->
         await engine.store.purge_message_bodies(older_than=9_999_999_999.0)
         transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            r = await c.post(
+            resp = await c.post(
                 f"/messages/{mid}/resend",
                 json={"to": "OB2", "idempotency_key": "k1", "source": "OB1"},
             )
-            assert r.status_code == 409
+            assert resp.status_code == 409
     finally:
         await engine.stop()
 

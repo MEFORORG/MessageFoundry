@@ -27,8 +27,8 @@ from uuid import uuid4
 
 import pytest
 
-from messagefoundry.config.models import ContentType, RetryPolicy, Validation
-from messagefoundry.config.wiring import ConnectionSpec, ConnectorType, InboundConnection, Registry
+from messagefoundry.config.models import ConnectorType, ContentType, RetryPolicy, Validation
+from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing.binary import chunk_b64, is_doc_ref, parse_doc_ref
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek
@@ -157,7 +157,7 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 
     monkeypatch.setattr(PostgresStore, "open", _open_then_arm)
 
-    gen = store.__wrapped__()
+    gen = store.__wrapped__()  # type: ignore[attr-defined]  # the fixture's own function
     with pytest.raises(RuntimeError, match="fixture setup failed after open"):
         await anext(gen)
 
@@ -1839,8 +1839,12 @@ async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
                     f"still plaintext at rest after the keyed reopen: {sql}"
                 )
             # ... and the read paths still return the original cleartext through the new key.
-            assert (await keyed.get_message(eid))["error"] == err
-            assert (await keyed.get_message(qid))["raw"] == RAW
+            fetched = await keyed.get_message(eid)
+            assert fetched is not None
+            assert fetched["error"] == err
+            fetched = await keyed.get_message(qid)
+            assert fetched is not None
+            assert fetched["raw"] == RAW
             assert (await keyed.list_dead())[0]["last_error"] == fail
             assert keyed.state_view()[("ns", "k")] == {"mrn": "M-LEGACY-STATE"}
             assert keyed.reference_view()["providers"]["P1"] == {"mrn": "M-LEGACY-REF"}
@@ -1904,7 +1908,9 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -
             assert refused == [("messages", "raw")], "the open must report the surface exactly once"
             row = await reopened._fetchone("SELECT raw AS v FROM messages WHERE id=$1", planted)
             assert row["v"] == plant, "the keyed reopen sealed a planted row on a sealed surface"
-            assert (await reopened.get_message(good))["raw"] == RAW
+            fetched = await reopened.get_message(good)
+            assert fetched is not None
+            assert fetched["raw"] == RAW
             with pytest.raises(CipherError, match=r"messages\.raw"):
                 await reopened.get_message(planted)
             assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
@@ -2818,7 +2824,7 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
 
     settings = load_settings(environ=os.environ).store
     summary, metadata = "MRN=999001 NAME=DOE^JANE", '{"site": "WESTWING"}'
-    s = await PostgresStore.open(settings, cipher=AesGcmCipher(b"k" * 32))
+    s = await PostgresStore.open(settings, cipher=AesGcmCipher(bytearray(b"k" * 32)))
     try:
         mid = await s.enqueue_message(
             channel_id="IB", raw=RAW, deliveries=[("OB", "p")], summary=summary, metadata=metadata
@@ -2829,6 +2835,7 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         assert row["metadata"].startswith(MARKER_PREFIX) and "WESTWING" not in row["metadata"]
         # decrypt on the read paths.
         rec = await s.get_message(mid)
+        assert rec is not None
         assert rec["summary"] == summary and rec["metadata"] == metadata
         assert any(
             m["summary"] == summary and m["metadata"] == metadata for m in await s.list_messages()
@@ -4475,7 +4482,9 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     verify = await PostgresStore.open(settings, cipher=cipher_b)  # key_b alone, no retired
     try:
         assert len(await verify.list_messages()) == 1
-        assert (await verify.get_message(mid))["raw"] == RAW  # decrypts under the new key alone
+        fetched = await verify.get_message(mid)
+        assert fetched is not None
+        assert fetched["raw"] == RAW  # decrypts under the new key alone
         blobs = await verify._fetchall(
             "SELECT raw AS v FROM messages UNION ALL SELECT payload AS v FROM queue WHERE payload <> ''"
         )
@@ -4649,7 +4658,9 @@ async def test_ack_fires_after_skeleton_and_incref_commit_pg(store) -> None:
 
     row = await _only_message(store)
     assert row["status"] == MessageStatus.RECEIVED.value
-    ref, _ = parse_doc_ref(Message.parse(row["raw"]).field("OBX-5.5"))
+    doc = Message.parse(row["raw"]).field("OBX-5.5")
+    assert doc is not None
+    ref, _ = parse_doc_ref(doc)
     assert await _a_refcount(store, ref) == 1  # incref durable at the moment AA is available
 
 
@@ -4681,7 +4692,7 @@ async def test_crash_orphan_sweep_and_rerun_dedups_pg(store) -> None:
 async def test_strict_downgraded_to_header_only_over_threshold_pg(store, monkeypatch) -> None:
     # Over the streaming threshold, whole-body hl7apy validation is NOT invoked (header-only downgrade) —
     # the detached document is opaque, so the header parse Peek already did is the validation seam.
-    def _boom(text, *, expected_version=None):  # type: ignore[no-untyped-def]
+    def _boom(text, *, expected_version=None):
         raise AssertionError("whole-body validate must not run over the streaming threshold")
 
     monkeypatch.setattr(wiring_runner, "validate", _boom)
@@ -4800,12 +4811,14 @@ async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
     inside ``PostgresStore.open``, the close-time settlement, or the persistence across a reopen. A
     keyed handle is the only way those run here at all."""
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.gcm_bound import GCM_RESERVE_BLOCK
     from messagefoundry.store.postgres import PostgresStore
 
     settings = load_settings(environ=os.environ).store
     k = generate_key()
     cipher = make_cipher(k)
+    assert isinstance(cipher, AesGcmCipher)
     key_id = cipher.active_key_id
     try:
         keyed = await PostgresStore.open(settings, cipher=cipher)
@@ -4822,6 +4835,7 @@ async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
             await keyed.close()  # settles to the exact spend
 
         reopened_cipher = make_cipher(k)
+        assert isinstance(reopened_cipher, AesGcmCipher)
         reopened = await PostgresStore.open(settings, cipher=reopened_cipher)
         try:
             # The requirement: the KEY's lifetime figure survives the process, on this backend.

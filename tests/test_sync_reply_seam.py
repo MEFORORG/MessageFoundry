@@ -57,7 +57,8 @@ def test_an_f_string_of_the_object_is_safe() -> None:
 def test_degraded_is_a_distinct_outcome_from_timeout() -> None:
     # The SLO series rate(timeout)/rate(total) IS the proxy API's error budget, so our own store
     # errors and rendezvous refusals must never be counted as the partner failing to answer.
-    assert ReplyOutcome.DEGRADED is not ReplyOutcome.TIMEOUT
+    # Two members with one value would alias to one object, and the set would hold one.
+    assert len({ReplyOutcome.DEGRADED, ReplyOutcome.TIMEOUT}) == 2
     assert ReplyOutcome.DEGRADED.value == "degraded"
     # Every D5 outcome-table row has exactly one member.
     assert {o.value for o in ReplyOutcome} == {
@@ -83,10 +84,13 @@ def test_the_resolver_takes_only_a_committed_message_id() -> None:
     # the body is durably committed to the ingress stage, so there is no shape of this call that
     # observes an uncommitted message.
     import inspect
+    from typing import get_args
 
     from messagefoundry.transports.base import SyncReplyResolver
 
-    args = SyncReplyResolver.__args__  # Callable[[str], Awaitable[InboundReply]]
-    assert args[0] is str, f"the resolver takes {args[0]!r}, not a message_id"
-    assert len(args) == 2, "the resolver must take exactly one argument — the committed message_id"
+    params, _returns = get_args(SyncReplyResolver)  # Callable[[str], Awaitable[InboundReply]]
+    assert params[0] is str, f"the resolver takes {params[0]!r}, not a message_id"
+    assert len(params) == 1, (
+        "the resolver must take exactly one argument — the committed message_id"
+    )
     assert inspect.isclass(str)

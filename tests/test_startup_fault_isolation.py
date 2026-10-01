@@ -30,6 +30,7 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     env,
 )
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 from tests._admin_account import create_local_user_chosen
@@ -47,13 +48,13 @@ ADT = (
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "fault.db")
     yield s
     await s.close()
 
 
-class _RecordingAlertSink:
+class _RecordingAlertSink(LoggingAlertSink):
     def __init__(self) -> None:
         self.stopped: list[tuple[str, str]] = []
         self.buildups: list[tuple[str, int, float]] = []
@@ -69,7 +70,7 @@ class _RecordingAlertSink:
         self.errors.append((name, kind))
 
 
-async def _until(predicate, timeout: float = 10.0) -> None:  # type: ignore[no-untyped-def]
+async def _until(predicate, timeout: float = 10.0) -> None:
     elapsed = 0.0
     while not predicate():
         await asyncio.sleep(0.02)

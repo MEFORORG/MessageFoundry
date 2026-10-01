@@ -138,7 +138,9 @@ async def test_state_upsert_overwrites_same_key(store: MessageStore) -> None:
     )
     assert store.state_view()[("ns", "k")] == "second"
     cur = await store._db.execute("SELECT COUNT(*) FROM state WHERE namespace='ns' AND key='k'")
-    assert (await cur.fetchone())[0] == 1  # upsert, not a second row
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row[0] == 1  # upsert, not a second row
 
 
 # --- ADVERSARIAL: re-run safety (crash-before-commit) ------------------------
@@ -166,7 +168,9 @@ async def test_rollback_leaves_no_state_row_and_no_cache_entry(
     monkeypatch.undo()
     # No state row, no outbound row, and nothing in the read-through cache.
     cur = await store._db.execute("SELECT COUNT(*) FROM state")
-    assert (await cur.fetchone())[0] == 0
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row[0] == 0
     assert ("ns", "k") not in store.state_view()
     assert await store.outbox_for(mid) == []
     # The routed row is recoverable so the transform re-runs (pure re-derivation).
@@ -235,7 +239,9 @@ async def test_rerun_after_recovery_reapplies_identically(store: MessageStore) -
     )
     assert store.state_view()[("ns", "k")] == "v"
     cur = await store._db.execute("SELECT COUNT(*) FROM state")
-    assert (await cur.fetchone())[0] == 1  # exactly once
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert fetched_row[0] == 1  # exactly once
 
 
 # --- ADVERSARIAL: atomicity (state + outbound commit together) ---------------
@@ -428,7 +434,7 @@ async def test_retention_runner_purges_state(tmp_path: Path) -> None:
 # --- backward compatibility (Send-only handlers) -----------------------------
 
 
-def _registry_with_handler(handle):  # type: ignore[no-untyped-def]
+def _registry_with_handler(handle):
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
@@ -462,7 +468,7 @@ def test_handler_returning_none_yields_no_deliveries_no_state() -> None:
 
 
 def test_mixed_send_and_setstate_list_is_partitioned() -> None:
-    def handle(msg: Message) -> list:  # type: ignore[type-arg]
+    def handle(msg: Message) -> list:
         return [Send("out", msg), SetState("ns", "k", "v")]
 
     reg = _registry_with_handler(handle)
@@ -475,7 +481,7 @@ def test_mixed_send_and_setstate_list_is_partitioned() -> None:
 
 
 def test_dry_run_resolves_state_get_and_captures_ops() -> None:
-    def handle(msg: Message) -> list:  # type: ignore[type-arg]
+    def handle(msg: Message) -> list:
         prior = state_get("patient_anon", "MRN1")  # no active store cache in dry-run
         assert prior is None  # nothing written yet this simulation
         return [Send("out", msg), SetState("patient_anon", "MRN1", "ANON-1")]
@@ -493,7 +499,7 @@ def test_dry_run_state_get_sees_earlier_handler_write() -> None:
     def h1(msg: Message) -> SetState:
         return SetState("ns", "k", "from-h1")
 
-    def h2(msg: Message):  # type: ignore[no-untyped-def]
+    def h2(msg: Message):
         assert state_get("ns", "k") == "from-h1"
         return Send("out", msg)
 
@@ -531,4 +537,6 @@ async def test_state_op_value_serializes_through_handoff(store: MessageStore) ->
     assert store.state_view()[("ns", "rec")] == payload
     # And the on-disk JSON (identity cipher here) is well-formed.
     cur = await store._db.execute("SELECT value FROM state WHERE namespace='ns' AND key='rec'")
-    assert json.loads((await cur.fetchone())[0]) == payload
+    fetched_row = await cur.fetchone()
+    assert fetched_row is not None
+    assert json.loads(fetched_row[0]) == payload

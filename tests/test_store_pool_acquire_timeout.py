@@ -108,7 +108,7 @@ def _sqlserver_store(pool: Any, timeout: float = FAST) -> Any:
 
     store = SqlServerStore.__new__(SqlServerStore)
     store._pool = pool
-    store._settings = types.SimpleNamespace(command_timeout=0, acquire_timeout=timeout)
+    store._settings = StoreSettings(command_timeout=0, acquire_timeout=timeout)
     store._acquire_wait = AcquireWaitHistogram()
     store.committed_txns = 0
     store.body_copies = 0
@@ -120,7 +120,7 @@ def _postgres_store(pool: Any, timeout: float = FAST) -> Any:
 
     store = PostgresStore.__new__(PostgresStore)
     store._pool = pool
-    store._settings = types.SimpleNamespace(acquire_timeout=timeout)
+    store._settings = StoreSettings(acquire_timeout=timeout)
     store._acquire_wait = AcquireWaitHistogram()
     return store
 

@@ -37,15 +37,16 @@ from pydantic import BaseModel
 from messagefoundry.api import security as api_security
 from messagefoundry.api.security import _PHI_VIEW_PERMISSIONS, require_service_cert
 from messagefoundry.auth import service as service_module
+from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.auth.policy import PasswordPolicy
-from messagefoundry.auth.service import AuthProvider, AuthService, _directory_login_refusal
+from messagefoundry.auth.service import AuthService, _directory_login_refusal
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import ApiSettings, AuthSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
-from messagefoundry.store.store import LockoutCounter, lockout_escalates
+from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -619,7 +620,8 @@ def test_the_console_dependency_of_the_browser_legs_is_stated() -> None:
     """OIDC is browser-only, so a JSON-only deployment has no OIDC route at all — while
     ``GET /auth/providers`` still advertises it, because ``oidc_available`` never consults the
     console mount. The enforcement paragraph must say both halves."""
-    source = inspect.getsource(AuthService.oidc_available.fget)  # type: ignore[union-attr]
+    # A property: mypy reads the attribute as its getter's type, which has no fget.
+    source = inspect.getsource(AuthService.oidc_available.fget)  # type: ignore[attr-defined]
     assert "serve_ui" not in source and "serve_web_console" not in source, (
         "oidc_available now consults the console mount; the doc's providers caveat is stale."
     )
@@ -737,12 +739,11 @@ def test_local_row_scopes_the_second_factor_to_step_up_and_administrator() -> No
     neither the default flip nor the opt-out can regress without reddening this guard.
     """
     service = AuthService.__new__(AuthService)
-    service._settings = AuthSettings(require_mfa=True)  # type: ignore[attr-defined]
-    user = SimpleNamespace(auth_provider=AuthProvider.LOCAL.value)
+    service._settings = AuthSettings(require_mfa=True)
+    # A placeholder user: _mfa_required_for reads no field off it, provider included (BACKLOG #1144).
+    user: UserRecord = SimpleNamespace(auth_provider=AuthProvider.LOCAL.value)  # type: ignore[assignment]
     assert (
-        service._mfa_required_for(  # type: ignore[arg-type]
-            user, frozenset({Role.OPERATOR}), second_factor_enrolled=False
-        )
+        service._mfa_required_for(user, frozenset({Role.OPERATOR}), second_factor_enrolled=False)
         is True
     ), (
         "_mfa_required_for no longer demands a second factor for a plain local account under the "
@@ -750,25 +751,19 @@ def test_local_row_scopes_the_second_factor_to_step_up_and_administrator() -> No
         "same change."
     )
     narrowed = AuthService.__new__(AuthService)
-    narrowed._settings = AuthSettings(  # type: ignore[attr-defined]
-        require_mfa=True, require_mfa_scope="administrators"
-    )
+    narrowed._settings = AuthSettings(require_mfa=True, require_mfa_scope="administrators")
     assert (
-        narrowed._mfa_required_for(  # type: ignore[arg-type]
-            user, frozenset({Role.OPERATOR}), second_factor_enrolled=False
-        )
+        narrowed._mfa_required_for(user, frozenset({Role.OPERATOR}), second_factor_enrolled=False)
         is False
     ), "require_mfa_scope='administrators' must restore the pre-6.3.3 non-admin exemption"
     assert (
-        service._mfa_required_for(  # type: ignore[arg-type]
+        service._mfa_required_for(
             user, frozenset({Role.ADMINISTRATOR}), second_factor_enrolled=False
         )
         is True
     )
     assert (
-        service._mfa_required_for(  # type: ignore[arg-type]
-            user, frozenset({Role.OPERATOR}), second_factor_enrolled=True
-        )
+        service._mfa_required_for(user, frozenset({Role.OPERATOR}), second_factor_enrolled=True)
         is True
     )
     factor = next(r for r in _primary_table()[1:] if r[0].startswith("**Local**"))[1]
@@ -1389,7 +1384,8 @@ def _flow_cache_full_statuses(func: ast.AST) -> list[int]:
             for call in (c for c in ast.walk(ret) if isinstance(c, ast.Call)):
                 for kw in call.keywords:
                     if kw.arg == "status_code" and isinstance(kw.value, ast.Constant):
-                        out.append(int(kw.value.value))
+                        assert isinstance(kw.value.value, int)
+                        out.append(kw.value.value)
     return out
 
 
@@ -1872,14 +1868,15 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     # require_mfa = false frees any un-enrolled account. Called on a stand-in self, so this pins the
     # rule the doc states rather than a whole AuthService.
     admin, other = frozenset({Role.ADMINISTRATOR}), frozenset({Role.OPERATOR})
-    user = SimpleNamespace(auth_provider=AuthProvider.LOCAL.value)
+    # A placeholder user: _mfa_required_for reads no field off it, provider included (BACKLOG #1144).
+    user: UserRecord = SimpleNamespace(auth_provider=AuthProvider.LOCAL.value)  # type: ignore[assignment]
 
     def required(scope: str, roles: frozenset[Role], *, on: bool, enrolled: bool) -> bool:
         fake = SimpleNamespace(_settings=SimpleNamespace(require_mfa=on, require_mfa_scope=scope))
         return bool(
             AuthService._mfa_required_for(
                 fake,  # type: ignore[arg-type]
-                user,  # type: ignore[arg-type]
+                user,
                 roles,
                 second_factor_enrolled=enrolled,
             )
@@ -2329,9 +2326,13 @@ def test_the_tenth_sweep_probes_the_directory_floor_under_both_scopes() -> None:
             ),
             _second_factor_enrolled=second_factor,
         )
-        fake._mfa_required_for = functools.partial(AuthService._mfa_required_for, fake)
+        fake._mfa_required_for = functools.partial(
+            AuthService._mfa_required_for,
+            fake,  # type: ignore[arg-type]
+        )
         fake._unverified_session_owes_factor = functools.partial(
-            AuthService._unverified_session_owes_factor, fake
+            AuthService._unverified_session_owes_factor,
+            fake,  # type: ignore[arg-type]
         )
         return bool(asyncio.run(AuthService._mfa_satisfied_hash(fake, "h")))  # type: ignore[arg-type]
 

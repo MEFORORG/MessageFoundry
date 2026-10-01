@@ -111,7 +111,7 @@ def test_postgres_driver_fails_without_the_connect_hook(
     def _no_metadata(name: str) -> str:
         raise importlib.metadata.PackageNotFoundError(name)
 
-    monkeypatch.setattr(checks.importlib.metadata, "version", _no_metadata)
+    monkeypatch.setattr(importlib.metadata, "version", _no_metadata)
     result = checks.check_postgres_driver()
     assert result.status is status
     assert "asyncpg ?" in result.detail
@@ -999,7 +999,8 @@ def test_every_open_store_in_verify_goes_through_the_gate() -> None:
     green through the regression it names. An AST walk, in the pattern
     :func:`test_verify_does_not_import_the_generators` already uses on this package."""
     verify_dir = Path(smoke.__file__).parent
-    gated, ungated = [], []
+    gated: list[str] = []
+    ungated: list[str] = []
     for source_file in sorted(verify_dir.glob("*.py")):
         tree = ast.parse(source_file.read_text(encoding="utf-8"))
         for node in tree.body:

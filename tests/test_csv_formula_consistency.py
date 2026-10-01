@@ -36,6 +36,7 @@ import sys
 import types
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -59,7 +60,8 @@ _CANONICAL = frozenset("=+-@\t\r\n\x00")
 
 #: The five spreadsheet writers, each as ``(label, trigger set, escape helper)``. Named through the
 #: writer modules' own attributes — an alias swapped back to a local copy fails the identity tests.
-_WRITERS: list[tuple[str, frozenset[str], Callable[[object], object]]] = [
+# Any in: the helpers are annotated str, and _NON_STR below feeds them other types on purpose.
+_WRITERS: list[tuple[str, frozenset[str], Callable[[Any], object]]] = [
     ("api/auth_routes (audit export)", auth_routes._CSV_FORMULA_TRIGGERS, auth_routes._csv_safe),
     ("config/codeset_edit", codeset_edit._CSV_FORMULA_TRIGGERS, codeset_edit._spreadsheet_safe),
     (

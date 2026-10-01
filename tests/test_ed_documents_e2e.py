@@ -30,6 +30,7 @@ from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
+    Payload,
     Registry,
     Send,
 )
@@ -63,17 +64,17 @@ def _raw_at_rest(db_path: Path, column: str = "raw", table: str = "messages") ->
 
 
 @pytest.fixture
-async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
+async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
     yield s
     await s.close()
 
 
-def _route(msg: Message) -> list[str]:
+def _route(msg: Payload) -> list[str]:
     return ["relay"]
 
 
-def _relay(msg: Message) -> Send:
+def _relay(msg: Payload) -> Send:
     return Send("file_out", msg)  # identity pass-through — the document must survive verbatim
 
 
