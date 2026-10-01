@@ -1974,6 +1974,7 @@ def test_a_markup_free_write_lands_on_the_handle_it_addresses() -> None:
     )
     assert '    set_field(out_msg, "PID-19", "")' in body
     assert "PID-20" not in body.split("# TODO")[0]
+    assert "(cross-message); intended target PID-20" in body
     assert 'set_field(msg, "PID-20"' not in body
     assert '    sends.append(Send("OB_OUT", out_msg))' in body
 
@@ -2000,6 +2001,114 @@ def test_a_disabled_write_names_the_local_it_would_write() -> None:
     )
     src = _handler_source(_CLONE_OUT + disabled + _SEND_OUT)
     assert 'ItemCopy -> set_field("MSH-6", "Y") on out_msg' in src
+
+
+def _reverse_copy(verb_markup: str = "", from_markup: str = " from ") -> str:
+    """``MsgTreeCopy %OUT/ from %A2/``: overwrites %OUT, with the verb and ``from`` styled or not."""
+    return _role_line(
+        (verb_markup or _span("keyword", "MsgTreeCopy"))
+        + " "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/")
+        + from_markup
+        + _span("other-handle", "%A2")
+        + _span("path", "/")
+    )
+
+
+@pytest.mark.parametrize(
+    "reverse",
+    [
+        pytest.param(_reverse_copy(from_markup=" " + _span("keyword", "from") + " "), id="styled"),
+        pytest.param(_reverse_copy().replace("<Line ", "<Lines ", 1), id="in-unknown-tag"),
+    ],
+)
+def test_a_reversed_copy_is_never_read_as_a_clone(reverse: str) -> None:
+    """A ``from`` reverses the copy whether the exporter styles it as a keyword or leaves it as
+    text, and whether the statement sits in a modelled tag or an unknown one."""
+    body = _handler_body(_handler_source(_CLONE_OUT + reverse + _SEND_OUT))
+    assert "a2_msg" not in body
+    assert 'Send("OB_OUT"' not in body
+
+
+def test_an_unstyled_msgcreate_verb_is_not_read_as_a_word() -> None:
+    """When the exporter leaves the verb unstyled, the verb itself is not an extra word."""
+    create = _role_line("MsgCreate " + _span("other-handle", "%NEW") + _ADT_A04)
+    body = _handler_body(_handler_source(create + _role_send("other-handle", "%NEW", "OB_NEW")))
+    assert '    sends.append(Send("OB_NEW", new_msg))' in body
+
+
+def test_a_msgcreate_type_with_a_trailing_newline_is_refused() -> None:
+    """The shapes are matched whole: a type literal carrying a newline is not ``ADT^A04``."""
+    create = _create(
+        "%NEW", " as " + _span("literal", '"ADT^A04\n"') + " version " + _span("literal", '"2.5"')
+    )
+    body = _handler_body(_handler_source(create))
+    assert "Message.parse(" not in body
+    assert "raise NotImplementedError" in body
+
+
+def test_a_write_to_a_built_message_outside_its_msh_declines() -> None:
+    """A MsgCreate skeleton holds only an MSH, and ``Message.set`` raises on an absent segment. A
+    write to its MSH maps; a write to any other segment is a TODO, never a call certain to raise."""
+    body = _handler_body(
+        _handler_source(
+            _create("%NEW", _ADT_A04)
+            + _write("other-handle", "%NEW", "X")
+            + _role_line(
+                _span("keyword", "ItemCopy")
+                + " "
+                + _span("literal", '"M"')
+                + " to "
+                + _span("other-handle", "%NEW")
+                + _span("path", "/PID-8")
+            )
+            + _role_send("other-handle", "%NEW", "OB_NEW")
+        )
+    )
+    assert '    set_field(new_msg, "MSH-6", "X")' in body
+    assert 'set_field(new_msg, "PID-8"' not in body
+    assert "skeleton has only an MSH segment" in body
+    assert "intended target PID-8" in body
+
+
+def test_a_markup_free_write_without_an_input_still_lands_on_its_handle() -> None:
+    """A list with role markup but no input handle does not fall back to msg either."""
+    body = _handler_body(
+        _handler_source(
+            _create("%NEW", _ADT_A04)
+            + '<Line Data="ItemClear %NEW/MSH-12"/>'
+            + _role_send("other-handle", "%NEW", "OB_NEW")
+        )
+    )
+    assert '    set_field(new_msg, "MSH-12", "")' in body
+    assert 'set_field(msg, "MSH-12"' not in body
+
+
+def test_an_inlined_call_passing_the_input_keeps_it_bound() -> None:
+    """A call whose list is inlined is read statement by statement, so passing the input to it does
+    not unbind msg. Only a call whose list is not inlined does (see the parametrized test above)."""
+    call = (
+        '<Call Data="ActionListCall &quot;Sub&quot; pass %ADT"><Actions>'
+        '<Line Data="ItemClear %ADT/PID-19"/></Actions></Call>'
+    )
+    body = _handler_body(
+        _handler_source(_WRITE_INPUT + call + _role_send("input-handle", "%ADT", "OB_IN"))
+    )
+    assert '    sends.append(Send("OB_IN", msg))' in body
+
+
+def test_a_send_in_a_branch_the_render_does_not_emit_never_becomes_a_send_of_msg() -> None:
+    """A marker nested inside a branch is not rendered. Its send must not be collected as a
+    destination, or the handler would gain a trailing, unconditional ``Send(dest, msg)``."""
+    nested = (
+        '<If><Line Data="If (a)"><List><Line Data="ItemClear %ADT/PID-19"/></List></Line>'
+        '<Line Data="Else"><List><Line Data="Catch"/>'
+        + _role_send("other-handle", "%OUT", "OB_NESTED")
+        + "</List></Line></If>"
+    )
+    body = _handler_body(_handler_source(_WRITE_INPUT + nested))
+    assert "Send(" not in body
 
 
 def test_a_module_with_scratch_locals_round_trips_through_the_lens() -> None:

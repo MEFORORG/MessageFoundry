@@ -223,7 +223,9 @@ emits the encoded result as one literal. It holds the default encoding character
 message type in MSH-9 and the version in MSH-12, and nothing else. Every other header field is
 whatever the action-list writes. The export must name the type in caret form (`ADT^A04`, with an
 optional structure) and the version as `2.x` or `2.x.y`, each exactly once, with no other operand.
-The only unstyled words it may carry are `as` and `version`; any other word may change what is built.
+The only words it may carry besides its operands are `as` and `version`; any other word may change
+what is built. A field write to the built message maps only onto its MSH. A write to any other segment
+becomes a TODO marker, because `Message.set` raises on a segment the skeleton does not have.
 An underscore form such as `ADT_A04` is refused, because HL7 also spells a message structure that way.
 Anything else renders a TODO marker and `raise NotImplementedError(...)` at the `MsgCreate`, because
 a message whose header the importer cannot build would be guessed. The `MsgCreate` grammar is not yet
@@ -238,12 +240,13 @@ validated against an export, so this rule was written from the HL7 shapes alone.
   `Try` with no `Catch` re-raises, so after it the body's own bindings hold.
 - The input handle is never rebound. A whole-tree write into it makes it unknown from that point.
 - Only a plain clone is read as one: two operands, a whole-tree destination, no qualifier, and no
-  unstyled word but `to`. A mode word, a `from` that reverses the direction, or a third operand
-  makes it an unread statement.
+  word but `to`, styled or not. A mode word, a `from` that reverses the direction, or a third
+  operand makes it an unread statement.
 - Every other statement may overwrite every handle it names as a whole tree, in either reading of
   its markup. That covers an unread verb (`MsgLoad`, among others), a `MsgCreate` whose handle is
-  not its first operand, an `ActionListCall` that passes a handle, and a span class the role layer
-  does not list. Each such handle is unknown afterwards. Only `MsgSend` and `MsgLog` are read-only.
+  not its first operand, an `ActionListCall` whose list is not inlined and that passes a handle, and
+  a span class the role layer does not list. Each such handle is unknown afterwards. A call whose
+  list is inlined is read statement by statement instead. Only `MsgSend` and `MsgLog` are read-only.
   The list is kept small on purpose: a missing verb costs a raise, while a wrongly listed one would
   deliver the wrong message.
 - A statement in an unmodelled element, or in a branch its construct cannot continue, still counts
@@ -260,8 +263,8 @@ superseded model's reading and still land on `msg`. That is how the synthetic fi
 markup-free list ends `MsgSend $out [OB_ACME_ADT]`, which now raises where it used to send `msg`. The
 fixture's import summary moves from 21 mapped and 8 unmapped to 20 and 9.
 
-In a list that does name an input, a markup-free field write lands on the local of the one handle
-its paths address. If that handle holds no known message, the write declines to a TODO marker
+In a list with any role markup, a markup-free field write lands on the local of the one handle its
+paths address. If that handle holds no known message, the write declines to a TODO marker
 rather than land on `msg`. A markup-free whole-tree write makes the handles it names unknown, as
 above.
 
