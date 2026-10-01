@@ -70,11 +70,13 @@ Usage (PowerShell 7)::
 
     python scripts/connscale_harvest.py --since 2026-09-01T13:01:20Z --max-runs 20
     python scripts/connscale_harvest.py --since 2026-09-20T00:00:00Z --json-out out/harvest.json
+    python scripts/connscale_harvest.py --from-json out/harvest.json --csv-dir out/harvest-csv
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import io
 import json
 import math
@@ -502,6 +504,9 @@ def _suite_skipped(job: dict[str, Any]) -> bool:
     )
 
 
+_UNJOINED_FIELDS = ("run_id", "artifact_id", "name", "reason")
+
+
 def _unjoined(run_id: int, artifact: dict[str, Any], reason: str) -> dict[str, Any]:
     return {
         "run_id": run_id,
@@ -814,24 +819,42 @@ def _cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
-def pin_verified(result: Harvest) -> bool:
-    """True only when there are harvested jobs and every one's payload records the pinned value."""
-    harvested = [j for j in result.jobs if j.status == HARVESTED]
+def _harvested(result: Harvest, population: str | None) -> list[JobOutcome]:
+    return [
+        j
+        for j in result.jobs
+        if j.status == HARVESTED and (population is None or j.population == population)
+    ]
+
+
+def pin_verified(result: Harvest, population: str | None = None) -> bool:
+    """True only when there are harvested jobs and every one's payload records the pinned value.
+
+    ``population`` narrows the question to one population's jobs. A floor is fitted to one
+    population, so the pin it needs is that population's: a harvest whose window also reaches back
+    before BACKLOG #2013 holds older payloads that record nothing, and they say nothing about the
+    newer ones (BACKLOG #1415).
+    """
+    harvested = _harvested(result, population)
     return bool(harvested) and all(j.per_lane_wake == PINNED_PER_LANE_WAKE for j in harvested)
 
 
-def _pin_line(result: Harvest) -> str:
-    harvested = [j for j in result.jobs if j.status == HARVESTED]
-    if pin_verified(result):
+def _pin_line(result: Harvest, population: str | None = None) -> str:
+    harvested = _harvested(result, population)
+    scope = "" if population is None else f" ({population} only)"
+    if pin_verified(result, population):
         return (
-            f"MEFOR_PIPELINE_PER_LANE_WAKE pin: VERIFIED; all {len(harvested)} harvested job(s) "
-            f"record {PINNED_PER_LANE_WAKE}."
+            f"MEFOR_PIPELINE_PER_LANE_WAKE pin{scope}: VERIFIED; all {len(harvested)} harvested "
+            f"job(s) record {PINNED_PER_LANE_WAKE}."
         )
     if not harvested:
-        return "MEFOR_PIPELINE_PER_LANE_WAKE pin: NOT VERIFIED by this scan; no job was harvested."
+        return (
+            f"MEFOR_PIPELINE_PER_LANE_WAKE pin{scope}: NOT VERIFIED by this scan; no job was "
+            "harvested."
+        )
     recorded = sum(1 for j in harvested if j.per_lane_wake is not None)
     return (
-        f"MEFOR_PIPELINE_PER_LANE_WAKE pin: NOT VERIFIED by this scan; {recorded} of "
+        f"MEFOR_PIPELINE_PER_LANE_WAKE pin{scope}: NOT VERIFIED by this scan; {recorded} of "
         f"{len(harvested)} harvested job(s) record it. A payload records none when it predates "
         "BACKLOG #2013, came from a local run, or had a step that recorded none."
     )
@@ -864,6 +887,7 @@ def render_markdown(result: Harvest) -> str:
         f"carried-over job copies from re-run attempts, counted once: "
         f"{result.carried_over_job_copies}",
         _pin_line(result),
+        *(_pin_line(result, p) for p in POPULATIONS if _harvested(result, p)),
         "",
     ]
     if result.listing_may_be_truncated:
@@ -928,14 +952,60 @@ def to_json_dict(result: Harvest) -> dict[str, Any]:
         **asdict(result),
         "complete": is_complete(result),
         "per_lane_wake_pin_verified": pin_verified(result),
+        "per_lane_wake_pin_verified_by_population": {
+            p: pin_verified(result, p) for p in POPULATIONS
+        },
         "cells": [asdict(c) for c in summarise(result)],
     }
+
+
+#: The fields ``from_json_dict`` rebuilds. Everything else in a ``--json-out`` file is derived.
+_HARVEST_FIELDS = tuple(f for f in Harvest.__dataclass_fields__ if f not in ("jobs", "readings"))
+
+
+def from_json_dict(data: dict[str, Any]) -> Harvest:
+    """Rebuild a :class:`Harvest` from a ``--json-out`` file, so it renders without the API.
+
+    Only the recorded fields are read back. The derived ones (``cells``, ``complete``, the pin
+    verdicts) are recomputed, so a hand-edited summary in the file cannot survive a re-render.
+    """
+    result = Harvest(**{k: data[k] for k in _HARVEST_FIELDS if k in data})
+    result.jobs = [JobOutcome(**j) for j in data.get("jobs", [])]
+    result.readings = [BaseReading(**r) for r in data.get("readings", [])]
+    return result
+
+
+def write_csvs(result: Harvest, out_dir: Path) -> list[Path]:
+    """Every reading, every job and every unjoined artifact as CSV, one row each.
+
+    CSV because it is the form a reader checks a number in, and it is a fraction of the JSON's size
+    when committed beside a decision that rests on it (BACKLOG #1415 criterion 1.3).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tables: list[tuple[str, list[str], list[dict[str, Any]]]] = [
+        (
+            "readings.csv",
+            list(BaseReading.__dataclass_fields__),
+            [asdict(r) for r in result.readings],
+        ),
+        ("jobs.csv", list(JobOutcome.__dataclass_fields__), [asdict(j) for j in result.jobs]),
+        ("unjoined.csv", list(_UNJOINED_FIELDS), list(result.unjoined_artifacts)),
+    ]
+    written: list[Path] = []
+    for name, header, rows in tables:
+        path = out_dir / name
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=header, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
+        written.append(path)
+    return written
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
-        "--since", required=True, type=parse_time, help="window start, ISO 8601 (run creation)"
+        "--since", type=parse_time, help="window start, ISO 8601 (run creation); required to scan"
     )
     parser.add_argument("--until", type=parse_time, help="window end, ISO 8601; default now")
     parser.add_argument("--repo", default=DEFAULT_REPO)
@@ -955,28 +1025,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="exclude a payload without rate_window from any run created after this instant",
     )
     parser.add_argument("--json-out", type=Path, help="also write every reading and job here")
+    parser.add_argument(
+        "--csv-dir", type=Path, help="also write readings.csv, jobs.csv and unjoined.csv here"
+    )
+    parser.add_argument(
+        "--from-json",
+        type=Path,
+        help="re-render a saved --json-out file instead of scanning; no API call is made",
+    )
     parser.add_argument("--quiet", action="store_true", help="no per-run progress on stderr")
     args = parser.parse_args(argv)
 
-    until = args.until or datetime.now(UTC)
-    if until < args.since:
-        parser.error("--until is before --since")
-    try:
-        result = harvest(
-            GhApi(),
-            repo=args.repo,
-            workflow=args.workflow,
-            branch=args.branch,
-            since=args.since,
-            until=until,
-            max_runs=args.max_runs,
-            event=args.event,
-            with_tail_until=args.with_tail_until,
-            progress=not args.quiet,
-        )
-    except HarvestError as exc:
-        print(f"harvest failed: {exc}", file=sys.stderr)
-        return 2
+    if args.from_json:
+        try:
+            result = from_json_dict(json.loads(args.from_json.read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            print(f"cannot read {args.from_json}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        if args.since is None:
+            parser.error("--since is required unless --from-json is given")
+        until = args.until or datetime.now(UTC)
+        if until < args.since:
+            parser.error("--until is before --since")
+        try:
+            result = harvest(
+                GhApi(),
+                repo=args.repo,
+                workflow=args.workflow,
+                branch=args.branch,
+                since=args.since,
+                until=until,
+                max_runs=args.max_runs,
+                event=args.event,
+                with_tail_until=args.with_tail_until,
+                progress=not args.quiet,
+            )
+        except HarvestError as exc:
+            print(f"harvest failed: {exc}", file=sys.stderr)
+            return 2
+    if args.csv_dir:
+        write_csvs(result, args.csv_dir)
     # The JSON first, so a console that cannot print the report does not lose the data.
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)

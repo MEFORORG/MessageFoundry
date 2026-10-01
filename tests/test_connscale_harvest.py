@@ -14,6 +14,7 @@ mix.
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import subprocess
@@ -926,3 +927,89 @@ def test_an_empty_harvest_does_not_claim_it_read_a_payload() -> None:
     api.runs = []
     text = ch.render_markdown(_harvest(api))
     assert "PER_LANE_WAKE pin: NOT VERIFIED by this scan; no job was harvested." in text
+
+
+def test_the_pin_is_judged_per_population_as_well_as_overall() -> None:
+    # BACKLOG #1415 fits a floor to ONE population, so the pin it needs is that population's. Here the
+    # post_2024 job records false and two older with-tail/post_1420 jobs record nothing: the whole
+    # scan is NOT VERIFIED, and the post_2024 population alone is VERIFIED.
+    api = _fixture()
+    api.blobs[12] = _with_context(
+        {"fixed_aggregate": 28.0}, rate_window=ch.POST_2024_RATE_WINDOW, per_lane_wake="false"
+    )
+    result = _harvest(api)
+    assert ch.pin_verified(result) is False
+    assert ch.pin_verified(result, ch.POST_2024) is True
+    assert ch.pin_verified(result, ch.WITH_TAIL) is False
+    text = ch.render_markdown(result)
+    assert "pin (post_2024 only): VERIFIED; all 1 harvested job(s) record false." in text
+    assert "pin (with_tail only): NOT VERIFIED by this scan; 0 of 2" in text
+    assert "pin (post_1420 only)" not in text  # no job in it, so no line about it
+    by_population = ch.to_json_dict(result)["per_lane_wake_pin_verified_by_population"]
+    assert by_population == {ch.POST_2024: True, ch.POST_1420: False, ch.WITH_TAIL: False}
+
+
+def test_a_saved_harvest_re_renders_identically_without_the_api() -> None:
+    result = _harvest(_pinned_fixture("false"))
+    saved = json.loads(json.dumps(ch.to_json_dict(result), sort_keys=True))
+    rebuilt = ch.from_json_dict(saved)
+    assert ch.render_markdown(rebuilt) == ch.render_markdown(result)
+    assert ch.to_json_dict(rebuilt) == saved
+
+
+def test_a_hand_edited_summary_does_not_survive_a_re_render() -> None:
+    saved = ch.to_json_dict(_harvest(_fixture()))
+    saved["cells"] = []
+    saved["per_lane_wake_pin_verified"] = True
+    rebuilt = ch.to_json_dict(ch.from_json_dict(saved))
+    assert rebuilt["cells"] and rebuilt["per_lane_wake_pin_verified"] is False
+
+
+def test_the_csvs_carry_one_row_per_reading_job_and_unjoined_artifact(tmp_path: Path) -> None:
+    result = _harvest(_fixture())
+    result.unjoined_artifacts.append({"run_id": 1, "artifact_id": 2, "name": "n", "reason": "r"})
+    paths = ch.write_csvs(result, tmp_path / "csv")
+    rows = {p.name: list(csv.DictReader(p.open(encoding="utf-8"))) for p in paths}
+    assert len(rows["readings.csv"]) == len(result.readings) > 0
+    assert len(rows["jobs.csv"]) == len(result.jobs) > 0
+    assert rows["unjoined.csv"] == [{"run_id": "1", "artifact_id": "2", "name": "n", "reason": "r"}]
+    assert {r["value"] for r in rows["readings.csv"]} >= {"13.12", "28.0", "40.0"}
+
+
+def test_an_empty_table_still_writes_its_header(tmp_path: Path) -> None:
+    ch.write_csvs(_result_with([]), tmp_path)
+    assert (tmp_path / "readings.csv").read_text(encoding="utf-8").startswith("population,leg,")
+    assert (tmp_path / "unjoined.csv").read_text(encoding="utf-8") == (
+        "run_id,artifact_id,name,reason\n"
+    )
+
+
+def test_main_re_renders_a_saved_harvest_and_needs_no_since(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    saved = tmp_path / "h.json"
+    saved.write_text(json.dumps(ch.to_json_dict(_harvest(_fixture()))), encoding="utf-8")
+
+    def no_api() -> FakeApi:
+        raise AssertionError("--from-json must not touch the API")
+
+    monkeypatch.setattr(ch, "GhApi", no_api)
+    rc = ch.main(["--from-json", str(saved), "--csv-dir", str(tmp_path / "csv")])
+    assert rc == 0
+    assert "connscale base-reading harvest" in capsys.readouterr().out
+    assert (tmp_path / "csv" / "jobs.csv").is_file()
+
+
+def test_main_without_since_or_a_saved_harvest_is_a_usage_error() -> None:
+    with pytest.raises(SystemExit) as exc:
+        ch.main(["--quiet"])
+    assert exc.value.code == 2
+
+
+def test_main_reports_an_unreadable_saved_harvest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert ch.main(["--from-json", str(bad)]) == 2
+    assert "cannot read" in capsys.readouterr().err
