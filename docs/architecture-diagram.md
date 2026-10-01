@@ -11,6 +11,7 @@ The views in this file each answer a different question. More diagrams live in o
 2. **System topology** — the engine's internal packages, process boundaries, and the one-way dependency rule.
 3. **Runtime message flow** — how a received message moves through the staged queue and earns a disposition.
 4. **Config wiring graph** — how Connections, Routers, and Handlers wire together by name (no "channel" object).
+5. **Receive to deliver**: the order of steps from receipt to delivery, when the sender gets its ACK, and what each failure does.
 
 **Legend.** Solid/thick arrows = *depends on / calls*. Dotted arrows = *talks to over the API or wire*
 (separate process). Cylinders = persisted stage/store. Hexagon = the single disposition authority.
@@ -28,6 +29,7 @@ the block, because a copy drifts from its source.
 | System topology | [architecture-diagram.md](architecture-diagram.md) (this file, section 2) |
 | Runtime message flow | [architecture-diagram.md](architecture-diagram.md) (this file, section 3) |
 | Config wiring graph | [architecture-diagram.md](architecture-diagram.md) (this file, section 4) |
+| Receive to deliver sequence, with its failure paths | [architecture-diagram.md](architecture-diagram.md) (this file, section 5) |
 | Trust boundaries and PHI data flow | [SECURITY.md](SECURITY.md) |
 | Sign-in and permission check flow | [SECURITY.md](SECURITY.md) |
 | Deployment topologies | [DEPLOYMENT.md](DEPLOYMENT.md) |
@@ -318,6 +320,118 @@ Connections/Routers/Handlers are authored against the `messagefoundry` surface
 (`inbound` / `outbound` / `@router` / `@handler` / `Send` / `MLLP` / `File` / `Message`), registered
 into a `Registry` by the loader ([config/wiring.py](../messagefoundry/config/wiring.py)) and run by the
 `RegistryRunner` ([pipeline/wiring_runner.py](../messagefoundry/pipeline/wiring_runner.py)).
+
+---
+
+## 5. Receive to deliver - the sequence
+
+This view answers one question for an integrator: when does the sender get its ACK, and what
+happens if a step fails after that. The listener commits the raw message to the `ingress` stage, and
+only then sends the ACK. Routing, transform and delivery run after the ACK. Each one is its own
+committed step.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant SND as Sender
+  participant LSN as Inbound listener
+  participant MST as Message store
+  participant RTW as Router worker
+  participant TRW as Transform worker
+  participant DLW as Delivery worker
+  participant OBC as Outbound Connection
+
+  SND->>LSN: HL7 message
+  LSN->>LSN: decode, parse, and strict validate when the inbound asks for it
+  LSN->>MST: commit the raw message to the ingress stage
+  MST-->>LSN: committed, the message is RECEIVED
+  LSN-->>SND: ACK with code AA
+  Note over SND,LSN: The sender has its answer. No later step sends it a NAK.
+
+  RTW->>MST: claim the ingress row
+  RTW->>RTW: run the Router
+  RTW->>MST: in one transaction, consume the ingress row and add one routed row per Handler
+  Note over MST: ROUTED, or UNROUTED when the Router picks no Handler
+
+  TRW->>MST: claim a routed row
+  TRW->>TRW: run the Handler
+  TRW->>MST: in one transaction, consume the routed row and add one outbound row per Send
+
+  DLW->>MST: claim an outbound row
+  DLW->>OBC: send
+  OBC-->>DLW: accepted
+  DLW->>MST: mark the outbound row done
+  Note over MST: The finalizer sets PROCESSED when no row is still in flight
+```
+
+**Legend.** A solid arrow is a call. A dashed arrow is a reply. A note over the message store names
+the disposition the message holds at that point. Section 6 covers every disposition.
+
+The codes are those of an HL7 v2 inbound in the original acknowledgement mode. In enhanced mode
+the three codes are `CA`, `CE` and `CR`. An inbound with acknowledgements turned off sends no reply.
+An inbound of another content type skips HL7 parsing and the HL7 ACK, and its connector owns any
+reply to the sender.
+
+### When a step fails
+
+The second diagram shows four failures. Only the first one reaches the sender, because only the
+first one happens before the ACK.
+
+```mermaid
+sequenceDiagram
+  participant SND as Sender
+  participant LSN as Inbound listener
+  participant MST as Message store
+  participant WRK as Router or transform worker
+  participant DLW as Delivery worker
+  participant OBC as Outbound Connection
+
+  alt The listener cannot accept the message
+    SND->>LSN: HL7 message
+    LSN->>MST: record the message as ERROR, with no ingress row
+    LSN-->>SND: NAK with AR for a decode or parse failure, AE for a strict validation failure
+  else A Router or a Handler raises, after the ACK
+    WRK->>MST: dead-letter the row at its own stage
+    MST->>MST: the finalizer sets ERROR
+    Note over SND,LSN: No NAK. The sender already holds its AA.
+  else The engine stops before a handoff commits
+    WRK->>MST: claim a row, which marks it in flight
+    Note over MST,WRK: The engine stops. The handoff never commits, so the row stays in flight.
+    MST->>MST: on the next start, reset each in-flight row to pending
+    WRK->>MST: claim the row again and run the stage again
+  else A delivery fails
+    DLW->>OBC: send
+    OBC-->>DLW: a transport error, or a NAK with AE or CE
+    DLW->>MST: put the outbound row back to pending, with a backoff
+    Note over DLW,OBC: The worker tries again. A NAK with AR or CR skips the retries.
+    DLW->>MST: dead-letter the outbound row when the attempts run out
+    MST->>MST: the finalizer sets ERROR
+  end
+```
+
+| Failure | What the sender sees | Where the message ends |
+|---|---|---|
+| The body cannot be decoded or parsed | NAK `AR` | `ERROR`, recorded with no ingress row |
+| Strict validation fails or times out | NAK `AE` | `ERROR`, recorded with no ingress row |
+| The store cannot commit the message | NAK `AE` from the MLLP listener, then the connection closes | Nothing was ACKed, so the sender sends it again |
+| A Router or a Handler raises | The `AA` it already holds | `ERROR`, with the row dead-lettered at its own stage |
+| The engine stops before a handoff commits | The `AA` it already holds | The stage runs again after the restart |
+| A delivery fails | The `AA` it already holds | Retries, then `ERROR` with the outbound row dead-lettered |
+
+A stage can run again safely. A Router and a Handler are pure, so the second run derives the same
+rows. A committed handoff has already consumed its row, so it cannot run twice. A delivery that was
+in flight when the engine stopped may be sent a second time, which is why an outbound Connection
+must be idempotent.
+
+A single-node engine resets every in-flight row when it starts. An engine shard resets only the rows
+on its own lanes. A clustered node recovers them when it becomes the leader, and
+[CLUSTERING.md](CLUSTERING.md) holds that detail.
+
+Two settings in `[delivery]` shape the failure paths, and [CONFIGURATION.md](CONFIGURATION.md) lists
+both. `retry_max_attempts` is the number of delivery attempts before the row is dead-lettered, 100 as
+shipped. `internal_error` decides what a worker does when a Router, a Handler or a send raises from a
+code error. The default, `continue`, dead-letters the row and moves on. The other value, `stop`,
+keeps the row, stops that lane and raises an alert.
 
 ---
 
