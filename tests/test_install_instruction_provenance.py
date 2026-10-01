@@ -655,6 +655,8 @@ def test_every_attestation_verify_command_pins_the_release_workflow_and_ref() ->
         "messagefoundry/scaffold.py",
     }
     assert expected <= files, f"the sweep missed {sorted(expected - files)}; found {sorted(files)}"
+    # Eight commands across those seven files: INSTALL-GUIDE.md carries two.
+    assert len(commands) >= 8, commands
     missing = [
         f"{rel}:{line}"
         for rel, line, command in commands
