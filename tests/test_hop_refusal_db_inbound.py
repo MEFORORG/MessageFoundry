@@ -412,6 +412,17 @@ def test_build_check_passes_an_attested_reference_source(monkeypatch: pytest.Mon
     )
 
 
+def test_build_check_leaves_an_unresolved_reference_source_to_its_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A set staged before its env() value exists must not refuse the whole graph; its sync reports
+    # it, as before. The weakened-source test above is the arm that shows the check does run.
+    from messagefoundry.config.wiring import env
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    _build_check(_ref_registry(encrypt=False, password=env("REF_PW_NOT_PROVISIONED")), PROD_PHI)
+
+
 def test_build_check_honours_the_escape_on_a_warn_instance(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     _build_check(_ref_registry(encrypt=False), STAGING_PHI)

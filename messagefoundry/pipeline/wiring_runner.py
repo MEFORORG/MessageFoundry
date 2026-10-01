@@ -8908,14 +8908,19 @@ def _build_check_connectors(
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
         DatabaseLookupExecutor(resolved_lookups)
     # Vault BACKLOG #2354: a DATABASE reference source's DSN, built (and discarded) under this
-    # posture, so a source every sync would refuse fails check, dry-run and reload rather than only
-    # surfacing as a failed sync after start. Builds no pool and opens no socket.
+    # posture, so weakened TLS that every sync would refuse fails check, dry-run and reload rather
+    # than only surfacing as a failed sync after start. TLS and auth only: the egress allowlist and
+    # the statement checks stay at sync. Builds no pool and opens no socket. A source whose env()
+    # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
+    # refuse the whole graph.
     for rname, rspec in registry.references.items():
-        if rspec.source.kind == "database":
-            database_source_dsn(
-                resolve_env_settings(rspec.source.settings, env_values),
-                connection=reference_connection_name(rname),
-            )
+        if rspec.source.kind != "database":
+            continue
+        try:
+            rsettings = resolve_env_settings(rspec.source.settings, env_values)
+        except WiringError:
+            continue
+        database_source_dsn(rsettings, connection=reference_connection_name(rname))
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         fsettings = _fhir_lookup_settings(fspec, env_values, egress)

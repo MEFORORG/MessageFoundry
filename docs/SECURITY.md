@@ -477,8 +477,11 @@ is a PHI instance. SQLite has no login, so nothing here applies to it.
 
 ### Data-layer hops refuse cleartext on their defaults, except the Vault hops (ASVS 12.3.1 census)
 
-This census was read at engine commit `bca583f2a7` on 2026-09-30, under vault BACKLOG #2354. It
-names at least the sites that open a database, directory, secrets-store or log-collector connection.
+This census was read at engine commit `bca583f2a7` on 2026-09-30, under vault BACKLOG #2354. One
+row then changed in the same work: the `DatabaseRef` row describes the gate that work added. At
+`bca583f2a7` a sync built its DSN with no posture, so the escape was unclamped there, and
+`messagefoundry check` never built it. The table names at least the sites that open a database,
+directory, secrets-store or log-collector connection.
 A hop missing from it is not thereby gated. A 2026-08-22 re-scoping counted 14 such sites in 11
 modules but never recorded the list, so this table does not try to match that count.
 
@@ -496,7 +499,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
 | `db_lookup` | `transports/database.py` `DatabaseLookupExecutor` | ODBC, SQL Server preset, `ApplicationIntent=ReadOnly` | `_build_dsn`, posture stamped by `RegistryRunner._build_lookup_executor` | refuses | No |
-| `DatabaseRef` reference sync | `pipeline/reference_sync.py` `database_source_dsn`, from `_load_database_source` and from `build_check` | ODBC, SQL Server preset | `_build_dsn`, with the engine's posture at sync time | refuses at `messagefoundry check`, dry-run, reload and every sync. Before vault BACKLOG #2354 only the sync checked it, with no posture, so the escape was unclamped | No |
+| `DatabaseRef` reference sync | `pipeline/reference_sync.py` `database_source_dsn`, from `_load_database_source` and from `build_check` | ODBC, SQL Server preset | `_build_dsn`, with the engine's posture at sync time | refuses at `messagefoundry check`, dry-run, reload and every sync. `serve` start does not stop: its first sync fails and the set stays unloaded | No |
 | Vault KV secrets | `config/secretprovider_vault.py` | hvac over whatever scheme the address names | none on the scheme | an `http://` address is used as given | Off by default; once on, `http://` crosses in the clear. Vault BACKLOG #2317 |
 | Vault store key provider | `store/keyprovider_vault.py` | as above | none on the scheme | as above | as above; #2317 |
 | Vault Transit cipher | `store/crypto_transit.py` | as above | none on the scheme | as above | as above; #2317 |

@@ -696,10 +696,11 @@ def DatabaseRef(
     The engine runs ``statement`` (a read-only ``SELECT``/proc) on the set's refresh cadence and builds
     the snapshot from the rows: ``key_column`` is the lookup key; ``value_column`` (if given) is that
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
-    shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is refused
-    at ``messagefoundry check`` and at every sync unless ``tls_hop_attested`` below is set;
-    ``MEFOR_ALLOW_INSECURE_TLS`` works only at ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
-    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
+    shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
+    refused at ``messagefoundry check`` and at every sync unless ``tls_hop_attested`` below is
+    set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at ``[security].enforcement = warn``. The
+    dial-out is gated by the **fail-closed** ``[egress].allowed_db`` allowlist, exactly like a
+    DATABASE poll source — point the engine only at allowed hosts.
 
     ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
     the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
