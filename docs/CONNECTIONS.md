@@ -1972,8 +1972,8 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. |
 | `fhir_version` | `R4B` | `R4B` (default) / `R5` / `STU3` — explicit (no plain-R4 on pydantic-v2 wheels) |
 | `format` | `json` | `json` only; FHIR-XML is deferred to a hardened-`lxml` path |
-| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`PUT {base}/{ResourceType}/{id}`) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
-| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware PUT) |
+| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
+| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
@@ -1994,8 +1994,48 @@ entry); the engine never orchestrates cross-entry atomicity.
 **Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
 problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
 `If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
-is in the **URL** query), and `if-match` (optimistic lock on a known id via an `If-Match` ETag derived from
-the resource's `meta.versionId`).
+is in the **URL** query), and `if-match` (optimistic lock on a known id via an ETag derived from the
+resource's `meta.versionId`, sent as the entry's `request.ifMatch`).
+
+#### An update keeps the resource id out of the URL
+
+The engine never puts a message-derived resource id in the request URL of a write. A RESTful update is
+`PUT {base}/{ResourceType}/{id}` by specification, and an id in the path would reach the receiving server's
+access logs on a first deployment. So `update` and `if-match` send the resource as the one entry of a
+`transaction` `Bundle`, POSTed to `{base}`. The entry's `request` carries `PUT {ResourceType}/{id}` and, for
+`if-match`, the `ifMatch` ETag. The server processes that entry as the same update
+([FHIR http, transaction](https://hl7.org/fhir/R4B/http.html#transaction)). This is vault BACKLOG #1965,
+under ASVS 14.2.1 and owner ruling R3.
+
+What a site needs to know:
+
+- The server must support the `transaction` interaction, and for `if-match` it must honor an entry's
+  `request.ifMatch`. A server that accepts transactions but ignores `ifMatch` would apply the update
+  unconditionally, and nothing would fail. Check both before pointing an `update` or `if-match`
+  connection at a server.
+- The entry carries a `fullUrl` of `{base}/{ResourceType}/{id}`, because FHIR requires one on a `PUT`
+  entry. Like the rest of the entry, it is in the body.
+- The resource goes out byte for byte. It is spliced into the `Bundle` unchanged, so a decimal such as
+  `1.50` keeps its precision.
+- The reply is a `transaction-response` `Bundle`, and with `capture_response` that `Bundle` is what is
+  captured. The capture outcome comes from the entry's `response.outcome`.
+- If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
+  that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
+  logged as a warning, and the 2xx reply counts as delivered.
+- `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
+  entry, which describes the updated resource, and an entry field hides a reply header of the same
+  name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
+  `Location` is usually relative. A value with a control character, or longer than a header value may
+  be, is dropped.
+- An `If-Match`, `If-None-Match`, `If-Modified-Since` or `If-None-Exist` header moves into the entry's
+  matching field, whether it is static in `headers` or stamped by a Handler through `dynamic_headers`.
+  The connector's own `if-match` ETag wins over both, as it did on the `PUT`.
+- The resource type stays in the URL for `create`, `if-none-exist` and `conditional-update`, and so does
+  the operator-configured search of `conditional-update`. None of them is the message-derived id.
+
+The read site is outside this. A `fhir_lookup` read-by-id is `GET {base}/{ResourceType}/{id}`, which is what
+a RESTful read is by specification. Owner ruling R3 names the update and if-match writes only, and the
+vault row records that it does not decide the read site.
 
 **OperationOutcome & delivery semantics.** A 2xx is **delivered** (a returned `OperationOutcome` is captured,
 never an error). On an error status the HTTP code decides, refined by the `OperationOutcome`: 5xx → retry; a
@@ -2092,9 +2132,9 @@ table top to bottom and take the first row that matches:
 |---|---|
 | `conditional="conditional-update"` | `u`, `s` — a search-based `PUT` |
 | `conditional="if-none-exist"` | `c`, `s` — a `POST` the server searches for first |
-| `conditional="if-match"` | `u` — a version-aware `PUT`, no search |
+| `conditional="if-match"` | `u` — a version-aware update, no search |
 | `interaction="create"` (no conditional) | `c` |
-| `interaction="update"` (no conditional) | `u` |
+| `interaction="update"` (no conditional) | `u` — the one `transaction` entry is an update, and a server authorizes a transaction entry by entry |
 | `FhirLookup(...)` (structurally GET-only) | `r`, `s` |
 | `interaction="transaction"`/`"batch"` | the Bundle decides, so no fixed set |
 
