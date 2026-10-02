@@ -289,6 +289,87 @@ migration is to accept the new virtual-account default instead. This flip is exe
 `windows-service-smoke` CI leg (a bare `-LockConfigDir` install, which now runs under the virtual account,
 must start and serve `/health` + MLLP on both Windows Server SKUs).
 
+### Restrict the service token
+
+The installer sets two things on the service's registration. Both make Windows start the engine
+with less than its account holds.
+
+**A short privilege list, for every account.** A Windows service keeps every privilege of its
+account unless its registration lists the ones it needs. The installer lists one,
+`SeChangeNotifyPrivilege`, and Windows removes the rest when the service starts. By default Windows
+gives every service account `SeImpersonatePrivilege`, which the engine does not use. This list is
+set for the default account, for `-ServiceAccount` and for `-AllowLocalSystem` alike.
+
+**A restricted service SID, for the default account.** When the service runs as its own virtual
+account, `NT SERVICE\<ServiceName>`, the installer sets its SID type to `restricted`. Windows then
+gives it a write-restricted token. It reads what it could read before. A permission for `Users`,
+`Authenticated Users` or any other group the account belongs to no longer lets it write. It still
+writes where a permission names at least one of these:
+
+- the service itself, `NT SERVICE\<ServiceName>`;
+- its logon session, `Everyone`, or the special `WRITE RESTRICTED` group;
+- `OWNER RIGHTS`, on a file or folder the service owns. Measured 2026-10-01 with a stand-in token:
+  it wrote inside a folder it had created whose only entries were SYSTEM, Administrators and
+  `OWNER RIGHTS`.
+
+So when you check whether the engine can write a directory, look for those entries and for who
+owns it, and not only for the service's name.
+
+What that changes for you:
+
+- **The data directory and the logs work as before.** The installer grants them to the service by
+  name, and reads that grant back.
+- **Grant every other directory the engine writes to the service by name.** That covers at least
+  the directory of each File connection, a DR backup directory, and the store's own directory when
+  `-DbPath` puts it outside the data directory. The installer reads that last one and warns when
+  the grant is missing. An inbound File directory counts
+  too unless it uses `after_read="leave"`, because the engine moves each processed file into a
+  subfolder. A directory that only `Users` can write would be refused, and the connection reports
+  it the way it reports any directory it cannot write.
+
+  ```powershell
+  icacls "D:\hl7\out" /grant "NT SERVICE\MessageFoundry:(OI)(CI)M"
+  ```
+
+- **A network share is not affected.** The file server checks the account there. The restriction
+  is part of the local token and does not travel.
+
+Read both settings back with `sc.exe qsidtype MessageFoundry` and `sc.exe qprivs MessageFoundry`.
+
+**Other accounts get the privilege list and not the restricted SID.** With `-AllowLocalSystem`, or
+with `-ServiceAccount` naming anything but the service's own virtual account, the service runs as
+an account that is not the service itself. Under a restricted SID that account's own profile and
+the grants written for it would stop counting. No run has shown what such a service then fails to
+write, so the installer sets the SID type to `none` for a gMSA, a named user, another virtual
+account and LocalSystem, and prints a warning that says so. It writes `none` on every run. So a
+re-install that changes the account never keeps a restricted SID from the account before, and a
+SID type you set by hand with `sc.exe sidtype` is replaced.
+
+**`-SkipRestrictedServiceSid` opts out** for the default account. Use it only when the engine must
+write somewhere you cannot grant to `NT SERVICE\<ServiceName>`. The engine can then write wherever
+its account, or any group the account is in, can. The privilege list is still set.
+
+**This is not a wall around code that runs inside the engine.** The restriction limits where the
+engine's own token writes, which is what matters when a flaw lets a sender steer a file path. A
+config module runs inside the engine's process, and code there can ask Windows for a second token
+for the same account. Measured 2026-10-01 on Windows 11 with a stand-in token: the logon the File
+connection's alternate credential uses (`LogonUserW` with `LOGON32_LOGON_NEW_CREDENTIALS`) returned
+a token that kept the short privilege list and was no longer write-restricted. So the config
+directory is still code that runs with the service account's access. Lock it down as
+[Lock down the config directory](#lock-down-the-config-directory-config-2) says.
+
+**When it takes effect.** A service gets both settings when Windows starts it. Microsoft documents
+a SID type change as needing a system start. The `windows-service-smoke` CI leg installs a new
+service, starts it and reads the token the running engine holds.
+
+Measured 2026-10-02 on Windows Server 2022 and 2025, in CI run 36981542600: a new service held both
+settings at its first start. The host was not restarted. All three service processes had a
+write-restricted token whose only privilege was `SeChangeNotifyPrivilege`.
+
+Nobody has measured a change on a service that was already installed. If you re-run the installer
+over an existing service and need the new SID type in force, restart the host. The installer prints
+that reminder on every re-install.
+
 ### Protect the store encryption key at rest (WP-11d)
 
 PHI columns are AES-256-GCM-encrypted at rest when a key is configured (see [PHI.md](PHI.md) §3).
@@ -693,6 +774,11 @@ list below says what it covers.
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
 | Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |
 
+**The service SID type and the privilege list are not in that table, because they go with the
+registration.** The installer sets both on the registration and nowhere else. The uninstaller looks
+for the service's registry key after it removes the service. If Windows has only marked the service
+for deletion, the key and both settings are still there, and the inventory says so.
+
 **Why the uninstaller does not put the permissions back.** Turning inheritance on again would hand
 the parent directory's principals read access to logs and a message store that can carry PHI — on
 the way out, when nobody is watching. And nothing recorded what the permissions and the owner were
@@ -741,3 +827,7 @@ read rather than printing a shorter list. Check those by hand before you call th
   there too (the installer only ACLs the default data dir), or startup fails — pick a writable
   location and grant it, or opt out to LocalSystem with `-AllowLocalSystem` (see *Security
   hardening* above).
+- **A File connection cannot write a directory that used to work.** The service's token is
+  write-restricted, so a permission for `Users` or `Authenticated Users` no longer lets it write.
+  Grant the directory to `NT SERVICE\<ServiceName>` by name. See
+  [Restrict the service token](#restrict-the-service-token).

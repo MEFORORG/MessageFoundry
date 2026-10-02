@@ -787,9 +787,14 @@ def test_the_two_copies_of_the_helper_have_not_drifted(tmp_path: Path) -> None:
 _PATH_PARAMS = ["DataDir", "AppExe", "Config", "DbPath"]
 
 
-def _preflight_facts(tmp_path: Path) -> dict:
-    """Assignments and command calls of install-service.ps1, with source offsets, by AST."""
-    assert _SCRIPT is not None
+def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:
+    """Assignments and command calls of install-service.ps1, with source offsets, by AST.
+
+    ``script`` reads another file the same way: the uninstaller, or a changed copy of the installer
+    that a guard must fail on.
+    """
+    path = script if script is not None else _SCRIPT
+    assert path is not None
     body = """
   $assigns = @(foreach ($a in $ast.FindAll({ $args[0] -is
       [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
@@ -821,7 +826,7 @@ def _preflight_facts(tmp_path: Path) -> dict:
   [pscustomobject]@{ assignments = @($assigns); commands = @($cmds) } |
       ConvertTo-Json -Depth 6 -Compress
 """
-    parsed: dict = json.loads(_ok(_extract(_SCRIPT, [], body), tmp_path).strip().splitlines()[-1])
+    parsed: dict = json.loads(_ok(_extract(path, [], body), tmp_path).strip().splitlines()[-1])
     return parsed
 
 

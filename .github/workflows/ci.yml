@@ -3761,6 +3761,17 @@ jobs:
           # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
           # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
           .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir @cached
+          # vault BACKLOG #2702: that install gives the service a restricted token. The samples
+          # graph has File connections under the working directory (in\, dev-inbox\, out\), and a
+          # grant to Users there no longer counts. So they get the grant docs/SERVICE.md tells an operator
+          # to add for any directory a File connection writes. The installer grants the data
+          # directory itself; the "Verify the service token" step below shows a directory with
+          # no such grant is refused.
+          foreach ($d in "in", "dev-inbox", "out") {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            & icacls $d /grant "NT SERVICE\MessageFoundry:(OI)(CI)M" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "could not grant the service account on '$d' (icacls exit $LASTEXITCODE)" }
+          }
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
           # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
           # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an
@@ -3982,6 +3993,190 @@ jobs:
           if ($total -lt 1) { throw "message was not recorded by the engine" }
           "messages.total = $total"
 
+      # vault BACKLOG #2702: install-service.ps1 sets a restricted service SID and a one-entry
+      # RequiredPrivileges list. The two steps above show the engine still starts and still takes a
+      # message under that token. Without THIS step they would be green whether or not the token is
+      # restricted, so it reads the token three ways, and each reading has a control that must NOT
+      # read the same way.
+      #
+      # 1. The registration, through the Service Control Manager (sc.exe qsidtype, sc.exe qprivs).
+      # 2. The token of the RUNNING engine: nssm.exe, the launcher and the python.exe it started.
+      #    Settings on a registration are not a token, and the child is the process that does the
+      #    work. scripts/ci/service_token_probe.py holds the rule; this shell is its control.
+      # 3. What the token can DO, which only code running under it can show. The service is stopped
+      #    and started again with the probe in place of the engine, under the same registration. It
+      #    must run as the service's own account with the same token, write the data directory,
+      #    be REFUSED on a directory that grants only Users and Authenticated Users, find a
+      #    writable temporary directory, and get through the engine's alternate-credential logon
+      #    (transports/wincred.py), which is documented to need no privilege. The probe keeps
+      #    running afterwards, so the stop step below still has a running service to stop.
+      #
+      # NOT PROVEN HERE: an explicit -ServiceAccount, a gMSA and -AllowLocalSystem. The installer
+      # does not set the restricted SID for those, and no leg installs under them. Nor is a real
+      # network share: the probe's credential is made up, so it runs the logon and the
+      # impersonation and never the SMB hop, which the far end checks and this token does not.
+      #
+      # A SID-type change is documented to need a system start. This install is the service's
+      # first, so the token read here is the one its first start got. A red at reading 2 with a
+      # green reading 1 would be that case, and is not to be turned green by dropping reading 2.
+      #
+      # THIS STEP'S FIRST RUN, merge-group run 36981542600, both runners. Readings 1 and 2 passed
+      # on a real service (docs/SERVICE.md "Restrict the service token" records what that
+      # showed). Reading 3 was never judged: the step read the exit code of the start command and
+      # stopped. The comment at that command says why that code says nothing here. So the rule
+      # on the probe's report has not yet met a real report. A first red there may be the rule
+      # or this step and not the token: the step prints the whole report, so read it and say
+      # which it is before anything is changed. Do not re-run it to see if it passes.
+      #
+      # "Invalid account name!" from the two set commands below is noise. This copy prints it on
+      # any set made once the service runs as a virtual account, and still makes the change. The
+      # install step's own set printed it in that run, and the token read after it passed. The
+      # probe's report is checked for the account as well, so a set that did change it goes red.
+      # The name is quoted: unquoted, YAML reads " #2702)" as a comment and cuts the name there.
+      - name: "Verify the service token is restricted (vault BACKLOG #2702)"
+        run: |
+          # Two commands below exit non-zero on a run that worked, and say so where they are
+          # called. Set here so that never depends on the runner's default for this preference.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $privilege = "SeChangeNotifyPrivilege"
+          $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
+          function Assert-Native([string]$What) {
+            if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+          }
+
+          # --- 1. the registration -----------------------------------------------------------------
+          $sidType = (& sc.exe qsidtype MessageFoundry | Out-String); Assert-Native "sc.exe qsidtype MessageFoundry"
+          $privs = (& sc.exe qprivs MessageFoundry | Out-String); Assert-Native "sc.exe qprivs MessageFoundry"
+          "===== sc.exe qsidtype MessageFoundry ====="; $sidType
+          "===== sc.exe qprivs MessageFoundry ====="; $privs
+          $restricted = '(?m)SID_TYPE\s*:\s*RESTRICTED\s*$'
+          # CONTROL: the other two values must NOT match, or the pattern matches everything.
+          # UNRESTRICTED ends in the same letters, which is the one a loose pattern lets through.
+          foreach ($not in "SERVICE_SID_TYPE:  UNRESTRICTED", "SERVICE_SID_TYPE:  NONE") {
+            if ($not -match $restricted) { throw "CONTROL FAILED: '$not' reads as RESTRICTED, so the pattern proves nothing" }
+          }
+          if ($sidType -notmatch $restricted) { throw "the service SID type is not RESTRICTED" }
+          $listed = @([regex]::Matches($privs, 'Se[A-Za-z]+Privilege') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+          if (($listed -join ',') -ne $privilege) {
+            throw "the registration lists [$($listed -join ', ')], not exactly $privilege"
+          }
+
+          # --- 2. the running engine's token -------------------------------------------------------
+          $serviceSid = ([Security.Principal.NTAccount]"NT SERVICE\MessageFoundry").Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MessageFoundry'"
+          if (-not $svc -or -not $svc.ProcessId) { throw "the service is not running, so there is no token to read" }
+          # Every process under the service's root. A child must be at least as new as its parent:
+          # a process whose parent id was only REUSED by the root is not under it. The same walk
+          # as Get-ServiceProcess in scripts/service/measure-store-access.ps1.
+          $all = @(Get-CimInstance Win32_Process)
+          $tree = @($all | Where-Object { [int]$_.ProcessId -eq [int]$svc.ProcessId })
+          $frontier = $tree
+          while ($frontier.Count -gt 0) {
+            $frontier = @(foreach ($parent in $frontier) {
+              $all | Where-Object {
+                ([int]$_.ParentProcessId -eq [int]$parent.ProcessId) -and
+                ($_.CreationDate -ge $parent.CreationDate) -and
+                (@($tree | ForEach-Object { [int]$_.ProcessId }) -notcontains [int]$_.ProcessId)
+              }
+            })
+            $tree += $frontier
+          }
+          $tree | Format-Table ProcessId, ParentProcessId, Name -AutoSize | Out-String
+          # The engine is the python.exe the launcher starts, so that is the token that matters.
+          # The service's root process and the launcher are read as well, and every one must pass.
+          $procs = @($tree[0]) + @($tree | Select-Object -Skip 1 | Where-Object {
+            $_.Name -in @("messagefoundry.exe", "python.exe", "pythonw.exe")
+          })
+          if (-not ($procs | Where-Object { $_.Name -eq "python.exe" })) {
+            throw "no python.exe runs under the service, so the engine's own token was not read"
+          }
+          $pids = @($procs | ForEach-Object { "--pid"; "$($_.ProcessId)" })
+          & python $probe check-read --service-sid $serviceSid --privilege $privilege --control-pid $PID @pids
+          Assert-Native "the token check on the running service"
+
+          # --- 3. what the token can do ------------------------------------------------------------
+          $data = "C:\ProgramData\MessageFoundry"
+          $denied = "C:\mefor-token-probe-denied"
+          $report = Join-Path $data "token-probe.json"
+          $python = (Get-Command python).Source
+          # The parameters are stored as one string, unquoted, so no path in it may hold a space.
+          if ("$probe$report$data$denied" -match '\s') { throw "a probe path holds a space: $probe $report $denied" }
+          New-Item -ItemType Directory -Force -Path $denied | Out-Null
+          & icacls $denied /inheritance:r /grant:r "*S-1-5-32-545:(OI)(CI)M" "*S-1-5-11:(OI)(CI)M" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
+          Assert-Native "icacls on $denied"
+          # An explicit OWNER RIGHTS or CREATOR OWNER entry would survive the call above and could let the
+          # service write as the owner of what it creates. Removing one that is not there is a no-op.
+          & icacls $denied /remove:g "*S-1-3-4" "*S-1-3-0" | Out-Null
+          Assert-Native "icacls /remove:g on $denied"
+          Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
+          # The report is the only witness that THIS start worked, so an older one must not be there.
+          if (Test-Path -LiteralPath $report) { throw "a report from an earlier run could not be removed: $report" }
+          # The stop's exit code is not read either: it comes from the same short wait as the
+          # start's, described below, and the engine may take up to 15 seconds to drain. The
+          # Service Control Manager is asked instead, the way the installer's own stop is checked.
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry
+          $global:LASTEXITCODE = 0
+          foreach ($i in 1..60) {
+            if ((Get-Service -Name MessageFoundry).Status -eq "Stopped") { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ((Get-Service -Name MessageFoundry).Status -ne "Stopped") { throw "the engine did not stop within 30 seconds" }
+          # The engine's program and parameters are saved, raw, and put back once the probe has
+          # reported. The service reads them only when it starts, so the probe keeps running,
+          # and the uninstall step below reads the ENGINE's registration, as it did before this
+          # step existed. Written straight to the registry, so the quotes inside the engine's
+          # parameters never pass through a command line.
+          $parameters = "HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters"
+          $key = Get-Item -LiteralPath $parameters
+          $saved = @{}
+          foreach ($value in "Application", "AppParameters") {
+            $saved[$value] = @{
+              Text = $key.GetValue($value, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+              Kind = $key.GetValueKind($value)
+            }
+          }
+          if ($saved.AppParameters.Text -notmatch '^serve ') { throw "CONTROL FAILED: the saved parameters are not the engine's: $($saved.AppParameters.Text)" }
+          try {
+            & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry Application $python
+            Assert-Native "setting the probe as the service's program"
+            & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry AppParameters "$probe inside --report $report --granted-dir $data --denied-dir $denied --hold-seconds 900"
+            Assert-Native "setting the probe's parameters"
+            # THE EXIT CODE OF THIS START IS NOT READ, AND READING IT IS WHAT FAILED THIS STEP ON ITS
+            # FIRST RUN (merge-group run 36981542600, both runners). The service holds
+            # START_PENDING for its AppThrottle, five seconds, before it reports RUNNING. This
+            # command gives up after about three and exits 1 with "Unexpected status
+            # SERVICE_START_PENDING in response to START control". The same run printed that
+            # line for EVERY start in the job, the engine's own included, and each of those
+            # services came up. The probe did too: the service log shows it reached its hold,
+            # which comes after it writes its report. So the start is judged by the report, with
+            # the bounded wait below, the way the health step judges the engine by /health.
+            # The code is cleared at once, so no later line can read this start's 1 by mistake.
+            & "$env:SMOKE_NSSM_DIR\nssm.exe" start MessageFoundry
+            $global:LASTEXITCODE = 0
+            # The wait is INSIDE the try, so the engine's values go back only once the probe has
+            # reported or the wait has run out. A probe that dies at once is restarted by the
+            # service from the registry; put back any sooner, that restart would start the ENGINE,
+            # and the red would show a healthy engine and no report.
+            foreach ($i in 1..120) {
+              if (Test-Path -LiteralPath $report) { break }
+              Start-Sleep -Milliseconds 500
+            }
+          } finally {
+            foreach ($value in $saved.Keys) {
+              Set-ItemProperty -LiteralPath $parameters -Name $value -Value $saved[$value].Text -Type $saved[$value].Kind
+            }
+          }
+          $restored = (Get-Item -LiteralPath $parameters).GetValue("AppParameters", $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          if ($restored -ne $saved.AppParameters.Text) { throw "the engine's parameters were not put back: $restored" }
+          if (-not (Test-Path -LiteralPath $report)) {
+            # What the Service Control Manager says, since the start's own exit code says nothing.
+            Get-Service -Name MessageFoundry | Format-List Name, Status, StartType | Out-String
+            throw "the probe wrote no report as the service within 60 seconds; see the service logs below"
+          }
+          & python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege
+          Assert-Native "the check on what the service token can do"
+
       - name: Stop the service (graceful)
         if: always()
         run: '& "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry'
@@ -4000,6 +4195,31 @@ jobs:
         if: always()
         shell: powershell
         run: .\scripts\service\uninstall-service.ps1
+
+      # vault BACKLOG #2702: the SID type and the privilege list are settings on the registration,
+      # so the uninstall reverses them by removing it. This reads that back: the service's registry
+      # key, which holds both, must be gone. The control key is a service Windows always has, so
+      # an "absent" reading cannot come from a read that sees no service key at all. It says only
+      # that no key is LEFT: when the install above failed before it registered anything, there
+      # was never one, and the red is that step's. The key is given 30 seconds, so a removal that
+      # is still finishing is not read as one that was left behind.
+      - name: Confirm the uninstall took the token settings with the registration
+        if: always()
+        shell: powershell
+        run: |
+          $services = "HKLM:\SYSTEM\CurrentControlSet\Services"
+          if (-not (Test-Path -LiteralPath "$services\EventLog")) {
+            throw "CONTROL FAILED: this read cannot see the EventLog service key, so it proves nothing"
+          }
+          foreach ($i in 1..60) {
+            if (-not (Test-Path -LiteralPath "$services\MessageFoundry")) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (Test-Path -LiteralPath "$services\MessageFoundry") {
+            Get-ItemProperty -LiteralPath "$services\MessageFoundry" | Format-List ServiceSidType, RequiredPrivileges, DeleteFlag
+            throw "the MessageFoundry service key is still there after the uninstall, with the SID type and privilege list in it"
+          }
+          "no MessageFoundry service key is left, so no SID type and no privilege list is either"
 
       # --- ADR 0183 Amendment A, Wave 0 (BACKLOG #1136): the AUTH-ON arm ------------------------------
       # Everything above runs with sign-in OFF, so it cannot see the question these two steps ask:
