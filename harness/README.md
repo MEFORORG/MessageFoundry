@@ -261,3 +261,22 @@ The DICOMweb scenario also requires the stored part to equal the object it sent,
 is registered only where the `[dicom]` extra is installed. The sink redacts the values of common
 credential headers and never logs a body. An outbound URL is always loopback: a sink binds nothing
 else, so moving `host` moves only where a driver dials.
+
+### TIMER, PassThrough and Loopback (internal inbounds)
+
+`harness/config/internal.py` serves the three inbound kinds that have no external peer of their
+own, and `harness/scenarios/internal.py` drives each from its natural source (ports and the
+directory in `harness/endpoints/internal.py`, defaults 2610-2614):
+
+- `internal_timer` -- nothing to inject. `IB_Internal_Timer` fires a fixed synthetic ADT^A08 every
+  2 seconds into a File archive (`./harness_io/internal_timer_out` by default; a served harness
+  keeps writing one small file per tick). The scenario counts only records received after it
+  started and files that appeared after its sink started, so an earlier run cannot satisfy it.
+- `internal_passthrough` -- MLLP in on 2610; the handler `Send`s into `PT_Internal_Relay`, whose
+  own router forwards to a sink on 2611. The re-ingressed child is asserted on its own channel. The
+  engine records a PassThrough child with no control id, so the scenario finds it by its body (an
+  audited read); `tests/test_harness_internal.py` pins that gap with a strict xfail.
+- `internal_loopback` -- MLLP in on 2612; the capturing outbound (`reingress_to`) dials a harness
+  sink on 2613, and that sink's ACK is the message that re-enters on `LB_Internal_Reply`, whose
+  router forwards it to a sink on 2614. The scenario asserts the forwarded copy is that ACK
+  (MSA-2 naming the control id sent), not the original.
