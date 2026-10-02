@@ -102,8 +102,8 @@ def _step1_bytes() -> bytes:
 # BACKLOG #2632, the one amendment so far. A statement in the ``@Data`` of an element that is not a
 # ``<Line>`` used to render as a label, as the text of a dead condition, as a live send, or not at
 # all, while the handle scan counted its clone. The step 1 path now marks that statement as a counted
-# TODO, never emits it as a write or a delivery, refuses it where it is a send, and holds no handle
-# for the list. A list the gate declines takes that path, so "renders as step 1" has to mean this
+# TODO, never emits it as a write or a delivery, refuses a send in a Block's or a Call's ``@Data``,
+# and holds no handle for the list. A list the gate declines takes that path, so "renders as step 1" has to mean this
 # path, or the guard would fail on the repair itself. The rule is copied here as text, apart from
 # the head, so a later change to the head's rule turns the guard red until someone amends this copy
 # on purpose.
@@ -2428,10 +2428,19 @@ def _label_statement_shapes() -> Iterator[Shape]:
         delivered = Raw(f"<Try><List>{carrying(tag, send).xml}{catch}</List></Try>")
         yield Shape(f"2632-{tag}-send-in-a-try-main-delivers", "%ADT", (delivered,))
         yield Shape(f"2632-{tag}-send-naming-no-destination", "%ADT", (carrying(tag, unnamed),))
+        flat = carrying(tag, "MsgSend %OUT")
+        yield Shape(f"2632-{tag}-flat-send-naming-no-destination", "%ADT", (flat,))
+        # The same send in a construct's body. main leaves a bare TODO there, so the refusal
+        # takes the place of the body's ``pass``, and a ``try`` gains the guard that re-raises it.
         yield Shape(
-            f"2632-{tag}-flat-send-naming-no-destination",
+            f"2632-{tag}-flat-send-naming-no-destination-in-an-if",
             "%ADT",
-            (carrying(tag, "MsgSend %OUT"),),
+            (Raw(f'<If Data="If (x)"><List>{flat.xml}</List></If>'),),
+        )
+        yield Shape(
+            f"2632-{tag}-flat-send-naming-no-destination-in-a-try",
+            "%ADT",
+            (Raw(f"<Try><List>{flat.xml}{catch}</List></Try>"),),
         )
     # A keyword span that does not lead a Block's label, and a table verb that does not lead it:
     # both still read as a label.
@@ -2859,7 +2868,9 @@ def _loud(src: str) -> Counter[tuple[int, str]]:
     """Every send and every refusal in ``src``, as ``(indent, destination)``. A refusal of a send
     stands for that send, so the two share a key. One at the handler's own level acts on every
     message; the same line one level in is dead until someone writes the condition. Keyed by the
-    destination too, so a send that goes cannot hide behind a refusal gained elsewhere."""
+    destination too, so a send that goes cannot hide behind a refusal gained elsewhere. That
+    holds for a send that names a destination. Every refusal naming none shares one key at its
+    indent, so one of those can still hide behind another."""
     loud: Counter[tuple[int, str]] = Counter((indent, dest) for indent, dest, _ in _live_sends(src))
     for line in src.splitlines():
         if _REFUSAL.match(line):
@@ -2928,9 +2939,17 @@ def _quieter(was: _Out, now: _Out) -> list[str]:
     uncounted = Counter(_unmapped_names(was)) - Counter(_unmapped_names(now))
     if uncounted:
         found.append(f"(c) main counts {sorted(uncounted)} unmapped, and this does not")
-    if _todos(old) - _todos(new):
-        found.append(f"(c) a TODO main writes is gone: {sorted(_todos(old) - _todos(new))}")
+    unwritten = _todos(old) - _todos(new)
+    if unwritten:
+        found.append(f"(c) a TODO main writes is gone: {sorted(unwritten)}")
     return found
+
+
+# A line that may change where the counts do not: a comment, a refusal, the guard that
+# re-raises a refusal with its bare ``raise``, and the ``pass`` of a body that held no code.
+_QUIET_LINE = re.compile(
+    r"\s*(?:#|raise NotImplementedError\(|except NotImplementedError:|raise$|pass$)"
+)
 
 
 def _breaches(xml: str, was: _Out, now: _Out) -> list[str]:
@@ -2946,7 +2965,9 @@ def _breaches(xml: str, was: _Out, now: _Out) -> list[str]:
     It then counts at least one more step unmapped, with the marker's reason in the module. The
     exception is a list whose counts stay as they were: a statement under a ``@Disabled``
     ancestor, one on an unmodelled tag beside no send the scan reads, or a send off a ``<Line>``
-    that main already counted unmapped. There only comment lines and refusals change."""
+    that main already counted unmapped. There only comment lines and refusals change, with
+    what a refusal brings: the guard that re-raises it ahead of a Catch, and the loss of a
+    ``pass`` its body no longer needs (:data:`_QUIET_LINE`)."""
     if now == was:
         return []
     found: list[str] = []
@@ -2967,7 +2988,7 @@ def _breaches(xml: str, was: _Out, now: _Out) -> list[str]:
     changed = (was_lines - now_lines) + (now_lines - was_lines)
     if now[1] != was[1]:
         found.append("(counts) the counts change, and no more is unmapped")
-    if not all(line.lstrip().startswith("#") or _REFUSAL.match(line) for line in changed):
+    if not all(map(_QUIET_LINE.match, changed)):
         found.append("(code) more than comment lines and refusals change")
     return found
 
