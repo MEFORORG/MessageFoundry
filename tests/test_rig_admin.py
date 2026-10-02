@@ -43,16 +43,13 @@ from messagefoundry.apiclient import ApiError
 from messagefoundry.auth.policy import CONTEXT_WORDS, PasswordPolicy
 
 _ROOT = Path(__file__).resolve().parents[1]
-_SIGN_IN_KEY = "MEFOR_SECURITY_REQUIRE_SIGN_IN"
 
 
 def _env_for_a_sqlite_store(**extra: str) -> dict[str, str]:
     """This process's environment for a child that must use its OWN SQLite store: no store setting
-    a server-database leg exports, and no sign-in switch a shell may hold."""
+    a server-database leg exports."""
     kept = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith("MEFOR_STORE_") and name != _SIGN_IN_KEY
+        name: value for name, value in os.environ.items() if not name.startswith("MEFOR_STORE_")
     }
     return {**kept, **extra}
 
@@ -388,31 +385,6 @@ def test_a_drive_of_another_processs_engines_refuses_to_draw_its_own_credential(
     assert rigadmin.RIG_SESSION.supplied is False and rigadmin.REMOTE_RIG_SESSION.supplied is True
 
 
-# --- no runner hands `serve` the sign-in switch -------------------------------
-
-
-def _lines_naming_the_switch(text: str) -> list[str]:
-    return [line.strip() for line in text.splitlines() if _SIGN_IN_KEY in line]
-
-
-def test_no_harness_module_hands_serve_the_sign_in_switch() -> None:
-    """The only line in ``harness/`` that names the switch REMOVES it from a node's environment.
-
-    THIS IS ABOUT ``serve``, and it reads for one name. ``harness/load/ingress_probe.py`` builds
-    the engine in-process through the test factory with ``allow_no_auth=True`` and never runs
-    ``serve``; this check does not see it and makes no claim about it."""
-    found = {
-        path.relative_to(_ROOT).as_posix(): lines
-        for path in sorted((_ROOT / "harness").rglob("*.py"))
-        if (lines := _lines_naming_the_switch(path.read_text(encoding="utf-8")))
-    }
-    assert found == {
-        "harness/load/failover.py": [f'self._env.pop("{_SIGN_IN_KEY}", None)'],
-    }, found
-    # CONTROL: the reader sees an assignment of the shape the runners used to carry.
-    assert _lines_naming_the_switch(f'    env["{_SIGN_IN_KEY}"] = "false"\n')
-
-
 # --- the command line's own failures -----------------------------------------
 
 
@@ -508,10 +480,8 @@ async def test_a_rig_node_serves_with_sign_in_on_and_the_rig_reads_it_signed_in(
     config.mkdir()
     (config / "IB_RIG_PROOF.py").write_text(_CONFIG.format(port=_free_port()), encoding="utf-8")
     base_env = _env_for_a_sqlite_store(MEFOR_STORE_PATH=str(tmp_path / "rig.db"))
-    # What a runner used to set, and what a shell may still hold. The node must drop it.
-    base_env[_SIGN_IN_KEY] = "false"
     node = EngineNode("rig-proof", _free_port(), env=base_env, config_dir=str(config), cwd=tmp_path)
-    assert _SIGN_IN_KEY not in node._env and rigadmin.ADMIN_PASS_ENV not in node._env
+    assert rigadmin.ADMIN_PASS_ENV not in node._env
     assert node._env["MEFOR_SECURITY_REQUIRE_MFA"] == "false"
 
     await node.start()

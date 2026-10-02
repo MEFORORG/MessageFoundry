@@ -595,10 +595,10 @@ def test_a_zero_lockout_never_refuses_the_next_attempt(minutes: int, escalate: b
 
 
 def test_sign_in_limiter_and_lockout_off_with_sign_in_off_are_NOT_loosenings() -> None:
-    """CONDITIONAL on sign-in: with it off there is no sign-in to limit, and the sign-in-off posture
-    is reported under its own switch."""
+    """CONDITIONAL on sign-in: with it off there is no sign-in to limit. Only an app an embedder or a
+    test builds can have it off; `serve` always requires it (vault BACKLOG #2719)."""
     named = _names(
-        sec=SecuritySettings(require_sign_in=False),
+        sec=SecuritySettings(),
         auth=AuthSettings(
             enabled=False,
             login_rate_limit_enabled=False,
@@ -610,25 +610,29 @@ def test_sign_in_limiter_and_lockout_off_with_sign_in_off_are_NOT_loosenings() -
             mfa_verify_min_elapsed_seconds=0,
         ),
     )
-    assert "require_sign_in" in named
     assert not _SIGN_IN_FIELDS & set(named)
     assert "mfa_verify_min_elapsed_seconds" not in named
     # The OIDC-gated entries sit behind the sign-in gate too.
     federated = _names(
-        sec=SecuritySettings(require_sign_in=False),
-        auth=_oidc(oidc_callback_min_elapsed_seconds=0, oidc_flow_cache_max=1_000_000_000),
+        sec=SecuritySettings(),
+        auth=_oidc(
+            enabled=False, oidc_callback_min_elapsed_seconds=0, oidc_flow_cache_max=1_000_000_000
+        ),
     )
     assert "oidc_callback_min_elapsed_seconds" not in federated
     assert "oidc_flow_cache_max" not in federated
 
 
-def test_gated_on_the_security_switch_not_a_stale_auth_section() -> None:
-    """`security set` passes the NEW [security] beside the [auth] it read before the edit, so
-    turning sign-in on there must show these entries at once."""
-    stale = AuthSettings(enabled=False, login_rate_limit_enabled=False, lockout_minutes=0)
-    named = _names(sec=SecuritySettings(require_sign_in=True), auth=stale)
+def test_the_limiter_entries_are_gated_on_auth_enabled() -> None:
+    """The gate reads [auth].enabled. [security] has no sign-in switch any more (vault BACKLOG
+    #2719), so `security set` cannot turn sign-in on beside a stale [auth]."""
+    weak = {"login_rate_limit_enabled": False, "lockout_minutes": 0}
+    named = _names(sec=SecuritySettings(), auth=AuthSettings(**weak))  # type: ignore[arg-type]
     assert "login_rate_limit_enabled" in named
     assert "lockout_minutes" in named
+    # CONTROL: the same weakening with sign-in off is not named.
+    off = _names(sec=SecuritySettings(), auth=AuthSettings(enabled=False, **weak))  # type: ignore[arg-type]
+    assert "login_rate_limit_enabled" not in off
 
 
 def test_a_disabled_limiter_does_not_also_report_its_zeroed_parts() -> None:
@@ -915,7 +919,7 @@ def test_a_trust_every_peer_proxy_entry_is_a_named_loosening(entry: str) -> None
     api = _proxied("10.0.0.1", entry)
     assert _names(api=api) == ["trusted_proxies"]
     # Not gated on sign-in: a forged source address poisons the audit trail either way.
-    no_auth = _names(sec=SecuritySettings(require_sign_in=False), api=api)
+    no_auth = _names(api=api, auth=AuthSettings(enabled=False))
     assert "trusted_proxies" in no_auth
 
 
@@ -1124,13 +1128,12 @@ def test_plain_ldap_with_the_opt_in_is_refused_at_load_under_enforce(tmp_path: P
         # A loopback ldap:// (an on-box LDAPS proxy): the cleartext-hop gradient's loopback ALLOW was
         # deliberately not extended to this hop.
         ("", "ldap://127.0.0.1:389"),
-        # Sign-in off ([auth].enabled lives at [security].require_sign_in, ADR 0118): nothing dials the
-        # directory yet, but turning sign-in on would make the bind live with no second check.
-        ("[security]\nrequire_sign_in = false\n", "ldap://dc.test.invalid:389"),
+        # The sign-in-off case that sat here went with the switch (vault BACKLOG #2719): no config
+        # can turn sign-in off any more.
     ],
-    ids=["loopback", "sign_in_off"],
+    ids=["loopback"],
 )
-def test_the_enforce_refusal_has_no_loopback_or_sign_in_carve_out(
+def test_the_enforce_refusal_has_no_loopback_carve_out(
     tmp_path: Path, prefix: str, server: str
 ) -> None:
     path = tmp_path / "messagefoundry.toml"
@@ -1172,7 +1175,8 @@ def test_the_opt_in_with_sign_in_off_is_not_named() -> None:
     """Nothing builds the authenticator with sign-in off, so there is no live bind to report."""
     auth = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True)
     assert "ad_allow_insecure_ldap" in _risks(SecuritySettings(), auth)
-    assert "ad_allow_insecure_ldap" not in _risks(SecuritySettings(require_sign_in=False), auth)
+    off = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True, enabled=False)
+    assert "ad_allow_insecure_ldap" not in _risks(SecuritySettings(), off)
 
 
 def test_an_ldaps_server_under_enforce_still_loads(tmp_path: Path) -> None:

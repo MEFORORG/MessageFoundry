@@ -113,7 +113,6 @@ def test_security_section_is_canonical(tmp_path: Path) -> None:
     # Every posture switch resolves FROM [security] into the internal field it replaces...
     s = _load(
         tmp_path,
-        "security.require_sign_in = false\n"
         "security.require_mfa = false\n"
         "security.block_unlisted_outbound = true\n"
         "security.serve_web_console = true\n"
@@ -125,7 +124,8 @@ def test_security_section_is_canonical(tmp_path: Path) -> None:
         "security.allow_unencrypted_phi = true\n"
         "security.production_instance = false\n",
     )
-    assert s.auth.enabled is False and s.auth.require_mfa is False
+    # Sign-in has no switch any more (vault BACKLOG #2719), so a loaded config always has it on.
+    assert s.auth.enabled is True and s.auth.require_mfa is False
     assert s.egress.deny_by_default is True
     assert s.api.serve_ui is True
     assert s.retention.messages_days == 45 and s.retention.allow_unbounded_phi is True
@@ -138,7 +138,6 @@ def test_security_section_is_canonical(tmp_path: Path) -> None:
     legacy = [
         ('[api]\nhost = "0.0.0.0"\n', "local_access_only"),
         ("[api]\nserve_ui = true\n", "serve_web_console"),
-        ("[auth]\nenabled = false\n", "require_sign_in"),
         ("[auth]\nrequire_mfa = false\n", "require_mfa"),
         ("[egress]\ndeny_by_default = true\n", "block_unlisted_outbound"),
         ("[store]\nallow_unencrypted_phi = true\n", "allow_unencrypted_phi"),
@@ -166,6 +165,29 @@ def test_security_section_is_canonical(tmp_path: Path) -> None:
     # ONE of the nineteen gates relaxed can find the one they actually meant.
     with pytest.raises(ValueError, match="allow_unencrypted_phi"):
         _load(tmp_path, "security.handles_real_patient_data = false\n")
+
+
+def test_the_sign_in_switch_is_refused_as_removed_in_every_form(tmp_path: Path) -> None:
+    """``serve`` always requires sign-in (vault BACKLOG #2719). The switch that turned it off, and the
+    ``[auth]`` key it had replaced, are refused as REMOVED, from the file and from the environment,
+    whatever value they carry. ``true`` is refused too: the key no longer exists to agree with."""
+    for toml in (
+        "security.require_sign_in = false\n",
+        "security.require_sign_in = true\n",
+        "[auth]\nenabled = false\n",
+        "[auth]\nenabled = true\n",
+    ):
+        with pytest.raises(ValueError, match=r"was REMOVED.*BACKLOG #2719") as excinfo:
+            _load(tmp_path, toml)
+        # The unknown-key refusal would offer `require_mfa` as the nearest spelling, which steers an
+        # operator from one loosening to another. The removed-key text must not.
+        assert "did you mean" not in str(excinfo.value)
+        assert "moved to" not in str(excinfo.value)
+    for var in ("MEFOR_SECURITY_REQUIRE_SIGN_IN", "MEFOR_AUTH_ENABLED"):
+        with pytest.raises(ValueError, match="was REMOVED"):
+            _load(tmp_path, "", environ={var: "false"})
+    # CONTROL: the same loader accepts the switch beside it, so the refusal is about this key.
+    assert _load(tmp_path, "security.require_mfa = true\n").auth.enabled is True
 
 
 def test_web_console_on_by_default(tmp_path: Path) -> None:
@@ -276,7 +298,8 @@ def test_secure_defaults_applied(tmp_path: Path) -> None:
     # disabling it (serve_web_console=false) SHRINKS the /ui attack surface, so on IS the default here.
     assert d.serve_web_console is True
     assert d.encrypt_stored_data is True and d.allow_unencrypted_phi is False
-    assert d.require_sign_in is True and d.require_mfa is True
+    assert d.require_mfa is True
+    assert "require_sign_in" not in SecuritySettings.model_fields  # vault BACKLOG #2719
     assert d.sign_out_after_idle_minutes == 30 and d.max_session_hours == 12
     assert d.block_unlisted_outbound is True
     assert d.delete_message_bodies_after_days == 30
@@ -587,7 +610,7 @@ def test_unknown_security_key_delivered_by_env_is_refused(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match=r"\[security\]\.block_unlisted_outboud"):
         _load(
             tmp_path,
-            "[security]\nrequire_sign_in = true\n",
+            "[security]\nrequire_mfa = true\n",
             {"MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUD": "true"},
         )
 
