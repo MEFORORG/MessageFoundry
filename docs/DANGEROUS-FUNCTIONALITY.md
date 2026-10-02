@@ -141,6 +141,28 @@ that is the repository's own scanner. From an installed wheel, the walk continue
 folder, so a file planted at that path in any parent folder would run. It serves the
 de-identification leak check only, and is not on the message path.
 
+`_child_bootstrap.py` loads the engine package by path, then runs a module by name. It is the
+script a Python child starts through when the engine builds the child's command line with
+`python_child_argv` in `childenv.py`. At least three kinds of child do: the sandbox worker, each
+engine shard, and the child that loads the config before any shard starts. The tray's own Python
+start does not. The child runs with `-P`, which keeps the working directory off its import path. In
+a source checkout that is not installed, that also hides the package, so the script does three
+things:
+
+1. It puts the folder above the package on the import path, after the standard library and ahead
+   of site-packages. It skips this when that folder is on the path already, which is the installed
+   case.
+2. It loads the `messagefoundry` package from the folder the script sits in, by file location,
+   before anything can import it by name.
+3. It runs the module named on its command line, the way `python -m` would.
+
+**What holds it.** The path is the script's own folder, never a setting. Each caller passes a
+module name fixed in the code, so nothing from a message or a configuration file reaches that
+command line. The engine starts the script and never imports it. One edge is worth knowing. In a
+source checkout, the folder above the package is the checkout's root. A file there named like an
+installed third-party package would load in that package's place, inside each of these children.
+An installed engine does not reach that edge, because the folder above its package is site-packages.
+
 ---
 
 ## 4. The engine starts processes
