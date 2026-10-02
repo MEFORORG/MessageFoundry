@@ -52,41 +52,33 @@ MLLP, DICOM and X12 listeners and the operator API. It has no row for some liste
 For the TLS and peer controls on each listener, see the
 [channel matrix](DEPLOYMENT.md#channel--tls-posture-matrix).
 
-## Each outbound hop has its own limit on the target, and some have none
+## Each outbound hop has its own setting for the target
 
-At least these hops dial out. The table says which setting limits each target, and what an empty
-list means. The engine's own update check makes no network call: `[update_check].mode` accepts only
-`local`.
+At least these hops dial out. The table names the setting that sets or limits each target. The
+engine's own update check makes no network call: `[update_check].mode` accepts only `local`.
 
-| Outbound hop | Setting that limits the target | An empty list means | Read more |
-|---|---|---|---|
-| Outbound Connections, the `db_lookup` and `fhir_lookup` reads, and database-poll and remote-file inbound Connections | The `[egress].allowed_*` destination lists | Refuse every destination of that type while `[security].block_unlisted_outbound` is on. Allow any destination of that type while it is set to false | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
-| SMART and OAuth2 token endpoints | `[egress].allowed_http` | The same | `_check_credential_token_url_egress` in `messagefoundry/pipeline/wiring_runner.py` |
-| Forward web proxy | `[egress].allowed_proxy` | Refuse a proxy address. The `default` value is exempt: the environment or operating system names that proxy, not the config | [CONFIGURATION.md](CONFIGURATION.md#egress) |
-| AI assistance broker | `[ai].allowed_endpoints` | Refuse the endpoint | [CONFIGURATION.md](CONFIGURATION.md#ai--ai-coding-assistance-policy) |
-| OpenID Connect identity provider | `[auth].oidc_allowed_endpoints` | Refused at load while OpenID Connect is on | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
-| Alert webhook and alert email | `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts` | Any host | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
-| Active Directory over LDAP | One target, `[auth].ad_server` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
-| Store database on SQL Server or PostgreSQL | One target, `[store].server`. The default SQLite store is a local file | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
-| HashiCorp Vault, for the store key or for Connection secrets | One target each: `MEFOR_STORE_VAULT_ADDR` and `MEFOR_SECRETS_VAULT_ADDR`. With one unset, the Vault client falls back to its own `VAULT_ADDR` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
-| Syslog forwarding and the startup clock check | `[logging].forward_host` and `[logging].ntp_peer` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
-| Startup TLS-floor probe, behind a declared TLS terminator under `enforce` | One target, `[security].web_console_public_address` | No list | `probe_tls_floor` in `messagefoundry/config/tls_probe.py` |
-| Backup to a network share | `[backup].destination` | No list | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| Outbound hop | Setting that names or limits the target | Read more |
+|---|---|---|
+| Outbound Connections, the `db_lookup` and `fhir_lookup` reads, and database-poll and remote-file inbound Connections | The `[egress].allowed_*` destination lists | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
+| SMART and OAuth2 token endpoints | `[egress].allowed_http` | `_check_credential_token_url_egress` in `messagefoundry/pipeline/wiring_runner.py` |
+| A forward web proxy that the config names by address | `[egress].allowed_proxy` | `_check_forward_proxy_egress` in `messagefoundry/pipeline/wiring_runner.py` |
+| AI assistance broker | `[ai].allowed_endpoints` | [CONFIGURATION.md](CONFIGURATION.md#ai--ai-coding-assistance-policy) |
+| OpenID Connect identity provider | `[auth].oidc_allowed_endpoints` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| Alert webhook and alert email | `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts` | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
+| Active Directory over LDAP | One target, `[auth].ad_server` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| Store database on SQL Server or PostgreSQL | One target, `[store].server`. The default SQLite store is a local file | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| HashiCorp Vault, for the store key or for Connection secrets | One target each: `MEFOR_STORE_VAULT_ADDR` and `MEFOR_SECRETS_VAULT_ADDR`. With one unset, the Vault client falls back to its own `VAULT_ADDR` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| Syslog forwarding and the startup clock check | `[logging].forward_host` and `[logging].ntp_peer` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
+| Startup TLS-floor probe, behind a declared TLS terminator under `enforce` | One target, `[security].web_console_public_address` | `probe_tls_floor` in `messagefoundry/config/tls_probe.py` |
+| Backup to a network share | `[backup].destination` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 
-The table leaves out at least these:
+What an empty or unset list permits differs by setting and by `[security].block_unlisted_outbound`.
+This page does not restate it. Read each setting's entry in [CONFIGURATION.md](CONFIGURATION.md)
+before you rely on it.
 
-- An inbound File Connection is outside the `[egress]` lists. `[egress].allowed_file_dirs` bounds
-  File destinations only.
-- With `auth = entra`, a database hop adds a second target. The ODBC driver gets its own token, and
-  no MessageFoundry setting names where from.
-- Kerberos sign-in and the browser leg of OpenID Connect are in the infrastructure-hops table.
-
-Once `serve` is past the open-egress guard below, it turns `[security].block_unlisted_outbound` on
-if the operator left it unset.
-
-A host firewall is the layer under all of this. For the "No list" rows, the engine has no
-allow-list of its own. [ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) lists ports
-for some of these hops. It says to mirror each outbound firewall rule with its allow-list entry.
+A host firewall is the layer under all of this.
+[ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) lists ports for some of these hops.
+It says to mirror each outbound firewall rule with its allow-list entry.
 
 ## At startup, `serve` guards stop the engine and a listener guard fails one Connection
 
@@ -102,7 +94,7 @@ Each one is in `_serve` in `messagefoundry/__main__.py`.
 | Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
 | Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |
 | Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
-| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. `_serve` says which lists count |
+| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. `egress_open` in `messagefoundry/__main__.py` holds the rule |
 
 Under `enforcement = warn`, the proxy-attestation and open-egress guards only warn, and the
 operator-bind guard accepts the override that DEPLOYMENT.md describes. The sign-in, revocation and
@@ -122,9 +114,9 @@ At least two more listener checks fail a Connection under `enforce`, and `tls_ho
 neither. `check_inbound_revocation` covers a mutual-TLS listener, and `tls_crl_file` or
 `tls_revocation_attested` clears it. `check_http_intake_auth` covers a non-loopback HTTP listener,
 which [CONNECTIONS.md](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023)
-describes. Both are in the same file. They run when each inbound Connection starts. So a running
-engine does not prove that every listener passed. On a config reload the same refusal fails the
-whole reload.
+describes. Both checks are in `messagefoundry/pipeline/wiring_runner.py`. They run when each inbound
+Connection starts. So a running engine does not prove that every listener passed. On a config reload
+the same refusal fails the whole reload.
 
 **The operator socket serves TLS in every topology but one.** With no operator certificate, the
 engine mints a self-signed pair on first run and serves TLS with it. The exception is
@@ -135,20 +127,12 @@ has the detail.
 
 `[security].allowed_client_networks` is a second layer. It does not limit who can reach the socket.
 It refuses a request whose client address is outside the listed networks. It is empty by default,
-which means no restriction. At least these limits apply:
+which means no restriction.
 
-- The check runs after the engine accepts the connection.
-- `/health` is exempt, and loopback is always allowed.
-- A proxy the engine was not told about, or address translation in front, hides the client address.
-  The list then cannot tell those clients apart. Behind an undeclared proxy that forwards over loopback,
-  it admits every request. `messagefoundry/api/client_networks.py` describes the cases.
-- It does not cover the inbound Connection listeners. Each of those takes its own
-  `source_ip_allowlist`.
-
-So keep a host firewall as the first layer.
+The check has limits, so keep a host firewall as the first layer.
 [ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)
-has the detail. [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says what turning a protective
-switch off costs.
+names the topologies where it has no effect. [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says
+what turning a protective switch off costs.
 
 ## What sits on disk is listed in PHI.md
 
@@ -161,16 +145,17 @@ switch off costs.
 
 ## Read your own instance's lists
 
-No one command gives the whole answer. Each row below has a stated gap.
+No single source gives the whole answer. Each one below has gaps that this page does not list. The
+operating system's socket list is the direct answer for what is listening.
 
-| Question | Where to read it | What it leaves out |
-|---|---|---|
-| What is listening on the host? | The operating system's socket list, such as `Get-NetTCPConnection -State Listen` on Windows | This is the direct answer. It does not say which Connection owns a socket |
-| Which Connections exist, and of what type? | `messagefoundry graph --config <config dir> --json` | It imports the config modules, so it runs their code. It prints each Connection's type and authored settings. It does not print the bind address, and an `env()` value shows as a placeholder |
-| What is a running engine serving? | `GET /connections` | Needs the `monitoring:read` permission. One row per endpoint, with its method. It shows no bind address, and it fills a port for MLLP rows only. It shows only what the caller's scope and the answering engine shard cover |
-| Which protective switches are off on a running engine? | `GET /security/posture` | It reports the engine shard that answers |
-| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` | It reads the authored file, not the running service. It does not see the service's environment or command line, or any Connection. A path that does not exist is not an error: it prints shipped defaults. When `loosenings_partial` is true, the list can miss entries. Its `loosenings_scope` field names some of these gaps. `_security` in `messagefoundry/__main__.py` is the source |
-| Which Connections carry a loosening, across all engine shards? | `messagefoundry check --config <config dir>` | It also runs the config modules. It opens no store |
+| Question | Where to read it |
+|---|---|
+| What is listening on the host? | The operating system's socket list, such as `Get-NetTCPConnection -State Listen` on Windows |
+| Which Connections exist, and of what type? | `messagefoundry graph --config <config dir> --json` |
+| What is a running engine serving? | `GET /connections` |
+| Which protective switches are off on a running engine? | `GET /security/posture` |
+| Which switches does the settings file turn off? | `messagefoundry security show --service-config <file>` |
+| Which Connections carry a loosening, across all engine shards? | `messagefoundry check --config <config dir>` |
 
 ## `messagefoundry verify` does not measure exposure
 
@@ -185,8 +170,7 @@ It does not check at least these, read from `messagefoundry/verify/`:
   whether a few ports are free on `127.0.0.1`.
 - The ports your Connections bind. The `host.ports` row does not read your config directory.
 - The operator bind and its TLS. The `manual.tls` row is MANUAL. A person confirms it.
-- Egress. No row reads an `[egress]` list, and `verify` dials no partner. The self smoke is a dry run
-  with no network. The live smoke sends one message to the engine's own listener.
+- Egress. No row reads an `[egress]` list.
 - Loosenings. No row reads the loosening list. Use the posture read-out above.
 - Known vulnerabilities. `verify` reads no advisory feed and no software bill of materials.
 
@@ -198,7 +182,7 @@ rest of its limits.
 
 | Input | Document | What to take from it |
 |---|---|---|
-| Component inventory | [SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) | Each release carries a software bill of materials (SBOM) for Linux and one for Windows, a Vulnerability Exploitability eXchange (VEX) file, and signatures. Scan the SBOM for the platform you run. It covers the engine's core install only. It leaves out at least the optional extras, the web console wheel and the toolkit wheel |
+| Component inventory | [SUPPLY-CHAIN.md](SUPPLY-CHAIN.md) | Each release carries a software bill of materials (SBOM) for Linux and one for Windows, a Vulnerability Exploitability eXchange (VEX) file, and signatures. Scan the SBOM for the platform you run. The document says what each SBOM covers |
 | How the project ranks a dependency vulnerability | [.github/SECURITY.md](../.github/SECURITY.md#dependency-third-party-vulnerabilities) | Known exploited first (the CISA Known Exploited Vulnerabilities list), then the Exploit Prediction Scoring System (EPSS) score. The Common Vulnerability Scoring System (CVSS) score only breaks ties |
 | How long an old version stays covered | [SUPPORT-POLICY.md](SUPPORT-POLICY.md) | Only the latest release is supported, with no back-port. A clock runs on adopting each security release, and the page gives the days |
 
