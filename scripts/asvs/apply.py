@@ -738,9 +738,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     if args.scope is not None:
-        declared = {s.strip() for s in args.scope.split(",") if s.strip()}
-        written = set(payload_ids)
-        unscoped, unwritten = sorted(written - declared), sorted(declared - written)
+        in_scope = {s.strip() for s in args.scope.split(",") if s.strip()}
+        in_payload = set(payload_ids)
+        unscoped, unwritten = sorted(in_payload - in_scope), sorted(in_scope - in_payload)
         if unscoped or unwritten:
             print("REFUSING: the payload's cells do not match the declared scope.")
             # BOTH DIRECTIONS, NAMED SEPARATELY. Writing a cell nobody declared is the #1476 shape;
@@ -813,7 +813,11 @@ def main(argv: list[str] | None = None) -> int:
         if not anchor_repair:
             required = required + ("reviewed_by",)
         for field in required:
-            if not c.get(field) and c.get(field) != 0:
+            value = c.get(field)
+            # A WHITESPACE-ONLY STRING IS MISSING TOO (BACKLOG #2276). It is truthy, so it passed
+            # here, and over a cell with no `reviewed_by` table no later guard caught it: the
+            # writer landed a blank that states nothing.
+            if (not value and value != 0) or (isinstance(value, str) and not value.strip()):
                 problems.append(f"{c.get('id')}: missing {field}")
         if c.get("verdict") not in VERDICTS:
             problems.append(f"{c.get('id')}: bad verdict {c.get('verdict')!r}")
@@ -830,9 +834,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"{type(c['review_notes']).__name__}"
             )
         # THE LEGACY PLAIN STRING IS REFUSED (BACKLOG #2168). The record is migrated and the loader
-        # refuses one, so writing it would land a cell the next verify cannot load. A blank string
-        # is not the legacy form and is not refused here; an empty one is the "missing" refusal
-        # above. The one-way migration guards that stood here went with the form.
+        # refuses one, so writing it would land a cell the next verify cannot load. A blank string,
+        # empty or whitespace-only, is not the legacy form and is not refused here; outside an
+        # anchor repair it is the "missing" refusal above (BACKLOG #2276), and inside one the prose
+        # byte-identity check refuses any change. The one-way migration guards that stood here went
+        # with the form.
         now_rb = c.get("reviewed_by")
         if isinstance(now_rb, str) and now_rb.strip():
             problems.append(

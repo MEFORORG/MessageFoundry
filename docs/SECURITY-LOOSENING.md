@@ -50,8 +50,7 @@ section reference.
 | | `allow_unencrypted_phi_under_strict_enforcement` | `false` |
 | In-use data protection | `memory_encryption_operator_declared` | `false` (ADR 0152 — *not* a loosening: it ASSERTS a host property rather than giving one up. Its absence on an exposed PHI instance warns at every start) |
 | | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property that cannot be satisfied on Windows) |
-| Sign-in & identity | `require_sign_in` | `true` |
-| | `require_mfa` | `true` |
+| Sign-in & identity | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
@@ -257,13 +256,24 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   longer enough** — keyless start additionally requires `allow_unencrypted_phi_under_strict_enforcement = true`
   (below), otherwise `serve` exits 2.
 
-### `require_sign_in = false` — disable authentication
-- **What you lose:** every request runs as a full-privilege *system* identity; no RBAC.
-- **When acceptable:** a **loopback-only** embedding/dev harness.
-- **Compensating controls:** a loopback bind with no declared TLS terminator only.
-- **Still refused:** an exposed instance with auth off — a non-loopback bind, **or** a loopback bind behind a
-  declared TLS terminator — is a **hard refuse** — serving full-privilege admin to the network is never one "I
-  accept the risk" away, at any posture.
+### `require_sign_in` — RETIRED, and refused at load
+This section is kept rather than deleted, because the compensating control it named rested on a
+false premise.
+- **It said:** turning sign-in off was acceptable for a loopback-only embedding or dev harness, with
+  *"a loopback bind with no declared TLS terminator"* as the compensating control.
+- **Why it went (vault BACKLOG #2719):** a loopback bind limits who can reach the API, not who did.
+  Every request ran as one shared system identity, so each audit row named the same actor and the
+  same address, and one local user could not be told from another or from a process. Every
+  instance carries patient data (ADR 0186), so the mode had no in-scope use. It could not repair
+  an account either: with no auth service, creating an account, unbinding one and reading the audit
+  log all answered 503.
+- **What replaced it:** nothing. `serve` refuses to start with sign-in off, on every bind, at any
+  `enforcement` level. A config or environment that still sets `[security].require_sign_in`, or the
+  `[auth].enabled` key it had replaced, is refused at load as REMOVED. For a site whose every
+  Administrator signs in through an outside service, the answer is a local Administrator made
+  before the outage ([SECURITY.md](SECURITY.md#keep-a-local-administrator)).
+- **For embedders and tests only:** the app factories still take `allow_no_auth=True`. `serve` never
+  passes it.
 
 ### `require_mfa = false` — single-factor admin
 - **What you lose:** the Administrator role authenticates with a password only (no native TOTP second
@@ -359,8 +369,8 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **Compensating controls:** front the admin surface with an MFA-enforcing proxy; prefer `require_mfa = true`
   (native TOTP); enable `admin_new_ip_step_up`. A startup **AUDIT** line records the override and the posture
   view (`GET /security/posture`) names it.
-- **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, auth-off to
-  the network, open egress, unbounded retention) — this ack lifts **only** the single-factor-admin refusal,
+- **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, auth off on
+  any bind, open egress, unbounded retention) — this ack lifts **only** the single-factor-admin refusal,
   and only at exposure. `require_mfa` off on a **loopback** bind was never refused (no exposure), so this ack
   is a no-op there.
 
@@ -445,8 +455,8 @@ is refused, so an opt-out does nothing and is not reported.
   is `enforce`-equivalent already).
 - **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings + startup
   **AUDIT** line + posture view keep the deviation visible.
-- **Still refused (even at `warn`):** the **no-auth-to-the-network** hard refuse (`require_sign_in = false` on
-  an exposed instance — a non-loopback bind, or a loopback bind behind a declared TLS terminator) is
+- **Still refused (even at `warn`):** the **no-auth** hard refuse (sign-in off, on any bind, loopback
+  included; vault BACKLOG #2719) is
   unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
@@ -558,7 +568,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 > inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
 > #2354). A loopback `ldap://` address is refused too.
 > It is reported only while a plain bind is live, which needs at least `ad_enabled`,
-> `[security].require_sign_in` and an `ad_server` that is not `ldaps://`.
+> sign-in (always on under `serve`) and an `ad_server` that is not `ldaps://`.
 - **What you lose:** the encryption and the server authentication on the AD hop. Both binds are SIMPLE
   binds, so the service-account password and the password of every user who signs in or steps up cross
   the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
@@ -572,8 +582,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
-> **Conditional** on sign-in. With `[security].require_sign_in = false` there is no session for the signal to
-> guard, so it is reported **only** while auth is on. The default is `true` since BACKLOG #288
+> **Conditional** on sign-in. An app an embedder builds with sign-in off has no session for the signal to
+> guard, so it is reported **only** while auth is on, which `serve` always is. The default is `true` since BACKLOG #288
 > (owner ruling 2026-09-26); before that it shipped off, with an exposure-time advisory.
 - **What you lose:** a session token presented from a **client address it has not verified from**
   can perform a sensitive admin action on the strength of the ordinary step-up window alone. Nothing
@@ -589,8 +599,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
 
 ### `[auth].login_rate_limit_enabled = false`, or a limit looser than its default — sign-in attempts go less paced
-> **Conditional** on sign-in, like `admin_new_ip_step_up`: with `[security].require_sign_in = false` there
-> is no sign-in to limit. Each of these values is reported under its own key
+> **Conditional** on sign-in, like `admin_new_ip_step_up`: an app an embedder builds with sign-in off has
+> no sign-in to limit, and `serve` always requires it. Each of these values is reported under its own key
 > ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). The owner ruled on 2026-09-27 that a silent weakening here
 > keeps ASVS 6.1.1 at partial.
 >
@@ -1229,16 +1239,18 @@ This section is kept rather than deleted, because the claim it used to make is t
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
   line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook
   for their own process and report nothing.
-- **A default start reports `remote_debug_enabled`.** `messagefoundry serve` runs through a
-  console-script launcher, which cannot pass an interpreter option, so the interface stays on. The
-  installed service and the container image start the same way, and neither sets the option or the
-  variable yet.
+- **A start through the console script reports `remote_debug_enabled`.** `messagefoundry serve`
+  runs through a console-script launcher, which cannot pass an interpreter option, so the
+  interface stays on. A developer's own start reports it, and so does each CI leg that starts the
+  engine that way.
+- **The two shipped service launches report neither entry** (vault BACKLOG #2701). The Windows
+  installer and the container image start the interpreter itself, with
+  `-I -X disable-remote-debug`, so the interface is off before any engine code runs.
 - **How to clear it:** start the engine as
-  `python -P -X disable-remote-debug -m messagefoundry serve ...`. Spell the option with hyphens: the
-  interpreter accepts the underscore spelling and ignores it. `-P` keeps the working directory off
-  the import path, which `python -m` would otherwise put first.
-  `PYTHON_DISABLE_REMOTE_DEBUG=1` in the engine's environment also works, but the interpreter
-  ignores it under `-I` or `-E`.
+  `python -I -X disable-remote-debug -m messagefoundry serve ...`. Spell the option with hyphens: the
+  interpreter accepts the underscore spelling and ignores it. `-I` keeps the working directory off
+  the import path, which `python -m` would otherwise put first. It also makes the interpreter
+  ignore `PYTHON_DISABLE_REMOTE_DEBUG=1`, so with `-I` the option is the only form that works.
 - **It is not refused**, at any `enforcement` level. A refusal would stop every start through the
   console script.
 - **Attach debugging goes with it.** `python -m pdb -p <pid>` uses this interface, so it cannot
@@ -1249,6 +1261,95 @@ This section is kept rather than deleted, because the claim it used to make is t
   `python -m pdb -m messagefoundry <command>`, which does not use the interface. That reaches
   the command's own process. Router and Handler bodies that run in a sandbox worker
   (`[sandbox].mode = "subprocess"`) are in a child process, which it does not reach.
+
+### `interpreter_not_isolated`, `startup_code_unexpected` and `startup_directory_writable`: what runs in the interpreter before the engine does
+
+> **OBSERVATIONS, not switches.** No setting declares them. They follow from how the engine's
+> interpreter was started and where it is installed. Vault BACKLOG #2701.
+- **What they are about:** two things put code inside a Python process before its first line
+  runs. The `PYTHON*` environment variables change where the interpreter imports from. And the
+  interpreter runs start-up code: every line of a `.pth` file in a site directory that begins
+  with `import`, and a module named `sitecustomize` found anywhere on the import path. Either
+  would run inside the engine, with the store key, the connection secrets and the messages in
+  flight.
+- **`interpreter_not_isolated`: the interpreter was started without `-I`.** It then reads the
+  `PYTHON*` variables, unless it was started with `-E`, so a `PYTHONPATH` or `PYTHONHOME` left in
+  the service's environment decides what the engine imports. Another product's installer can
+  leave one behind. The entry names the variables that are set.
+- **`python_variables_reach_children`: the engine ignores a variable its children would honour.**
+  The engine ignores the `PYTHON*` variables, and `PYTHONPATH`, `PYTHONHOME`, `PYTHONPLATLIBDIR`,
+  `PYTHONPYCACHEPREFIX` or `PYTHONUSERBASE` is set in its environment. The Python children it
+  starts (the sandbox worker, and each engine shard under `supervise`) are not isolated, and the
+  engine hands them these variables by name. Remove the variable from the service's environment.
+- **`startup_code_unexpected`: a `.pth` import line or a customize module the engine does not
+  know.** The entry names each file. A file is expected in three cases, and in no other:
+  1. An installed package lists it in its `RECORD` with a matching hash. That covers the `.pth`
+     an editable install writes, the one `setuptools` ships, and any other that came with a
+     package.
+  2. It is a `sitecustomize` in the base interpreter's own standard library directory. Some
+     operating-system builds ship one. A virtual environment's own library folder does not count.
+  3. It is `_virtualenv.pth` holding exactly `import _virtualenv`, in an environment whose
+     `pyvenv.cfg` says `virtualenv` or `uv` made it. Those tools write that file into every
+     environment they create; `python -m venv` does not. The module the line imports is not
+     checked.
+
+  What is and is not listed:
+  - A `.pth` file with no `import` line only adds directories to the import path. It is not
+    start-up code and is not listed.
+  - `usercustomize` is listed only where the user site directory is on, which is the only place
+    the interpreter imports it. It is off under `-I` and in a virtual environment.
+  - The search covers the engine's own import path and the absolute `PYTHONPATH` entries the
+    engine hands its Python children. So a `sitecustomize` that only a child would run is listed
+    too, and `supervise` refuses on it before it starts an engine shard.
+- **`startup_directory_writable`: the engine's own account can add a file where start-up code is
+  read from.** That is a site directory, or any directory on the import path, where a
+  `sitecustomize` would be found. Code running as that account could plant start-up code there,
+  and it would run at the next start, ahead of the check that looks for it.
+  `startup_directory_unchecked` says the engine could not tell. Neither is a clean reading. An
+  import-path entry that is an archive is not checked.
+  **The answer is the running process's, not a reading of the permissions.** On Windows the
+  engine opens each directory and lets Windows judge its token. So a write-restricted service
+  token reads as it really is. And an engine started from an elevated session whose token holds
+  the restore privilege switched on reads every directory as writable, whatever the permissions
+  say, because that process could write there. Changing permissions does not clear that one; a
+  service the installer set up does not hold the privilege
+  ([`SERVICE.md`](SERVICE.md#restrict-the-service-token)).
+- **The inventory is detection. The directory's permissions are the prevention.** Start-up code
+  runs before any engine code, so a planted file could change what the inventory reads or skip
+  it. And the list of expected files sits in the directory it describes, so whoever can write the
+  directory can write a matching row. The inventory catches an honest mistake and a careless
+  plant. Install the engine where the service account can read and cannot write.
+- **What is refused:** under `[security].enforcement = "enforce"`, `serve` and `supervise` refuse
+  to start on `startup_code_unexpected`, before they open the store or bind a port. Under `warn`
+  they start and report it. The other entries are never refused, at any level: a developer's own
+  environment is not isolated and is writable by construction.
+- **What a development start reports:** `interpreter_not_isolated` and
+  `startup_directory_writable`, beside `remote_debug_enabled`. It does not refuse: an editable
+  install's `.pth` is recorded by its package, and `python -m venv` writes no `.pth` of its own.
+  **A start under a tool that injects a `sitecustomize` through `PYTHONPATH` does refuse**, unless
+  an installed package records that file. Some debuggers and tracing agents work this way.
+- **What the shipped service launches report:** the Windows installer and the container image
+  start the interpreter with `-I`, so neither reports `interpreter_not_isolated`. The image copies
+  its virtual environment owned by root, and the engine runs as another user, so it does not
+  report `startup_directory_writable`. **On Windows that entry depends on the install.** The
+  installer does not change the permissions of the virtual environment, so the reading follows
+  from each directory's own permissions and from the service token.
+  [`SERVICE.md`](SERVICE.md#the-service-launch) says what to check.
+- **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
+  for the engine's own process. The posture's `interpreter` block carries the whole reading: the
+  flags, each file found with its verdict, and the directories. `supervise` logs one WARNING for
+  each entry at start for the supervisor process. `messagefoundry security show` is a separate
+  process, so it reports none of them, and its scope line says so.
+- **The reading is taken once, at start.** Start-up code runs when the interpreter starts, so a
+  file added later has not run in this process. Restart the engine to read again.
+- **How to clear them:** start the engine as
+  `python -I -X disable-remote-debug -m messagefoundry serve ...`, remove each file the entry names
+  or install it as part of a package, and take the service account's write permission off the
+  directories the entry names.
+- **Not covered**, at least: the import-time code of a third-party package, a file planted and
+  removed between two starts, and a child's user site directory where the engine does not run in
+  a virtual environment. An engine shard reports `interpreter_not_isolated` for itself: the
+  supervisor starts it with `-P`, not `-I`.
 
 ---
 
@@ -1271,7 +1372,6 @@ chapter was not part of the verification above.
 | `serve_web_console`, `web_console_public_address` | V13 Configuration · V3 Web Frontend Security | **SC-7** Boundary Protection · **AC-3** Access Enforcement | §164.312(a)(1) Access Control |
 | `encrypt_stored_data`, `allow_unencrypted_phi` | V11 Cryptography | **SC-28** Protection of Information at Rest · **SC-13** Cryptographic Protection | §164.312(a)(2)(iv) Encryption and Decryption |
 | `allow_unencrypted_phi_under_strict_enforcement` (strict-enforcement ack) | V11 Cryptography | **SC-28** Protection of Information at Rest · **SC-13** Cryptographic Protection | §164.312(a)(2)(iv) Encryption and Decryption |
-| `require_sign_in` | V6 Authentication | **IA-2** Identification and Authentication (Organizational Users) | §164.312(d) Person or Entity Authentication |
 | `require_mfa` | V6 Authentication (multi-factor) | **IA-2(1)/(2)** MFA to Privileged / Non-Privileged Accounts | §164.312(d) Person or Entity Authentication |
 | `allow_single_factor_admin_when_exposed` (production ack) | V6 Authentication (multi-factor) | **IA-2(1)/(2)** MFA to Privileged / Non-Privileged Accounts | §164.312(d) Person or Entity Authentication |
 | `sign_out_after_idle_minutes`, `max_session_hours` | V7 Session Management | **AC-12** Session Termination | §164.312(a)(2)(iii) Automatic Logoff |
@@ -1301,6 +1401,7 @@ chapter was not part of the verification above.
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
+| `interpreter_not_isolated` / `python_variables_reach_children` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

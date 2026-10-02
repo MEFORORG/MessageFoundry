@@ -784,7 +784,7 @@ def test_the_two_copies_of_the_helper_have_not_drifted(tmp_path: Path) -> None:
 # ORDER IS THE DEFECT, so the guards below are about WHERE the normalization happens, not merely that
 # it happens. Three assertions of shape and one of behaviour.
 
-_PATH_PARAMS = ["DataDir", "AppExe", "Config", "DbPath"]
+_PATH_PARAMS = ["DataDir", "AppExe", "PythonExe", "Config", "DbPath"]
 
 
 def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:

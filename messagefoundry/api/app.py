@@ -12,12 +12,12 @@ be driven two ways:
 * :func:`create_managed_app(...)` — own the engine via an ASGI lifespan (the CLI server,
   and anything driven by a synchronous test client).
 
-Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached (the
-``serve`` path attaches one unless ``[security].require_sign_in`` is off). With **no** enabled auth
-attached, both factories are **fail-closed**: every protected route is refused (503) unless the
-caller passes ``allow_no_auth=True`` (embedding / dev), in which case requests run as the
-full-access system identity (SYS-1). ``serve`` passes the opt-in itself when sign-in is off, after
-its own start-up refusals.
+Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached. The
+``serve`` path always attaches one: it refuses to start with sign-in off, on every bind (vault
+BACKLOG #2719). With **no** enabled auth attached, both factories are **fail-closed**: every
+protected route is refused (503) unless the caller passes ``allow_no_auth=True``, in which case
+requests run as the full-access system identity (SYS-1). Only embedders and tests pass it;
+``serve`` never does.
 
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
@@ -146,6 +146,7 @@ from messagefoundry.api.models import (
     GraphResponse,
     Health,
     IntegrityResult,
+    InterpreterView,
     LogInfo,
     LogLevelInfo,
     LogLevelUpdate,
@@ -363,8 +364,9 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
-from messagefoundry.remotedebug import remote_debug_posture
+from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_posture
 from messagefoundry.service_status import query_service_state
+from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
 from messagefoundry.store.content_search import (
@@ -917,13 +919,19 @@ def _posture_security(state: Any) -> SecuritySettings:
 
 
 def _posture_loosenings(
-    state: Any, engine: Engine, runner: RegistryRunner | None
+    state: Any,
+    engine: Engine,
+    runner: RegistryRunner | None,
+    *,
+    remote_debug: RemoteDebugPosture,
+    startup: StartupPosture,
 ) -> tuple[list[tuple[str, str]], str | None]:
     """The active ``security_loosenings()`` entries and the scope note, read off ``state``.
 
     ``GET /security/posture`` and the start's ``config_loaded`` audit row (vault BACKLOG #2597) both
-    call this, so the row records the list the route would report. ``runner`` is passed in rather
-    than read here, so a caller that also reads the graph for something else reads it once."""
+    call this, so the row records the list the route would report. ``runner`` and the two process
+    readings (vault BACKLOG #2700 / #2701) are passed in rather than read here, so a caller that
+    also reports them elsewhere reads each once."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
     security = _posture_security(state)
@@ -995,9 +1003,8 @@ def _posture_loosenings(
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
-            # Vault BACKLOG #2700: read off THIS process, which is the engine. An app built
-            # without `serve` never installed the hook, and the reading then says so.
-            remote_debug=remote_debug_posture(),
+            remote_debug=remote_debug,
+            startup=startup,
         )
     )
     return pairs, loosenings_scope
@@ -1093,7 +1100,13 @@ async def _record_start_audit(
     could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is."""
     switches: list[str] | None
     try:
-        pairs, _scope = _posture_loosenings(app.state, engine, engine.registry_runner)
+        pairs, _scope = _posture_loosenings(
+            app.state,
+            engine,
+            engine.registry_runner,
+            remote_debug=remote_debug_posture(),
+            startup=await asyncio.to_thread(startup_posture),
+        )
         switches = [name for name, _risk in pairs]
     except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
         _log.exception("the start's loosenings list could not be read; config_loaded records None")
@@ -2337,8 +2350,19 @@ def create_app(
         # the registry then reports nothing for it and `store_privilege` below renders the explicit
         # `not_probed` status, so silence never reads as a clean observation.
         store_privilege = getattr(request.app.state, "store_privilege", None)
-        pairs, loosenings_scope = _posture_loosenings(request.app.state, engine, runner)
+        # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
+        # once here, so the loosening list and the `interpreter` block below report one reading.
+        # An app built without `serve` never installed the remote-debugging hook, and the reading
+        # then says so. The start-up reading is the one `serve` took as it started, kept for the
+        # life of the process. An app built without `serve` takes it here, once, and that first
+        # reading reads files, so the call is kept off the event loop.
+        remote_debug = remote_debug_posture()
+        startup = await asyncio.to_thread(startup_posture)
+        pairs, loosenings_scope = _posture_loosenings(
+            request.app.state, engine, runner, remote_debug=remote_debug, startup=startup
+        )
         loosenings = [SecurityLoosening(switch=name, risk=risk) for name, risk in pairs]
+        interpreter_view = InterpreterView.from_readings(startup, remote_debug)
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
         # read live off the running graph, like the loosenings above; the settings half from the resolved
         # service configuration `serve` stashed (`cred_settings`, read above with `security`, so the
@@ -2429,6 +2453,7 @@ def create_app(
             store_privilege=store_privilege_view,
             static_credential_hops=static_hops,
             static_credential_hops_scope=static_hops_scope,
+            interpreter=interpreter_view,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
             kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?

@@ -249,10 +249,10 @@ def test_the_retired_bootstrap_timers_are_refused_as_unknown_keys(tmp_path: Path
 
 
 def test_a_relocated_key_keeps_its_specific_message(tmp_path: Path) -> None:
-    # [auth].enabled IS a real field, so it is refused by _reject_relocated_keys with the message that
-    # names its new home — the generic unknown-key refusal must not shadow it.
-    cfg = _write(tmp_path / "messagefoundry.toml", "[auth]\nenabled = true\n")
-    with pytest.raises(ValueError, match=r"moved to \[security\]\.require_sign_in"):
+    # [auth].require_mfa IS a real field, so it is refused by _reject_relocated_keys with the message
+    # that names its new home — the generic unknown-key refusal must not shadow it.
+    cfg = _write(tmp_path / "messagefoundry.toml", "[auth]\nrequire_mfa = true\n")
+    with pytest.raises(ValueError, match=r"moved to \[security\]\.require_mfa"):
         load_settings(config_path=cfg, environ={})
 
 
@@ -267,7 +267,7 @@ def test_an_engine_written_config_still_loads(tmp_path: Path) -> None:
         tmp_path / "messagefoundry.toml",
         # [security] desugars into api/auth/egress/retention/store/diagnostics/ai fields.
         "[security]\n"
-        "require_sign_in = true\n"
+        "require_mfa = true\n"
         "block_unlisted_outbound = true\n"
         "serve_web_console = true\n"
         "local_access_only = true\n"
@@ -289,7 +289,7 @@ def test_an_engine_written_config_still_loads(tmp_path: Path) -> None:
     )
     assert s.store.path == "cli.db"
     assert s.api.port == 9001
-    assert s.auth.enabled is True  # desugared from [security].require_sign_in
+    assert s.auth.require_mfa is True  # desugared from [security].require_mfa
     assert s.egress.deny_by_default is True
     assert s.api.host == "127.0.0.1"
     assert s.retention.messages_days == 30

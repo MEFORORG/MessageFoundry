@@ -339,6 +339,12 @@ _GUARD_CASES = [
         ADT_UMLAUT_TEXT.replace("JANE", "JA\x00NE").encode("utf-8"),
         id="nul_hl7",
     ),
+    # ADR 0205 rule 4: an MLLP start byte inside an HL7 v2 body, past its leading whitespace.
+    pytest.param(
+        _inbound(encoding="utf-8"),
+        ADT_UMLAUT_TEXT.replace("JANE", "JA\x0bNE").encode("utf-8"),
+        id="frame_byte_hl7",
+    ),
     pytest.param(_inbound(content_type=ContentType.JSON), b'{"a": "b\x00c"}', id="nul_text"),
     pytest.param(
         _inbound(content_type=ContentType.JSON), b'{"a": "' + b"y" * 64 + b'"}', id="size_text"

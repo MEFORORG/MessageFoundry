@@ -94,6 +94,12 @@ from messagefoundry.transports.base import (
     wait_for_intake,
 )
 from messagefoundry.transports.base import cap_setting as _cap_setting
+from messagefoundry.transports.framing import (
+    MLLP_CODEC,
+    check_frame_bytes,
+    frame_for_delivery,
+    frame_reply,
+)
 
 __all__ = [
     "SB",
@@ -881,6 +887,44 @@ class MLLPDestination(DestinationConnector):
         name = type(exc).__name__
         return f"{name}: {' '.join(extras)}" if extras else name
 
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        """ADR 0205 rule 1 on ``payload`` without sending it: raise the permanent
+        :class:`NegativeAckError` :meth:`send` would. With ``rewrite`` it checks the payload as
+        :meth:`send` frames it, after the same delimiter rewrites, which drop a frame byte at either
+        end; a payload those rewrites cannot parse is their :class:`DeliveryError`. Without it, the
+        payload as given, which is how a batch member sits inside its envelope."""
+        body = self._rewrite_for_wire(payload) if rewrite else payload
+        check_frame_bytes(MLLP_CODEC, body, self.encoding, transport="MLLP")
+
+    def _rewrite_for_wire(self, payload: str) -> str:
+        """``payload`` after this destination's delimiter rewrites, as :meth:`send` frames it; a
+        payload the rewrites cannot parse is a :class:`DeliveryError`."""
+        if self.encoding_characters is not None:
+            # Re-encode the body with this destination's delimiters before framing. A non-HL7/
+            # garbled payload can't be rewritten — surface it as a DeliveryError (the message
+            # reached neither the wire nor the peer) rather than framing a corrupted message; the
+            # pipeline records the ERROR.
+            try:
+                payload = reencode_delimiters(payload, self.encoding_characters)
+            except ValueError as exc:
+                raise DeliveryError(f"MLLP encoding-character override failed: {exc}") from exc
+        if self.hl7_raw_separators:
+            # BACKLOG #107: re-serialize emitting the reserved structural separators as raw bytes
+            # (composes after any delimiter rewrite above). A non-HL7 / unparseable payload can't be
+            # rewritten — surface a DeliveryError (the message reached neither wire nor peer) rather
+            # than framing a corrupted message; the pipeline records the ERROR.
+            try:
+                payload = emit_raw_separators(payload)
+            except (ValueError, IndexError) as exc:
+                # ValueError includes HL7PeekError (no leading MSH, or an over-budget escape
+                # expansion). IndexError: the same truncated-header shapes that
+                # reencode_delimiters maps to ValueError above (BACKLOG #1601).
+                raise DeliveryError(
+                    "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
+                    f"{safe_exc(exc)}"
+                ) from exc
+        return payload
+
     def waiting_for_reply(self, now: float) -> bool:
         """#136 (ADR 0065 amendment): whether this outbound is currently AWAITING an MLLP ACK and at
         least ``waiting_display_delay`` has elapsed since the send began. DISPLAY ONLY — read off the
@@ -909,30 +953,9 @@ class MLLPDestination(DestinationConnector):
                 # before any payload byte leaves the box (defense in depth against a reload routing PHI
                 # around the construction-only gate).
                 self._hop_guard.assert_send()
-            if self.encoding_characters is not None:
-                # Re-encode the body with this destination's delimiters before framing. A non-HL7/
-                # garbled payload can't be rewritten — surface it as a DeliveryError (the message
-                # reached neither the wire nor the peer) rather than framing a corrupted message; the
-                # pipeline records the ERROR.
-                try:
-                    payload = reencode_delimiters(payload, self.encoding_characters)
-                except ValueError as exc:
-                    raise DeliveryError(f"MLLP encoding-character override failed: {exc}") from exc
-            if self.hl7_raw_separators:
-                # BACKLOG #107: re-serialize emitting the reserved structural separators as raw bytes
-                # (composes after any delimiter rewrite above). A non-HL7 / unparseable payload can't be
-                # rewritten — surface a DeliveryError (the message reached neither wire nor peer) rather
-                # than framing a corrupted message; the pipeline records the ERROR.
-                try:
-                    payload = emit_raw_separators(payload)
-                except (ValueError, IndexError) as exc:
-                    # ValueError includes HL7PeekError (no leading MSH, or an over-budget escape
-                    # expansion). IndexError: the same truncated-header shapes that
-                    # reencode_delimiters maps to ValueError above (BACKLOG #1601).
-                    raise DeliveryError(
-                        "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
-                        f"{safe_exc(exc)}"
-                    ) from exc
+            payload = self._rewrite_for_wire(payload)
+            # ADR 0205 rule 1: frame once, before any dial; the four paths below only write bytes.
+            wire = frame_for_delivery(MLLP_CODEC, payload, self.encoding, transport="MLLP")
             if self.no_ack:
                 # BACKLOG #117 (ADR 0124): fire-and-forward — write + drain, no ACK read, deliver on
                 # the successful TCP write. Composes with persistent (reuse the cached connection).
@@ -940,8 +963,8 @@ class MLLPDestination(DestinationConnector):
                 # correlate, so the outgoing-MSH-10 read would be pure waste (the two knobs are also
                 # rejected together at wiring — see build_outbound_connection).
                 if not self.persistent:
-                    return await self._send_once_no_ack(payload)
-                return await self._send_persistent_no_ack(payload)
+                    return await self._send_once_no_ack(wire)
+                return await self._send_persistent_no_ack(wire)
             # BACKLOG #82: read the OUTGOING control id (MSH-10) once, off the final on-wire payload
             # (after any delimiter/raw-separator rewrite), so _check_ack can correlate it to the reply's
             # MSA-2. Off → None → no correlation (byte-identical). Defensive: a non-HL7 / unparseable
@@ -963,8 +986,8 @@ class MLLPDestination(DestinationConnector):
                     )
                     sent_control_id = None
             if not self.persistent:
-                return await self._send_once(payload, sent_control_id)
-            return await self._send_persistent(payload, sent_control_id)
+                return await self._send_once(wire, sent_control_id)
+            return await self._send_persistent(wire, sent_control_id)
         finally:
             self._sending = False
 
@@ -996,7 +1019,7 @@ class MLLPDestination(DestinationConnector):
         return reader, writer
 
     async def _send_once(
-        self, payload: str, sent_control_id: str | None = None
+        self, wire: bytes, sent_control_id: str | None = None
     ) -> DeliveryResponse | None:
         """The historical connect-per-send path (``persistent=false``) — one connection per delivery,
         closed in a finally, error text unchanged. Two deliberate deltas from the pre-ADR-0067 code,
@@ -1005,7 +1028,7 @@ class MLLPDestination(DestinationConnector):
         :meth:`send` applies to both modes."""
         reader, writer = await self._dial()
         try:
-            writer.write(frame(payload, self.encoding))
+            writer.write(wire)
             await asyncio.wait_for(writer.drain(), self.timeout)
             # #136: stamp the side-band "waiting for reply" marker around the ACK read only (cleared in
             # the finally). Purely observational — the read itself is unchanged.
@@ -1022,7 +1045,7 @@ class MLLPDestination(DestinationConnector):
             await self._close_bounded(writer)
         return self._check_ack(ack_bytes, sent_control_id)
 
-    async def _send_once_no_ack(self, payload: str) -> DeliveryResponse | None:
+    async def _send_once_no_ack(self, wire: bytes) -> DeliveryResponse | None:
         """Connect-per-send fire-and-forward (``no_ack`` + ``persistent=false``, BACKLOG #117 / ADR
         0124): dial → write → drain → bounded close, with **no ACK read** and no MSA-1 validation. The
         delivery is confirmed on the successful TCP write (at-most-once-confirmation). A connect/drain
@@ -1031,7 +1054,7 @@ class MLLPDestination(DestinationConnector):
         (``capture_response`` is rejected at wiring for a no-ack outbound)."""
         _reader, writer = await self._dial()
         try:
-            writer.write(frame(payload, self.encoding))
+            writer.write(wire)
             await asyncio.wait_for(writer.drain(), self.timeout)
         except TimeoutError as exc:
             raise DeliveryError("MLLP timed out draining the write (no-ack)") from exc
@@ -1042,7 +1065,7 @@ class MLLPDestination(DestinationConnector):
         return None
 
     async def _send_persistent(
-        self, payload: str, sent_control_id: str | None = None
+        self, wire: bytes, sent_control_id: str | None = None
     ) -> DeliveryResponse | None:
         """One delivery over the cached connection (ADR 0067): reuse-time liveness check →
         reconnect-before-first-byte (uncharged) → write/drain/ACK-read (any failure after ``write()``
@@ -1082,7 +1105,7 @@ class MLLPDestination(DestinationConnector):
         self._conn = conn
         try:
             try:
-                writer.write(frame(payload, self.encoding))
+                writer.write(wire)
                 await asyncio.wait_for(writer.drain(), self.timeout)
             except (TimeoutError, OSError) as exc:
                 # Payload bytes were (at least partially) written: the peer may have processed the
@@ -1171,7 +1194,7 @@ class MLLPDestination(DestinationConnector):
             await self._discard_unparseable(conn, writer)
         return response
 
-    async def _send_persistent_no_ack(self, payload: str) -> DeliveryResponse | None:
+    async def _send_persistent_no_ack(self, wire: bytes) -> DeliveryResponse | None:
         """One fire-and-forward delivery over the cached connection (``no_ack`` + ``persistent=true``,
         BACKLOG #117 / ADR 0124). Simpler than :meth:`_send_persistent`: **no ACK frame is read** and
         **no desync/leftover guard runs** — no reply is expected, so any bytes a misbehaving peer
@@ -1211,7 +1234,7 @@ class MLLPDestination(DestinationConnector):
         # closes it under us — this send then fails loud and is retried.
         self._conn = conn
         try:
-            writer.write(frame(payload, self.encoding))
+            writer.write(wire)
             await asyncio.wait_for(writer.drain(), self.timeout)
         except (TimeoutError, OSError) as exc:
             # Payload bytes were (at least partially) written: the peer may have processed the message
@@ -2139,7 +2162,7 @@ class MLLPSource(SourceConnector):
                 nak = build_ack(
                     inbound, code="AE", text=_HANDLER_FAILURE_NAK_TEXT, ack_mode=self.ack_mode
                 )
-                return frame(nak, self.encoding)
+                return frame_reply(MLLP_CODEC, nak, self.encoding)
             except Exception as exc:  # noqa: BLE001 -- fall back to the defaults, then give up
                 logger.warning(
                     "MLLP-level NAK for a handler fault could not be built: %s", safe_exc(exc)
@@ -2456,7 +2479,8 @@ class MLLPSource(SourceConnector):
                                 handler_dropped = True
                                 break
                             if reply is not None:
-                                writer.write(frame(reply, self.encoding))
+                                # ADR 0205: a reply never carries a second frame boundary.
+                                writer.write(frame_reply(MLLP_CODEC, reply, self.encoding))
                                 await self._drain_ack(writer)
                         if handler_dropped:
                             failed = True  # handler_error already names why this closes
