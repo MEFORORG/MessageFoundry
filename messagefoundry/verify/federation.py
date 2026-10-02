@@ -215,8 +215,10 @@ def _secret_row(settings: ServiceSettings) -> CheckResult:
         resolve_secret_provider,
     )
 
-    rid, title = "fed.client_secret", "OIDC client secret resolves"
     auth = settings.auth
+    if auth.oidc_private_key_jwt:
+        return _client_key_row(settings)
+    rid, title = "fed.client_secret", "OIDC client secret resolves"
     try:
         provider = resolve_secret_provider(settings.secrets)
         value = resolve_connector_secret(
@@ -233,6 +235,37 @@ def _secret_row(settings: ServiceSettings) -> CheckResult:
         return CheckResult(rid, title, Status.FAIL, "resolved to an empty value")
     source = "[secrets] provider reference" if auth.oidc_client_secret_ref else "environment"
     return CheckResult(rid, title, Status.PASS, f"resolved from the {source} (value not shown)")
+
+
+def _client_key_row(settings: ServiceSettings) -> CheckResult:
+    """Under ``private_key_jwt``, load the signing key exactly as the engine does (BACKLOG #296).
+
+    The same construction :class:`~messagefoundry.auth.service.AuthService` runs, so an unresolvable
+    reference, an unreadable file, a bad passphrase, a weak RSA key or a wrong curve fails here and
+    not at the first federated sign-in. No socket is opened and nothing is signed or sent. Whether
+    the IdP has the public half registered is the operator's to confirm."""
+    from messagefoundry.auth.oidc.client_auth import client_auth_from_settings
+    from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
+
+    rid, title = "fed.client_key", "OIDC private_key_jwt signing key loads"
+    auth = settings.auth
+    try:
+        client_auth = client_auth_from_settings(auth, resolve_secret_provider(settings.secrets))
+    # SigningError is a ValueError; catching the base keeps this module off the signing seam.
+    except (SecretProviderError, ValueError) as exc:
+        return CheckResult(rid, title, Status.FAIL, str(exc))
+    except Exception as exc:  # never raise out of a check
+        return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
+    if client_auth is None:  # unreachable: the caller checked the method
+        return CheckResult(rid, title, Status.ERROR, "private_key_jwt is not configured")
+    source = "[secrets] provider reference" if auth.oidc_client_private_key_ref else "settings"
+    return CheckResult(
+        rid,
+        title,
+        Status.PASS,
+        f"loaded from {source} for {auth.oidc_client_assertion_algorithm.value}, "
+        f"aud={client_auth.audience} (key not shown; confirm the IdP holds its public half)",
+    )
 
 
 _ACL_WORDS = {True: "owner-only", False: "writable by a non-owner", None: "could not be read"}

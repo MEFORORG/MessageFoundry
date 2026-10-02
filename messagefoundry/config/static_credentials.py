@@ -416,16 +416,19 @@ def _auth_features_on(settings: ServiceSettings) -> tuple[bool, bool]:
 def resolved_secret_refs(settings: ServiceSettings) -> list[str]:
     """The ``*_secret`` references the engine hands the ``[secrets]`` provider (BACKLOG #1989).
 
-    A reference counts only where its credential is resolved: the AD bind password with AD on, the
-    OIDC client secret with OIDC on. The SMTP password's reference is resolved whenever ``[alerts]``
-    is read, with or without an SMTP transport, because ``notifier_from_settings`` resolves it before
-    it decides which transports to build. The single reader: the ``settings:vault.secrets`` hop here
+    A reference counts only where its credential is resolved: the AD bind password with AD on, and
+    with OIDC on the client secret or, under ``private_key_jwt``, the signing key. The SMTP
+    password's reference is resolved whenever ``[alerts]`` is read, with or without an SMTP
+    transport, because ``notifier_from_settings`` resolves it before it decides which transports to
+    build. The single reader: the ``settings:vault.secrets`` hop here
     and the least-privilege table in ``privilege_check`` both call it."""
     auth, alerts = settings.auth, settings.alerts
     ad_on, oidc_on = _auth_features_on(settings)
+    pkjwt = auth.oidc_private_key_jwt
     candidates = (
         auth.ad_bind_password_secret if ad_on else None,
-        auth.oidc_client_secret_ref if oidc_on else None,
+        auth.oidc_client_secret_ref if oidc_on and not pkjwt else None,
+        auth.oidc_client_private_key_ref if oidc_on and pkjwt else None,
         alerts.email_password_secret,
     )
     return [ref for ref in candidates if ref]
@@ -468,8 +471,11 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
         add("ai.broker", "static", "AI broker x-api-key from [ai].api_key", False)
     if ad_on:
         add("auth.ad_bind", "static", "LDAP simple bind with a static ad_bind_password", False)
-    if oidc_on:
-        add("auth.oidc", "static", "OIDC token request with a static client_secret", False)
+    # BACKLOG #296: under private_key_jwt the token request carries a short-lived signed assertion,
+    # a compliant kind like SMART's, so the hop is not reported. Under client_secret_post it is, and
+    # the product now offers that compliant kind for it.
+    if oidc_on and not settings.auth.oidc_private_key_jwt:
+        add("auth.oidc", "static", "OIDC token request with a static client_secret", True)
     # The syslog/SIEM forwarder dials the collector. Only TLS with a client certificate authenticates
     # the engine to it; UDP, TCP and server-only TLS present nothing.
     log = settings.logging

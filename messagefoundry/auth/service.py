@@ -1941,18 +1941,24 @@ class AuthService:
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_secret: str | None = None
+        self._oidc_client_auth: oidc.PrivateKeyJwtClientAuth | None = None
         self._oidc_jwks: oidc.JwksCache | None = None
         self._oidc_flows: oidc.FlowCache | None = None
         if settings.oidc_enabled:
             # A SEPARATE branch from the ldap one above: secret_provider is otherwise consumed only
             # inside `elif settings.ad_enabled`, so every test that injects ldap= would skip secret
             # resolution entirely and the reference would be dead in tests but live in production.
-            self._oidc_client_secret = resolve_connector_secret(
-                secret_provider,
-                ref=settings.oidc_client_secret_ref,
-                literal=settings.oidc_client_secret,
-                label="[auth].oidc_client_secret",
-            )
+            # BACKLOG #296: exactly one client credential is resolved, the one the configured method
+            # sends. Under private_key_jwt the key is read and checked here, so a missing,
+            # unreadable, weak or wrong-curve key refuses startup like an unresolvable secret.
+            self._oidc_client_auth = oidc.client_auth_from_settings(settings, secret_provider)
+            if self._oidc_client_auth is None:
+                self._oidc_client_secret = resolve_connector_secret(
+                    secret_provider,
+                    ref=settings.oidc_client_secret_ref,
+                    literal=settings.oidc_client_secret,
+                    label="[auth].oidc_client_secret",
+                )
             # Eager: a bad CA path or an unresolvable secret must refuse startup, exactly as the AD
             # bind password does. NO network I/O happens here — JwksCache opens no socket until its
             # first get_key — so an UNREACHABLE IdP still constructs cleanly (AC-8).
@@ -3197,6 +3203,7 @@ class AuthService:
             token_endpoint=self._settings.oidc_token_endpoint or "",
             client_id=self._settings.oidc_client_id or "",
             client_secret=self._oidc_client_secret,
+            client_auth=self._oidc_client_auth,
             code=code,
             redirect_uri=redirect_uri,
             code_verifier=flow.code_verifier,

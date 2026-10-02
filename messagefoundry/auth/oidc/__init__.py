@@ -20,6 +20,10 @@ from messagefoundry.auth.oidc.claims import (
     OidcClaimPolicy,
     validate_id_token,
 )
+from messagefoundry.auth.oidc.client_auth import (
+    PrivateKeyJwtClientAuth,
+    client_auth_from_settings,
+)
 from messagefoundry.auth.oidc.flow import (
     DEFAULT_FLOW_CACHE_MAX,
     DEFAULT_FLOW_TTL_SECONDS,
@@ -60,8 +64,10 @@ __all__ = [
     "JwksError",
     "OidcClaimPolicy",
     "PendingFlow",
+    "PrivateKeyJwtClientAuth",
     "TokenRefusedError",
     "build_authorization_url",
+    "client_auth_from_settings",
     "exchange_code",
     "generate_pkce",
     "jwk_to_public_key",

@@ -30,8 +30,12 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 from messagefoundry.redaction import json_loads_or_refusal
+
+if TYPE_CHECKING:  # the annotation only; this module takes no module-scope transports import
+    from messagefoundry.auth.oidc.client_auth import PrivateKeyJwtClientAuth
 
 _VERIFIER_BYTES = 48  # 64 base64url chars — within RFC 7636's 43..128
 _STATE_BYTES = 32
@@ -329,11 +333,15 @@ def exchange_code(
     code_verifier: str,
     opener: urllib.request.OpenerDirector,
     timeout: float = 10.0,
+    client_auth: PrivateKeyJwtClientAuth | None = None,
 ) -> Mapping[str, object]:
     """POST the authorization ``code`` (+ the PKCE verifier) to the token endpoint; return the JSON.
 
-    ``opener`` is injected (production supplies a hardened, CA-pinned, no-redirect opener). A
-    confidential client sends ``client_secret_post``; a public client omits it and relies on PKCE.
+    ``opener`` is injected (production supplies a hardened, CA-pinned, no-redirect opener). The
+    client authenticates one of two ways. With ``client_secret`` it sends ``client_secret_post``.
+    With ``client_auth`` it sends a ``private_key_jwt`` assertion minted for this one request
+    (BACKLOG #296), and no secret. Passing both is refused, so a secret can never ride beside an
+    assertion. With neither, the request carries no client credential and relies on PKCE alone.
     Raises :class:`FlowError` on a non-2xx, misframed, oversized or non-JSON response — PHI/secret-safe: the
     secret, the ``code``, and the tokens never enter an exception message.
     A 4xx raises the subclass :class:`TokenRefusedError`, so the caller can tell an endpoint that
@@ -352,7 +360,14 @@ def exchange_code(
         "client_id": client_id,
         "code_verifier": code_verifier,
     }
-    if client_secret is not None:
+    if client_auth is not None:
+        if client_secret is not None:
+            raise FlowError(
+                "the token request takes a client secret or a client assertion, not both"
+            )
+        # Minted here, per request, so every POST carries a fresh `jti` and `exp`.
+        form.update(client_auth.form_fields())
+    elif client_secret is not None:
         form["client_secret"] = client_secret
     data = urllib.parse.urlencode(form).encode("ascii")
     headers = {

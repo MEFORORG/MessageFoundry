@@ -187,10 +187,15 @@ _FILE_SECRET_KEYS = (
     ("store", "encryption_keys_retired"),
     ("auth", "ad_bind_password"),
     ("auth", "oidc_client_secret"),  # ADR 0142: env only (MEFOR_AUTH_OIDC_CLIENT_SECRET)
+    ("auth", "oidc_client_private_key_password"),  # BACKLOG #296: env only
     ("alerts", "email_password"),
     ("api", "tls_key_password"),
     ("ai", "api_key"),  # ADR 0135: engine-broker LLM credential — env only (MEFOR_AI_API_KEY)
 )
+
+#: (section, key) fields that take inline PEM or a path to a PEM file. Only inline PEM in the config
+#: file warns; a path there is the [api].tls_key_file pattern (see _warn_file_secrets).
+_FILE_INLINE_PEM_KEYS = (("auth", "oidc_client_private_key"),)  # BACKLOG #296
 
 
 class StoreBackend(str, Enum):  # noqa: UP042
@@ -2896,6 +2901,26 @@ class AuthSettings(_Section):
     # `_ref` suffix (not the house `_secret`) avoids the absurd `oidc_client_secret_secret`; ADR 0142.
     oidc_client_secret: str | None = None
     oidc_client_secret_ref: str | None = None
+    # BACKLOG #296: how the engine authenticates to the token endpoint. `client_secret_post` (the
+    # default, byte-identical to before) sends the secret above. `private_key_jwt` (OIDC Core section
+    # 9, RFC 7523) sends a short-lived JWT signed with the private key below instead, and no secret;
+    # the two are exclusive, so a configured credential is always the one that is sent.
+    oidc_token_endpoint_auth_method: Literal["client_secret_post", "private_key_jwt"] = (
+        "client_secret_post"
+    )
+    # The signing key: inline PEM (ENV: MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY; inline PEM in the config
+    # file warns) or a path to a PEM file, or a [secrets].provider reference in the `_ref` field. Read
+    # eagerly at startup, so a missing, unreadable, weak or wrong-curve key refuses to start.
+    oidc_client_private_key: str | None = None
+    oidc_client_private_key_ref: str | None = None
+    oidc_client_private_key_password: str | None = None  # env only (_FILE_SECRET_KEYS warns)
+    # Asymmetric only: the enum holds no `none` and no HMAC algorithm, so neither can be configured.
+    oidc_client_assertion_algorithm: SignatureAlgorithm = SignatureAlgorithm.RS256
+    oidc_client_assertion_key_id: str | None = None  # JWS `kid`, for an IdP holding several keys
+    # The assertion `aud`: the pinned token endpoint (OIDC Core section 9; Entra ID and Okta require
+    # it), or the pinned issuer for an IdP that asks for its issuer identifier. A closed choice, so
+    # the assertion is only ever addressed to a URL already pinned and allow-listed here.
+    oidc_client_assertion_audience: Literal["token_endpoint", "issuer"] = "token_endpoint"
     oidc_authorization_endpoint: str | None = None  # https, pinned
     oidc_token_endpoint: str | None = None  # https, pinned
     oidc_jwks_uri: str | None = None  # https, pinned
@@ -3372,6 +3397,14 @@ class AuthSettings(_Section):
             )
         return self
 
+    @property
+    def oidc_private_key_jwt(self) -> bool:
+        """Whether the OIDC client authenticates with a signed assertion, not a secret (BACKLOG #296).
+
+        The one comparison every reader shares, so no two of them can spell the method differently.
+        """
+        return self.oidc_token_endpoint_auth_method == "private_key_jwt"  # nosec B105 -- a method name, not a credential
+
     @model_validator(mode="after")
     def _require_oidc_fields(self) -> AuthSettings:
         """Federated OIDC needs its pinned endpoints + a fail-closed posture when enabled (ADR 0142).
@@ -3420,15 +3453,51 @@ class AuthSettings(_Section):
         # understand. `if not value` is already the emptiness test used by the `missing` list ten lines
         # above; this line was the only one in the validator that disagreed. Whitespace is stripped for the
         # test only — the value itself is never rewritten.
-        if (
-            not (self.oidc_client_secret or "").strip()
-            and not (self.oidc_client_secret_ref or "").strip()
-        ):
-            raise ValueError(
-                "oidc_enabled requires a NON-EMPTY client secret: set oidc_client_secret (via "
-                "MEFOR_AUTH_OIDC_CLIENT_SECRET) or oidc_client_secret_ref (a [secrets].provider "
-                "reference). An env var exported with no value counts as missing."
-            )
+        has_secret = bool(
+            (self.oidc_client_secret or "").strip() or (self.oidc_client_secret_ref or "").strip()
+        )
+        if self.oidc_private_key_jwt:
+            # BACKLOG #296. Blank counts as missing here too, for the reason the secret test gives.
+            if (
+                not (self.oidc_client_private_key or "").strip()
+                and not (self.oidc_client_private_key_ref or "").strip()
+            ):
+                raise ValueError(
+                    "oidc_token_endpoint_auth_method='private_key_jwt' requires a NON-EMPTY signing "
+                    "key: set oidc_client_private_key (inline PEM via "
+                    "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY, or a path to a PEM file) or "
+                    "oidc_client_private_key_ref (a [secrets].provider reference)"
+                )
+            # A secret this method never sends is a live credential nobody uses. Refused rather
+            # than ignored, so the configuration says exactly what goes on the wire.
+            if has_secret:
+                raise ValueError(
+                    "oidc_token_endpoint_auth_method='private_key_jwt' never sends the client "
+                    "secret: remove oidc_client_secret / oidc_client_secret_ref"
+                )
+        else:
+            if not has_secret:
+                raise ValueError(
+                    "oidc_enabled requires a NON-EMPTY client secret: set oidc_client_secret (via "
+                    "MEFOR_AUTH_OIDC_CLIENT_SECRET) or oidc_client_secret_ref (a [secrets].provider "
+                    "reference). An env var exported with no value counts as missing."
+                )
+            stray = [
+                name
+                for name, value in (
+                    ("oidc_client_private_key", self.oidc_client_private_key),
+                    ("oidc_client_private_key_ref", self.oidc_client_private_key_ref),
+                    ("oidc_client_private_key_password", self.oidc_client_private_key_password),
+                    ("oidc_client_assertion_key_id", self.oidc_client_assertion_key_id),
+                )
+                if value is not None
+            ]
+            if stray:
+                raise ValueError(
+                    f"{', '.join(stray)} apply only with "
+                    "oidc_token_endpoint_auth_method='private_key_jwt'; the configured method is "
+                    "'client_secret_post', which sends the client secret and no assertion"
+                )
 
         # Every pinned URL must be https (no dev escape — this is an off-box trust boundary) and its
         # host must appear in the allow-list, which must itself be non-empty.
@@ -6021,15 +6090,26 @@ def _warn_file_secrets(file_data: Mapping[str, Any], path: Path) -> None:
     for section, key in _FILE_SECRET_KEYS:
         sect = file_data.get(section)
         if isinstance(sect, dict) and sect.get(key) is not None:
-            _log.warning(
-                "secret [%s].%s is set in %s; move it to env (MEFOR_%s_%s) — the config file is "
-                "not a safe place for secrets",
-                section,
-                key,
-                path,
-                section.upper(),
-                key.upper(),
-            )
+            _warn_file_secret(section, key, path)
+    # A key-or-path field is a secret only when it holds the key itself. A path in the file is the
+    # TLS-key pattern and fine; inline PEM is not (BACKLOG #296).
+    for section, key in _FILE_INLINE_PEM_KEYS:
+        sect = file_data.get(section)
+        value = sect.get(key) if isinstance(sect, dict) else None
+        if isinstance(value, str) and "-----BEGIN" in value:
+            _warn_file_secret(section, key, path)
+
+
+def _warn_file_secret(section: str, key: str, path: Path) -> None:
+    _log.warning(
+        "secret [%s].%s is set in %s; move it to env (MEFOR_%s_%s) — the config file is "
+        "not a safe place for secrets",
+        section,
+        key,
+        path,
+        section.upper(),
+        key.upper(),
+    )
 
 
 def _section_models() -> dict[str, type[BaseModel]]:

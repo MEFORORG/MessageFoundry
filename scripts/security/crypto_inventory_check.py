@@ -320,6 +320,11 @@ INVENTORY: dict[str, frozenset[str]] = {
         {"cryptography", "hmac", "messagefoundry.transports.signing"}
     ),
     "messagefoundry/auth/oidc/flow.py": frozenset({"hashlib", "hmac", "secrets"}),
+    # BACKLOG #296: the private_key_jwt client assertion. The signing is the shared signer's
+    # (transports/signing.py); secrets draws each assertion's jti.
+    "messagefoundry/auth/oidc/client_auth.py": frozenset(
+        {"messagefoundry.transports.signing", "secrets"}
+    ),
     "messagefoundry/auth/oidc/jwks.py": frozenset(
         {"cryptography", "messagefoundry.transports.signing"}
     ),
@@ -969,6 +974,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/auth/oidc/flow.py": frozenset(
         {"compare:hmac.compare_digest", "csprng:secrets.token_bytes", "hash:hashlib.sha256"}
+    ),
+    "messagefoundry/auth/oidc/client_auth.py": frozenset(
+        {"csprng:secrets.token_urlsafe", "sign_verify:.sign()"}
     ),
     "messagefoundry/auth/oidc/jwks.py": frozenset(
         {
