@@ -1203,15 +1203,16 @@ This section is kept rather than deleted, because the claim it used to make is t
   toolkit (`messagefoundry-toolkit`) start through their own entry points and install none.
   The interpreter raises an event before it runs an injected script. The hook raises on that
   event, and the interpreter then drops the script. A refusal logs a WARNING with the script's
-  file name, and no audit row. The name is written in ASCII, with a backslash escape for every
-  other character, so a character a log sink cannot encode does not keep the line out of that
-  sink. Where refusals arrive faster than they are logged, lines past a backlog of 64 are
-  dropped. Every refusal is counted, and once one has been refused the entry carries the count.
+  file name, and no audit row. The name is written in printable ASCII. Every other character,
+  and the backslash itself, is written as a backslash escape. So a character a log sink cannot
+  encode does not keep the line out of that sink. Where refusals arrive faster than they are
+  logged, lines past a backlog of 64 are dropped. Every refusal is counted, and once one has
+  been refused the entry carries the count.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. The hook goes in when the command-line module is imported, ahead of its
   other imports. On one Windows development machine that was about 55 ms after the process was
-  created, against about 200 ms when `serve` installed it as its first step. The interpreter's
+  created, against about 210 ms when `serve` installed it as its first step. The interpreter's
   own start-up, about 20 ms there, cannot be covered from inside the engine. And a process that
   can write the engine's memory can run code in it by other means, and can remove a hook.
 - **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process the

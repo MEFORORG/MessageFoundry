@@ -370,16 +370,18 @@ def test_a_long_file_name_is_cut(reports: queue.SimpleQueue[str]) -> None:
         pytest.param("\\", id="two-characters-as-a-doubled-backslash"),
     ],
 )
-def test_the_logged_name_keeps_its_bound_once_escaped(
+def test_the_logged_name_is_bounded_and_can_be_read_back(
     caplog: pytest.LogCaptureFixture, character: str
 ) -> None:
-    """Every escape is longer than the character it stands for, so a name the hook cut to the
-    limit would otherwise be logged at several times it."""
+    """The hook keeps a fixed number of characters, and each is logged whole. A second cut made
+    after escaping would let the injecting process choose how little of the name survives."""
+    name = character * remotedebug._FILE_NAME_LIMIT
     with caplog.at_level(logging.WARNING, logger="messagefoundry.remotedebug"):
-        remotedebug._report(character * remotedebug._FILE_NAME_LIMIT)
+        remotedebug._report(name)
     message = caplog.records[-1].getMessage()
     logged = message.split("script file name ")[1].removesuffix("). Nothing in it ran.")
-    assert len(logged) == remotedebug._FILE_NAME_LIMIT
+    assert logged.encode("ascii").decode("unicode_escape") == name
+    assert len(logged) <= 10 * remotedebug._FILE_NAME_LIMIT
 
 
 # --- the refusal line and the log sinks (vault BACKLOG #2742) -----------------------------------
@@ -577,8 +579,10 @@ def test_install_tries_again_while_the_hook_does_not_answer(
 def test_install_does_not_raise_when_a_hook_objects_with_any_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The interpreter swallows a RuntimeError from a hook that objects to a new one, and passes
-    on anything else. The command line installs at import, so that must not get out."""
+    """The documented contract is that the interpreter swallows a RuntimeError from a hook that
+    objects to a new one, and passes on anything else. The command line installs at import, so
+    that must not get out. A stand-in raises here, because CPython 3.14.6 was measured to
+    swallow a ValueError as well."""
     installs = _Installs(monkeypatch)
     before = sys.unraisablehook
 
@@ -589,7 +593,6 @@ def test_install_does_not_raise_when_a_hook_objects_with_any_exception(
     monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
     install_remote_debug_guard()  # returns
     assert installs.reporters == 0 and sys.unraisablehook is before
-    assert remote_debug_posture().guard_installed is False
 
 
 def test_a_reporter_that_cannot_start_is_tried_again_by_the_next_call(
@@ -845,9 +848,16 @@ def recording(hook):
 
 
 sys.addaudithook = recording
+if mode == "objecting":
+
+    def objects(event, args):
+        if event == "sys.addaudithook":
+            raise ValueError("this hook refuses every new one")
+
+    real(objects)
 before = remote_debug_posture().guard_installed
 try:
-    if mode == "import":
+    if mode in ("import", "objecting"):
         import messagefoundry.__main__
     elif mode == "run":
         import runpy
@@ -912,6 +922,18 @@ def test_the_command_line_installs_the_guard_ahead_of_its_other_imports(
     assert reading["before"] is False and reading["after"] is True
     # Added once, and with nothing of the engine loaded but what the guard itself imports.
     assert reading["loaded_at_install"] == [sorted(_GUARD_NEEDS | own_module)]
+
+
+def test_the_command_line_still_imports_when_another_hook_refuses_the_guard(
+    tmp_path: Path,
+) -> None:
+    """Against a real interpreter: a hook installed earlier raises a ValueError on every new
+    hook. The probe exits non-zero if the import raises, and the reading must say the guard is
+    not there. On CPython 3.14.6 the interpreter swallows that ValueError itself, so this arm
+    does not show that the install contains it. The stand-in test further up does."""
+    reading = _install_probe(tmp_path, "objecting")
+    assert reading["before"] is False and reading["after"] is False
+    assert len(cast("list[object]", reading["loaded_at_install"])) == 1  # tried, once
 
 
 def test_the_probe_alone_installs_nothing(tmp_path: Path) -> None:

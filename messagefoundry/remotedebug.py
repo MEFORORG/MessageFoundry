@@ -89,10 +89,9 @@ REMOTE_SCRIPT_EVENT: Final = "cpython.remote_debugger_script"
 #: when one already installed objects, so asking is the only way to know.
 _PROBE_EVENT: Final = "messagefoundry.remotedebug.probe"
 
-#: The injecting process chooses the script's name, so the logged copy is bounded. The hook cuts
-#: the name to this length for the queue. :func:`_report` cuts its escaped spelling to the same
-#: length, because an escape is up to ten characters long. That cut can fall inside the last
-#: escape.
+#: The injecting process chooses the script's name, so the logged copy is bounded: the hook keeps
+#: this many characters of it. :func:`_ascii` then spells each one in up to ten characters, and
+#: the spelling is logged whole, so it can be read back.
 _FILE_NAME_LIMIT: Final = 120
 
 #: Refusals waiting for the reporter thread. Past this the refusal is still counted and still
@@ -140,7 +139,8 @@ def _guard(event: str, args: tuple[object, ...]) -> None:
 
 
 def _ascii(name: str) -> str:
-    """``name`` with every character outside ASCII written as a backslash escape.
+    """``name`` in printable ASCII: the standard ``unicode_escape`` spelling, which escapes every
+    character outside ASCII, every control character and the backslash itself.
 
     The injecting process chooses the name, and a log sink encodes what it is given. Measured on
     the three sinks ``configure_logging`` builds (vault BACKLOG #2742): a lone surrogate fails the
@@ -149,24 +149,26 @@ def _ascii(name: str) -> str:
     set the stream to replace what it cannot encode, and it then shows ``?`` for the character.
     An ASCII line is written whole by all three, whatever each one's encoding.
 
-    A backslash already in the name is doubled first. Otherwise a file named with the six
-    characters of an escape would be logged the same as the character that escape stands for,
-    and the reader could not tell which file it was.
+    The spelling can be read back with the same codec. The backslash is escaped too, so a file
+    named with the six characters of an escape is not logged the same as the character that
+    escape stands for.
 
     This covers this module's one line. A lone surrogate in any other log line fails the same two
     sinks the same way.
     """
-    return name.replace("\\", "\\\\").encode("ascii", "backslashreplace").decode("ascii")
+    return name.encode("unicode_escape").decode("ascii")
 
 
 def _report(name: str) -> None:
     # Scrubbed here as well as by the handlers: the injecting process chooses the name, it may
-    # hold a line break, and a handler with no filter chain would write it as it came.
+    # hold a line break, and a handler with no filter chain would write it as it came. `_ascii`
+    # has escaped the line break already; the scrub stays as the step CodeQL's log-injection
+    # query recognises.
     _log.warning(
         "refused a script that another process injected through the interpreter's remote "
         "debugging (audit event %s, script file name %s). Nothing in it ran.",
         REMOTE_SCRIPT_EVENT,
-        scrub_log_argument(_ascii(name))[:_FILE_NAME_LIMIT],
+        scrub_log_argument(_ascii(name)),
     )
 
 
@@ -229,8 +231,10 @@ def install_remote_debug_guard() -> None:
     Call it as early in the process as possible: a script injected before the call runs. A second
     call finds the hook answering and adds nothing, and an audit hook cannot be removed.
 
-    It does not raise. The command line calls it at import, ahead of everything that could report
-    a failure, so a hook that could not go in is left for :func:`remote_debug_posture` to report.
+    A hook that another hook refused, and a reporter thread the interpreter could not start, do
+    not raise here. The command line makes this call at import, ahead of everything that could
+    report a failure, so a hook that did not go in is left for :func:`remote_debug_posture` to
+    report.
 
     Nothing is added where ``sys.is_remote_debug_enabled()`` is False, which is every child started
     through :func:`messagefoundry.childenv.python_child_argv`. The event cannot fire there.
@@ -246,8 +250,10 @@ def install_remote_debug_guard() -> None:
             # Quiet first, so no refusal is ever reported with its full path.
             previous = sys.unraisablehook
             quiet = sys.unraisablehook = _without_own_refusals(previous)
-            # never-raise: a hook already installed may object to this one. The interpreter
-            # swallows a RuntimeError from it and passes on any other exception.
+            # never-raise: a hook already installed may object to this one. The documented
+            # contract is that the interpreter swallows a RuntimeError from it and passes on any
+            # other exception. Measured on CPython 3.14.6 it swallows a ValueError too, so this
+            # holds the line for an interpreter that does what the documentation says.
             with contextlib.suppress(Exception):
                 sys.addaudithook(_guard)
             if not _guard_answers():
