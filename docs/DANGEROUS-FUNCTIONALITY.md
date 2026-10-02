@@ -150,7 +150,7 @@ de-identification leak check only, and is not on the message path.
 | Module | What it runs | When | Form |
 |---|---|---|---|
 | `pipeline/sandbox.py` | The sandbox worker | Only when `[sandbox].mode = "subprocess"` | argument list |
-| `pipeline/supervisor.py` | Engine-shard children | Only under `messagefoundry supervise` | argument list |
+| `pipeline/supervisor.py` | Engine-shard children, and one child that loads the config before any shard starts | Only under `messagefoundry supervise` | argument list |
 | `pipeline/dr.py` | The operator's disaster-recovery hook | A DR takeover or fail-back, when `[dr].takeover_hook` or `[dr].release_hook` is set | shell string |
 | `service.py` | `sc.exe`, and elevated `cmd.exe` and `powershell.exe` | Service status, start, stop, restart and install | argument list, ShellExecute |
 | `service_status.py` | `sc.exe query` | Reading the service's state | argument list |
@@ -187,6 +187,14 @@ Two argument-list starts are not pinned that way:
   `shutil.which`, whose Windows search can include the working directory, so a planted `code.cmd`
   may win there too. What holds it: `repo_path` must name an existing folder, and the tray runs as
   the signed-in user, who owns `tray.toml`.
+
+**What each child is handed.** A process started with no environment of its own gets a copy of the
+engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
+environment for the sandbox worker, the disaster-recovery hook and the engine shards. Its
+docstring says what each one gets, and why that is not an isolation boundary by itself. The other
+starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
+lists each of those with its reason, and fails a new start whose environment does not come from
+that module.
 
 **The other forms are the ones to look at hardest.**
 
@@ -419,6 +427,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py` |
+| It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials, for the ASVS 14.2.1 warning and loosening entry. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least at each connection build, in `messagefoundry check`, on `GET /security/posture` and on each settings view (`GET /metadata`, `graph --json`). Nothing bounds the URL's length, because the operator wrote it. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |
 
 **Hand-written parsers the patterns cannot see.**
 
@@ -481,7 +490,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 
 | Why it is left out | Files |
 |---|---|
-| It reads the JSON the MessageFoundry command line prints. The extension runs that command itself, and section 9 says when. Message content inside that JSON goes on to `hl7diff.ts`, in the table above. `connectionSchemaModel.ts` matches pattern 4 only because its caller passes it that command's result under the name `fetch`. | `cli.ts`, `connectionSchemaModel.ts`, `engineControlModel.ts`, `stepsModel.ts` |
+| It reads the JSON the MessageFoundry command line prints. The extension runs that command itself, and section 9 says when. Message content inside that JSON goes on to `hl7diff.ts`, in the table above. `connectionSchemaModel.ts` matches pattern 4 only because its caller passes it that command's result under the name `fetch`. | `cliJson.ts`, `connectionSchemaModel.ts`, `engineControlModel.ts`, `stepsModel.ts` |
 | It reads your config source line by line, from the open editor or the config folder. That code runs when the engine loads it (sections 1 and 2), so reading its text trusts it no further. | `completionScope.ts`, `editorToolbar.ts`, `liveDebug.ts`, `stepsModel.ts`, `symbolIndex.ts`, `traceView.ts` |
 | It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
 | It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |

@@ -63,6 +63,8 @@ def _pairs(
     rotation: SecretRotationSettings | None = None,
     cleartext_hops: tuple[str, ...] = (),
     expiry_hops: tuple[str, ...] = (),
+    hostname_hops: tuple[str, ...] = (),
+    query_hops: tuple[str, ...] = (),
     db_hops: tuple[str, ...] = (),
     attested_hops: tuple[str, ...] = (),
     revocation_hops: tuple[str, ...] = (),
@@ -78,6 +80,8 @@ def _pairs(
         rotation or SecretRotationSettings(),
         cleartext_hops=cleartext_hops,
         expiry_relaxed_hops=expiry_hops,
+        hostname_unchecked_hops=hostname_hops,
+        query_credential_hops=query_hops,
         unverified_db_hops=db_hops,
         attested_hops=attested_hops,
         revocation_attested_hops=revocation_hops,
@@ -126,6 +130,8 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -154,6 +160,8 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -179,6 +187,8 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -225,6 +235,8 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -370,6 +382,8 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -939,6 +953,8 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -966,6 +982,8 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1025,6 +1043,8 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1375,6 +1395,10 @@ _CONNECTION_DEVIATIONS_REPORTED = {
     # Owner ruling 2026-09-24: the hop attestation got a factory surface, so it is reported.
     "tls_hop_attested": "attested_secure_hops",
     "tls_revocation_attested": "revocation_attested_hops",
+    # ASVS 12.3.2 re-read, 2026-10-01. CORRECTED: this was exempt below as "gated by the same ADR
+    # 0092 hop cell", which was false -- that cell keys on cleartext and verify-off, never on the
+    # name check, so the flag was accepted with no line on any surface.
+    "tls_check_hostname": "hostname_unchecked_hops",
 }
 
 #: Per-connection parameters the readers do NOT report, each with the reason. Same discipline as the
@@ -1414,7 +1438,6 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     "use_tls": "same as tls",
     "tls_verify": "verify-off is gated by the ADR 0092 hop cell; a connection-scoped reader is owed",
     "verify_tls": "same as tls_verify",
-    "tls_check_hostname": "gated by the same ADR 0092 hop cell",
     "encrypt": "SQL Server preset only — _build_dsn's posture-keyed weakened-TLS refusal gates it",
     # ADR 0173 made tls_revocation_attested authorable; it is REPORTED above, by
     # revocation_attested_hops. Its reason rides in the reader's output, so it is not a second switch.
@@ -1523,6 +1546,78 @@ def test_the_reported_connection_deviations_are_actually_wired() -> None:
     assert "tls_hop_attested" in names
 
 
+def test_the_hostname_check_flag_is_actually_wired() -> None:
+    """ASVS 12.3.2: driven through its reader AND through `security_loosenings`, with a default
+    connection beside it as the control that must not appear."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        hostname_unchecked_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_NAMELESS",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={"host": "h", "port": 1, "tls": True, "tls_check_hostname": False},
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_CHECKED",
+            ConnectionSpec(type=ConnectorType.MLLP, settings={"host": "h", "port": 2, "tls": True}),
+        )
+    )
+    assert _CONNECTION_DEVIATIONS_REPORTED["tls_check_hostname"] == "hostname_unchecked_hops"
+    hops = tuple(n for n, _ in hostname_unchecked_hops(reg))
+    assert hops == ("OB_NAMELESS",)
+    risks = dict(_pairs(hostname_hops=hops))
+    assert "OB_NAMELESS" in risks["tls_check_hostname"]
+    assert "OB_CHECKED" not in risks["tls_check_hostname"]
+    assert "tls_check_hostname" not in _names()  # control: nothing declared, nothing named
+
+
+def test_the_url_query_credential_is_actually_wired() -> None:
+    """ASVS 14.2.1: driven through its reader AND through `security_loosenings`, with a benign query
+    beside it as the control that must not appear."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        query_credential_hops,
+    )
+
+    reg = Registry()
+    for name, url in (
+        ("OB_SIGNED", "https://h.example.invalid/x?sig=SYNTHETIC"),
+        ("OB_BENIGN", "https://h.example.invalid/x?fmt=json"),
+    ):
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.REST, settings={"url": url})
+            )
+        )
+    hops = tuple(n for n, _ in query_credential_hops(reg))
+    assert hops == ("OB_SIGNED",)
+    risk = dict(_pairs(query_hops=hops))["url_query_credential"]
+    assert "OB_SIGNED" in risk and "OB_BENIGN" not in risk and "SYNTHETIC" not in risk
+    assert "url_query_credential" not in _names()  # control: nothing declared, nothing named
+
+
+def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> None:
+    """CORRECTED (ASVS 12.3.2 re-read): the entry said the hostname match is "still fully verified"
+    for every listed hop. It now conditions that on the hop leaving the name check on."""
+    risk = dict(_pairs(expiry_hops=("OB_X",)))["tls_allow_expired"]
+    assert "hostname match and key usage are still fully verified" not in risk
+    assert "tls_check_hostname=false" in risk
+
+
 def test_the_revocation_attestation_is_actually_wired() -> None:
     """Another REPORTED entry, driven the same way as the ones above: through its reader AND through
     `security_loosenings`. ADR 0173 made the pair authorable on an outbound, so the reader must see it
@@ -1619,6 +1714,8 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=("OB_LEGACY", "OB_LAB"),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1659,6 +1756,8 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=("OB_PARTNER_ADT", "OB_LAB_ORU"),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1690,6 +1789,8 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=("OB_PG_RESULTS", "inbound:IB_PG_ORDERS"),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1718,6 +1819,8 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=("OB_PARTNER", "inbound:IB_LAB"),
@@ -2174,10 +2277,11 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
     app = create_managed_app(
         db_path=tmp_path / "managed_posture.db",
         poll_interval=0.05,
-        # enabled=False so the route stays reachable without a session; the stash is deliberately
-        # OUTSIDE the `enabled` guard, and that is exactly what this pins — a settings object that
-        # exists but is disabled is still the resolved settings the registry must read.
+        # enabled=False plus the opt-in so the route stays reachable without a session; the stash is
+        # deliberately OUTSIDE the `enabled` guard, and that is exactly what this pins — a settings
+        # object that exists but is disabled is still the resolved settings the registry must read.
         auth_settings=_ad(ad_session_recheck_seconds=0, enabled=False),
+        allow_no_auth=True,
     )
     transport = httpx.ASGITransport(app=app)
     async with (

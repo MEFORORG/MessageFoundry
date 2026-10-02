@@ -14,8 +14,9 @@ the point:
 
 * **Viewer** (``monitoring:read`` + ``messages:read``) covers the five ``messages:read`` surfaces;
 * a **custom role** holding ``messages:view_raw`` *without* ``messages:view_summary`` covers
-  ``GET /messages/{id}`` — and demonstrates that the doc's "the split is reachable" claim is real,
-  not theoretical (``view_raw`` is not a superset of ``view_summary``);
+  ``GET /messages/{id}``. Minting refuses that role since vault BACKLOG #1187, so the fixture
+  lifts the rule (see ``tests/_role_pairing.py``) to prove the route redaction holds as a second
+  line (``view_raw`` is not a superset of ``view_summary``);
 * a **custom role** holding ``monitoring:diagnose`` *without* ``messages:view_summary`` covers
   ``GET /alerts/active`` (BACKLOG #2443), since no built-in role holds that split.
 
@@ -44,8 +45,10 @@ from messagefoundry.config.wiring import ConnectionSpec, Registry, build_outboun
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
 from tests._admin_account import create_local_user_chosen
+from tests._role_pairing import bypass_view_raw_pairing_rule
 
 PW = "a-strong-test-passphrase"  # >= 15 chars, satisfies the ASVS password policy
+
 
 #: Synthetic ADT — invented MRN/name, never real PHI.
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSGSEED|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
@@ -134,9 +137,10 @@ def _objects(node: object) -> list[dict[str, object]]:
 
 
 @pytest.fixture
-async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
+async def seeded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_Seed]:
     """An engine holding one message with a summary, an error, metadata, a captured reply and a
     dead-lettered delivery — so every gated property has a non-null value to withhold."""
+    bypass_view_raw_pairing_rule(monkeypatch)
     engine = await Engine.create(tmp_path / "field_authz_sites.db", poll_interval=0.02)
     try:
         # require_mfa=False: this is a redaction test, not an MFA test — the step-up surfaces
@@ -363,15 +367,32 @@ async def test_the_seed_actually_carries_every_gated_model_property_pair(seeded:
         )
 
 
-async def test_view_raw_without_view_summary_is_reachable(seeded: _Seed) -> None:
-    """The doc claims a custom role may hold ``view_raw`` without ``view_summary``. Pin it, since the
-    whole reason the disposition fields sit on the view_summary tier rests on that being possible."""
+async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identity(
+    seeded: _Seed,
+) -> None:
+    """A ``view_raw``-only identity (see ``tests/_role_pairing.py``) opens both seeded rows and reads
+    the PROCESSED row's body, but gets no top-level gated property on either row. The administrator
+    arm shows each of those properties is set on the row, so no withholding assertion is vacuous.
+    Nested properties are the surfaces test's job."""
     async with _client(seeded.engine, seeded.service) as client:
         headers = await _login(client, "rawonly")
         response = await client.get(f"/messages/{seeded.message_id}", headers=headers)
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body["summary"] is None and body["error"] is None and body["metadata"] is None
+        assert body["summary"] is None and body["metadata"] is None
+        errored = await client.get(f"/messages/{seeded.error_message_id}", headers=headers)
+        assert errored.status_code == 200, errored.text
+        detail = errored.json()
+        assert detail["error"] is None
+        assert detail["summary"] is None and detail["metadata"] is None
+        # Positive control, per row: the administrator gets each property (masked, not null).
+        boss = await _login(client, "boss")
+        for mid, props in (
+            (seeded.message_id, ("summary", "metadata")),
+            (seeded.error_message_id, ("summary", "metadata", "error")),
+        ):
+            seen = (await client.get(f"/messages/{mid}", headers=boss)).json()
+            assert all(seen[p] is not None for p in props), (mid, seen)
         # The body is its own fetch since BACKLOG #2345, on the same messages:view_raw gate.
         raw = await client.get(f"/messages/{seeded.message_id}/raw", headers=headers)
         assert raw.status_code == 200, raw.text

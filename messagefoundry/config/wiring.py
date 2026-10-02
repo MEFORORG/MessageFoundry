@@ -87,7 +87,12 @@ from messagefoundry.connection_names import (
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.secretscrub import (
+    CREDENTIAL_PLACEHOLDER,
+    credential_query_params,
+    has_credential_like_segment,
+    scrub_credentials,
+)
 
 __all__ = [
     "ConnectionSpec",
@@ -151,7 +156,9 @@ __all__ = [
     "validate_config",
     "accepted_cleartext_hops",
     "expiry_relaxed_hops",
+    "hostname_unchecked_hops",
     "path_form_fhir_updates",
+    "query_credential_hops",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
     "overbroad_smart_scopes",
@@ -1399,30 +1406,76 @@ def connector_secret_env_values(
     return out
 
 
-#: Settings whose value is a URL that may carry `user:password@` userinfo. `proxy` has no `_url`
-#: suffix, which is why this is a NAME set plus a suffix rule rather than a suffix rule alone.
-_URL_SETTING_SUFFIXES = ("url", "_url", "_uri", "endpoint", "_endpoint")
+#: Settings whose value is a URL that may carry `user:password@` userinfo, by name suffix.
+#: CORRECTED (review of a87fcb2932): this comment said a NAME set covered `proxy`, and no set
+#: existed, so a `proxy` key was not a URL setting at all.
+#: Review of 0c6b32e5c4: a bare ``uri`` and ``http_proxy``-style names were missed, so the suffix
+#: rule now covers ``uri`` and ``proxy`` too (which also covers a bare ``proxy``).
+_URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy")
 
 
-def _mask_url_userinfo(value: object) -> object:
-    """Replace the PASSWORD half of a URL's userinfo with ``***``, keeping everything else readable.
+def _is_url_setting(name: str) -> bool:
+    return name.lower().endswith(_URL_SETTING_SUFFIXES)
+
+
+#: A URL scheme at the very start of a value, ``https://`` and the like. Shown in a withheld URL so
+#: the view still says what kind of hop it is; a scheme holds none of the characters a secret needs.
+_URL_SCHEME_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+
+#: The placeholder a withheld URL renders as, after its scheme when it has one: the engine's one
+#: spelling of "a credential was here", imported rather than restated.
+_WITHHELD_URL = CREDENTIAL_PLACEHOLDER
+
+
+def _url_may_carry_a_credential(value: str) -> bool:
+    """Whether a URL setting must be withheld from a settings view, by a COARSE rule. This is the
+    one statement of the rule; the docs point here.
+
+    Any of these withholds it: an ``@``, ``%40`` or ``%3A`` anywhere in it (any case); a value
+    ``urlsplit`` refuses; a credential-looking query name by the warning detector
+    (:func:`~messagefoundry.secretscrub.credential_query_params`); or a credential-looking name in
+    any ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
+    (:func:`~messagefoundry.secretscrub.has_credential_like_segment`). It does not try to find WHERE
+    a secret is: three review rounds on PR 1912 each found a URL reader that disagreed with a mask
+    that did. The cost is the view: a URL with an ``@`` in its path or query, such as an email
+    address, is withheld too.
+
+    The ``@``, ``%40`` and ``%3A`` tests read the value with tab, CR and LF removed, as ``urlsplit``
+    removes them before any reader decodes the host: ``%<TAB>40`` is ``%40`` to that reader.
+
+    It covers at least the shapes above, not every place a URL can hold a secret: a secret that is a
+    bare path segment (``/services/T000/B000/SECRET``) has no name to find, and is shown. Each step
+    is one scan of the value, so the rule is linear in its length."""
+    cleaned = value.replace("\t", "").replace("\r", "").replace("\n", "")
+    if "@" in cleaned:
+        return True
+    folded = cleaned.casefold()
+    if "%40" in folded or "%3a" in folded:
+        return True
+    try:
+        urllib.parse.urlsplit(value)
+    except ValueError:
+        return True
+    return has_credential_like_segment(value) or bool(credential_query_params(value))
+
+
+def _mask_url(value: str) -> str:
+    """A URL setting as ``redacted_settings`` shows it: unchanged, or ``<scheme>://<redacted>`` when
+    :func:`_url_may_carry_a_credential` says it may carry one (just ``<redacted>`` when the value
+    does not start with a scheme and ``//``).
 
     BACKLOG #1207. ``url="https://user:SECRET@host/path"`` was returned verbatim by both serializers
     while ``proxy_password`` on the SAME object masked -- the credential was safe in the typed field
     and disclosed in the URL beside it.
 
-    The user half and the host and path are PRESERVED deliberately: an operator diagnosing a
-    connection needs to see which account and which host, and masking the whole URL would destroy the
-    view rather than protect it. Only the secret is removed.
-    """
-    if not isinstance(value, str) or "@" not in value or "//" not in value:
+    CORRECTED (Manager decision on PR 1912, 2026-10-01): #1207 masked only the password and kept the
+    user, host and path, and later rounds tried to mask exactly what each URL reader reads. Each
+    round of review found a reader that disagreed with the mask. This rule withholds the whole URL
+    instead, failing closed, and gives up the user, host and path in the view for such a URL."""
+    if not _url_may_carry_a_credential(value):
         return value
-    scheme, _, rest = value.partition("//")
-    userinfo, at, hostpart = rest.rpartition("@")
-    if not at or ":" not in userinfo:
-        return value  # no userinfo, or a user with no password -- nothing secret to remove
-    user, _, _pw = userinfo.partition(":")
-    return f"{scheme}//{user}:***@{hostpart}"
+    scheme = _URL_SCHEME_PREFIX.match(value)
+    return f"{scheme.group(0)}{_WITHHELD_URL}" if scheme else _WITHHELD_URL
 
 
 def _redact_header_name(name: object) -> str:
@@ -1469,21 +1522,38 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     """A JSON-safe, secret-scrubbed view of a connection's settings for the API ``/metadata`` endpoint:
     each EnvRef becomes ``{"env": key}`` (the value is never resolved — only the key is shown), a
     credential field rendered inline is replaced with ``"***"`` (an ``env()`` *default* is dropped for
-    a credential field so a fallback secret can't leak), and a credential header inside a ``headers``
-    table is redacted too."""
+    a credential field so a fallback secret can't leak), a credential header inside a ``headers``
+    table is redacted too, and a URL setting that may carry a credential is withheld whole as
+    ``<scheme>://<redacted>`` (:func:`_mask_url`)."""
     out: dict[str, Any] = {}
     for name, value in settings.items():
         is_secret = _is_secret_setting(name)
         if isinstance(value, EnvRef):
             ref: dict[str, Any] = {"env": value.key}
             if value.default is not _UNSET and not is_secret:
-                ref["default"] = value.default
+                default = value.default
+                if isinstance(default, str) and _is_url_setting(name):
+                    # A URL default gets the same rule as a literal URL below (ASVS 14.2.1).
+                    default = _mask_url(default)
+                ref["default"] = default
             out[name] = ref
         elif is_secret:
             out[name] = "***"
-        elif isinstance(value, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
-            # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view.
-            out[name] = _mask_url_userinfo(value)
+        elif _is_env_marker(value) and _is_url_setting(name):
+            # The RAW connections.toml marker, {"env": ..., "default": ...}, when it reaches this view
+            # undecoded (a hand-built spec, a stored graph). Review of 0c6b32e5c4: it fell to the
+            # last arm and its default was served verbatim. Same treatment as an EnvRef above.
+            marker: dict[str, Any] = {"env": value.get("env")}
+            if "default" in value:
+                raw_default = value["default"]
+                marker["default"] = (
+                    _mask_url(raw_default) if isinstance(raw_default, str) else raw_default
+                )
+            out[name] = marker
+        elif isinstance(value, str) and _is_url_setting(name):
+            # BACKLOG #1207 and ASVS 14.2.1: withheld whole when it may carry a credential; the
+            # rule is stated once, on _url_may_carry_a_credential.
+            out[name] = _mask_url(value)
         elif name == "headers" and isinstance(value, dict):
             # Both axes: a header NAME is rendered through _redact_header_name before it is used as
             # the output key AND before it is handed to the value rule, so a reference in the name
@@ -1590,7 +1660,9 @@ def MLLP(
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
-    tls_allow_expired: bool = False,  # OUTBOUND: honour an EXPIRED server cert (chain+hostname still verified; #129)
+    # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
+    # too unless tls_check_hostname=False.
+    tls_allow_expired: bool = False,
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
 ) -> ConnectionSpec:
@@ -3611,7 +3683,9 @@ def Ftp(
     host: str | EnvRef,  # the FTP server (may be env())
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
-    tls_allow_expired: bool = False,  # FTPS: honour an EXPIRED server cert (chain+hostname still verified; #129)
+    # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
+    # unless a hand-built spec sets tls_check_hostname=False.
+    tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
@@ -5044,8 +5118,8 @@ def _peer_label(settings: Mapping[str, Any]) -> str:
 
 
 def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every OUTBOUND connection that declares ``tls_allow_expired``, as ``(name, peer)`` (#129 /
-    ADR 0094, surfaced by #333).
+    """Every connection that declares ``tls_allow_expired``, as ``(name, peer)`` (#129 / ADR 0094,
+    surfaced by #333): every outbound, and the inbound REMOTEFILE pollers.
 
     The sibling of :func:`accepted_cleartext_hops`, and the same contract: the SINGLE reader, so
     ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
@@ -5055,18 +5129,96 @@ def expiry_relaxed_hops(registry: Registry) -> list[tuple[str, str]]:
     — ``MLLP``/``Rest``/``FHIR``/``DICOM``/``Soap``/``Ftp``) rather than in a typed
     ``OutboundConnection`` field like ``cleartext_accepted``, so this reads the dict.
 
-    **Outbound only, and that is a fact about the graph rather than a scoping choice.** ``FhirLookup``
-    exposes ``verify_tls`` but no ``tls_allow_expired``, and no inbound factory takes it (an inbound
-    verifies a CLIENT cert, which is a different question). Said here explicitly so that ADDING the
-    parameter to a lookup or an inbound later cannot silently escape this reader: whoever adds it must
-    extend this function, exactly as ``accepted_cleartext_hops`` had to grow its ``fhir_lookups`` arm.
+    **Inbound too.** ``Ftp()`` is a source factory as well, and a REMOTEFILE poller dials out over
+    FTPS through the same context, which honours the flag. Inbound names are prefixed ``inbound:``.
+    Only that inbound type is walked: an MLLP or HTTP listener verifies a client, and its context
+    never reads the flag. Like the outbound arm, this lists what is DECLARED, so a plain-FTP poller
+    or an outbound with TLS off that sets the flag is listed though nothing is relaxed there.
+    CORRECTED (ASVS 12.3.2 re-read review, 2026-10-01): this read *"Outbound only, and that is a fact
+    about the graph ... no inbound factory takes it"*, which was false for that poller, so an expired
+    certificate it accepted was logged at construction and listed nowhere. ``FhirLookup`` exposes
+    ``verify_tls`` but no ``tls_allow_expired``; whoever adds it there must extend this function.
 
     Pure — it reads the loaded graph and touches nothing else."""
-    return sorted(
+    out = [
         (oc.name, _peer_label(oc.spec.settings))
         for oc in registry.outbound.values()
         if oc.spec.settings.get("tls_allow_expired")
+    ]
+    out.extend(
+        (inbound_record_name(ic.name), _peer_label(ic.spec.settings))
+        for ic in registry.inbound.values()
+        if ic.spec.type is ConnectorType.REMOTEFILE and ic.spec.settings.get("tls_allow_expired")
     )
+    return sorted(out)
+
+
+def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
+    """Whether a connection's settings turn ``tls_check_hostname`` off, or might.
+
+    An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
+    reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
+    construction WARNING names the resolved value either way."""
+    value = settings.get("tls_check_hostname", True)
+    return isinstance(value, EnvRef) or not value
+
+
+def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every connection that declares ``tls_check_hostname=false``, as ``(name, peer)`` (ASVS 12.3.2).
+
+    The sibling of :func:`expiry_relaxed_hops`, on the same contract: the SINGLE reader, so
+    ``messagefoundry check``, ``security_loosenings()`` and ``GET /security/posture`` can never report
+    different sets. Sorted by name.
+
+    The flag keeps the chain check and drops the name check, so any certificate that chains to the
+    hop's trust anchor is accepted whatever host it names. The ``MLLP``, ``Email`` and ``Direct``
+    factories take it, and the ``MLLP`` one is also a ``connections.toml`` ``[settings]`` key.
+    ``Ftp()`` does not take it, but the FTPS context honours it from a hand-built ``ConnectionSpec``,
+    and that is why this reads the settings dict of EVERY connection rather than a factory list. Inbound is walked too, because a REMOTEFILE
+    poller dials out over FTPS; inbound names are prefixed ``inbound:``, as
+    :func:`revocation_attested_hops` prefixes them.
+
+    It lists what is DECLARED, including on a hop whose TLS is off, where the flag is inert, and
+    including an ``env()`` value it cannot resolve. Over-reporting an inert flag is the safe
+    direction for a register whose job is to show what an operator loosened. Pure."""
+    out = [
+        (oc.name, _peer_label(oc.spec.settings))
+        for oc in registry.outbound.values()
+        if _declares_hostname_check_off(oc.spec.settings)
+    ]
+    out.extend(
+        (inbound_record_name(ic.name), _peer_label(ic.spec.settings))
+        for ic in registry.inbound.values()
+        if _declares_hostname_check_off(ic.spec.settings)
+    )
+    return sorted(out)
+
+
+def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every outbound and ``FhirLookup`` whose ``url`` carries a credential-like query parameter, as
+    ``(name, parameter names)`` (ASVS 14.2.1). Lookup names are prefixed ``fhir_lookup:``.
+
+    The single reader, on the contract of :func:`expiry_relaxed_hops`, so ``messagefoundry check``,
+    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree. Sorted by name. The
+    second element is the parameter NAMES only, comma-joined, from
+    :func:`~messagefoundry.secretscrub.credential_query_params`; a value never leaves this function.
+
+    A credential in the query rides the request line, so the partner's and every proxy's access log
+    holds it. ``refuse_url_credentials`` refuses a credential in the userinfo, because that shape
+    never authenticated anything; a query credential does authenticate, and some partner APIs take
+    it nowhere else, so it is reported rather than refused.
+
+    It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
+    construction WARNING in ``pipeline.wiring_runner`` reads the resolved one. Pure."""
+    out: list[tuple[str, str]] = []
+    for name, settings in (
+        *((oc.name, oc.spec.settings) for oc in registry.outbound.values()),
+        *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
+    ):
+        url = settings.get("url")
+        if isinstance(url, str) and (names := credential_query_params(url)):
+            out.append((name, ", ".join(names)))
+    return sorted(out)
 
 
 def path_form_fhir_updates(registry: Registry) -> list[str]:

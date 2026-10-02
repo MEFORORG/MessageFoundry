@@ -1578,8 +1578,10 @@ def test_extension_parser_table_drift_is_reported() -> None:
     for old, new in (
         ("| `hl7diff.ts`, `hl7scope.ts` |", "| `hl7diff.ts` |"),
         ("| `connectionForm.ts` |", "| `connectionForm.ts`, `nope.ts` |"),
-        ("| `engineClient.ts` |", "| `engineClient.ts`, `cli.ts` |"),
-        ("| `completion.ts` |", "| `completion.ts`, `cli.ts` |"),
+        # cliJson.ts is a file the scan finds (its JSON.parse moved there from cli.ts, vault
+        # BACKLOG #1187), so it serves as the planted scan-found name in both arms.
+        ("| `engineClient.ts` |", "| `engineClient.ts`, `cliJson.ts` |"),
+        ("| `completion.ts` |", "| `completion.ts`, `cliJson.ts` |"),
         ("| `completion.ts` |", "| `completion.ts`, `nope.ts` |"),
     ):
         assert _ts_parser_drift(_replace_once(text, old, new), live, sources), new

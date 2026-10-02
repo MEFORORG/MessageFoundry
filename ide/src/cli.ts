@@ -6,14 +6,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 
+import { UNTRUSTED_WORKSPACE_STDERR, parseJsonResult, type CliResult } from "./cliJson";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
 
-export interface CliResult {
-  stdout: string;
-  stderr: string;
-  code: number;
-}
+// Parsing lives in cliJson.ts (no vscode, so the unit suite runs it). Every importer of CliResult
+// keeps importing it from here.
+export type { CliResult } from "./cliJson";
 
 function config() {
   return vscode.workspace.getConfiguration("messagefoundry");
@@ -164,11 +163,7 @@ export function run(args: string[], cwd?: string): Promise<CliResult> {
   if (isExecGated()) {
     // Untrusted workspace: refuse to exec any (possibly repo-supplied) interpreter (SEC-004). Return
     // a synthetic non-zero result; callers already treat a non-zero exit as the error path.
-    return Promise.resolve({
-      stdout: "",
-      stderr: "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace",
-      code: 1,
-    });
+    return Promise.resolve({ stdout: "", stderr: UNTRUSTED_WORKSPACE_STDERR, code: 1 });
   }
   return new Promise((resolve) => {
     execFile(
@@ -196,11 +191,7 @@ export function run(args: string[], cwd?: string): Promise<CliResult> {
  */
 export function runWithStdin(args: string[], stdin: string, cwd?: string): Promise<CliResult> {
   if (isExecGated()) {
-    return Promise.resolve({
-      stdout: "",
-      stderr: "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace",
-      code: 1,
-    });
+    return Promise.resolve({ stdout: "", stderr: UNTRUSTED_WORKSPACE_STDERR, code: 1 });
   }
   return new Promise((resolve) => {
     const child = execFile(
@@ -224,32 +215,13 @@ export function runWithStdin(args: string[], stdin: string, cwd?: string): Promi
   });
 }
 
-/** Parse a `--json` CLI result's stdout, surfacing an `{"error": …}` body as a thrown Error. */
-function parseJsonResult<T>(res: CliResult, label: string): T {
-  const text = res.stdout.trim();
-  if (!text) {
-    throw new Error(res.stderr.trim() || `messagefoundry ${label} produced no output`);
-  }
-  const parsed: unknown = JSON.parse(text);
-  // The CLI prints {"error": "..."} (e.g. on a WiringError) instead of the expected array/object;
-  // surface it as a thrown Error so every caller's try/catch shows the real message.
-  if (
-    parsed !== null &&
-    typeof parsed === "object" &&
-    !Array.isArray(parsed) &&
-    typeof (parsed as { error?: unknown }).error === "string"
-  ) {
-    throw new Error((parsed as { error: string }).error);
-  }
-  return parsed as T;
-}
-
 /**
  * Run a `--json` subcommand and parse stdout. The CLI prints valid JSON even on a non-zero exit
  * (e.g. `validate` returns 1 when there are diagnostics), so we parse stdout regardless of code.
+ * A failure's message never quotes the CLI's output; see cliJson.ts for why.
  */
 export async function runJson<T>(args: string[], cwd?: string): Promise<T> {
-  return parseJsonResult<T>(await run([...args, "--json"], cwd), args.join(" "));
+  return parseJsonResult<T>(await run([...args, "--json"], cwd), args);
 }
 
 /**
@@ -258,7 +230,7 @@ export async function runJson<T>(args: string[], cwd?: string): Promise<T> {
  * structural edit shifts every row coordinate — reading the dirty buffer, never the on-disk file.
  */
 export async function runJsonWithStdin<T>(args: string[], stdin: string, cwd?: string): Promise<T> {
-  return parseJsonResult<T>(await runWithStdin([...args, "--json"], stdin, cwd), args.join(" "));
+  return parseJsonResult<T>(await runWithStdin([...args, "--json"], stdin, cwd), args);
 }
 
 // ---- Code-set (translation table) CLI bridge --------------------------------------------------

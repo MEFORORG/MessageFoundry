@@ -60,6 +60,7 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
     relax_verify_expiry,
     resolve_trust_anchor,
+    warn_hostname_check_off,
 )
 from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.mllpcodec import (
@@ -647,6 +648,10 @@ def _mllp_ssl_context(
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = bool(s.get("tls_check_hostname", True))
+        if not ctx.check_hostname:  # ASVS 12.3.2: a recorded loosening, never a silent one
+            warn_hostname_check_off(
+                connector="MLLP destination", name=name, host=str(s.get("host", "127.0.0.1"))
+            )
     else:
         logger.warning(
             "MLLP-over-TLS certificate verification is DISABLED (tls_verify=false, permitted by %s).",
@@ -665,7 +670,8 @@ def _mllp_ssl_context(
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
         # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has
-        # passed while STILL validating chain + hostname. Opt-in per connection (default False = byte-
+        # passed while STILL validating the chain, and the hostname unless tls_check_hostname=false
+        # (relax_verify_expiry's WARNING says which). Opt-in per connection (default False = byte-
         # identical); applied on the verify path only, so it composes with (never bypasses) the
         # tls_verify=false refusal above and the #200 cleartext/verify-off hop refusals.
         if s.get("tls_allow_expired"):
@@ -801,7 +807,7 @@ class MLLPDestination(DestinationConnector):
         # #190 (ADR 0093): thread the instance [tls] internal-CA trust-anchor policy so an internal hop
         # that names no tls_ca_file of its own can verify against the org internal CA.
         self._ssl: ssl.SSLContext | None = _mllp_ssl_context(
-            s, server=False, trust_anchor_policy=config.trust_anchor_policy
+            s, server=False, trust_anchor_policy=config.trust_anchor_policy, name=config.name
         )
         # #200 (ADR 0092): a plaintext MLLP egress (tls off) is a cleartext PHI hop — guard it on the
         # posture gradient (a production-PHI hop off-loopback is refused at the enforced construction

@@ -258,8 +258,9 @@ suite("connectionSchema — an engine that predates the verb", () => {
     resetConnectionSchemaCache();
   });
 
-  /** What cli.ts's parseJsonResult throws when argparse rejects the action: stdout is empty, so the
-   *  stderr usage blob becomes the message. Verbatim shape, trimmed. */
+  /** The stderr argparse writes when it rejects the action. Verbatim shape, trimmed. cliJson's
+   *  parseJsonResult no longer puts it in a message (it throws a CliOutputError with a flag; see
+   *  cli-json.test.ts); these arms pin the text path any other error still takes. */
   const ARGPARSE_STDERR =
     "usage: messagefoundry connection [-h] [--config CONFIG] [--name NAME] [--data DATA] [--json]\n" +
     "                                 {list,upsert,remove}\n" +

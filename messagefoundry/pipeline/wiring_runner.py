@@ -162,7 +162,13 @@ from messagefoundry.pipeline.phase_timing import (
 )
 from messagefoundry.pipeline.reference_sync import database_source_dsn, reference_connection_name
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
-from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
+from messagefoundry.pipeline.sandbox import (
+    GraphShape,
+    SandboxMode,
+    SandboxPolicy,
+    SandboxSession,
+    graph_shape,
+)
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
@@ -172,6 +178,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
 )
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
+from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.store import (
     MessageStatus,
     OutboxItem,
@@ -1008,6 +1015,7 @@ class RegistryRunner:
         self._sandbox_policy = sandbox_policy
         self._sandbox_config_source = sandbox_config_source
         self._sandbox_sessions: dict[str, SandboxSession] = {}
+        self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
         # origin. Coarse by design (bounds total work, not topology). From [pipeline] max_correlation_depth.
@@ -3988,6 +3996,33 @@ class RegistryRunner:
                 if _pool_warn is not None:
                     log.warning(_pool_warn)
 
+    def _engine_graph_shape(self) -> GraphShape:
+        """The shape of the graph now being served, which each sandbox worker's must match.
+
+        One object per registry, shared by every inbound's session: a shape holds every name in the
+        graph, so one per session would cost the square of the connection count. A session calls
+        this at each worker spawn, from its worker thread, so it always compares with the registry
+        being served then, whichever way ``self.registry`` was last swapped."""
+        cached = self._sandbox_graph_shape
+        if cached is None or cached[0] is not self.registry:
+            cached = self._sandbox_graph_shape = (self.registry, graph_shape(self.registry))
+        return cached[1]
+
+    async def _close_sandbox_sessions(self) -> None:
+        """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
+        a process. A no-op unless ``[sandbox].mode=subprocess`` spawned any. The next dispatch on an
+        inbound makes a fresh session, whose worker loads the config as it is then."""
+        if not self._sandbox_sessions:
+            return
+        sessions = list(self._sandbox_sessions.values())
+        self._sandbox_sessions.clear()
+
+        def close_all() -> None:
+            for session in sessions:
+                session.close()
+
+        await asyncio.to_thread(close_all)
+
     def _sandbox_for(self, name: str) -> SandboxSession | None:
         """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
 
@@ -4016,6 +4051,7 @@ class RegistryRunner:
                 inbound=name,  # attributes the child's relayed stderr to this feed (ADR 0176)
                 config_dir=cfg_dir,
                 env=env,
+                graph=self._engine_graph_shape,
                 code_sets=self.registry.code_sets,
             )
             self._sandbox_sessions[name] = session
@@ -4346,15 +4382,7 @@ class RegistryRunner:
         # ADR 0087 (#197): stop the per-inbound sandbox worker children (kills + reaps each subprocess).
         # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
-        if self._sandbox_sessions:
-            _sessions = list(self._sandbox_sessions.values())
-            self._sandbox_sessions.clear()
-
-            def _close_sandboxes() -> None:
-                for _s in _sessions:
-                    _s.close()
-
-            await asyncio.to_thread(_close_sandboxes)
+        await self._close_sandbox_sessions()
         if self._lookup_executor is not None:
             await self._lookup_executor.aclose()
             self._lookup_executor = None
@@ -5398,15 +5426,7 @@ class RegistryRunner:
                 # child that re-loads the swapped config (its docstring's "Router/Handler changes take
                 # effect immediately" now also holds under mode=subprocess). Off-loop: close() waits on a
                 # process. No-op unless mode=subprocess actually spawned any.
-                if self._sandbox_sessions:
-                    _stale_sessions = list(self._sandbox_sessions.values())
-                    self._sandbox_sessions.clear()
-
-                    def _close_stale_sandboxes() -> None:
-                        for _s in _stale_sessions:
-                            _s.close()
-
-                    await asyncio.to_thread(_close_stale_sandboxes)
+                await self._close_sandbox_sessions()
                 # Rebuild the live-lookup executor from the new graph, closing the old pools. build_check
                 # already validated the new specs, so this can't fail on a bad spec here.
                 old_lookup_executor = self._lookup_executor
@@ -5481,6 +5501,9 @@ class RegistryRunner:
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
                 log.exception("reload failed; rolling back inbound intake to the previous graph")
                 self.registry = old
+                # A session made after the swap holds a worker that loaded the NEW graph. Drop it,
+                # or that worker would go on answering for a graph the engine no longer serves.
+                await self._close_sandbox_sessions()
                 # Step 2a's lane-partition decisions are deliberately NOT undone here — that comment
                 # carries why, and the short version is that un-deciding a lane step 3 has already given
                 # a worker to is how a rollback would create two claimers on one lane.
@@ -9244,6 +9267,7 @@ def check_fhir_lookup_allowed(
     ``[egress].allowed_proxy`` here too — outside the ``allowed_http`` guard below, because that list
     being empty says nothing about whether the proxy is permitted (BACKLOG #1659, DELTA-04 lockstep)."""
     _check_forward_proxy_egress(f"FhirLookup {name!r}", settings, egress.allowed_proxy)
+    warn_url_query_credentials(f"FhirLookup {name!r}", settings)  # ASVS 14.2.1
     if egress.deny_by_default and not egress.allowed_http:
         raise WiringError(
             f"FhirLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
@@ -9820,6 +9844,41 @@ def warn_unbudgeted_streaming_inbound(ic: InboundConnection, *, budget: int) -> 
     return True
 
 
+def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
+    """Log a WARNING when a connection's resolved ``url`` carries a credential-like query parameter
+    (ASVS 14.2.1). ``label`` names the connection (``"outbound 'OB_X'"``); the line carries it and
+    the parameter NAMES, never a value or the URL.
+
+    WARN, not refuse, and the reason is the difference from the userinfo precedent.
+    ``transports.rest.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
+    authenticated anything: urllib reads it as part of the host, and the error text carried the
+    password into ``queue.last_error``. A query credential does authenticate, and some partner APIs
+    take it nowhere else (a shared-access ``sig``, an API ``key``), so a refusal would remove the
+    hop with no header to move it to. The detection is also a heuristic over names, and a false
+    refusal has no override. What the warning records is the cost: the request line, query and all,
+    lands in the partner's and every proxy's access log. The engine's own log lines already drop the
+    query (``_peer_label``, ``rest._redact_url``).
+
+    Called from :func:`check_egress_allowed`, the one function every outbound build path runs
+    (check, start, operator start, test), and from :func:`check_fhir_lookup_allowed`, its FhirLookup
+    twin. Both run on env-resolved settings, so this sees a URL that ``env()`` supplied.
+    ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
+    registry, and walks the same two tables."""
+    url = settings.get("url")
+    if not isinstance(url, str):
+        return
+    names = credential_query_params(url)
+    if names:
+        log.warning(
+            "%s: the endpoint url carries a credential in its query string (parameter(s) "
+            "%s). It rides the request line, so the partner's and any proxy's access log will hold "
+            "it. Move it to a header if the partner accepts one (bearer_token, basic auth, or a "
+            "headers table supplied whole by env()); see docs/SECURITY-LOOSENING.md (ASVS 14.2.1).",
+            label,
+            ", ".join(names),
+        )
+
+
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     """Fail-closed: refuse (raise :class:`WiringError`) an outbound destination not on the ``[egress]``
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
@@ -9835,6 +9894,8 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     # nothing about whether the proxy is permitted (BACKLOG #1659).
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
+    # ASVS 14.2.1: a recorded loosening, never a silent one
+    warn_url_query_credentials(f"outbound {dest.name!r}", dest.settings)
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
         # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
         # to files, so this log line is a forensic surface an operator reads -- and "under

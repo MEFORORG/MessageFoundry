@@ -165,7 +165,7 @@ suite("liveDebug namedElements", () => {
 
 suite("liveDebug buildLiveLenses", () => {
   test("router routing lens + inbound disposition lens + sole-handler send count", () => {
-    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summarize([row({})]), "adt_a01.hl7");
+    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summarize([row({})]), "adt_a01.hl7", false);
     const byLine = new Map(lenses.map((l) => [l.line, l.title]));
     assert.ok(byLine.get(2)?.includes("adt_a01.hl7: RECEIVED"), `inbound lens: ${byLine.get(2)}`);
     assert.ok(byLine.get(5)?.includes("routed → [acme_adt_handler]"), `router lens: ${byLine.get(5)}`);
@@ -177,7 +177,7 @@ suite("liveDebug buildLiveLenses", () => {
     const summary = summarize([
       row({ handlers: ["acme_adt_handler", "other_handler"], deliveries: [{ to: "A" }, { to: "B" }] }),
     ]);
-    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summary, "adt.hl7");
+    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summary, "adt.hl7", false);
     const byLine = new Map(lenses.map((l) => [l.line, l.title]));
     assert.ok(byLine.get(5)?.includes("routed → [acme_adt_handler, other_handler]"));
     assert.ok(!byLine.has(9), "no send-count lens when >1 handler ran (ambiguous attribution)");
@@ -185,7 +185,7 @@ suite("liveDebug buildLiveLenses", () => {
 
   test("unrouted run renders 'routed → (nowhere)'", () => {
     const summary = summarize([row({ handlers: [], deliveries: [], disposition: "UNROUTED" })]);
-    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summary, "x.hl7");
+    const lenses = buildLiveLenses(namedElements(CONFIG_TEXT), summary, "x.hl7", false);
     const byLine = new Map(lenses.map((l) => [l.line, l.title]));
     assert.ok(byLine.get(5)?.includes("routed → (nowhere)"));
   });
@@ -472,6 +472,25 @@ suite("LiveDebugController per-run reveal (ASVS 14.2.6, vault BACKLOG #1187)", (
     }
   });
 
+  test("a masked run's lens tooltip shows an error count, never the error text (ground d1)", async () => {
+    // The CLI's masked error is scrubbed, not removed: a lone identifier passes it whole.
+    const quoted = "unmapped patient 900123456";
+    const runner: TraceRunner = async () => [traceEntry({ disposition: "ERROR", error: quoted })];
+    const controller = new LiveDebugController(runner);
+    try {
+      await controller.runWith("/synthetic/adt.hl7", "/ws");
+      const masked = controller.lensesForText(CONFIG_TEXT).find((l) => l.line === 2);
+      assert.ok(masked?.tooltip?.startsWith("1 of 1 message(s) failed."), masked?.tooltip);
+      assert.ok(!masked?.tooltip?.includes(quoted), `masked tooltip quoted the error: ${masked?.tooltip}`);
+
+      await controller.runWith("/synthetic/adt.hl7", "/ws", true); // control: the revealed run
+      const shown = controller.lensesForText(CONFIG_TEXT).find((l) => l.line === 2);
+      assert.strictEqual(shown?.tooltip, `Errors: ${quoted}`);
+    } finally {
+      controller.dispose();
+    }
+  });
+
   test("hideValues drops a shown run's values before the next run", async () => {
     const controller = new LiveDebugController(async () => [traceEntry({})]);
     try {
@@ -559,7 +578,8 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
     try {
       await controller.runWith(syntheticSample(), "/ws");
       await controller.toggle(); // Live on, masked
-      const reveal = controller.revealOnce(); // starts a --show-phi run that has not landed
+      const reveal = controller.revealOnce();
+      await waitFor(() => calls.length === 3, 5000); // the --show-phi run started, not landed
       await controller.hideValues();
       release();
       await reveal;
@@ -570,11 +590,199 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
     }
   });
 
+  test("a reveal over a multi-message sample shows only the message picked (ground e)", async () => {
+    // Three messages, each error carrying a different synthetic value. The reveal must keep one.
+    const three = [
+      traceEntry({ source: "adt.hl7 [1]", disposition: "ERROR", error: "SYNTH-ONE" }),
+      traceEntry({ source: "adt.hl7 [2]", disposition: "ERROR", error: "SYNTH-TWO" }),
+      traceEntry({ source: "adt.hl7 [3]", disposition: "ERROR", error: "SYNTH-THREE" }),
+    ];
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return three;
+    };
+    const offered: string[][] = [];
+    const picker = async (messages: { source: string }[]): Promise<number | undefined> => {
+      offered.push(messages.map((m) => m.source));
+      return 1; // the second message
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", picker);
+    try {
+      await controller.runWith(syntheticSample(), "/ws"); // masked: lists the three messages
+      await controller.revealOnce();
+      assert.deepStrictEqual(calls, [false, true]);
+      assert.deepStrictEqual(offered, [["adt.hl7 [1]", "adt.hl7 [2]", "adt.hl7 [3]"]]);
+      assert.strictEqual(controller.isShowingValues(), true);
+      assert.strictEqual(controller["entries"]?.length, 1, "a reveal keeps one message");
+      const inbound = controller.lensesForText(CONFIG_TEXT).find((l) => l.line === 2);
+      assert.strictEqual(inbound?.tooltip, "Errors: SYNTH-TWO");
+      assert.ok(inbound?.title.includes("adt.hl7 message 2 of 3"), inbound?.title);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("hideValues while the which-message pick is open starts no reveal", async () => {
+    let answer!: (index: number | undefined) => void;
+    const asked = new Promise<number | undefined>((r) => (answer = r));
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({ source: "a [1]" }), traceEntry({ source: "a [2]" })];
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", () => asked);
+    try {
+      await controller.runWith(syntheticSample(), "/ws");
+      await controller.toggle(); // Live on, masked
+      const reveal = controller.revealOnce(); // the pick is open
+      await controller.hideValues();
+      answer(0); // the user answers after Hide
+      await reveal;
+      assert.ok(!calls.includes(true), `no --show-phi run may start: ${JSON.stringify(calls)}`);
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("dismissing the which-message pick reveals nothing (control: the pick is the act)", async () => {
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({ source: "a [1]" }), traceEntry({ source: "a [2]" })];
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", async () => undefined);
+    try {
+      await controller.runWith(syntheticSample(), "/ws");
+      await controller.revealOnce();
+      assert.deepStrictEqual(calls, [false], "no --show-phi run without a picked message");
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("after a count mismatch the next reveal re-lists the messages before it asks", async () => {
+    let count = 1;
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return Array.from({ length: count }, (_v, i) => traceEntry({ source: `a [${i + 1}]` }));
+    };
+    const offered: number[] = [];
+    const picker = async (messages: { source: string }[]): Promise<number | undefined> => {
+      offered.push(messages.length);
+      return 0;
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", picker);
+    try {
+      await controller.runWith(syntheticSample(), "/ws"); // masked: one message listed
+      count = 2; // the sample gains a message, and no masked run notices
+      await controller.revealOnce(); // focus {0 of 1} meets two entries: nothing revealed
+      assert.deepStrictEqual(calls, [false, true]);
+      assert.strictEqual(controller.isShowingValues(), false);
+      await controller.revealOnce(); // re-lists with a masked run, then asks
+      assert.deepStrictEqual(calls, [false, true, false, true]);
+      assert.deepStrictEqual(offered, [2]);
+      assert.strictEqual(controller.isShowingValues(), true);
+      assert.strictEqual(controller["entries"]?.length, 1);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("Hide while the reveal lists the sample's messages opens no pick", async () => {
+    let count = 1;
+    let gateNext = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      if (!showPhi && gateNext) {
+        gateNext = false;
+        await gate; // the reveal's own listing run, held open while the user hides
+      }
+      return Array.from({ length: count }, (_v, i) => traceEntry({ source: `a [${i + 1}]` }));
+    };
+    let picks = 0;
+    const picker = async (): Promise<number | undefined> => {
+      picks += 1;
+      return 0;
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", picker);
+    try {
+      await controller.runWith(syntheticSample(), "/ws"); // masked: one message listed
+      count = 2;
+      await controller.revealOnce(); // count mismatch: nothing revealed, the list is dropped
+      gateNext = true;
+      const reveal = controller.revealOnce(); // re-lists with a masked run (held)
+      await waitFor(() => calls.length === 3, 5000);
+      await controller.hideValues(); // cancels; its own masked run lands and re-lists
+      release();
+      await reveal;
+      assert.strictEqual(picks, 0, "a cancelled reveal must not open the which-message pick");
+      assert.ok(!calls.slice(2).includes(true), `no --show-phi run after Hide: ${JSON.stringify(calls)}`);
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a second reveal while the first is choosing does nothing", async () => {
+    let answer!: (index: number | undefined) => void;
+    const asked = new Promise<number | undefined>((r) => (answer = r));
+    let picks = 0;
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({ source: "a [1]" }), traceEntry({ source: "a [2]" })];
+    };
+    const picker = (): Promise<number | undefined> => {
+      picks += 1;
+      return asked;
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", picker);
+    try {
+      await controller.runWith(syntheticSample(), "/ws");
+      await controller.toggle(); // Live on, masked
+      const first = controller.revealOnce(); // the pick is open
+      await waitFor(() => picks === 1, 5000);
+      await controller.revealOnce(); // returns at once
+      assert.strictEqual(picks, 1, "the second reveal must not open a second pick");
+      answer(1);
+      await first;
+      assert.deepStrictEqual(calls, [false, false, true]);
+      assert.strictEqual(controller.isShowingValues(), true);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a revealed run that cannot tell which message to keep stores none", async () => {
+    const runner: TraceRunner = async () => [traceEntry({ error: "SYNTH-ONE" }), traceEntry({ error: "SYNTH-TWO" })];
+    const controller = new LiveDebugController(runner);
+    try {
+      await controller.runWith("/synthetic/adt.hl7", "/ws", true); // no focus, two messages
+      assert.strictEqual(controller.isShowingValues(), false);
+      assert.strictEqual(controller["entries"], null);
+      const lenses = controller.lensesForText(CONFIG_TEXT);
+      assert.strictEqual(lenses.length, 1);
+      assert.ok(!lenses[0].title.includes("SYNTH"), lenses[0].title);
+      assert.ok(lenses[0].title.includes("nothing was revealed"), lenses[0].title);
+    } finally {
+      controller.dispose();
+    }
+  });
+
   test("turning Live off orphans a reveal still running", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
+    let revealStarted = false;
     const runner: TraceRunner = async (_s, _c, showPhi) => {
       if (showPhi) {
+        revealStarted = true;
         await gate;
       }
       return [traceEntry({})];
@@ -584,6 +792,9 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
       await controller.runWith(syntheticSample(), "/ws");
       await controller.toggle(); // Live on, masked
       const reveal = controller.revealOnce();
+      // Wait until the --show-phi run is in flight, or this would test the cancelled-choice path.
+      await waitFor(() => revealStarted, 5000);
+      assert.ok(revealStarted, "the reveal's --show-phi run never started");
       await controller.toggle(); // Live off; no masked re-run follows to supersede the reveal
       release();
       await reveal;

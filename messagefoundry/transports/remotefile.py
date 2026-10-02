@@ -93,6 +93,7 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
     relax_verify_expiry,
     resolve_trust_anchor,
+    warn_hostname_check_off,
 )
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
@@ -479,7 +480,10 @@ class _RemoteClient(abc.ABC):
 
 
 def _ftps_ssl_context(
-    settings: dict[str, Any], *, trust_anchor_policy: TrustAnchorPolicy | None = None
+    settings: dict[str, Any],
+    *,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
+    name: str = "",
 ) -> ssl.SSLContext:
     """Build a verifying TLS context for an FTPS control+data channel, mirroring the MLLP outbound arm
     (mllp.py ``_mllp_ssl_context``). Without this, ``ftplib.FTP_TLS()`` falls back to a no-verify stdlib
@@ -494,7 +498,11 @@ def _ftps_ssl_context(
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
     the connection names no ``tls_ca_file`` of its own (the verify path only; ``None`` = the historical
     ``create_default_context(cafile=…)`` behaviour, byte-identical). It never disables verification, so
-    the internal CA never bypasses the ``tls_verify=false`` refusal above."""
+    the internal CA never bypasses the ``tls_verify=false`` refusal above.
+
+    ``name`` is the connection's, for the ``tls_check_hostname=false`` warning (ASVS 12.3.2). ``Ftp()``
+    does not take that key, so ``connections.toml`` cannot set it either, but a hand-built
+    ``ConnectionSpec`` can, and this context honours it, so the warning lives here."""
     # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
     # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
     # arm). Off the construction gate (posture unstamped) the escape is refused since vault BACKLOG
@@ -521,6 +529,12 @@ def _ftps_ssl_context(
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = bool(settings.get("tls_check_hostname", True))
+        if not ctx.check_hostname:  # ASVS 12.3.2: a recorded loosening, never a silent one
+            warn_hostname_check_off(
+                connector="remote-file (FTPS) connection",
+                name=name,
+                host=str(settings.get("host", "")),
+            )
     else:
         logger.warning(
             "REMOTEFILE ftps TLS certificate verification is DISABLED (tls_verify=false, permitted "
@@ -545,7 +559,8 @@ def _ftps_ssl_context(
     if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
         harden_verify_flags(ctx)
         # #129 (ADR 0094): opt-in granular expiry-only relaxation — accept an expired server cert while
-        # STILL validating chain + hostname (verify path only; default off = byte-identical).
+        # STILL validating the chain, and the hostname unless tls_check_hostname=false (verify path
+        # only; default off = byte-identical).
         if settings.get("tls_allow_expired"):
             relax_verify_expiry(ctx, host=str(settings.get("host", "")))
     return ctx
@@ -743,6 +758,7 @@ class _FtpClient(_RemoteClient):
         *,
         tls: bool,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
+        name: str = "",
     ) -> None:
         self._host = str(settings["host"])
         self._port = int(settings.get("port", 21))
@@ -754,7 +770,9 @@ class _FtpClient(_RemoteClient):
         # posture: a verify-disabled ftps without the escape is refused here, not silently insecure.
         # #190 (ADR 0093): thread the instance [tls] internal-CA trust-anchor policy (verify path only).
         self._context: ssl.SSLContext | None = (
-            _ftps_ssl_context(settings, trust_anchor_policy=trust_anchor_policy) if tls else None
+            _ftps_ssl_context(settings, trust_anchor_policy=trust_anchor_policy, name=name)
+            if tls
+            else None
         )
 
     def _connect(self) -> ftplib.FTP:
@@ -1709,7 +1727,10 @@ class _SftpClient(_RemoteClient):
 
 
 def _make_client(
-    settings: dict[str, Any], *, trust_anchor_policy: TrustAnchorPolicy | None = None
+    settings: dict[str, Any],
+    *,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
+    name: str = "",
 ) -> _RemoteClient:
     """Build the protocol-appropriate client. Tests monkeypatch this (or the client classes) so no
     real server/SSH is needed; both connectors call it per operation-batch. ``trust_anchor_policy``
@@ -1721,7 +1742,7 @@ def _make_client(
     if protocol == "ftp":
         return _FtpClient(settings, tls=False)
     if protocol == "ftps":
-        return _FtpClient(settings, tls=True, trust_anchor_policy=trust_anchor_policy)
+        return _FtpClient(settings, tls=True, trust_anchor_policy=trust_anchor_policy, name=name)
     raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
 
 
@@ -1837,7 +1858,9 @@ class RemoteFileDestination(DestinationConnector):
         # Constructing the SFTP client validates the host-key escape posture fail-fast (build_check).
         # #190 (ADR 0093): pass the instance [tls] internal-CA trust-anchor policy so an FTPS hop that
         # names no tls_ca_file of its own verifies against the org internal CA.
-        self._client = _make_client(s, trust_anchor_policy=config.trust_anchor_policy)
+        self._client = _make_client(
+            s, trust_anchor_policy=config.trust_anchor_policy, name=config.name
+        )
         self._settings = s
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
@@ -2063,7 +2086,7 @@ class RemoteFileSource(SourceConnector):
         _validate_common(
             s, connection=None if config.name is None else inbound_record_name(config.name)
         )
-        self._client = _make_client(s)
+        self._client = _make_client(s, name=config.name or "")
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")

@@ -248,7 +248,25 @@ def validate_custom_role_permissions(values: Iterable[str]) -> list[Permission]:
             "permission(s) not assignable to a custom role: "
             + ", ".join(sorted(p.value for p in forbidden))
         )
+    if raw_body_without_summary(perms):
+        raise CustomRoleError(
+            "messages:view_raw needs messages:view_summary in the same custom role: a role that may "
+            "read whole message bodies but not the patient summary is not a coherent role"
+        )
     return sorted(perms, key=lambda p: p.value)
+
+
+def raw_body_without_summary(perms: Iterable[Permission]) -> bool:
+    """True for a permission set holding ``messages:view_raw`` without ``messages:view_summary``.
+
+    Minting refuses that shape (ASVS 14.2.6, vault BACKLOG #1187). Owner ruling R18 makes a
+    one-message read the reveal act only for a ``view_summary`` holder, and a role that may read the
+    whole body while denied the summary drawn from it is not coherent. Refusing it once here covers
+    every body route (``/raw``, attachments, the console body page, export) rather than one route at
+    a time; the routes keep their own gates as a second line. No built-in role has this shape.
+    """
+    held = set(perms)  # one pass, so an iterator argument answers correctly
+    return Permission.MESSAGES_VIEW_RAW in held and Permission.MESSAGES_VIEW_SUMMARY not in held
 
 
 def decode_custom_role_permissions(raw: str | None) -> frozenset[Permission]:
@@ -276,4 +294,8 @@ def decode_custom_role_permissions(raw: str | None) -> frozenset[Permission]:
         if perm in CUSTOM_ROLE_FORBIDDEN_PERMISSIONS:
             continue  # belt-and-braces: a forbidden perm in storage still grants nothing
         granted.add(perm)
+    if raw_body_without_summary(granted):
+        # A stored row of the shape minting refuses (hand-edited, or written before the rule) keeps
+        # everything but the body read: fail closed on the permission it cannot justify.
+        granted.discard(Permission.MESSAGES_VIEW_RAW)
     return frozenset(granted)

@@ -237,7 +237,11 @@ def test_mode_off_session_is_byte_identical_and_never_spawns(graph: tuple[Regist
     registry, config_dir = graph
     ic = registry.inbound["IB_T"]
     off = SandboxSession(
-        SandboxPolicy(mode=SandboxMode.OFF), inbound="IB_T", config_dir=config_dir, env=None
+        SandboxPolicy(mode=SandboxMode.OFF),
+        inbound="IB_T",
+        config_dir=config_dir,
+        env=None,
+        graph=None,
     )
     # Router + Handler go through the OFF branch (in-process) — identical to sandbox=None.
     assert route_only(registry, ic, RAW, sandbox=off, run_context=RunContext()) == route_only(
@@ -262,6 +266,7 @@ def test_subprocess_parity_router_and_handler(graph: tuple[Registry, str]) -> No
         inbound="IB_T",
         config_dir=config_dir,
         env=None,
+        graph=None,
     )
     try:
         names_sb = route_only(registry, ic, RAW, sandbox=session, run_context=RunContext())
@@ -282,6 +287,7 @@ def test_forbidden_import_is_denied_and_worker_survives(graph: tuple[Registry, s
         inbound="IB_T",
         config_dir=config_dir,
         env=None,
+        graph=None,
     )
     try:
         with pytest.raises(SandboxError, match="socket"):
@@ -305,6 +311,7 @@ def test_busy_loop_is_wall_capped_and_recovers(graph: tuple[Registry, str]) -> N
         inbound="IB_T",
         config_dir=config_dir,
         env=None,
+        graph=None,
     )
     try:
         started = time.monotonic()
@@ -331,6 +338,7 @@ def test_db_lookup_in_sandbox_fails_closed(graph: tuple[Registry, str]) -> None:
         inbound="IB_T",
         config_dir=config_dir,
         env=None,
+        graph=None,
     )
     try:
         with pytest.raises(SandboxError, match="db_lookup/fhir_lookup is forbidden"):
@@ -349,6 +357,7 @@ def test_run_context_reaches_the_worker(graph: tuple[Registry, str]) -> None:
         inbound="IB_T",
         config_dir=config_dir,
         env=None,
+        graph=None,
     )
     try:
         deliver = _deliveries(
@@ -401,6 +410,7 @@ async def test_subprocess_marshals_live_store_run_context(
             inbound="IB_T",
             config_dir=config_dir,
             env=None,
+            graph=None,
         )
         try:
             names = route_only(registry, ic, RAW, sandbox=session, run_context=router_rc)
@@ -455,6 +465,7 @@ def _session(config_dir: str, inbound: str = "IB_T", **kw: object) -> SandboxSes
         inbound=inbound,
         config_dir=config_dir,
         env=None,
+        graph=None,
         **kw,  # type: ignore[arg-type]
     )
 
@@ -1324,6 +1335,7 @@ def test_a_bootstrap_stderr_flood_does_not_wedge_the_spawn(tmp_path: Path) -> No
         inbound="IB_FLOOD",
         config_dir=str(tmp_path),
         env=None,
+        graph=None,
     )
     try:
         started = time.monotonic()

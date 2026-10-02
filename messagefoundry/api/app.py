@@ -13,9 +13,13 @@ be driven two ways:
   and anything driven by a synchronous test client).
 
 Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached (the
-``serve`` path always attaches one). With **no** auth attached the routes are **fail-closed** (403)
-unless the app explicitly opts out via ``allow_no_auth=True`` (embedding / dev), in which case
-requests run as the full-access system identity (SYS-1). The API binds localhost by default and
+``serve`` path attaches one unless ``[security].require_sign_in`` is off). With **no** enabled auth
+attached, both factories are **fail-closed**: every protected route is refused (503) unless the
+caller passes ``allow_no_auth=True`` (embedding / dev), in which case requests run as the
+full-access system identity (SYS-1). ``serve`` passes the opt-in itself when sign-in is off, after
+its own start-up refusals.
+
+The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
 engine mints and reuses a self-signed pair on first run. ONE TOPOLOGY IS EXCLUDED --
 ``[api].tls_terminated_upstream`` declares a reverse proxy terminating TLS in front and speaking
@@ -320,7 +324,9 @@ from messagefoundry.config.wiring import (
     accepted_cleartext_hops,
     attested_secure_hops,
     expiry_relaxed_hops,
+    hostname_unchecked_hops,
     load_config,
+    query_credential_hops,
     redacted_settings,
     revocation_attested_hops,
     unverified_generic_db_hops,
@@ -2221,18 +2227,22 @@ def create_app(
         if runner is not None:
             cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
             expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
+            hostname_hops = [name for name, _ in hostname_unchecked_hops(runner.registry)]
+            query_hops = [name for name, _ in query_credential_hops(runner.registry)]
             db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
             attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
             revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
         else:
-            cleartext_hops, expired_hops, db_hops = [], [], []
+            cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
+            query_hops = []
             attested_hops, revocation_hops = [], []
         loosenings_scope = (
             None
             if runner is not None
             else (
                 "settings only — no connection graph is loaded on this engine, so the per-connection "
-                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS / tls_hop_attested / "
+                "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
+                "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
                 "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
             )
         )
@@ -2251,6 +2261,8 @@ def create_app(
                 secret_rotation_settings,
                 cleartext_hops=cleartext_hops,
                 expiry_relaxed_hops=expired_hops,
+                hostname_unchecked_hops=hostname_hops,
+                query_credential_hops=query_hops,
                 unverified_db_hops=db_hops,
                 attested_hops=attested_hops,
                 revocation_attested_hops=revocation_hops,
@@ -4787,8 +4799,14 @@ def create_app(
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_READ)),
     ) -> MessageResponses:
         """The captured request/response replies for a message (ADR 0013). ``outcome``/``detail`` need
-        the message-read permission; the PHI ``body`` is included only for a caller that also holds the
-        raw-body permission (``MESSAGES_VIEW_RAW``). Every access is audited (``response.read``)."""
+        the message-read permission; the PHI ``body`` is included only for a caller that also holds
+        BOTH ``MESSAGES_VIEW_RAW`` and ``MESSAGES_VIEW_SUMMARY``. Every access is audited
+        (``response.read``).
+
+        Why both (ASVS 14.2.6, vault BACKLOG #1187): owner ruling R18 makes this one-message JSON
+        request the reveal act only for a ``view_summary`` holder. Minting refuses a custom role
+        holding ``view_raw`` alone and no built-in role has that shape, so this is the second line;
+        such a caller gets a null ``body``, the same answer as a caller without ``view_raw``."""
         row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (per-channel RBAC), mirroring get_message.
@@ -4797,7 +4815,9 @@ def create_app(
                 await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         captured = await engine.store.correlate_response(message_id)
-        include_body = identity.has(Permission.MESSAGES_VIEW_RAW)
+        include_body = identity.has(Permission.MESSAGES_VIEW_RAW) and identity.has(
+            Permission.MESSAGES_VIEW_SUMMARY
+        )
         # Reading captured replies is PHI access — audit it. If bodies are exposed, also record the
         # per-message PHI view timeline (record_view), exactly like opening a raw body.
         await engine.store.record_audit(
@@ -4813,7 +4833,8 @@ def create_app(
             await engine.store.record_view(message_id, actor=identity.username)
         # `detail` can embed a reply fragment (e.g. an unparseable-ACK note), so it gates on
         # messages:view_summary like every other disposition text (#120) — a bare messages:read caller
-        # (Viewer) reaches this endpoint but gets `detail` nulled. The PHI `body` stays on view_raw above.
+        # (Viewer) reaches this endpoint but gets `detail` nulled. The PHI `body` stays on the
+        # view_raw + view_summary pair above.
         return MessageResponses(
             message_id=message_id,
             responses=[
@@ -4837,11 +4858,17 @@ def create_app(
         message_id: ResourceId,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
+        identity: Identity = Depends(
+            require_phi_read(Permission.MESSAGES_VIEW_RAW, Permission.MESSAGES_VIEW_SUMMARY)
+        ),
     ) -> OutboundPayloads:
         """The **transformed outbound payloads** MEFOR routed for a message — one entry per
         destination (#14 parity tool). The PHI bodies are returned in full, so the route requires
-        ``MESSAGES_VIEW_RAW`` outright (unlike ``/responses``, where the body is conditional). Works on
+        ``MESSAGES_VIEW_RAW`` and ``MESSAGES_VIEW_SUMMARY`` outright (unlike ``/responses``, where the
+        body is conditional). The second is there because owner ruling R18 makes this one-message
+        request the reveal act only for a ``view_summary`` holder (ASVS 14.2.6, vault BACKLOG #1187).
+        Minting refuses a custom role holding ``view_raw`` alone, so this is the second line; such
+        an identity gets the ordinary 403. Works on
         both simulate/shadow and live runs — the transformed payload is retained on the done outbound
         row in either mode. Every access is audited (``outbound.read`` + a per-message ``viewed``
         event when bodies are returned)."""
@@ -7638,6 +7665,7 @@ def create_managed_app(
     env_values: Mapping[str, Any] | None = None,
     env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
     auth_settings: AuthSettings | None = None,
+    allow_no_auth: bool = False,
     ai_settings: AiSettings | None = None,
     security_settings: SecuritySettings | None = None,
     alerts_settings: AlertsSettings | None = None,
@@ -7689,7 +7717,10 @@ def create_managed_app(
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
-    built-in roles; it creates no account (ADR 0183). The store is opened via the
+    built-in roles; it creates no account (ADR 0183). With unset or disabled ``auth_settings`` every
+    protected route is refused (503) unless the caller passes ``allow_no_auth=True``, the same opt-in
+    :func:`create_app` takes; beside enabled ``auth_settings`` that opt-in raises ``ValueError``.
+    The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
     — the CLI server passes it; in-process/test callers omit it (no separate API socket is bound).
@@ -7706,6 +7737,14 @@ def create_managed_app(
             raise ValueError("create_managed_app requires either store_settings or db_path")
         store_settings = sqlite_settings(db_path, synchronous=synchronous)
     resolved = store_settings
+    # create_app can ignore the opt-in beside an enabled service, because it is handed the service
+    # already attached. Here the service attaches in the lifespan, so an app that never ran it
+    # would answer as the system identity. The combination is refused instead.
+    if allow_no_auth and auth_settings is not None and auth_settings.enabled:
+        raise ValueError(
+            "create_managed_app: allow_no_auth=True was passed beside enabled auth_settings; "
+            "pass the opt-in only when sign-in is off"
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -8357,9 +8396,8 @@ def create_managed_app(
                 # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
                 await notifier.aclose()
 
-    # Auth disabled (or unset) → explicitly run open (dev/loopback; __main__ refuses a non-loopback
-    # serve when auth is off). Auth enabled → fail-closed until the lifespan attaches the service.
-    allow_no_auth = auth_settings is None or not auth_settings.enabled
+    # Unset or disabled auth_settings no longer select the open mode: only the caller's opt-in,
+    # checked at the top, does (vault BACKLOG #2611).
     return create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test

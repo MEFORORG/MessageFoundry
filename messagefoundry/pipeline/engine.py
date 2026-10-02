@@ -798,6 +798,7 @@ class Engine:
             cpu_seconds=_sb.cpu_seconds,
             mem_mb=_sb.mem_mb,
             startup_seconds=_sb.startup_seconds,
+            pass_environment=_sb.pass_environment,
         )
         sandbox_config_source = (
             str(self.config_dir) if self.config_dir is not None else None,

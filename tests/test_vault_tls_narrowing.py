@@ -785,3 +785,25 @@ def test_a_proxy_that_appears_after_construction_is_refused_before_sending(
     with pytest.raises(EgressReplyError, match=r"https:// proxy"):
         client.adapter.get(_PATH)
     assert proxy.negotiated == [] and proxy.failures == 0, "a socket reached the proxy"
+
+
+def test_every_vault_context_pins_the_approved_kex_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ASVS 11.6.2: the Vault factory calls ``harden_kex_groups`` on each context it builds, as every
+    other engine-built context does. RED before the change: the spy saw no context at all. Each
+    factory call is checked, because the adapter calls it once per connection."""
+    from messagefoundry.config import tls_policy
+
+    pinned: list[ssl.SSLContext] = []
+    real = tls_policy.harden_kex_groups
+
+    def spy(ctx: ssl.SSLContext) -> str | None:
+        pinned.append(ctx)
+        return real(ctx)
+
+    monkeypatch.setattr(tls_policy, "harden_kex_groups", spy)
+    factory = tls_policy.assert_hvac_tls_suites(
+        {"url": "https://vault.example.invalid:8200"}, connector="Vault test"
+    )
+    built = [factory(), factory()]
+    assert len(pinned) == 3  # once at construction, then once per connection
+    assert all(any(ctx is seen for seen in pinned) for ctx in built)

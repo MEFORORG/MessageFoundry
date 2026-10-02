@@ -972,6 +972,8 @@ def _names(store_privilege: StorePrivilegePosture | None) -> dict[str, str]:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1031,6 +1033,8 @@ def test_the_opt_out_is_named_as_a_loosening() -> None:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),
@@ -1056,6 +1060,8 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
                 SecretRotationSettings(),
                 cleartext_hops=(),
                 expiry_relaxed_hops=(),
+                hostname_unchecked_hops=(),
+                query_credential_hops=(),
                 unverified_db_hops=(),
                 attested_hops=(),
                 revocation_attested_hops=(),
@@ -1147,7 +1153,9 @@ def test_serve_lifespan_runs_the_preflight_and_stashes_a_real_observation(tmp_pa
 
     from messagefoundry.api.app import create_managed_app
 
-    app = create_managed_app(store_settings=sqlite_settings(tmp_path / "managed.db"))
+    app = create_managed_app(
+        store_settings=sqlite_settings(tmp_path / "managed.db"), allow_no_auth=True
+    )
     with TestClient(app) as tc:
         resp = tc.get("/security/posture")
     assert resp.status_code == 200
@@ -1272,7 +1280,9 @@ def test_the_preflight_reads_the_PASSED_store_settings_not_the_ambient_environme
 
     for key, value in hostile.items():
         monkeypatch.setenv(key, value)
-    app = create_managed_app(store_settings=sqlite_settings(tmp_path / "pinned.db"))
+    app = create_managed_app(
+        store_settings=sqlite_settings(tmp_path / "pinned.db"), allow_no_auth=True
+    )
     with TestClient(app) as tc:
         resp = tc.get("/security/posture")
     assert resp.status_code == 200

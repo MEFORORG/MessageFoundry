@@ -20,7 +20,11 @@ import pytest
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import load_settings
-from tests._phi_gate_provisions import RETENTION_WINDOWS_ENV, setenv_at_rest_opt_out
+from tests._phi_gate_provisions import (
+    PHI_GATE_PROVISIONS_TOML,
+    RETENTION_WINDOWS_ENV,
+    setenv_at_rest_opt_out,
+)
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -294,6 +298,71 @@ def test_dryrun_show_phi_still_yields_the_raised_text(
     assert rc == 0
     error = json.loads(capsys.readouterr().out)[0]["error"]
     assert "DOE^JANE^Q" in error and "900123456^^^H^MR" in error
+
+
+PRINTER_CONFIG = PHI_RAISER_CONFIG.replace(
+    '    raise ValueError("unmapped patient " + str(msg["PID-5"]) + " mrn " + str(msg["PID-3"]))',
+    '    print(msg["PID-5"])\n    return []',
+)
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace", "json"]])
+def test_dryrun_sends_a_handlers_print_to_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], trace: list[str]
+) -> None:
+    """A print() in a Handler goes to stderr, so ``dryrun --json`` stdout stays one JSON document.
+
+    Before vault BACKLOG #1187 the dry-run ran the Handler with stdout untouched, so the print came
+    first on stdout and the IDE's JSON.parse quoted it in an error message. The IDE no longer quotes
+    CLI output either way; this keeps the result parseable. Synthetic data only (CLAUDE.md §9)."""
+    assert PRINTER_CONFIG != PHI_RAISER_CONFIG, "the fixture swap did not apply"
+    cfg, _messages, message = _phi_raiser(tmp_path)
+    Path(cfg, "IB_TEST.py").write_text(PRINTER_CONFIG, encoding="utf-8")
+    rc = main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace])
+    assert rc == 0
+    captured = capsys.readouterr()
+    # Control: the print ran, and its text is on stderr, so the absence on stdout is not vacuous.
+    assert "DOE^JANE^Q" in captured.err
+    assert "DOE" not in captured.out
+    results = json.loads(captured.out)
+    assert isinstance(results, list) and len(results) == 1
+
+
+@pytest.mark.parametrize(
+    ("trace", "target"),
+    [
+        ([], "messagefoundry.pipeline.dryrun.dry_run"),
+        (["--trace", "json"], "messagefoundry.pipeline.dryrun_trace.trace_dry_run"),
+    ],
+)
+def test_dryrun_loop_error_withholds_text_except_inbound_selection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    trace: list[str],
+    target: str,
+) -> None:
+    """vault BACKLOG #1187: the IDE shows a ``{"error": ...}`` body as written, so an error that stops
+    the per-message loop is reported by class only. The inbound-selection refusal is the control: it
+    is composed from connection names and keeps its text."""
+    from messagefoundry.pipeline.dryrun import UnknownInboundError
+
+    cfg, _messages, message = _phi_raiser(tmp_path)
+
+    def raises(exc: Exception) -> Callable[..., object]:
+        def _run(*_a: object, **_k: object) -> object:
+            raise exc
+
+        return _run
+
+    monkeypatch.setattr(target, raises(KeyError("DOE^JANE^Q")))
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace]) != 0
+    body = json.loads(capsys.readouterr().out)
+    assert "DOE" not in body["error"] and "KeyError" in body["error"], body
+
+    monkeypatch.setattr(target, raises(UnknownInboundError("no such inbound connection: 'IB_X'")))
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace]) != 0
+    assert json.loads(capsys.readouterr().out) == {"error": "no such inbound connection: 'IB_X'"}
 
 
 # --- BACKLOG #1692: dryrun prints a Handler's declared metadata writes ----------------------------
@@ -952,30 +1021,32 @@ def test_serve_refuses_auth_off_behind_declared_terminator(
     )  # named the terminator exposure
 
 
+#: A loopback instance with the shared PHI-gate provisions, so the sign-in arms decide the outcome.
+_LOOPBACK_TOML = PHI_GATE_PROVISIONS_TOML + "security.local_access_only = true\n"
+_SIGN_IN_OFF_LOOPBACK_TOML = _LOOPBACK_TOML + "security.require_sign_in = false\n"
+
+
 def test_serve_auth_off_on_unexposed_loopback_still_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from messagefoundry.store.crypto import generate_key
-
     # BACKLOG #1013 (negative control): the arm was WIDENED, not broadened to fire on any auth-off. A
     # true loopback dev instance with no declared terminator (instance_exposed False) is the supported
     # no-auth flow and must still start silently.
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
-    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    (tmp_path / "messagefoundry.toml").write_text(
-        "security.block_unlisted_outbound = true\n"
-        "security.allow_unencrypted_phi = true\n"
-        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-        "alerts.security_notifications_required = false\n"
-        "security.local_access_only = true\n"
-        "security.require_sign_in = false\n",
-        encoding="utf-8",
-    )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    rc, captured = _run_secure_serve(tmp_path, monkeypatch, _SIGN_IN_OFF_LOOPBACK_TOML, env="dev")
+    assert rc == 0
     # The widened arm stayed silent because the instance is not exposed.
     assert "refusing to serve with [auth] enabled=false" not in capsys.readouterr().err
+    # vault BACKLOG #2611: the factory denies by default, so `serve` is what asks it for the open mode.
+    assert captured["allow_no_auth"] is True
+
+
+def test_serve_does_not_ask_the_factory_for_the_open_mode_with_sign_in_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control on the last assertion above: with sign-in on (the default), no opt-in is passed.
+    rc, captured = _run_secure_serve(tmp_path, monkeypatch, _LOOPBACK_TOML, env="dev")
+    assert rc == 0
+    assert captured["allow_no_auth"] is False
 
 
 def test_serve_auth_on_behind_terminator_unaffected_by_arm(
