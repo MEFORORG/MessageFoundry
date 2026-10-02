@@ -799,7 +799,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Visibility:** each load logs a WARNING for every path it let through. `serve` and
   `GET /security/posture` name the variable while it is honoured, and both read the engine's own
   environment. `messagefoundry security show` reads the shell it runs in, which may not be the
-  service's. No audit row is written.
+  service's. Honouring it writes no audit row of its own. A `GET /security/posture` read is
+  audited, and that row lists it.
 - **Reversible:** yes, immediately — unset the variable and restart.
 
 ### `cleartext_accepted = true` on a connection — a declared cleartext hop

@@ -6794,10 +6794,8 @@ def security_loosenings(
     :func:`insecure_config_source_escape_permitted` says the loader honours it. It reports the
     environment of the process that renders the list. For ``serve`` and ``GET /security/posture``
     that is the engine's own. ``messagefoundry security show`` reads the shell it runs in, which may
-    not be the service's. At least four other process-wide variables are still unreported here:
-    ``MEFOR_ALLOW_INSECURE_TLS`` (the ``enforcement`` entry's text names it),
-    ``MEFOR_TLS_REVOCATION_ATTESTED``, ``MEFOR_ALLOW_UNVERIFIED_WEBCONSOLE`` and
-    ``MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING``.
+    not be the service's, and its scope marker says so. Other process-wide variables are still
+    unreported here; ``docs/SECURITY-LOOSENING.md`` names them, under *The switches*.
 
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement.

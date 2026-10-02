@@ -745,8 +745,9 @@ def test_the_clamp_predicate(escape: str | None, dial: str | None, permitted: bo
 
 
 def test_the_environment_dial_is_the_dial_settings_resolve(tmp_path: Path) -> None:
-    """The clamp reads one variable for the dial, so pin that it is the one settings read, and that
-    it outranks the file. Then an instance that resolves to ``enforce`` cannot unlock the escape."""
+    """The clamp reads the dial from the environment, so pin that the documented name is one
+    settings read, and that it outranks the file. The two-spellings test below covers the other
+    names the loader accepts."""
     strict = tmp_path / "strict.toml"
     strict.write_text('[security]\nenforcement = "enforce"\n', encoding="utf-8")
     resolved = load_settings(config_path=strict, environ={SECURITY_ENFORCEMENT_ENV: "warn"})
@@ -788,13 +789,21 @@ def test_two_spellings_of_the_dial_that_disagree_leave_the_escape_inert() -> Non
 
 
 def _cli_override_sections(source: str) -> set[str]:
-    """The section names a module writes as settings overrides, in the three shapes the code base
-    uses: a dict literal whose value is a dict, ``x["section"]``, and ``x.setdefault("section", ...)``.
+    """The section names a module writes as settings overrides, in these shapes: a dict literal
+    whose value is a dict literal, ``x["section"]``, ``x.setdefault("section", ...)``, and a
+    ``section=`` keyword to ``dict(...)`` or ``.update(...)``.
 
-    It cannot see a section name held in a variable, and it does not check that the dict reaches
-    ``load_settings(cli=...)``. It over-reports before it under-reports."""
+    A screen, not a proof. It misses at least a section name held in a variable or a constant, a
+    dict comprehension, and a dict literal whose value is a name. It also reports any read of
+    ``x["section"]``, override or not, and it does not check that the dict reaches
+    ``load_settings(cli=...)``."""
     found: set[str] = set()
     for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and (
+            (isinstance(node.func, ast.Name) and node.func.id == "dict")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "update")
+        ):
+            found.update(kw.arg for kw in node.keywords if kw.arg is not None)
         if isinstance(node, ast.Dict):
             for key, value in zip(node.keys, node.values, strict=True):
                 if (
@@ -820,7 +829,8 @@ def _cli_override_sections(source: str) -> set[str]:
 
 def test_no_command_line_override_sets_the_dial() -> None:
     """The clamp is sound because nothing outranks the environment for this dial. A command-line
-    override would, so pin that neither module that builds one writes a ``security`` section."""
+    override would, so screen the two modules that build one for a ``security`` section. The
+    helper's docstring lists the shapes this cannot see."""
     package = _REPO / "messagefoundry"
     main = _cli_override_sections((package / "__main__.py").read_text(encoding="utf-8"))
     checks = _cli_override_sections((package / "checks.py").read_text(encoding="utf-8"))
@@ -860,7 +870,9 @@ def _load_in_a_child(source: Path, env: dict[str, str]) -> subprocess.CompletedP
         text=True,
         env=env,
         cwd=str(_REPO),
-        timeout=30,  # well under the 60s pytest-timeout watchdog, so THIS reports the failure
+        # Three of these run in one test. 15s each keeps the sum under the 60s pytest-timeout
+        # watchdog, so a hung child is a named TimeoutExpired here. A child import takes about 1s.
+        timeout=15,
     )
 
 

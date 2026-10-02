@@ -236,6 +236,13 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[
     import messagefoundry.config.wiring as wiring
 
     real = inspect.unwrap(wiring._win32_config_source_probes)
+    # A stand-in that forgot to record what it replaced would be captured here as "real", and the
+    # tests of the real access list would then pass without reading one.
+    if Path(real.__code__.co_filename) != Path(wiring.__file__):
+        raise RuntimeError(
+            "the Windows config-source readers found here are not the engine's own: a stand-in was "
+            "installed without functools.wraps over the readers it replaced"
+        )
     probes = _clean_config_source_probes()
 
     @functools.wraps(real)

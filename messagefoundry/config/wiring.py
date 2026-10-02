@@ -7076,10 +7076,13 @@ def _refuse_unsafe_config_source(message: str) -> None:
         )
         return
     if insecure_config_source_allowed():
+        # True in every case that reaches here: no dial in the environment, a dial that is not
+        # warn, warn in the settings file only, and two spellings of the dial that disagree.
         raise WiringError(
-            f"{message}. {INSECURE_CONFIG_SOURCE_ESCAPE_ENV} is set but not honoured: it is refused "
-            f"under [security].enforcement = enforce, and works only with "
-            f"{SECURITY_ENFORCEMENT_ENV}=warn in the same environment. Lock the config directory "
+            f"{message}. {INSECURE_CONFIG_SOURCE_ESCAPE_ENV} is set but not honoured: it works only "
+            f"with {SECURITY_ENFORCEMENT_ENV}=warn in the same environment, and every spelling of "
+            "that name there must say warn. The settings file's dial does not count, and under "
+            "[security].enforcement = enforce the escape is refused. Lock the config directory "
             "instead (docs/SERVICE.md)"
         )
     raise WiringError(message)

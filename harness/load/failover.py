@@ -152,7 +152,9 @@ class EngineNode:
         # refuses it. The escape is honoured only beside the warn dial above (vault BACKLOG #2599).
         # It used to reach this child by inheritance from the test session, which no longer sets it.
         # This default is not set on POSIX, where a checkout passes the check. multishard and
-        # shardcert pass the escape in themselves on every platform, and it is honoured there too.
+        # shardcert pass the escape to their nodes themselves on every platform, and with the dial
+        # above it is honoured in those nodes too. The shardcert driver's own in-process load is
+        # not covered: on a writable Windows checkout its shell must carry both variables.
         if sys.platform == "win32":
             self._env.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
         self._config_dir = config_dir

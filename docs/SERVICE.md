@@ -424,8 +424,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     nothing: under `[security].enforcement = enforce`, the default, it is refused, and the refusal
     names it. A production service leaves it unset and locks the config dir (above), so the guard
     stays fail-closed. While it is honoured, the `serve` start-up warning and `GET /security/posture`
-    name it. No audit row is written. Its limits are stated once, in its entry in
-    [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md).
+    name it. Honouring it writes no audit row of its own. Its limits are stated once, in its entry in
+    [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md): among them, the dial is read from the
+    environment, so a program that embeds the engine with its own settings is outside the clamp.
 - `/config/reload` only loads from the startup `--config` directory and any directories listed in
   `[api].config_reload_roots` (see [CONFIGURATION.md](CONFIGURATION.md)); an arbitrary path is
   rejected. Keep those roots admin-owned too.
