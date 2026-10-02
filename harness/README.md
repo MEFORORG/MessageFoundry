@@ -200,3 +200,32 @@ invariant held, 1 when one broke, 2 on a setup error (including a 4xx mid-run). 
 seed, iteration, layer, mutation and sizes -- never a body -- and writes the exact bytes sent under
 `--fuzz-out` (default: `messagefoundry-harness-fuzz` in the system temp directory, outside any
 checkout). The same seed always produces the same bytes.
+
+### Raw TCP and X12
+
+`harness/config/tcp_x12.py` adds two independent paths on ports 2580 to 2583 (`tcp_in`,
+`tcp_out`, `x12_in`, `x12_out`): an STX/ETX-framed `Tcp()` inbound carrying HL7 to a `Tcp()`
+outbound that expects a reply frame, and an `X12()` inbound (`content_type="x12"`, framed by the
+`ISA...IEA` interchange itself) to an `X12()` outbound that requires a TA1. The drivers and sinks
+(`harness/drivers/tcp.py`, `x12.py`; `harness/sinks/tcp.py`, `x12.py`) use the engine's own pure
+codecs, `messagefoundry.framing` and `messagefoundry.parsing.x12.X12FrameReader`, never
+`transports/`. The X12 payloads come from a small synthetic builder,
+`harness/drivers/_x12_interchange.py` (ISA15 `T`, no patient data).
+
+```
+python -m harness --scenario tcp_delivered              # AA ACK, PROCESSED, byte-for-byte at a tcp sink
+python -m harness --scenario tcp_handler_error          # ADT^A03 -> the handler raises -> ERROR
+python -m harness --scenario tcp_not_hl7_nak            # a non-HL7 frame -> framed AR NAK
+python -m harness --scenario tcp_dead_letter            # a sink that closes unanswered -> retried, dead-lettered
+python -m harness --scenario x12_delivered              # PROCESSED, verbatim at an x12 sink answering TA1*A
+python -m harness --scenario x12_envelope_rejected      # IEA02 != ISA13 -> the handler raises -> ERROR
+python -m harness --scenario x12_ta1_reject_dead_letter # TA1*R -> dead-lettered after one attempt
+```
+
+The engine records MSH-10 as the control id of an HL7 frame arriving over TCP, so the TCP
+scenarios match by it. It records **no** control id for an X12 interchange (a non-HL7 inbound
+commits its body with `control_id=None`), so the X12 scenarios list the inbound's newest rows,
+open each new row's body once through the audited `GET /messages/{id}/raw` (surface `harness`),
+and match this run's fresh ISA13 values. On an auth-enabled engine that read needs a token with
+`messages:view_raw`, which the TCP and MLLP scenarios do not. A burst of other traffic large
+enough to push this run's rows off that page reads as "not found", never as a pass.
