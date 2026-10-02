@@ -183,7 +183,10 @@ It also probes each Vault token the engine uses and the AD bind account, when th
 configured. A Vault token that holds more than the engine needs, or an AD bind account in an
 administrative group, makes it exit 3. A Vault or AD probe that cannot run makes it exit 4. Those
 findings are reported only; they never stop a start. Run the task with the service's environment,
-so the probes read the engine's own tokens and bind password. SMTP and the identity provider are
+so the probes read the engine's own tokens and bind password. A Vault hop whose
+`MEFOR_*_VAULT_TOKEN` is unset is not observed, and the check never falls back to `VAULT_TOKEN`. Each
+run binds to AD as the service account, so a wrong bind password counts toward the account lockout
+threshold every time. SMTP and the identity provider are
 printed with the identity the engine presents and the least grant each needs, marked **not probed**.
 Confirm those by hand; they never change the exit code. The full per-hop table is in
 [`SECURITY.md`](SECURITY.md) §*Each backend hop's least privilege; the engine probes the store,

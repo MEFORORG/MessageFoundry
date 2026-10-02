@@ -20,6 +20,7 @@ local-only deployment never touches them.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import re
@@ -983,24 +984,33 @@ class LdapAuthenticator:
         import ldap3
 
         try:
-            with self._service_conn() as svc:
-                who = _authzid_text(svc.extend.standard.who_am_i())
-                try:
-                    _search(
-                        svc,
-                        "bind-account group read",
-                        search_base=self._s.ad_bind_dn,
-                        search_filter="(objectClass=*)",
-                        search_scope=ldap3.BASE,
-                        attributes=["tokenGroups", "memberOf", "primaryGroupID"],
-                    )
-                except (ldap3.core.exceptions.LDAPException, LdapError) as exc:
-                    # An LdapError is a refused referral, whose text is the engine's own.
-                    why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
-                    return BindAccountReading(who, problem=f"group membership not read: {why}")
-                entry = svc.entries[0] if svc.entries else None
+            svc = self._service_conn()
         except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
+        # Unbound explicitly: ldap3's context manager does not unbind a connection that was already
+        # bound when it entered, which auto_bind makes every one here, so the session would stay
+        # open until the object is collected.
+        try:
+            who = _authzid_text(svc.extend.standard.who_am_i())
+            try:
+                _search(
+                    svc,
+                    "bind-account group read",
+                    search_base=self._s.ad_bind_dn,
+                    search_filter="(objectClass=*)",
+                    search_scope=ldap3.BASE,
+                    attributes=["tokenGroups", "memberOf", "primaryGroupID"],
+                )
+            except (ldap3.core.exceptions.LDAPException, LdapError) as exc:
+                # An LdapError is a refused referral, whose text is the engine's own.
+                why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
+                return BindAccountReading(who, problem=f"group membership not read: {why}")
+            entry = svc.entries[0] if svc.entries else None
+        except ldap3.core.exceptions.LDAPException as exc:
+            raise LdapError(str(exc)) from exc
+        finally:
+            with contextlib.suppress(ldap3.core.exceptions.LDAPException):
+                svc.unbind()
         if entry is None:
             return BindAccountReading(
                 who,

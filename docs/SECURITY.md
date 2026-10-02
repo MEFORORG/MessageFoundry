@@ -584,8 +584,8 @@ except that a Vault token missing a capability the engine calls is noted.
   command runs the same read on demand.
 - **Each Vault token.** The command reads the token's own policies, TTL and renewability
   (`auth/token/lookup-self`), then its capabilities (`sys/capabilities-self`) on each path the engine
-  calls and on four administrative paths it never calls. The token, its id and its accessor are
-  never printed.
+  calls and on seven administrative paths it never calls. The token, its id and its accessor are
+  never printed. It reads only the token in `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN`.
 - **The AD bind account.** The command binds as the service account and asks the directory who it
   is (the RFC 4532 "Who am I?" operation). It then reads that account's own `tokenGroups`, which AD
   computes over every nested and primary group, and flags an administrative group. Who am I proves
@@ -605,9 +605,9 @@ backend hops that present a static credential or none (the *Delegated identity* 
 | Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
-| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
-| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
-| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else | **Yes**, by `check-privileges` (hop `vault.secrets`); reported only, never gates a start |
+| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>`; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
+| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
+| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.secrets`); reported only, never gates a start |
 | LDAP (AD) | `[auth].ad_bind_dn` | read and search on the user and group search bases; no write and no administrative group | **Partly**, by `check-privileges`: identity and administrative groups; delegated ACLs not read; never gates a start |
 | SMTP (alerts) | `[alerts].email_username`, or no AUTH account | send as `[alerts].email_from` only | No: printed, not probed |
 | IdP (OIDC) | `[auth].oidc_client_id` at `[auth].oidc_issuer` | a confidential client allowed the configured `oidc_scopes` only; no directory or admin API permission | No: printed, not probed |
@@ -615,24 +615,52 @@ backend hops that present a static credential or none (the *Delegated identity* 
 
 The Vault rows name at least the calls the code makes today. A policy that grants them and nothing
 more is the least grant for that consumer. The Transit cipher skips the separate audit-key read when
-one key does both jobs.
+one key does both jobs. The two `check-privileges` paths are in Vault's `default` policy. A token
+made with `-no-default-policy` needs them granted, or its hop reads as not observed. Neither path
+lets a token change anything.
 
-A Vault token is **over-granted** when it carries the `root` policy, when a path the engine calls
-grants more than that call needs, or when any administrative path grants anything but `deny`. The
-four administrative paths are a policy write (`sys/policies/acl/`), a secrets mount (`sys/mounts/`),
-an auth method (`sys/auth/`) and `auth/token/create`. Grants on other paths the engine does not call
-are not read, so a clean token still needs its policy read by hand. The AD bind account is
-over-granted when it is in Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account
-Operators, Server Operators, Print Operators or Backup Operators. AD names these by SID, so a
-localised group name does not hide one. When `tokenGroups` cannot be read, the probe falls back to
-the direct `memberOf` and `primaryGroupID`, which miss a nested group, and reports the hop as not
-observed unless it finds one.
+A Vault token is **over-granted** when any of these holds:
+
+- it carries the `root` policy;
+- a path the engine calls grants more than that call needs;
+- an administrative path grants anything but `deny`;
+- the store and the connector-secret hops hold the same token. Then each hop is judged against the
+  union of both grants, so each holds the other's paths beyond its own least grant.
+
+The seven administrative paths are two policy writes (`sys/policies/acl/` and the older
+`sys/policy/`), two identity-group paths that can attach a policy (`identity/group` and
+`identity/group/name/`), a secrets mount (`sys/mounts/`), an auth method (`sys/auth/`) and
+`auth/token/create`. Grants on other paths the engine does not call are not read, so a clean token
+still needs its policy read by hand.
+
+The AD bind account is **over-granted** when it is in an administrative group:
+
+- **By fixed SID**, read from `tokenGroups`: Domain Admins, Domain Controllers, Schema Admins,
+  Enterprise Admins, Group Policy Creator Owners, Key Admins and Enterprise Key Admins in its
+  domain; Administrators, Account Operators, Server Operators, Print Operators and Backup Operators
+  in BUILTIN; and Enterprise Domain Controllers. A SID does not change with the language, so a
+  localised group name does not hide one.
+- **By name only**: DnsAdmins. It has no fixed SID; the DNS role gives it an ordinary one when it is
+  installed. So it is found only in the direct `memberOf`, and a nested DnsAdmins membership is not
+  seen.
+
+When `tokenGroups` cannot be read, the probe falls back to the direct `memberOf` and
+`primaryGroupID`, which miss a nested group, and reports the hop as not observed unless it finds
+one. A Who am I that names no identity is also not observed, never clean.
 
 These probes add read-only calls the engine does not otherwise make: the token self-lookup, the
 capabilities read, Who am I and one read of the bind account's own entry. Each goes through the
 client the engine builds for that hop, with its TLS, trust anchor and cleartext refusal. Run the
 command with the service's environment, so the Vault tokens and the AD bind password are the
-engine's own. Without them, those hops are not observed.
+engine's own:
+
+- **A Vault hop whose `MEFOR_*_VAULT_TOKEN` is unset is not observed.** The engine itself would fall
+  back to `VAULT_TOKEN` or `~/.vault-token` there. The check does not: in an operator's shell that
+  token is the operator's own, and judging it as the engine's would report on the wrong token.
+- **Each run binds to AD as the service account.** A wrong or stale bind password is a failed bind,
+  and each one counts toward the domain's account lockout threshold. Repeated runs with the wrong
+  password can lock the account the running engine uses. Check the password before you run the
+  command again.
 
 `check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when a probe
 could not read its principal, and 1 when the settings do not load. Clean means no grant beyond the

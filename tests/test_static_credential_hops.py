@@ -808,7 +808,7 @@ def test_the_least_privilege_auth_rows_need_auth_enabled(feature: str, row: str)
         hops = pc.settings_hops(
             settings,
             vault_probe=lambda consumer: pytest.fail("no Vault consumer is configured"),
-            ldap_probe=lambda: BindAccountReading("u:EXAMPLE\svc", ("S-1-5-32-545",)),
+            ldap_probe=lambda: BindAccountReading(r"u:EXAMPLE\svc", ("S-1-5-32-545",)),
         )
         return next(h for h in hops if h.hop == row)
 

@@ -21,16 +21,20 @@ same split the preflight draws between ``UNOBSERVABLE`` and ``NOT_APPLICABLE``.
 
 **Nothing printed is a secret or PHI.** Identities are principal names, DNs, usernames, env-var
 NAMES, Vault policy names and client ids, never a password, token, accessor or key; the store detail
-has already been through the preflight's redactor. Every function here is pure: it reads its
-arguments and nothing else.
+has already been through the preflight's redactor.
+
+**This module does no I/O of its own, and it is not pure.** The judging functions read only their
+arguments. :func:`settings_hops` and :func:`ldap_hop` CALL the probes they are handed, and the real
+probes make network calls and an LDAP bind, so do not call them on an event loop or a hot path.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import unicodedata
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from messagefoundry.config.settings import (
     SchemaManagement,
@@ -64,7 +68,9 @@ __all__ = [
     "HopPrivilege",
     "HopState",
     "VaultConsumer",
+    "VaultKind",
     "ad_bind_configured",
+    "printable",
     "administrative_group",
     "exit_code_for",
     "ldap_hop",
@@ -185,15 +191,28 @@ def store_hop(report: StorePrivilegeReport, store: StoreSettings) -> HopPrivileg
 # --- Vault: one hop per token ------------------------------------------------------------------
 
 #: Paths the engine never calls, asked about in the same capabilities read as the paths it does.
-#: Any capability but ``deny`` on one means the token can widen its own reach: write a policy, mount
-#: a secrets or auth engine, or mint a token. The names after the last slash are placeholders no
-#: deployment uses; Vault answers with the policy that would apply to them.
+#: Any capability but ``deny`` on one means the token can widen its own reach: write a policy
+#: (``sys/policies/acl/`` and the older ``sys/policy/``), attach a policy through an identity group,
+#: mount a secrets or auth engine, or mint a token. The names after the last slash are placeholders
+#: no deployment uses; Vault answers with the policy that would apply to them.
 VAULT_ADMIN_PATHS: tuple[str, ...] = (
     "sys/policies/acl/messagefoundry-check-privileges",
+    "sys/policy/messagefoundry-check-privileges",
+    "identity/group",
+    "identity/group/name/messagefoundry-check-privileges",
     "sys/mounts/messagefoundry-check-privileges",
     "sys/auth/messagefoundry-check-privileges",
     "auth/token/create",
 )
+
+#: What the check itself needs on every token: both are in Vault's ``default`` policy, so a token
+#: made with ``-no-default-policy`` needs them granted to read clean.
+_SELF_READ_GRANT = (
+    "read on auth/token/lookup-self and update on sys/capabilities-self, for this check"
+)
+
+#: Which provider uses a token, and so which paths its probe asks about.
+VaultKind = Literal["kek", "transit", "kv"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +222,7 @@ class VaultConsumer:
     connector-secret provider, reading ``refs``). The probe dispatches on ``kind`` alone."""
 
     hop: str
-    kind: str
+    kind: VaultKind
     identity: str
     minimal: str
     refs: tuple[str, ...] = ()
@@ -223,7 +242,8 @@ def vault_consumers(settings: ServiceSettings) -> list[VaultConsumer]:
                 "transit",
                 "store Transit cipher (token in MEFOR_STORE_VAULT_TOKEN)",
                 "read on transit/keys/<data key> and transit/keys/<audit key>; update on "
-                "transit/encrypt/<data key>, transit/decrypt/<data key> and transit/hmac/<audit key>",
+                "transit/encrypt/<data key>, transit/decrypt/<data key> and transit/hmac/<audit key>; "
+                + _SELF_READ_GRANT,
             )
         )
     elif store.key_provider == "vault":
@@ -232,7 +252,8 @@ def vault_consumers(settings: ServiceSettings) -> list[VaultConsumer]:
                 "vault.store",
                 "kek",
                 "store key provider (token in MEFOR_STORE_VAULT_TOKEN)",
-                "read on transit/keys/<KEK> and update on transit/decrypt/<KEK>",
+                "read on transit/keys/<KEK> and update on transit/decrypt/<KEK>; "
+                + _SELF_READ_GRANT,
             )
         )
     # The same reader as the settings:vault.secrets hop, so the two cannot disagree about which
@@ -247,25 +268,44 @@ def vault_consumers(settings: ServiceSettings) -> list[VaultConsumer]:
                 "kv",
                 f"connector secret provider for {len(refs)} reference(s) "
                 "(token in MEFOR_SECRETS_VAULT_TOKEN)",
-                "read on the KV v2 data path of each reference, and nothing else",
+                "read on the KV v2 data path of each reference, and nothing else; "
+                + _SELF_READ_GRANT,
                 tuple(refs),
             )
         )
     return out
 
 
+def printable(text: str) -> str:
+    """``text`` with every Unicode control, format and unassigned character removed, for printing
+    a value a remote server chose (a Vault policy name, a Who am I answer).
+
+    Wider than :func:`~messagefoundry.controlchars.strip_control_chars`, which removes C0 and DEL:
+    this also removes C1 controls such as U+009B, which a terminal can read as an escape sequence,
+    and format characters such as the U+202E right-to-left override, which can reorder a line so a
+    policy named ``root`` reads as something else. Category ``C*`` covers all of them."""
+    return "".join(ch for ch in text if not unicodedata.category(ch).startswith("C"))
+
+
 def _caps(caps: Iterable[str]) -> str:
-    return ", ".join(sorted(caps)) or "none"
+    return ", ".join(sorted(printable(c) for c in caps)) or "none"
 
 
-def vault_hop(consumer: VaultConsumer, reading: VaultTokenReading) -> HopPrivilege:
+def vault_hop(
+    consumer: VaultConsumer,
+    reading: VaultTokenReading,
+    *,
+    shared: Mapping[str, VaultTokenReading] | None = None,
+) -> HopPrivilege:
     """Judge one token's self-reading against what the engine calls with it.
 
-    Over-granted: a ``root`` policy; any capability beyond the one a configured path needs; or any
-    capability but ``deny`` on an administrative path the engine never calls. A capability the
-    engine needs and the token lacks is reported but is not an over-grant: the engine's own call
-    would fail. Unobservable: any part of the reading could not be made, and no over-grant was seen.
-    Over-grant wins, as it does in the exit code."""
+    Over-granted: a ``root`` policy; any capability beyond the one a configured path needs; any
+    capability but ``deny`` on an administrative path the engine never calls; or, when ``shared``
+    names other hops that hold the SAME token, any grant on a path only those hops need. One token
+    serving two hops holds the union of both grants, so each hop holds more than its own least
+    grant. A capability the engine needs and the token lacks is reported but is not an over-grant:
+    the engine's own call would fail. Unobservable: any part of the reading could not be made, and
+    no over-grant was seen. Over-grant wins, as it does in the exit code."""
     over: list[str] = []
     notes: list[str] = []
     if "root" in reading.policies:
@@ -284,6 +324,13 @@ def vault_hop(consumer: VaultConsumer, reading: VaultTokenReading) -> HopPrivile
         extra = set(reading.capabilities.get(path, ())) - {"deny"}
         if extra:
             over.append(f"{path} grants {_caps(extra)}; the engine never calls it")
+    for other_hop, other in (shared or {}).items():
+        for path in other.required:
+            extra = set(other.capabilities.get(path, ())) - {"deny"}
+            if path not in reading.required and extra:
+                over.append(
+                    f"the same token serves {other_hop}, so it also holds {_caps(extra)} on {path}"
+                )
 
     seen: list[str] = []
     if reading.looked_up:
@@ -295,7 +342,8 @@ def vault_hop(consumer: VaultConsumer, reading: VaultTokenReading) -> HopPrivile
             ttl = f"ttl {reading.ttl}s"
         renew = {True: "renewable", False: "not renewable", None: "renewability not reported"}
         seen.append(
-            f"token policies [{', '.join(reading.policies)}], {ttl}, {renew[reading.renewable]}"
+            f"token policies [{', '.join(printable(p) for p in reading.policies)}], {ttl}, "
+            f"{renew[reading.renewable]}"
         )
     checked = [p for p in reading.required if p in reading.capabilities]
     if checked:
@@ -316,42 +364,80 @@ def vault_hop(consumer: VaultConsumer, reading: VaultTokenReading) -> HopPrivile
     return HopPrivilege(consumer.hop, state, consumer.identity, consumer.minimal, ". ".join(parts))
 
 
+def _vault_hops(
+    consumers: list[VaultConsumer], readings: list[VaultTokenReading]
+) -> list[HopPrivilege]:
+    """Judge every Vault hop, each against the union of grants of every hop that holds its token.
+
+    Two hops hold one token when lookup-self named the same token for both (``same_token_as``); a
+    reading that could not name its token is judged alone."""
+    hops: list[HopPrivilege] = []
+    for consumer, reading in zip(consumers, readings, strict=True):
+        shared = {
+            other_consumer.hop: other
+            for other_consumer, other in zip(consumers, readings, strict=True)
+            if other is not reading and reading.same_token_as(other)
+        }
+        hops.append(vault_hop(consumer, reading, shared=shared))
+    return hops
+
+
 # --- LDAP: the AD bind account ------------------------------------------------------------------
 
-#: Well-known BUILTIN groups whose members administer the domain or its controllers (the MS-DTYP
-#: well-known SID list). A SID is language-neutral, so a localised group name cannot hide one.
-_ADMIN_BUILTIN_SIDS: dict[str, str] = {
+#: Well-known groups whose members administer the domain or its controllers, by fixed SID (the
+#: MS-DTYP well-known SID list). A SID is language-neutral, so a localised group name cannot hide
+#: one. Enterprise Domain Controllers is not BUILTIN, but its SID is fixed across every forest.
+_ADMIN_WELL_KNOWN_SIDS: dict[str, str] = {
+    "S-1-5-9": "Enterprise Domain Controllers",
     "S-1-5-32-544": "Administrators",
     "S-1-5-32-548": "Account Operators",
     "S-1-5-32-549": "Server Operators",
     "S-1-5-32-550": "Print Operators",
     "S-1-5-32-551": "Backup Operators",
 }
-#: Relative ids of a domain's own administrative groups, read off ``S-1-5-21-a-b-c-<rid>``. The same
-#: three the config-directory ACL check treats as administrators (config/wiring.py).
+#: Relative ids of a domain's own administrative groups, read off ``S-1-5-21-a-b-c-<rid>``. Key
+#: Admins and Enterprise Key Admins can write any account's key credentials; Group Policy Creator
+#: Owners can author policy the domain applies; Domain Controllers holds replication rights.
+#:
+#: Kept apart from ``config/wiring.py``'s ``_WIN_ADMIN_RIDS`` on purpose: that set answers a
+#: different question (may this owner write the config directory, which includes the built-in
+#: Administrator ACCOUNT, RID 500), it is private, and it carries no group names to print.
 _ADMIN_DOMAIN_RIDS: dict[int, str] = {
     512: "Domain Admins",
+    516: "Domain Controllers",
     518: "Schema Admins",
     519: "Enterprise Admins",
+    520: "Group Policy Creator Owners",
+    526: "Key Admins",
+    527: "Enterprise Key Admins",
 }
-#: The same groups by name, for the direct ``memberOf`` read. A localised directory names them
-#: differently, which is why the SID read comes first.
+#: Administrative groups with NO fixed SID: DnsAdmins gets an ordinary RID when the DNS role is
+#: installed, so it differs per domain. It is matched by name in the direct ``memberOf`` only; a
+#: nested DnsAdmins membership is not seen, and the hop's detail says so.
+_ADMIN_NAME_ONLY = ("DnsAdmins",)
+#: Every administrative group by name, for the direct ``memberOf`` read. A localised directory
+#: names the fixed-SID groups differently, which is why the SID read comes first.
 _ADMIN_GROUP_NAMES: dict[str, str] = {
-    name.lower(): name for name in (*_ADMIN_BUILTIN_SIDS.values(), *_ADMIN_DOMAIN_RIDS.values())
+    name.lower(): name
+    for name in (
+        *_ADMIN_WELL_KNOWN_SIDS.values(),
+        *_ADMIN_DOMAIN_RIDS.values(),
+        *_ADMIN_NAME_ONLY,
+    )
 }
 
 _LDAP_RIGHTS_NOT_READ = (
     "rights not read: Who am I proves identity, and the group read covers administrative groups "
-    "only; delegated directory ACLs (what the account may change, and where) are not read. "
-    "Attest them by hand in the directory"
+    "only (DnsAdmins by direct membership only); delegated directory ACLs (what the account may "
+    "change, and where) are not read. Attest them by hand in the directory"
 )
 
 
 def administrative_group(sid: str) -> str | None:
     """The administrative group ``sid`` names, or ``None``. A domain SID must have exactly the
     ``S-1-5-21-a-b-c-<rid>`` shape with an ASCII rid, as the config-directory check requires."""
-    if sid in _ADMIN_BUILTIN_SIDS:
-        return _ADMIN_BUILTIN_SIDS[sid]
+    if sid in _ADMIN_WELL_KNOWN_SIDS:
+        return _ADMIN_WELL_KNOWN_SIDS[sid]
     parts = sid.split("-")
     rid = parts[-1]
     if len(parts) == 8 and sid.startswith("S-1-5-21-") and rid.isascii() and rid.isdigit():
@@ -368,9 +454,9 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     """Probe and judge the bind account, when AD is configured.
 
     Over-granted: any administrative group, by SID from ``tokenGroups`` (every nested and primary
-    group) or, when that was unreadable, by name from the direct ``memberOf`` and ``primaryGroupID``.
-    Clean: the transitive read found none. Unobservable: the bind or the read failed, or only the
-    direct read was possible and it found none."""
+    group), by name from the direct ``memberOf``, or by the ``primaryGroupID``. Clean: Who am I
+    named the bound identity and the transitive read found none. Unobservable: the bind or a read
+    failed, Who am I named no identity, or only the direct read was possible and it found none."""
     if not ad_bind_configured(settings):
         return _not_configured("ldap", "[auth].enabled or [auth].ad_enabled is off")
     auth = settings.auth
@@ -380,37 +466,35 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     )
     reading = probe()
     transitive = bool(reading.group_sids)
-    if transitive:
-        found = {g for sid in reading.group_sids if (g := administrative_group(sid))}
-    else:
-        # The canonical spelling, never the directory's, so nothing remote reaches the output.
-        found = {
-            _ADMIN_GROUP_NAMES[c.lower()]
-            for c in reading.member_of
-            if c.lower() in _ADMIN_GROUP_NAMES
-        }
-        if reading.primary_group_rid in _ADMIN_DOMAIN_RIDS:
-            found.add(_ADMIN_DOMAIN_RIDS[reading.primary_group_rid])
-    problem = reading.problem
-    if problem is None and not transitive:
-        problem = (
+    found = {g for sid in reading.group_sids if (g := administrative_group(sid))}
+    # The canonical spelling, never the directory's, so nothing remote reaches the output. Read on
+    # both paths: it is the only read that can see DnsAdmins.
+    found |= {
+        _ADMIN_GROUP_NAMES[c.lower()] for c in reading.member_of if c.lower() in _ADMIN_GROUP_NAMES
+    }
+    if reading.primary_group_rid in _ADMIN_DOMAIN_RIDS:
+        found.add(_ADMIN_DOMAIN_RIDS[reading.primary_group_rid])
+    problems = [reading.problem] if reading.problem is not None else []
+    if reading.authzid is None:
+        problems.append("Who am I returned no identity, so the bound identity is not proven")
+    if reading.problem is None and not transitive:
+        problems.append(
             "nested group membership not read: tokenGroups came back empty, so only the direct "
             "memberOf and primaryGroupID were read"
         )
     parts: list[str] = []
     if reading.authzid is not None:
-        parts.append(f"Who am I: bound as {reading.authzid!r}")
+        parts.append(f"Who am I: bound as {printable(reading.authzid)!r}")
     scope = "transitive, from tokenGroups" if transitive else "direct memberOf only"
     if found:
         state = HopState.OVER_GRANTED
         parts.insert(0, f"over-granted: member of {', '.join(sorted(found))} ({scope})")
-    elif problem is not None:
+    elif problems:
         state = HopState.UNOBSERVABLE
     else:
         state = HopState.CLEAN
         parts.append(f"no administrative group ({scope})")
-    if problem is not None:
-        parts.append(f"could not observe: {problem}")
+    parts += [f"could not observe: {p}" for p in problems]
     parts.append(_LDAP_RIGHTS_NOT_READ)
     return HopPrivilege("ldap", state, identity, minimal, ". ".join(parts))
 
@@ -468,11 +552,12 @@ def settings_hops(
 ) -> list[HopPrivilege]:
     """Every hop after the store, in a fixed order: the Vault tokens, LDAP, SMTP and the IdP.
 
-    The probes are injected so this module stays free of I/O: each runs only for a hop the settings
-    configure (:mod:`messagefoundry.privilege_probes` supplies the real ones)."""
+    The probes are injected, so this module does no I/O of its own: each runs only for a hop the
+    settings configure (:mod:`messagefoundry.privilege_probes` supplies the real ones, which make
+    network calls)."""
     consumers = vault_consumers(settings)
     vault = (
-        [vault_hop(c, vault_probe(c)) for c in consumers]
+        _vault_hops(consumers, [vault_probe(c) for c in consumers])
         if consumers
         else [_not_configured("vault", "no Vault consumer is configured")]
     )

@@ -488,7 +488,7 @@ def test_a_hop_the_engine_cannot_probe_says_so_and_never_fails_the_run() -> None
         for h in settings_hops(
             settings,
             vault_probe=lambda consumer: VaultTokenReading(looked_up=True),
-            ldap_probe=lambda: BindAccountReading("u:EXAMPLE\mefor-ldap", ("S-1-5-32-545",)),
+            ldap_probe=lambda: BindAccountReading(r"u:EXAMPLE\mefor-ldap", ("S-1-5-32-545",)),
         )
     }
     assert hops["vault.store"].state is HopState.CLEAN

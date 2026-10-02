@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -46,6 +47,7 @@ from messagefoundry.privilege_check import (
     VAULT_ADMIN_PATHS,
     HopState,
     VaultConsumer,
+    _vault_hops,
     administrative_group,
     exit_code_for,
     ldap_hop,
@@ -92,8 +94,10 @@ class _FakeVault:
         caps: dict[str, list[str]] | None = None,
         lookup_error: Exception | None = None,
         caps_error: Exception | None = None,
+        accessor: str = _ACCESSOR,
     ) -> None:
         self.asked: list[str] = []
+        self._accessor = accessor
         self._policies = list(policies)
         self._caps = caps or {}
         self._lookup_error = lookup_error
@@ -107,7 +111,7 @@ class _FakeVault:
                 return {
                     "data": {
                         "id": _TOKEN,
-                        "accessor": _ACCESSOR,
+                        "accessor": outer._accessor,
                         "policies": outer._policies,
                         "ttl": 2764800,
                         "renewable": True,
@@ -184,6 +188,70 @@ def test_any_grant_on_an_administrative_path_is_an_over_grant() -> None:
     hop = vault_hop(_STORE, _reading(_FakeVault(caps=caps)))
     assert hop.state is HopState.OVER_GRANTED
     assert "auth/token/create grants update; the engine never calls it" in hop.detail
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "sys/policy/messagefoundry-check-privileges",
+        "identity/group",
+        "identity/group/name/messagefoundry-check-privileges",
+    ],
+)
+def test_the_older_policy_endpoint_and_identity_groups_are_administrative(path: str) -> None:
+    hop = vault_hop(_STORE, _reading(_FakeVault(caps=_least_caps() | {path: ["update"]})))
+    assert hop.state is HopState.OVER_GRANTED
+    assert f"{path} grants update; the engine never calls it" in hop.detail
+
+
+def test_a_policy_name_cannot_drive_the_terminal_or_reorder_the_line() -> None:
+    hostile = "mefor‮toor\x9b31m\x1b"
+    hop = vault_hop(_STORE, _reading(_FakeVault(policies=(hostile,), caps=_least_caps())))
+    assert "‮" not in hop.detail and "\x9b" not in hop.detail and "\x1b" not in hop.detail
+    assert "token policies [mefortoor31m]" in hop.detail
+
+
+def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> None:
+    kv_path = "secret/data/mefor/ad"
+    caps = _least_caps() | {kv_path: ["read"]}
+    store = read_vault_token(lambda: _FakeVault(caps=caps), lambda: dict(_KEK_PATHS))
+    secrets = read_vault_token(
+        lambda: _FakeVault(caps=caps), lambda: {kv_path: frozenset({"read"})}
+    )
+    assert store.same_token_as(secrets)
+    kv = VaultConsumer("vault.secrets", "kv", "kv", "read the KV path")
+    hops = _vault_hops([_STORE, kv], [store, secrets])
+    assert [h.state for h in hops] == [HopState.OVER_GRANTED, HopState.OVER_GRANTED]
+    assert f"the same token serves vault.secrets, so it also holds read on {kv_path}" in (
+        hops[0].detail
+    )
+    assert f"serves vault.store, so it also holds update on transit/decrypt/{_KEK}" in (
+        hops[1].detail
+    )
+    assert _ACCESSOR not in _out(hops[0]) and _ACCESSOR not in repr(store)
+    # The control: two different tokens with the same grants are each judged alone.
+    other = read_vault_token(
+        lambda: _FakeVault(caps=caps, accessor="other-other-other"),
+        lambda: {kv_path: frozenset({"read"})},
+    )
+    assert [h.state for h in _vault_hops([_STORE, kv], [store, other])] == [
+        HopState.CLEAN,
+        HopState.CLEAN,
+    ]
+
+
+def test_an_unknown_consumer_kind_is_refused_not_probed_as_the_kek() -> None:
+    bogus = VaultConsumer("vault.x", cast("Any", "kv2"), "x", "x")
+    with pytest.raises(ValueError, match="no Vault probe for consumer kind 'kv2'"):
+        probe_vault(bogus)
+
+
+def test_a_probe_problem_is_logged_without_the_token(caplog: pytest.LogCaptureFixture) -> None:
+    error = ConnectionError(f"https://vault.invalid/ token={_TOKEN}")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.privilege_probes"):
+        _reading(_FakeVault(lookup_error=error))
+    assert "check-privileges: token lookup-self failed: ConnectionError" in caplog.text
+    assert _TOKEN not in caplog.text
 
 
 def test_a_missing_capability_is_noted_and_is_not_an_over_grant() -> None:
@@ -361,6 +429,7 @@ def test_the_transit_cipher_probe_asks_about_the_cipher_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vault = _FakeVault()
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _TOKEN)
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-data")
     monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
     monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t: vault)
@@ -422,7 +491,10 @@ class _FakeLdapConn:
     """The service connection: Who am I, then one BASE read of the bind DN. Records each search;
     any write method raises, so a probe that wrote would fail the test."""
 
-    def __init__(self, raw: dict[str, list[bytes]] | None, authzid: str = "u:EXAMPLE\\svc") -> None:
+    def __init__(
+        self, raw: dict[str, list[bytes]] | None, authzid: str | None = "u:EXAMPLE\\svc"
+    ) -> None:
+        self.unbound = False
         self.searches: list[dict[str, Any]] = []
         self.result: dict[str, Any] | None = None
         self.entries: list[_FakeEntry] = []
@@ -443,6 +515,10 @@ class _FakeLdapConn:
         self.result = {"result": 0}
         self.entries = [] if self._raw is None else [_FakeEntry(self._raw)]
         return bool(self.entries)
+
+    def unbind(self) -> bool:
+        self.unbound = True
+        return True
 
     def __getattr__(self, name: str) -> Any:
         if name in {"modify", "add", "delete", "modify_dn", "password_modify"}:
@@ -493,6 +569,49 @@ def test_whoami_and_a_transitive_read_with_no_admin_group_is_clean(
     assert "Who am I: bound as 'u:EXAMPLE\\\\svc'" in hop.detail
     assert "rights not read" in hop.detail
     assert _BIND_SECRET not in _out(hop)
+    assert conn.unbound  # the session is closed, not left for the collector
+
+
+def test_a_whoami_that_names_no_one_is_unobservable_never_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _FakeLdapConn({"tokenGroups": [_sid(*_DOMAIN, 513)]}, authzid=None)
+    hop = _judge(_read(monkeypatch, conn))
+    assert hop.state is HopState.UNOBSERVABLE
+    assert "Who am I returned no identity" in hop.detail
+
+
+@pytest.mark.parametrize(
+    ("sid", "group"),
+    [
+        (_sid(*_DOMAIN, 516), "Domain Controllers"),
+        (_sid(*_DOMAIN, 520), "Group Policy Creator Owners"),
+        (_sid(*_DOMAIN, 526), "Key Admins"),
+        (_sid(*_DOMAIN, 527), "Enterprise Key Admins"),
+        (_sid(9), "Enterprise Domain Controllers"),
+    ],
+)
+def test_the_wider_administrative_groups_are_over_grants(
+    monkeypatch: pytest.MonkeyPatch, sid: bytes, group: str
+) -> None:
+    hop = _judge(_read(monkeypatch, _FakeLdapConn({"tokenGroups": [_sid(*_DOMAIN, 513), sid]})))
+    assert hop.state is HopState.OVER_GRANTED
+    assert f"member of {group} (transitive" in hop.detail
+
+
+def test_dnsadmins_is_found_by_direct_membership_beside_a_clean_sid_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DnsAdmins has no fixed RID, so its SID in tokenGroups cannot be recognised; the direct
+    memberOf is read on every path for it."""
+    raw = {
+        "tokenGroups": [_sid(*_DOMAIN, 513), _sid(*_DOMAIN, 1101)],
+        "memberOf": [b"CN=DnsAdmins,CN=Users,DC=example,DC=com"],
+    }
+    hop = _judge(_read(monkeypatch, _FakeLdapConn(raw)))
+    assert hop.state is HopState.OVER_GRANTED
+    assert "member of DnsAdmins" in hop.detail
+    assert "DnsAdmins by direct membership only" in hop.detail
 
 
 @pytest.mark.parametrize(
@@ -555,7 +674,7 @@ def test_a_failed_bind_is_unobservable_never_raised(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(LdapAuthenticator, "read_bind_account", _boom)
     reading = read_ldap_bind(_ad_service_settings(), None)
     assert reading.authzid is None
-    assert reading.problem == "automatic bind not successful - invalidCredentials"
+    assert reading.problem == "AD bind probe: automatic bind not successful - invalidCredentials"
     assert _judge(reading).state is HopState.UNOBSERVABLE
 
 
@@ -627,6 +746,37 @@ def test_cli_exits_4_when_vault_is_unreachable_and_sends_one_request(
     # A transport failure on the lookup skips the capabilities read, which would only time out too.
     assert vault.asked == []
     assert "capabilities-self" not in hop["detail"]
+
+
+def test_cli_never_judges_a_fallback_token_when_the_engines_is_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With MEFOR_STORE_VAULT_TOKEN unset, hvac would read VAULT_TOKEN or ~/.vault-token: the
+    operator's token, not the engine's. The probe refuses before any client is built."""
+    built: list[object] = []
+
+    def _build(addr: Any, token: Any) -> _FakeVault:
+        built.append(token)
+        return _FakeVault()
+
+    argv = _cli(monkeypatch, tmp_path, _build)
+    monkeypatch.delenv("MEFOR_STORE_VAULT_TOKEN")
+    monkeypatch.setenv("VAULT_TOKEN", "hvs.synthetic-operator-305")
+    assert main(argv) == EXIT_UNOBSERVABLE
+    hop = next(h for h in json.loads(capsys.readouterr().out)["hops"] if h["hop"] == "vault.store")
+    assert hop["state"] == "unobservable"
+    assert "MEFOR_STORE_VAULT_TOKEN is not set" in hop["detail"]
+    assert built == []
+
+
+def test_the_secrets_probe_refuses_an_unset_token_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MEFOR_SECRETS_VAULT_TOKEN", raising=False)
+    monkeypatch.setenv("VAULT_TOKEN", "hvs.synthetic-operator-305")
+    monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t: pytest.fail("built"))
+    kv = VaultConsumer("vault.secrets", "kv", "kv", "kv", ("mefor/ad",))
+    reading = probe_vault(kv)
+    assert any("MEFOR_SECRETS_VAULT_TOKEN is not set" in p for p in reading.problems)
+    assert not reading.looked_up
 
 
 def test_cli_exits_0_on_a_least_privilege_token(

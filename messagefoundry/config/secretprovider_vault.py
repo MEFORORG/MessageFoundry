@@ -225,8 +225,20 @@ def secrets_vault_client() -> Any:
     """The connector-secret hop's Vault client, built from the same environment and by the same
     :func:`_build_client` :meth:`VaultSecretProvider.resolve` uses: same TLS narrowing, same anchor,
     no redirects, and the same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``,
-    which reads the token's own grants through it and changes nothing."""
-    return _build_client(os.environ.get(_ENV_ADDR), os.environ.get(_ENV_TOKEN))
+    which reads the token's own grants through it and changes nothing.
+
+    **It refuses when ``MEFOR_SECRETS_VAULT_TOKEN`` is unset, where the provider does not.** Given
+    no token, hvac reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is
+    the operator's own token, and the check would judge it as the engine's. Raises
+    :class:`SecretProviderError`, which the probe reports as not observed."""
+    token = os.environ.get(_ENV_TOKEN)
+    if not token:
+        raise SecretProviderError(
+            f"{_ENV_TOKEN} is not set, so the connector-secret token is not known. The check reads "
+            f"only the token named there, never VAULT_TOKEN or ~/.vault-token; run it with the "
+            f"service's environment"
+        )
+    return _build_client(os.environ.get(_ENV_ADDR), token)
 
 
 def kv_required_capabilities(refs: Iterable[str]) -> dict[str, frozenset[str]]:

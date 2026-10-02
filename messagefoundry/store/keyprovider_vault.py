@@ -286,7 +286,7 @@ class VaultKeyProvider:
         self._settings = settings
 
     def active_key(self) -> str | None:
-        transit_key = os.environ.get(_ENV_TRANSIT_KEY)
+        transit_key = _kek_name()
         wrapped_dek = os.environ.get(_ENV_WRAPPED_DEK)
         if not transit_key or not wrapped_dek:
             # Fail closed: selecting `vault` without the KEK name + wrapped DEK is a misconfiguration, not
@@ -374,12 +374,30 @@ def build_provider(settings: StoreSettings) -> VaultKeyProvider:
 TRANSIT_MOUNT = "transit"
 
 
+def _kek_name() -> str | None:
+    """The KEK's Transit key name. One read for :meth:`VaultKeyProvider.active_key` and for
+    :func:`kek_required_capabilities`, so the probe asks about the key the provider unwraps under."""
+    return os.environ.get(_ENV_TRANSIT_KEY) or None
+
+
 def store_vault_client() -> Any:
     """The store hop's Vault client, built from the same environment and by the same
     :func:`_build_client` the providers use: same TLS narrowing, same anchor, no redirects, and the
     same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
-    own grants through it and changes nothing."""
-    return _build_client(os.environ.get(_ENV_ADDR), os.environ.get(_ENV_TOKEN))
+    own grants through it and changes nothing.
+
+    **It refuses when ``MEFOR_STORE_VAULT_TOKEN`` is unset, where the providers do not.** Given no
+    token, hvac reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is
+    the operator's own token, and the check would judge it as the engine's. Raises
+    :class:`KeyProviderError`, which the probe reports as not observed."""
+    token = os.environ.get(_ENV_TOKEN)
+    if not token:
+        raise KeyProviderError(
+            f"{_ENV_TOKEN} is not set, so the store token is not known. The check reads only the "
+            f"token named there, never VAULT_TOKEN or ~/.vault-token; run it with the service's "
+            f"environment"
+        )
+    return _build_client(os.environ.get(_ENV_ADDR), token)
 
 
 def kek_required_capabilities() -> dict[str, frozenset[str]]:
@@ -388,7 +406,7 @@ def kek_required_capabilities() -> dict[str, frozenset[str]]:
     Kept beside the calls so the two cannot drift: ``read_key`` is a read of ``transit/keys/<KEK>``
     and ``decrypt_data`` an update of ``transit/decrypt/<KEK>``. Raises :class:`KeyProviderError`
     when the KEK name is not set, as the provider itself would."""
-    kek = os.environ.get(_ENV_TRANSIT_KEY)
+    kek = _kek_name()
     if not kek:
         raise KeyProviderError(
             f"[store].key_provider={_EXTRA!r} is selected but {_ENV_TRANSIT_KEY} is not set, so the "

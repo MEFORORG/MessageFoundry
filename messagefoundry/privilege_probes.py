@@ -24,12 +24,15 @@ refusal text, never a server's error body.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.privilege_check import VAULT_ADMIN_PATHS
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from messagefoundry.auth.ldap import BindAccountReading
@@ -51,7 +54,12 @@ class VaultTokenReading:
 
     ``required`` is each path the engine calls with the capabilities that call needs; it is empty
     when the paths could not be named. ``capabilities`` is Vault's answer for those paths and for
-    the administrative ones. ``problems`` names every part that could not be read."""
+    the administrative ones. ``problems`` names every part that could not be read.
+
+    ``token_ref`` is the token's ACCESSOR, as lookup-self reported it. It is kept only so
+    :meth:`same_token_as` can tell when two hops hold one token, and it is never printed: it is out
+    of ``repr`` and out of every hop's text. An accessor cannot authenticate, but with the right
+    policy it can look up or revoke the token, so it is treated as a value not to show."""
 
     looked_up: bool = False
     policies: tuple[str, ...] = ()
@@ -60,6 +68,18 @@ class VaultTokenReading:
     required: Mapping[str, frozenset[str]] = field(default_factory=dict)
     capabilities: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     problems: tuple[str, ...] = ()
+    token_ref: str | None = field(default=None, repr=False, compare=False)
+
+    def same_token_as(self, other: VaultTokenReading) -> bool:
+        """Whether lookup-self named the same token for both readings. ``False`` when either could
+        not name its token."""
+        return self.token_ref is not None and self.token_ref == other.token_ref
+
+
+def _problem(text: str) -> str:
+    """Log one probe problem and return it. The text is already secret-free (:func:`_why`)."""
+    logger.warning("check-privileges: %s", text)
+    return text
 
 
 def _why(exc: BaseException) -> str:
@@ -97,17 +117,18 @@ def read_vault_token(
     try:
         client = build_client()
     except Exception as exc:  # any build failure is this hop's finding, reported, never raised
-        return VaultTokenReading(problems=(f"no Vault client: {_why(exc)}",))
+        return VaultTokenReading(problems=(_problem(f"no Vault client: {_why(exc)}"),))
     try:
         needed = dict(required())
     except Exception as exc:  # an unset key name or a malformed reference
         needed = {}
-        problems.append(_why(exc))
+        problems.append(_problem(_why(exc)))
 
     looked_up = False
     policies: tuple[str, ...] = ()
     ttl: int | None = None
     renewable: bool | None = None
+    token_ref: str | None = None
     try:
         response: Any = client.auth.token.lookup_self()
         data = response.get("data") if isinstance(response, Mapping) else None
@@ -122,13 +143,15 @@ def read_vault_token(
         ttl = raw_ttl if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) else None
         raw_renewable = data.get("renewable")
         renewable = raw_renewable if isinstance(raw_renewable, bool) else None
+        raw_ref = data.get("accessor")
+        token_ref = raw_ref if isinstance(raw_ref, str) and raw_ref else None
     except OSError as exc:
         # A transport failure (requests' errors are OSErrors): the capabilities read would wait out
         # the same timeout against the same server, so it is not sent.
-        problems.append(f"token lookup-self failed: {_why(exc)}")
+        problems.append(_problem(f"token lookup-self failed: {_why(exc)}"))
         return VaultTokenReading(required=needed, problems=tuple(problems))
     except Exception as exc:  # Vault answered and refused, or answered in an unexpected shape
-        problems.append(f"token lookup-self failed: {_why(exc)}")
+        problems.append(_problem(f"token lookup-self failed: {_why(exc)}"))
 
     capabilities: dict[str, tuple[str, ...]] = {}
     paths = [*needed, *VAULT_ADMIN_PATHS]
@@ -143,9 +166,9 @@ def read_vault_token(
             if isinstance(caps, list):
                 capabilities[path] = _strings(caps)
             else:
-                problems.append(f"capabilities-self returned nothing for {path}")
-    except Exception as exc:
-        problems.append(f"capabilities-self failed: {_why(exc)}")
+                problems.append(_problem(f"capabilities-self returned nothing for {path}"))
+    except Exception as exc:  # Vault refused or could not be reached: reported, never raised
+        problems.append(_problem(f"capabilities-self failed: {_why(exc)}"))
 
     return VaultTokenReading(
         looked_up=looked_up,
@@ -155,13 +178,15 @@ def read_vault_token(
         required=needed,
         capabilities=capabilities,
         problems=tuple(problems),
+        token_ref=token_ref,
     )
 
 
 def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
     """Read the token behind one Vault consumer, with the client and paths of the provider that
     uses it. Imports lazily, as the providers do, so the command stays light without Vault."""
-    if consumer.kind == "kv":
+    kind = consumer.kind
+    if kind == "kv":
         from messagefoundry.config.secretprovider_vault import (
             kv_required_capabilities,
             secrets_vault_client,
@@ -175,11 +200,14 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
         store_vault_client,
     )
 
-    if consumer.kind == "transit":
+    if kind == "transit":
         from messagefoundry.store.crypto_transit import transit_cipher_required_capabilities
 
         return read_vault_token(store_vault_client, transit_cipher_required_capabilities)
-    return read_vault_token(store_vault_client, kek_required_capabilities)
+    if kind == "kek":
+        return read_vault_token(store_vault_client, kek_required_capabilities)
+    # Unreachable while VaultKind has three members; a fourth must be routed here, not defaulted.
+    raise ValueError(f"no Vault probe for consumer kind {kind!r}")
 
 
 def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> BindAccountReading:
@@ -199,4 +227,4 @@ def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> Bin
         )
         return authenticator.read_bind_account()
     except Exception as exc:  # no extra, no CA file, a failed bind: reported, never raised
-        return BindAccountReading(None, problem=_why(exc))
+        return BindAccountReading(None, problem=_problem(f"AD bind probe: {_why(exc)}"))
