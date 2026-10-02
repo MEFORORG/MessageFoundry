@@ -852,6 +852,9 @@ def test_the_engine_homes_still_export_the_moved_names() -> None:
     # defines its own delivery and reply framers (ADR 0205), which the leaf must not carry.
     for name in framing.__all__:
         assert getattr(tframing, name) is getattr(framing, name), name
+    for name in ("frame_for_delivery", "frame_reply", "check_frame_bytes"):
+        assert name in tframing.__all__, name
+        assert not hasattr(framing, name), name
 
 
 def test_importing_api_does_not_eagerly_pull_fastapi() -> None:

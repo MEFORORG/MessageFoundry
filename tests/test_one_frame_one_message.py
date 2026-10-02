@@ -39,6 +39,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.framing import MLLP_CODEC, STX_ETX_CODEC, FrameCodec
 from messagefoundry.parsing import _builtin_hl7
+from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.dicom.hl7_map import encode_segment
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.split import split_batch
@@ -95,26 +96,38 @@ def test_a_clean_payload_frames_exactly_as_before() -> None:
     )
 
 
+#: An explicit TCP codec whose end byte is above 0x7F. CLEAN holds neither byte, so only the
+#: added character can trip it: "É" encodes in UTF-8 as 0xC3 0x89, which a character check misses.
+EXPLICIT = FrameCodec(start=0x05, end=0xC3)
+
+
 @pytest.mark.parametrize(
-    ("codec", "payload"),
+    ("codec", "payload", "transport"),
     [
-        pytest.param(MLLP_CODEC, SMUGGLED, id="P1-mllp-end-and-start"),
-        pytest.param(STX_ETX_CODEC, SMUGGLED_STX, id="P1-reverse-stx-etx"),
-        pytest.param(MLLP_CODEC, EMBEDDED_SB, id="P15-start-byte-only"),
-        pytest.param(FrameCodec(start=0x7E, end=0x7F), CLEAN + "~", id="explicit-codec"),
+        pytest.param(MLLP_CODEC, SMUGGLED, "MLLP", id="P1-mllp-end-and-start"),
+        pytest.param(STX_ETX_CODEC, SMUGGLED_STX, "TCP", id="P1-reverse-stx-etx"),
+        pytest.param(MLLP_CODEC, EMBEDDED_SB, "MLLP", id="P15-start-byte-only"),
+        pytest.param(EXPLICIT, CLEAN.replace("JANE", "J" + chr(0xC9) + "NE"), "TCP", id="explicit"),
     ],
 )
 def test_a_frame_byte_in_the_payload_is_a_permanent_refusal(
-    codec: FrameCodec, payload: str
+    codec: FrameCodec, payload: str, transport: str
 ) -> None:
     # Before ADR 0205 the codec wrapped these as asked, and the decoder read two frames (or one
     # frame holding a second start byte). This is the shape the audit measured.
     with pytest.raises(NegativeAckError) as caught:
-        frame_for_delivery(codec, payload, "utf-8", transport="MLLP")
+        frame_for_delivery(codec, payload, "utf-8", transport=transport)
     assert caught.value.permanent is True
     assert caught.value.code == "framing"
+    assert str(caught.value).startswith(transport + ": payload holds the frame ")
     # The text names a byte and a position, never the content.
     assert "DOE" not in str(caught.value) and "FORGED" not in str(caught.value)
+
+
+def test_the_explicit_codec_control_frames_a_clean_payload() -> None:
+    # The control for the explicit case above: the same codec frames CLEAN, so that refusal is the
+    # added character's, not something CLEAN already held.
+    assert frame_for_delivery(EXPLICIT, CLEAN, "utf-8", transport="TCP") == EXPLICIT.frame(CLEAN)
 
 
 def test_an_unencodable_payload_is_the_content_free_permanent_refusal() -> None:
@@ -171,7 +184,7 @@ async def test_both_tcp_send_paths_refuse_before_any_dial(
             await dest.send(SMUGGLED_STX)
     finally:
         await dest.aclose()
-    assert caught.value.permanent is True
+    assert caught.value.permanent is True and str(caught.value).startswith("TCP: ")
 
 
 # --- rule 2: a leaf write never emits a raw control character -----------------------------------
@@ -306,6 +319,15 @@ def test_writes_that_take_structure_refuse_frame_bytes_and_nul(char: str) -> Non
     assert msg.encode() == CLEAN  # nothing was written
 
 
+def test_the_three_frame_byte_tables_stay_in_step() -> None:
+    # parsing may not import the codec, so the model spells MLLP's bytes as literals; this pins them
+    # to the codec, to the ingress guard's copy, and to the leaf escaper's alphabet.
+    frame = {chr(MLLP_CODEC.start), chr(MLLP_CODEC.end)}
+    assert set(message_module._STRUCTURE_REFUSED) == frame | {NUL}
+    assert set(ingress_guards._MLLP_FRAME_CHARS) == frame
+    assert set(message_module._STRUCTURE_REFUSED) <= set(_builtin_hl7._HEX_ESCAPED_CONTROLS)
+
+
 def test_other_c0_characters_still_pass_a_whole_field_write() -> None:
     msg = Message.parse(CLEAN)
     msg.set("PID-5", "DOE^JA\x01NE")
@@ -404,6 +426,25 @@ async def test_a_leading_frame_byte_is_still_received(store: MessageStore) -> No
     await runner._handle_inbound(reg.inbound["in"], (SB + CLEAN).encode("utf-8"))
     cur = await store._db.execute("SELECT status FROM messages")
     assert [dict(r)["status"] for r in await cur.fetchall()] == [MessageStatus.RECEIVED.value]
+
+
+async def test_a_trailing_frame_byte_is_received_and_kept_in_the_stored_raw(
+    store: MessageStore,
+) -> None:
+    # The listener stores the decoded text as received, so the stored raw keeps a trailing 0x1C.
+    # The encode drops it, which is what pass-through sends; a path that sent the stored raw would
+    # meet rule 1 and dead-letter, as the last assertion shows.
+    reg = _registry()
+    runner = wiring_runner.RegistryRunner(reg, store)
+    await runner._handle_inbound(reg.inbound["in"], (CLEAN + EB).encode("utf-8"))
+    cur = await store._db.execute("SELECT id, status FROM messages")
+    ((mid, status),) = [tuple(r) for r in await cur.fetchall()]
+    assert status == MessageStatus.RECEIVED.value
+    stored = await store.get_message(mid)
+    assert stored is not None and stored["raw"].endswith(EB)
+    assert EB not in Message.parse(stored["raw"]).encode()
+    with pytest.raises(NegativeAckError):
+        frame_for_delivery(MLLP_CODEC, stored["raw"], "utf-8", transport="MLLP")
 
 
 # --- rule 1 at the delivery stage: a batch member, and a shadow (simulate) outbound -------------
