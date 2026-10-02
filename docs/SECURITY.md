@@ -2647,7 +2647,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   binds an account to a federated identity, Windows SSO refuses it. `POST /auth/negotiate` and
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
-  account**, in the bind's own transaction, so nothing minted before the bind outlives it. The
+  account**, in the bind's own transaction, so nothing minted before the bind outlives it,
+  with one limit on the SQL Server store that the next bullet states. The
   audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
@@ -2659,6 +2660,19 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   has no Windows SSO fallback during an IdP outage. If every enabled Administrator is bound,
   nobody can sign in to unbind one, and `provision-admin` will not rescue the site: it refuses
   while any enabled Administrator exists, and a bound one counts.
+- **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
+  in the instant the sweep runs can be missed, and it then lasts until it expires. The same
+  holds on that store for an unbind and for an administrator's revoke of a user's sessions,
+  which run the same sweep. The Postgres store follows a rotated row and the SQLite store runs
+  one writer at a time, so neither has this limit. This was read from the code and not run
+  against a server. A bind ends sessions only: an engine factor already enrolled on the
+  account stays.
+- **A bind and a user delete can collide on the SQL Server and Postgres stores.** A bind locks
+  the account's row and then its sessions, and deleting a user locks the sessions and then
+  the row. If both run against one account at the same moment, the database ends one of
+  them, so one administrator request fails and is retried. No bound account keeps its
+  sessions and no user is left half deleted. The SQLite store runs one writer at a time and
+  does not have this.
 - **Limit: an account with no binding is unchanged.** It still signs in by Windows SSO, and its
   first engine factor is enrolled on proof of the directory credential alone. The Kerberos row
   of the [pathway table](#authentication-pathways--comparative-strength) describes that leg.

@@ -596,7 +596,7 @@ _FEDERATED_NOTICES: dict[str, str] = {
     ),
     "unlinked": (
         "Unlinked. The account's sessions were signed out, and a federated sign-in no longer "
-        "reaches it. Windows SSO can sign it in again."
+        "reaches it. Windows SSO can sign it in again, where Windows SSO is switched on."
     ),
 }
 
@@ -761,7 +761,8 @@ def federated_unlink_confirm_page(view: FederatedIdentityView, *, is_self: bool)
                 "p",
                 f"Unlinking signs {view.username} out of every session. Their next federated "
                 "sign-in is refused until an administrator links them again. Windows SSO can sign "
-                "them in again once they are unlinked.",
+                "them in again once they are unlinked, where Windows SSO is switched on. Where it "
+                "is not, the account has no sign-in until it is linked again.",
             ),
             el(
                 "form",

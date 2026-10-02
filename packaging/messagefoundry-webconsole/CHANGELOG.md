@@ -30,7 +30,8 @@ this line.**
 - **The Link form and its notice say what a link takes away.** Linking an account to a
   federated identity now ends the account's sessions, and Windows SSO no longer signs the
   account in while it is linked. The form says so before the link, and the Linked notice after
-  it. The Unlinked notice says Windows SSO can sign the account in again. The message for a
+  it. The Unlinked notice says Windows SSO can sign the account in again where it is switched
+  on. The message for a
   failed Windows SSO sign-in no longer points at a password form, which a directory account
   does not have. (vault BACKLOG #2609)
 

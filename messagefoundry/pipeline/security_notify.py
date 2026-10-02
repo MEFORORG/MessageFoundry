@@ -405,10 +405,12 @@ def _build_body(event: SecurityEvent) -> str:
             ACCOUNT_CREATED,
             USERNAME_CHANGED,
             FEDERATED_IDENTITY_BOUND,
+            FEDERATED_IDENTITY_UNBOUND,
         )
     ):
         # A directory rename is an administrator's act, so "if this was you" cannot apply to it.
-        # Nor to a federated link: both routes refuse an administrator linking their own account.
+        # Nor to a federated link or unlink: both routes refuse an administrator changing their
+        # own account's binding.
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

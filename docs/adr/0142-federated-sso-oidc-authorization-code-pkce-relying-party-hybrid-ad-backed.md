@@ -559,5 +559,15 @@ admitted kept a sign-in that never met the identity provider. Two things changed
   describes an account with no binding. Amendment B's "A hybrid account can also log in by AD
   password or Kerberos" is narrowed the same way.
 
+**Two limits, stated and not closed here.** On the SQL Server store, a session whose token is
+rotated in the instant the bind's sweep runs can be missed, and it then lasts until it expires;
+an unbind and an administrator's revoke of a user's sessions run the same sweep. And on the SQL
+Server and Postgres stores a bind locks the account's row and then its sessions, while deleting
+a user locks them in the other order, so the two can deadlock against one account. The worst
+outcome is one administrator request failing and being retried: no bound account keeps its
+sessions and no user is left half deleted.
+[SECURITY.md](../SECURITY.md#federated-sign-in-oidc-browser-only--adr-0142) is the source of
+record for both.
+
 **Not decided here.** An account with no binding still enrols its first engine factor on proof of the
 directory credential alone. Closing that needs its own decision.

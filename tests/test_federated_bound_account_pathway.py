@@ -33,7 +33,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND, SecurityEvent
+from messagefoundry.auth.notifications import (
+    FEDERATED_IDENTITY_BOUND,
+    FEDERATED_IDENTITY_UNBOUND,
+    SecurityEvent,
+)
 from messagefoundry.auth.service import FEDERATED_SIGN_IN_REQUIRED, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.pipeline import Engine, security_notify
@@ -502,6 +506,27 @@ def test_the_bind_notice_tells_the_holder_what_the_bind_took_away() -> None:
     # An administrator did it, and the holder never can, so the "if this was you" closing is wrong.
     assert "If this was you" not in body
     assert "If you did not expect this change" in body
+    # The unlink is an administrator's act for the same reason.
+    unbound = security_notify._build_body(
+        SecurityEvent(
+            event_type=FEDERATED_IDENTITY_UNBOUND,
+            username="jdoe",
+            email="jdoe@corp.example",
+            detail={"issuer": "https://idp.example"},
+        )
+    )
+    assert "If this was you" not in unbound
+
+
+def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
+    """RED when: the claim that nothing minted before a bind outlives it loses the limits written
+    beside it. The claim is true of the sweep as designed, and the two limits are what a reader
+    planning on it has to know."""
+    text = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text(
+        encoding="utf-8"
+    )
+    assert "**Limits of the session sweep.**" in text
+    assert "**A bind and a user delete can collide on the SQL Server and Postgres stores.**" in text
 
 
 def test_the_security_doc_says_provision_admin_does_not_replace_a_local_administrator() -> None:
