@@ -1247,10 +1247,16 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
   content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is
   quarantined before its bytes reach the pipeline), `max_file_bytes`, `.error` quarantine (never a silent
-  drop), and the fail-closed pre-ingest `set_scan_hook` AV/ICAP seam all apply. **Three File-source
-  behaviours do *not* carry over:** the HL7 **batch split** (a multi-message `MSH`/`FHS`/`BHS` file is one
-  hand-off here, not N), opt-in gzip `decompress` (ADR 0123, local `File(...)` only), and
-  `min_age_seconds` (above).
+  drop), and the fail-closed pre-ingest `set_scan_hook` AV/ICAP seam all apply. The HL7 **batch split**
+  carries over too: a multi-message `MSH`/`FHS`/`BHS` file is N hand-offs and N dispositions, in file
+  order, as with `File(...)` ([ADR 0206](adr/0206-an-hl7-write-or-re-encode-never-lets-data-become-structure.md)
+  rule 5). **Two File-source behaviours do *not* carry over:** opt-in gzip `decompress` (ADR 0123, local
+  `File(...)` only), and `min_age_seconds` (above).
+- **One message per body on a listener.** An MLLP, TCP or HTTP inbound, and any other source that does
+  not split, refuses an HL7 v2 body holding more than one `MSH` segment: it records `ERROR`, and a
+  listener with an ACK channel answers `AR` with MSA-3 `more than one MSH in body` (ADR 0206 rule 5). A
+  sender with a batch sends one message per frame or request, or drops the file where a `File(...)` or
+  remote-file source splits it.
 - **Leader-gated.** The remote directory is a *shared* external resource, so in a cluster only the leader
   lists, downloads, or moves its files — otherwise two nodes would double-ingest the drop.
 - **No timeout knob.** Neither factory exposes one. The bounds these connections do have are hard-coded

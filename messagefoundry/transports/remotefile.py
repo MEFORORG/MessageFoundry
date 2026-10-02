@@ -98,6 +98,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import load_connection_cert_chain, ssh_key_encrypted
+from messagefoundry.parsing.split import split_batch_bytes
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -2090,6 +2091,9 @@ class RemoteFileSource(SourceConnector):
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")
+        # The declared charset, read the way the File source and the listener read it: the batch split
+        # decodes with it to find the MSH boundaries (ADR 0206 rule 5).
+        self._encoding: str = s.get("encoding", "utf-8")
         self._poll_seconds: float = float(s.get("poll_seconds", 5.0))
         self._after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self._after_read not in ("move", "delete", "leave"):
@@ -2381,7 +2385,7 @@ class RemoteFileSource(SourceConnector):
                 )
                 continue
             try:
-                await self._handler(raw)
+                stopped = await self._hand_off(raw)
             except Exception as exc:
                 # The handler records every message-level outcome itself and returns, so an exception
                 # escaping here is an infrastructure failure (the durable store write failed). Leave the
@@ -2393,6 +2397,10 @@ class RemoteFileSource(SourceConnector):
                     safe_exc(exc, file_name=name),
                 )
                 continue
+            if stopped:
+                # Stopping part-way through a batch: the whole file stays, and the next start hands
+                # it over again (at-least-once, as the File source does).
+                return
             await self._after_processing(path, name, len(raw))
             disposed += 1
             if file_key is not None:
@@ -2403,6 +2411,26 @@ class RemoteFileSource(SourceConnector):
             await (
                 self.processed_ledger.prune()
             )  # bound growth (age + count), only when something new
+
+    async def _hand_off(self, raw: bytes) -> bool:
+        """Hand one retrieved file to the pipeline, one message at a time; return True when a stop
+        arrived before every message was handed over.
+
+        An ``hl7v2`` file is split on ``MSH`` boundaries first, as the File source splits one (ADR
+        0206 rule 5): a batch file, with or without an ``FHS``/``BHS`` envelope, becomes one hand-off
+        and one disposition per message, in file order. The listener refuses a body holding a second
+        ``MSH``, so a whole batch handed over unsplit would be one ``ERROR``. A single-message or
+        undecodable file is handed over as its original bytes. Any other content type is handed over
+        verbatim, never decoded."""
+        assert self._handler is not None
+        if self.content_type is not None and self.content_type is not ContentType.HL7V2:
+            await self._handler(raw)
+            return False
+        for index, message in enumerate(split_batch_bytes(raw, self._encoding)):
+            if index and self._stop.is_set():
+                return True
+            await self._handler(message)
+        return False
 
     def _at_ceiling(self, disposed: int, remaining: int) -> bool:
         """True when this poll has spent its per-tick budget (``poll_max_files``) and must stop, leaving

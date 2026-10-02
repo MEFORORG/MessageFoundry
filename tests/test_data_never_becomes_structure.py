@@ -14,17 +14,31 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from messagefoundry import actions
 from messagefoundry.checks import _check_handler_security
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, ContentType, Destination, Validation
+from messagefoundry.config.wiring import (
+    ConnectionSpec,
+    InboundConnection,
+    OutboundConnection,
+    Registry,
+    Send,
+)
 from messagefoundry.lens import parse_source, rewrite_source
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing.message import Message, reencode_with_separators
+from messagefoundry.parsing.split import split_batch_bytes
+from messagefoundry.pipeline import ingress_guards, wiring_runner
+from messagefoundry.pipeline.dryrun import dry_run
+from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
+from tests.test_remotefile_transport import _FakeClient, _RecordingHandler, _settle
+from tests.test_remotefile_transport import _src as _remote_src
 
 CR, BS = "\r", chr(92)
 ENC = "^~" + BS + "&"
@@ -359,3 +373,180 @@ async def test_a_non_hl7_payload_under_the_override_is_permanent_too() -> None:
     with pytest.raises(NegativeAckError, match="encoding-character override failed") as caught:
         await dest.send("not an HL7 message")
     assert caught.value.permanent is True
+
+
+# --- rule 5: a source that does not split refuses a body with a second MSH (#2560) ----------------
+
+#: Audit probe P6: two messages in one body.
+P6_BODY = MSH + CR + "PID|1||111" + CR + MSH2 + CR + "PID|1||999" + CR
+ONE = MSH + CR + "PID|1||111" + CR
+
+
+def _mllp_ic(content_type: ContentType = ContentType.HL7V2) -> InboundConnection:
+    return InboundConnection(
+        "in",
+        ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575}),
+        router="r",
+        content_type=content_type,
+        validation=Validation(strict=False, hl7_version="2.5"),
+    )
+
+
+def test_P6_control_the_parser_still_reads_one_message_with_one_control_id() -> None:
+    # The parser is unchanged: rule 5 refuses at the source, where a disposition can be recorded.
+    two = Message.parse(P6_BODY)
+    assert two.segments() == ["MSH", "PID", "MSH", "PID"] and two.control_id == "CTRL1"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(P6_BODY, id="P6-two-messages"),
+        pytest.param("FHS|" + ENC + CR + "BHS|" + ENC + CR + P6_BODY, id="enveloped-batch"),
+        pytest.param(CR + " " + P6_BODY, id="leading-whitespace"),
+        pytest.param(ONE + "MSHX|" + ENC + "|A" + CR, id="any-line-the-parser-reads-as-MSH"),
+    ],
+)
+def test_ingress_refuses_a_second_msh(body: str) -> None:
+    with pytest.raises(ingress_guards.IngressMultipleMessagesRejected) as caught:
+        ingress_guards.check_decoded(body, _mllp_ic())
+    assert caught.value.phase == "decode"
+    assert caught.value.reason == ingress_guards.MULTIPLE_MESSAGES_REJECTED_REASON
+    assert isinstance(caught.value, ingress_guards.IngressBodyRejected)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(ONE, id="one-message"),
+        pytest.param(CR + CR + ONE, id="leading-blank-lines"),
+        pytest.param(
+            "FHS|" + ENC + CR + "BHS|" + ENC + CR + ONE + "BTS|1" + CR, id="one-enveloped"
+        ),
+        pytest.param(ONE.replace("111", "MSH"), id="MSH-as-field-data"),
+        pytest.param(" " + "\t", id="blank"),
+    ],
+)
+def test_ingress_admits_one_message(body: str) -> None:
+    ingress_guards.check_decoded(body, _mllp_ic())
+
+
+def test_the_second_msh_refusal_is_hl7v2_only() -> None:
+    ingress_guards.check_decoded('{"a": "x' + CR + 'MSH"}', _mllp_ic(ContentType.JSON))
+
+
+@pytest.fixture
+async def store(tmp_path: Path) -> Any:
+    s = await MessageStore.open(tmp_path / "msh.db")
+    yield s
+    await s.close()
+
+
+def _registry(ic: InboundConnection) -> Registry:
+    reg = Registry()
+    reg.add_inbound(ic)
+    reg.add_outbound(
+        OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": "."}))
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("out", m))
+    return reg
+
+
+async def _rows(store: MessageStore) -> list[dict[str, Any]]:
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def test_P6_the_mllp_listener_naks_and_records_error(store: MessageStore) -> None:
+    reg = _registry(_mllp_ic())
+    runner = wiring_runner.RegistryRunner(reg, store)
+    ack = await runner._handle_inbound(reg.inbound["in"], P6_BODY.encode("utf-8"))
+    assert ack is not None and "MSA|AR|" in ack and "more than one MSH in body" in ack
+    assert await _rows(store) == [
+        {
+            "status": MessageStatus.ERROR.value,
+            "error": ingress_guards.MULTIPLE_MESSAGES_REJECTED_REASON,
+        }
+    ]
+
+
+async def test_P6_the_http_listener_records_error_and_commits_nothing(store: MessageStore) -> None:
+    ic = InboundConnection(
+        "in",
+        ConnectionSpec(ConnectorType.HTTP, {"host": "127.0.0.1", "port": 8080, "path": "/in"}),
+        router="r",
+        content_type=ContentType.HL7V2,
+        validation=Validation(strict=False, hl7_version="2.5"),
+    )
+    reg = _registry(ic)
+    runner = wiring_runner.RegistryRunner(reg, store)
+    assert await runner._handle_inbound_http(ic, P6_BODY.encode("utf-8")) is None
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
+
+
+def test_the_dry_run_refuses_what_the_listener_refuses() -> None:
+    result = dry_run(_registry(_mllp_ic()), P6_BODY.encode("utf-8"), inbound="in")
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == ingress_guards.MULTIPLE_MESSAGES_REJECTED_REASON
+
+
+def test_split_batch_bytes_splits_a_batch_and_hands_one_message_over_untouched() -> None:
+    assert split_batch_bytes(ONE.encode("latin-1"), "latin-1") == [ONE.encode("latin-1")]
+    batch = ("FHS|" + ENC + CR + P6_BODY).replace("111", "M" + chr(0xFC)).encode("latin-1")
+    parts = split_batch_bytes(batch, "latin-1")
+    assert [p.decode("latin-1").split("|")[9] for p in parts] == ["CTRL1", "CTRL2"]
+    assert "M" + chr(0xFC) in parts[0].decode("latin-1")
+    undecodable = P6_BODY.encode("utf-16")
+    assert split_batch_bytes(undecodable, "utf-8") == [undecodable]
+    assert split_batch_bytes(P6_BODY.encode(), "no-such-codec") == [P6_BODY.encode()]
+
+
+async def test_the_remote_file_source_splits_a_batch_like_the_file_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(files={"/in/batch.hl7": P6_BODY.encode("utf-8")})
+    src = _remote_src(monkeypatch, client)
+    handler = _RecordingHandler()
+    src._handler = handler
+    await _settle(src)
+    await src._poll_once()
+    assert [b.decode("utf-8") for b in handler.bodies] == [
+        # split_batch's own shape: the CR before a later MSH goes with the boundary.
+        MSH + CR + "PID|1||111",
+        MSH2 + CR + "PID|1||999" + CR,
+    ]
+    assert "/in/.processed/batch.hl7" in client.files
+
+
+async def test_the_remote_file_source_hands_a_non_hl7_file_over_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b'{"a": "MSH"}'
+    client = _FakeClient(files={"/in/a.json": body})
+    src = _remote_src(monkeypatch, client, pattern="*.json")
+    src.content_type = ContentType.JSON
+    handler = _RecordingHandler()
+    src._handler = handler
+    await _settle(src)
+    await src._poll_once()
+    assert handler.bodies == [body]
+
+
+async def test_a_stop_part_way_through_a_remote_batch_leaves_the_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(files={"/in/batch.hl7": P6_BODY.encode("utf-8")})
+    src = _remote_src(monkeypatch, client)
+
+    class _StopAfterFirst(_RecordingHandler):
+        async def __call__(self, raw: bytes) -> str | None:
+            src._stop.set()
+            return await super().__call__(raw)
+
+    handler = _StopAfterFirst()
+    src._handler = handler
+    await _settle(src)
+    await src._poll_once()
+    assert len(handler.bodies) == 1
+    assert "/in/batch.hl7" in client.files and "/in/.processed/batch.hl7" not in client.files

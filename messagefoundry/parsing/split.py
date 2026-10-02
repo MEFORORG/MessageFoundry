@@ -26,7 +26,7 @@ import re
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import normalize
 
-__all__ = ["encode_batch", "split_batch", "split_by_obr"]
+__all__ = ["encode_batch", "split_batch", "split_batch_bytes", "split_by_obr"]
 
 # Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment. We match
 # ``\rMSH`` *without* the trailing field separator so a batch whose MSH-1 isn't ``|`` (e.g.
@@ -55,6 +55,26 @@ def split_batch(raw: str | bytes) -> list[str]:
     # isn't MSH-led after stripping (the batch header) is dropped.
     messages = [c.lstrip("\r") for c in chunks if c.strip() and c.lstrip("\r").startswith("MSH")]
     return messages or [text]
+
+
+def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
+    """Split a received HL7 file's bytes into one byte string per message, for a source that reads
+    whole files and hands each message over on its own (ADR 0206 rule 5).
+
+    The bytes are decoded with the connection's declared ``encoding`` at ``errors="strict"`` so the
+    ``MSH`` boundaries are found in the right characters, split by :func:`split_batch`, and each
+    message is re-encoded in the same ``encoding``. Two shapes come back as ``[raw]``, untouched: a
+    file holding one message, so a non-batch file is handed over byte for byte, and a file that does
+    not decode (or names an unknown codec), so the listener's own strict decode records its
+    ``ERROR``. Nothing is dropped here."""
+    try:
+        text = raw.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return [raw]
+    messages = split_batch(text)
+    if len(messages) == 1:
+        return [raw]
+    return [message.encode(encoding) for message in messages]
 
 
 def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: str) -> str:

@@ -71,11 +71,13 @@ from messagefoundry.redaction import safe_exc
 __all__ = [
     "FRAME_BYTE_REJECTED_REASON",
     "INGRESS_MAX_BYTES",
+    "MULTIPLE_MESSAGES_REJECTED_REASON",
     "NUL_REJECTED_REASON",
     "STRICT_VALIDATE_TIMEOUT_SECONDS",
     "IngressBodyRejected",
     "IngressFrameByteRejected",
     "IngressGuardError",
+    "IngressMultipleMessagesRejected",
     "IngressNulRejected",
     "admit_resubmission",
     "admit_resubmitted_body",
@@ -394,6 +396,40 @@ def _holds_an_embedded_frame_byte(text: str) -> bool:
     return any(ch in rest for ch in _MLLP_FRAME_CHARS)
 
 
+#: The stored reason for an ``hl7v2`` body holding more than one ``MSH`` segment (ADR 0206 rule 5).
+MULTIPLE_MESSAGES_REJECTED_REASON = (
+    "ingress HL7 v2 body holds more than one MSH segment; this source takes one message per body"
+)
+
+
+class IngressMultipleMessagesRejected(IngressBodyRejected):
+    """An ``hl7v2`` body holding a second ``MSH`` segment (ADR 0206 rule 5). The parser would read it
+    as one message with one control id, and a receiver that splits on ``MSH`` would read two. A
+    source that splits a batch first, the File and remote-file sources, hands each message over
+    alone and never trips this."""
+
+    ack_text = "more than one MSH in body"
+
+    def __init__(self) -> None:
+        super().__init__(MULTIPLE_MESSAGES_REJECTED_REASON)
+
+
+#: The first character the parser keeps: it strips the whitespace around a body before it reads it.
+_FIRST_KEPT = re.compile(r"\S")
+
+
+def _holds_more_than_one_message(text: str) -> bool:
+    """Whether ``text`` holds more than one ``MSH`` segment, by the parser's own reading: it strips
+    the whitespace around the body, then treats every line whose first three characters are ``MSH``
+    as a header. C-level scans and no copy."""
+    first = _FIRST_KEPT.search(text)
+    if first is None:
+        return False
+    start = first.start()
+    later = text.count("\rMSH", start)
+    return later > 1 or (later == 1 and text.startswith("MSH", start))
+
+
 def decode_body(raw: str | bytes, ic: InboundConnection, *, encoding: str) -> str:
     """Decode one received text body for ``ic`` in ``encoding`` at ``errors="strict"``; return the text.
 
@@ -426,14 +462,16 @@ def _decode_refusal(encoding: str, exc: Exception) -> str:
 
 def check_decoded(text: str, ic: InboundConnection) -> None:
     """The post-decode guards, in the listener's order: reject an embedded NUL, then an embedded MLLP
-    frame byte in an HL7 v2 body, then bound the length.
+    frame byte in an HL7 v2 body, then a second ``MSH`` in one (ADR 0206 rule 5), then bound the
+    length.
 
     Order is the load-bearing part, which is why they share one function: the NUL check must run
     on the DECODED text and BEFORE anything derives a control id, a summary or a stored raw from it,
     or those derived values carry the NUL onward into a store that cannot hold it.
 
     The NUL refusal is :class:`IngressNulRejected`; the frame-byte refusal is
-    :class:`IngressFrameByteRejected` (ADR 0205 rule 4), and both are :class:`IngressBodyRejected`.
+    :class:`IngressFrameByteRejected` (ADR 0205 rule 4); the second-``MSH`` refusal is
+    :class:`IngressMultipleMessagesRejected` (ADR 0206 rule 5). Each is :class:`IngressBodyRejected`.
     The length bound is the ``size``-phase :class:`IngressGuardError` and applies to a non-HL7 body
     only: the HL7 ceiling is ``Peek.parse``'s, at :func:`peek_max_bytes`, which is where the
     per-connection cap lives."""
@@ -443,6 +481,8 @@ def check_decoded(text: str, ic: InboundConnection) -> None:
         _raise_if_oversize(len(text))
     elif _holds_an_embedded_frame_byte(text):
         raise IngressFrameByteRejected()
+    elif _holds_more_than_one_message(text):
+        raise IngressMultipleMessagesRejected()
 
 
 def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
