@@ -260,7 +260,7 @@ from messagefoundry.config.ai_policy import (
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import config_fingerprint_detail, fingerprint_matches
+from messagefoundry.config.fingerprint import fingerprint_matches
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -1080,14 +1080,17 @@ async def _record_reload_audit(
     return list(failed_steps)
 
 
-async def _record_start_audit(app: FastAPI, engine: Engine) -> None:
+async def _record_start_audit(
+    app: FastAPI, engine: Engine, *, fingerprint_failed: bool = False
+) -> None:
     """Write the start's ``config_loaded`` row through :func:`_record_reload_audit` (vault BACKLOG
     #2597), so a restart records which code and which posture the engine started with.
 
     Called once per process, after every settings stash the loosenings reader needs. It never
     raises: the engine is already taking traffic, and a lost row is logged at ERROR rather than
     refusing a start. A loosenings list that cannot be read is recorded as ``None``, which says
-    unknown, never as an empty list, which would say none are active."""
+    unknown, never as an empty list, which would say none are active. A start whose fingerprint
+    could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is."""
     switches: list[str] | None
     try:
         pairs, _scope = _posture_loosenings(app.state, engine, engine.registry_runner)
@@ -1096,7 +1099,11 @@ async def _record_start_audit(app: FastAPI, engine: Engine) -> None:
         _log.exception("the start's loosenings list could not be read; config_loaded records None")
         switches = None
     await _record_reload_audit(
-        engine, actor="system", action="config_loaded", extra={"loosenings": switches}
+        engine,
+        actor="system",
+        action="config_loaded",
+        failed_steps=["config_fingerprint"] if fingerprint_failed else [],
+        extra={"loosenings": switches},
     )
 
 
@@ -6266,12 +6273,12 @@ def create_app(
         drift = False
         target = engine.running_config_dir
         if target is not None:
-            try:
-                current = await asyncio.to_thread(config_fingerprint_detail, target)
+            # The one best-effort rule every load uses (vault BACKLOG #2597). An unreadable bundle
+            # reports clean rather than a false DRIFT alarm.
+            current, _reason = await engine.fingerprint_bundle(target)
+            if current is not None:
                 # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift.
                 drift = not fingerprint_matches(current.get("fingerprint"), fp)
-            except OSError:  # dir unreadable now — report clean rather than a false DRIFT alarm
-                drift = False
         git_head = loaded.get("git_head") if loaded else None
         files = loaded.get("files") if loaded else None
         return ConfigProvenance(
@@ -8127,7 +8134,7 @@ def create_managed_app(
                 # Right after the load, so the digest covers the bytes it read, and the provenance
                 # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
                 # unreadable bundle: it leaves the baseline empty and the start goes on.
-                await engine.capture_start_provenance()
+                start_fingerprint_failure = await engine.capture_start_provenance()
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
@@ -8284,6 +8291,13 @@ def create_managed_app(
             # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
+            # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
+            # last stash the loosenings reader needs is the one above, and the graph is already
+            # serving, so a later startup step that aborts must not leave the start unrecorded.
+            if config_dir is not None:
+                await _record_start_audit(
+                    app, engine, fingerprint_failed=start_fingerprint_failure is not None
+                )
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
                 await auth.initialize()
@@ -8391,8 +8405,6 @@ def create_managed_app(
                             notifier or LoggingAlertSink(),
                         )
                     )
-            if config_dir is not None:
-                await _record_start_audit(app, engine)
             yield
         finally:
             if upload_retention_runner is not None:

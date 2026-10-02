@@ -156,3 +156,6 @@ async def test_an_unreadable_vcs_head_degrades_the_same_way_at_every_load(
     assert real.status_code == 200, real.text
     assert real.json()["failures"] == ["config_fingerprint"]
     assert len(start_rows) == 1 and "fingerprint" not in start_rows[0]
+    # Marked like a reload's, so a reader can tell a failed digest from a row that never had one.
+    assert start_rows[0]["degraded"] is True
+    assert start_rows[0]["failed_steps"] == ["config_fingerprint"]

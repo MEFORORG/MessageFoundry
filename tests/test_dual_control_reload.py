@@ -242,21 +242,26 @@ async def test_the_reload_audit_takes_no_fingerprint_after_the_swap(
 ) -> None:
     """Round-2 finding on this branch was a post-swap fingerprint whose fault escaped after the graph
     swapped. Since vault BACKLOG #2597 the row reads the digest the engine took BEFORE the swap, so
-    the writer hashes nothing: a fault in the API's own fingerprint call cannot reach it, and the
-    row names the digest GET /config/provenance compares against."""
-    import messagefoundry.api.app as app_module
+    the writer hashes nothing after it, and the row names the digest GET /config/provenance
+    compares against."""
+    import messagefoundry.config.fingerprint as fp_mod
 
-    def _boom(_path: object) -> dict[str, object]:
-        raise RuntimeError("cannot schedule new futures after shutdown")
+    calls: list[object] = []
+    real = fp_mod.config_fingerprint_detail
+
+    def _counting(path: Path) -> dict[str, object]:
+        calls.append(path)
+        return real(path)
 
     service = await _service(engine)
     await _add(service, "deployer", Role.ADMINISTRATOR)
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
         headers = await _token(c, "deployer")
-        monkeypatch.setattr(app_module, "config_fingerprint_detail", _boom)
+        monkeypatch.setattr(fp_mod, "config_fingerprint_detail", _counting)
         r = await c.post("/config/reload", json={}, headers=headers)
     assert r.status_code == 200, r.text
     assert r.json()["inbound"] == 1 and r.json()["failures"] == []
+    assert len(calls) == 1, "one digest per applied reload, taken before the swap"
     rows = await engine.store.list_audit(action="config_reload")
     assert len(rows) == 1
     loaded = engine.loaded_config_fingerprint

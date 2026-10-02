@@ -1873,16 +1873,19 @@ class Engine:
             log.warning("config fingerprint failed for %s: %s", path, reason)
             return None, reason
 
-    async def capture_start_provenance(self) -> None:
+    async def capture_start_provenance(self) -> str | None:
         """Take the provenance baseline for the graph a start loaded from :attr:`config_dir`.
 
         The start's first load is the lifespan's, not :meth:`reload_detail`, so without this call
         :attr:`loaded_config_fingerprint` stayed ``None`` until the first reload and ``GET
         /config/provenance`` could not see drift after a plain start (vault BACKLOG #2597). The
         caller runs it right after the first load, so the digest covers the bytes that load read.
-        An unreadable bundle leaves the baseline ``None`` and the start goes on."""
-        if self.config_dir is not None:
-            self.loaded_config_fingerprint, _reason = await self.fingerprint_bundle(self.config_dir)
+        An unreadable bundle leaves the baseline ``None`` and the start goes on. Returns the
+        failure reason, or ``None`` when the digest was taken or there is no config dir."""
+        if self.config_dir is None:
+            return None
+        self.loaded_config_fingerprint, reason = await self.fingerprint_bundle(self.config_dir)
+        return reason
 
     def guard_registry(self, registry: Registry) -> None:
         """Run the engine's registry guard over ``registry``; raises ``WiringError`` to refuse it.
