@@ -1884,13 +1884,16 @@ def test_a_statement_in_a_try_or_a_list_wrapper_is_named_in_its_marker() -> None
 
 
 def test_a_send_in_a_block_label_is_never_a_delivery() -> None:
-    """A ``MsgSend`` in a Block's ``@Data`` used to render as a live send of msg, with its outbound
-    declared. It may never have run, so it is marked, and the Block renders as the label it is."""
+    """A ``MsgSend`` in a Block's ``@Data`` used to render as a live send of msg. It may never
+    have run, so it is refused: no ``Send``, a raise where the send stood, and its outbound still
+    declared for the hand-finish, as for any refused send."""
     body = _container("Block", _role_send("input-handle", "%ADT", "OB_LABEL"))
     src = _handler_source(body)
-    assert "Send(" not in _handler_body(src) and 'outbound("OB_LABEL"' not in src
-    assert "    # Corepoint Block: MsgSend %ADT to connection" in src
-    assert "    # TODO: Corepoint MsgSend — hand-finish (not on a Line" in src
+    assert "Send(" not in _handler_body(src) and 'outbound("OB_LABEL"' in src
+    assert (
+        "    # TODO: Corepoint MsgSend to OB_LABEL — hand-finish: MsgSend is not on a Line" in src
+    )
+    assert '    raise NotImplementedError("Corepoint import: MsgSend to OB_LABEL: ' in src
     assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["MsgSend"], 0)
     # On a Call it is no call either: not counted as mapped, not labelled as an inlined list.
     call = _container("Call", _role_send("input-handle", "%ADT", "OB_LABEL"))
@@ -1901,11 +1904,12 @@ def test_a_send_in_a_block_label_is_never_a_delivery() -> None:
     assert 'sends.append(Send("OB_LABEL", msg))' in _handler_source(line)
 
 
-@pytest.mark.parametrize("verb", sorted(_STATEMENT_VERBS))
+@pytest.mark.parametrize("verb", sorted(_STATEMENT_VERBS - {"msgsend"}))
 def test_a_call_carrying_a_statement_is_a_label_and_not_a_call(verb: str) -> None:
     """One rule for every element but a Line. A ``<Call>`` whose ``@Data`` is a statement names no
     list to inline, so it is not counted as a mapped call, whichever statement it is. Its body
-    still renders beneath the label. The control is a Call that names a list."""
+    still renders beneath the label. The control is a Call that names a list. A ``MsgSend`` is
+    left out: it is no label but a refused send, which the tests further down pin."""
     data = f"{_VERB_SPELLINGS[verb]} %ADT"
     call = _labelled("Call", data, '<Line Data="ItemClear %ADT/PID-19"/>')
     src = _handler_body(_handler_source(call))
@@ -2043,8 +2047,8 @@ def test_a_marker_at_the_end_of_any_flattened_body_never_orphans_a_branch(
 def test_a_send_label_keeps_its_body_where_main_put_it() -> None:
     """main rendered a ``MsgSend`` in a Block's ``@Data`` as a live send and then its body at the
     Block's own level, so a construct ending that body adopted a branch written after the Block.
-    The send is now a marker under the label. The body stays at that level, so the branch is
-    still adopted and its send stays dead."""
+    The send is now refused. The body stays at that level, so the branch is still adopted and
+    its send stays dead."""
     body = _labelled(
         "Block", "MsgSend %ADT [OB_LABEL]", '<If Data="If (x)"><List/></If>'
     ) + _sibling_arm("Else")
@@ -2106,9 +2110,10 @@ def test_a_branch_marker_holding_only_a_marked_wrapper_still_opens_its_branch(pa
 def test_a_demoted_label_changes_no_shape_around_it(
     outer: str, label: str, plain: str, orphans: int
 ) -> None:
-    """A Call or a send label becomes a plain label when its ``@Data`` is a statement. Whether
-    the element around it is a branch-group is still read from the kind it had, so the tree keeps
-    the shape it has with the plain call, or the plain send, in its place. Only that send goes."""
+    """A Call becomes a plain label when its ``@Data`` is a statement, and a send there becomes a
+    refused send. Whether the element around it is a branch-group is still read from the kind it
+    had, so the tree keeps the shape it has with the plain call, or the plain send, in its place.
+    Only the line of that send differs: a raise where the plain one delivers."""
     construct, branch = _SIBLING_BRANCHES["if-else"]
     marked, control = (
         _handler_body(
@@ -2117,16 +2122,24 @@ def test_a_demoted_label_changes_no_shape_around_it(
         for inner in (label, plain)
     )
     assert _LABEL_MARKER in marked and _LABEL_MARKER not in control
-    assert _code(marked) == [line for line in _code(control) if "OB_LABEL" not in line]
+
+    def around(src: str) -> list[str]:
+        return [line for line in _code(src) if "OB_LABEL" not in line]
+
+    assert around(marked) == around(control)
+    sent = [line for line in _code(control) if "OB_LABEL" in line]
+    refused = [line for line in _code(marked) if "OB_LABEL" in line]
+    assert len(refused) == len(sent) and all("raise NotImplementedError(" in r for r in refused)
     assert marked.count(_ORPHAN) == control.count(_ORPHAN) == orphans
 
 
 def test_demoting_a_handlers_only_visible_send_adds_no_trailing_send() -> None:
     """A handler with no send the render reaches ends on ``return Send(...)`` for every
     destination in its tree, and main leaves one kind of send in the tree unrendered: a send in a
-    branch that another branch holds. So when a send label is the handler's only visible send,
-    demoting it must not move the handler to that form. It keeps its ``sends`` list, and delivers
-    nothing. The control is the same list with the label's send on a Line."""
+    branch that another branch holds. So when a send off a Line is the handler's only visible
+    send, refusing it must not move the handler to that form. It is still a send, so the handler
+    keeps its ``sends`` list, and delivers nothing. The control is the same list with that send
+    on a Line."""
     hidden = (
         '<Block Data="Matching &quot;M&quot;"><Line Data="Matching &quot;M&quot;"/>'
         '<Line Data="MsgSend %ADT [OB_HIDDEN]"/></Block>'
@@ -2141,6 +2154,79 @@ def test_demoting_a_handlers_only_visible_send_adds_no_trailing_send() -> None:
     assert _LABEL_MARKER in marked and "Send(" not in marked
     assert "    return sends" in marked and "    return sends" in control
     assert 'Send("OB_HIDDEN"' not in control and 'Send("OB_LABEL", msg)' in control
+
+
+_SEND_OUT = _role_send("other-handle", "%OUT", "OB_R")
+_NO_DESTINATION = "    return None  # TODO: Corepoint export named no destination for this handler"
+
+
+@pytest.mark.parametrize("tag", ["Block", "Call"])
+def test_a_send_off_a_line_is_refused_aloud_and_never_filters_in_silence(tag: str) -> None:
+    """The Lander's second hold on PR 1938. A lone role-marked send of a handle that is not msg,
+    in a Block's or a Call's ``@Data``, with no copy into that handle. main refuses it with a
+    raise, so the message goes to ERROR. Rendered as a label and a comment, it left a handler
+    that returned an empty list: FILTERED, with nobody told. It is a refused send where main put
+    one, with its outbound still declared for the hand-finish, and it counts unmapped once."""
+    body = _container(tag, _SEND_OUT)
+    src = _handler_source(body)
+    lines = _handler_body(src).splitlines()
+    refusals = [i for i, line in enumerate(lines) if line.startswith("    raise ")]
+    assert len(refusals) == 1
+    raised = lines[refusals[0]]
+    assert raised.startswith('    raise NotImplementedError("Corepoint import: MsgSend to OB_R: ')
+    assert _LABEL_MARKER in raised
+    todo = lines[refusals[0] - 1]
+    assert todo.startswith("    # TODO: Corepoint MsgSend to OB_R — hand-finish: ")
+    assert _LABEL_MARKER in todo and todo.endswith('(MsgSend %OUT to connection "OB_R")')
+    assert "Send(" not in _handler_body(src) and 'outbound("OB_R"' in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["MsgSend"], 0)
+
+
+def test_a_catch_never_swallows_the_refusal_of_a_send_off_a_line() -> None:
+    """A refused send in a ``try`` keeps the guard main gives it: every Catch renders as
+    ``except Exception:``, which would catch the refusal and run the Catch body in its place."""
+    body = f'<Try><List>{_container("Block", _SEND_OUT)}<Line Data="Catch"/>{_CLEAR}</List></Try>'
+    src = _handler_body(_handler_source(body))
+    guard = (
+        "    except NotImplementedError:  # a refused MsgSend above — never caught\n        raise\n"
+    )
+    assert "        raise NotImplementedError(" in src and guard in src
+    assert src.index(guard) < src.index("    except Exception:")
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param("MsgSend %OUT", id="no-markup"),
+        pytest.param(
+            _span("keyword", "MsgSend") + " " + _span("other-handle", "%OUT"), id="role-marked"
+        ),
+    ],
+)
+@pytest.mark.parametrize("tag", ["Block", "Call"])
+def test_a_send_off_a_line_naming_no_destination_keeps_mains_loud_ending(
+    tag: str, data: str
+) -> None:
+    """A send that names no destination selects no ``sends`` list on main, and the handler ends on
+    the ``return None`` that says no destination was named. Off a Line it keeps that ending, and
+    never a bare ``return sends``. It is refused as any other send off a Line is."""
+    src = _handler_body(_handler_source(_labelled(tag, data)))
+    assert src.rstrip("\n").endswith("\n" + _NO_DESTINATION)
+    assert "sends" not in src
+    assert (
+        '    raise NotImplementedError("Corepoint import: MsgSend (no destination named): ' in src
+    )
+
+
+@pytest.mark.parametrize("tag", ["Block", "Call"])
+def test_a_send_off_a_line_is_refused_even_where_main_delivered_it(tag: str) -> None:
+    """main sent msg for a send of the input handle in a Block's ``@Data``. It may never have
+    run, so it is no delivery. A refusal is the loud way to say so: nothing is sent, and nothing
+    is filtered in silence either."""
+    for send in (_role_send("input-handle", "%ADT", "OB_R"), _role_line("MsgSend %ADT [OB_R]")):
+        src = _handler_body(_handler_source(_container(tag, send)))
+        assert "Send(" not in src and "    raise NotImplementedError(" in src, send
+        assert src.rstrip("\n").endswith("\n    return sends"), send
 
 
 def test_a_wrappers_marker_stays_where_the_wrapper_sat() -> None:
