@@ -98,6 +98,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from messagefoundry.parsing.peek import parse_path
+
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
 
 # What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
@@ -1221,11 +1223,105 @@ def _unvetted_import_hits(
     return hits
 
 
+# leaf-to-whole-field (ADR 0206 rule 3): a value read decoded from a component or subcomponent and
+# written to a whole field through ``set``, which takes whole-field text as structure. The model
+# cannot tell the decoded value from authored text, so only the call site can be flagged. Paths
+# must be string literals for the AST to know their level; anything else is left alone.
+
+
+def _literal_path(node: ast.expr | None) -> tuple[str, int, int | None, int | None] | None:
+    """``parse_path`` of a string-literal HL7 path, or None for anything else."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            return parse_path(node.value)
+        except ValueError:
+            return None
+    return None
+
+
+def _is_leaf_read(node: ast.AST) -> bool:
+    """A ``<name>.field("<leaf>")`` call or a ``<name>["<leaf>"]`` read: a decoded value."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "field"
+        and isinstance(node.func.value, ast.Name)
+        and node.args
+    ):
+        path = _literal_path(node.args[0])
+    elif (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(node.value, ast.Name)
+    ):
+        path = _literal_path(node.slice)
+    else:
+        return False
+    return path is not None and path[2] is not None
+
+
+def _carries_decoded_leaf(
+    node: ast.AST,
+    env: Mapping[str, list[tuple[ast.expr, bool]]],
+    resolving: frozenset[str] = frozenset(),
+) -> bool:
+    """Whether ``node`` holds a decoded leaf read, directly or through a name bound in ``env``."""
+    for sub in ast.walk(node):
+        if _is_leaf_read(sub):
+            return True
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id not in resolving:
+            bound = env.get(sub.id, [])
+            if any(_carries_decoded_leaf(v, env, resolving | {sub.id}) for v, _aug in bound):
+                return True
+    return False
+
+
+def _whole_field_write_value(node: ast.AST) -> ast.expr | None:
+    """The value of a whole-field write, ``<name>.set("<field>", v)`` or ``<name>["<field>"] = v``."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set"
+        and isinstance(node.func.value, ast.Name)
+        and len(node.args) >= 2
+    ):
+        path = _literal_path(node.args[0])
+        return node.args[1] if path is not None and path[2] is None else None
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                path = _literal_path(target.slice)
+                if path is not None and path[2] is None:
+                    return node.value
+    return None
+
+
+def _leaf_to_whole_field_hits(tree: ast.Module) -> list[int]:
+    """Line numbers of whole-field writes whose value is a decoded leaf, read against the
+    assignments of the scope holding the write (so ``v = msg.field("PID-3.1")`` a line earlier is
+    seen, as ``unsafe-db-lookup`` sees a statement composed earlier)."""
+    module_env = _scope_assignments(tree.body)
+    bodies: list[Sequence[ast.stmt]] = [tree.body]
+    bodies += [
+        node.body
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    hits: list[int] = []
+    for body in bodies:
+        env = {**module_env, **_scope_assignments(body)}
+        for node in _scope_nodes(body):
+            value = _whole_field_write_value(node)
+            if value is not None and _carries_decoded_leaf(value, env):
+                hits.append(getattr(node, "lineno", 0))
+    return hits
+
+
 def _check_handler_security(
     config_dir: str | Path, *, strict: bool = False, allow: frozenset[str] = frozenset()
 ) -> CheckResult:
     """Flag risky patterns in the config-dir Router/Handler modules — a static compensating control
-    for ASVS 15.2.5 / 15.2.4 (ADR 0144). Five rule families:
+    for ASVS 15.2.5 / 15.2.4 (ADR 0144). Six rule families:
 
     * ``phi-to-log`` — the message body reaching a ``print``/INFO+ log call (CLAUDE.md §9).
     * ``unsafe-db-lookup`` — an f-string/concatenated statement into ``db_lookup``/``fhir_lookup``
@@ -1235,6 +1331,9 @@ def _check_handler_security(
     * ``impure-transform`` — a re-run-divergent nondeterministic source (wall clock / ``random`` /
       ``uuid4``) in a router/handler, breaking the at-least-once purity invariant (CLAUDE.md §2).
     * ``unvetted-import`` — an operator-added third-party import (supply-chain / slopsquat surface).
+    * ``leaf-to-whole-field`` — a value read decoded from a component or subcomponent and written to a
+      whole field with ``set``, where its escaped separators would become structure; the safe write
+      is ``set_data`` (ADR 0206 rule 3). Literal paths only.
 
     Static analysis catches only a fraction of insecure code, so this is a **filter, not a fix**.
     **Advisory by default** (``required=False``, prints, never blocks); ``strict=True`` (the opt-in
@@ -1245,7 +1344,7 @@ def _check_handler_security(
     reports those) so it never crashes the gate. ``impure-transform`` is scoped to ``@router``/``@handler``
     bodies (so an undecorated helper's wall-clock fallback is not a false positive); ``phi-to-log`` scans
     every function body — decorated or an undecorated ``_*`` transform helper — keying on the first
-    positional parameter as the message symbol (BACKLOG #337); the other three scan the whole module."""
+    positional parameter as the message symbol (BACKLOG #337); the other four scan the whole module."""
     base = Path(config_dir)
     if not base.is_dir():
         return CheckResult(
@@ -1283,6 +1382,7 @@ def _check_handler_security(
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
             if _ambient_authority_hit(node):
                 file_hits.append((node.lineno, "ambient-authority"))
+        file_hits += [(lineno, "leaf-to-whole-field") for lineno in _leaf_to_whole_field_hits(tree)]
         # Per-FunctionDef body rules — phi-to-log + impure-transform, over each function's own body
         # only (not nested defs, not the signature), so each call is scanned once with its own message
         # symbol and an import-time default arg is never mistaken for per-message impurity. phi-to-log

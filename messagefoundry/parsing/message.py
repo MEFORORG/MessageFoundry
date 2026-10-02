@@ -355,6 +355,29 @@ class Message:
         reps[rep_index - 1] = comp_sep.join(comps)
         self._assign_field(seg, fld, occurrence, rep_sep.join(reps))
 
+    def set_data(
+        self, path: str, value: str, *, occurrence: int = 1, repetition: int | None = None
+    ) -> None:
+        """Write ``value`` at ``path`` as DATA at every level, a whole field included (ADR 0206).
+
+        :meth:`set` takes whole-field text as the caller's structure, so ``"A^B"`` becomes two
+        components. That is right for text the author wrote and wrong for a value read back with
+        :meth:`field` from a component or subcomponent, which is decoded: its escaped separators
+        come back as plain characters, and a whole-field :meth:`set` would make them live structure.
+        This write escapes the value as one leaf first, so it lands as the first component of the
+        field (or of the repetition ``repetition`` names) and reads back unchanged. At a component
+        or subcomponent path it is exactly :meth:`set`, which escapes there already. Use it whenever
+        the value came from a message rather than from the author::
+
+            msg.set_data("PV1-19", msg.field("PID-3.1") or "")
+
+        Raises as :meth:`set` does: ``ValueError`` on a CR or LF, ``KeyError`` on an absent segment."""
+        if parse_path(path)[2] is None and "\r" not in value and "\n" not in value:
+            # CR and LF stay raw through the escaper, so set() below refuses them as it always has.
+            field_sep, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
+            value = self._escape_leaf(value, field_sep, comp_sep, rep_sep, esc, sub_sep)
+        self.set(path, value, occurrence=occurrence, repetition=repetition)
+
     def __setitem__(self, path: str, value: str) -> None:
         self.set(path, value)
 

@@ -292,20 +292,22 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
     Recognizes exactly the ADR 0089 Phase A forms:
 
     * ``msg.set(path, value)`` → ``set_field`` (path + value editable slots).
-    * ``msg.set(dst, msg.field(src))`` / ``msg.set(dst, msg.field(src) or "")`` → ``copy_field``.
+    * ``msg.set(dst, msg.field(src))`` / ``msg.set(dst, msg.field(src) or "")`` → ``copy_field``, and
+      the same two shapes through ``msg.set_data``, the write a copy from a leaf uses (ADR 0206).
     * ``msg.delete_segments("SEG")`` / ``msg.delete_segment("SEG")`` → ``delete_segment``.
 
     A ``*args`` / ``**kwargs`` splat, the wrong positional arity (``msg.set`` with != 2, ``delete`` with
     != 1), a non-``msg`` receiver, or any other method makes it unrecognized (→ a read-only ``code`` row):
     when unsure the lens degrades rather than risk a corrupting edit. ``occurrence=``/other keyword args
-    are preserved as read-only ``display`` fields (never dropped, never editable in Phase A)."""
+    are preserved as read-only ``display`` fields (never dropped, never editable in Phase A). A
+    ``msg.set_data`` call that is not a copy is a ``code`` row: ``set_field`` means :meth:`Message.set`."""
     func = call.func
     if not isinstance(func, ast.Attribute) or not _is_msg_method(func, func.attr):
         return None
     display = _native_display(call)
     if display is None:
         return None
-    if func.attr == "set":
+    if func.attr in ("set", "set_data"):
         if len(call.args) != 2:
             return None
         dst_or_path, value = call.args[0], call.args[1]
@@ -316,6 +318,8 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
             return _NativeAction(
                 "copy_field", [("src", field_call.args[0]), ("dst", dst_or_path)], display
             )
+        if func.attr == "set_data":
+            return None
         return _NativeAction("set_field", [("path", dst_or_path), ("value", value)], display)
     if func.attr in ("delete_segments", "delete_segment"):
         if len(call.args) != 1:
@@ -4510,6 +4514,16 @@ _NATIVE_INSERT_ACTIONS = frozenset(
 )
 
 
+# A literal HL7 path to a component or subcomponent, the grammar of ``parsing.peek.parse_path``
+# restated because the lens stays stdlib-only. A malformed path simply does not match.
+_LEAF_PATH_RE = re.compile(r"^[A-Z][A-Z0-9]{2}-\d+\.\d+(?:\.\d+)?$")
+
+
+def _is_leaf_literal(value: Any) -> bool:
+    """Whether an insert parameter is a literal HL7 path to a component or subcomponent."""
+    return isinstance(value, str) and _LEAF_PATH_RE.match(value) is not None
+
+
 def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> str:
     """Render the NATIVE Message-API form of an inserted ``set_field``/``copy_field``/``delete_segment``.
 
@@ -4517,7 +4531,8 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
     recognizes the SAME editable action row (:func:`_recognize_native_method`):
 
     * ``set_field {path, value}``     → ``msg.set(<path>, <value>)``
-    * ``copy_field {src, dst}``       → ``msg.set(<dst>, msg.field(<src>) or "")``
+    * ``copy_field {src, dst}``       → ``msg.set(<dst>, msg.field(<src>) or "")``, or ``msg.set_data``
+      in place of ``msg.set`` when ``src`` is a literal component or subcomponent path (ADR 0206)
     * ``delete_segment {segment_id}`` → ``msg.delete_segments(<segment_id>)``
     * ``add_segment {line}``          → ``msg.add_segment(<line>)`` (ADR 0106 §3 Group 1)
     * ``add_repetition {path, value}``→ ``msg.add_repetition(<path>, <value>)`` (ADR 0106 §3 Group 1)
@@ -4553,7 +4568,11 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
         dst = _render_insert_value(params.get("dst", ""), "dst")
         # The occurrence applies to BOTH the inner read and the outer write, so the copy operates on the
         # loop's occurrence (not occurrence 1); the recognizer surfaces only the outer set's occurrence.
-        return f'msg.set({dst}, msg.field({src}{suffix}) or ""{suffix})'
+        # A literal component or subcomponent ``src`` reads decoded, so it is written with set_data,
+        # as actions.copy_field does (ADR 0206 rule 1). A ``src`` given as an expression cannot be
+        # classified here and keeps set; the handler-security lint cannot see that one either.
+        write = "set_data" if _is_leaf_literal(params.get("src")) else "set"
+        return f'msg.{write}({dst}, msg.field({src}{suffix}) or ""{suffix})'
     if name == "add_segment":
         line = _render_insert_value(params.get("line", ""), "line")
         return f"msg.add_segment({line})"
