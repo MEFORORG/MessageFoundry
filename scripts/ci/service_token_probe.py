@@ -392,11 +392,7 @@ def try_alternate_credential(granted: Path, denied: Path) -> dict[str, Any]:
     try:
         inner = asyncio.run(run())
     except OSError as exc:
-        # WHICH CALL FAILED is part of the reading. Only the logon and the impersonation raise
-        # CredentialLogonError; any other OSError came from the calls made under the credential,
-        # and blaming the logon for it would send a reader to the wrong step.
-        stage = "logon" if isinstance(exc, wincred.CredentialLogonError) else "under the credential"
-        return {"ran": True, "ok": False, "stage": stage, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ran": True, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return {"ran": True, "ok": True, "error": None, **inner}
 
 
@@ -455,13 +451,18 @@ _SECURITY_IMPERSONATION = 2
 def token_problems(token: dict[str, Any], *, service_sid: str, privileges: list[str]) -> list[str]:
     """Why ``token`` is not the token a hardened service holds. Empty when it is.
 
-    Three things, each checked on its own so a red says which one failed: the token is
-    write-restricted, its restricting list names the service SID, and it holds exactly
-    ``privileges``. A privilege that is held but switched off still counts as held.
+    Four things, each checked on its own so a red says which one failed: the token's user is the
+    service's own virtual account, it is write-restricted, its restricting list names the service
+    SID, and it holds exactly ``privileges``. A privilege that is held but switched off still
+    counts as held. The user is checked because the SID type and the privilege list would both
+    survive a change of account, and a service running as LocalSystem under them is not the
+    service this leg is about.
     """
     if token.get("error"):
         return [f"its token could not be read: {token['error']}"]
     problems = []
+    if token["user"] != service_sid:
+        problems.append(f"it runs as {token['user']}, not as the service's own account")
     if not token["write_restricted"]:
         problems.append("it is not write-restricted")
     if service_sid not in token["restricting_sids"]:
@@ -500,7 +501,7 @@ def inside_problems(
                 "CONTROL FAILED: the token is in neither Users nor Authenticated Users, so a "
                 "refused write to a directory that grants only those proves nothing"
             )
-    granted, denied = report.get("granted"), report.get("denied")
+    granted, denied, temp = report.get("granted"), report.get("denied"), report.get("temp")
     if granted and not granted["wrote"]:
         problems.append(f"it could not write {granted['directory']}, which names it in a grant")
     if denied and denied["wrote"]:
@@ -514,15 +515,17 @@ def inside_problems(
             f"the write to {denied['directory']} failed, but not as a refusal "
             f"({denied['error']}), so it shows nothing about the restriction"
         )
+    if temp and not temp["wrote"]:
+        problems.append(
+            f"it could not write its temporary directory ({temp['directory']}): {temp['error']}"
+        )
     cred = report.get("wincred")
     if cred:
         if not cred.get("ran"):
             problems.append(f"the alternate-credential call could not be run: {cred.get('error')}")
         elif not cred.get("ok"):
-            problems.append(
-                f"the alternate-credential call failed at the {cred.get('stage', 'logon')} "
-                f"stage: {cred.get('error')}"
-            )
+            # The error names the call that failed: the logon, the impersonation or a later one.
+            problems.append(f"the alternate-credential call failed: {cred.get('error')}")
         else:
             thread = cred.get("thread_token")
             level = thread["impersonation_level"] if thread else None
@@ -534,26 +537,6 @@ def inside_problems(
             if not cred["granted"]["wrote"]:
                 problems.append("a write under the alternate credential failed")
     return problems
-
-
-def inside_notes(report: dict[str, Any]) -> list[str]:
-    """Readings worth a line in the log that do NOT fail the leg.
-
-    The temporary directory is here and not in :func:`inside_problems`. Whether a hardened service
-    has a writable one says something about what the engine can still do, and nothing about whether
-    the token is restricted, which is what the leg is there to prove. It was a failing check until
-    the leg's first hosted run, which stopped before reading it. An unmeasured guess must not be
-    able to evict a pull request from the merge queue, so it is printed, loudly, and read by a
-    person.
-    """
-    temp = report.get("temp")
-    if temp and not temp["wrote"]:
-        return [
-            f"the service could not write its temporary directory ({temp['directory']}): "
-            f"{temp['error']}. The engine would meet this the first time it asked for a temporary "
-            "file."
-        ]
-    return []
 
 
 def _report_problems(subject: str, problems: list[str]) -> None:
@@ -598,9 +581,6 @@ def _check_inside(args: argparse.Namespace) -> int:
     print(json.dumps(report, indent=2))
     problems = inside_problems(report, service_sid=args.service_sid, privileges=args.privilege)
     _report_problems("the service", problems)
-    for note in inside_notes(report):
-        # A workflow command: GitHub shows it as a warning on the run, where a plain line is lost.
-        print(f"::warning title=service token probe::{note}")
     if not problems:
         cred = report["wincred"]
         print(

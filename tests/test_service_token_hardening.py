@@ -554,6 +554,7 @@ def _passing_report() -> dict[str, Any]:
     """A report shaped like the one a hardened service writes. No Windows call is made."""
     wrote = {"directory": "d", "wrote": True, "errno": None, "error": None}
     token = {
+        "user": "S-1-5-80-1",
         "write_restricted": True,
         "restricting_sids": ["S-1-5-80-1", "S-1-1-0"],
         "privileges": [_PRIVILEGE],
@@ -594,13 +595,10 @@ def _broken(path: list[str], value: Any) -> dict[str, Any]:
         (["granted", "wrote"], False, "could not write d"),
         (["token", "privileges"], [_PRIVILEGE, "SeImpersonatePrivilege"], "not exactly"),
         (["token", "groups"], [], "CONTROL FAILED"),
-        (["wincred", "ok"], False, "failed at the logon stage"),
-        # The stage is part of the reading: a failure after the logon must not blame the logon.
-        (
-            ["wincred"],
-            {"ran": True, "ok": False, "stage": "under the credential", "error": "x"},
-            "failed at the under the credential stage",
-        ),
+        (["temp", "wrote"], False, "temporary directory"),
+        (["wincred", "ok"], False, "alternate-credential call failed"),
+        # The SID type and the privilege list survive a change of account. The user must not.
+        (["token", "user"], "S-1-5-18", "not as the service's own account"),
         # Windows answers a refused impersonation with an identification-level token and a success.
         (["wincred", "thread_token", "impersonation_level"], 1, "refused the impersonation"),
         (["wincred", "granted", "wrote"], False, "under the alternate credential"),
@@ -617,18 +615,6 @@ def test_the_rule_fails_each_way_a_report_can_be_wrong(
     assert probe.inside_problems(_passing_report(), **rule) == [], "CONTROL: the base report passes"
     problems = probe.inside_problems(_broken(path, value), **rule)
     assert any(expect in p for p in problems), problems
-
-
-def test_an_unwritable_temp_directory_is_a_note_and_not_a_failure() -> None:
-    """The temporary directory says what the engine can still do, not whether the token is
-    restricted. Its first hosted run never reached it, so it must not be able to fail the leg on a
-    guess. It is still reported: a failure is a note, and a success is no note at all."""
-    probe = _probe()
-    rule = {"service_sid": "S-1-5-80-1", "privileges": [_PRIVILEGE]}
-    failed = _broken(["temp"], {"directory": "t", "wrote": False, "errno": 13, "error": "denied"})
-    assert probe.inside_problems(failed, **rule) == []
-    assert any("temporary directory (t)" in note for note in probe.inside_notes(failed))
-    assert probe.inside_notes(_passing_report()) == [], "CONTROL: a writable one leaves no note"
 
 
 def test_a_report_with_a_step_missing_is_not_a_pass() -> None:
@@ -744,8 +730,11 @@ def test_the_smoke_leg_judges_the_probe_start_by_its_report() -> None:
         for verb in ("start", "set")
     }
     assert len(follows["start"]) == 1 and len(follows["set"]) == 2, follows
-    assert not follows["start"][0].startswith("Assert-Native"), (
-        f"the step reads the exit code of the start again: {follows['start'][0]}"
+    # CLEARED, and on the very next line. A check that only forbade Assert-Native there would
+    # pass a read two lines down, where the start's stale 1 would fail every run.
+    assert follows["start"][0] == "$global:LASTEXITCODE = 0", (
+        f"the start's exit code is not cleared at once, so a later line can read it: "
+        f"{follows['start'][0]}"
     )
     assert all(line.startswith("Assert-Native") for line in follows["set"]), (
         f"CONTROL FAILED: a set command's exit code is no longer read: {follows['set']}"
@@ -753,6 +742,41 @@ def test_the_smoke_leg_judges_the_probe_start_by_its_report() -> None:
     script = "\n".join(lines)
     assert "if (-not (Test-Path -LiteralPath $report))" in script and "wrote no report" in script, (
         "the step no longer fails when the probe wrote no report, so nothing judges the start"
+    )
+    # The report is the only witness of this start, so one left by an earlier start must be gone
+    # before it, and the step must stop if it is not.
+    stale = script.index("a report from an earlier run could not be removed")
+    assert stale < script.index('nssm.exe" start MessageFoundry'), (
+        "the stale-report check runs after the start it is there to protect"
+    )
+
+
+def test_a_reinstall_is_told_the_host_may_need_a_restart(tmp_path: Path) -> None:
+    """Only a NEW service's first start has been measured to pick the settings up. On a service
+    that was already installed the installer says a restart may be needed, on every re-install,
+    because a second run before the restart finds the registration already as asked.
+
+    Read from the AST: the warning sits in an `if ($ServiceExisted)` at the top level, and that
+    variable is read from the Service Control Manager before the service is installed.
+    """
+    assert _SCRIPT is not None
+    body = """
+  $ifs = @($ast.FindAll({ $args[0] -is
+      [System.Management.Automation.Language.IfStatementAst] }, $true) | Where-Object {
+      $_.Clauses[0].Item1.Extent.Text -eq '$ServiceExisted' } | ForEach-Object {
+      $_.Clauses[0].Item2.Extent.Text })
+  ConvertTo-Json -InputObject @($ifs) -Compress
+"""
+    bodies = _last_json(_ok(_extract(_SCRIPT, [], body), tmp_path))
+    assert any("Write-Warning" in b and "restart" in b.lower() for b in bodies), bodies
+    facts = _preflight_facts(tmp_path)
+    existed = [a for a in facts["assignments"] if a["lhs"] == "ServiceExisted"]
+    installs = [
+        c for c in facts["commands"] if c["name"] == "Invoke-Nssm" and " install " in c["text"]
+    ]
+    assert len(existed) == 1 and "Get-Service" in existed[0]["rhsText"], existed
+    assert installs and existed[0]["start"] < installs[0]["start"], (
+        "the service is looked for after it is installed, so every run would read as a re-install"
     )
 
 
