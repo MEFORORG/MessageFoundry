@@ -4076,22 +4076,20 @@ def create_app(
         # records the identical fingerprint-bearing row, and reports a failed row the same way (#1940).
         failures = [f.step for f in outcome.failures]
         if req.dry_run:
+            # The directory this dry run checked comes from the outcome, never from
+            # engine.last_reload_dir: a dry run does not move that field (vault BACKLOG #2598).
+            checked = outcome.directory
             fingerprint: dict[str, object] = {}
-            if engine.last_reload_dir is not None:
-                try:
-                    fingerprint = await asyncio.to_thread(
-                        config_fingerprint_detail, engine.last_reload_dir
-                    )
-                except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
-                    _log.warning(
-                        "config fingerprint failed for %s: %s", engine.last_reload_dir, exc
-                    )
+            try:
+                fingerprint = await asyncio.to_thread(config_fingerprint_detail, checked)
+            except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
+                _log.warning("config fingerprint failed for %s: %s", checked, exc)
             await engine.store.record_audit(
                 "config_reload_check",
                 actor=user.username,
                 detail=json.dumps(
                     {
-                        "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
+                        "dir": str(checked),
                         "inbound": len(registry.inbound),
                         "outbound": len(registry.outbound),
                         "dry_run": True,

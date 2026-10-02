@@ -146,10 +146,14 @@ class ReloadOutcome:
       engine that does not exist, and reporting plain success would hide a step an operator has to
       go finish by hand -- so the partial outcome is its own answer (ASVS 2.3.3, BACKLOG #1111).
 
-    A dry run applies nothing, so it reports ``applied`` False with no failures."""
+    A dry run applies nothing, so it reports ``applied`` False with no failures.
+
+    ``directory`` is the resolved directory this call loaded, applied or not. A dry run's audit row
+    reads it here, because :attr:`Engine.last_reload_dir` moves only on an applied reload."""
 
     registry: Registry
     applied: bool
+    directory: Path
     failures: tuple[ReloadStepFailure, ...] = ()
 
     @property
@@ -537,7 +541,9 @@ class Engine:
         # and so the engine's own reloads, which pass the resolved startup dir, always pass.
         configured = [*config_reload_roots, *([config_dir] if config_dir else [])]
         self._reload_roots_lexical = lexical_roots([*configured, *self._reload_roots])
-        # The directory the most recent reload loaded from (resolved) — for audit by the API.
+        # The directory the most recent APPLIED reload loaded from (resolved). The provenance drift
+        # check and set_connection_flag both trust it to name where the running graph came from, so
+        # a dry run or a failed reload never moves it (vault BACKLOG #2598).
         self.last_reload_dir: Path | None = None
         # ADR 0041 D1 (config provenance, item C): the content fingerprint + best-effort git commit of
         # the graph currently loaded, captured at each successful non-dry-run load. None until the first
@@ -1900,7 +1906,8 @@ class Engine:
         resolve **within** an allowed reload root (the startup dir + ``config_reload_roots``);
         otherwise :class:`ConfigReloadDenied` is raised — the loader executes Python, so an
         arbitrary client path must never be honoured. The resolved directory is recorded on
-        :attr:`last_reload_dir` for auditing.
+        :attr:`last_reload_dir` only once a non-dry-run reload has swapped the graph; every outcome
+        also carries it as :attr:`ReloadOutcome.directory`.
 
         Validates first (a bad config raises before anything is swapped, so the running graph is
         left untouched), then atomically swaps via the runner's quiesce-and-swap reload. If the
@@ -1940,7 +1947,6 @@ class Engine:
         # Off the event loop: the resolve opens the target and each parent, and a slow volume would
         # otherwise stall every listener for as long as that takes (vault BACKLOG #2581).
         path = await asyncio.to_thread(self._resolve_reload_target, config_dir)
-        self.last_reload_dir = path
         if not await asyncio.to_thread(path.is_dir):
             raise FileNotFoundError(f"config directory not found: {config_dir}")
         # Re-gather this environment's values so a reload/promote picks up edited environments/<env>.toml
@@ -2059,7 +2065,7 @@ class Engine:
                 coordinator=self._coordinator,
             )
             checker.build_check(registry)
-            return ReloadOutcome(registry=registry, applied=False)
+            return ReloadOutcome(registry=registry, applied=False, directory=path)
         # ADR 0041 D1 (config provenance, item C): fingerprint the bundle BEFORE the swap. The digest
         # is a pure, offline fold over the directory's file BYTES (config/fingerprint.py). It never
         # reads the live graph, so computing it here is meaning-preserving, and it narrows the window
@@ -2097,8 +2103,10 @@ class Engine:
         # reported as a PARTIAL outcome, never as a failed reload. Telling the caller the reload
         # failed while the new graph serves traffic would be a false report, and reporting plain
         # success would hide a step an operator still has to finish by hand.
-        # Provenance is now the NEW bundle's (the digest was taken above, before the swap).
+        # Provenance is now the NEW bundle's (the digest was taken above, before the swap), and so is
+        # the directory it came from. Set together and only here (vault BACKLOG #2598).
         self.loaded_config_fingerprint = fingerprint
+        self.last_reload_dir = path
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
@@ -2137,7 +2145,9 @@ class Engine:
                 len(failures),
                 ", ".join(f.step for f in failures),
             )
-        return ReloadOutcome(registry=registry, applied=True, failures=tuple(failures))
+        return ReloadOutcome(
+            registry=registry, applied=True, directory=path, failures=tuple(failures)
+        )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
         """Resolve the reload target and enforce the allow-list (see :class:`ConfigReloadDenied`).
