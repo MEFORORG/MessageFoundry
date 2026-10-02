@@ -546,8 +546,9 @@ class Engine:
         # a dry run or a failed reload never moves it (vault BACKLOG #2598).
         self.last_reload_dir: Path | None = None
         # ADR 0041 D1 (config provenance, item C): the content fingerprint + best-effort git commit of
-        # the graph currently loaded, captured at each successful non-dry-run load. None until the first
-        # load or when fingerprinting failed. Read by GET /config/provenance to report the running commit
+        # the graph currently loaded, captured at the start's first load (capture_start_provenance,
+        # vault BACKLOG #2597) and at each successful non-dry-run reload. None before either, or when
+        # fingerprinting failed. Read by GET /config/provenance to report the running commit
         # and detect on-disk DRIFT. Holds only a one-way hash + a commit sha — never resolved env values.
         self.loaded_config_fingerprint: dict[str, object] | None = None
 
@@ -1789,7 +1790,7 @@ class Engine:
 
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
-        config_dir = self.last_reload_dir or self.config_dir
+        config_dir = self.running_config_dir
         if config_dir is None:
             raise WiringError(
                 "no config directory is configured — a connection flag cannot be persisted"
@@ -1848,6 +1849,40 @@ class Engine:
                     rr.registry.outbound[name] = replace(
                         rr.registry.outbound[name], flagged=flagged
                     )
+
+    @property
+    def running_config_dir(self) -> Path | None:
+        """The directory the running graph came from: the last applied reload's, else the startup
+        ``--config`` dir. The provenance drift check and :meth:`set_connection_flag` read it."""
+        return self.last_reload_dir or self.config_dir
+
+    async def fingerprint_bundle(self, path: Path) -> tuple[dict[str, object] | None, str | None]:
+        """The ADR 0041 D1 content fingerprint of ``path``, or ``(None, reason)`` when it cannot be read.
+
+        The one best-effort rule for every load: the start, an applied reload and a dry run all call
+        it, so a bundle one of them tolerates cannot make another refuse (vault BACKLOG #2597).
+        OSError is an unreadable file; ValueError is a VCS head that is not UTF-8
+        (UnicodeDecodeError). Anything else, such as an ImportError of the fingerprint module, still
+        raises. The reason is a :func:`safe_exc` rendering, logged here at WARNING."""
+        from messagefoundry.config.fingerprint import config_fingerprint_detail
+
+        try:
+            return await asyncio.to_thread(config_fingerprint_detail, path), None
+        except (OSError, ValueError) as exc:
+            reason = safe_exc(exc)
+            log.warning("config fingerprint failed for %s: %s", path, reason)
+            return None, reason
+
+    async def capture_start_provenance(self) -> None:
+        """Take the provenance baseline for the graph a start loaded from :attr:`config_dir`.
+
+        The start's first load is the lifespan's, not :meth:`reload_detail`, so without this call
+        :attr:`loaded_config_fingerprint` stayed ``None`` until the first reload and ``GET
+        /config/provenance`` could not see drift after a plain start (vault BACKLOG #2597). The
+        caller runs it right after the first load, so the digest covers the bytes that load read.
+        An unreadable bundle leaves the baseline ``None`` and the start goes on."""
+        if self.config_dir is not None:
+            self.loaded_config_fingerprint, _reason = await self.fingerprint_bundle(self.config_dir)
 
     def guard_registry(self, registry: Registry) -> None:
         """Run the engine's registry guard over ``registry``; raises ``WiringError`` to refuse it.
@@ -2073,18 +2108,12 @@ class Engine:
         # here also means a failure the OSError guard never covered (an ImportError on the local
         # import, say) aborts the reload while the OLD graph is still live, instead of surfacing as a
         # failed reload with the NEW graph already serving. The value is ASSIGNED only after the swap.
-        fingerprint: dict[str, object] | None
-        try:
-            from messagefoundry.config.fingerprint import config_fingerprint_detail
-
-            fingerprint = await asyncio.to_thread(config_fingerprint_detail, path)
-        except OSError as exc:
-            # Still best-effort: an unreadable bundle leaves provenance unknown rather than refusing
-            # an otherwise-applicable config. Recorded as a step failure so the caller is not told the
-            # reload was clean when GET /config/provenance will report nothing.
-            log.warning("config fingerprint before reload failed for %s: %s", path, exc)
-            fingerprint = None
-            failures.append(ReloadStepFailure("config_fingerprint", safe_exc(exc)))
+        # Still best-effort: an unreadable bundle leaves provenance unknown rather than refusing an
+        # otherwise-applicable config. Recorded as a step failure so the caller is not told the
+        # reload was clean when GET /config/provenance will report nothing.
+        fingerprint, fingerprint_failure = await self.fingerprint_bundle(path)
+        if fingerprint_failure is not None:
+            failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
         if runner is None:
             runner = self.add_registry(registry)
             try:

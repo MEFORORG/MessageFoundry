@@ -237,12 +237,13 @@ async def test_released_reload_whose_audit_row_fails_is_not_compensated_to_faile
     )
 
 
-async def test_a_fingerprint_fault_after_the_swap_never_escapes_the_reload_audit(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_the_reload_audit_takes_no_fingerprint_after_the_swap(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Round-2 finding on this branch. The post-swap fingerprint caught only OSError and ValueError,
-    so any other fault escaped after the graph swapped: a 500 on the inline route, and a released
-    reload compensated to 'failed'. The helper now catches it, and the row is still written."""
+    """Round-2 finding on this branch was a post-swap fingerprint whose fault escaped after the graph
+    swapped. Since vault BACKLOG #2597 the row reads the digest the engine took BEFORE the swap, so
+    the writer hashes nothing: a fault in the API's own fingerprint call cannot reach it, and the
+    row names the digest GET /config/provenance compares against."""
     import messagefoundry.api.app as app_module
 
     def _boom(_path: object) -> dict[str, object]:
@@ -253,13 +254,14 @@ async def test_a_fingerprint_fault_after_the_swap_never_escapes_the_reload_audit
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
         headers = await _token(c, "deployer")
         monkeypatch.setattr(app_module, "config_fingerprint_detail", _boom)
-        with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
-            r = await c.post("/config/reload", json={}, headers=headers)
+        r = await c.post("/config/reload", json={}, headers=headers)
     assert r.status_code == 200, r.text
-    assert r.json()["inbound"] == 1
+    assert r.json()["inbound"] == 1 and r.json()["failures"] == []
     rows = await engine.store.list_audit(action="config_reload")
-    assert len(rows) == 1  # the fingerprint degraded; the row itself still landed
-    assert any("config fingerprint failed" in rec.getMessage() for rec in caplog.records)
+    assert len(rows) == 1
+    loaded = engine.loaded_config_fingerprint
+    assert loaded is not None
+    assert json.loads(rows[0]["detail"])["fingerprint"] == loaded["fingerprint"]
 
 
 async def test_inline_reload_whose_audit_row_fails_reports_the_swap_it_made(
