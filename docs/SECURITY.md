@@ -159,6 +159,39 @@ store vouches for. `serve --allow-insecure-bind`, or its config twin `[security]
 unauthenticated full access — or to silently void the loopback assumption by changing
 `[security].local_access_only` / `listen_address` (SYS-1).
 
+**Sign-in is checked before the request body is read (vault BACKLOG #2739).** FastAPI reads and
+decodes a declared request body before it runs a route's dependencies, and the `require*()` gate
+is a dependency. Left alone, a gated JSON route that declares a body would answer a caller with no
+session from the body parser. The answer would be **422** for JSON that does not parse, or **400**
+for bytes that cannot be read. The engine's route class, `AuthenticatedBeforeBodyRoute`
+(`messagefoundry/api/security.py`), stops that. On a gated route that declares a body, it runs
+the gate's authentication step before FastAPI reads the body. The guards that sit ahead of the
+gate run first, in the order FastAPI would run them. So a caller with no identity gets the gate's
+own refusal whatever the body holds. The response does not say whether the body parsed, or whether
+the route takes a body.
+
+- `create_app` sets the class on the app's router. Each route registered on the app gets the
+  check with nothing to remember, and no list of routes is kept.
+- Some route shapes are not covered, and the engine has none of them. The class docstring is the
+  one list. It names at least a route added through `include_router`, a gate nested inside
+  another dependency, and an unmarked dependency ahead of a gate. An embedder who adds routes in
+  one of those ways must check them.
+- The gate itself does not change. After the body is read it runs in full, as before: sign-in
+  again, then the password and factor checks, the permission check and its audit rows, pacing and
+  step-up. So a signed-in caller that the gate then refuses still gets the parser's answer first
+  for a body that does not parse.
+- Nothing is handed from the early check to the gate. A session that ends while the body is
+  arriving is refused by the gate. The price is one more identity lookup for a signed-in
+  request to a route with a body. That lookup reads the session, its user and the user's roles.
+  It writes nothing, so it does not move the session's idle clock.
+- A route with no gate is not touched. `POST /auth/login` has to parse a body from a caller with
+  no session. A gated route that declares no body is not touched either, because FastAPI already
+  runs its gate first. That includes the web console's `/ui` routes, which read their forms
+  inside the handler.
+
+`tests/test_auth_before_body.py` tests the mechanism. `tests/test_preauth_malformed_body.py` pins
+what an unauthenticated caller gets on every operation that takes a body.
+
 **The proxy-to-engine hop is yours to secure, and `serve` makes you say so (BACKLOG #1179).** With
 `tls_terminated_upstream`, the proxy terminates TLS and the engine mints no certificate
 ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
@@ -702,7 +735,9 @@ route handler only when all of them pass.
    cookie** serves the `/ui` routes and a same-origin browser's `/ws/stats` handshake. The JSON API's
    `require*()` gates never read the cookie. `/ws/stats` accepts two planes, cookie first and
    header token second; the WebSocket note under the gate table below has the order.
-3. **The `require*()` deny-by-default ladder**, in this order: **503** `authentication is not configured`
+3. **The `require*()` deny-by-default ladder.** Its first two rungs, the 503 and the 401, answer
+   before the request body is read; [Enforcement model](#enforcement-model) says how. The ladder
+   runs in this order: **503** `authentication is not configured`
    when no enabled `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
    required` when the identity is flagged `must_change_password` and the path is not must-change
@@ -2613,6 +2648,8 @@ flowchart TB
   steps that come before the ladder and the conditions on each rung.
 - Not every route takes this path. [Enforcement model](#enforcement-model) lists the routes that
   need no session, and the one route that authenticates by client certificate.
+- On a route that declares a body, the session check runs before the body is read and again
+  after it. The checks below it run after.
 - The six-sided boxes are checks, and they run from top to bottom. Each account check lets a short
   list of self-service routes through. That lets a person change the password, prove the factor or
   set the address.

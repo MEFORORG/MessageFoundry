@@ -5647,7 +5647,7 @@ class SecuritySettings(_Section):
     # to every local account (ASVS 6.3.3); "administrators" restores the pre-6.3.3 posture.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     allow_single_factor_admin_when_exposed: bool = (
-        False  # ADR 0140: permit single-factor admin on an EXPOSED production-PHI bind
+        False  # ADR 0140: lift the require_mfa-off refusal at exposure under enforcement = enforce
     )
     sign_out_after_idle_minutes: int = 30
     max_session_hours: int = 12
@@ -7019,12 +7019,15 @@ def security_loosenings(
                 + " (ASVS 3.7.3)",
             )
         )
+    # Vault BACKLOG #2798: each text names only the accounts its switch frees; the tests say why.
     if not sec.require_mfa:
         out.append(
             (
                 "require_mfa",
-                "every account is single-factor — no engine second factor is required, and a "
-                "directory session is admitted on a ticket that asserts no strength",
+                "an account with no second factor enrolled is single-factor, so a Kerberos session "
+                "enters on a ticket that asserts no strength. An enrolled account must still "
+                "satisfy its factor, and an OIDC sign-in still needs a checked amr/acr claim while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7033,15 +7036,20 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa_scope",
-                "only Administrators must enroll a second factor — every other account, local or "
-                "directory, is single-factor until it opts in by enrolling",
+                "a local account without the Administrator role is single-factor until it enrolls "
+                "a second factor. Administrators and directory accounts still owe one; an OIDC "
+                "sign-in meets it with an amr/acr claim checked while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:
         out.append(
             (
                 "allow_single_factor_admin_when_exposed",
-                "single-factor admin is permitted on an EXPOSED production-PHI bind — no second factor over the network",
+                "an EXPOSED instance under enforcement = enforce may start with "
+                "[security].require_mfa off, on an audited warning instead of the refusal. Every "
+                "account with no second factor enrolled is then single-factor over the network, "
+                "unless an OIDC sign-in carries a checked amr/acr claim",
             )
         )
     if not sec.encrypt_stored_data:

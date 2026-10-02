@@ -16,6 +16,8 @@
         seat.ps1 -Declare -Handoff <path>     # point at the document a replacement should read
         seat.ps1 -Close [-Handback]
         seat.ps1 -BumpEpoch                   # mark an account switch; see POOL EPOCH below
+        seat.ps1 -ClearHandoff -Box <boxKey> -SessionId <sessionKey>
+                                              # clear ANOTHER, dead session's pointer to a deleted file
 
     WHY A RECORD AND NOT A ROW IN A SHARED FILE. This layer lives inside .git, which is NOT under
     version control -- measured: `git ls-files | grep -c '^\.git/'` returns 0 while the same
@@ -80,6 +82,13 @@ param(
     [Parameter(ParameterSetName = 'Close')][switch]$Close,
     [Parameter(ParameterSetName = 'Close')][switch]$Handback,
     [Parameter(ParameterSetName = 'Epoch')][switch]$BumpEpoch,
+    # CLEAR A DEAD SESSION'S BROKEN HANDOFF POINTER. Every other path here writes the CALLER's own
+    # record, so a seat that died pointing at a deleted file kept fleet.ps1's
+    # handoffPointersBroken stop raised forever: its writer never runs again, and nothing else could
+    # reach the record. -Box and -SessionId name the TARGET record (its directory and file stem), not
+    # the caller. Refusal rules and why each exists: Invoke-ClearHandoff's description.
+    [Parameter(ParameterSetName = 'ClearHandoff')][switch]$ClearHandoff,
+    [Parameter(ParameterSetName = 'ClearHandoff')][string]$Box,
     # THE HOOK PATH FOR DECLARATION. -Prompt records that a seat was ASKED for a goal and had not
     # given one at that moment. It never invents a goal: a hook cannot know intent, and a goal a
     # machine wrote is not a declaration of anything.
@@ -641,6 +650,169 @@ function Write-RecordAtomic {
 }
 
 # ---------------------------------------------------------------------------------------------
+# -ClearHandoff: the one path that writes a record belonging to ANOTHER session.
+# ---------------------------------------------------------------------------------------------
+
+function Invoke-ClearHandoff {
+    <#
+    .SYNOPSIS
+        Null a dead session's handoff pointer whose file is gone. Returns the exit code: 0 cleared,
+        1 refused. Refusals go to stderr and NEVER to .writer-errors.txt, which fleet.ps1 reads as an
+        error log -- a correct refusal is not a writer failure.
+
+    .DESCRIPTION
+        WHY THIS EXISTS. A pointer goes dangling when the file it names is deleted, usually with the
+        worktree that held it. The seat that declared it is dead, so its own -Record never runs
+        again and nothing else here writes another session's record. fleet.ps1 then carries
+        handoffPointersBroken as a stop condition for as long as the record survives. Measured
+        2026-10-02: 2 of 6 pointers, one in a box whose worktree no longer exists.
+
+        IT REFUSES ANYTHING IT CANNOT PROVE, because it writes under a seat that cannot object:
+          - the record is missing or unreadable, or carries no pointer;
+          - ANYTHING exists at the pointer's path. A drifted pointer still reaches a document, and
+            fleet.ps1 does not count drift as broken (BACKLOG #1372);
+          - the path cannot be evaluated: not fully qualified, its drive or share root is
+            unreachable, or its nearest existing ancestor cannot be listed. Test-Path answers
+            false rather than throwing for all three, and unevaluated is not dangling;
+          - the record is a Codex seat. Claude's registry cannot fence one, so every Codex
+            session would read as a registry miss;
+          - the liveness fence is unavailable, the record has no sessionId to fence, any registry
+            file is unreadable, or the lookup throws;
+          - the fence reads anything but DEAD, STALE or a clean miss. It is an ALLOW-list, so a
+            state added to session-registry.ps1 later is refused until someone decides about it.
+            A live seat repairs its own pointer with -Declare; another session must not race it.
+        A clean registry miss is allowed. session-registry.ps1 says a miss alone must not authorise
+        a destructive act; here the second signal is the missing file, the unreadable-file veto
+        covers a registry record caught mid-write, and the act erases nothing, because the whole
+        prior pointer is kept in handoffClears. The normal write path carries handoffClears
+        forward, so a later -Record on the same record does not drop the audit trail.
+
+        IT NEVER NEEDS THE TARGET'S WORKTREE, so a box whose worktree was removed still clears.
+
+        EVERY OTHER FIELD IS LEFT EXACTLY AS IT WAS, `asOf` and `writes` included. Bumping `asOf`
+        would make a dead record read as fresh to fleet.ps1's age and SUPERSEDED rules. Dates are
+        parsed with -DateKind String so a round trip cannot rewrite their format.
+    #>
+    param([string]$SeatsDir, [string]$TargetBox, [string]$TargetSession, $Caller, [string]$CallerBox)
+
+    function Refuse([string]$Why) {
+        [System.Console]::Error.WriteLine("seat.ps1 -ClearHandoff: REFUSED: $Why")
+        return 1
+    }
+
+    # A key that starts with a dot is refused as well: `..` passes the character class and would
+    # step out of the seats directory, and `.writer-alive` is not a box.
+    foreach ($pair in @(@('-Box', $TargetBox), @('-SessionId', $TargetSession))) {
+        if (-not $pair[1] -or $pair[1] -notmatch '^[A-Za-z0-9._-]+$' -or $pair[1].StartsWith('.')) {
+            return (Refuse "$($pair[0]) '$($pair[1])' must match ^[A-Za-z0-9._-]+$ and not start with a dot.")
+        }
+    }
+
+    # -DateKind arrived in pwsh 7.5. Without it the parse below fails and reads as a bad record.
+    if ($PSVersionTable.PSVersion -lt [version]'7.5') {
+        return (Refuse "needs pwsh 7.5 or later for ConvertFrom-Json -DateKind; this is $($PSVersionTable.PSVersion).")
+    }
+    if ($env:KORUS_AGENT -eq 'codex' -or $TargetSession.StartsWith('codex-')) {
+        return (Refuse "$TargetBox/$TargetSession is a Codex seat, and Claude's session registry cannot fence one.")
+    }
+
+    $recPath = Join-Path (Join-Path $SeatsDir $TargetBox) "$TargetSession.json"
+    if (-not (Test-Path -LiteralPath $recPath -PathType Leaf)) {
+        return (Refuse "no record at $recPath.")
+    }
+    try {
+        $rec = Get-Content -LiteralPath $recPath -Raw -EA Stop | ConvertFrom-Json -DateKind String -EA Stop
+    } catch {
+        return (Refuse "record at $recPath is unreadable: $($_.Exception.Message)")
+    }
+    if ($null -eq $rec -or $rec -isnot [System.Management.Automation.PSCustomObject]) {
+        return (Refuse "record at $recPath is not a JSON object.")
+    }
+    $names = @(Get-RosterMapKeys $rec)
+
+    $prior = if ($names -contains 'handoff') { $rec.handoff } else { $null }
+    $ptrPath = $null
+    # Get-RosterMapKeys, never `.Properties.Name`: under StrictMode that projection throws on an
+    # object with no members, and its description records the measurement.
+    if ($prior -and ((Get-RosterMapKeys $prior) -contains 'path')) { $ptrPath = [string]$prior.path }
+    if (-not $ptrPath) { return (Refuse "record $TargetBox/$TargetSession carries no handoff pointer.") }
+
+    # Test-Path answers $false, not an error, for a path it could not reach. So before its false is
+    # read as MISSING, prove the answer could have been true: the path is fully qualified (not
+    # `C:foo` or `\foo`, which resolve against the caller), its drive or share root answers, and the
+    # nearest ancestor that exists can be listed. Any failure is UNEVALUATED, never dangling.
+    try {
+        if (-not [System.IO.Path]::IsPathFullyQualified($ptrPath)) { throw "the path is not fully qualified" }
+        $full = [System.IO.Path]::GetFullPath($ptrPath)
+        $root = [System.IO.Path]::GetPathRoot($full)
+        if (-not $root -or -not (Test-Path -LiteralPath $root -EA Stop)) { throw "its root '$root' does not answer" }
+        $exists = Test-Path -LiteralPath $full -EA Stop
+        if (-not $exists) {
+            $anc = Split-Path -Parent $full
+            while ($anc -and -not (Test-Path -LiteralPath $anc -PathType Container -EA Stop)) { $anc = Split-Path -Parent $anc }
+            if (-not $anc) { throw "no ancestor of the path exists" }
+            # Throws on access denied, which is the case Test-Path would have hidden.
+            [void][System.IO.Directory]::EnumerateFileSystemEntries($anc).GetEnumerator().MoveNext()
+        }
+    } catch {
+        return (Refuse "the pointer '$ptrPath' cannot be evaluated: $($_.Exception.Message)")
+    }
+    if ($exists) {
+        return (Refuse "the pointer's file still exists at '$ptrPath'. Only a pointer to a missing file is cleared; a drifted one still reaches a document.")
+    }
+
+    $sid = if ($names -contains 'sessionId') { [string]$rec.sessionId } else { '' }
+    if (-not $sid) { return (Refuse "record $TargetBox/$TargetSession has no sessionId, so its session cannot be fenced.") }
+
+    try {
+        . "$PSScriptRoot\session-registry.ps1"
+        $roots = @(Get-ClaudeConfigRoots)
+        if ($roots.Count -eq 0) {
+            return (Refuse "the liveness fence is unavailable: no config root under '$env:USERPROFILE' holds a sessions directory.")
+        }
+        # A registry file caught mid-write parses to nothing, and Get-SessionLiveness skips it. That
+        # file may be the very session being fenced, so ANY unreadable one vetoes the clear.
+        $bad = @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable })
+        if ($bad.Count -gt 0) {
+            return (Refuse "$($bad.Count) session registry file(s) cannot be read, so the fence is incomplete; first: $($bad[0].File) ($($bad[0].Error)).")
+        }
+        $l = Get-SessionLiveness -SessionId $sid
+    } catch {
+        return (Refuse "the liveness lookup for session $sid failed: $($_.Exception.Message)")
+    }
+    $cleanMiss = (-not $l.Found) -and $l.State -eq 'UNKNOWN'
+    if (-not ($cleanMiss -or $l.State -in @('DEAD', 'STALE'))) {
+        return (Refuse "session $sid reads $($l.State) ($($l.Detail)). Only DEAD, STALE or no registry record is cleared; a live seat repairs its own pointer with -Declare.")
+    }
+
+    $entry = [ordered]@{
+        clearedAt           = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        clearedBySessionId  = $Caller.Id
+        clearedBySessionKey = $Caller.Key
+        clearedByBox        = $CallerBox
+        writerVersion       = $WRITER
+        fenceState          = $l.State
+        fenceDetail         = $l.Detail
+        priorPointer        = $prior
+    }
+    $clears = @()
+    if ($names -contains 'handoffClears' -and $null -ne $rec.handoffClears) { $clears = @($rec.handoffClears) }
+    $clears += [pscustomobject]$entry
+
+    $rec.handoff = $null
+    if ($names -contains 'handoffClears') { $rec.handoffClears = $clears }
+    else { $rec | Add-Member -NotePropertyName 'handoffClears' -NotePropertyValue $clears }
+
+    try {
+        Write-RecordAtomic -Path $recPath -Object $rec
+    } catch {
+        return (Refuse "the write to $recPath failed: $($_.Exception.Message)")
+    }
+    Write-Host "cleared handoff pointer on $TargetBox/$TargetSession (was '$ptrPath'; fence $($l.State))"
+    return 0
+}
+
+# ---------------------------------------------------------------------------------------------
 # Main. Everything is wrapped: rule 2 says this exits 0 whatever happens.
 # ---------------------------------------------------------------------------------------------
 
@@ -656,13 +828,14 @@ try {
         # Rule 1: no worktree, no key, NO WRITE. There is nowhere legitimate to record this, so it
         # goes to stderr and the script still exits 0.
         Write-Error "seat.ps1: could not resolve a rooted existing worktree; nothing written." -EA Continue
-        exit 0
+        # -ClearHandoff is a CLI act, not a hook, so its caller is told it did nothing.
+        exit ([int][bool]$ClearHandoff)
     }
 
     $coord = Get-CoordDir -From $wt
     if (-not $coord) {
         Write-Error "seat.ps1: could not resolve the git common dir from '$wt'; nothing written." -EA Continue
-        exit 0
+        exit ([int][bool]$ClearHandoff)
     }
 
     $script:SeatsDir = Join-Path $coord 'seats'
@@ -690,6 +863,21 @@ try {
         Set-Content -LiteralPath $f -Value ([string]$next) -Encoding utf8
         Write-Host "pool epoch is now $next"
         exit 0
+    }
+
+    if ($ClearHandoff) {
+        # The CALLER's identity, for the audit entry. -SessionId names the TARGET on this path, so it
+        # is deliberately not passed as the override here.
+        $code = 1
+        try {
+            $caller = Get-SessionKey -Payload $null -Override $null
+            $code = Invoke-ClearHandoff -SeatsDir $script:SeatsDir -TargetBox $Box -TargetSession $SessionId `
+                -Caller $caller -CallerBox $boxKey
+        } catch {
+            [System.Console]::Error.WriteLine("seat.ps1 -ClearHandoff: REFUSED: $($_.Exception.Message)")
+            $code = 1
+        }
+        exit $code
     }
 
     $sk = Get-SessionKey -Payload $payload -Override $SessionId
@@ -834,6 +1022,11 @@ try {
         notes            = if ($Declare -and $Notes) { ($Notes -replace '\s+', ' ').Substring(0, [Math]::Min(2000, $Notes.Length)) } else { Prior 'notes' '' }
     }
 
+    # Carried forward ONLY where it exists, so a record never cleared keeps its old shape. Without
+    # this, the next -Record on a cleared record would drop the audit trail -ClearHandoff wrote.
+    $priorClears = Prior 'handoffClears' $null
+    if ($null -ne $priorClears) { $rec['handoffClears'] = @($priorClears) }
+
     Write-RecordAtomic -Path $recPath -Object $rec
     # ------------------------------------------------------------ the role-card marker
     # A DECLARATION ALSO WRITES `.claude/seat.local.txt`, BECAUSE NOTHING ELSE DOES AND THE CARD
@@ -899,7 +1092,8 @@ try {
 } catch {
     Write-WriterError -Stage 'main' -Message $_.Exception.Message
     Write-Error "seat.ps1: $($_.Exception.Message)" -EA Continue
-    $exit = 0
+    # Rule 2 protects the HOOK paths. -ClearHandoff is a CLI act whose caller must hear a failure.
+    $exit = [int][bool]$ClearHandoff
 }
 
 exit $exit

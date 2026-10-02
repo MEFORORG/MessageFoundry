@@ -1292,7 +1292,15 @@ def test_serve_refuses_exposed_without_mfa_in_prod(
         main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
         == 2
     )
-    assert "require_mfa off; refusing to start" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "require_mfa off; refusing to start" in err
+    # Vault BACKLOG #2798 amendment: with require_mfa off the un-enrolled accounts are single-factor,
+    # not the Administrator role alone, and an OIDC sign-in with a checked claim is the exception.
+    assert (
+        "every account with no second factor enrolled, Administrators included, would "
+        "authenticate with a single factor over the network, unless an OIDC sign-in carries a "
+        "checked amr/acr claim" in err
+    )
 
 
 def test_serve_warns_exposed_without_mfa_in_staging(
@@ -1314,6 +1322,11 @@ def test_serve_warns_exposed_without_mfa_in_staging(
     err = capsys.readouterr().err
     assert "require_mfa off" in err and "single-factor" in err
     assert "refusing to start" not in err  # warned, did not refuse
+    # Vault BACKLOG #2798: with require_mfa off the scope is not read, so the warning must not name it.
+    assert (
+        "every account with no second factor enrolled is single-factor over the network, unless "
+        "an OIDC sign-in carries a checked amr/acr claim" in err
+    )
 
 
 def test_serve_exposed_without_mfa_refuses_on_dev_too(

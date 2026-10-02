@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from dataclasses import dataclass
 from typing import Any
 
-from fastapi import HTTPException, Request, WebSocket, status
+from fastapi import HTTPException, Request, Response, WebSocket, status
+from fastapi.dependencies.models import Dependant
+from fastapi.routing import APIRoute
 
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
@@ -357,6 +360,181 @@ def _password_change_required(deadline: float | None) -> str:
     return f"password change required; the temporary password stops working at {when}"
 
 
+# --- Answering before the request body is read (vault BACKLOG #2739) ---------------------------------
+# FastAPI reads and decodes a declared request body BEFORE it solves a route's dependencies, and the
+# sign-in check is a dependency. So a gated route that declared a body answered a caller with no
+# session from the body parser (422, or 400) and not with the gate's refusal. The owner ruled on
+# 2026-10-02 that the refusal comes first.
+#
+# The mechanism is ONE route class, :class:`AuthenticatedBeforeBodyRoute`, set on the app's router.
+# No route opts in and no list names the routes. For a route that declares a body and carries a
+# gate it runs, in the order FastAPI would run them, each dependency up to and including the gate
+# that is marked as able to answer before the body, and only then lets FastAPI read the body. A
+# dependency is marked in one of two ways: :func:`answers_before_body` for a guard that sits ahead
+# of a gate, and :func:`_gate` for a ``require*()`` closure, whose step is its AUTHENTICATION step
+# alone.
+#
+# THE GATE ITSELF IS UNCHANGED, AND NOTHING IS HANDED TO IT. After the body is read FastAPI runs the
+# gate as the dependency it always was, and the gate resolves the caller again. So a session
+# revoked while the body was arriving is refused, as it was before. Handing the gate the identity
+# resolved before the body would save that second lookup, and was tried: it let a session revoked
+# mid-upload through the routes the factor gate exempts. The second lookup is the price: it reads
+# the session, its user and the user's roles, and only a signed-in request to a route with a body
+# pays it.
+#
+# Everything else a gate does still runs once, after the body: must-change, the factor gate, the
+# permission loop and its audit rows, pacing and step-up. So a signed-in caller the gate then
+# refuses still gets the parser's answer first for a body that does not parse, as before.
+
+#: The function attribute a dependency carries its :class:`BeforeBody` under.
+_BEFORE_BODY_ATTR = "__before_body__"
+
+_Gate = Callable[[Request], Awaitable[Identity]]
+_Step = Callable[[Request], Awaitable[object]]
+
+
+@dataclass(frozen=True, slots=True)
+class BeforeBody:
+    """What one dependency contributes to the check that runs before a request body is read."""
+
+    #: Raises the dependency's own refusal, or returns. Its return value is not used.
+    step: _Step
+    #: True for a ``require*()`` gate. The early check runs nothing past the first one.
+    authenticates: bool
+
+
+def before_body_of(call: object) -> BeforeBody | None:
+    """The :class:`BeforeBody` a dependency was marked with, or ``None`` when it carries none."""
+    found = getattr(call, _BEFORE_BODY_ATTR, None)
+    return found if isinstance(found, BeforeBody) else None
+
+
+def answers_before_body[G: _Step](guard: G) -> G:
+    """Mark a guard that sits AHEAD of a gate, so the early check runs it first, as FastAPI would.
+
+    For a dependency that only reads ``app.state`` and either returns or raises, such as "no engine
+    is attached". The early check calls it and FastAPI then calls it again, so it must have no side
+    effect and must give the same answer both times. Without the mark an unauthenticated caller
+    would get the gate's refusal where today it gets this guard's, which is a second answer for
+    one request shape."""
+    setattr(guard, _BEFORE_BODY_ATTR, BeforeBody(guard, authenticates=False))
+    return guard
+
+
+def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
+    """Mark a ``require*()`` closure with the step that authenticates its caller.
+
+    Returns the SAME function object. The route-gate walk reads a gate's ``__qualname__`` and its
+    closure cells (see :func:`require`), and an attribute changes neither.
+
+    A factory whose gate refuses AHEAD of its base's sign-in check must put that refusal in its
+    step too, in the same order, as :func:`require_phi_read` does with the hop refusal."""
+    setattr(dependency, _BEFORE_BODY_ATTR, BeforeBody(authenticate, authenticates=True))
+    return dependency
+
+
+def _authentication_of(gate: _Gate) -> _Step:
+    """The authentication step of a gate built in this module, for a factory that wraps it."""
+    found = before_body_of(gate)
+    if found is None or not found.authenticates:
+        raise TypeError(f"{gate!r} is not a gate built by a require*() factory")
+    return found.step
+
+
+def steps_before_body(dependant: Dependant) -> tuple[tuple[Callable[..., Any], _Step], ...]:
+    """``(dependency, step)`` for each marked dependency of a route, in the order FastAPI runs them,
+    up to and including its first gate. Empty when the route has no gate: a route with none parses
+    its body for a caller with no session by design (sign-in itself is one).
+
+    :class:`AuthenticatedBeforeBodyRoute` lists what this does not find."""
+    steps: list[tuple[Callable[..., Any], _Step]] = []
+    for dependency in dependant.dependencies:
+        call = dependency.call
+        found = before_body_of(call)
+        if call is None or found is None:
+            continue
+        steps.append((call, found.step))
+        if found.authenticates:
+            return tuple(steps)
+    return ()
+
+
+class AuthenticatedBeforeBodyRoute(APIRoute):
+    """Refuse a caller the gate would refuse for having no identity BEFORE the body is read.
+
+    ``create_app`` sets this as the router's route class, so every route registered on the app
+    itself is one, and a new gated route is covered with nothing to remember. Three kinds of
+    route get FastAPI's own handler back unchanged: one that declares no body, where FastAPI
+    already runs the gate before it reads anything; one with no gate; and one whose gate is not
+    this module's (the web console's ``require_ui*``, whose routes declare no body).
+
+    WHAT IT DOES NOT COVER, at least. The engine has none of these, and this list is the one
+    place they are stated:
+
+    * A route reached through ``include_router``. It is served by that router's route class,
+      and FastAPI serves it from the include's own context. So a gate that the include call
+      itself adds is not among the route's own dependencies, which is all this reads, and an
+      override set on the app is not seen for it.
+    * A gate nested inside another dependency. Only a route's top-level dependencies are read,
+      which is also all ``scripts/security/route_gates.py`` reads.
+    * A dependency that sits ahead of the gate and carries no mark. The gate's refusal answers
+      before it, so a caller with no identity never reaches it.
+
+    The refusal is not a copy of the gate's. The step raises the same ``HTTPException`` from the
+    same function the gate calls, and it travels through the same exception handlers and the same
+    middleware, so the response is the one the gate gives a request whose body had no problem.
+
+    A dependency a test or an embedder overrides through ``dependency_overrides`` is skipped here.
+    The override decides in its place, where FastAPI runs it."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+        # ``body_field`` is the very condition FastAPI reads a body on before it solves
+        # dependencies, so it is FastAPI's test and not a second opinion kept here.
+        steps = steps_before_body(self.dependant) if self.body_field is not None else ()
+        if not steps:
+            return handler
+        provider = self.dependency_overrides_provider
+
+        async def authenticate_then_read(request: Request) -> Response:
+            overridden = getattr(provider, "dependency_overrides", None) or {}
+            for call, step in steps:
+                if call not in overridden:
+                    await step(request)
+            return await handler(request)
+
+        return authenticate_then_read
+
+
+async def _session_caller(
+    request: Request, *, activity: bool = True
+) -> tuple[AuthService | None, Identity]:
+    """The authentication step of :func:`require`: the live service and the caller's identity.
+
+    The service is ``None`` only on the ``allow_no_auth`` path, where the identity is the system
+    one and none of the session checks apply. Raises the 503 or the 401 an unidentified caller
+    gets. ``activity`` is :meth:`AuthService.identity_for_token`'s: False validates the session
+    the same way and leaves its idle clock alone."""
+    auth = get_auth(request)
+    if auth is None or not auth.enabled:
+        if _allow_no_auth(request.app.state):
+            return None, _SYSTEM_IDENTITY
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not configured")
+    identity = await auth.identity_for_token(bearer_token(request), activity=activity)
+    if identity is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
+    return auth, identity
+
+
+async def _authenticate_session_before_body(request: Request) -> None:
+    """The early-check step of every gate built on :func:`require`: refuse, or return nothing.
+
+    It counts as no activity. The gate that runs after the body is what moves the session's idle
+    clock, so a request whose body then fails to parse leaves the clock where it was, which is
+    what such a request did before this check existed."""
+    await _session_caller(request, activity=False)
+
+
 def require(
     *permissions: Permission, mfa_gate: bool = True
 ) -> Callable[[Request], Awaitable[Identity]]:
@@ -374,16 +552,9 @@ def require(
     ordinary closure cell the drift guard already ignores."""
 
     async def dependency(request: Request) -> Identity:
-        auth = get_auth(request)
-        if auth is None or not auth.enabled:
-            if _allow_no_auth(request.app.state):
-                return _SYSTEM_IDENTITY
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not configured"
-            )
-        identity = await auth.identity_for_token(bearer_token(request))
-        if identity is None:
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
+        auth, identity = await _session_caller(request)
+        if auth is None:
+            return identity
         if identity.must_change_password and request.url.path not in _MUST_CHANGE_EXEMPT_PATHS:
             enrol_first = await auth.must_enrol_before_rotating(identity)
             if not (enrol_first and (request.method, request.url.path) in _ENROL_FIRST_ROUTES):
@@ -455,7 +626,7 @@ def require(
                 )
         return identity
 
-    return dependency
+    return _gate(dependency, _authenticate_session_before_body)
 
 
 def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
@@ -476,7 +647,7 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
             _enforce_admin_write_pacing(request, auth, identity)
         return identity
 
-    return dependency
+    return _gate(dependency, _authentication_of(base))
 
 
 # --- mTLS client-cert → Identity resolver (#200, ADR 0083) -------------------------------------------
@@ -630,12 +801,20 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
             "authorize PHI (ADR 0083)"
         )
 
-    async def dependency(request: Request) -> Identity:
+    # The step below lives INSIDE this factory on purpose. tests/test_docs_security_pathways.py
+    # pins that the primitive admitting a certificate identity is referenced from here alone, so
+    # a second route cannot widen the plane unseen. A module-level helper would move that
+    # reference out from under the pin.
+    async def caller(request: Request) -> Identity:
         identity = await resolve_client_cert_identity(request)
         if identity is None:
-            # No subject in the message (no cert / unmapped) — never echo the presented subject (could be
-            # attacker-chosen); a generic 401 keeps the deny-by-default surface uniform.
+            # No subject in the message (no cert / unmapped) — never echo the presented subject
+            # (could be attacker-chosen); a generic 401 keeps the deny-by-default surface uniform.
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "client certificate not authorized")
+        return identity
+
+    async def dependency(request: Request) -> Identity:
+        identity = await caller(request)
         # An identity implies a live AuthService — :func:`resolve_client_cert_identity` returns None
         # when auth is absent or disabled. Narrowed rather than asserted so a later refactor of that
         # resolver degrades to a missing audit row instead of a 500 on the request path.
@@ -680,7 +859,7 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
                 )
         return identity
 
-    return dependency
+    return _gate(dependency, caller)
 
 
 def enforce_phi_read_hop(request: Request) -> None:
@@ -716,6 +895,12 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
     It also enforces the #200 API PHI-read DATA-PATH guard (:func:`enforce_phi_read_hop`) before any
     identity work, so a production-PHI instance serving over an insecure hop refuses to emit PHI."""
     base = require(*permissions)
+    authenticate = _authentication_of(base)
+
+    async def before_body(request: Request) -> None:
+        # The hop refusal answers ahead of sign-in in the dependency below, so it does here too.
+        enforce_phi_read_hop(request)
+        await authenticate(request)
 
     async def dependency(request: Request) -> Identity:
         enforce_phi_read_hop(request)
@@ -723,7 +908,7 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
         enforce_phi_read_pacing(request, identity)
         return identity
 
-    return dependency
+    return _gate(dependency, before_body)
 
 
 def enforce_phi_read_pacing(request: Request, identity: Identity) -> None:
@@ -811,7 +996,7 @@ def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[I
                 )
         return identity
 
-    return dependency
+    return _gate(dependency, _authentication_of(base))
 
 
 def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
@@ -843,7 +1028,7 @@ def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitab
                 )
         return identity
 
-    return dependency
+    return _gate(dependency, _authentication_of(base))
 
 
 async def _action_step_up_ok(auth: AuthService, token: str | None, action: str) -> bool:
@@ -914,7 +1099,7 @@ def require_step_up_action(
                 )
         return identity
 
-    return dependency
+    return _gate(dependency, _authentication_of(base))
 
 
 def require_reauth_only_action(
@@ -958,7 +1143,7 @@ def require_reauth_only_action(
                 )
         return identity
 
-    return dependency
+    return _gate(dependency, _authentication_of(base))
 
 
 async def optional_identity(request: Request) -> Identity | None:
