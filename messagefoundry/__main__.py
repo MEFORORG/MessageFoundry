@@ -1817,7 +1817,7 @@ def _serve(args: argparse.Namespace) -> int:
     # `instance_exposed` the MFA-at-exposure gate consults (BACKLOG #1013: this arm previously keyed on
     # the bind alone, so an auth-off PHI instance behind a declared terminator would have started
     # silently on first deployment). A true loopback posture with no declared terminator is the only
-    # place no-auth may run, and the production-tier arm further down narrows it again.
+    # place no-auth may run.
     if not settings.auth.enabled and instance_exposed:
         exposure_desc = (
             f"non-loopback host {settings.api.host!r}"
@@ -1828,8 +1828,7 @@ def _serve(args: argparse.Namespace) -> int:
         print(
             f"error: refusing to serve with [auth] enabled=false on {exposure_desc}; the API would "
             "answer as a full-privilege system identity with no authentication. Enable auth or bind a "
-            "loopback host with no declared terminator (an enforcing production instance refuses "
-            "sign-in off there too).",
+            "loopback host with no declared terminator.",
             file=sys.stderr,
         )
         return 2
@@ -1871,26 +1870,8 @@ def _serve(args: argparse.Namespace) -> int:
     # clamp key on this, NOT the production-tier `production` fact. ENFORCE (the secure default)
     # reproduces the historical production=True refuse posture byte-identically; `warn` reproduces the
     # historical non-production warn+audit+continue. The `production` tier fact is retained ONLY where it
-    # reflects a true property (the sign-in-off refusal just below; the DEBUG-logging refusal further
-    # down; the AI data-scope ceiling).
+    # reflects a true property (the DEBUG-logging refusal below; the AI data-scope ceiling).
     enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
-
-    # Sign-in off is a development escape hatch: an enforcing production-tier instance refuses it on
-    # ANY bind (vault BACKLOG #2611). A non-production tier and enforcement = warn keep it, subject
-    # to the exposed-instance arm above. This is the first point where the tier and the dial are both
-    # known.
-    if not settings.auth.enabled and production and enforcing:
-        print(
-            "error: refusing to serve with [auth] enabled=false "
-            "([security].require_sign_in=false) on a production instance (environment "
-            f"{env_name!r}; the tier comes from the name `prod` or "
-            "[security].production_instance=true) under [security].enforcement=enforce; the API "
-            "would answer every account and process on this host as a full-privilege system "
-            "identity with no authentication. Set [security].require_sign_in=true and create the "
-            "first Administrator with `messagefoundry provision-admin`.",
-            file=sys.stderr,
-        )
-        return 2
 
     # ADR 0118: [security].require_encryption_for_remote=false is the config-file twin of
     # --allow-insecure-bind (accept off-machine access on the API's self-signed placeholder, and on a

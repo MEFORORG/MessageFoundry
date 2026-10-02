@@ -984,62 +984,6 @@ def test_serve_does_not_ask_the_factory_for_the_open_mode_with_sign_in_on(
     assert captured["allow_no_auth"] is False
 
 
-@pytest.mark.parametrize(
-    ("extra_toml", "env"),
-    [
-        pytest.param("", "prod", id="prod"),
-        pytest.param("security.production_instance = true\n", "dev", id="declared-production"),
-    ],
-)
-def test_serve_refuses_auth_off_on_an_enforcing_production_instance(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    extra_toml: str,
-    env: str,
-) -> None:
-    # vault BACKLOG #2611: sign-in off is a development escape hatch. A loopback bind keeps the
-    # network out and not the other accounts on the host, so an enforcing production-tier instance
-    # refuses it on any bind. The tier decides, however the instance came by it: the built-in name
-    # `prod`, or [security].production_instance on another name.
-    rc, captured = _run_secure_serve(
-        tmp_path, monkeypatch, _SIGN_IN_OFF_LOOPBACK_TOML + extra_toml, env=env
-    )
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "refusing to serve with [auth] enabled=false" in err
-    # ...and it is the tier arm, naming the two settings that decided it and the way out.
-    assert "on a production instance" in err
-    assert "[security].production_instance" in err and "[security].enforcement=enforce" in err
-    assert "provision-admin" in err
-    assert not captured, "the refusal came before the app was built"
-
-
-@pytest.mark.parametrize(
-    ("extra_toml", "env"),
-    [
-        pytest.param("", "staging", id="staging"),
-        pytest.param('security.enforcement = "warn"\n', "prod", id="prod-at-warn"),
-        pytest.param("security.production_instance = false\n", "prod", id="prod-declared-not"),
-    ],
-)
-def test_serve_auth_off_off_the_enforcing_production_tier_still_starts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    extra_toml: str,
-    env: str,
-) -> None:
-    # The controls on the refusal above (vault BACKLOG #2611). Each moves ONE of the two facts the
-    # arm reads, the tier or the dial, and the start goes through: the arm did not broaden into
-    # "sign-in off never starts". The `dev` row is the unexposed-loopback test further up.
-    rc, _ = _run_secure_serve(
-        tmp_path, monkeypatch, _SIGN_IN_OFF_LOOPBACK_TOML + extra_toml, env=env
-    )
-    assert rc == 0
-    assert "refusing to serve with [auth] enabled=false" not in capsys.readouterr().err
-
-
 def test_serve_auth_on_behind_terminator_unaffected_by_arm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

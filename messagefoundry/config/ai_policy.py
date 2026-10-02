@@ -81,8 +81,7 @@ class SecurityEnforcement(str, Enum):  # noqa: UP042
       to the historical ``production=False`` dial position (the non-production posture).
 
     The *tier* fact (``[security].production_instance`` / ``[ai].production``) is retained where it
-    reflects a true property (at least the DEBUG-logging refusal, the AI data-scope ceiling and the
-    refusal of sign-in off on a production instance); this enum owns
+    reflects a true property (the DEBUG-logging refusal, the AI data-scope ceiling); this enum owns
     only the security REFUSE/WARN dial. The value is the wire/storage string."""
 
     ENFORCE = "enforce"

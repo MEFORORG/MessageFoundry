@@ -109,7 +109,7 @@ port = 8765
 # next two lines together (TLS is then required) — listen_address alone is refused as contradictory:
 # local_access_only = false
 # listen_address = "0.0.0.0"
-# production_instance = true          # production tier? (drives the prod-DEBUG refusal, the AI data-scope ceiling, and under enforce the refusal of require_sign_in = false)
+# production_instance = true          # production tier? (drives the prod-DEBUG refusal + the AI data-scope ceiling)
 # EVERY instance carries patient data (ADR 0186) - there is no data-class switch to set here, and the
 # retired one is REFUSED at load. To relax a specific PHI gate, name that gate's own switch.
 # block_unlisted_outbound = true      # lock outbound destinations down (recommended for Test/Prod)
