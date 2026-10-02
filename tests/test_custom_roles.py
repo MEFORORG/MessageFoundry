@@ -151,6 +151,35 @@ def test_no_builtin_role_has_the_refused_shape() -> None:
     assert raw_body_without_summary({Permission.MESSAGES_VIEW_RAW})
 
 
+def test_the_predicate_answers_an_iterator_correctly() -> None:
+    from messagefoundry.auth.permissions import raw_body_without_summary
+
+    pair = [Permission.MESSAGES_VIEW_SUMMARY, Permission.MESSAGES_VIEW_RAW]
+    assert not raw_body_without_summary(iter(pair))
+    assert raw_body_without_summary(iter([Permission.MESSAGES_VIEW_RAW]))
+
+
+def test_the_test_bypass_lifts_only_the_pairing_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests._role_pairing import bypass_view_raw_pairing_rule
+
+    bypass_view_raw_pairing_rule(monkeypatch)
+    # Lifted: the pairing rule, at both mint and decode.
+    assert validate_custom_role_permissions(["messages:view_raw"]) == [Permission.MESSAGES_VIEW_RAW]
+    assert decode_custom_role_permissions(json.dumps(["messages:view_raw"])) == frozenset(
+        {Permission.MESSAGES_VIEW_RAW}
+    )
+    # Kept: every other rule.
+    with pytest.raises(CustomRoleError):
+        validate_custom_role_permissions([])
+    with pytest.raises(CustomRoleError):
+        validate_custom_role_permissions(["messages:view_raw", "users:manage"])
+    with pytest.raises(CustomRoleError):
+        validate_custom_role_permissions(["not:a:real:perm"])
+    assert decode_custom_role_permissions(
+        json.dumps(["messages:view_raw", "users:manage", "bogus:perm"])
+    ) == frozenset({Permission.MESSAGES_VIEW_RAW})
+
+
 async def test_service_refuses_to_mint_or_edit_into_view_raw_without_view_summary() -> None:
     store = await _store()
     try:

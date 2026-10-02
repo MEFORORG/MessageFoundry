@@ -371,8 +371,8 @@ async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identi
     seeded: _Seed,
 ) -> None:
     """A ``view_raw``-only identity (see ``tests/_role_pairing.py``) gets the open and the body, but
-    no gated property, on both seeded rows: the PROCESSED one carries summary and metadata, and the
-    ERROR one carries ``error``, so each withholding assertion has a value to withhold."""
+    no gated property, on both seeded rows. The ERROR row carries ``error`` as well as summary and
+    metadata, so every withholding assertion has a value to withhold."""
     async with _client(seeded.engine, seeded.service) as client:
         headers = await _login(client, "rawonly")
         response = await client.get(f"/messages/{seeded.message_id}", headers=headers)
@@ -381,7 +381,9 @@ async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identi
         assert body["summary"] is None and body["metadata"] is None
         errored = await client.get(f"/messages/{seeded.error_message_id}", headers=headers)
         assert errored.status_code == 200, errored.text
-        assert errored.json()["error"] is None
+        detail = errored.json()
+        assert detail["error"] is None
+        assert detail["summary"] is None and detail["metadata"] is None
         # The body is its own fetch since BACKLOG #2345, on the same messages:view_raw gate.
         raw = await client.get(f"/messages/{seeded.message_id}/raw", headers=headers)
         assert raw.status_code == 200, raw.text

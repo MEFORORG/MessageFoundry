@@ -20,4 +20,8 @@ from messagefoundry.auth import permissions
 
 def bypass_view_raw_pairing_rule(monkeypatch: pytest.MonkeyPatch) -> None:
     """Let a custom role hold ``messages:view_raw`` without ``messages:view_summary``."""
-    monkeypatch.setattr(permissions, "raw_body_without_summary", lambda _perms: False)
+
+    def never(perms: object) -> bool:  # the real predicate's parameter name, so keywords work
+        return False
+
+    monkeypatch.setattr(permissions, "raw_body_without_summary", never)

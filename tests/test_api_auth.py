@@ -567,7 +567,8 @@ async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
 
 async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) -> None:
     """vault BACKLOG #1187: the admin's own surface, POST and PUT /roles/custom, answers 400 with the
-    pairing message. The control creates the same role with view_summary added."""
+    pairing message. Controls: a POST and a PUT keeping view_summary are accepted. A final listing
+    shows neither refusal wrote anything, name included."""
     service = await _service(engine)
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -597,13 +598,16 @@ async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) 
         edited = await c.put(
             role_url,
             headers=h,
-            json={"display_name": "R", "permissions": ["messages:read", "messages:view_raw"]},
+            json={
+                "display_name": "Changed",
+                "permissions": ["messages:read", "messages:view_raw"],
+            },
         )
         assert edited.status_code == 400, edited.text
         assert "messages:view_raw needs messages:view_summary" in edited.json()["detail"]
         # Neither refusal wrote anything: one role, still holding view_summary.
         listed = (await c.get("/roles/custom", headers=h)).json()
-        assert [r["permissions"] for r in listed] == [sorted(both)], listed
+        assert [(r["display_name"], r["permissions"]) for r in listed] == [("R", sorted(both))]
 
 
 def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:
