@@ -54,6 +54,7 @@ __all__ = [
     "ParsedMessage",
     "FieldEntry",
     "HL7ParseError",
+    "DelimiterRewriteRefused",
     "parse",
     "extract_field",
     "extract_part",
@@ -83,6 +84,11 @@ class HL7ParseError(ValueError):
     Raised by :func:`parse`. Its text is fixed and quotes nothing from the body, because callers
     pass it on to a sender or a log and the body can carry PHI.
     """
+
+
+class DelimiterRewriteRefused(ValueError):
+    """:func:`encode_with_separators` met a value the target delimiters cannot carry as data (ADR
+    0206 rule 4). Its text is fixed and quotes nothing from the message."""
 
 
 class FieldEntry(TypedDict):
@@ -1042,8 +1048,16 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     :func:`separators`. Each data field is rewritten with a character map from the message's own
     repetition, component, subcomponent and escape characters to the target ones. That equals splitting
     the field on its separators and re-joining with the targets, because a split leaf holds no source
-    separator. Leaves are never unescaped or re-escaped, so a character above U+007F passes through
-    byte for byte. A target delimiter that already appears literally inside a leaf is carried as is.
+    separator. Leaves are never unescaped, so a character above U+007F passes through byte for byte.
+
+    **A target delimiter that sits literally inside a leaf is escaped with the target escape character**
+    (ADR 0206 rule 4): the sender chooses the source separators, so a character that is plain data
+    under them may be a delimiter under the target set, and carried raw it would become structure the
+    Router and Handler never saw. The target field, component, repetition, subcomponent and escape
+    characters become ``F``, ``S``, ``R``, ``T`` and ``E`` escapes. A leaf the target set cannot
+    represent raises :class:`DelimiterRewriteRefused`: an escape sequence, or an escape character
+    nothing closes, whose text holds such a character, and a segment id holding the target field
+    separator. A field with none of those characters takes a single ``str.translate``.
 
     Where two source separators are the same character, the one split first wins: repetition, then
     component, then subcomponent, the order python-hl7 split them. The segment id is kept verbatim. On
@@ -1064,6 +1078,16 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     table: dict[int, str] = {}
     for source, dest in ((s_rep, t_rep), (s_comp, t_comp), (s_sub, t_sub), (s_esc, t_esc)):
         table.setdefault(ord(source), dest)
+    # The characters that are data under the source set and a delimiter under the target set. A
+    # source separator or the source escape character is never data in a leaf, so it is left out.
+    codes: dict[str, str] = {}
+    for char, code in ((t_field, "F"), (t_comp, "S"), (t_rep, "R"), (t_sub, "T"), (t_esc, "E")):
+        if char not in (s_comp, s_rep, s_sub, s_esc):
+            codes.setdefault(char, code)
+    structure: dict[str, str] = {}
+    for source, dest in ((s_rep, t_rep), (s_comp, t_comp), (s_sub, t_sub)):
+        structure.setdefault(source, dest)
+    rewrite = _LeafRewrite(table, structure, codes, s_esc, t_esc) if codes else None
     lines: list[str] = []
     for index, seg in enumerate(msg["segments"]):
         _ensure_split(msg, index)
@@ -1078,8 +1102,77 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
             parts = [texts[0], texts[1].replace(s_esc, t_esc), texts[2].replace(s_esc, t_esc)]
             tail = texts[3:]
         else:
+            if t_field in texts[0]:
+                raise DelimiterRewriteRefused(
+                    "a segment id holds the target field separator, which would split it"
+                )
             parts = [texts[0]]
             tail = texts[1:]
-        parts.extend(text.translate(table) for text in tail)
+        if rewrite is None:
+            parts.extend(text.translate(table) for text in tail)
+        else:
+            parts.extend(rewrite(text) for text in tail)
         lines.append(t_field.join(parts))
     return "\r".join(lines) + "\r"
+
+
+class _LeafRewrite:
+    """The per-field rewrite :func:`encode_with_separators` uses when some target delimiter is data
+    under the source set. ``table`` is the whole-field ``str.translate`` map, ``structure`` the
+    source-to-target separator map (checked before the escape character, as ``table`` ranks them),
+    and ``codes`` maps each such data character to its escape code."""
+
+    def __init__(
+        self,
+        table: dict[int, str],
+        structure: dict[str, str],
+        codes: dict[str, str],
+        s_esc: str,
+        t_esc: str,
+    ) -> None:
+        self._table = table
+        self._structure = structure
+        self._codes = codes
+        self._s_esc = s_esc
+        self._t_esc = t_esc
+        self._danger = re.compile("[" + re.escape("".join(codes)) + "]")
+
+    def __call__(self, text: str) -> str:
+        if self._danger.search(text) is None:
+            return text.translate(self._table)
+        structure, codes, s_esc, t_esc = self._structure, self._codes, self._s_esc, self._t_esc
+        out: list[str] = []
+        run: list[str] | None = None  # the text of an open escape sequence
+        for char in text:
+            if char in structure:
+                if run is not None:  # an escape nothing closed ends with its leaf
+                    out.append(self._unclosed(run))
+                    run = None
+                out.append(structure[char])
+            elif run is not None:
+                if char == s_esc:
+                    out.append(t_esc + self._sequence(run) + t_esc)
+                    run = None
+                else:
+                    run.append(char)
+            elif char == s_esc:
+                run = []
+            else:
+                code = codes.get(char)
+                out.append(char if code is None else t_esc + code + t_esc)
+        if run is not None:
+            out.append(self._unclosed(run))
+        return "".join(out)
+
+    def _sequence(self, run: list[str]) -> str:
+        text = "".join(run)
+        if self._danger.search(text) is not None:
+            raise DelimiterRewriteRefused(
+                "an escape sequence holds a target delimiter, which the target set cannot carry"
+            )
+        return text
+
+    def _unclosed(self, run: list[str]) -> str:
+        # unescape() keeps an escape character nothing closes as data, with the text after it, and
+        # translate() maps it to the target escape character. Kept the same way here.
+        return self._t_esc + self._sequence(run)

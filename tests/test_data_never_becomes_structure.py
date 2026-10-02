@@ -19,8 +19,12 @@ import pytest
 
 from messagefoundry import actions
 from messagefoundry.checks import _check_handler_security
+from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.lens import parse_source, rewrite_source
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing import _builtin_hl7
+from messagefoundry.parsing.message import Message, reencode_with_separators
+from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.mllp import MLLPDestination
 
 CR, BS = "\r", chr(92)
 ENC = "^~" + BS + "&"
@@ -231,3 +235,127 @@ def test_a_set_data_call_that_is_not_a_copy_is_a_code_row() -> None:
     source = LENS_SOURCE + '    msg.set_data("PV1-19", "A")\n'
     rows = parse_source(source)[0]["rows"]
     assert [r.get("kind") for r in rows][-1] == "code"
+
+
+# --- rule 4: the delimiter rewrite escapes a target delimiter found in a leaf (#2559) -------------
+
+STANDARD = ("|", "^", "~", "&", BS)
+#: Audit probe P3: the sender declares ``#`` as the field separator, so a literal ``|`` is data.
+P3_SOURCE = (
+    "MSH#"
+    + ENC
+    + "#SND#FAC#RCV#FAC#20260101120000##ADT^A01#CTRL1#P#2.5"
+    + CR
+    + "PID#1##111##DOE|INJECTED|X^JANE"
+    + CR
+)
+
+
+def test_P3_a_literal_target_field_separator_stays_inside_its_field() -> None:
+    out = Message.parse(reencode_with_separators(P3_SOURCE, STANDARD))
+    # Before ADR 0206 the downstream parse gave PID-5, PID-6 and PID-7 as three fields.
+    assert out.field("PID-5.1") == "DOE|INJECTED|X"
+    assert out.field("PID-5.2") == "JANE"
+    assert out.field("PID-6") is None and out.field("PID-7") is None
+    assert out.field("PID-5") == "DOE" + _esc("F") + "INJECTED" + _esc("F") + "X^JANE"
+
+
+def test_P3_control_the_engine_saw_one_field_on_the_way_in() -> None:
+    inbound = Message.parse(P3_SOURCE)
+    assert inbound.field("PID-5.1") == "DOE|INJECTED|X"
+    assert inbound.field("PID-6") is None
+
+
+@pytest.mark.parametrize(
+    ("source_enc", "literal", "code"),
+    [
+        pytest.param("@~" + BS + "&", "^", "S", id="component"),
+        pytest.param("^@" + BS + "&", "~", "R", id="repetition"),
+        pytest.param("^~" + BS + "@", "&", "T", id="subcomponent"),
+        pytest.param("^~!&", BS, "E", id="escape"),
+    ],
+)
+def test_every_target_delimiter_found_in_a_leaf_is_escaped(
+    source_enc: str, literal: str, code: str
+) -> None:
+    src = (
+        f"MSH|{source_enc}|SND|FAC|RCV|FAC|20260101120000||ADT|C1|P|2.5"
+        + CR
+        + f"PID|1||A{literal}B"
+        + CR
+    )
+    out = reencode_with_separators(src, STANDARD)
+    assert out.split(CR)[1] == "PID|1||A" + _esc(code) + "B"
+    assert Message.parse(out).field("PID-3.1") == "A" + literal + "B"
+
+
+def test_escapes_and_structure_survive_the_slow_path() -> None:
+    # A field that needs the escape walk still maps its separators and existing escape sequences.
+    src = (
+        "MSH#^~!&#SND#FAC#RCV#FAC#20260101120000##ADT#C1#P#2.5"
+        + CR
+        + "PID#1##A|B^C!S!D~E&F!X41!"
+        + CR
+    )
+    out = Message.parse(reencode_with_separators(src, STANDARD))
+    assert out.field("PID-3.1") == "A|B"
+    assert out.field("PID-3.2") == "C^D"
+    assert out.field("PID-3.1.1", repetition=2) == "E"
+    assert out.field("PID-3.1.2", repetition=2) == "FA"
+
+
+def test_a_field_with_no_target_delimiter_is_byte_identical_to_before() -> None:
+    src = (
+        "MSH#^~"
+        + BS
+        + "&#SND#FAC#RCV#FAC#20260101120000##ADT^A01#C1#P#2.5"
+        + CR
+        + "PID#1##DOE^J"
+        + CR
+    )
+    assert reencode_with_separators(src, STANDARD).split(CR)[1] == "PID|1||DOE^J"
+
+
+@pytest.mark.parametrize(
+    "pid",
+    [
+        pytest.param(
+            "PID#1##A" + BS + "Z|Y" + BS + "B", id="escape-sequence-holds-a-target-delimiter"
+        ),
+        pytest.param("PID#1##AB" + BS + "Z|Y", id="unclosed-escape-holds-a-target-delimiter"),
+        pytest.param("P|D#1##A", id="segment-id-holds-the-target-field-separator"),
+    ],
+)
+def test_a_value_the_target_set_cannot_carry_is_refused(pid: str) -> None:
+    src = "MSH#" + ENC + "#SND#FAC#RCV#FAC#20260101120000##ADT#C1#P#2.5" + CR + pid + CR
+    with pytest.raises(_builtin_hl7.DelimiterRewriteRefused) as caught:
+        reencode_with_separators(src, STANDARD)
+    assert "INJECTED" not in str(caught.value) and "Z|Y" not in str(caught.value)
+
+
+async def test_the_mllp_override_refusal_is_permanent_and_dials_nothing() -> None:
+    dest = MLLPDestination(
+        Destination(
+            name="out",
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 1, "encoding_characters": "|^~" + BS + "&"},
+        )
+    )
+    bad = P3_SOURCE.replace("DOE|INJECTED|X", "A" + BS + "Z|Y" + BS)
+    with pytest.raises(NegativeAckError) as caught:
+        await dest.send(bad)
+    assert caught.value.permanent is True and caught.value.code == "reencode"
+    assert "Z|Y" not in str(caught.value)
+
+
+async def test_a_non_hl7_payload_under_the_override_is_permanent_too() -> None:
+    dest = MLLPDestination(
+        Destination(
+            name="out",
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 1, "encoding_characters": "#@*!%"},
+        )
+    )
+    with pytest.raises(NegativeAckError, match="encoding-character override failed") as caught:
+        await dest.send("not an HL7 message")
+    assert caught.value.permanent is True

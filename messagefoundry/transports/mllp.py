@@ -75,6 +75,7 @@ from messagefoundry.mllpcodec import (
     build_ack,
     frame,
 )
+from messagefoundry.parsing._builtin_hl7 import DelimiterRewriteRefused
 from messagefoundry.parsing.message import emit_raw_separators, reencode_with_separators
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
@@ -533,13 +534,18 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
     escape character does. Crucially we do **not** round-trip leaves through an ``unescape``/``escape``
     pair (python-hl7's corrupted code points above U+007F — accented/CJK names — and would silently
     mangle PHI; the same quirk :class:`~messagefoundry.parsing.message.Message` avoids). When the source
-    already uses the target escape character, leaves are byte-identical.
+    already uses the target escape character, leaves are byte-identical. A target delimiter that sits
+    literally in a leaf is escaped with the target escape character (ADR 0206 rule 4).
 
     Raises :class:`ValueError` if ``payload`` is not parseable HL7 (no MSH / malformed header), so the
-    caller can fail the delivery loud instead of framing a corrupted message."""
+    caller can fail the delivery loud instead of framing a corrupted message, and
+    :class:`~messagefoundry.parsing._builtin_hl7.DelimiterRewriteRefused` (a ``ValueError``) for a
+    value the target delimiters cannot carry as data."""
     field_sep, comp, rep, esc, sub = target
     try:
         return reencode_with_separators(payload, (field_sep, comp, rep, sub, esc))
+    except DelimiterRewriteRefused:
+        raise  # its own fixed text says why; it is not a parse failure
     except (IndexError, ValueError) as exc:
         # ValueError covers HL7ParseError (no leading MSH/FHS/BHS, or a header too truncated to read
         # MSH-1/MSH-2: "MSH", "MSH\rPID|1", "MSH|\rPID|1"; BACKLOG #1601) and a header whose own
@@ -912,13 +918,19 @@ class MLLPDestination(DestinationConnector):
                 self._hop_guard.assert_send()
             if self.encoding_characters is not None:
                 # Re-encode the body with this destination's delimiters before framing. A non-HL7/
-                # garbled payload can't be rewritten — surface it as a DeliveryError (the message
-                # reached neither the wire nor the peer) rather than framing a corrupted message; the
-                # pipeline records the ERROR.
+                # garbled payload can't be rewritten, nor can a value the target delimiters cannot
+                # carry as data (ADR 0206 rule 4). Either is a property of the payload, so a retry
+                # re-derives the same failure: it is permanent, and the worker dead-letters the row
+                # at once (ADR 0204) rather than hold the lane for the retry budget. The message
+                # reached neither the wire nor the peer.
                 try:
                     payload = reencode_delimiters(payload, self.encoding_characters)
                 except ValueError as exc:
-                    raise DeliveryError(f"MLLP encoding-character override failed: {exc}") from exc
+                    raise NegativeAckError(
+                        f"MLLP encoding-character override failed: {exc}",
+                        code="reencode",
+                        permanent=True,
+                    ) from exc
             if self.hl7_raw_separators:
                 # BACKLOG #107: re-serialize emitting the reserved structural separators as raw bytes
                 # (composes after any delimiter rewrite above). A non-HL7 / unparseable payload can't be
