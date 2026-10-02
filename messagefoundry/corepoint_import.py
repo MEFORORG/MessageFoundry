@@ -1696,7 +1696,7 @@ _NOT_A_LETTER = re.compile(r"[^a-z]+")
 
 
 def _letters(text: str) -> str:
-    """The ASCII letters of ``text``, lower-cased, with everything else dropped."""
+    """The letters ``a`` to ``z`` of ``text`` once it is lower-cased, with everything else dropped."""
     return _NOT_A_LETTER.sub("", text.lower())
 
 
@@ -2030,7 +2030,8 @@ def _names_a_call(text: str) -> bool:
     The gate therefore looks in all three texts, anywhere in each, and at their letters alone. Every
     verb step 1 can read is a run of letters in one of them, so this is true wherever step 1 reads a
     call. It is also true of text that only mentions a call, or marks one in another spelling, such
-    as the ``action-list-call-pass`` span class. That closes the gate and costs only a hand-finish."""
+    as the ``action-list-call-pass`` span class. That closes the gate too, and every list in the
+    package then renders as step 1 renders it, step 1's own gaps included (ADR 0086, the cost)."""
     readings = (text, strip_markup(text), *(token.text for token in parse_roles(text)))
     return any(word in _letters(reading) for reading in readings for word in _CALL_WORDS)
 

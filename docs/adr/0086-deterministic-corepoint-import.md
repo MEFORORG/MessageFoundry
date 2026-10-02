@@ -247,9 +247,15 @@ tag is `Call`. That one tag is read as step 1 reads it, on the local name and in
 also when any string it holds names a call verb. Every string is read: the tag, each attribute's
 name and value, and the text in and after the element. Each string is read three ways: raw, with
 the markup stripped, and span by span with the markup stripped. The last two are how step 1 takes a
-verb from `@Data`. Only the ASCII letters count, so `Action_List_Call` and the
-`action-list-call-pass` span class name a call too. A string that only mentions a call closes the
-gate as well. That costs a hand-finish, never a wrong delivery.
+verb from `@Data`. Only the letters `a` to `z` count, after lower-casing, so `Action_List_Call`
+and the `action-list-call-pass` span class name a call too. A string on an element that only
+mentions a call closes the gate as well. The check does not see an XML comment or a processing
+instruction, because the parser drops both, for step 1 too.
+
+**Closing the gate is not free.** Every list in that package then renders as step 1 renders it,
+with the gaps *The cost* names below. A list the open gate would refuse at a send may send `msg`
+there under step 1. So a mention costs more than a hand-finish. The check is eager all the same: a
+called list sent for every message is the worse error, and step 1's gaps are known and recorded.
 
 **No construct is on the list:** no `If`, `ElseIf`, `Else`, `Case`, `ChooseFrom`, `Matching`,
 `ForEach`, `Loop`, `While`, `Try`, `Catch`, `Call`, `ActionListExit` or other exit, and no
@@ -335,10 +341,11 @@ the send or lacking one it did, lifts a send out of a branch, or binds a local b
 level. Where the head differs from step 1, none of these checks exempts a send step 1 also makes,
 so a write leaking into `msg` is caught too. The oracle applies `ItemCopy`, `ItemAppend` and
 `ItemClear` to the field each names. The battery's shapes all sit in one package frame, so a
-separate test checks 15 other frames. A list another list calls, before it or after it, by the verb
+separate test checks 17 other frames. A list another list calls, before it or after it, by the verb
 or by a `<Call>` tag in any case or namespace. A list nested in another list's construct. A root
 that is no `<Package>`. An unread package attribute. A list tag in another case or in a namespace.
-Each renders exactly as step 1. The walker matches each
+A call named, or a `<Call>` tag, outside every list. Each renders exactly as step 1. The walker
+matches each
 statement against one whole-string template per verb rather than walking tokens as the importer
 does, so the two read the specification by different methods.
 
@@ -348,17 +355,35 @@ frames and five casings. A second arm writes several characters at once in 600 s
 1's own parse of the package says which of them hide a call. The head's gate never says, and no list
 of spellings does. Each hidden call must render exactly as step 1, with the called list after its
 caller and before it. More tests carry a hidden call under a `data`, `DATA` or namespaced key and
-as a `<Block>` label, and name a call in eight ways step 1 reads no call from. A control holds a
+as a `<Block>` label, and name a call in twelve ways step 1 reads no call from. A control holds a
 reference and a tag in a verb that is no call, and the gate still opens.
 
 Measured 2026-10-01: 4,050 single-character spellings and 560 of the 600 hide a call. These tests
-and the package frames are 96 in all. With the importer at f0a62ef70a, 83 of them fail, on every one
-of those spellings. Each mutation arm tried fails too. Reading the raw and the whole value fails 11
-tests, on 650 of the 4,050 and 91 of the 560. Reading the raw value and the spans fails 25, on 675
-and 82. Dropping the raw reading fails 3, and matching the spelling in place of the letters fails 2.
-Reading attribute values alone fails 4, and the `Data` key alone 7. Dropping the tag, the attribute
-names, the text or the tail fails 1 each. Reading only the first list fails 78, only the last 88,
-and only `<Line>` elements 2. Matching the `Call` tag exactly fails 3.
+and the package frames are 102 in all. With the importer at f0a62ef70a, 86 of them fail, on every
+one of those spellings. Each of 22 mutation arms fails too. The count after each arm is how many of
+the 102 tests fail.
+
+| Mutation of the gate | Fails |
+|---|---|
+| no call rule at all | 95 |
+| reads the raw value only | 75 |
+| reads the raw and the whole value (misses 650 of the 4,050 and 91 of the 560) | 11 |
+| reads the raw value and the spans (misses 675 and 82) | 25 |
+| drops the raw reading | 3 |
+| matches the spelling, not the letters | 5 |
+| drops only `-` and `_` | 3 |
+| reads attribute values only | 4 |
+| reads the `Data` key only | 9 |
+| reads values under a `data` key only, with every other string | 2 |
+| drops the tag, the attribute names, the text or the tail | 1 each |
+| reads elements inside lists only | 2 |
+| reads the first list only | 84 |
+| reads the last list only | 94 |
+| reads `<Line>` elements only | 3 |
+| matches the `Call` tag exactly | 3 |
+| drops the `Call` tag | 5 |
+| drops the ancestor rule | 3 |
+| drops the list-tag rule | 2 |
 
 The battery holds 7,787 shapes, measured 2026-10-01: 331 fixed seeds (every repro from every review
 of PR 1900 and every Lander repro, the 23 round-3 shapes and the gate review's 41 among them), 4,056
@@ -372,7 +397,7 @@ handle after a declined write to its skeleton (21), tolerating whitespace (4), a
 depth bound (3). In the second: accepting any `<Block>` label (2,312), accepting path annotations
 and the dotted form (12), landing a write to an unbound handle on `msg` (180), rendering
 `ItemAppend` as a set (4), and dropping `ItemClear` (2). The package-frame test fails on dropping
-the call rule (9 of 15 frames), the ancestor rule (3 of 15) or the list-tag rule (2 of 15). Against
+the call rule (11 of 17 frames), the ancestor rule (3 of 17) or the list-tag rule (2 of 17). Against
 the previous head, 6fa49a9d5,
 the first battery of 7,746 shapes failed 5,937, including 20 of the 23 round-3 seeds.
 

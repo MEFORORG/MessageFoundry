@@ -2191,6 +2191,18 @@ def _renders_as_step1(package: str) -> bool:
             + "</List></q:ActionList></Package>",
             id="a-namespaced-list-tag",
         ),
+        pytest.param(
+            '<Package Name="A"><Connection Note="ActionListCall Sub"/><ActionList Name="Sub"><List>'
+            + _SUB
+            + "</List></ActionList></Package>",
+            id="a-call-named-outside-every-list",
+        ),
+        pytest.param(
+            '<Package Name="A"><Rules><Call Data="Sub"/></Rules><ActionList Name="Sub"><List>'
+            + _SUB
+            + "</List></ActionList></Package>",
+            id="a-call-tag-outside-every-list",
+        ),
     ],
 )
 def test_the_package_around_a_list_can_close_its_gate(package: str) -> None:
@@ -2198,8 +2210,9 @@ def test_the_package_around_a_list_can_close_its_gate(package: str) -> None:
     call, before it or after it: by the plain verb, by a verb the attribute does not spell, or by a
     ``<Call>`` tag in any case or namespace. A list nested in another list's construct. A root that
     is no package. An unread attribute on the package. A list whose own tag is in another case or a
-    namespace. Each renders exactly as step 1 renders it (code review of the gate, round 2, and
-    Lander QA on f0a62ef70a). The control: the same list alone in a plain package opens the gate."""
+    namespace. A call named, or a ``<Call>`` tag, outside every list. Each renders exactly as step 1
+    renders it (code review of the gate, round 2, and Lander QA on f0a62ef70a). The control: the
+    same list alone in a plain package opens the gate."""
     assert _renders_as_step1(package)
     plain = f'<Package Name="A"><ActionList Name="Sub"><List>{_SUB}</List></ActionList></Package>'
     assert not _renders_as_step1(plain)
@@ -2271,7 +2284,11 @@ _MENTIONS = {
     "as-a-span-class": _line(
         f"{_kw('Call')} {_lit('Sub')} {_span('action-list-call-pass', 'pass %ADT')}"
     ),
+    "in-another-attribute": '<Line Data="MsgLog %ADT" Comment="ActionListCall Sub"/>',
     "with-underscores": _line('Action_List_Call "Sub"'),
+    "with-dots": _line('Action.List.Call "Sub"'),
+    "with-a-digit": _line('ActionList2Call "Sub"'),
+    "with-a-space": _line('ActionList Call "Sub"'),
 }
 
 
@@ -2363,6 +2380,7 @@ def test_a_call_only_the_whole_value_spells_closes_the_gate(data: str) -> None:
 def test_a_call_step1_does_not_read_still_closes_the_gate(element: str) -> None:
     """The gate reads what step 1 reads AND more: the raw value it always read, every string of
     every element, and the letters alone."""
+    assert _generate_text(step1, _calling(element))[0], "step 1 must import the package"
     assert not _step1_reads_a_call(element)
     assert _closes(element)
 
