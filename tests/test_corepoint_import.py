@@ -2055,6 +2055,72 @@ def test_a_send_label_keeps_its_body_where_main_put_it() -> None:
     assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
 
 
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_branch_marker_holding_only_a_marked_wrapper_still_opens_its_branch(pair: str) -> None:
+    """The in-body form. A branch marker written in its construct's own list opens a branch when
+    it holds no statement, and what follows it is dead until the condition is written. A wrapper
+    carrying a statement, inside that marker's ``<Line>``, adds a label marker and no statement.
+    So the branch still opens, and the label marker leads it."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    opener = _labelled("Line", branch, "<List{S}/>")
+    arm = _CLEAR + '<Line Data="MsgSend %ADT [OB_FLAT]"/>'
+    template = construct.replace("<List/>", f"<List>{_FILLED}{opener}{arm}</List>")
+    src = _assert_the_markers_change_no_code(template, 1)
+    assert '        sends.append(Send("OB_FLAT", msg))' in src
+    assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
+    assert next(line for line in src.splitlines() if _LABEL_MARKER in line).startswith(
+        " " * 8 + "#"
+    )
+
+
+@pytest.mark.parametrize(
+    ("outer", "label", "plain", "orphans"),
+    [
+        # main reads a ``<Call>`` with no ``@Data`` around a call as a branch-group and drops the
+        # wrapper, so the If inside it adopts the Else written after it.
+        pytest.param(
+            "Call",
+            _labelled("Call", "MsgLog %ADT"),
+            _labelled("Call", 'ActionListCall "Sub"'),
+            0,
+            id="a-call-in-a-bare-call",
+        ),
+        # A bare ``<Block>`` around a call or a send is no branch-group on main. It stays a
+        # label, and the Else after it is an orphan there, statement or no statement.
+        pytest.param(
+            "Block",
+            _labelled("Call", "MsgLog %ADT"),
+            _labelled("Call", 'ActionListCall "Sub"'),
+            1,
+            id="a-call-in-a-bare-block",
+        ),
+        pytest.param(
+            "Block",
+            _labelled("Block", "MsgSend %ADT [OB_LABEL]"),
+            '<Line Data="MsgSend %ADT [OB_LABEL]"/>',
+            1,
+            id="a-send-in-a-bare-block",
+        ),
+    ],
+)
+def test_a_demoted_label_changes_no_shape_around_it(
+    outer: str, label: str, plain: str, orphans: int
+) -> None:
+    """A Call or a send label becomes a plain label when its ``@Data`` is a statement. Whether
+    the element around it is a branch-group is still read from the kind it had, so the tree keeps
+    the shape it has with the plain call, or the plain send, in its place. Only that send goes."""
+    construct, branch = _SIBLING_BRANCHES["if-else"]
+    marked, control = (
+        _handler_body(
+            _handler_source(f"<{outer}>{inner}{construct}</{outer}>" + _sibling_arm(branch))
+        )
+        for inner in (label, plain)
+    )
+    assert _LABEL_MARKER in marked and _LABEL_MARKER not in control
+    assert _code(marked) == [line for line in _code(control) if "OB_LABEL" not in line]
+    assert marked.count(_ORPHAN) == control.count(_ORPHAN) == orphans
+
+
 def test_a_wrappers_marker_stays_where_the_wrapper_sat() -> None:
     """Source order. A marker is not moved ahead of a construct it follows. Where that construct
     adopts a branch written after the wrapper, the marker follows the whole chain."""

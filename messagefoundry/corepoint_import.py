@@ -110,6 +110,7 @@ __all__ = [
     "CorepointImportError",
     "Action",
     "UnmappedAction",
+    "LabelMarker",
     "Control",
     "Handler",
     "Destination",
@@ -180,8 +181,12 @@ class LabelMarker(UnmappedAction):
     """The counted TODO for a statement written in the ``@Data`` of an element that is not a
     ``<Line>`` (:func:`_label_marker`, BACKLOG #2632).
 
-    It renders and counts as any :class:`UnmappedAction`. It is its own type so that
-    :func:`_parse_list` can tell it from a statement position, which it is not."""
+    It renders and counts as any :class:`UnmappedAction`. It is its own type because it is no
+    statement position of the export: every test that decides the SHAPE of the tree leaves it
+    out, so the tree is the one the same export gives with no marker in it. At least these three
+    decide shape: :func:`_parse_list` (which construct a sibling branch continues),
+    :func:`_split_branches` (which marker opens a branch) and the branch-group test in
+    :func:`_parse_statement`."""
 
 
 @dataclass(frozen=True)
@@ -230,6 +235,10 @@ class Control:
     refusal: str = ""
     # The local a live ``"send"`` delivers: a name this module generated, never export text.
     message: str = "msg"
+    # ``"send"`` or ``"call"`` on a ``"block"`` that would have been one, had its ``@Data`` not
+    # been a statement off a ``<Line>`` (BACKLOG #2632). It renders and counts as the label it is.
+    # Only the tests that decide the shape of the tree read it (:func:`_structural_kind`).
+    demoted_from: str = ""
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -1420,17 +1429,32 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     marker: Control | None = None
     start = 0
     for i, step in enumerate(steps):
-        if isinstance(step, Control) and step.kind in _BRANCH_PARENT and not step.body:
+        # A marker opens a branch when it holds no statement of its own. A label marker is none:
+        # a ``<List Data="MsgLog …"/>`` inside a ``Catch`` line leaves it a branch marker, and
+        # the label marker leads the branch.
+        if (
+            isinstance(step, Control)
+            and step.kind in _BRANCH_PARENT
+            and all(isinstance(held, LabelMarker) for held in step.body)
+        ):
             if marker is None:
                 body = tuple(steps[:i])
             else:
-                branches.append(replace(marker, body=tuple(steps[start:i])))
+                branches.append(replace(marker, body=(*marker.body, *steps[start:i])))
             marker = step
             start = i + 1
     if marker is None:
         return tuple(steps), ()
-    branches.append(replace(marker, body=tuple(steps[start:])))
+    branches.append(replace(marker, body=(*marker.body, *steps[start:])))
     return body, tuple(branches)
+
+
+def _structural_kind(step: Step) -> str:
+    """The kind the branch-group test reads for ``step``, or ``""`` for a leaf.
+
+    A label demoted from a send or a call answers with the kind it had, so demoting it changes
+    the shape of nothing around it (BACKLOG #2632)."""
+    return (step.demoted_from or step.kind) if isinstance(step, Control) else ""
 
 
 # How deep the ``<List>`` tree may nest. The walk is mutually recursive (list → statement → list), so
@@ -1614,18 +1638,19 @@ def _parse_statement(
         detail = marker[0].detail if marker else statement or note
         return [Control("unknown", tag, detail, body=tuple(body))]
 
-    if marker and kind == "send":
-        # A ``MsgSend`` in a Block's or a Call's ``@Data``: the marker stands for it, under the
-        # element's label. A send that may never have run is not a delivery, so it does not count
-        # as mapped. Its body stays at the element's own level, where a send's body always went:
-        # a construct ending that body may adopt a branch written after the element.
-        return [Control("block", tag, statement, body=tuple(marker)), *body]
-    if marker and kind == "call":
-        # A ``<Call>`` whose ``@Data`` is a statement names no list, so it is not a call and does
-        # not count as one. It renders as the plain label it is, like every other such element.
-        kind = "block"
+    if marker and kind in ("send", "call"):
+        # A statement in a Block's or a Call's ``@Data`` that would render as a live send, or as
+        # an inlined call. The marker stands for it, under a plain label. A send that may never
+        # have run is not a delivery, and a ``<Call>`` that names no list is not a call, so
+        # neither counts as mapped. The label keeps the SHAPE the element had. It remembers its
+        # kind for the branch-group test, and a send's body stays at the element's own level,
+        # where a construct ending it may adopt a branch written after the element.
+        demoted = Control("block", tag, statement, body=tuple(marker), demoted_from=kind)
+        if kind == "send":
+            return [demoted, *body]
+        return [replace(demoted, body=(*marker, *body))]
 
-    if not data and any(isinstance(s, Control) and s.kind == kind for s in body):
+    if not data and any(_structural_kind(s) == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
         # at all, holding one child per branch (``<Line Data="If (…)">``, ``<Line Data="Else">``,
         # ``<Line Data="Catch">``) that each carry their OWN condition and their OWN body. Emitting a

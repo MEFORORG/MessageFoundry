@@ -444,7 +444,8 @@ A container renders a control verb itself: its own construct, a call, an exit, a
 `MsgSend` is the exception, because it would deliver a message. So in a Block's or a Call's `@Data`
 it is a statement too, and the element then renders as a plain label. Its body stays at the
 element's own level, where a send's body always went. A `<Call>` carrying any statement renders as
-a plain label too: it names no list, so it is not counted as a call. *Corrected 2026-10-02 (the
+a plain label too: it names no list, so it is not counted as a call. Either label remembers the
+kind it had, for the one test that reads it (below). *Corrected 2026-10-02 (the
 Lander's hold on PR 1938):* at first only a `MsgSend` did that, and a `<Call Data="MsgLog …">`
 still counted as a mapped call. A `LoopExit` there still renders its `break`, which only ever sits
 in a loop that is itself a dead placeholder.
@@ -455,23 +456,32 @@ Whether Corepoint runs such a statement is not known. So:
   a Block's or a Call's label comment, before a construct's placeholder, and before a list wrapper's
   flattened statements. An unmodelled element is one counted marker already, so the statement is
   named in that marker and not counted twice.
-- A marker never changes which construct adopts a branch. A branch marker written after its
-  construct as a sibling is adopted by it, and its body is then dead until someone writes the
-  condition. An orphaned branch renders its body live. So the marker is its own step type,
-  `LabelMarker`, which stands for no statement position of the export. `_parse_list` holds a
-  marker back from its list until a statement position follows it, so the one adoption rule,
-  `_adopt_branch`, never finds a marker as the step before a branch. The branch is adopted
-  exactly as it is with every marker taken out, and the marker follows the whole chain. Among
-  the steps that are not adopted, every marker stays where its element sat, in source order.
-  That holds at any depth of wrapper, and wherever a flattened body leaves a marker last: a
-  wrapper nested in another, a branch-group `<If>`, a `<Line>` carrying a list.
-  *Corrected 2026-10-02, twice.* The first cut let the adoption see the marker as a step, and an
-  `Else` after such a wrapper ran for every message (code review, round 2). The second moved a
-  wrapper's marker ahead of the step before it, by looking one step back in one call. A wrapper
-  nested in another starts a new call, so its marker orphaned the branch again. With no branch to
-  follow, the marker was still moved ahead of an `If` it came after (the Lander's hold on PR
-  1938). Moving one marker was the wrong mechanism. The rule now covers every marker, in the one
-  place that builds the list a branch is adopted in.
+- A marker never changes the shape of the tree. Which construct holds which branch, which
+  branch marker opens a branch, and which element is a branch-group are all decided as they are
+  with every marker taken out. An orphaned branch renders its body live, so this is what keeps a
+  marker from turning dead code into live code. The marker is its own step type, `LabelMarker`,
+  which stands for no statement position of the export. At least three places decide shape, and
+  each leaves it out:
+  - `_parse_list` holds a marker back from its list until a statement position follows it. So
+    the one rule that adopts a sibling branch, `_adopt_branch`, never finds a marker as the step
+    before a branch, and the marker follows the whole chain. That holds at any depth of wrapper,
+    and wherever a flattened body leaves a marker last: a wrapper nested in another, a
+    branch-group `<If>`, a `<Line>` carrying a list.
+  - `_split_branches` opens a branch at a branch marker that holds no statement of its own. A
+    label marker is none, so `<Line Data="Catch"><List Data="MsgLog …"/></Line>` still opens its
+    branch, and the label marker leads it.
+  - The branch-group test reads the kind a label had before it was demoted from a send or a
+    call (`Control.demoted_from`). So a demoted label makes no group appear and none go.
+
+  Among the steps that are not adopted, every marker stays where its element sat, in source
+  order. *Corrected 2026-10-02, three times.* The first cut let the sibling adoption see the
+  marker as a step, and an `Else` after such a wrapper ran for every message (code review, round
+  2). The second moved a wrapper's marker ahead of the step before it, by looking one step back
+  in one call. A wrapper nested in another starts a new call, so its marker orphaned the branch
+  again (the Lander's hold on PR 1938). The third repaired the sibling adoption alone. Code
+  review of it found the other two places above, each with a branch main keeps dead that
+  rendered live. Moving one marker, and then guarding one test, were both too narrow. The rule
+  is now stated for the whole tree, and a test compares that tree with main's.
 - Nothing is mapped for it, and it is never emitted as a write or a delivery.
 - The scan holds no handle for the whole list. Every role-parsed send in it raises, and no
   role-parsed field write maps onto `msg`. So a clone or a send counts only on a `<Line>`.
@@ -524,30 +534,41 @@ did, each with one wrapper, and the bound stayed green on a wrapper nested in an
 now also nest the wrapper to a depth of two and three, with the statement on the inner wrapper,
 the outer, or each, with and without a statement inside, for each of the four branch kinds. They
 end a branch-group, a `<Line>`'s list and a wrapper around the construct with such a wrapper, and
-they put a send label over a construct.
+they put a send label over a construct. After code review of the repair they also put a marked
+wrapper inside a bare branch marker, and a demoted label inside a bare `<Call>` and a bare
+`<Block>`.
 
-A second test states the rule itself. `test_no_branch_main_adopts_is_orphaned` parses every shape
-with the vendored file as it is, with the amended baseline and with the head. All three must hold
-the same branches adopted and the same branches orphaned. The bound sees an orphan only through a
-live send or a vocabulary call in its body; this test needs neither.
+Seeds cover only the routes someone thought of, and three reviews in a row found one nobody had.
+So a second test states the rule for the whole tree and draws shapes of its own.
+`test_no_branch_main_adopts_is_orphaned` parses a list with the vendored file as it is, with the
+amended baseline and with the head. It compares the shape of the three trees: every construct
+with its body and its branches, label markers left out, a demoted label read as the kind it had.
+The shapes must be equal. The head is held to that wherever the gate is closed. The test runs
+over the battery, and over 4,000 lists drawn with no grammar: any tag, any `@Data` from a pool of
+statements, conditions and branch verbs, nested four deep. The bound sees an orphan only through
+a live send or a vocabulary call in its body. This test needs neither. It is still a sample: it
+shows no difference on the lists it draws, not that none exists.
 
-Measured 2026-10-02 at the repaired head. The battery holds 8,041 shapes, 585 of them fixed seeds,
-and the amendment changes 719. The repair added 73 seeds. Each row puts part of the repair back and
-counts the shapes that fail. "Head alone" changes the head only, which the head-equals-baseline
-check sees. "Both" changes the head and the baseline copy alike, which that check cannot see.
+Measured 2026-10-02 at the repaired head. The battery holds 8,073 shapes, 617 of them fixed seeds,
+and the amendment changes 751. The repair added 105 seeds. Each row puts part of the repair back
+and counts the lists that fail. "Head alone" changes the head only, which the
+head-equals-baseline check sees. "Both" changes the head and the baseline copy alike, which that
+check cannot see. The shape test is counted on the battery and on its 4,000 raw lists.
 
-| What is put back | Head alone | Both: the bound | Both: the branch test |
-|---|---|---|---|
-| the whole repair, so the rule at `880f431d94` | 79 | 37 | 37 |
-| the adoption sees a marker as a step | 54 | 54 | 54 |
-| the same, and a wrapper moves its marker one step back (round 2) | 62 | 35 | 35 |
-| a send label nests its body | 2 | 2 | 2 |
-| a `<Call>` carrying a statement stays a call | 15 | 0 | 0 |
+| What is put back | Head alone | Both: the bound | Both: shape, battery | Both: shape, raw |
+|---|---|---|---|---|
+| the whole repair, so the rule at `880f431d94` | 111 | 50 | 53 | 125 |
+| a sibling adoption sees a marker as a step | 70 | 70 | 70 | 2 |
+| the same, and a wrapper moves its marker one step back (round 2) | 78 | 43 | 43 | 0 |
+| a branch marker holding a label marker opens no branch | 4 | 1 | 4 | 7 |
+| the branch-group test reads the rendered kind | 12 | 12 | 12 | 14 |
+| a send label nests its body | 2 | 2 | 2 | 116 |
+| a `<Call>` carrying a statement stays a call | 23 | 0 | 0 | 0 |
 
-Every shape in the two "Both" columns is one of the 73 new seeds, but for eight in the second row,
-which are the seeds round 2 added. The last row is not a fail-open. It counts a label as a mapped
-call, so only the head-equals-baseline check and a unit test see it. With the repair in place
-every count is zero.
+With the repair in place every count is zero. The last row changes no shape and adds no live
+code on these lists: with the kind remembered, a Call that stays a call only counts a label as a
+mapped call. So only the head-equals-baseline check and a unit test see it. That is a reading of
+this battery, not a proof about the change.
 
 The measurement below is older. It was taken the same day at `880f431d94`, before the repair, and
 was not run again. The battery then held 7,968 shapes, 512 of them fixed seeds. The 181 seeds new
@@ -671,12 +692,14 @@ omitting it would claim it vanished.
 - **AC-6g (a statement off a `<Line>`, amendment 2026-10-02)** — an element other than a `<Line>`
   whose `@Data` is a statement (§2(b.4)) SHALL emit a counted TODO naming it, SHALL emit no live
   code for it, and its list SHALL hold no handle as `msg`; a prose label SHALL stay a comment.
-  The marker SHALL NOT change which construct adopts a branch.
+  The marker SHALL NOT change the shape of the tree: which construct holds which branch.
   → `::test_a_clone_where_a_label_belongs_is_marked_and_its_send_is_judged_on_the_marker`,
   `::test_a_send_in_a_block_label_is_never_a_delivery`,
   `::test_a_prose_block_label_stays_a_label`, `::test_the_scan_and_the_render_ask_one_rule`,
   `::test_a_wrappers_marker_never_orphans_a_sibling_branch`,
-  `::test_a_marker_at_the_end_of_any_flattened_body_never_orphans_a_branch`
+  `::test_a_marker_at_the_end_of_any_flattened_body_never_orphans_a_branch`,
+  `::test_a_branch_marker_holding_only_a_marked_wrapper_still_opens_its_branch`,
+  `::test_a_demoted_label_changes_no_shape_around_it`
 
 ## 4. Consequences
 
