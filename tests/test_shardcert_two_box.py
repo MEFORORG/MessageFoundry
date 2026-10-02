@@ -60,7 +60,9 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
             self.kill_calls = 0
             rec.nodes.append(self)
 
-        async def start(self) -> None:
+        async def start(self, *, provision: bool = True) -> None:
+            # `provision` mirrors EngineNode.start: the kill leg restarts a shard on a store the
+            # run already provisioned, and says so.
             return None
 
         def kill(self) -> None:

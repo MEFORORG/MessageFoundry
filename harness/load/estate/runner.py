@@ -35,7 +35,12 @@ from harness.config.estate._shape import hub_flags, simple_count
 from harness.load.connscale.probe import FdSampler, ProcSample
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
+from harness.load.enginepoll import (
+    SIGN_IN_ERRORS,
+    EnginePoller,
+    EngineSample,
+    sample_until_reconciled,
+)
 from harness.load.estate.driver import EstateDriver
 from harness.load.estate.profile import EstateProfile
 from harness.load.estate.report import (
@@ -50,6 +55,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.rigadmin import RIG_SESSION
 from harness.load.sink import CorrelationSink
 
 log = logging.getLogger(__name__)
@@ -161,7 +167,7 @@ async def _run_one(
         config_dir=_CONFIG_DIR,
         cwd=cwd,
     )
-    poller = EnginePoller(node.url, token=None, origin=time.perf_counter())
+    poller = EnginePoller(node.url, token=RIG_SESSION, origin=time.perf_counter())
     flags = hub_flags(profile.count, profile.simple_fraction)
     driver = EstateDriver(
         host=sink_host,
@@ -175,8 +181,10 @@ async def _run_one(
     samples: list[EngineSample] = []
     try:
         await sink.start()
-        await node.start()
+        # The start provisions the rig Administrator and the open signs in, so a refusal at either
+        # is a setup failure like the preflights below (SIGN_IN_ERRORS).
         try:
+            await node.start()
             await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
             await poller.open()
             await poller.sample_once()  # baseline
@@ -185,7 +193,7 @@ async def _run_one(
                 sink_host, profile.base_port + profile.count - 1, timeout=_PORTS_READY_TIMEOUT
             )
             await _await_inbound_rows(poller, profile.count, timeout=_PORTS_READY_TIMEOUT)
-        except (EstateError, FailoverError) as exc:
+        except (EstateError, FailoverError, *SIGN_IN_ERRORS) as exc:
             raise EstateError(_startup_failure_detail(exc, node)) from exc
         pid = node.pid
         fd_sampler = FdSampler(pid) if pid is not None else None
@@ -273,9 +281,8 @@ def _node_env(
     inbound_bind_host: str = "127.0.0.1",
 ) -> dict[str, str]:
     env = dict(base)
-    env["MEFOR_SECURITY_REQUIRE_SIGN_IN"] = (
-        "false"  # the poller reads /stats without a bearer token
-    )
+    # No sign-in setting here: the node serves with sign-in on, and `EngineNode` provisions the rig
+    # Administrator the poller signs in as (harness.load.rigadmin).
     env["MEFOR_ESTATE_COUNT"] = str(profile.count)
     env["MEFOR_ESTATE_SIMPLE_FRACTION"] = repr(profile.simple_fraction)
     env["MEFOR_ESTATE_HUB_FANOUT"] = str(profile.hub_fanout)
