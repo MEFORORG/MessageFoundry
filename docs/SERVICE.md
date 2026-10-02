@@ -312,7 +312,9 @@ What that changes for you:
 - **The data directory and the logs work as before.** The installer grants them to the service by
   name, and reads that grant back.
 - **Grant every other directory the engine writes to the service by name.** That covers at least
-  the directory of each File connection and a DR backup directory. An inbound File directory counts
+  the directory of each File connection, a DR backup directory, and the store's own directory when
+  `-DbPath` puts it outside the data directory. The installer reads that last one and warns when
+  the grant is missing. An inbound File directory counts
   too unless it uses `after_read="leave"`, because the engine moves each processed file into a
   subfolder. A directory that only `Users` can write would be refused, and the connection reports
   it the way it reports any directory it cannot write.
@@ -326,13 +328,14 @@ What that changes for you:
 
 Read both settings back with `sc.exe qsidtype MessageFoundry` and `sc.exe qprivs MessageFoundry`.
 
-**Other accounts get the privilege list and not the restricted SID.** A restricted token counts
-only permissions that name the service. With `-ServiceAccount` or `-AllowLocalSystem` the service
-runs as a different account, so that account's own profile and the grants written for it would stop
-counting. No run has shown what such a service then fails to write, so the installer leaves the SID
-type at `none` for a gMSA, a named user, another virtual account and LocalSystem, and prints a
-warning that says so. It writes `none` on every run, so a re-install that changes the account never
-keeps a restricted SID from the account before.
+**Other accounts get the privilege list and not the restricted SID.** With `-AllowLocalSystem`, or
+with `-ServiceAccount` naming anything but the service's own virtual account, the service runs as
+an account that is not the service itself. Under a restricted SID that account's own profile and
+the grants written for it would stop counting. No run has shown what such a service then fails to
+write, so the installer sets the SID type to `none` for a gMSA, a named user, another virtual
+account and LocalSystem, and prints a warning that says so. It writes `none` on every run. So a
+re-install that changes the account never keeps a restricted SID from the account before, and a
+SID type you set by hand with `sc.exe sidtype` is replaced.
 
 **`-SkipRestrictedServiceSid` opts out** for the default account. Use it only when the engine must
 write somewhere you cannot grant to `NT SERVICE\<ServiceName>`. The engine can then write wherever
@@ -344,8 +347,8 @@ config module runs inside the engine's process, and code there can ask Windows f
 for the same account. Measured 2026-10-01 on Windows 11 with a stand-in token: the logon the File
 connection's alternate credential uses (`LogonUserW` with `LOGON32_LOGON_NEW_CREDENTIALS`) returned
 a token that kept the short privilege list and was no longer write-restricted. So the config
-directory is still code that runs with the service account's access. Lock it down as the section
-below says.
+directory is still code that runs with the service account's access. Lock it down as
+[Lock down the config directory](#lock-down-the-config-directory-config-2) says.
 
 **When it takes effect.** A service gets both settings when Windows starts it. Microsoft documents
 a SID type change as needing a system start. The `windows-service-smoke` CI leg installs a new

@@ -32,6 +32,7 @@ and that the engine starts under it as a real service. No test here installs a s
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import subprocess
@@ -310,6 +311,11 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
     lockdown = calls("Set-SecureDataDirAcl")
     if not grants or not lockdown or grants[0]["start"] < lockdown[0]["start"]:
         problems.append("the service's grant is not read back after the data-directory lockdown")
+    read = [a["rhsText"] for a in facts["assignments"] if a["lhs"] == "writeDirs"]
+    if not any("$DbPath" in rhs for rhs in read):
+        problems.append(
+            "the store's own directory is not read back, so a -DbPath elsewhere is missed"
+        )
     return problems
 
 
@@ -332,8 +338,9 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
             "is not exactly",
         ),
         ("$problem = Get-WriteGrantProblem -Path $dir", "$problem = '' # -Path $dir", "read back"),
+        ("$writeDirs += (Split-Path -Parent $DbPath)", "", "store's own directory"),
     ],
-    ids=["call-removed", "switch-unwired", "privilege-added", "grant-not-read"],
+    ids=["call-removed", "switch-unwired", "privilege-added", "grant-not-read", "store-not-read"],
 )
 def test_the_wiring_guard_fails_when_a_piece_is_changed(
     tmp_path: Path, old: str, new: str, expect: str
@@ -368,21 +375,22 @@ def test_the_services_own_grant_is_read_from_the_dacl(tmp_path: Path) -> None:
     """Modify granted by name reads clean. Read-only, and no entry at all, are both named. Run on a
     real directory, with the test's own account standing in for the service's."""
     assert _SCRIPT is not None
-    dirs = {
-        name: tmp_path / f"{name}-{uuid.uuid4().hex[:8]}" for name in ("modify", "read", "none")
-    }
+    names = ("modify", "read", "none", "only")
+    dirs = {name: tmp_path / f"{name}-{uuid.uuid4().hex[:8]}" for name in names}
+    table = "; ".join(f"{name} = {_psq(str(path))}" for name, path in dirs.items())
     for d in dirs.values():
         d.mkdir()
     # THE RESTORE IS IN A `finally`. Each directory has inheritance stripped, and one drops this
     # account altogether; left like that, pytest's tmp_path cleanup fails on some LATER run.
     body = rf"""
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-  $dirs = @{{ modify = {_psq(str(dirs["modify"]))}; read = {_psq(str(dirs["read"]))}; none = {_psq(str(dirs["none"]))} }}
+  $dirs = @{{ {table} }}
   $out = [ordered]@{{}}
   try {{
     & icacls $dirs.modify /inheritance:r /grant:r "${{me}}:(OI)(CI)M" '*S-1-5-18:(OI)(CI)F' | Out-Null
     & icacls $dirs.read /inheritance:r /grant:r "${{me}}:(OI)(CI)RX" '*S-1-5-18:(OI)(CI)F' | Out-Null
     & icacls $dirs.none /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+    & icacls $dirs.only /inheritance:r /grant:r "${{me}}:M" '*S-1-5-18:(OI)(CI)F' | Out-Null
     foreach ($name in $dirs.Keys) {{
       $out[$name] = Get-WriteGrantProblem -Path $dirs[$name] -Principal $me
     }}
@@ -396,6 +404,10 @@ def test_the_services_own_grant_is_read_from_the_dacl(tmp_path: Path) -> None:
     assert "Modify by name" in got["read"], "a read-only grant passed as a write grant"
     assert "Modify by name" in got["none"], (
         "a directory that grants only Users passed. A restricted token does not count that group."
+    )
+    assert "Modify by name" in got["only"], (
+        "a grant on the folder alone passed. What the service creates there would not inherit it, "
+        "so it could create its store and be refused on it at the next start."
     )
 
 
@@ -529,7 +541,7 @@ def test_a_restricted_token_is_refused_where_only_a_group_grants_it(tmp_path: Pa
 
 def _passing_report() -> dict[str, Any]:
     """A report shaped like the one a hardened service writes. No Windows call is made."""
-    wrote = {"directory": "d", "wrote": True, "errno": None, "winerror": None, "error": None}
+    wrote = {"directory": "d", "wrote": True, "errno": None, "error": None}
     token = {
         "write_restricted": True,
         "restricting_sids": ["S-1-5-80-1", "S-1-1-0"],
@@ -566,6 +578,8 @@ def _broken(path: list[str], value: Any) -> dict[str, Any]:
     ("path", "value", "expect"),
     [
         (["denied", "wrote"], True, "grants only Users"),
+        # errno 2: the directory was not there. That is a failed write and not a refused one.
+        (["denied", "errno"], 2, "not as a refusal"),
         (["granted", "wrote"], False, "could not write d"),
         (["temp", "wrote"], False, "temporary directory"),
         (["token", "privileges"], [_PRIVILEGE, "SeImpersonatePrivilege"], "not exactly"),
@@ -601,19 +615,54 @@ def test_a_report_with_a_step_missing_is_not_a_pass() -> None:
         assert probe.inside_problems(report, **rule) == [f"the report has no {step} reading"]
 
 
+def _smoke_step_script(name_starts: str) -> str:
+    """The run script of one windows-service-smoke step, without its comment lines.
+
+    Read from the parsed workflow, so a needle cannot be satisfied by a YAML comment above the step
+    or by a comment inside it. Imported here: without PyYAML that module skips whoever imports it.
+    """
+    from tests._workflow_contexts import jobs_of
+
+    steps = jobs_of("ci.yml")["windows-service-smoke"]["steps"]
+    found = [s for s in steps if str(s.get("name", "")).startswith(name_starts)]
+    assert len(found) == 1, f"expected one step named {name_starts!r}, found {len(found)}"
+    lines = str(found[0]["run"]).splitlines()
+    return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+
+
+def _sample_file_directories() -> set[str]:
+    """The top-level directory of every File connection in samples/config, read from the syntax
+    tree so a call split over lines is still found. A directory that is not a literal fails here,
+    by name, and not later as a write refusal on a hosted runner."""
+    found = set()
+    for module in sorted((_ROOT / "samples" / "config").glob("*.py")):
+        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "File"):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "directory":
+                    continue
+                assert isinstance(keyword.value, ast.Constant), (
+                    f"{module.name}: a File directory that is not a literal; add its directory to "
+                    "the smoke leg's grant list by hand and teach this test to read it"
+                )
+                found.add(str(keyword.value.value).removeprefix("./").split("/")[0])
+    return found
+
+
 def test_the_smoke_leg_grants_every_directory_the_samples_graph_writes() -> None:
     """The leg grants the service by name on the directories the samples graph's File connections
     use, because a restricted token does not count a grant to Users. The list in ci.yml is a hand
     copy of those connections, so a new one would fail far from its cause. This ties the two."""
-    found = set()
-    for module in sorted((_ROOT / "samples" / "config").glob("*.py")):
-        for line in module.read_text(encoding="utf-8").splitlines():
-            if "File(directory=" in line and not line.lstrip().startswith("#"):
-                path = line.split("File(directory=", 1)[1].split('"')[1]
-                found.add(path.removeprefix("./").split("/")[0])
+    found = _sample_file_directories()
     assert found, "CONTROL FAILED: no File connection was found in samples/config"
-    ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    listed = ci.split("foreach ($d in ", 1)[1].split(")", 1)[0]
+    toml = (_ROOT / "samples" / "config" / "connections.toml").read_text(encoding="utf-8")
+    assert not [line for line in toml.splitlines() if line.lstrip().startswith("directory")], (
+        "samples/config/connections.toml now declares a directory; this test reads the .py modules "
+        "only, so add that directory to the smoke leg's grant list and to this test"
+    )
+    script = _smoke_step_script("Install the service")
+    listed = script.split("foreach ($d in ", 1)[1].split(")", 1)[0]
     assert {d.strip().strip('"') for d in listed.split(",")} == found, (
         f"the smoke leg grants [{listed}], and the samples graph's File connections use {sorted(found)}"
     )
@@ -621,30 +670,27 @@ def test_the_smoke_leg_grants_every_directory_the_samples_graph_writes() -> None
 
 def test_the_smoke_leg_reads_the_token_it_asked_for() -> None:
     """The leg must read the registration back, read the running engine's token, and run the probe
-    as the service. This checks the steps are there; the leg's own result is the reading.
+    as the service. This checks the commands are in the step's run script; the leg's own result is
+    the reading.
 
     THIS CANNOT BE DEMONSTRATED FROM A PULL REQUEST: the job runs on a schedule, on dispatch and in
     the merge queue, and a pull_request event skips it.
     """
-    ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    start = ci.index("  windows-service-smoke:")
-    job = ci[start : ci.index("\n  # Container image smoke", start)]
+    script = _smoke_step_script("Verify the service token is restricted")
     for needle in (
-        "sc.exe qsidtype",
-        "sc.exe qprivs",
+        "& sc.exe qsidtype MessageFoundry",
+        "& sc.exe qprivs MessageFoundry",
         # The leg names the privilege itself and does not read it from the installer: a list the
         # installer widened would otherwise pass its own check.
         f'$privilege = "{_PRIVILEGE}"',
-        "service_token_probe.py",
-        "$probe check-read",
-        "python.exe",
-        "$probe check-inside",
-        "--control-pid $PID",
+        '$probe = Join-Path $PWD "scripts\\ci\\service_token_probe.py"',
+        "& python $probe check-read --service-sid $serviceSid --privilege $privilege --control-pid $PID",
+        '$_.Name -eq "python.exe"',
+        "& python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege",
     ):
-        assert needle in job, f"windows-service-smoke no longer runs {needle!r}"
-    assert "$probe check-read" not in ci.replace(job, ""), (
-        "CONTROL FAILED: the needle is found outside the job, so finding it proves nothing"
-    )
+        assert needle in script, f"the step no longer runs {needle!r}"
+    # CONTROL: the comment lines are really gone, so a needle cannot be met by one.
+    assert "# ---" not in script and "CONTROL" in script
 
 
 # --- 6. the uninstaller and a registration that is only marked for deletion ------------------------

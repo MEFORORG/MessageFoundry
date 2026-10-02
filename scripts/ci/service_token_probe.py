@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import contextlib
 import ctypes
+import errno
 import json
 import os
 import sys
@@ -503,6 +504,12 @@ def inside_problems(
         problems.append(
             f"it wrote {denied['directory']}, which grants only Users and Authenticated Users: "
             "the token is not restricted to the service's own grants"
+        )
+    elif denied and denied["errno"] != errno.EACCES:
+        # A directory that is missing or mistyped fails too. Only "access denied" is a refusal.
+        problems.append(
+            f"the write to {denied['directory']} failed, but not as a refusal "
+            f"({denied['error']}), so it shows nothing about the restriction"
         )
     if temp and not temp["wrote"]:
         problems.append(

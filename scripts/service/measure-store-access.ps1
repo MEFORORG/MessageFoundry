@@ -211,6 +211,13 @@ function Get-Sid([string]$Account) {
 function Get-ServiceSids {
     # The virtual account plus groups a service token carries that could appear on a DACL: Everyone,
     # Authenticated Users, SERVICE, Users, LOCAL and NT SERVICE\ALL SERVICES.
+    #
+    # THIS LIST IS TOO WIDE FOR WRITE ACCESS SINCE install-service.ps1 SET A RESTRICTED SERVICE SID
+    # (vault BACKLOG #2702). The service still READS through every group here. It WRITES only through
+    # its own SID and Everyone of these. So where a trio file is writable only through one of the
+    # other groups, the attribution below reports write access the service does not have. Not
+    # narrowed here: the read and write halves would need separate lists, and no run has shown the
+    # change. Read an attribution with that in mind.
     $sids = @("S-1-1-0", "S-1-5-11", "S-1-5-6", "S-1-5-32-545", "S-1-2-0", "S-1-5-80-0")
     $own = Get-Sid $ServiceIdentity
     if ($own) { $sids += $own }
