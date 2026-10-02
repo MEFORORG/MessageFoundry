@@ -661,6 +661,9 @@ def test_a_first_chunk_that_is_not_an_envelope_is_kept_for_the_parser() -> None:
     # Only the envelope header lines are dropped; a segment after them is kept for the parser.
     stray = split_batch("BHS|" + ENC + CR + "EVN|junk" + CR + "".join(THREE[:2]))
     assert len(stray) == 3 and stray[0] == "EVN|junk"
+    # Whitespace the content sniff does not list (a file separator, U+2028) is still not a message.
+    for blank in (chr(0x1C), chr(0x2028)):
+        assert len(split_batch(blank + CR + "".join(THREE[:2]))) == 2
 
 
 def test_the_dry_run_split_keeps_a_bom_led_first_message_as_the_live_split_does() -> None:
@@ -852,6 +855,8 @@ def test_a_copy_re_pick_that_would_pass_the_column_limit_is_refused() -> None:
         'msg.set("PV1-19", str(len(msg.field("PID-3.1") or "")))',
         'msg.set("PV1-19", next(r for r in reps if msg.field("PID-3.5") == r))',
         'msg.set("PV1-19", "Y" if msg.field("PID-3.1").startswith("9") else "N")',
+        'msg.set("PV1-19", max(reps, key=lambda r: msg.field("PID-3.1")))',
+        'msg.set("PV1-19", str((lambda reps: reps)(TABLE)))',
     ],
 )
 def test_the_lint_ignores_a_leaf_that_does_not_flow_into_the_value(
@@ -898,6 +903,14 @@ def test_the_lint_follows_a_name_only_through_its_value(tmp_path: Path) -> None:
         msg.set("PV1-19", a)
     """
     assert "[leaf-to-whole-field]" in _lint(tmp_path, tainted)
+    # A comprehension reads its first iterable before it binds the target of the same name.
+    shadowed = """
+    @handler("h")
+    def h(msg):
+        x = msg.field("PID-3.1") or ""
+        msg.set("PV1-19", "".join([x for x in x]))
+    """
+    assert "[leaf-to-whole-field]" in _lint(tmp_path, shadowed)
 
 
 def test_the_shipped_results_relay_sample_is_clean() -> None:

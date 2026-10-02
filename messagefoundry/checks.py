@@ -1300,8 +1300,9 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
     in ``tainted``.
 
     Only the data flow counts. A conditional's test, a comprehension's filter, a subscript's key, a
-    mapping lookup's key and the argument of a call that returns a length, a truth value or a
-    number select or measure the value and do not become it, so a leaf read there is not followed.
+    mapping lookup's key, a ``key=`` function and the argument of a call that returns a length, a
+    truth value or a number select or measure the value and do not become it, so a leaf read there
+    is not followed.
     A node of any other kind is read conservatively, through every child expression."""
     if _is_leaf_read(node):
         return True
@@ -1319,8 +1320,16 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
         return _comprehension_flows(node, node.elt, tainted)
     if isinstance(node, ast.DictComp):
         return _comprehension_flows(node, node.value, tainted)
+    if isinstance(node, ast.Lambda):
+        # Its body may be called; its parameters shadow outer names of the same spelling.
+        params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        return _flows(node.body, set(tainted) - {p.arg for p in params})
     if isinstance(node, ast.Call):
-        args: list[ast.expr] = [*node.args, *(kw.value for kw in node.keywords)]
+        # A ``key=`` function orders or selects the result (``sorted``, ``max``) and is not it.
+        args: list[ast.expr] = [
+            *node.args,
+            *(kw.value for kw in node.keywords if kw.arg != "key"),
+        ]
         func = node.func
         if isinstance(func, ast.Name) and func.id in _NO_FLOW_CALLS:
             return False
@@ -1331,7 +1340,7 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
                 args = args[1:]
         return _flows(func, tainted) or any(_flows(arg, tainted) for arg in args)
     # BinOp, BoolOp, JoinedStr, FormattedValue, List, Tuple, Set, Dict (keys too: a dict's keys
-    # can come back out as values), Lambda (its body may be called) and anything unforeseen.
+    # can come back out as values) and anything unforeseen.
     return any(_flows(child, tainted) for child in ast.iter_child_nodes(node))
 
 
@@ -1345,8 +1354,10 @@ def _comprehension_flows(
     local = set(tainted)
     for gen in node.generators:
         names = {n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)}
+        # The iterable is read before its targets are bound, so ``[x for x in x]`` reads the outer x.
+        carries = _flows(gen.iter, local)
         local -= names
-        if _flows(gen.iter, local):
+        if carries:
             local |= names
     return _flows(result, local)
 

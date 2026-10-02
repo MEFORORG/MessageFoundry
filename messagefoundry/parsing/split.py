@@ -70,7 +70,7 @@ def split_batch(raw: str | bytes) -> list[str]:
     head = first.lstrip(_LEADING_WS_STR)  # the leading noise the content sniff tolerates
     while head.startswith(_ENVELOPE_HEADERS):
         head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
-    if head:
+    if head.strip():  # a chunk of other whitespace alone is not a message either
         messages.insert(0, head)
     return messages or [text]
 

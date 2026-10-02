@@ -117,8 +117,8 @@ open points settled below.
 - **The lint's reach (rule 3).** It follows the value's data flow: the written expression, and
   every binding in the write's own scope of a name that flows into it, as `unsafe-db-lookup`
   follows a name (BACKLOG #1658). A conditional's test, a comprehension's filter, a subscript or
-  mapping key, and the argument of a call that returns a length, a truth value or a number select or
-  measure the value and are not followed, so `msg.set("PID-3", mr)` in
+  mapping key, a `key=` function, and the argument of a call that returns a length, a truth value
+  or a number select or measure the value and are not followed, so `msg.set("PID-3", mr)` in
   `samples/results_relay/results_relay.py`, whose only leaf read is a generator filter, is clean.
   Every binding of a name counts, so it over-reports rather than miss a branch, and the names are
   solved as one fixed point per scope, so a long chain costs a pass per link rather than doubling at
@@ -127,8 +127,9 @@ open points settled below.
   another scope, and it does not see a dynamic path. **Known blind spots**, each a shape it does not
   flag: a loop target (`for rep in msg.repetitions(...)`, whose items are then written whole); a
   walrus target bound inside an expression; a value passed by keyword (`msg.set("PV1-19",
-  value=v)`); an augmented subscript write (`msg["PV1-19"] += v`); and decoded leaves joined into a
-  line handed to `add_segment`. It also reads `"~".join(...)` and other method calls by their
+  value=v)`); an augmented subscript write (`msg["PV1-19"] += v`); decoded leaves joined into a
+  line handed to `add_segment`; a write inside a nested function, which sees the module's bindings
+  but not its enclosing function's; and a dict comprehension's keys. It also reads `"~".join(...)` and other method calls by their
   receiver and arguments, so it flags a join of leaves but cannot tell what a join it does not
   follow produced. It is advisory, so these are recorded rather than closed.
 - **What a value under the target set becomes (rule 4).** Escaped, not refused. The draft allowed
