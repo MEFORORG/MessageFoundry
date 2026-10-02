@@ -21,6 +21,7 @@ import abc
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import ClassVar
 from uuid import uuid4
 
 from harness import drivers, sinks
@@ -73,6 +74,12 @@ class BaseScenario(abc.ABC):
 
     name: str
     description: str
+
+    #: The ``harness/config`` SUBDIRECTORY whose graph this scenario runs against, or ``""`` for the
+    #: top-level graphs ``serve --config harness/config`` loads. A family whose graph needs something
+    #: that serve does not provide (a credential, an external server) keeps it in a subdirectory, and
+    #: its own test serves it.
+    graph: ClassVar[str] = ""
 
     @property
     @abc.abstractmethod
