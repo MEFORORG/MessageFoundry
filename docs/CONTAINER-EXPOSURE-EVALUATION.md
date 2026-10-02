@@ -148,7 +148,7 @@ MLLP gate (`check_mllp_tls_exposure`), per inbound's resolved host (`[inbound].b
 trusted, isolated segment** — e.g. a local integration rig where partners and console are on the same
 host and no real PHI flows. It downgrades both the API refuse-path and the MLLP `WiringError` to loud
 warnings. It is **never** a production setting and must not be baked into the shipped image's default
-command. (It also does **not** override the auth-disabled refusal or the production-PHI MFA refusal —
+command. (It also does **not** override the auth-disabled refusal or the MFA-at-exposure refusal —
 those stay fail-closed.)
 
 **Exact required config per topology** — one self-contained block each ([ADR
@@ -399,12 +399,14 @@ The console stays a **host-side process**; only its target URL changes.
      target. The asyncio/uvicorn/SQLite stack is OS-portable and the console stays on the host, so this
      is low-risk — but it is the first non-Windows runtime and deserves a CI leg.
 
-7. **Production-PHI + local accounts must enable MFA to even start.** The MFA-at-exposure gate
-   *refuses* a non-loopback bind on a production PHI instance with local accounts unless
-   `[security].require_mfa = true`. An all-AD deployment is no exception: BACKLOG #1144 retired the
-   directory delegation, so directory accounts are in scope too. The container's
-   default config and docs must make `require_mfa = true` the production default, or the operator hits
-   a hard startup refusal — which is correct, but should be expected, not surprising.
+7. **An exposed instance must keep MFA on to even start.** An instance is exposed when it has an
+   off-loopback bind or a declared TLS-terminating proxy. The MFA-at-exposure gate *refuses* an
+   exposed instance with `[security].require_mfa = false` under the shipped `enforce`, unless
+   `[security].allow_single_factor_admin_when_exposed` is set. It reads neither the PHI tier nor the
+   kind of account. `require_mfa` defaults on, and it covers directory accounts too: BACKLOG #1144
+   retired the directory delegation ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)).
+   The container's config and docs must keep `require_mfa = true`, or the operator hits a hard
+   startup refusal. That refusal is correct, but it should be expected, not surprising.
 
 8. **Doc/memory staleness.** The current-state doc staleness (MFA / mTLS / off-box logs described as
    "0.2 / not built") **was corrected in this change** (see header flag 2). The **project memory**

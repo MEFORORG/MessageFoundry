@@ -2453,9 +2453,12 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
     `administrators` a directory session that proved no factor owes more than a local account does,
     and an OIDC sign-in meets its factor on the IdP's claim, so it is not the local rule. At least
     seven sentences in five other operator docs said directory MFA is delegated, which
-    `_unverified_session_owes_factor` contradicts while `require_mfa` is on. The probes earlier in
-    this file pin the code; these assertions red if an old phrasing returns. ADRs are dated records
-    and are not read here."""
+    `_unverified_session_owes_factor` contradicts while `require_mfa` is on. A second review round
+    found the claim in more files, with two neighbours: a lockout said to cover local accounts only,
+    which `verify_mfa` and the step-up re-bind contradict, and container comments keying the
+    MFA-at-exposure gate on local admins and the PHI tier, neither of which the `admin_exposed`
+    block in `__main__.py` reads. The probes earlier in this file pin the code; these assertions
+    red if an old phrasing returns. ADRs are dated records and are not read here."""
     retired_by_doc = {
         "docs/SECURITY.md": ("binds a directory account like any other",),
         "docs/DEPLOYMENT.md": (
@@ -2465,20 +2468,45 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
         ),
         "docs/PHI.md": ("AD MFA delegated", "native TOTP MFA built for local accounts"),
         "docs/CLOUD-PHI-HIPAA.md": ("AD/Entra MFA stays delegated",),
-        "docs/EARLY-ADOPTER-GUIDE.md": ("AD/Entra MFA is enforced by your directory;",),
+        "docs/EARLY-ADOPTER-GUIDE.md": (
+            "AD/Entra MFA is enforced by your directory;",
+            "lockout covers local accounts only",
+        ),
         "docker/README.md": ("AD-only shops delegate MFA",),
+        # Round two of the same sweep: the delegation claim, and the account-kind gate wording it
+        # carried, survived in at least these files too.
+        "docs/FEATURE-MAP.md": (
+            "directory-delegated",
+            "TOTP MFA (local users)",
+            "passkeys (local users, browser)",
+        ),
+        "docs/MENTAL-MODEL.md": (
+            "the \\[webauthn\\] extra) for local accounts,",
+            "as a second factor for local accounts.",
+        ),
+        "docs/CONTAINER-EXPOSURE-EVALUATION.md": (
+            "Production-PHI + local accounts",
+            "production-PHI MFA refusal",
+        ),
+        "docs/REMOTE-CONSOLE.md": ("TOTP MFA) or AD/LDAP",),
+        "docker/compose.yaml": (
+            "required for local Administrator accounts on an exposed PHI bind",
+        ),
+        "docker/k8s/ha-postgres.yaml": ("local-admin MFA on an exposed PHI bind",),
+        "docker/k8s/statefulset.yaml": ("local-admin MFA on an exposed PHI bind",),
     }
     for name, retired in retired_by_doc.items():
         text = _flat((_ROOT / name).read_text(encoding="utf-8"))
         for phrase in retired:
             assert phrase not in text, (
-                f"{name} says {phrase!r} again; while `require_mfa` is on, a directory session "
-                "that proved no factor owes an engine one (BACKLOG #1133)."
+                f"{name} says {phrase!r} again, which the code contradicts; the docstring names "
+                "the rule each phrase broke (BACKLOG #1133)."
             )
     doc = _flat(_doc_text())
     assert (
-        "While `[security].require_mfa` is on, a Kerberos session owes an engine factor under "
-        "either `require_mfa_scope` value." in doc
+        "a directory session that proved no factor at sign-in owes an engine factor under either "
+        "`require_mfa_scope` value. That is every Kerberos session, and an OIDC session minted "
+        "while `[auth].oidc_require_mfa_claim` is off." in doc
     ), (
         "docs/SECURITY.md's Browser AD login paragraph must state the directory rule (BACKLOG #1133)."
     )

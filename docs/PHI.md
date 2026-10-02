@@ -1890,7 +1890,7 @@ separate follow-up.
 | Item | Closes | Maps to | Effort |
 |---|---|---|---|
 | **P2-1** TLS on the engine API | Tokens + PHI cleartext over the network | §164.312(e) · SC-8 | M |
-| **P2-2** MFA for console/API auth — ✅ **Built (WP-14 TOTP and WP-14b passkeys, local and directory accounts)** | Single-factor auth (mitigated: `[security].require_mfa` is an **access gate on every authorized route**, and its shipped `require_mfa_scope` is `every_local_account`, not the Administrator role alone. A Kerberos session owes an engine factor. An OIDC sign-in meets it on the IdP's checked `amr`/`acr` claim while `[auth].oidc_require_mfa_claim` is on, the default. [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states the rule) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
+| **P2-2** MFA for console/API auth — ✅ **Built (WP-14 TOTP and WP-14b passkeys, local and directory accounts)** | Single-factor auth (mitigated: `[security].require_mfa` is an **access gate on every authorized route**, and its shipped `require_mfa_scope` is `every_local_account`, not the Administrator role alone. Directory accounts are not exempt; [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states which sessions owe a factor) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
 | **P2-3** Network-segmentation guidance + periodic integrity checks | Lateral movement; tamper detection | §164.312(c) · SC-7/SI-7 | S–M |
 | **P2-4** Strict-parse CPU/time budget on the hl7apy path | Malformed input pinning a worker — message size/segment caps are built, but the opt-in strict parse itself has no time bound | NIST SC-5 (DoS; not a §164.312 safeguard) | S |
 

@@ -183,7 +183,10 @@ carries the recommended hardening for an exposed console (client-certificate dev
 
 ### Authentication at exposure
 
-Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or AD/LDAP. Note:
+Auth is on by default. Remote users sign in with a local account, or a directory account through
+Windows SSO or OIDC. The directory password sign-in is retired (BACKLOG #1137). A directory
+account is not exempt from the engine's second factor
+([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)). Note:
 
 - With `[security].require_sign_in = false`, an exposed instance is **hard-refused** — an off-loopback
   bind, or a loopback bind behind a declared TLS terminator (a bare loopback bind with no declared
@@ -197,7 +200,8 @@ Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or
   `[security].enforcement = enforce` (the default) **and**
   `[security].allow_single_factor_admin_when_exposed` is not set
   ([`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block). Either switch turns the
-  refusal into a loud, audited warning that starts. A non-PHI instance is silent.
+  refusal into a loud warning that starts, and the allow flag also writes an audit line. No instance
+  is exempt: the engine treats every instance as carrying PHI (BACKLOG #1279).
   **"Exposed" here is the bind-and-proxy posture, not the console**: an off-loopback bind, **or**
   `[api].tls_terminated_upstream` — whether or not `/ui` ends up mounted. So the recommended
   loopback-behind-a-terminator topology in §3 **does** trip it, including when the default-on console

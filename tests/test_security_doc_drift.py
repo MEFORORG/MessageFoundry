@@ -1403,8 +1403,9 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "test_docs_security_pathways.py",
         "test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa",
     ): (
-        "absence of retired delegated-directory-MFA sentences in six operator docs (BACKLOG "
-        "#1133); the code they describe is pinned by calling it in the tenth-sweep probe test"
+        "absence of retired delegated-directory-MFA, local-only-lockout and local-admin-gate "
+        "sentences in operator docs and container manifests (BACKLOG #1133); the MFA rule they "
+        "describe is pinned by calling it in the tenth-sweep probe test"
     ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
