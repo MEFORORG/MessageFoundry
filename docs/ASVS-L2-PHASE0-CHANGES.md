@@ -625,8 +625,9 @@ value.
 >   ISO *tracked-since* date — is persisted in store meta (`secret_rotation_meta`), so the DEK is watched
 >   without an operator setting `[secret_rotation].store_key_last_rotated` (which stays an override).
 >   `messagefoundry rotate-key` re-stamps it, and a changed key-id is auto-detected on the next start.
-> - **Widened enumeration.** Every configured secret class the engine holds (store-DB / AD / SMTP
->   passwords, both Vault tokens, the OIDC client secret, the TLS key passphrase, connector `env()` creds)
+> - **Widened enumeration.** Every configured secret class the engine holds (at least: store-DB / AD /
+>   SMTP passwords, both Vault tokens, the OIDC client secret and private_key_jwt key and passphrase,
+>   the TLS key passphrase, connector `env()` creds)
 >   is fingerprinted with a **DEK-derived keyed MAC** (`store/crypto.py rotation_fingerprint_key`, HKDF) —
 >   a keyed MAC, **never a salted hash**, so a low-entropy AD/SMTP password's fingerprint is not offline-
 >   guessable. A changed fingerprint resets the clock (rotation auto-detected, never operator-attested);

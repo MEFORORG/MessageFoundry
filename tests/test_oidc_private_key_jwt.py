@@ -362,7 +362,8 @@ async def test_the_service_sends_the_assertion_and_resolves_no_secret(
         )
         with pytest.raises(_Stop):
             service._exchange_and_validate("code", flow, "https://ops.example/ui/oidc/callback")
-        assert "client_secret" not in calls[0]
+        fields = calls[0]["client_auth"].form_fields()
+        assert "client_secret" not in fields and "client_assertion" in fields
         assert isinstance(calls[0]["client_auth"], PrivateKeyJwtClientAuth)
     finally:
         await store.close()
@@ -571,3 +572,68 @@ def test_verify_names_a_key_file_as_a_file(
     assert rows["fed.client_key"].status is Status.PASS
     assert "PEM file" in rows["fed.client_key"].detail
     assert "environment" not in rows["fed.client_key"].detail
+
+
+# --- review round 2 ----------------------------------------------------------------------------
+
+
+def test_an_expired_certificate_is_refused(ec_key: ec.EllipticCurvePrivateKey) -> None:
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import NameOID
+
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-console")])
+    past = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=10)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(ec_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(past)
+        .not_valid_after(past + datetime.timedelta(days=1))
+        .sign(ec_key, hashes.SHA256())
+    )
+    pem = cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+    with pytest.raises(SigningError, match="validity window"):
+        oidc_client_auth_from_settings(
+            AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_certificate=pem)), None
+        )
+
+
+def test_a_key_literal_beside_a_key_reference_is_refused(
+    ec_key: ec.EllipticCurvePrivateKey,
+) -> None:
+    with pytest.raises(ValidationError, match="not both"):
+        AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_private_key_ref="kv/mf#oidc-key"))
+
+
+@pytest.mark.parametrize("name", ["oidc_client_certificate", "oidc_client_private_key_password"])
+def test_a_blank_certificate_or_passphrase_is_refused(
+    name: str, ec_key: ec.EllipticCurvePrivateKey
+) -> None:
+    with pytest.raises(ValidationError, match="set but blank"):
+        AuthSettings(**_pkjwt(_pem(ec_key), **{name: "   "}))
+
+
+def test_provision_admin_gives_a_refused_key_its_fixed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import messagefoundry.__main__ as cli
+    import messagefoundry.auth.service as service
+    from messagefoundry.config.tls_policy import HopPosture
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise SigningError("synthetic: could not load the signing private key")
+
+    monkeypatch.setattr(service, "AuthService", _raise)
+    with pytest.raises(cli._ProvisionAuthRefused) as caught:
+        cli._build_provision_auth_service(
+            ServiceSettings(),
+            object(),  # type: ignore[arg-type]
+            posture=HopPosture(enforcing=True),
+        )
+    assert str(caught.value) == cli._PROVISION_AUTH_REFUSALS["client_key"]
+    assert "synthetic" not in str(caught.value)

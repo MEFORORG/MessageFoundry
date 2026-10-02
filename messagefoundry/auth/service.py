@@ -1816,8 +1816,8 @@ def oidc_client_auth_from_settings(
     )
     if not key:
         raise SecretProviderError("[auth].oidc_client_private_key resolved to an empty value")
-    # The settings validator guarantees both while oidc_enabled is set; `verify` can reach here with
-    # it off. Refused, so neither reaches the signer as an empty string.
+    # Unreachable while the settings validator holds, since both callers run only with oidc_enabled
+    # set. Kept so a future caller's gap fails here, by name, not in the signer as an empty string.
     if not settings.oidc_client_id or not audience:
         raise ValueError(
             "private_key_jwt needs oidc_client_id and the assertion audience "

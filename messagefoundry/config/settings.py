@@ -3473,10 +3473,9 @@ class AuthSettings(_Section):
                 "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY, or a path to a PEM file) or "
                 "oidc_client_private_key_ref (a [secrets].provider reference)"
             )
-        # A credential the configured method never sends is a live credential nobody uses. Refused
-        # rather than ignored, so the configuration says exactly what goes on the wire.
         # The signer sends any non-empty `kid` verbatim, so a blank or space-padded one would reach
-        # the IdP as a key id that matches nothing. Refused rather than trimmed.
+        # the IdP as a key id that matches nothing. Refused rather than trimmed. A blank certificate
+        # or passphrase is refused for the same reason: either would be used as given.
         kid = self.oidc_client_assertion_key_id
         if (
             self.oidc_private_key_jwt
@@ -3486,6 +3485,25 @@ class AuthSettings(_Section):
             raise ValueError(
                 "oidc_client_assertion_key_id is blank or has leading or trailing whitespace"
             )
+        blank = [
+            name
+            for name in ("oidc_client_certificate", "oidc_client_private_key_password")
+            if getattr(self, name) is not None and not given(getattr(self, name))
+        ]
+        if self.oidc_private_key_jwt and blank:
+            raise ValueError(f"{', '.join(blank)} is set but blank; remove it or give a value")
+        # The provider reference would win silently over the literal, so both is refused.
+        if (
+            self.oidc_private_key_jwt
+            and given(self.oidc_client_private_key)
+            and given(self.oidc_client_private_key_ref)
+        ):
+            raise ValueError(
+                "set oidc_client_private_key or oidc_client_private_key_ref, not both: the "
+                "reference would be used and the other ignored"
+            )
+        # A credential the configured method never sends is a live credential nobody uses. Refused
+        # rather than ignored, so the configuration says exactly what goes on the wire.
         if self.oidc_private_key_jwt and has_secret:
             raise ValueError(
                 "oidc_token_endpoint_auth_method='private_key_jwt' never sends the client "

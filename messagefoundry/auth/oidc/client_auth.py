@@ -40,7 +40,6 @@ from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.transports.signing import (
     CLIENT_ASSERTION_TYPE,
     CompactJwtSigner,
-    _PublicKey,
     client_assertion_claims,
 )
 
@@ -100,11 +99,6 @@ class PrivateKeyJwtClientAuth:
             certificate=certificate,
             certificate_setting="oidc_client_certificate",
         )
-
-    @property
-    def public_key(self) -> _PublicKey:
-        """The verifying key, for tests and for the operator registering the client at the IdP."""
-        return self._signer.public_key
 
     def form_fields(self) -> dict[str, str]:
         """The two token-request form fields that authenticate the client in place of a secret."""

@@ -38,12 +38,15 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import datetime
+import hmac
 import json
 import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import (
@@ -460,21 +463,28 @@ def certificate_thumbprint(setting: str, certificate: str, public_key: _PublicKe
     ``public_key``: the base64url SHA-256 digest of the certificate's DER encoding (BACKLOG #296).
 
     ``certificate`` is inline PEM or a path to a PEM file, read under the signing key's rules. A
-    certificate that does not parse, or that holds some other public key, is refused: a header naming
-    a certificate the signature does not verify under would send an IdP to the wrong key."""
+    certificate that does not parse, holds some other public key, or is outside its validity window
+    is refused: a header naming a certificate the IdP will not accept fails every sign-in, so it
+    fails at startup instead. Nothing watches the window after startup."""
     material = _read_key_material(setting, certificate, kind="certificate")
+    spki = serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
     cert: x509.Certificate | None = None
+    cert_spki = b""
     try:
         cert = x509.load_pem_x509_certificate(material)
-    except ValueError:
+        cert_spki = cert.public_key().public_bytes(*spki)
+    except (ValueError, UnsupportedAlgorithm):
         cert = None
     if cert is None:
         raise SigningError(f"could not load the certificate named by {setting!r} -- check the PEM")
-    spki = serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
-    if cert.public_key().public_bytes(*spki) != public_key.public_bytes(*spki):
+    # Constant-time, as the DIRECT key/certificate check is (ASVS 11.2.4, BACKLOG #1167).
+    if not hmac.compare_digest(cert_spki, public_key.public_bytes(*spki)):
         raise SigningError(
             f"the certificate named by {setting!r} does not hold the public half of the signing key"
         )
+    now = datetime.datetime.now(datetime.UTC)
+    if not cert.not_valid_before_utc <= now <= cert.not_valid_after_utc:
+        raise SigningError(f"the certificate named by {setting!r} is outside its validity window")
     return _b64u_encode(cert.fingerprint(hashes.SHA256()))
 
 

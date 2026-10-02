@@ -584,7 +584,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #296: `secrets` draws the random `jti` in client_assertion_claims, the one RFC 7523
     # claim builder the SMART client and the OIDC private_key_jwt client share.
-    "messagefoundry/transports/signing.py": frozenset({"cryptography", "secrets"}),
+    "messagefoundry/transports/signing.py": frozenset({"cryptography", "hmac", "secrets"}),
     # ADR 0024: the SMART Backend Services client_assertion JWT. Its claims (and their random `jti`)
     # and its signature both come from signing.py since BACKLOG #296.
     "messagefoundry/transports/smart.py": frozenset(
@@ -1411,6 +1411,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # to the signing key's by SubjectPublicKeyInfo bytes, and sends only its SHA-256 thumbprint.
     "messagefoundry/transports/signing.py": frozenset(
         {
+            "compare:hmac.compare_digest",
             "csprng:secrets.token_urlsafe",
             "key_cert:.public_bytes()",
             "key_cert:cryptography.x509.load_pem_x509_certificate",
