@@ -55,12 +55,13 @@ from harness.load.connscale.runner import (
 )
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import (
+    SIGN_IN_ERRORS,
     EnginePoller,
     EngineSample,
     rig_client,
     sample_until_reconciled,
 )
-from harness.load.failover import EngineNode, _await_port
+from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
@@ -470,10 +471,14 @@ async def _run_one_step(
         #     negligible for a measurement tool, and the steady-state measurement is unaffected.
         #     The engines share ONE store, so the first start provisions the rig Administrator
         #     and the rest skip that step: it would only find the account already there.
-        for index, node in enumerate(nodes):
-            await node.start(provision=index == 0)
-            await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
-        await poller.open()
+        #     A refused provisioning or sign-in is a setup failure, reported as the others are.
+        try:
+            for index, node in enumerate(nodes):
+                await node.start(provision=index == 0)
+                await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
+            await poller.open()
+        except (FailoverError, *SIGN_IN_ERRORS) as exc:
+            raise ConnScaleError(f"the engines did not start signed in: {exc}") from exc
         await poller.sample_once()  # aggregate baseline
 
         # Preflight EVERY engine's inbound block (first + last port bound, all N rows reported), so the

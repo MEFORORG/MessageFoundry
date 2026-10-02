@@ -64,7 +64,12 @@ from harness.load.connscale.report import (
 )
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
+from harness.load.enginepoll import (
+    SIGN_IN_ERRORS,
+    EnginePoller,
+    EngineSample,
+    sample_until_reconciled,
+)
 from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -475,12 +480,14 @@ async def _run_one_step(
                 before,
                 after,
             )
-        await node.start()
         # Any start/preflight failure is re-wrapped as ConnScaleError carrying the engine LOG TAIL
         # (captured NOW, before the `finally` stops the node and unlinks its log). This lets
         # run_connscale distinguish the benign pooled RCSI fail-closed gate from a REAL defect, and
         # converts the port-preflight's FailoverError so it can't escape and crash the whole sweep.
+        # The start is inside it because it provisions the rig Administrator first, and the open
+        # signs in: a refusal at either is a setup failure like the rest (SIGN_IN_ERRORS).
         try:
+            await node.start()
             await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
             await poller.open()
             await poller.sample_once()  # baseline
@@ -490,7 +497,7 @@ async def _run_one_step(
                 sink_host, profile.base_port + count - 1, timeout=_PORTS_READY_TIMEOUT
             )
             await _await_inbound_rows(poller, count, timeout=_PORTS_READY_TIMEOUT)
-        except (ConnScaleError, FailoverError) as exc:
+        except (ConnScaleError, FailoverError, *SIGN_IN_ERRORS) as exc:
             raise ConnScaleError(_startup_failure_detail(exc, node)) from exc
         # FD sampler keyed on the engine PID (the harness owns it).
         pid = node.pid
@@ -1217,6 +1224,9 @@ async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:
     client = poller.client
     if client is None:
         return None, True
+    # Before the timer starts: the reload route wants a credential proved within the last few
+    # minutes, and proving it inside the timed call would charge a sign-in to the reload.
+    await poller.prove_sign_in()
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, time_reload_outcome, client, None)
 

@@ -4057,11 +4057,13 @@ jobs:
           # THE READ IS SIGNED IN (vault BACKLOG #2719). `rigadmin get` first checks that the service
           # refuses /messages to a request with no session, then signs in ONCE as the Administrator the
           # install step provisioned and asks again until a message shows, for up to 10 seconds. One
-          # sign-in, because the engine paces sign-ins per client address. It prints the count, and
-          # exits non-zero when the count never reached 1 or the service refused any of it.
+          # sign-in, because the engine paces sign-ins per client address. It prints the count. It
+          # exits 1 when the count never reached 1, and 4 when the rig could not sign in or the
+          # service answered /messages with no session.
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
           python samples\send_mllp.py samples\messages\adt_a01.hl7
           $total = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert --field total --at-least 1 --timeout 10 /messages
+          if ($LASTEXITCODE -eq 4) { throw "the rig could not sign in to the service, or the service answered /messages with no session" }
           if ($LASTEXITCODE -ne 0) { throw "message was not recorded by the engine (messages.total = '$total')" }
           "messages.total = $total"
 
@@ -4482,12 +4484,18 @@ jobs:
           # call first checks the engine refuses the read to a request with no session, then signs
           # in ONCE and asks again until the count reaches --at-least, for up to --timeout seconds.
           # One sign-in a call, because the engine paces sign-ins per client address. It prints the
-          # last count it read, or nothing when the engine refused; a non-zero exit means the count
-          # was never reached, and `|| true` keeps that from aborting under set -e before the
-          # FAIL line below can say what was seen.
+          # last count it read, or nothing when the engine refused. Exit 1 means the count was never
+          # reached; the `||` keeps that from aborting under set -e before the FAIL line below can
+          # say what was seen. Exit 4 means the rig could not sign in, or the engine answered with
+          # no session, and that is reported as what it is.
           total() { MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" docker exec -e MEFOR_RIG_ADMIN_PASSWORD mefor \
             python /rig/rigadmin.py get --engine https://127.0.0.1:8765 --cacert "$cert" --field total "$@"; }
-          processed=$(total --at-least 1 --timeout 30 "/messages?status=processed") || true
+          rig_rc=0
+          processed=$(total --at-least 1 --timeout 30 "/messages?status=processed") || rig_rc=$?
+          if [ "$rig_rc" -eq 4 ]; then
+            echo "FAIL: the rig could not sign in to the engine, or the engine answered /messages with no session"
+            exit 1
+          fi
           received=$(total "/messages?status=received") || true
           processed="${processed:-0}"; received="${received:-0}"
           echo "processed=$processed received=$received"

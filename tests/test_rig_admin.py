@@ -370,15 +370,19 @@ def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(
         enginepoll.adopt_rig_session(_FakeClient(set()), "https://a", None)  # type: ignore[arg-type]
 
 
-# --- no rig switches sign-in off ---------------------------------------------
+# --- no runner hands `serve` the sign-in switch -------------------------------
 
 
 def _lines_naming_the_switch(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if _SIGN_IN_KEY in line]
 
 
-def test_no_harness_module_sets_the_sign_in_switch() -> None:
-    """The only line in ``harness/`` that names the switch REMOVES it from a node's environment."""
+def test_no_harness_module_hands_serve_the_sign_in_switch() -> None:
+    """The only line in ``harness/`` that names the switch REMOVES it from a node's environment.
+
+    THIS IS ABOUT ``serve``, and it reads for one name. ``harness/load/ingress_probe.py`` builds
+    the engine in-process through the test factory with ``allow_no_auth=True`` and never runs
+    ``serve``; this check does not see it and makes no claim about it."""
     found = {
         path.relative_to(_ROOT).as_posix(): lines
         for path in sorted((_ROOT / "harness").rglob("*.py"))
@@ -389,6 +393,65 @@ def test_no_harness_module_sets_the_sign_in_switch() -> None:
     }, found
     # CONTROL: the reader sees an assignment of the shape the runners used to carry.
     assert _lines_naming_the_switch(f'    env["{_SIGN_IN_KEY}"] = "false"\n')
+
+
+# --- the command line's own failures -----------------------------------------
+
+
+def test_a_rig_that_cannot_sign_in_exits_with_its_own_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``run`` returns its child's code, and the harness command line uses 0 to 3. So "the rig never
+    signed in" has a code of its own, and a workflow can fail on that and nothing else."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    engine = f"http://127.0.0.1:{port}"
+    assert rigadmin.EXIT_RIG_FAILED == 4
+    assert rigadmin.main(["get", "--engine", engine, "/stats"]) == rigadmin.EXIT_RIG_FAILED
+    code = rigadmin.main(["run", "--engine", engine, "--", sys.executable, "-c", "pass"])
+    assert code == rigadmin.EXIT_RIG_FAILED
+    assert "did not answer" in capsys.readouterr().err
+
+
+# --- the workflow legs carry this module's settings ---------------------------
+
+
+def _serving_step(workflow: str, job: str, needle: str) -> dict[str, Any]:
+    from tests._workflow_contexts import jobs_of
+
+    steps = [s for s in jobs_of(workflow)[job]["steps"] if needle in str(s.get("run") or "")]
+    assert len(steps) == 1, f"{workflow} {job}: {len(steps)} step(s) hold {needle!r}"
+    step: dict[str, Any] = steps[0]
+    return step
+
+
+def test_each_workflow_leg_carries_the_settings_this_module_names() -> None:
+    """``SERVE_ENV`` and ``NOTIFY_ENV`` are written out by hand in seven workflow steps, in three
+    syntaxes. This holds each copy to the module, so the port or the address cannot drift in one.
+
+    An enforcing leg carries both. A leg at ``warn`` carries ``SERVE_ENV``: the notification gate
+    only warns there."""
+    pytest.importorskip("yaml")
+    enforcing = {**rigadmin.SERVE_ENV, **rigadmin.NOTIFY_ENV}
+    assert len(enforcing) == 5, "CONTROL FAILED: the module's settings changed shape"
+    legs: list[tuple[str, str, dict[str, str]]] = [
+        ("ci.yml", "load-test", enforcing),
+        ("benchmark.yml", "baseline-sqlite", enforcing),
+        ("ci.yml", "load-test-sqlserver", dict(rigadmin.SERVE_ENV)),
+        ("benchmark.yml", "baseline-postgres", dict(rigadmin.SERVE_ENV)),
+        ("benchmark.yml", "baseline-sqlserver", dict(rigadmin.SERVE_ENV)),
+    ]
+    for workflow, job, wanted in legs:
+        env = _serving_step(workflow, job, "messagefoundry serve")["env"]
+        got = {name: str(env.get(name)) for name in wanted}
+        assert got == wanted, f"{workflow} {job}: {got}"
+    # The container smoke passes them to `docker run`, the Windows smoke to NSSM.
+    docker = str(_serving_step("ci.yml", "docker-smoke", "serve --config")["run"])
+    service = str(_serving_step("ci.yml", "windows-service-smoke", "AppEnvironmentExtra")["run"])
+    for name, value in enforcing.items():
+        assert f"-e {name}={value} " in docker, f"docker-smoke: {name}"
+        assert f'"{name}={value}" `' in service, f"windows-service-smoke: {name}"
 
 
 # --- one real engine ---------------------------------------------------------
@@ -458,6 +521,12 @@ async def test_a_rig_node_serves_with_sign_in_on_and_the_rig_reads_it_signed_in(
         poller = EnginePoller(node.url, RIG_SESSION, origin=time.perf_counter())
         await poller.open()
         try:
+            assert await poller.sample_once() is not None
+            # A caller about to TIME a sensitive request proves the credential first: a new
+            # session, taken by the client, that the engine answers.
+            before = rigadmin._held.token
+            await poller.prove_sign_in()
+            assert rigadmin._held.token != before
             assert await poller.sample_once() is not None
         finally:
             await poller.close()

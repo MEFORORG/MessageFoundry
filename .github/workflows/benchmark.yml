@@ -116,6 +116,7 @@ jobs:
           for _ in $(seq 1 60); do
             curl -fsS --max-time 5 --cacert "$cert" https://127.0.0.1:8765/health > /dev/null 2>&1 && { ready=1; break; } || sleep 0.5
           done
+          rig_rc=0
           set +e
           if [ -n "$ready" ]; then
             # `run` first checks the engine refuses a request with no session, then signs in and
@@ -124,6 +125,7 @@ jobs:
               --engine https://127.0.0.1:8765 --cacert "$cert" -- \
               python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
               --db-backend sqlite --report-json out/load/reference-sqlite.json --report-csv out/load/reference-sqlite.csv
+            rig_rc=$?
           else
             echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
           fi
@@ -136,8 +138,10 @@ jobs:
           wait "$engine_pid" 2>/dev/null || true
           echo "===== engine log (tail) ====="; tail -40 engine.log || true
           # A never-ready engine fails the step. The old loop could not fail, so a dead engine produced a
-          # green run with no report. The harness's own exit stays unpropagated, as before.
-          [ -n "$ready" ]
+          # green run with no report. The harness's own exit stays unpropagated, as before. Exit 4 is
+          # not the harness's: it is `rigadmin run` saying the rig never signed in, so no load ran.
+          # That fails the step, or a refused sign-in would be a green run with no report.
+          [ -n "$ready" ] && [ "$rig_rc" -ne 4 ]
       - name: Upload baseline report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -272,6 +276,7 @@ jobs:
           for _ in $(seq 1 60); do
             curl -fsS --max-time 5 --cacert "$cert" https://127.0.0.1:8765/health > /dev/null 2>&1 && { ready=1; break; } || sleep 0.5
           done
+          rig_rc=0
           set +e
           if [ -n "$ready" ]; then
             # Signed in, as the sqlite leg above: `run` hands the session to the load CLI as --token.
@@ -279,6 +284,7 @@ jobs:
               --engine https://127.0.0.1:8765 --cacert "$cert" -- \
               python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
               --db-backend postgres --report-json out/load/reference-postgres.json --report-csv out/load/reference-postgres.csv
+            rig_rc=$?
           else
             echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
           fi
@@ -290,7 +296,8 @@ jobs:
           kill -9 "$engine_pid" 2>/dev/null || true
           wait "$engine_pid" 2>/dev/null || true
           echo "===== engine log (tail) ====="; tail -40 engine.log || true
-          [ -n "$ready" ]
+          # As the sqlite leg: a rig that never signed in (exit 4) fails the step.
+          [ -n "$ready" ] && [ "$rig_rc" -ne 4 ]
       - name: Failover profile (two nodes, kill primary mid-load)
         # Runs even when the reference step failed: it starts its own serve nodes, so a reference
         # engine that never came up says nothing about it. It gates on the database step, which runs
@@ -469,6 +476,7 @@ jobs:
           for _ in $(seq 1 60); do
             curl -fsS --max-time 5 --cacert "$cert" https://127.0.0.1:8765/health > /dev/null 2>&1 && { ready=1; break; } || sleep 0.5
           done
+          rig_rc=0
           set +e
           if [ -n "$ready" ]; then
             # Signed in, as the sqlite leg above: `run` hands the session to the load CLI as --token.
@@ -476,6 +484,7 @@ jobs:
               --engine https://127.0.0.1:8765 --cacert "$cert" -- \
               python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
               --db-backend sqlserver --report-json out/load/reference-sqlserver.json --report-csv out/load/reference-sqlserver.csv
+            rig_rc=$?
           else
             echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
           fi
@@ -487,7 +496,8 @@ jobs:
           kill -9 "$engine_pid" 2>/dev/null || true
           wait "$engine_pid" 2>/dev/null || true
           echo "===== engine log (tail) ====="; tail -40 engine.log || true
-          [ -n "$ready" ]
+          # As the sqlite leg: a rig that never signed in (exit 4) fails the step.
+          [ -n "$ready" ] && [ "$rig_rc" -ne 4 ]
       - name: Failover profile (two nodes, kill primary mid-load)
         # Runs even when the reference step failed: it starts its own serve nodes, so a reference
         # engine that never came up says nothing about it. It gates on the database step, which runs

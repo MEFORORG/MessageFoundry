@@ -324,6 +324,10 @@ async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch)
         assert env["MEFOR_PIPELINE_CLAIM_MODE"] == "pooled"
         assert env["MEFOR_INBOUND_BIND_HOST"] == "0.0.0.0"
         assert env["MEFOR_CONNSCALE_SINK_HOST"] == loadgen_ip
+        # Rigs sign in, and each of the six driver processes holds its own session as the one rig
+        # Administrator. The engine's default cap of five would end them in turn, so the engine
+        # half sizes the cap to the fleet it advertises.
+        assert int(env["MEFOR_AUTH_MAX_SESSIONS_PER_USER"]) > 6
 
     # (2) The engine report carries every cell's PID + node id for CPU correlation.
     assert len(eng_report.cells) == len(cells)

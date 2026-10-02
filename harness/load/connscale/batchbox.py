@@ -572,6 +572,13 @@ async def run_batch_engine(
             install_executor_shim=False,
             db_path=None,  # batch is SQL-Server-scoped: the store comes from MEFOR_STORE_*
         )
+        # RIGS SIGN IN, AND THIS RIG'S DRIVE IS SPLIT OVER PROCESSES. Each of the driver's `procs`
+        # connscale-remote processes holds its own session as the one rig Administrator. The engine
+        # keeps five sessions for a user by default and ends the oldest past that, so a sixth
+        # process would end the first one's session, which would sign in again and end the next.
+        # So the cap is sized to the fleet this cell advertises, doubled for a process that signs
+        # in again. setdefault, so an operator's own value stands.
+        node_env.setdefault("MEFOR_AUTH_MAX_SESSIONS_PER_USER", str(2 * procs + 2))
         node = EngineNode(
             f"batch-{cell.cell_id}", api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
         )

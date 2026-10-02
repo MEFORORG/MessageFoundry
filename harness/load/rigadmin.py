@@ -14,9 +14,9 @@ and the account write are the shipped code path. ``scripts/service/measure-store
 the same on Windows; this is that recipe for every platform.
 
 **This is test tooling.** It adds no flag, no environment switch and no password path to any shipped
-command. The rig password is drawn per run and is never written to a file or printed. It is held in
-memory, in this process's environment for a child harness process, and in the environment of the
-one child that provisions.
+command. The rig password is drawn per run, and this module never writes it to a file or prints
+it. It is held in memory, in this process's environment for a child harness process, and in the
+environment of the one child that provisions.
 
 Two things a rig's ``serve`` needs beside the account:
 
@@ -33,10 +33,11 @@ the image's interpreter.
 
 The session is one per process, as the TLS anchor is (:mod:`harness.load.tlsmat`). Sessions live in
 the store, so one sign-in covers every node that shares a store, however many nodes there are. That
-matters because the engine caps the sessions one user may hold: a session per node would end the
-first ones on a large fleet. A node on a different store refuses the session, and
-:func:`renew_session` signs in again there. A drive split over more harness PROCESSES than that cap
-(five by default) would end sessions in turn; no single-box rig is split that way.
+matters because the engine caps the sessions one user may hold (five by default) and ends the
+oldest past that: a session per node would end the first ones on a large fleet. A node on a
+different store refuses the session, and :func:`renew_session` signs in again there. A drive split
+over several harness PROCESSES holds one session in each, so the rig that splits its drive that way
+sizes the cap on the engine it starts (``connscale/batchbox.py``).
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ __all__ = [
     "ADMIN_NAME_ENV",
     "ADMIN_PASS_ENV",
     "EXIT_EXISTS",
+    "EXIT_RIG_FAILED",
     "NOTIFY_ENV",
     "RIG_SESSION",
     "SERVE_ENV",
@@ -118,6 +120,12 @@ _ADMIN_EXISTS = "already has an enabled Administrator"
 #: ``provision`` exit code for "the store already had an Administrator". Not a failure: the second
 #: node of a shared store meets it on every run.
 EXIT_EXISTS = 3
+
+#: Exit code of every command-line mode when THE RIG could not do its part: the engine did not
+#: answer, refused the sign-in, or answered a request that carried no session. ``run`` otherwise
+#: returns its child's own code, and the harness command line uses 0 to 3, so a caller can tell a
+#: rig that never signed in from a load run that finished with a verdict.
+EXIT_RIG_FAILED = 4
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _HTTP_TIMEOUT_S = 10.0
@@ -536,7 +544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(args.handler(args))
     except RigAdminError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_RIG_FAILED
 
 
 if __name__ == "__main__":

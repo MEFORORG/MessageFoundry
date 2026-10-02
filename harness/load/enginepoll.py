@@ -22,6 +22,7 @@ single URL (the default) a sample is byte-identical to the one-shard behavior.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -535,6 +536,11 @@ def adopt_rig_session(client: EngineClient, url: str, cacert: str | None) -> Non
     client.set_step_up_handler(_step_up)
 
 
+#: What opening a poller or a client as the rig Administrator can raise: the engine did not
+#: answer, or it answered and refused the sign-in. A runner reports either as a setup failure.
+SIGN_IN_ERRORS: tuple[type[Exception], ...] = (ApiError, rigadmin.RigAdminError)
+
+
 def rig_client(url: str, *, cacert: str | None, allow_insecure: bool = False) -> EngineClient:
     """An :class:`EngineClient` for ``url``, signed in as the rig Administrator.
 
@@ -625,6 +631,23 @@ class EnginePoller:
         clients, self._clients = self._clients, []
         for client in clients:
             await loop.run_in_executor(None, client.close)
+
+    async def prove_sign_in(self) -> None:
+        """Sign the PRIMARY client in afresh, for a caller about to TIME a sensitive request.
+
+        A route such as ``POST /config/reload`` wants a credential proved within the last few
+        minutes. A client that finds the proof stale is refused, signs in and asks again, and all
+        of that would land inside the caller's timer. So the caller proves it first, outside the
+        timer. Only a rig poller does anything here, and a failure is left for the timed request to
+        report in its own terms."""
+        if isinstance(self._token, rigadmin.RigSession) and self._clients:
+            await asyncio.get_running_loop().run_in_executor(None, self._prove_sign_in_sync)
+
+    def _prove_sign_in_sync(self) -> None:
+        url = self._urls[0]
+        cacert = self._cacert or self._cacert_for(url)
+        with contextlib.suppress(*SIGN_IN_ERRORS):
+            self._clients[0].set_token(rigadmin.renew_session(url, None, cacert=cacert))
 
     async def sample_once(self) -> EngineSample | None:
         sample = await asyncio.get_running_loop().run_in_executor(None, self._sample_sync)

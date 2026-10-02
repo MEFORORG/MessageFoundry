@@ -43,7 +43,12 @@ from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, NoLoss
 from harness.load.connscale.runner import ConnScaleError, _reconcile
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
+from harness.load.enginepoll import (
+    SIGN_IN_ERRORS,
+    EnginePoller,
+    EngineSample,
+    sample_until_reconciled,
+)
 from harness.load.failover import _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -288,7 +293,11 @@ async def run_connscale_remote(
     aggregate_rate = per_conn_rate * count  # per band
     try:
         await sink.start()
-        await poller.open()
+        try:
+            await poller.open()
+        except SIGN_IN_ERRORS as exc:
+            # A setup failure, in words: under the batch driver this process's stderr is discarded.
+            raise ConnScaleError(f"could not sign in to the engines: {exc}") from exc
         await poller.sample_once()  # aggregate baseline
 
         # Preflight EVERY band's inbound block reachable on the ENGINE box before the hold.
