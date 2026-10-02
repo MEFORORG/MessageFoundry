@@ -235,17 +235,21 @@ carry only plain text: no nesting, no entity, no attribute but `class`. Across t
 handle spellings may differ only in case, each handle carries one span class everywhere, there is
 at most one input handle, and no clone or `MsgCreate` writes the input. The list's own tag is
 exactly `ActionList`, every element enclosing it is a `<Package>`, and the list and each of those
-carry only `Name` and `Desc`. **In a
-package that may call any list** (a `<Call>` tag, or any attribute naming `ActionListCall`), **no
-list is fully understood:** a called list runs when and as often as its caller runs it, and the
-router, which forwards to every handler, cannot express that. **The call check reads an attribute
-as step 1 reads it, and more.** Step 1 takes a verb from `@Data` with the tags removed and the
-character references resolved: from a `keyword` span, read span by span, or else from the head of
-the whole value. So the check looks for the verb in the raw value, in the whole value stripped, and
-in each span stripped, anywhere in each, in every attribute of every element. Tags are matched
-exactly, so a namespaced or differently cased tag is not understood. A
+carry only `Name` and `Desc`. In the list and around it, tags are matched exactly, so a namespaced
+or differently cased tag is not understood. A
 list nested more than 25 `<List>` and `<Block>` levels deep is not understood either, so a depth
 step 1 refuses is refused the same way.
+
+**In a package that may call any list, no list is fully understood.** A called list runs when and
+as often as its caller runs it. The router forwards to every handler, so it cannot express that.
+The call check asks one question of every element in the file: may it call a list? It may when its
+tag is `Call`. That one tag is read as step 1 reads it, on the local name and in any case. It may
+also when any string it holds names a call verb. Every string is read: the tag, each attribute's
+name and value, and the text in and after the element. Each string is read three ways: raw, with
+the markup stripped, and span by span with the markup stripped. The last two are how step 1 takes a
+verb from `@Data`. Only the ASCII letters count, so `Action_List_Call` and the
+`action-list-call-pass` span class name a call too. A string that only mentions a call closes the
+gate as well. That costs a hand-finish, never a wrong delivery.
 
 **No construct is on the list:** no `If`, `ElseIf`, `Else`, `Case`, `ChooseFrom`, `Matching`,
 `ForEach`, `Loop`, `While`, `Try`, `Catch`, `Call`, `ActionListExit` or other exit, and no
@@ -258,14 +262,16 @@ with a `(...)` annotation, a dotted path, a list another list calls, and a list 
 list's construct each opened the gate. A label such as `While x` or a path such as
 `/PID-8 (replace all)` passed the word rules, and a called sub-list became a handler that built and
 sent its message for every inbound message.
-*Corrected 2026-10-01 (Lander QA on f0a62ef70a):* the call check read only the raw attribute, so
-`ActionList&#67;all`, `ActionList&#x43;all` and `ActionList<b></b>Call` each left the gate open
-while step 1 read a call. A sub-list called under an `If` then sent its message for every inbound
-message, where step 1 raises. The whole value stripped is not enough on its own: after an unclosed
-`&#x`, the whole value loses the verb and only the span still holds it. The audit made with that
-repair found one more gap between this text and the gate: the list's own tag was not matched
-exactly, so `<actionlist>` and a namespaced `<q:ActionList>` were understood. No wrong delivery is
-known from it. The gate now refuses both.
+*Corrected 2026-10-01 (Lander QA on f0a62ef70a):* the call check read only the raw attribute
+value. So `ActionList&#67;all`, `ActionList&#x43;all` and `ActionList<b></b>Call` each left the gate
+open while step 1 read a call. A sub-list called under an `If` then sent its message for every
+inbound message, where step 1 raises. The whole value stripped is not enough alone: after an
+unclosed `&#x`, the whole value loses the verb and only the span still holds it. The code review of
+that repair widened the check twice more: from attribute values to every string, and from the
+verb's spelling to its letters. A call named by an element tag, an attribute name, element text or
+a call-marking span class had left the gate open, though step 1 reads none of those as a call. The
+same audit found the list's own tag was not matched exactly, so `<actionlist>` and a namespaced
+`<q:ActionList>` were understood. No wrong delivery is known from that. The gate now refuses both.
 
 **A list that is not fully understood renders exactly as step 1 renders it,** byte for byte, with the
 same summary counts: the importer runs step 1's code path on it, untouched, so there is no partial
@@ -329,22 +335,30 @@ the send or lacking one it did, lifts a send out of a branch, or binds a local b
 level. Where the head differs from step 1, none of these checks exempts a send step 1 also makes,
 so a write leaking into `msg` is caught too. The oracle applies `ItemCopy`, `ItemAppend` and
 `ItemClear` to the field each names. The battery's shapes all sit in one package frame, so a
-separate test checks that a called list, a list nested in another list's construct, a root that is
-no `<Package>`, an unread package attribute, and a list tag in another case or in a namespace each
-render exactly as step 1. The walker matches each
+separate test checks 15 other frames. A list another list calls, before it or after it, by the verb
+or by a `<Call>` tag in any case or namespace. A list nested in another list's construct. A root
+that is no `<Package>`. An unread package attribute. A list tag in another case or in a namespace.
+Each renders exactly as step 1. The walker matches each
 statement against one whole-string template per verb rather than walking tokens as the importer
 does, so the two read the specification by different methods.
 
 **A call the attribute does not spell** has its own tests in the same file. They write one character
-of the verb as a character reference or behind a tag, at every position, in ten ways and six frames,
-and several characters at once in 600 seeded values. Step 1's own parse of the package says which of
-them hide a call, never the head's gate and never a list of spellings, and each of those must render
-exactly as step 1. A control holds a reference and a tag in a verb that is no call, and the gate
-still opens. Measured 2026-10-01: 2,430 single-character spellings and 556 of the 600 hide a call.
-Reading the raw value alone, as f0a62ef70a did, fails 69 of the 80 tests in this group and the
-package-frame test, on every one of those spellings. Reading the raw and the whole value fails 11
-tests, on 390 of the 2,430 and 83 of the 556. Reading the raw value and the spans fails 19, on 405
-and 97. Dropping the raw reading fails 2.
+of the verb as a character reference or behind a tag. They do so at every position, in ten ways, six
+frames and five casings. A second arm writes several characters at once in 600 seeded values. Step
+1's own parse of the package says which of them hide a call. The head's gate never says, and no list
+of spellings does. Each hidden call must render exactly as step 1, with the called list after its
+caller and before it. More tests carry a hidden call under a `data`, `DATA` or namespaced key and
+as a `<Block>` label, and name a call in eight ways step 1 reads no call from. A control holds a
+reference and a tag in a verb that is no call, and the gate still opens.
+
+Measured 2026-10-01: 4,050 single-character spellings and 560 of the 600 hide a call. These tests
+and the package frames are 96 in all. With the importer at f0a62ef70a, 83 of them fail, on every one
+of those spellings. Each mutation arm tried fails too. Reading the raw and the whole value fails 11
+tests, on 650 of the 4,050 and 91 of the 560. Reading the raw value and the spans fails 25, on 675
+and 82. Dropping the raw reading fails 3, and matching the spelling in place of the letters fails 2.
+Reading attribute values alone fails 4, and the `Data` key alone 7. Dropping the tag, the attribute
+names, the text or the tail fails 1 each. Reading only the first list fails 78, only the last 88,
+and only `<Line>` elements 2. Matching the `Call` tag exactly fails 3.
 
 The battery holds 7,787 shapes, measured 2026-10-01: 331 fixed seeds (every repro from every review
 of PR 1900 and every Lander repro, the 23 round-3 shapes and the gate review's 41 among them), 4,056
@@ -358,14 +372,16 @@ handle after a declined write to its skeleton (21), tolerating whitespace (4), a
 depth bound (3). In the second: accepting any `<Block>` label (2,312), accepting path annotations
 and the dotted form (12), landing a write to an unbound handle on `msg` (180), rendering
 `ItemAppend` as a set (4), and dropping `ItemClear` (2). The package-frame test fails on dropping
-the call rule (5 of 11 frames), the ancestor rule (3 of 11) or the list-tag rule (2 of 11). Against
+the call rule (9 of 15 frames), the ancestor rule (3 of 15) or the list-tag rule (2 of 15). Against
 the previous head, 6fa49a9d5,
 the first battery of 7,746 shapes failed 5,937, including 20 of the 23 round-3 seeds.
 
 **Unverified assumptions, shared by the importer and the oracle.** At least these: that
 `MsgTreeCopy %A/ to %B/` makes B a copy of A; that `MsgSend` leaves its handle holding the message it
 sent; that a `<Block>` with no label runs its body once, in line; that a `@Disabled`
-value of `1`, `true` or `yes` means the step never runs; and that `MsgCreate` and `MsgSend` stamp no
+value of `1`, `true` or `yes` means the step never runs; that every caller of a list sits in the
+same export file, which is all the call check reads, so a list exported apart from its caller is
+read as never called; and that `MsgCreate` and `MsgSend` stamp no
 header field the skeleton lacks, such as MSH-7, MSH-10 or MSH-11. If Corepoint stamps those, a built
 message goes out without them, and the generated module does not flag it. Each was read from the
 validated export, not measured in Corepoint.

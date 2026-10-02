@@ -1692,10 +1692,18 @@ _DISABLED_SURE = frozenset({"1", "true", "yes"})
 # the type is read: ``ADT_A01`` is also how HL7 spells a message STRUCTURE (MSH-9.3).
 _MESSAGE_TYPE = re.compile(r"([A-Z0-9]{3})\^([A-Z0-9]{3})(?:\^([A-Z0-9_]{3,7}))?")
 _HL7_VERSION = re.compile(r"2\.[1-9](?:\.[1-9])?")
-# What step 1 reads as a call, taken from its own tables so the package-wide check cannot fall
-# behind them: the verbs (``actionlistcall``) and the tags (``call``).
-_CALL_VERBS = tuple(verb for verb, kind in _KIND_BY_VERB.items() if kind == "call")
+_NOT_A_LETTER = re.compile(r"[^a-z]+")
+
+
+def _letters(text: str) -> str:
+    """The ASCII letters of ``text``, lower-cased, with everything else dropped."""
+    return _NOT_A_LETTER.sub("", text.lower())
+
+
+# What step 1 reads as a call, taken from its own tables: the tags (``call``) and the verbs
+# (``actionlistcall``), each verb as its letters. Used only by the package-wide call check.
 _CALL_TAGS = frozenset(tag for tag, kind in _CONTAINER_KIND_BY_TAG.items() if kind == "call")
+_CALL_WORDS = tuple(_letters(verb) for verb, kind in _KIND_BY_VERB.items() if kind == "call")
 
 
 @dataclass(frozen=True)
@@ -2010,8 +2018,8 @@ class _Binder:
         return Control("send", st.verb, st.text, args=args, message=local)
 
 
-def _names_a_call(value: str) -> bool:
-    """Whether any reading of one attribute value names an ``ActionListCall``.
+def _names_a_call(text: str) -> bool:
+    """Whether the letters of any reading of ``text`` spell a call verb.
 
     Step 1 never reads a verb from the raw value. It reads it through :func:`strip_markup`, which
     removes tags and resolves character references: from a ``keyword`` span, read span by span
@@ -2019,11 +2027,20 @@ def _names_a_call(value: str) -> bool:
     ``ActionList<b></b>Call`` are both calls to step 1, and the two readings can differ from each
     other: after an unclosed ``&#x``, only the span still holds the verb.
 
-    The gate therefore looks in all three texts, and anywhere in each. Every verb step 1 can read is a
-    run of one of them, so this is true wherever step 1 reads a call. It is also true of a value that
-    only mentions one, which closes the gate and costs nothing but a hand-finish."""
-    readings = (value, strip_markup(value), *(token.text for token in parse_roles(value)))
-    return any(verb in text.lower() for text in readings for verb in _CALL_VERBS)
+    The gate therefore looks in all three texts, anywhere in each, and at their letters alone. Every
+    verb step 1 can read is a run of letters in one of them, so this is true wherever step 1 reads a
+    call. It is also true of text that only mentions a call, or marks one in another spelling, such
+    as the ``action-list-call-pass`` span class. That closes the gate and costs only a hand-finish."""
+    readings = (text, strip_markup(text), *(token.text for token in parse_roles(text)))
+    return any(word in _letters(reading) for reading in readings for word in _CALL_WORDS)
+
+
+def _may_call(elem: Element) -> bool:
+    """Whether ``elem`` may call a list: step 1 reads its tag as a call, or any string it holds names
+    one. Every string is read, not only ``@Data``: the tag, each attribute's name and value, and the
+    text in and after the element, which step 1 never reads."""
+    strings = (elem.tag, *elem.attrib, *elem.attrib.values(), elem.text or "", elem.tail or "")
+    return _local(elem.tag).lower() in _CALL_TAGS or any(map(_names_a_call, strings))
 
 
 def _hardened_fromstring(text: str) -> Element:
@@ -2082,10 +2099,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
     parents = {child: parent for parent in root.iter() for child in parent}
     # A list another list may call runs when and as often as its caller runs it, which the router
     # cannot express: so in a package that may call any list, no list is fully understood.
-    calls = any(
-        _local(elem.tag).lower() in _CALL_TAGS or any(map(_names_a_call, elem.attrib.values()))
-        for elem in root.iter()
-    )
+    calls = any(map(_may_call, root.iter()))
 
     handlers: list[Handler] = []
     taken: set[str] = {"route"}
