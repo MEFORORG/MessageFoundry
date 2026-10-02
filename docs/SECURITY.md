@@ -2146,7 +2146,9 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The policy is applied** — `tests/test_field_authz_enforcement_sites.py` hits the redaction
   surfaces over HTTP as a caller lacking `messages:view_summary` (a Viewer, plus a `custom:` role
   holding `view_raw` **without** `view_summary` for the detail route, and one holding
-  `monitoring:diagnose` without it for the alert list) and asserts every gated property
+  `monitoring:diagnose` without it for the alert list). Minting refuses the `view_raw` role since
+  vault BACKLOG #1187, so that fixture lifts the pairing rule alone (`tests/_role_pairing.py`) to
+  prove the route tier holds as a second line and asserts every gated property
   comes back `null`, with a companion assertion that an administrator sees all fifteen — matched **per
   model, not per property name** — so the negative cannot pass vacuously. That distinction is
   load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on

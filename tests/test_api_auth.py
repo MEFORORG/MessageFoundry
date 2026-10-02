@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -29,6 +28,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._role_pairing import bypass_view_raw_pairing_rule
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -509,22 +509,12 @@ async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
     ``body``, the answer a caller without ``view_raw`` gets.
 
     Minting refuses such a custom role and decoding drops ``view_raw`` from a stored one (see
-    test_custom_roles.py). This pins the route gates as the second line, so it stands in a
-    validator and decoder from before that rule.
+    test_custom_roles.py). This pins the route gates as the second line, so it lifts that one
+    rule (``tests/_role_pairing.py``).
 
     The ``both`` custom role is the control arm: it differs from ``rawonly`` by ``view_summary``
     alone, and it reads both bodies, so the refusals are that permission and not a broken route."""
-    import messagefoundry.auth.service as service_module
-    from messagefoundry.auth.permissions import Permission
-
-    def validate(values: list[str]) -> list[Permission]:
-        return sorted({Permission(v) for v in values}, key=lambda p: p.value)
-
-    def decode(raw: str | None) -> frozenset[Permission]:
-        return frozenset(Permission(v) for v in json.loads(raw or "[]"))
-
-    monkeypatch.setattr(service_module, "validate_custom_role_permissions", validate)
-    monkeypatch.setattr(service_module, "decode_custom_role_permissions", decode)
+    bypass_view_raw_pairing_rule(monkeypatch)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     await _add(service, "adm", Role.ADMINISTRATOR)
@@ -574,6 +564,38 @@ async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
     # The response.read row records that no body went out to the view_raw-only caller.
     reads = [dict(r) for r in await engine.store.list_audit(action="response.read")]
     assert any(r["actor"] == "rawonly" and '"body": false' in r["detail"] for r in reads), reads
+
+
+async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) -> None:
+    """vault BACKLOG #1187: the admin's own surface, POST and PUT /roles/custom, answers 400 with the
+    pairing message. The control creates the same role with view_summary added."""
+    service = await _service(engine)
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])  # a fresh login is step-up fresh
+        refused = await c.post(
+            "/roles/custom",
+            headers=h,
+            json={"display_name": "Raw", "permissions": ["messages:read", "messages:view_raw"]},
+        )
+        assert refused.status_code == 400, refused.text
+        assert "messages:view_raw needs messages:view_summary" in refused.json()["detail"]
+        made = await c.post(
+            "/roles/custom",
+            headers=h,
+            json={
+                "display_name": "Raw and summary",
+                "permissions": ["messages:read", "messages:view_raw", "messages:view_summary"],
+            },
+        )
+        assert made.status_code == 201, made.text
+        edited = await c.put(
+            f"/roles/custom/{made.json()['id']}",
+            headers=h,
+            json={"display_name": "Raw", "permissions": ["messages:view_raw"]},
+        )
+        assert edited.status_code == 400, edited.text
+        assert "messages:view_raw needs messages:view_summary" in edited.json()["detail"]
 
 
 def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:
