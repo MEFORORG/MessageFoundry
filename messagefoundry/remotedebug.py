@@ -85,7 +85,8 @@ REMOTE_SCRIPT_EVENT: Final = "cpython.remote_debugger_script"
 #: when one already installed objects, so asking is the only way to know.
 _PROBE_EVENT: Final = "messagefoundry.remotedebug.probe"
 
-#: The injecting process chooses the script's name, so the logged copy is bounded.
+#: The injecting process chooses the script's name, so the logged copy is bounded: this many
+#: characters of the name, and at most ten times that once :func:`_ascii` has escaped them.
 _FILE_NAME_LIMIT: Final = 120
 
 #: Refusals waiting for the reporter thread. Past this the refusal is still counted and still
@@ -131,6 +132,22 @@ def _guard(event: str, args: tuple[object, ...]) -> None:
         args[0].append(True)
 
 
+def _ascii(name: str) -> str:
+    """``name`` with every character outside ASCII written as a backslash escape.
+
+    The injecting process chooses the name, and a log sink encodes what it is given. Measured on
+    the three sinks ``configure_logging`` builds (vault BACKLOG #2742): a lone surrogate fails the
+    write on the ``[logging].file`` sink and on the syslog forwarder, which both encode UTF-8, so
+    the refusal line reaches neither. Standard output keeps the line only where ``main()`` has
+    set the stream to replace what it cannot encode, and it then shows ``?`` for the character.
+    An ASCII line is written whole by all three, whatever each one's encoding.
+
+    This covers this module's one line. A lone surrogate in any other log line fails the same two
+    sinks the same way.
+    """
+    return name.encode("ascii", "backslashreplace").decode("ascii")
+
+
 def _report(name: str) -> None:
     # Scrubbed here as well as by the handlers: the injecting process chooses the name, it may
     # hold a line break, and a handler with no filter chain would write it as it came.
@@ -138,7 +155,7 @@ def _report(name: str) -> None:
         "refused a script that another process injected through the interpreter's remote "
         "debugging (audit event %s, script file name %s). Nothing in it ran.",
         REMOTE_SCRIPT_EVENT,
-        scrub_log_argument(name),
+        scrub_log_argument(_ascii(name)),
     )
 
 

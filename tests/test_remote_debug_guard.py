@@ -18,9 +18,12 @@ Every other arm has a control too, named in its test.
 from __future__ import annotations
 
 import ast
+import io
+import json
 import logging
 import os
 import queue
+import socket
 import subprocess
 import sys
 import time
@@ -45,6 +48,8 @@ from messagefoundry.config.settings import (
     security_loosenings,
 )
 from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.logging_guard import active_guard
+from messagefoundry.logging_setup import LogFile, SyslogForward, configure_logging
 from messagefoundry.pipeline import Engine
 from messagefoundry.remotedebug import (
     REMOTE_SCRIPT_EVENT,
@@ -350,6 +355,137 @@ def test_a_long_file_name_is_cut(reports: queue.SimpleQueue[str]) -> None:
     with pytest.raises(RemoteScriptRefused):
         remotedebug._guard(REMOTE_SCRIPT_EVENT, ("x" * 5000,))
     assert len(reports.get_nowait()) == remotedebug._FILE_NAME_LIMIT
+
+
+# --- the refusal line and the log sinks (vault BACKLOG #2742) -----------------------------------
+
+#: File names the injecting process could choose, and how the log must spell each. Written as
+#: escapes so this file stays ASCII. The last one is the control: a plain name is logged as it is.
+_NAMES = [
+    pytest.param("pay\udcffload.py", r"pay\udcffload.py", id="lone-low-surrogate"),
+    pytest.param("pay\ud83dload.py", r"pay\ud83dload.py", id="lone-high-surrogate"),
+    pytest.param("pay\u4e2dload.py", r"pay\u4e2dload.py", id="outside-cp1252"),
+    pytest.param("pay\U0001f600load.py", r"pay\U0001f600load.py", id="astral"),
+    pytest.param("pay\xe9load.py", r"pay\xe9load.py", id="latin-1"),
+    pytest.param("payload.py", "payload.py", id="plain-ascii"),
+]
+
+
+@pytest.mark.parametrize(("name", "spelled"), _NAMES)
+def test_the_warning_is_ascii_whatever_the_file_name(
+    caplog: pytest.LogCaptureFixture, name: str, spelled: str
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.remotedebug"):
+        remotedebug._report(name)
+    message = caplog.records[-1].getMessage()
+    assert message.isascii()
+    assert f"script file name {spelled})" in message
+
+
+class _Sinks:
+    """The three sinks ``configure_logging`` builds, each one readable by the test.
+
+    Standard output is a strict cp1252 stream: the encoding a redirected stdout has on a stock
+    Windows install, with none of the leniency ``main()`` adds. The forwarder sends UDP to a
+    socket this object holds."""
+
+    def __init__(self, directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.directory = directory
+        self.log = directory / "engine.log"
+        self._stdout = io.BytesIO()
+        # Held here: dropping the wrapper would close the buffer under it.
+        self._stream = io.TextIOWrapper(
+            self._stdout, encoding="cp1252", errors="strict", write_through=True
+        )
+        monkeypatch.setattr(sys, "stdout", self._stream)
+        self.collector = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.collector.bind(("127.0.0.1", 0))
+        self.collector.settimeout(0.2)
+        configure_logging(
+            "INFO",
+            log_file=LogFile(path=str(self.log)),
+            forward=SyslogForward(host="127.0.0.1", port=self.collector.getsockname()[1]),
+            # Nothing here is an engine, and the control arm fails every sink on purpose.
+            stop_on_write_failure=False,
+        )
+
+    def on_stdout(self) -> str:
+        return self._stdout.getvalue().decode("cp1252")
+
+    def in_file(self) -> str:
+        return self.log.read_text("utf-8")
+
+    def rolled_aside(self) -> list[str]:
+        return sorted(p.name for p in self.directory.iterdir() if ".broken-" in p.name)
+
+    def states(self) -> dict[str, str]:
+        guard = active_guard()
+        assert guard is not None
+        return {status.sink: status.state for status in guard.status()}
+
+    def forwarded(self, wait: float) -> str:
+        """Every datagram that arrives within ``wait`` seconds, or up to the refusal line."""
+        received = ""
+        deadline = time.monotonic() + wait
+        while REMOTE_SCRIPT_EVENT not in received and time.monotonic() < deadline:
+            try:
+                received += self.collector.recvfrom(65535)[0].decode("utf-8")
+            except TimeoutError:
+                continue
+        return received
+
+
+@pytest.fixture
+def build_sinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[], _Sinks]]:
+    """Build the sinks from the test body, not from fixture set-up. pytest puts its own stdout
+    back between the two, and the stdout sink moves to whatever ``sys.stdout`` is when a write
+    fails, so sinks built in set-up would be rescued by pytest's lenient stream."""
+    built: list[_Sinks] = []
+
+    def build() -> _Sinks:
+        built.append(_Sinks(tmp_path, monkeypatch))
+        return built[-1]
+
+    yield build
+    for one in built:
+        one.collector.close()
+
+
+@pytest.mark.parametrize(("name", "spelled"), _NAMES)
+def test_the_refusal_line_reaches_every_sink_whatever_the_file_name(
+    build_sinks: Callable[[], _Sinks], name: str, spelled: str
+) -> None:
+    """The injecting process chooses the name, and it must not be able to keep the refusal out
+    of a log. The control for these arms is the test below, on the same sinks."""
+    sinks = build_sinks()
+    remotedebug._report(name)
+    wanted = f"script file name {spelled})"
+    assert REMOTE_SCRIPT_EVENT in sinks.in_file() and wanted in sinks.in_file()
+    assert wanted in sinks.on_stdout()
+    # The forwarder renders JSON, so a backslash in the name arrives doubled.
+    assert json.dumps(wanted)[1:-1] in sinks.forwarded(_WAIT)
+    assert sinks.rolled_aside() == []
+    assert sinks.states() == {"stdout": "healthy", "file": "healthy"}
+
+
+def test_without_the_escape_a_lone_surrogate_keeps_the_line_out_of_every_sink(
+    build_sinks: Callable[[], _Sinks], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CONTROL for the test above: the same sinks and the same name, with the name passed as it
+    came. The line reaches none of them and the log file is rolled aside, so every assertion
+    above could have failed.
+
+    This arm depends on the sinks themselves failing on a lone surrogate, which they do for any
+    logger's line. If a later change makes the sinks take any string, this arm goes red: delete
+    it then, and the escape is no longer what protects the line."""
+    sinks = build_sinks()
+    monkeypatch.setattr(remotedebug, "_ascii", lambda name: name)
+    remotedebug._report("pay\udcffload.py")
+    assert REMOTE_SCRIPT_EVENT not in sinks.in_file()
+    assert REMOTE_SCRIPT_EVENT not in sinks.on_stdout()
+    assert REMOTE_SCRIPT_EVENT not in sinks.forwarded(1.0)
+    assert len(sinks.rolled_aside()) == 1
+    assert sinks.states() == {"stdout": "unwritable", "file": "unwritable"}
 
 
 # --- installing --------------------------------------------------------------------------------
