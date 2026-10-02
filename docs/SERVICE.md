@@ -419,25 +419,26 @@ readings. The `windows-service-smoke` CI leg reads the registration, the running
 line and that block. Nobody has read a result from it yet: it runs on a schedule, on dispatch and
 in the merge queue, not on a pull request.
 
-**Keep the service account out of the install's `site-packages`.** Isolated mode does not stop
-start-up code. The interpreter runs every line of a `.pth` file that begins with `import`, and a
-module named `sitecustomize`, from the install's site directories, before any engine code. So
-whoever can write those directories runs code inside the engine at its next start.
+**Keep the service account out of the directories the interpreter reads start-up code from.**
+Isolated mode does not stop start-up code. The interpreter runs every line of a `.pth` file that
+begins with `import`, and a module named `sitecustomize`, before any engine code. So whoever can
+write one of those directories runs code inside the engine at its next start.
 
 - The engine lists that start-up code at every start. Under `[security].enforcement = "enforce"`
   it refuses to start on a file no installed package records, and names it. That check is
   detection: code that already ran can defeat it.
-- The engine also reads whether its own account can add a file there, and reports
-  `site_packages_writable` when it can. On Windows the site directories are the virtual
-  environment's own folder and its `Lib\site-packages`.
-- **The installer does not change the virtual environment's permissions.** Check them yourself:
-  `icacls <venv>` and `icacls <venv>\Lib\site-packages`. Under the default account,
+- The engine also reads whether its own account can add a file to each of those directories,
+  and reports `startup_directory_writable`, naming them, when it can. On Windows they are the
+  virtual environment's own folder, its `Lib\site-packages`, the base interpreter's folders, and
+  with an editable install the repository itself.
+- **The installer does not change the permissions of any of them.** Check them yourself with
+  `icacls`. Under the default account,
   [Restrict the service token](#restrict-the-service-token) lists the entries that would let the
   engine write. Under `-AllowLocalSystem` the engine runs as SYSTEM, which a directory's
   permissions usually grant full control.
 
 What counts as expected start-up code, and what each entry leaves open, is in
-[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-site_packages_writable-what-runs-in-the-interpreter-before-the-engine-does).
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-startup_directory_writable-what-runs-in-the-interpreter-before-the-engine-does).
 
 ### Protect the store encryption key at rest (WP-11d)
 

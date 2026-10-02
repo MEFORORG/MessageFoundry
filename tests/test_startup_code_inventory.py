@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import locale
 import os
 import shutil
+import site as site_module
 import subprocess
 import sys
+import venv
 from pathlib import Path
 
 import pytest
@@ -74,8 +77,11 @@ def site_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     site = tmp_path / "site-packages"
     site.mkdir()
     monkeypatch.setattr(startupcode, "_site_dirs", lambda: [site])
-    # The import path is searched for customize modules; keep it to the stand-in directory.
+    # The import path is searched for customize modules; keep it to the stand-in directory, and
+    # keep this run's own PYTHONPATH and user-site setting out of the reading.
     monkeypatch.setattr(sys, "path", [str(site)])
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(site_module, "ENABLE_USER_SITE", False)
     return site
 
 
@@ -118,13 +124,52 @@ def test_a_pth_file_a_package_records_is_expected_and_an_edited_one_is_not(site_
     assert (edited.verdict, edited.owner, edited.expected) == ("modified", "vendor", False)
 
 
-def test_the_packaging_tool_file_is_expected_only_with_its_own_content(site_dir: Path) -> None:
+def test_the_packaging_tool_file_is_expected_only_with_its_own_content(
+    site_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(startupcode, "_made_by_a_packaging_tool", lambda: True)
     pth = site_dir / "_virtualenv.pth"
     pth.write_text("import _virtualenv\n", "utf-8")
     assert _pth_verdicts(site_dir) == {"_virtualenv.pth": "packaging_tool"}
     # CONTROL: the same name with one more statement is not the tool's file.
     pth.write_text("import _virtualenv\nimport os\n", "utf-8")
     assert _pth_verdicts(site_dir) == {"_virtualenv.pth": "unrecorded"}
+
+
+def test_the_packaging_tool_file_is_expected_only_where_that_tool_made_the_environment(
+    tmp_path: Path, site_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``python -m venv`` writes no ``_virtualenv.pth``. One found in such an environment came from
+    somewhere else, and its name does not make it expected."""
+    (site_dir / "_virtualenv.pth").write_text("import _virtualenv\n", "utf-8")
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    cfg = tmp_path / "pyvenv.cfg"
+    cfg.write_text("home = /usr/bin\nversion = 3.14.0\n", "utf-8")
+    assert _pth_verdicts(site_dir) == {"_virtualenv.pth": "unrecorded"}
+    for key in ("virtualenv = 20.31.2", "uv = 0.8.0"):
+        cfg.write_text(f"home = /usr/bin\n{key}\n", "utf-8")
+        assert _pth_verdicts(site_dir) == {"_virtualenv.pth": "packaging_tool"}, key
+    # No pyvenv.cfg at all, as in an interpreter that is not a virtual environment.
+    cfg.unlink()
+    assert _pth_verdicts(site_dir) == {"_virtualenv.pth": "unrecorded"}
+
+
+def test_a_pth_file_is_split_into_lines_the_way_site_splits_it(
+    site_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``site`` reads a ``.pth`` as UTF-8 and falls back to the locale's encoding. Byte 0x85 is not
+    UTF-8; in Latin-1 it is a line break. So ``site`` runs the import after it, and a reader that
+    decoded the file another way would see one line that is not an import."""
+    monkeypatch.setattr(locale, "getencoding", lambda: "latin-1")
+    (site_dir / "split.pth").write_bytes(b"some/dir\x85import os\n")
+    assert startupcode._executable_lines(site_dir / "split.pth") == ["import os"]
+    # CONTROL: the same bytes without the break are one directory line.
+    (site_dir / "one.pth").write_bytes(b"some/dir import os\n")
+    assert startupcode._executable_lines(site_dir / "one.pth") == []
+    # A file neither encoding can read was not read, and is listed for its RECORD row to judge.
+    monkeypatch.setattr(locale, "getencoding", lambda: "ascii")
+    assert startupcode._executable_lines(site_dir / "split.pth") is None
+    assert "split.pth" in _pth_verdicts(site_dir)
 
 
 def test_the_engines_own_editable_pth_never_counts(site_dir: Path) -> None:
@@ -152,7 +197,7 @@ def test_a_sitecustomize_on_the_import_path_is_found_and_not_run(
         f"open({str(ran)!r}, 'w').close()\n", encoding="utf-8"
     )
     monkeypatch.setattr(sys, "path", [str(site_dir), str(elsewhere)])
-    items = startupcode._customize_items()
+    items = startupcode._customize_items([site_dir])
     assert [(i.kind, Path(i.path).parent.name, i.verdict) for i in items] == [
         ("sitecustomize", "on-pythonpath", "unrecorded")
     ]
@@ -165,10 +210,39 @@ def test_every_entry_is_searched_not_only_the_first_that_answers(
     first, second = tmp_path / "first", tmp_path / "second"
     for directory in (first, second):
         directory.mkdir()
-        (directory / "usercustomize.py").write_text("x = 1\n", encoding="utf-8")
+        (directory / "sitecustomize.py").write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(first), str(second)])
-    found = [Path(i.path).parent.name for i in startupcode._customize_items()]
+    found = [Path(i.path).parent.name for i in startupcode._customize_items([site_dir])]
     assert found == ["first", "second"]
+
+
+def test_usercustomize_counts_only_where_the_user_site_is_on(
+    site_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``site`` imports ``usercustomize`` only when the user site is enabled. It is off under
+    ``-I`` and in a virtual environment, and a file that cannot run there must not refuse a
+    start."""
+    (site_dir / "usercustomize.py").write_text("x = 1\n", encoding="utf-8")
+    assert startupcode._customize_items([site_dir]) == []
+    # CONTROL: with the user site on, the same file is listed.
+    monkeypatch.setattr(site_module, "ENABLE_USER_SITE", True)
+    assert [i.kind for i in startupcode._customize_items([site_dir])] == ["usercustomize"]
+
+
+def test_the_path_the_children_inherit_is_searched_too(
+    tmp_path: Path, site_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An isolated engine does not have PYTHONPATH on its own import path. Its Python children are
+    handed the absolute entries and are not isolated, so a module there runs in them."""
+    inherited = tmp_path / "inherited"
+    inherited.mkdir()
+    (inherited / "sitecustomize.py").write_text("x = 1\n", encoding="utf-8")
+    assert startupcode._customize_items([site_dir]) == []  # CONTROL: not on sys.path
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["relative/entry", str(inherited)]))
+    found = [Path(i.path).parent.name for i in startupcode._customize_items([site_dir])]
+    assert found == ["inherited"]
+    # The directory joins the ones checked for write access.
+    assert str(inherited) in read_startup_posture().startup_dirs
 
 
 def test_a_namespace_package_named_sitecustomize_runs_nothing_and_is_not_listed(
@@ -178,7 +252,7 @@ def test_a_namespace_package_named_sitecustomize_runs_nothing_and_is_not_listed(
     (tmp_path / "pkg" / "sitecustomize").mkdir(parents=True)
     (tmp_path / "pkg" / "sitecustomize" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(tmp_path / "ns"), str(tmp_path / "pkg")])
-    found = [Path(i.path).parent.parent.name for i in startupcode._customize_items()]
+    found = [Path(i.path).parent.parent.name for i in startupcode._customize_items([site_dir])]
     # CONTROL: the package with an __init__ IS listed.
     assert found == ["pkg"]
 
@@ -193,19 +267,68 @@ def test_a_sitecustomize_in_the_interpreters_own_library_is_expected(
     monkeypatch.setattr(
         startupcode, "_interpreter_dirs", lambda: frozenset({startupcode._norm(str(stdlib))})
     )
-    assert [i.verdict for i in startupcode._customize_items()] == ["interpreter"]
+    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["interpreter"]
     # CONTROL: the same file where the interpreter's library is not.
     monkeypatch.setattr(startupcode, "_interpreter_dirs", lambda: frozenset())
-    assert [i.verdict for i in startupcode._customize_items()] == ["unrecorded"]
+    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["unrecorded"]
 
 
 def test_a_sitecustomize_a_package_records_is_expected(site_dir: Path) -> None:
     module = site_dir / "sitecustomize.py"
     module.write_text("x = 1\n", encoding="utf-8")
-    assert [i.verdict for i in startupcode._customize_items()] == ["unrecorded"]
+    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["unrecorded"]
     _install_dist(site_dir, "hooks", [module])
-    items = startupcode._customize_items()
+    items = startupcode._customize_items([site_dir])
     assert [(i.verdict, i.owner) for i in items] == [("recorded", "hooks")]
+
+
+def test_a_sitecustomize_a_package_ships_in_a_directory_of_its_own_is_expected(
+    site_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Some packages ship the module in a sub-directory and put that directory on the import
+    path. The file's RECORD row is in the site directory above it, not in the entry it was found
+    on."""
+    bootstrap = site_dir / "agent" / "bootstrap"
+    bootstrap.mkdir(parents=True)
+    module = bootstrap / "sitecustomize.py"
+    module.write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(site_dir), str(bootstrap)])
+    # CONTROL: nothing records it yet.
+    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["unrecorded"]
+    _install_dist(site_dir, "agent", [module])
+    items = startupcode._customize_items([site_dir])
+    assert [(i.verdict, i.owner) for i in items] == [("recorded", "agent")]
+
+
+def test_the_interpreters_own_directories_are_the_base_interpreters(tmp_path: Path) -> None:
+    """In a virtual environment the plain ``platstdlib`` path is the environment's own library
+    folder. A module planted there must not read as the interpreter's, so the directories are
+    asked for with the base prefixes. Read off a real virtual environment, made here, so the
+    answer does not depend on how this test run was started."""
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    scripts = environment / ("Scripts" if sys.platform == "win32" else "bin")
+    probe = (
+        "import json, sys, sysconfig; from messagefoundry import startupcode; "
+        "print(json.dumps({'dirs': sorted(startupcode._interpreter_dirs()), "
+        "'plain': startupcode._norm(sysconfig.get_path('platstdlib')), "
+        "'prefix': startupcode._norm(sys.prefix)}))"
+    )
+    engine_root = str(Path(startupcode.__file__).resolve().parents[1])
+    proc = subprocess.run(
+        [str(scripts / "python"), "-c", probe],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": engine_root},
+        timeout=50,
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["dirs"], "CONTROL FAILED: no standard library directory was found"
+    # CONTROL: the plain answer IS inside the environment, so the hazard is real here.
+    assert Path(report["plain"]).is_relative_to(report["prefix"])
+    inside = [d for d in report["dirs"] if Path(d).is_relative_to(report["prefix"])]
+    assert not inside, f"the environment's own directory reads as the interpreter's: {inside}"
 
 
 # --- the writable-directory arm -------------------------------------------------------------------
@@ -249,16 +372,32 @@ def test_a_read_only_directory_reads_as_not_writable(tmp_path: Path) -> None:
         locked.chmod(0o755)
 
 
-def test_the_reading_lists_the_writable_site_directories(
+def test_the_reading_checks_every_directory_start_up_code_is_read_from(
+    tmp_path: Path, site_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A customize module is looked for on every import-path directory, so each of those is a
+    place to plant one, not only the site directories. An entry that is not a directory is not."""
+    on_path = tmp_path / "on-the-import-path"
+    on_path.mkdir()
+    archive = tmp_path / "bundle.zip"
+    archive.write_bytes(b"")
+    monkeypatch.setattr(sys, "path", [str(site_dir), str(on_path), str(archive), "missing-dir"])
+    monkeypatch.setattr(startupcode, "_can_add_files", lambda d: d == on_path)
+    reading = read_startup_posture()
+    assert reading.startup_dirs == (str(site_dir), str(on_path))
+    assert reading.writable_startup_dirs == (str(on_path),)
+
+
+def test_the_reading_lists_the_writable_start_up_directories(
     site_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(startupcode, "_can_add_files", lambda d: True)
-    assert read_startup_posture().writable_site_dirs == (str(site_dir),)
+    assert read_startup_posture().writable_startup_dirs == (str(site_dir),)
     monkeypatch.setattr(startupcode, "_can_add_files", lambda d: False)
-    assert read_startup_posture().writable_site_dirs == ()
+    assert read_startup_posture().writable_startup_dirs == ()
     monkeypatch.setattr(startupcode, "_can_add_files", lambda d: None)
     reading = read_startup_posture()
-    assert reading.unchecked_site_dirs == (str(site_dir),) and not reading.writable_site_dirs
+    assert reading.unchecked_startup_dirs == (str(site_dir),) and not reading.writable_startup_dirs
 
 
 # --- what is refused and what is reported ---------------------------------------------------------
@@ -274,9 +413,9 @@ def test_only_unexpected_start_up_code_refuses() -> None:
     assert "distutils-precedence" not in refusal
     # A plain launch with a writable site directory is reported, never refused: a developer's own
     # environment is both.
-    developer = StartupPosture(launch=_PLAIN, writable_site_dirs=("/venv",))
+    developer = StartupPosture(launch=_PLAIN, writable_startup_dirs=("/venv",))
     assert startup_refusal(developer) is None
-    assert _names(developer) == ["interpreter_not_isolated", "site_packages_writable"]
+    assert _names(developer) == ["interpreter_not_isolated", "startup_directory_writable"]
 
 
 def test_the_hardened_launch_reports_nothing() -> None:
@@ -288,10 +427,13 @@ def test_the_hardened_launch_reports_nothing() -> None:
     [
         (StartupPosture(launch=_PLAIN), ["interpreter_not_isolated"]),
         (StartupPosture(launch=_HARDENED, items=(_PLANTED,)), ["startup_code_unexpected"]),
-        (StartupPosture(launch=_HARDENED, writable_site_dirs=("/v",)), ["site_packages_writable"]),
         (
-            StartupPosture(launch=_HARDENED, unchecked_site_dirs=("/v",)),
-            ["site_packages_unchecked"],
+            StartupPosture(launch=_HARDENED, writable_startup_dirs=("/v",)),
+            ["startup_directory_writable"],
+        ),
+        (
+            StartupPosture(launch=_HARDENED, unchecked_startup_dirs=("/v",)),
+            ["startup_directory_unchecked"],
         ),
         (
             StartupPosture(
@@ -311,10 +453,14 @@ def test_a_variable_the_engine_honours_is_named_in_the_not_isolated_entry() -> N
     honoured = InterpreterLaunch(False, False, False, False, code_path_variables=("PYTHONPATH",))
     (risk,) = [r for n, r in startup_loosenings(StartupPosture(launch=honoured))]
     assert "PYTHONPATH is set in its environment now" in risk
+    assert "It reads the PYTHON* environment variables" in risk
     # CONTROL: under -E the same variable is not honoured, and the entry does not claim it is.
+    # The children still receive it, so that entry is there as well.
     ignored = InterpreterLaunch(False, False, True, False, code_path_variables=("PYTHONPATH",))
-    (risk,) = [r for n, r in startup_loosenings(StartupPosture(launch=ignored))]
-    assert "is set in its environment now" not in risk
+    entries = dict(startup_loosenings(StartupPosture(launch=ignored)))
+    assert list(entries) == ["interpreter_not_isolated", "python_variables_reach_children"]
+    assert "is set in its environment now" not in entries["interpreter_not_isolated"]
+    assert "It reads the PYTHON*" not in entries["interpreter_not_isolated"]
 
 
 def test_a_file_name_cannot_break_the_log_line() -> None:

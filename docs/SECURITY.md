@@ -4100,34 +4100,34 @@ which starts report it and how to clear it are stated once, in
 ### Isolated mode and start-up code of the engine's interpreter
 
 Two things put code inside a Python process before its first line runs: the `PYTHON*`
-environment variables, and the start-up code in the interpreter's site directories (a `.pth` line
-that begins with `import`, and a `sitecustomize` or `usercustomize` module). On a first
-deployment either would run inside the engine, with everything the engine holds.
+environment variables, and the interpreter's start-up code (a `.pth` line that begins with
+`import`, and a `sitecustomize` module). On a first deployment either would run inside the
+engine, with everything the engine holds.
 
 Three controls answer it:
 
 - **The shipped service launches are isolated.** The Windows installer registers the install's
   `python.exe` with `-I -X disable-remote-debug -m messagefoundry serve ...`, and the container
-  image's entry point is the same command with `-u -B` added. Under `-I` the interpreter ignores
-  every `PYTHON*` variable and keeps the working directory and the user's site directory off the
-  import path. `tests/test_isolated_launch.py` holds both launches to one list of options, and
-  each smoke leg reads the flags off the running engine.
+  image's entry point is the same command with `-u -B` added. What the options do is stated once,
+  in [SERVICE.md](SERVICE.md#the-service-launch). `tests/test_isolated_launch.py` holds both
+  launches to one list of options, and each smoke leg reads the flags off the running engine.
 - **`serve` and `supervise` inventory the start-up code** (`messagefoundry/startupcode.py`).
   Isolated mode does not stop it. Under `[security].enforcement = "enforce"` they refuse to start
   on a file no installed package records. This is detection: start-up code runs before the check.
-- **The site directories should not be writable by the service account.** That is the
-  prevention, and it is a deployment requirement the engine checks and reports. The container
-  image meets it: its virtual environment is owned by root and the engine runs as another user.
+- **The directories start-up code is read from should not be writable by the service account.**
+  That is the prevention, and it is a deployment requirement the engine checks and reports. The
+  container image meets it: its virtual environment is owned by root and the engine runs as
+  another user.
 
 What each control leaves open, what counts as expected start-up code, which entries a development
 start reports and how to clear each are stated once, in
-[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-site_packages_writable-what-runs-in-the-interpreter-before-the-engine-does).
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-startup_directory_writable-what-runs-in-the-interpreter-before-the-engine-does).
 
 **The engine's Python children are not isolated.** The sandbox worker and each engine shard start
 with `-P -X disable-remote-debug`, and the engine hands them the `PYTHON*` variables it holds,
 by name (`messagefoundry/childenv.py`). So a `PYTHONPATH` in the service's environment that the
 engine ignores would still reach an engine shard. The engine reports that case as
-`python_variables_reach_children`.
+`python_variables_reach_children`, and its inventory searches the entries a child would inherit.
 
 ### HIPAA §164.312 alignment
 

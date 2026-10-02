@@ -4449,13 +4449,15 @@ def _supervise(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2701: the start-up code check each shard's `serve` makes, for the same reason
     # as the gates around it, and because the supervisor's own interpreter ran that code too. The
     # supervisor builds no loosening list, so its own reading is logged here, like the
-    # remote-debugging one above. Each shard reports its own through `serve`.
+    # remote-debugging one above. Each shard reports its own through `serve`. The reading also
+    # searches the import path the shards inherit, so a module only they would run refuses here.
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.startupcode import startup_loosenings, startup_posture, startup_refusal
 
+    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
     startup = startup_posture()
     startup_refused = startup_refusal(startup)
-    if startup_refused is not None and settings.security.enforcement is SecurityEnforcement.ENFORCE:
+    if startup_refused is not None and enforcing:
         print(
             f"error: {startup_refused}. Every shard would refuse to start; refusing to start the "
             "fleet.",
@@ -4494,11 +4496,9 @@ def _supervise(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2601: the two key-file checks each shard's `serve` makes, for the same reason
     # as the gates above: every shard would refuse, and the supervisor would only restart them. The
     # store key file is checked before the renewal below can open the store and read it.
-    from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.restricted_file import RestrictedFileError
     from messagefoundry.store.base import KeylessAuditChainRefused
 
-    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
     if not _store_key_file_gate(settings, enforcing=enforcing):
         return 2
     try:

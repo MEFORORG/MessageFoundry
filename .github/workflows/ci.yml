@@ -4533,18 +4533,18 @@ jobs:
                   wrong.append(f"sys.flags.{flag} is not set")
           if interpreter["remote_debug_enabled"] is not False:
               wrong.append("remote debugging is enabled")
-          # CONTROL: the reading saw a site directory, so an empty writable list means something.
-          if not interpreter["site_dirs"]:
-              wrong.append("CONTROL FAILED: the engine reported no site directory")
-          if interpreter["writable_site_dirs"] or interpreter["unchecked_site_dirs"]:
-              wrong.append("the engine can write a site directory, or could not tell")
+          # CONTROL: the reading saw site-packages, so an empty writable list means something.
+          if not any(d.endswith("site-packages") for d in interpreter["startup_dirs"]):
+              wrong.append("CONTROL FAILED: the engine did not report site-packages as a start-up directory")
+          if interpreter["writable_startup_dirs"] or interpreter["unchecked_startup_dirs"]:
+              wrong.append("the engine can write a start-up directory, or could not tell")
           for name in (
               "interpreter_not_isolated",
               "remote_debug_enabled",
               "remote_debug_unguarded",
               "startup_code_unexpected",
-              "site_packages_writable",
-              "site_packages_unchecked",
+              "startup_directory_writable",
+              "startup_directory_unchecked",
           ):
               if name in loosened:
                   wrong.append(f"the posture names the loosening {name}")

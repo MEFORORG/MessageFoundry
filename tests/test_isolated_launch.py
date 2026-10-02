@@ -323,7 +323,7 @@ def test_the_image_smoke_leg_reads_the_launch_and_tries_the_write() -> None:
         "https://127.0.0.1:8765/security/posture",
         'for flag in ("isolated", "safe_path", "ignore_environment"):',
         'interpreter["remote_debug_enabled"] is not False',
-        'interpreter["writable_site_dirs"]',
+        'interpreter["writable_startup_dirs"]',
         "docker exec mefor touch /var/lib/mefor/write-control",
         'if docker exec mefor touch "$site/planted-by-smoke.pth"; then',
     ):

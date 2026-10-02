@@ -35,12 +35,12 @@ def _view(**overrides: object) -> InterpreterView:
 
 def test_no_reading_is_a_dash_in_every_row_and_never_a_hardened_launch() -> None:
     absent = _values(None)
-    hardened = _values(_view())
+    hardened = _values(_view(startup_dirs=["/s", "/lib"]))
     assert len(absent) == 3 and len(set(absent)) == 1
     assert hardened == [
         "yes",
         "off",
-        "0 found, 0 not expected; 0 site directories writable by the engine",
+        "0 found, 0 not expected; 0 of 2 start-up directories writable by the engine",
     ]
     assert not set(absent) & set(hardened)
 
@@ -62,7 +62,15 @@ def test_the_start_up_row_counts_what_was_found_and_what_was_not_expected() -> N
     planted = StartupCodeItemView(
         kind="sitecustomize", path="/s/sitecustomize.py", verdict="unrecorded", expected=False
     )
-    row = _values(_view(startup_code=[known, planted], writable_site_dirs=["/s"]))[2]
-    assert row == "2 found, 1 not expected; 1 site directories writable by the engine"
+    view = _view(startup_code=[known, planted], startup_dirs=["/s"], writable_startup_dirs=["/s"])
+    row = _values(view)[2]
+    assert row == "2 found, 1 not expected; 1 of 1 start-up directories writable by the engine"
     # The file names stay out of the page: they are in GET /security/posture.
     assert "sitecustomize" not in row
+
+
+def test_a_directory_that_could_not_be_checked_does_not_read_as_not_writable() -> None:
+    checked = _values(_view(startup_dirs=["/s"]))[2]
+    unchecked = _values(_view(startup_dirs=["/s"], unchecked_startup_dirs=["/s"]))[2]
+    assert checked.endswith("0 of 1 start-up directories writable by the engine")
+    assert unchecked.endswith("0 of 1 start-up directories writable by the engine, 1 NOT CHECKED")

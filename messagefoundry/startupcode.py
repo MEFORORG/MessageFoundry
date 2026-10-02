@@ -20,10 +20,10 @@ BACKLOG #2701).
 1. The launch flags (:class:`InterpreterLaunch`): whether the interpreter is isolated, and which
    of the ``PYTHON*`` variables that change where code loads from are set.
 2. The start-up code (:class:`StartupCodeItem`): each ``.pth`` file with an ``import`` line in a
-   site directory, and each ``sitecustomize`` or ``usercustomize`` module on the import path. Each
-   one is *expected* or it is not, by the rule under :data:`Verdict`.
-3. Whether this process can add a file to a site directory. That is the prevention; the inventory
-   is only detection.
+   site directory, and each customize module on the import path. Each one is *expected* or it is
+   not, by the rule under :data:`Verdict`.
+3. Whether this process can add a file to a directory start-up code is read from. That is the
+   prevention; the inventory is only detection.
 
 ``serve`` and ``supervise`` read it at start. Under ``[security].enforcement = "enforce"`` they
 refuse to start on start-up code that is not expected (:func:`startup_refusal`). Everything else
@@ -32,25 +32,36 @@ is reported as a loosening (:func:`startup_loosenings`), through ``security_loos
 
 **What "expected" means, and where the list comes from.** There is no list of file names in this
 module, apart from one (:data:`_PACKAGING_TOOL_PTH`). A file is expected when an installed
-distribution in the same directory names it in its ``RECORD`` with a matching hash
+distribution names it in its ``RECORD`` with a matching hash
 (:func:`messagefoundry.integrity.record_verdict`). So a ``.pth`` that came with a package, which
 includes the one an editable install of the engine writes and the one setuptools ships, is
 expected on any install, and a file somebody dropped beside them is not. A ``sitecustomize`` in the
-interpreter's own standard library directory is expected too: some operating-system builds ship
+BASE interpreter's standard library directory is expected too: some operating-system builds ship
 one, and whoever can write that directory can replace the standard library itself.
+
+**The children's import path is searched too.** The engine hands its Python children the absolute
+entries of ``PYTHONPATH`` (``messagefoundry/childenv.py``), and they are not isolated. So a
+``sitecustomize`` there runs in the sandbox worker and in each engine shard even when the engine
+itself ignores the variable. Those entries are searched beside the engine's own import path.
 
 **What this is not.** Start-up code runs first. A planted ``.pth`` line runs before any engine
 code, with the engine's rights, and could change what this module reads or skip it. The baseline
 has the same limit ``messagefoundry/integrity.py`` records for its own: ``RECORD`` sits in the
 directory it describes, so whoever can write the directory can write a matching row. The inventory
-catches an honest mistake and a careless plant. A site directory the service account cannot write
-is what stops a plant, which is why the third reading exists.
+catches an honest mistake and a careless plant. A directory the service account cannot write is
+what stops a plant, which is why the third reading exists.
 
-**Not covered.** A ``.pth`` file with no ``import`` line only adds directories to the import
-path. It is not start-up code and is not listed, though a module found through it may be. Nor is a
-package's own import-time code: that is ``messagefoundry/integrity.py`` for the engine's files and
-nothing for a third-party package. The Python children the engine starts are not isolated; see
-:func:`startup_loosenings`.
+**Not covered**, at least:
+
+* A ``.pth`` file with no ``import`` line. It only adds directories to the import path, so it is
+  not start-up code and is not listed. A customize module found through it is.
+* A package's own import-time code. That is ``messagefoundry/integrity.py`` for the engine's files
+  and nothing for a third-party package.
+* The module a packaging tool's ``.pth`` imports (:data:`_PACKAGING_TOOL_PTH`): only the ``.pth``
+  line is compared.
+* A child's user site directory. Outside a virtual environment a child that is not isolated has
+  one, and an isolated engine does not look there.
+* An import-path entry that is an archive. Only directories are checked for write access.
 
 No engine state. The standard library, ``messagefoundry.controlchars`` and, when a file needs a
 ``RECORD`` lookup, ``messagefoundry.integrity``.
@@ -60,6 +71,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib.machinery
+import locale
 import os
 import site
 import stat
@@ -105,11 +117,11 @@ _CODE_PATH_VARIABLES: Final = (
 
 #: How one piece of start-up code was classified.
 #:
-#: * ``recorded``: an installed distribution in the same directory lists the file in its
-#:   ``RECORD``, and the bytes match. Expected.
-#: * ``interpreter``: the file is in the interpreter's own standard library directory. Expected.
-#: * ``packaging_tool``: one of :data:`_PACKAGING_TOOL_PTH`, with exactly the content named there.
-#:   Expected.
+#: * ``recorded``: an installed distribution lists the file in its ``RECORD``, and the bytes
+#:   match. Expected.
+#: * ``interpreter``: the file is in the base interpreter's standard library directory. Expected.
+#: * ``packaging_tool``: one of :data:`_PACKAGING_TOOL_PTH`, with exactly the content named there,
+#:   in an environment that tool made. Expected.
 #: * ``modified``: a distribution lists the file, and its bytes differ from the row. Not expected.
 #: * ``unrecorded``: nothing lists the file. Not expected.
 Verdict = Literal["recorded", "interpreter", "packaging_tool", "modified", "unrecorded"]
@@ -118,15 +130,18 @@ _EXPECTED: Final[frozenset[Verdict]] = frozenset({"recorded", "interpreter", "pa
 
 #: ``.pth`` files a tool writes straight into a site directory, with no distribution to record
 #: them, by name and by the one statement each may hold. ``virtualenv`` and ``uv venv`` write
-#: ``_virtualenv.pth`` into every environment they create. The name alone is not enough: the file
-#: is expected only while its executable content is exactly this.
+#: ``_virtualenv.pth`` into every environment they create. The name alone is not enough. The file
+#: is expected only while its executable content is exactly this, and only in an environment
+#: whose ``pyvenv.cfg`` says one of :data:`_PACKAGING_TOOL_KEYS` made it: ``python -m venv`` writes
+#: no such file, so one found there was put there by something else.
 _PACKAGING_TOOL_PTH: Final = {"_virtualenv.pth": "import _virtualenv"}
+
+#: The ``pyvenv.cfg`` keys the tools above leave behind.
+_PACKAGING_TOOL_KEYS: Final = frozenset({"virtualenv", "uv"})
 
 #: What kind of start-up code a file is: a ``.pth`` file, or one of the two modules ``site``
 #: imports at start when it finds them.
 Kind = Literal["pth", "sitecustomize", "usercustomize"]
-
-_CUSTOMIZE_MODULES: Final[tuple[Kind, ...]] = ("sitecustomize", "usercustomize")
 
 #: A ``.pth`` file larger than this is not read for its lines. It is listed as start-up code
 #: without being parsed: no packaging tool writes one this size.
@@ -155,7 +170,7 @@ class InterpreterLaunch:
 
 @dataclass(frozen=True, slots=True)
 class StartupCodeItem:
-    """One file that runs, or would run, when this interpreter starts."""
+    """One file that runs, or would run, when this interpreter or one of its children starts."""
 
     kind: Kind
     path: str
@@ -175,12 +190,14 @@ class StartupPosture:
     launch: InterpreterLaunch
     #: Every piece of start-up code found, expected or not, in a stable order.
     items: tuple[StartupCodeItem, ...] = ()
-    #: The directories ``site`` reads ``.pth`` files from in this process.
-    site_dirs: tuple[str, ...] = ()
-    #: The site directories this process can add a file to.
-    writable_site_dirs: tuple[str, ...] = ()
-    #: The site directories where that could not be determined. Not a clean result.
-    unchecked_site_dirs: tuple[str, ...] = ()
+    #: The directories start-up code is read from: the site directories, whose ``.pth`` files
+    #: ``site`` reads, and every directory on the import path, where it looks for a customize
+    #: module.
+    startup_dirs: tuple[str, ...] = ()
+    #: The ones this process can add a file to.
+    writable_startup_dirs: tuple[str, ...] = ()
+    #: The ones where that could not be determined. Not a clean result.
+    unchecked_startup_dirs: tuple[str, ...] = ()
 
     @property
     def unexpected(self) -> tuple[StartupCodeItem, ...]:
@@ -189,6 +206,18 @@ class StartupPosture:
 
 def _norm(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
+
+
+def _unique(paths: list[str]) -> list[str]:
+    """``paths`` made absolute, in order, without repeats."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for path in paths:
+        key = _norm(path)
+        if key not in seen:
+            seen.add(key)
+            out.append(os.path.abspath(path))
+    return out
 
 
 def _interpreter_launch() -> InterpreterLaunch:
@@ -210,14 +239,18 @@ def _site_dirs() -> list[Path]:
     candidates = list(site.getsitepackages())
     if site.ENABLE_USER_SITE:
         candidates.append(site.getusersitepackages())
-    seen: set[str] = set()
-    out: list[Path] = []
-    for candidate in candidates:
-        key = _norm(candidate)
-        if key not in seen and os.path.isdir(candidate):
-            seen.add(key)
-            out.append(Path(os.path.abspath(candidate)))
-    return out
+    return [Path(path) for path in _unique(candidates) if os.path.isdir(path)]
+
+
+def _search_path() -> list[str]:
+    """The import path a customize module is looked for on: this process's, then the absolute
+    ``PYTHONPATH`` entries the engine hands its Python children. A process that reads the
+    variable has them on its own path already."""
+    inherited = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    return _unique(
+        [entry or os.getcwd() for entry in sys.path]
+        + [entry for entry in inherited if os.path.isabs(entry)]
+    )
 
 
 def _is_hidden(path: Path) -> bool:
@@ -237,24 +270,49 @@ def _is_hidden(path: Path) -> bool:
 def _executable_lines(path: Path) -> list[str] | None:
     """The lines of a ``.pth`` file that ``site`` executes, or None when the file was not read.
 
-    ``site`` executes a line that begins with ``import`` and a space or a tab, exactly, and treats
-    every other line as a directory or a comment. Trailing white space is dropped here, so a line
-    ending differs from :data:`_PACKAGING_TOOL_PTH` by nothing."""
+    This mirrors ``site.addpackage``, so that it splits the file into the lines ``site`` saw. The
+    bytes are read as UTF-8 and, where that fails, in the locale's encoding, as ``site`` does: a
+    different decoding can put a line break in a different place. ``site`` executes a line that
+    begins with ``import`` and a space or a tab, exactly. Trailing white space is dropped here,
+    so a line ending differs from :data:`_PACKAGING_TOOL_PTH` by nothing."""
     try:
         if path.stat().st_size > _PTH_READ_LIMIT:
             return None
-        text = path.read_bytes().decode("utf-8-sig", errors="replace")
+        raw = path.read_bytes()
     except OSError:
         return None
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode(locale.getencoding())
+        except (UnicodeDecodeError, LookupError):
+            return None
     return [line.rstrip() for line in text.splitlines() if line.startswith(("import ", "import\t"))]
 
 
-def _recorded(path: Path, directory: Path) -> tuple[Verdict, str | None]:
+def _recorded(path: Path, roots: list[Path]) -> tuple[Verdict, str | None]:
+    """The ``RECORD`` verdict for ``path`` against the distributions installed in each of
+    ``roots``, first answer wins. ``unrecorded`` when none of them lists it."""
     # Imported here: the settings module imports this one for its types, and the lookup needs the
     # packaging metadata reader, which is only wanted when there is a file to look up.
     from messagefoundry.integrity import record_verdict
 
-    return record_verdict(path, directory)
+    for root in roots:
+        verdict, owner = record_verdict(path, root)
+        if verdict != "unrecorded":
+            return verdict, owner
+    return "unrecorded", None
+
+
+def _made_by_a_packaging_tool() -> bool:
+    """Whether this environment's ``pyvenv.cfg`` carries one of :data:`_PACKAGING_TOOL_KEYS`."""
+    try:
+        text = (Path(sys.prefix) / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    keys = {line.partition("=")[0].strip().lower() for line in text.splitlines() if "=" in line}
+    return bool(keys & _PACKAGING_TOOL_KEYS)
 
 
 def _pth_items(directory: Path) -> list[StartupCodeItem]:
@@ -272,50 +330,58 @@ def _pth_items(directory: Path) -> list[StartupCodeItem]:
         lines = _executable_lines(path)
         if lines == []:
             continue  # directories only: not start-up code (see the module docstring)
-        if lines == [_PACKAGING_TOOL_PTH.get(name)]:
+        if lines == [_PACKAGING_TOOL_PTH.get(name)] and _made_by_a_packaging_tool():
             items.append(StartupCodeItem("pth", str(path), "packaging_tool"))
             continue
-        verdict, owner = _recorded(path, directory)
+        verdict, owner = _recorded(path, [directory])
         items.append(StartupCodeItem("pth", str(path), verdict, owner))
     return items
 
 
 def _interpreter_dirs() -> frozenset[str]:
-    """The interpreter's own standard library directories. In a virtual environment these are the
-    base interpreter's, which is the point: the environment's own directories are not in here."""
-    found = (sysconfig.get_path(name) for name in ("stdlib", "platstdlib"))
+    """The BASE interpreter's standard library directories.
+
+    Asked for with the base prefixes on purpose. In a virtual environment the plain
+    ``platstdlib`` answer is the environment's own library folder, which the environment's owner
+    can write, and a module planted there must not read as the interpreter's."""
+    base = {"base": sys.base_prefix, "platbase": sys.base_exec_prefix}
+    found = (sysconfig.get_path(name, vars=base) for name in ("stdlib", "platstdlib"))
     return frozenset(_norm(path) for path in found if path)
 
 
-def _customize_items() -> list[StartupCodeItem]:
-    """Each ``sitecustomize`` and ``usercustomize`` module findable on the import path.
+def _customize_modules() -> tuple[Kind, ...]:
+    """The module names ``site`` imports at start. ``usercustomize`` only where the user site is
+    on, which is the only place ``site`` imports it."""
+    return ("sitecustomize", "usercustomize") if site.ENABLE_USER_SITE else ("sitecustomize",)
+
+
+def _customize_items(site_dirs: list[Path]) -> list[StartupCodeItem]:
+    """Each customize module findable on the search path (:func:`_search_path`).
 
     Every entry is searched, not only the first that answers: a module on a later entry runs the
     day the earlier one is removed. Nothing is imported. A module found on an entry that was added
     after start-up, such as the working directory under ``python -m``, did not run at this start
-    and is listed anyway."""
+    and is listed anyway.
+
+    A package may ship the module in a directory of its own and put that directory on the import
+    path, so the ``RECORD`` lookup also asks each site directory the file sits under."""
     interpreter_dirs = _interpreter_dirs()
+    names = _customize_modules()
     items: list[StartupCodeItem] = []
-    seen: set[str] = set()
-    for entry in sys.path:
-        root = os.path.abspath(entry or os.getcwd())
-        key = _norm(root)
-        if key in seen:
-            continue
-        seen.add(key)
-        for name in _CUSTOMIZE_MODULES:
+    for root in _search_path():
+        for name in names:
             try:
                 spec = importlib.machinery.PathFinder.find_spec(name, [root])
             except (ImportError, OSError, ValueError):
                 spec = None
             if spec is None or spec.origin is None or not spec.has_location:
                 continue  # nothing there, or a namespace package, which runs no code
-            if key in interpreter_dirs:
+            if _norm(root) in interpreter_dirs:
                 items.append(StartupCodeItem(name, spec.origin, "interpreter"))
                 continue
-            # A distribution can only record a file under the directory its metadata sits in,
-            # which is the entry the module was found on.
-            verdict, owner = _recorded(Path(spec.origin), Path(root))
+            origin = Path(spec.origin)
+            holders = [d for d in site_dirs if d != Path(root) and origin.is_relative_to(d)]
+            verdict, owner = _recorded(origin, [Path(root), *holders])
             items.append(StartupCodeItem(name, spec.origin, verdict, owner))
     return items
 
@@ -376,7 +442,7 @@ def _can_add_files(directory: Path) -> bool | None:
 
 
 def read_startup_posture() -> StartupPosture:
-    """Read the launch flags, the start-up code and the site directories of THIS process, now.
+    """Read the launch flags, the start-up code and its directories for THIS process, now.
 
     Blocking file reads: directory listings, and one hash for each ``.pth`` or customize module
     that needs a ``RECORD`` lookup. Never raises for a file it cannot read. An interpreter started
@@ -386,21 +452,27 @@ def read_startup_posture() -> StartupPosture:
         return StartupPosture(launch=launch)
     site_dirs = _site_dirs()
     items = [item for directory in site_dirs for item in _pth_items(directory)]
-    items.extend(_customize_items())
+    items.extend(_customize_items(site_dirs))
+    # An import-path entry that is an archive, or that does not exist, holds no file to plant.
+    startup_dirs = [
+        path
+        for path in _unique([*(str(d) for d in site_dirs), *_search_path()])
+        if os.path.isdir(path)
+    ]
     writable: list[str] = []
     unchecked: list[str] = []
-    for directory in site_dirs:
-        answer = _can_add_files(directory)
+    for path in startup_dirs:
+        answer = _can_add_files(Path(path))
         if answer is None:
-            unchecked.append(str(directory))
+            unchecked.append(path)
         elif answer:
-            writable.append(str(directory))
+            writable.append(path)
     return StartupPosture(
         launch=launch,
         items=tuple(items),
-        site_dirs=tuple(str(directory) for directory in site_dirs),
-        writable_site_dirs=tuple(writable),
-        unchecked_site_dirs=tuple(unchecked),
+        startup_dirs=tuple(startup_dirs),
+        writable_startup_dirs=tuple(writable),
+        unchecked_startup_dirs=tuple(unchecked),
     )
 
 
@@ -432,10 +504,10 @@ def _unexpected_summary(unexpected: tuple[StartupCodeItem, ...]) -> str:
     """What the refusal and the loosening entry both open with, so they name the files alike."""
     files = _named(tuple(f"{item.path} ({item.verdict})" for item in unexpected))
     return (
-        "start-up code the engine does not know is installed in its interpreter "
-        f"({len(unexpected)}): {files}. A .pth line that begins with `import`, and a "
-        "sitecustomize or usercustomize module, run each time the interpreter starts, before any "
-        "engine code and with everything the engine holds"
+        "start-up code the engine does not know is installed where its interpreter, or a Python "
+        f"child it starts, would run it ({len(unexpected)}): {files}. A .pth line that begins "
+        "with `import`, and a sitecustomize or usercustomize module, run each time the "
+        "interpreter starts, before any engine code and with everything the engine holds"
     )
 
 
@@ -443,7 +515,7 @@ def startup_refusal(posture: StartupPosture) -> str | None:
     """Why ``serve`` or ``supervise`` must not start under the enforcing posture, or None.
 
     Only start-up code that is not expected refuses. A launch that is not isolated and a writable
-    site directory are reported and never refused: a plain ``messagefoundry serve`` from a
+    start-up directory are reported and never refused: a plain ``messagefoundry serve`` from a
     developer's own environment is both, by construction."""
     if not posture.unexpected:
         return None
@@ -462,11 +534,14 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
     launch = posture.launch
     variables = ", ".join(launch.code_path_variables)
     if not launch.isolated:
-        honoured = (
-            f" {variables} is set in its environment now."
-            if variables and not launch.ignore_environment
-            else ""
-        )
+        if launch.ignore_environment:
+            reads = "It was told to ignore the PYTHON* environment variables (-E)."
+        else:
+            reads = (
+                "It reads the PYTHON* environment variables, PYTHONPATH and PYTHONHOME included, "
+                "so one left in the service's environment decides what the engine imports."
+                + (f" {variables} is set in its environment now." if variables else "")
+            )
         path = (
             "The working directory is kept off its import path (-P)."
             if launch.safe_path
@@ -475,23 +550,21 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
         out.append(
             (
                 "interpreter_not_isolated",
-                "the engine's interpreter was not started in isolated mode (-I), so it reads "
-                "the PYTHON* environment variables, PYTHONPATH and PYTHONHOME included, and one "
-                f"left in the service's environment decides what the engine imports.{honoured} "
-                f"{path} The shipped service launches pass -I. An engine shard that `supervise` "
-                "starts is not isolated: the supervisor starts it with -P and hands it the "
-                f"variables. Start the engine as `python {' '.join(ISOLATED_LAUNCH_OPTIONS)} -m "
-                "messagefoundry serve ...`",
+                "the engine's interpreter was not started in isolated mode (-I). "
+                f"{reads} {path} The shipped service launches pass -I. An engine shard that "
+                "`supervise` starts is not isolated: the supervisor starts it with -P and hands "
+                "it the variables. Start the engine as "
+                f"`python {' '.join(ISOLATED_LAUNCH_OPTIONS)} -m messagefoundry serve ...`",
             )
         )
-    elif variables:
+    if launch.ignore_environment and variables:
         out.append(
             (
                 "python_variables_reach_children",
-                f"{variables} is set in the engine's environment. The engine ignores it (isolated "
-                "mode), but the Python children it starts (the sandbox worker, and each engine "
-                "shard under `supervise`) are not isolated and would import from where it "
-                "points. Remove it from the service's environment",
+                f"{variables} is set in the engine's environment. The engine ignores it, but the "
+                "Python children it starts (the sandbox worker, and each engine shard under "
+                "`supervise`) are not isolated and would import from where it points. Remove it "
+                "from the service's environment",
             )
         )
     if posture.unexpected:
@@ -503,25 +576,25 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
                 "part of a package",
             )
         )
-    if posture.writable_site_dirs:
+    if posture.writable_startup_dirs:
         out.append(
             (
-                "site_packages_writable",
-                f"the engine's own account can add files to {len(posture.writable_site_dirs)} of "
-                "the directories its interpreter reads start-up code from "
-                f"({_named(posture.writable_site_dirs)}). Code running as that account could plant "
-                "a .pth file or a sitecustomize module there, and it would run inside the engine "
-                "at the next start, ahead of the check that looks for it. Install the engine "
-                "where the service account can read and cannot write",
+                "startup_directory_writable",
+                "the engine's own account can add files to "
+                f"{len(posture.writable_startup_dirs)} of the directories its interpreter reads "
+                f"start-up code from ({_named(posture.writable_startup_dirs)}). Code running as "
+                "that account could plant a .pth file or a sitecustomize module there, and it "
+                "would run inside the engine at the next start, ahead of the check that looks "
+                "for it. Install the engine where the service account can read and cannot write",
             )
         )
-    if posture.unchecked_site_dirs:
+    if posture.unchecked_startup_dirs:
         out.append(
             (
-                "site_packages_unchecked",
+                "startup_directory_unchecked",
                 "the engine could not tell whether its own account can add files to "
-                f"{len(posture.unchecked_site_dirs)} of the directories its interpreter reads "
-                f"start-up code from ({_named(posture.unchecked_site_dirs)}), so nothing here "
+                f"{len(posture.unchecked_startup_dirs)} of the directories its interpreter reads "
+                f"start-up code from ({_named(posture.unchecked_startup_dirs)}), so nothing here "
                 "says they are protected. Check their permissions by hand",
             )
         )

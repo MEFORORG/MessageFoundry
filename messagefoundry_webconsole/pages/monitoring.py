@@ -85,7 +85,8 @@ def _interpreter_rows(interpreter: InterpreterView | None) -> list[list[object]]
 
     None is a posture built without the reading. It renders as a dash in every row, never as a
     hardened launch. Counts only: the file names are in ``GET /security/posture`` and in the
-    loosening list below."""
+    loosening list below. A directory the engine could not check is counted apart, so "not
+    checked" never reads as "not writable"."""
     isolated, remote, startup = (
         "Interpreter: isolated mode (-I)",
         "Interpreter: remote debugging (PEP 768)",
@@ -100,13 +101,18 @@ def _interpreter_rows(interpreter: InterpreterView | None) -> list[list[object]]
         remote_state = "on, injected scripts refused"
     else:
         remote_state = "ON, NOT GUARDED"
+    directories = (
+        f"{len(interpreter.writable_startup_dirs)} of {len(interpreter.startup_dirs)} start-up "
+        "directories writable by the engine"
+    )
+    if interpreter.unchecked_startup_dirs:
+        directories += f", {len(interpreter.unchecked_startup_dirs)} NOT CHECKED"
     return [
         [isolated, _yn(interpreter.isolated)],
         [remote, remote_state],
         [
             startup,
-            f"{len(interpreter.startup_code)} found, {unexpected} not expected; "
-            f"{len(interpreter.writable_site_dirs)} site directories writable by the engine",
+            f"{len(interpreter.startup_code)} found, {unexpected} not expected; {directories}",
         ],
     ]
 

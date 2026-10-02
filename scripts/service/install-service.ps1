@@ -1284,9 +1284,15 @@ $NssmDir = Resolve-AbsolutePath $NssmDir
 # with that path, so a relative one would be resolved against a different directory later.
 $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
 
-if (-not (Test-Path $AppExe)) {
-    throw "Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, or pass -AppExe."
+# The launcher only names the install, so it is required only while it is what finds the
+# interpreter. With -PythonExe the service's program is already named.
+if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path $AppExe)) {
+    throw ("Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, " +
+        "or pass -AppExe, or name the interpreter with -PythonExe.")
 }
+# NOT CHECKED: that this interpreter can import the engine. Finding out would mean running the
+# install's code from this elevated prompt. A wrong -PythonExe shows as ModuleNotFoundError in the
+# service's error log at its first start.
 if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
     throw ("The Python interpreter the service runs was not found" +
         $(if ($PythonExe) { " at: $PythonExe" } else { " beside '$AppExe' or one folder up" }) +

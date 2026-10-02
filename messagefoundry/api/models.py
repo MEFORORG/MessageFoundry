@@ -1354,6 +1354,7 @@ class StartupCodeItemView(BaseModel):
     """One file that runs when the engine's interpreter starts (vault BACKLOG #2701): a ``.pth``
     file with an ``import`` line, or a ``sitecustomize`` / ``usercustomize`` module.
 
+    It may be one that a Python child of the engine would run and the engine itself would not.
     ``verdict`` is ``recorded``, ``interpreter`` or ``packaging_tool`` for a file the engine
     expects, and ``modified`` or ``unrecorded`` for one it does not; ``expected`` says which.
     ``owner`` is the installed distribution that lists the file, where one does. The rule is in
@@ -1387,11 +1388,13 @@ class InterpreterView(BaseModel):
     #: change where an interpreter loads code from.
     code_path_variables: list[str] = Field(default_factory=list)
     startup_code: list[StartupCodeItemView] = Field(default_factory=list)
-    site_dirs: list[str] = Field(default_factory=list)
-    #: The site directories the engine's own account can add a file to. Empty is the safe reading
-    #: only while ``unchecked_site_dirs`` is empty too.
-    writable_site_dirs: list[str] = Field(default_factory=list)
-    unchecked_site_dirs: list[str] = Field(default_factory=list)
+    #: The directories start-up code is read from: the site directories and every directory on
+    #: the import path, the engine's own and the one it hands its Python children.
+    startup_dirs: list[str] = Field(default_factory=list)
+    #: The ones the engine's own account can add a file to. Empty is the safe reading only while
+    #: ``startup_dirs`` is not empty and ``unchecked_startup_dirs`` is.
+    writable_startup_dirs: list[str] = Field(default_factory=list)
+    unchecked_startup_dirs: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_readings(
@@ -1411,9 +1414,9 @@ class InterpreterView(BaseModel):
                 StartupCodeItemView.model_validate(item, from_attributes=True)
                 for item in startup.items
             ],
-            site_dirs=list(startup.site_dirs),
-            writable_site_dirs=list(startup.writable_site_dirs),
-            unchecked_site_dirs=list(startup.unchecked_site_dirs),
+            startup_dirs=list(startup.startup_dirs),
+            writable_startup_dirs=list(startup.writable_startup_dirs),
+            unchecked_startup_dirs=list(startup.unchecked_startup_dirs),
         )
 
 

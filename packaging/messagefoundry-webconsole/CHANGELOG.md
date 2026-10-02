@@ -37,7 +37,8 @@ this line.**
 - **The status page shows how the engine process was started.** Three new rows under the store
   and security readings: whether the interpreter runs in isolated mode, whether its remote
   debugging is off, and how much start-up code it found, with how much of that the engine did not
-  expect and how many site directories the engine's own account can write. They come from the new
+  expect and how many of the directories it is read from the engine's own account can write. A
+  directory the engine could not check is counted apart. They come from the new
   `interpreter` block of the engine's security posture, which moves the supported engine UI seam.
   The file names are in `GET /security/posture`. (vault BACKLOG #2701, #2700)
 

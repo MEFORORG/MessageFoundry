@@ -47,11 +47,11 @@ The command you pass (`serve --config /config --env prod`) follows it. It is the
 not the `messagefoundry` console script, because a console script cannot pass an option to the
 interpreter it starts.
 
-- **`-I` is isolated mode.** The interpreter ignores every `PYTHON*` environment variable, so a
-  `PYTHONPATH` set with `-e` or in an orchestrator's manifest cannot decide what the engine
-  imports. It also keeps the working directory off the import path. The working directory is the
-  writable store volume.
-- **`-X disable-remote-debug` turns off the interpreter's remote debugging** (PEP 768).
+- **`-I -X disable-remote-debug`** are the options the Windows service passes too.
+  [`docs/SERVICE.md`](../docs/SERVICE.md#the-service-launch) says what each does. For the image it
+  means a `PYTHONPATH` set with `-e` or in an orchestrator's manifest cannot decide what the
+  engine imports, and the working directory, which is the writable store volume, is off the
+  import path.
 - **`-u -B`** give unbuffered output and no bytecode files. The image also sets
   `PYTHONUNBUFFERED` and `PYTHONDONTWRITEBYTECODE`; those now serve only the Python children the
   engine starts, because the engine itself ignores them.
@@ -67,11 +67,11 @@ Two things undo this, and the engine reports both:
   `interpreter_not_isolated` and `remote_debug_enabled`.
 - **A derived image that leaves the venv owned by uid 10001.** Install extra packages as root and
   switch back: `USER root`, then `RUN /opt/venv/bin/pip install ...`, then `USER 10001`. The engine
-  reports `site_packages_writable` when its account can write there.
+  reports `startup_directory_writable` when its account can write there.
 
 `GET /security/posture` carries the reading in its `interpreter` block. The `docker-smoke` CI leg
 reads it off a running container and tries the write. What each entry means is in
-[`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-site_packages_writable-what-runs-in-the-interpreter-before-the-engine-does).
+[`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-startup_directory_writable-what-runs-in-the-interpreter-before-the-engine-does).
 
 ## Configuration — bake it in (recommended) or mount it carefully
 
@@ -99,7 +99,8 @@ A **Docker-Desktop-on-Windows** bind mount surfaces as `0o777` and **will be ref
 **Pass `--read-only` on a plain `docker run`.** [`compose.yaml`](compose.yaml) and both Kubernetes
 manifests set a read-only root file system; a bare `docker run` does not. The engine writes only
 `/var/lib/mefor` (a volume) and `/tmp` (a tmpfs). Without `--read-only` the image is still safe
-against one case that matters, described under *How the image starts the engine* below.
+against one case that matters, described under
+[How the image starts the engine](#how-the-image-starts-the-engine) above.
 
 `env()` value files resolve under `/config/environments/<env>.toml` (the image sets
 `MEFOR_ENVIRONMENTS_BASE_DIR=/config`), so mount/bake your whole config repo at `/config`.
