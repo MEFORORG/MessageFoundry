@@ -611,6 +611,7 @@ def test_accepts_runs_inside_the_sandbox_child(sandbox_graph: tuple[Registry, st
         inbound="IB_T",
         config_dir=config_dir,
         env=None,
+        graph=None,
     )
     try:
         with pytest.raises(SandboxError, match="socket"):
@@ -632,6 +633,7 @@ def test_pure_accepts_is_byte_identical_through_the_sandbox(
         inbound="IB_T",
         config_dir=config_dir,
         env=None,
+        graph=None,
     )
     try:
         assert route_only(registry, ic, ADT, sandbox=session, run_context=RunContext()) == [

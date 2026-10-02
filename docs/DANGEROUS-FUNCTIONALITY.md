@@ -150,7 +150,7 @@ de-identification leak check only, and is not on the message path.
 | Module | What it runs | When | Form |
 |---|---|---|---|
 | `pipeline/sandbox.py` | The sandbox worker | Only when `[sandbox].mode = "subprocess"` | argument list |
-| `pipeline/supervisor.py` | Engine-shard children | Only under `messagefoundry supervise` | argument list |
+| `pipeline/supervisor.py` | Engine-shard children, and one child that loads the config before any shard starts | Only under `messagefoundry supervise` | argument list |
 | `pipeline/dr.py` | The operator's disaster-recovery hook | A DR takeover or fail-back, when `[dr].takeover_hook` or `[dr].release_hook` is set | shell string |
 | `service.py` | `sc.exe`, and elevated `cmd.exe` and `powershell.exe` | Service status, start, stop, restart and install | argument list, ShellExecute |
 | `service_status.py` | `sc.exe query` | Reading the service's state | argument list |
@@ -187,6 +187,14 @@ Two argument-list starts are not pinned that way:
   `shutil.which`, whose Windows search can include the working directory, so a planted `code.cmd`
   may win there too. What holds it: `repo_path` must name an existing folder, and the tray runs as
   the signed-in user, who owns `tray.toml`.
+
+**What each child is handed.** A process started with no environment of its own gets a copy of the
+engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
+environment for the sandbox worker, the disaster-recovery hook and the engine shards. Its
+docstring says what each one gets, and why that is not an isolation boundary by itself. The other
+starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
+lists each of those with its reason, and fails a new start whose environment does not come from
+that module.
 
 **The other forms are the ones to look at hardest.**
 

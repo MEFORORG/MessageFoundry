@@ -37,8 +37,11 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from messagefoundry.childenv import engine_environment, python_child_argv
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import load_config
+from messagefoundry.controlchars import scrub_control_chars
+from messagefoundry.pipeline import _config_preflight
 from messagefoundry.pipeline.sharding import require_unified_store, shard_ids
 
 logger = logging.getLogger(__name__)
@@ -53,7 +56,9 @@ class ShardSpec:
 
     ``db_path`` and ``port`` are derived deterministically from the operator's ``--db``/``--port``
     bases so a restart re-attaches to the SAME store and re-binds the SAME API port. ``argv`` is the
-    full ``python -m messagefoundry serve ...`` command line.
+    full command line: :func:`messagefoundry.childenv.python_child_argv` for ``messagefoundry``,
+    then ``serve ...``. That function says how the shard imports this build without searching the
+    working directory.
     """
 
     shard: str
@@ -95,15 +100,12 @@ def build_shard_specs(
     """
     ordered = sorted(shard_list)
     single = len(ordered) <= 1
-    exe = python_executable or sys.executable
     specs: list[ShardSpec] = []
     for i, shard in enumerate(ordered):
         port = base_port + i
         db_path = _shard_db_path(db_base, shard, single=single)
         argv = [
-            exe,
-            "-m",
-            "messagefoundry",
+            *python_child_argv("messagefoundry", executable=python_executable),
             "serve",
             "--config",
             config,
@@ -168,6 +170,54 @@ def discover_shard_specs(
     )
 
 
+#: The module the pre-flight child runs, and how long (seconds) it may take to load the config.
+_PREFLIGHT_MODULE = _config_preflight.__name__
+PREFLIGHT_SECONDS = 120.0
+
+
+async def preflight_shard_config(config: str) -> str | None:
+    """Load ``config`` once in a child that has an engine shard's import path. ``None`` means it
+    loaded; otherwise the text says why an engine shard could not load it.
+
+    The supervisor's own discovery loads the config in THIS process, where ``python -m`` put the
+    working directory on the import path. An engine shard does not search the working directory
+    (:func:`messagefoundry.childenv.python_child_argv`). So a config that imports a helper from
+    there loads here and fails in every engine shard, and one that fails is restarted. Loading it
+    under the engine shard's rule first makes that one refusal, before any of them exists."""
+    process = await asyncio.create_subprocess_exec(
+        *python_child_argv(_PREFLIGHT_MODULE),
+        config,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        env=engine_environment(),
+    )
+    try:
+        _out, err = await asyncio.wait_for(process.communicate(), timeout=PREFLIGHT_SECONDS)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        return (
+            f"config {config!r} did not finish loading under an engine shard's import path "
+            f"within {PREFLIGHT_SECONDS:g}s; no engine shard was started"
+        )
+    if process.returncode == 0:
+        return None
+    lines = [line for line in err.decode("utf-8", "replace").splitlines() if line.strip()]
+    # One line, the child's own summary: the exception and its message, never a traceback.
+    said = scrub_control_chars(lines[-1])[:300] if lines else f"exit {process.returncode}"
+    refusal = (
+        f"config {config!r} loads in the supervisor but not in an engine shard ({said}); "
+        "no engine shard was started."
+    )
+    if process.returncode == _config_preflight.EXIT_IMPORT:
+        refusal += (
+            " An engine shard does not search the working directory for imports. A config helper "
+            "must be "
+            "a `_`-prefixed file beside the config, or an installed package."
+        )
+    return refusal
+
+
 #: A callable that launches a child for a spec and returns the process. Injectable so tests can swap a
 #: real ``serve`` for a fast, deterministic stub child (no full engine, Windows-safe).
 SpawnFn = Callable[["ShardSpec"], Awaitable["asyncio.subprocess.Process"]]
@@ -185,12 +235,16 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
 
     The new group also stops the console's own Ctrl-C from reaching the child, which is why
     :meth:`Supervisor._request_stop` has to deliver the break explicitly on every shutdown path.
+
+    The child is a whole engine, so it gets the whole environment, secrets included, and gets it
+    by name (:func:`messagefoundry.childenv.engine_environment`, vault BACKLOG #2587).
     """
+    env = engine_environment()
     if sys.platform == "win32":
         return await asyncio.create_subprocess_exec(
-            *spec.argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            *spec.argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, env=env
         )
-    return await asyncio.create_subprocess_exec(*spec.argv)
+    return await asyncio.create_subprocess_exec(*spec.argv, env=env)
 
 
 @dataclass
@@ -362,6 +416,10 @@ async def supervise(
         )
     except (WiringError, FileNotFoundError, ValueError) as exc:
         logger.error("supervise: %s", exc)
+        return 2
+    refusal = await preflight_shard_config(config)
+    if refusal is not None:
+        logger.error("supervise: %s", refusal)
         return 2
 
     logger.info(

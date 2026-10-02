@@ -162,7 +162,13 @@ from messagefoundry.pipeline.phase_timing import (
 )
 from messagefoundry.pipeline.reference_sync import database_source_dsn, reference_connection_name
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
-from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
+from messagefoundry.pipeline.sandbox import (
+    GraphShape,
+    SandboxMode,
+    SandboxPolicy,
+    SandboxSession,
+    graph_shape,
+)
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
@@ -1008,6 +1014,7 @@ class RegistryRunner:
         self._sandbox_policy = sandbox_policy
         self._sandbox_config_source = sandbox_config_source
         self._sandbox_sessions: dict[str, SandboxSession] = {}
+        self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
         # origin. Coarse by design (bounds total work, not topology). From [pipeline] max_correlation_depth.
@@ -3988,6 +3995,33 @@ class RegistryRunner:
                 if _pool_warn is not None:
                     log.warning(_pool_warn)
 
+    def _engine_graph_shape(self) -> GraphShape:
+        """The shape of the graph now being served, which each sandbox worker's must match.
+
+        One object per registry, shared by every inbound's session: a shape holds every name in the
+        graph, so one per session would cost the square of the connection count. A session calls
+        this at each worker spawn, from its worker thread, so it always compares with the registry
+        being served then, whichever way ``self.registry`` was last swapped."""
+        cached = self._sandbox_graph_shape
+        if cached is None or cached[0] is not self.registry:
+            cached = self._sandbox_graph_shape = (self.registry, graph_shape(self.registry))
+        return cached[1]
+
+    async def _close_sandbox_sessions(self) -> None:
+        """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
+        a process. A no-op unless ``[sandbox].mode=subprocess`` spawned any. The next dispatch on an
+        inbound makes a fresh session, whose worker loads the config as it is then."""
+        if not self._sandbox_sessions:
+            return
+        sessions = list(self._sandbox_sessions.values())
+        self._sandbox_sessions.clear()
+
+        def close_all() -> None:
+            for session in sessions:
+                session.close()
+
+        await asyncio.to_thread(close_all)
+
     def _sandbox_for(self, name: str) -> SandboxSession | None:
         """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
 
@@ -4016,6 +4050,7 @@ class RegistryRunner:
                 inbound=name,  # attributes the child's relayed stderr to this feed (ADR 0176)
                 config_dir=cfg_dir,
                 env=env,
+                graph=self._engine_graph_shape,
                 code_sets=self.registry.code_sets,
             )
             self._sandbox_sessions[name] = session
@@ -4346,15 +4381,7 @@ class RegistryRunner:
         # ADR 0087 (#197): stop the per-inbound sandbox worker children (kills + reaps each subprocess).
         # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
-        if self._sandbox_sessions:
-            _sessions = list(self._sandbox_sessions.values())
-            self._sandbox_sessions.clear()
-
-            def _close_sandboxes() -> None:
-                for _s in _sessions:
-                    _s.close()
-
-            await asyncio.to_thread(_close_sandboxes)
+        await self._close_sandbox_sessions()
         if self._lookup_executor is not None:
             await self._lookup_executor.aclose()
             self._lookup_executor = None
@@ -5398,15 +5425,7 @@ class RegistryRunner:
                 # child that re-loads the swapped config (its docstring's "Router/Handler changes take
                 # effect immediately" now also holds under mode=subprocess). Off-loop: close() waits on a
                 # process. No-op unless mode=subprocess actually spawned any.
-                if self._sandbox_sessions:
-                    _stale_sessions = list(self._sandbox_sessions.values())
-                    self._sandbox_sessions.clear()
-
-                    def _close_stale_sandboxes() -> None:
-                        for _s in _stale_sessions:
-                            _s.close()
-
-                    await asyncio.to_thread(_close_stale_sandboxes)
+                await self._close_sandbox_sessions()
                 # Rebuild the live-lookup executor from the new graph, closing the old pools. build_check
                 # already validated the new specs, so this can't fail on a bad spec here.
                 old_lookup_executor = self._lookup_executor
@@ -5481,6 +5500,9 @@ class RegistryRunner:
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
                 log.exception("reload failed; rolling back inbound intake to the previous graph")
                 self.registry = old
+                # A session made after the swap holds a worker that loaded the NEW graph. Drop it,
+                # or that worker would go on answering for a graph the engine no longer serves.
+                await self._close_sandbox_sessions()
                 # Step 2a's lane-partition decisions are deliberately NOT undone here — that comment
                 # carries why, and the short version is that un-deciding a lane step 3 has already given
                 # a worker to is how a rollback would create two claimers on one lane.

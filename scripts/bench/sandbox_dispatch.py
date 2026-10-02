@@ -234,7 +234,10 @@ def _sessions(config_dir: str, wall_seconds: float) -> Iterator[tuple[str, Sandb
         ("off", SandboxPolicy(mode=SandboxMode.OFF)),
         ("subprocess", SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=wall_seconds)),
     ):
-        yield mode, SandboxSession(policy, inbound="IB_BENCH", config_dir=config_dir, env=None)
+        yield (
+            mode,
+            SandboxSession(policy, inbound="IB_BENCH", config_dir=config_dir, env=None, graph=None),
+        )
 
 
 def measure(
