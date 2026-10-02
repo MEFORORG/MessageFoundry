@@ -9,8 +9,10 @@ bound account that could still use Windows SSO would keep a sign-in that never m
 provider at all. The refusal lives where every directory sign-in decides whether a row may sign in
 (``_directory_login_refusal``), at both of its call sites.
 
-The second half is the session that Windows SSO minted BEFORE the bind. A first bind revokes no
-session, so that session outlives it. It may not bind the account's first engine factor.
+The second half is what the bind does to sessions. Every bind ends every live session of the
+account, in the transaction that writes the pair, so nothing minted before it outlives it. And a
+Windows SSO session insert requires an unbound row, so a sign-in already in flight when a bind
+lands leaves nothing behind either.
 
 **What is and is not exercised.** No SPNEGO exchange runs here. ``kerberos_principal`` is replaced,
 as the other Windows SSO suites replace it, so each test starts where the acceptor hands over a
@@ -30,19 +32,13 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.api import create_app
-from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import (
-    FEDERATED_SIGN_IN_REQUIRED,
-    STEP_UP_ACTION_MFA_CONFIRM,
-    STEP_UP_ACTION_MFA_ENROLL,
-    STEP_UP_ACTION_SESSION_TERMINATE,
-    STEP_UP_ACTION_WEBAUTHN_ENROLL,
-    AuthService,
-)
+from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND
+from messagefoundry.auth.service import FEDERATED_SIGN_IN_REQUIRED, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.pipeline import Engine, security_notify
 from messagefoundry.store.store import MessageStore
+from tests._admin_account import create_local_user_chosen
 from tests.test_auth_oidc_service import (
     DEFAULT_SUB,
     PRINCIPAL,
@@ -51,13 +47,6 @@ from tests.test_auth_oidc_service import (
     _oid,
     _oidc_login,
     _service,
-)
-
-#: The three actions that bind a factor. ``session_terminate`` rides the same gate and is not one.
-FACTOR_BINDING_ACTIONS = (
-    STEP_UP_ACTION_MFA_ENROLL,
-    STEP_UP_ACTION_MFA_CONFIRM,
-    STEP_UP_ACTION_WEBAUTHN_ENROLL,
 )
 
 NEGOTIATE = {"Authorization": "Negotiate " + base64.b64encode(b"spnego-token").decode()}
@@ -99,16 +88,8 @@ def _principal(username: str, *, object_id: str | None = None) -> AdPrincipal:
     )
 
 
-class _Directory(_FakeLdap):
-    """Answers the step-up re-bind per account. The shared fake answers one fixed principal there,
-    which fails the re-bind's own-object check for every account but that one."""
-
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return self.resolve_principal(username)
-
-
-async def _login_failures(store: MessageStore, actor: str) -> list[dict[str, Any]]:
-    rows = await store.list_audit(action="auth.login_failed", actor=actor)
+async def _audit_details(store: MessageStore, action: str, actor: str) -> list[dict[str, Any]]:
+    rows = await store.list_audit(action=action, actor=actor)
     return [json.loads(str(dict(r)["detail"])) for r in rows]
 
 
@@ -116,10 +97,16 @@ async def _sso_service(
     store: MessageStore, rsa_key: rsa.RSAPrivateKey, *, bind: str | None = None, **over: Any
 ) -> AuthService:
     """Windows SSO and federated sign-in both on. ``bind`` binds ``jdoe`` before any sign-in."""
-    ldap = _Directory(
-        by_username={"jdoe": PRINCIPAL, "asmith": _principal("asmith"), "ghost": None}
-    )
+    ldap = _FakeLdap(by_username={"jdoe": PRINCIPAL, "asmith": _principal("asmith"), "ghost": None})
     return await _service(store, rsa_key, ldap=ldap, bind=bind, kerberos_enabled=True, **over)
+
+
+async def _windows_sso(service: AuthService, monkeypatch: pytest.MonkeyPatch, name: str) -> str:
+    """Sign ``name`` in by Windows SSO and return the session token."""
+    _as(monkeypatch, name)
+    out = await service.authenticate_kerberos(b"spnego-token")
+    assert out.ok and out.token is not None, out.error
+    return out.token
 
 
 # --- the sign-in refusal -----------------------------------------------------------------------
@@ -154,13 +141,12 @@ async def test_a_bound_account_is_refused_windows_sso_and_still_signs_in_at_its_
         # The generic string every ineligible mirror row gets: nothing in it names the cause.
         assert refused.error == "invalid credentials"
         assert len(pads) == 1, "the refusal was not held to the failure deadline"
-        assert await _login_failures(store, "jdoe") == [
+        assert await _audit_details(store, "auth.login_failed", "jdoe") == [
             {"provider": "ad", "reason": FEDERATED_SIGN_IN_REQUIRED}
         ]
         successes = await store.list_audit(action="auth.login_success", actor="jdoe")
         assert len(successes) == 1, "the refused sign-in wrote a success row"
-        mechanisms = [s.auth_mechanism for s in await store.list_sessions(user_id)]
-        assert mechanisms == [SessionMechanism.KERBEROS.value], "the refusal minted a session"
+        assert await store.list_sessions(user_id) == [], "the refusal minted a session"
 
         federated = await _oidc_login(service, monkeypatch, rsa_key)
         assert federated.ok and federated.identity is not None, federated.error
@@ -295,81 +281,87 @@ async def test_the_route_answers_the_refusal_as_it_answers_any_failed_negotiate(
         assert (await c.post("/auth/negotiate", headers=NEGOTIATE)).status_code == 429
 
 
-# --- the session Windows SSO minted before the bind ----------------------------------------------
+# --- a bind ends the account's sessions ----------------------------------------------------------
 
 
-async def test_a_session_minted_before_the_bind_cannot_bind_the_accounts_first_factor(
+async def test_a_bind_ends_every_session_of_the_account_and_no_other(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: ``_factor_binding_is_blocked`` stops reading the binding beside the session's
-    mechanism.
+    """RED when: a first bind goes back to revoking nothing, or the sweep reaches another account.
 
-    The control is the same session one line earlier: unbound, it may ask for the grant. After the
-    bind it is refused all three factor-binding actions, a good re-proof mints it no grant, and the
-    audit row says so. Ending its own sessions is not a factor-binding action and stays open."""
+    Binding moves the account behind its identity provider, so a session minted before the bind
+    must not outlive it. Two sessions of the bound account end, and the count is reported and
+    audited. Two controls on the same service stay signed in: another directory account, and the
+    administrator who performs the bind."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _sso_service(store, rsa_key)
-        _as(monkeypatch, "jdoe")
-        minted = await service.authenticate_kerberos(b"spnego-token")
-        assert minted.ok and minted.token is not None and minted.identity is not None
-        assert minted.mfa_required, "the fixture session owes no factor, so the gate is not read"
-        token = minted.token
-        for action in FACTOR_BINDING_ACTIONS:
-            assert await service.factor_binding_is_blocked(token, action) is False
+        mine = [await _windows_sso(service, monkeypatch, "jdoe") for _ in range(2)]
+        other = await _windows_sso(service, monkeypatch, "asmith")
+        await create_local_user_chosen(
+            service,
+            username="root",
+            password="a-strong-test-passphrase",
+            display_name=None,
+            email=None,
+            roles=[],
+            actor="test",
+        )
+        admin = (await service.login("root", "a-strong-test-passphrase")).token
+        assert admin is not None
+        for token in (*mine, other, admin):
+            assert await service.identity_for_token(token) is not None
+
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        binding = await service.bind_federated_subject(
+            user.id, DEFAULT_SUB, expected_issuer=None, expected_subject=None, actor="root"
+        )
+
+        assert binding.sessions_revoked == 2
+        for token in mine:
+            assert await service.identity_for_token(token) is None, "a session outlived the bind"
+            session = await store.get_session(hash_token(token))
+            assert session is not None and session.revoked_at is not None
+        assert await service.identity_for_token(other) is not None, "another account was signed out"
+        assert await service.identity_for_token(admin) is not None, "the binder was signed out"
+        [detail] = await _audit_details(store, "auth.federated_subject_bound", "root")
+        assert detail["sessions_revoked"] == 2
+    finally:
+        await store.close()
+
+
+async def test_a_session_that_owed_no_factor_does_not_outlive_the_bind_either(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the bind leaves a session alone because it has nothing left to prove.
+
+    With ``[security].require_mfa`` off a Windows SSO session owes no factor, so it acts in full
+    from the moment it is minted. Nothing short of ending it takes that away. The control is the
+    same session before the bind, which resolves and is satisfied."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _sso_service(store, rsa_key, require_mfa=False)
+        token = await _windows_sso(service, monkeypatch, "jdoe")
+        assert await service.identity_for_token(token) is not None
+        assert await service.mfa_satisfied(token) is True
 
         await _bind(service, store, DEFAULT_SUB)
 
-        # A first bind revokes nothing, which is why this gate has anything to refuse.
-        session = await store.get_session(hash_token(token))
-        assert session is not None and session.revoked_at is None
-        for action in FACTOR_BINDING_ACTIONS:
-            assert await service.factor_binding_is_blocked(token, action) is True, action
-        assert (
-            await service.factor_binding_is_blocked(token, STEP_UP_ACTION_SESSION_TERMINATE)
-            is False
-        )
-
-        elevation = await service.reauth(
-            minted.identity, "directory-pw", token=token, purpose=STEP_UP_ACTION_MFA_ENROLL
-        )
-        assert elevation.ok and elevation.token is not None
-        assert await service.has_action_step_up(elevation.token, STEP_UP_ACTION_MFA_ENROLL) is False
-        [row] = await store.list_audit(action="auth.reauth", actor="jdoe")
-        detail = json.loads(str(dict(row)["detail"]))
-        assert detail["ok"] is True and detail["grant_refused"] is True
+        assert await service.identity_for_token(token) is None
+        assert await service.mfa_satisfied(token) is False
     finally:
         await store.close()
 
 
-async def test_a_federated_session_on_the_bound_account_may_still_bind_a_factor(
-    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """RED when: the refusal reads the binding alone and forgets the session's mechanism.
-
-    With the claim gate off, a federated session is minted owing a factor, so it has to be able to
-    enrol one or the account is locked out. Its proof came through the identity provider."""
-    store = await MessageStore.open(":memory:")
-    try:
-        service = await _sso_service(store, rsa_key, bind=DEFAULT_SUB, oidc_require_mfa_claim=False)
-        federated = await _oidc_login(service, monkeypatch, rsa_key)
-        assert federated.ok and federated.token is not None, federated.error
-        assert federated.mfa_required, "the fixture session owes no factor, so the gate is not read"
-        for action in FACTOR_BINDING_ACTIONS:
-            assert await service.factor_binding_is_blocked(federated.token, action) is False
-    finally:
-        await store.close()
-
-
-async def test_the_enrolment_route_refuses_the_session_minted_before_the_bind(
+async def test_a_session_windows_sso_minted_before_the_bind_no_longer_resolves_on_the_api(
     engine: Engine, rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: the route gate and the service rule come apart.
+    """RED when: the revoke stops reaching the request path.
 
-    Two accounts on one service, each holding a Windows SSO session that owes a factor. The one
-    that stays unbound re-proves and reaches the enrolment route. The one bound afterwards is
-    refused there, with the multi-factor header and no step-up header, so a client is not sent to
-    re-prove a credential that would mint it nothing."""
+    Read where a caller meets it: the bearer token ``POST /auth/negotiate`` handed out answers
+    ``GET /auth/me`` before the bind and is refused after it. The unbound account's token is the
+    control."""
     store = _store_of(engine)
     service = await _sso_service(store, rsa_key)
     async with _client(engine, service) as c:
@@ -378,54 +370,102 @@ async def test_the_enrolment_route_refuses_the_session_minted_before_the_bind(
             _as(monkeypatch, name)
             r = await c.post("/auth/negotiate", headers=NEGOTIATE)
             assert r.status_code == 200, r.text
-            assert r.json()["mfa_required"] is True
             tokens[name] = r.json()["token"]
+            assert (await c.get("/auth/me", headers=_bearer(tokens[name]))).status_code == 200
+
         await _bind(service, store, DEFAULT_SUB)
 
-        outcomes: dict[str, httpx.Response] = {}
-        for name, token in tokens.items():
-            r = await c.post(
-                "/me/reauth",
-                headers=_bearer(token),
-                json={"password": "directory-pw", "purpose": STEP_UP_ACTION_MFA_ENROLL},
-            )
-            assert r.status_code == 200, r.text
-            outcomes[name] = await c.post("/me/mfa/enroll", headers=_bearer(r.json()["token"]))
-
-        assert outcomes["asmith"].status_code == 200, outcomes["asmith"].text
-        refused = outcomes["jdoe"]
-        assert refused.status_code == 403
-        assert refused.headers.get("X-MFA-Required") == "1"
-        assert "X-Step-Up-Required" not in refused.headers
+        assert (await c.get("/auth/me", headers=_bearer(tokens["jdoe"]))).status_code == 401
+        assert (await c.get("/auth/me", headers=_bearer(tokens["asmith"]))).status_code == 200
 
 
-async def test_a_passkey_ceremony_begun_before_the_bind_cannot_finish_after_it(
+async def test_a_bind_that_lands_during_a_windows_sso_sign_in_leaves_no_session(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: ``finish_webauthn_registration`` stops asking the rule itself.
+    """RED when: the Windows SSO session insert stops requiring an unbound row.
 
-    The route in front of the passkey finish rides the session window and asks no action-bound gate,
-    so the service is the only place the rule can stand for it. The control is the same call on the
-    unbound account: it gets as far as the ceremony lookup, which is a different refusal."""
+    The sign-in reads the row unbound and passes the refusal. The bind then commits, sweeping the
+    account's sessions, and only after that does the sign-in insert its own, which that sweep could
+    not see. The role lookup runs between the check and the insert, so the bind is fired from
+    inside it, once. The sign-in must end as the refusal, with nothing minted.
+
+    The control is the next sign-in through the same wrapper, now unarmed and with the bind already
+    committed: it is refused at the check, so the first refusal came from the insert."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _sso_service(store, rsa_key)
+        await _windows_sso(service, monkeypatch, "jdoe")  # the row exists and is unbound
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        real = store.roles_for_ad_groups
+        armed = [True]
+        checks_passed = 0
+
+        async def lookup(groups: Any) -> set[str]:
+            nonlocal checks_passed
+            checks_passed += 1
+            if armed.pop() if armed else False:
+                await _bind(service, store, DEFAULT_SUB)
+            return await real(groups)
+
+        monkeypatch.setattr(store, "roles_for_ad_groups", lookup)
+        raced = await service.authenticate_kerberos(b"spnego-token")
+
+        assert checks_passed == 1, "the sign-in was refused before the bind could land"
+        assert not raced.ok and raced.token is None
+        assert raced.reason == FEDERATED_SIGN_IN_REQUIRED
+        assert await store.list_sessions(user.id) == [], "the sign-in left a live session"
+        successes = await store.list_audit(action="auth.login_success", actor="jdoe")
+        assert len(successes) == 1, "the refused sign-in wrote a success row"
+
+        control = await service.authenticate_kerberos(b"spnego-token")
+        assert not control.ok and checks_passed == 1, "the control never reached the role lookup"
+    finally:
+        await store.close()
+
+
+async def test_a_windows_sso_sign_in_inside_a_rebinds_gap_does_not_outlive_the_rebind(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the write half of a rebind stops sweeping the account's sessions.
+
+    A rebind is a clear and then a separate write, and between the two the row is unbound. A
+    Windows SSO sign-in in that gap meets an unbound row and is admitted. The write that follows
+    must end it. The sign-in is fired from inside the write, just before it runs.
+
+    The control is the same sign-in before the rebind starts, which is refused."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _sso_service(store, rsa_key, bind=DEFAULT_SUB)
         _as(monkeypatch, "jdoe")
-        minted = await service.authenticate_kerberos(b"spnego-token")
-        assert minted.token is not None and minted.identity is not None
-        identity, token = minted.identity, minted.token
+        assert not (await service.authenticate_kerberos(b"spnego-token")).ok
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        real = store.set_user_federated_subject
+        in_gap: list[str] = []
 
-        async def finish() -> None:
-            await service.finish_webauthn_registration(
-                identity, "{}", label="key", token=token, rp_id="t", origin="https://t"
-            )
+        async def write(*args: Any, **kwargs: Any) -> int | None:
+            if not in_gap:
+                gap = await service.authenticate_kerberos(b"spnego-token")
+                assert gap.ok and gap.token is not None, "the gap sign-in was not admitted"
+                in_gap.append(gap.token)
+            return await real(*args, **kwargs)
 
-        with pytest.raises(ValueError, match="passkey ceremony expired"):
-            await finish()
-        await _bind(service, store, DEFAULT_SUB)
-        with pytest.raises(ValueError, match="signs in through its identity provider"):
-            await finish()
-        assert await store.list_webauthn_credentials(identity.user_id) == []
+        monkeypatch.setattr(store, "set_user_federated_subject", write)
+        rebound = await service.bind_federated_subject(
+            user.id,
+            "S-1-rebound",
+            expected_issuer=user.oidc_issuer,
+            expected_subject=user.oidc_subject,
+            actor="admin",
+        )
+
+        [token] = in_gap
+        assert await service.identity_for_token(token) is None, (
+            "the gap session outlived the rebind"
+        )
+        assert await store.list_sessions(user.id) == []
+        assert rebound.sessions_revoked == 1, "the count left out the session the write swept"
     finally:
         await store.close()
 
@@ -443,12 +483,19 @@ def test_the_security_doc_names_the_reason_the_audit_row_carries() -> None:
     assert f"`reason={FEDERATED_SIGN_IN_REQUIRED}`" in text
 
 
-def test_the_bind_notice_tells_the_holder_windows_sso_no_longer_signs_them_in() -> None:
+def test_the_bind_notice_tells_the_holder_what_the_bind_took_away() -> None:
     """RED when: the notice goes back to saying only that the provider can sign the holder in. The
-    bind withdraws a sign-in, and the notice is the one place the holder hears of it."""
-    from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND
+    bind ends the holder's sessions and withdraws a sign-in, and the notice is the one place the
+    holder hears of it."""
+    notice = security_notify._DESCRIPTIONS[FEDERATED_IDENTITY_BOUND]
+    assert "sessions were ended" in notice
+    assert "Windows single sign-on no longer" in notice
 
-    assert (
-        "Windows single sign-on no longer"
-        in security_notify._DESCRIPTIONS[FEDERATED_IDENTITY_BOUND]
+
+def test_the_security_doc_says_provision_admin_does_not_replace_a_local_administrator() -> None:
+    """RED when: the recovery sentence leaves the document. A site that binds every Administrator
+    has to read, before the outage, that the host command will refuse."""
+    text = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text(
+        encoding="utf-8"
     )
+    assert "`provision-admin` will not rescue the site" in text

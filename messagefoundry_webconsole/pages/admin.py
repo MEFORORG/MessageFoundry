@@ -584,15 +584,19 @@ def user_detail_page(
 # The post-redirect notices, keyed by the ?m= code. An allow-list, so the query string can select a
 # sentence but never supply one (the cluster page's rule). Worded for what the link does, not for
 # whether federated sign-in is on: it ships off, and a disabled account signs in with nothing.
+# The Windows SSO half holds whether or not federated sign-in is on (vault BACKLOG #2609).
 _FEDERATED_NOTICES: dict[str, str] = {
-    "linked": "Linked. A federated sign-in with this subject now reaches this account.",
+    "linked": (
+        "Linked. The account's sessions were signed out. A federated sign-in with this subject "
+        "now reaches this account, and Windows SSO no longer signs it in."
+    ),
     "relinked": (
         "Relinked. The account's sessions were signed out. A federated sign-in with the new "
         "subject now reaches this account, and the old subject reaches nothing."
     ),
     "unlinked": (
         "Unlinked. The account's sessions were signed out, and a federated sign-in no longer "
-        "reaches it."
+        "reaches it. Windows SSO can sign it in again."
     ),
 }
 
@@ -679,10 +683,14 @@ def _link_form(view: FederatedIdentityView, subject: str) -> Markup:
             id="federated-subject-hint",
             class_="muted",
         ),
-        *(
-            [el("p", "Relinking signs the account out of every session.", class_="muted")]
+        el(
+            "p",
+            "Relinking signs the account out of every session."
             if view.linked
-            else []
+            else "Linking signs the account out of every session. While it is linked, Windows "
+            "SSO no longer signs it in: it signs in through the identity provider only, whether "
+            "or not federated sign-in is switched on.",
+            class_="muted",
         ),
         el("button", "Relink" if view.linked else "Link", type="submit"),
         method="post",

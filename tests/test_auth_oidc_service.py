@@ -751,8 +751,9 @@ async def test_ac5_a_bound_row_with_no_directory_id_is_refused_not_resolved_by_n
             await service.bind_federated_subject(
                 legacy_id, "S-1-legacy", expected_issuer=None, expected_subject=None, actor="admin"
             )
-        assert await store.set_user_federated_subject(
-            legacy_id, "https://idp.example", "S-1-legacy"
+        assert (
+            await store.set_user_federated_subject(legacy_id, "https://idp.example", "S-1-legacy")
+            is not None
         )
         asmith_id = await _bind(service, store, "S-1-asmith", username="asmith")
 
@@ -868,6 +869,7 @@ async def test_the_admin_bind_audits_and_notifies_and_a_login_never_does(
             "username": "jdoe",
             "issuer": "https://idp.example",
             "subject": "S-1-alice",
+            "sessions_revoked": 0,
         }
         bound = [e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_BOUND]
         assert len(bound) == 1 and bound[0].username == "jdoe"
@@ -1649,12 +1651,17 @@ async def test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal(
             directory_object_id=_oid("jdoe"),
             password_generated=False,
         )
-        await store.create_session(token_hash="t-jdoe", user_id=user_id, expires_at=9e9, now=1.0)
         real_clear = store.clear_user_federated_subject
 
         async def clear_then_another_bind(user_id: str, **kw: Any) -> Any:
             outcome = await real_clear(user_id, **kw)
             await store.set_user_federated_subject(user_id, "https://idp.example", "S-1-other")
+            # The session is minted under the OTHER bind, after it landed. That bind ends the
+            # sessions it finds (vault BACKLOG #2609), so one minted earlier would say nothing
+            # about the call under test.
+            await store.create_session(
+                token_hash="t-jdoe", user_id=user_id, expires_at=9e9, now=1.0
+            )
             return outcome
 
         store.clear_user_federated_subject = clear_then_another_bind  # type: ignore[method-assign]

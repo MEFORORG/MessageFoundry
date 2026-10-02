@@ -922,12 +922,14 @@ class _DirectoryLoginRefused(Exception):
         self.reason = reason
 
 
-class _FederatedBindingWithdrawn(Exception):
-    """An admin unbound the account's federated identity while this login was still in flight.
+class _BindingChangedMidLogin(Exception):
+    """An admin changed the account's federated binding while this login was still in flight.
+
+    Two directions, one signal. A federated login whose account was UNBOUND under it (BACKLOG
+    #1474), and a Windows SSO login whose account was BOUND under it (vault BACKLOG #2609).
 
     Raised by :meth:`AuthService._issue_session` when the store refuses the conditional insert, and
-    caught by :meth:`AuthService._complete_ad_login`, which renders it as an audited refusal
-    (BACKLOG #1474).
+    caught by :meth:`AuthService._complete_ad_login`, which renders it as an audited refusal.
 
     **Signalled by raising because the alternative loses the race it exists to close.** The store
     refuses inside the same transaction that re-reads the binding, so there is no point at which the
@@ -1066,8 +1068,9 @@ class DirectoryObjectIdMissing(ValueError):
 class FederatedBinding:
     """What :meth:`AuthService.bind_federated_subject` wrote (BACKLOG #1143).
 
-    ``previous_*`` are ``None`` for a first bind. ``sessions_revoked`` is non-zero only on a rebind,
-    where the prior identity's sessions end in the same transaction that clears its binding.
+    ``previous_*`` are ``None`` for a first bind. ``sessions_revoked`` counts every session the bind
+    ended: the ones a rebind's clear swept, plus the ones the write's own transaction swept. Every
+    bind ends every session of the account, a first bind included (vault BACKLOG #2609).
     """
 
     issuer: str
@@ -1233,39 +1236,15 @@ _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
 }
 
 
+#: The pair a session insert requires of a row that must hold NO federated binding (vault BACKLOG
+#: #2609). Passed as ``require_federated_subject`` by the Windows SSO mint.
+_UNBOUND: Final[tuple[None, None]] = (None, None)
+
+
 def _holds_federated_binding(user: UserRecord) -> bool:
     """Whether ``user`` carries a federated binding. Either half of the pair counts as one, matching
     the unbind's own predicate, so a row holding half a pair is never read as unbound."""
     return user.oidc_issuer is not None or user.oidc_subject is not None
-
-
-def _binds_past_the_identity_provider(session: SessionRecord, user: UserRecord) -> bool:
-    """Whether binding a factor from ``session`` would go around ``user``'s identity provider
-    (vault BACKLOG #2609).
-
-    True when the account holds a federated binding, the session was not minted by the
-    federated login, and the session carries no factor the engine verified. Windows SSO refuses
-    a bound account, so this describes at least a session Windows SSO minted BEFORE an
-    administrator bound the account: a first bind revokes no session
-    (:meth:`AuthService.bind_federated_subject`). Its only proof is a directory ticket and, at
-    step-up, the directory password. Letting it bind the account's first engine factor would
-    give that proof a full session on an account the site put behind its identity provider.
-
-    The test is the negative one on purpose, so anything that is not an ``oidc`` session fails
-    closed: a row with no recorded mechanism, and a password session on a row that holds a
-    pair, which no engine writer produces because a bind refuses any account that is not a
-    directory one.
-
-    A session the federated login minted is never refused. With
-    ``[auth].oidc_require_mfa_claim`` off it is minted owing a factor, and it must be able to
-    enrol one. A session that has already proven an engine factor is not refused either: it is
-    adding a factor, not binding the first one.
-    """
-    return (
-        session.mfa_verified_at is None
-        and session.auth_mechanism != SessionMechanism.OIDC.value
-        and _holds_federated_binding(user)
-    )
 
 
 def _holds_unkeyed_federated_binding(user: UserRecord) -> bool:
@@ -1292,11 +1271,9 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
     admitted would keep a sign-in that never meets the identity provider. The keyword is required,
     so every caller states which pathway it is.
 
-    THE COST, STATED: binding an account withdraws Windows SSO from it, whether or not federation is
-    switched on at the time. An account bound while ``oidc_enabled`` is off, or bound under an
-    issuer that is no longer the configured one, signs in by neither leg until an administrator
-    unbinds it. The binding is the site's recorded decision, so a settings change does not reopen
-    the other leg on its own.
+    THE COST: the binding decides, not ``oidc_enabled``, so a settings change does not reopen
+    Windows SSO for a bound account. ``docs/SECURITY.md``, *Federated sign-in*, states what that
+    costs a site and is the source of record for it.
 
     The slugs are literals from a closed set, never directory- or IdP-supplied text, because they are
     stored on the audit row and read by the browser layer.
@@ -3666,9 +3643,9 @@ class AuthService:
         """Whether this session's step-up goes back to the IdP rather than to a password.
 
         True exactly when the session was minted by the federated login (``sessions.auth_mechanism``,
-        ADR 0184 item (iv)). The SESSION decides, not the account: a session Kerberos minted before
-        the account was bound outlives the bind, and it keeps its existing step-up. (A bound account
-        gets no NEW Kerberos session, vault BACKLOG #2609.) PUBLIC because the web
+        ADR 0184 item (iv)). The SESSION decides, not the account, so a Kerberos session keeps its
+        existing step-up. (A bound account holds no Kerberos session: the bind ends its sessions and
+        Windows SSO refuses it afterwards, vault BACKLOG #2609.) PUBLIC because the web
         console's ``/ui/reauth`` asks it to choose which page to render. :meth:`reauth` asks it too,
         so a caller that forgot to would still never verify a password for an OIDC session.
         """
@@ -4044,8 +4021,9 @@ class AuthService:
         supersedes_hash: str | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
-        # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller stays
-        # byte-identical -- no extra store read, no changed audit row. The federated caller has
+        # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller's audit row is
+        # unchanged. (Its session insert is guarded since vault BACKLOG #2609, which is one read
+        # inside that insert's transaction.) The federated caller has
         # already SELECTED the account by that pair and re-resolved ``principal`` from the selected
         # row (ADR 0184), so the name read below finds that row unless the directory renamed it.
         federated = federated_subject is not None or mech == "oidc"
@@ -4277,10 +4255,24 @@ class AuthService:
                 # revokes what is live at that instant, and without the guard this login's own
                 # INSERT lands just after it. The Kerberos and password legs pass nothing here, so
                 # they take no extra read and no extra statement.
-                require_federated_subject=federated_subject,
+                #
+                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so the
+                # sentence above holds for the password leg only. The refusal further up read
+                # the row before this mint, and a bind can commit between the two: its sweep
+                # runs in the bind's own transaction and cannot see a session inserted after
+                # it. So the insert itself requires an unbound row, under the lock the bind
+                # takes. That also covers a rebind's gap, where the row is unbound between the
+                # clear and the write.
+                require_federated_subject=federated_subject if federated else _UNBOUND,
                 supersedes_hash=supersedes_hash,
             )
-        except _FederatedBindingWithdrawn:
+        except _BindingChangedMidLogin:
+            if not federated:
+                # A bind landed between the refusal check and the insert. Same answer as the
+                # check gives, and nothing was minted.
+                return await self._refuse_directory_row(
+                    principal.username, FEDERATED_SIGN_IN_REQUIRED, client=client
+                )
             await self._directory_reject_audit(
                 principal.username, "oidc", "federated_subject_unbound"
             )
@@ -5502,11 +5494,11 @@ class AuthService:
         seed_reauth: bool,
         mechanism: SessionMechanism,
         max_expires_at: float | None = None,
-        require_federated_subject: tuple[str, str] | None = None,
+        require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
     ) -> str:
         """Mint a session token and persist the row. Callers passing
-        ``require_federated_subject`` must handle :class:`_FederatedBindingWithdrawn`.
+        ``require_federated_subject`` must handle :class:`_BindingChangedMidLogin`.
 
         ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
         7.2.4, login side). It is ended after the new
@@ -5544,10 +5536,10 @@ class AuthService:
             auth_mechanism=mechanism.value,
         )
         if not issued:
-            # Only reachable with a guard requested: an unbind revoked this account's sessions while
-            # this login was in flight, so issuing now would hand back a token the revocation could
-            # never have seen. Nothing was written, so there is nothing to undo.
-            raise _FederatedBindingWithdrawn()
+            # Only reachable with a guard requested: an unbind or a bind revoked this account's
+            # sessions while this login was in flight, so issuing now would hand back a token the
+            # revocation could never have seen. Nothing was written, so there is nothing to undo.
+            raise _BindingChangedMidLogin()
         if mfa_verified:
             # No second factor pending (MFA is not required for this user, or the federated IdP
             # asserted one): mark the session's 2nd factor satisfied at issuance so the step-up gate
@@ -6465,10 +6457,8 @@ class AuthService:
                     # The session is gone: a good password on a session that vanished mid-ceremony,
                     # or (with session_revoked) one revoked by its re-proof budget.
                     "session_lost": elevation.session_lost,
-                    # A good password whose purpose grant was refused: a pending session on an
-                    # account with a factor, or a factor-binding action that would go around a
-                    # bound account's identity provider (vault BACKLOG #2609). Without it the row
-                    # reads as a granted re-proof.
+                    # A good password whose purpose grant was refused (a pending session on an
+                    # account with a factor). Without it the row reads as a granted re-proof.
                     "grant_refused": grant_refused,
                     # This failure spent the session's re-proof budget, so it is revoked
                     # (BACKLOG #1138). A session already gone reads session_lost alone.
@@ -6524,18 +6514,14 @@ class AuthService:
     #: A new action on either reauth-only action gate belongs here too. A test in
     #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
     #: console packages. The action-less ``require_ui_reauth_only`` gate never consults it.
-    #:
-    #: Built from :data:`_FACTOR_BINDING_ACTIONS`, the actions that bind a NEW factor, so a new
-    #: enrolment action is added once and meets both rules. Ending a session binds nothing, so
-    #: ``session_terminate`` is in this set only.
-    _FACTOR_BINDING_ACTIONS = frozenset(
+    _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
             STEP_UP_ACTION_MFA_CONFIRM,
             STEP_UP_ACTION_WEBAUTHN_ENROLL,
+            STEP_UP_ACTION_SESSION_TERMINATE,
         }
     )
-    _PENDING_REFUSED_ACTIONS = _FACTOR_BINDING_ACTIONS | {STEP_UP_ACTION_SESSION_TERMINATE}
 
     async def _factor_binding_is_blocked(self, token: str | None, purpose: str) -> bool:
         """Whether a step-up grant for ``purpose`` must be REFUSED for this session (ASVS 6.3.3).
@@ -6555,32 +6541,17 @@ class AuthService:
         untouched: an account with NO factor still enrols, and ends sessions, from a password-only
         session, which is exactly the deadlock carve-out. Disable/delete actions are NOT listed:
         they run behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
-
-        **One first enrolment IS refused: a factor-binding action on an account that holds a
-        federated binding, from a session the federated login did not mint** (vault BACKLOG #2609).
-        See :func:`_binds_past_the_identity_provider`.
         """
-        if not token:
-            # No session to act on, so a listed action fails closed.
-            return purpose in self._PENDING_REFUSED_ACTIONS
-        return await self._factor_binding_is_blocked_hash(hash_token(token), purpose)
+        if purpose not in self._PENDING_REFUSED_ACTIONS:
+            return False
+        return await self._owes_enrolled_factor(token)
 
     async def _factor_binding_is_blocked_hash(self, token_hash: str, purpose: str) -> bool:
         """:meth:`_factor_binding_is_blocked` keyed on the session's hash (see
         :meth:`_elevated_hash`)."""
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
-        if await self._owes_enrolled_factor_hash(token_hash):
-            return True
-        if purpose not in self._FACTOR_BINDING_ACTIONS:
-            return False
-        # The second rule, :func:`_binds_past_the_identity_provider`. Fails closed when the
-        # session or its user cannot be found, as the rule above does.
-        session = await self._store.get_session(token_hash)
-        user = None if session is None else await self._store.get_user(session.user_id)
-        if session is None or user is None:
-            return True
-        return _binds_past_the_identity_provider(session, user)
+        return await self._owes_enrolled_factor_hash(token_hash)
 
     async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
         """Whether the session is MFA-pending on an account that already HAS a second factor.
@@ -7837,15 +7808,6 @@ class AuthService:
         user = await self._store.get_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
-        # vault BACKLOG #2609. The route in front of this leg rides the session window and asks no
-        # action-bound gate, so a ceremony begun before an administrator bound the account could
-        # finish after it. Asked here, before the challenge is spent. A session that is gone is
-        # left to the rotation below, which reports it as lost.
-        session = await self._store.get_session(hash_token(token))
-        if session is not None and _binds_past_the_identity_provider(session, user):
-            raise ValueError(
-                "this account signs in through its identity provider; sign in there to add a passkey"
-            )
         label = label.strip()
         if not label or len(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
@@ -8839,15 +8801,23 @@ class AuthService:
 
         **EVERY BIND CLEARS FIRST, THEN BINDS.** The clear is the unbind's own transaction, so the prior
         pair and every live session of the account go together and the audit row names the pair that
-        transaction cleared. On an unbound account the clear writes nothing and revokes nothing, so a
-        first bind revokes no session. It adds the federated way in, and it withdraws Windows SSO for
-        later sign-ins: ``_directory_login_refusal`` refuses a bound row there (vault BACKLOG #2609).
-        A session Windows SSO minted before the bind therefore outlives it, and
-        :func:`_binds_past_the_identity_provider` stops that session binding the account's first
-        factor. This sentence used to end "it adds a way in and withdraws none". On a rebind the
-        account is unbound between the two writes, and a federated login in that gap is refused
-        rather than admitted. If the bind is then refused because another account took the pair in
-        the gap, the account is left unbound, and the error says so.
+        transaction cleared. On an unbound account the clear writes nothing and revokes nothing. On a
+        rebind the account is unbound between the two writes, and a federated login in that gap is
+        refused rather than admitted. If the bind is then refused because another account took the
+        pair in the gap, the account is left unbound, and the error says so.
+
+        **EVERY BIND THEN ENDS THE ACCOUNT'S SESSIONS, A FIRST BIND INCLUDED** (vault BACKLOG #2609).
+        A bind adds the federated way in and withdraws Windows SSO, which
+        ``_directory_login_refusal`` refuses for a bound row. So a session minted before the bind
+        is one the account could no longer get, and it must not outlive the bind. This docstring
+        used to say a first bind "adds a way in and withdraws none" and revoked nothing.
+
+        The sweep is the write's own transaction (``Store.set_user_federated_subject``), so there
+        is no moment at which the pair is written and the earlier sessions are live. A Windows SSO
+        sign-in that read the row unbound either inserts its session before that transaction,
+        which ends it, or after, and then its guarded insert in :meth:`_complete_ad_login` finds
+        the row bound and is refused. The account's own session never performs the bind: both
+        routes refuse a caller binding its own account.
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).
@@ -8914,7 +8884,7 @@ class AuthService:
             )
         # ALWAYS THROUGH THE CLEAR, and the transaction's own answer decides bind versus rebind -- not
         # the `user` read above. The clear writes nothing and revokes nothing on an unbound account,
-        # so a first bind costs one statement. Deciding from the earlier read would let a binding
+        # so on a first bind it costs one statement. Deciding from the earlier read would let a binding
         # another administrator wrote in between be overwritten with its sessions left live. The
         # clear compares the CALLER's pair, not that read's: the read is this request's, and the
         # decision to replace a binding was made on whatever the caller's page showed (#2026).
@@ -8933,7 +8903,7 @@ class AuthService:
             # this write are two transactions, so a second bind of this account can land between
             # them; an unconditional write would overwrite it with no audit row and leave the
             # sessions it admitted live.
-            written = await self._store.set_user_federated_subject(
+            swept = await self._store.set_user_federated_subject(
                 user_id, issuer, subject, expect_unbound=True
             )
         except Exception as exc:
@@ -8953,7 +8923,7 @@ class AuthService:
                     else ""
                 )
             ) from exc
-        if not written:
+        if swept is None:
             if not rebind:
                 # Nothing was written: the caller saw the account unbound and another bind landed
                 # first. That is the changed-pair refusal, with its code (BACKLOG #2026).
@@ -8965,19 +8935,19 @@ class AuthService:
                 "another request bound this account while this one ran; read it and retry"
                 "; this request removed its previous binding first"
             )
+        # The write swept in its own transaction. On a rebind the clear already swept, so this
+        # adds only what was minted in the gap between the clear and the write.
+        revoked += swept
         detail: dict[str, object] = {
             "user_id": user_id,
             "username": user.username,
             "issuer": issuer,
             "subject": subject,
+            "sessions_revoked": revoked,
         }
         if rebind:
             detail.update(
-                {
-                    "previous_issuer": previous_issuer,
-                    "previous_subject": previous_subject,
-                    "sessions_revoked": revoked,
-                }
+                {"previous_issuer": previous_issuer, "previous_subject": previous_subject}
             )
         await self._audit(
             "auth.federated_subject_rebound" if rebind else "auth.federated_subject_bound",
@@ -8993,7 +8963,7 @@ class AuthService:
             FEDERATED_IDENTITY_BOUND,
             username=user.username,
             email=user.notify_email,
-            detail={"issuer": issuer},
+            detail={"issuer": issuer, "sessions_revoked": revoked},
         )
         return FederatedBinding(
             issuer=issuer,

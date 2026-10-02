@@ -2214,14 +2214,24 @@ class AuthStore(Protocol):
         *,
         now: float | None = None,
         expect_unbound: bool = False,
-    ) -> bool:
-        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015). Returns
-        whether a row was written.
+    ) -> int | None:
+        """Bind a user's verified federated ``(issuer, sub)`` identity (BACKLOG #1015), and end
+        every live session of that account in the same transaction (vault BACKLOG #2609).
+
+        Returns the number of sessions it revoked, or ``None`` when no row was written: the row
+        is unknown, or bound while ``expect_unbound``. **Compare the answer with ``None``.** A
+        bind that found no session returns ``0``, which is a write.
+
+        **Why the sweep is in here and not a second call.** A bound account is refused Windows
+        SSO, so a session minted before the bind is one the account could no longer get. If the
+        sweep were a call after this one, a failure between the two could not be retried: the
+        bind refuses a pair the account already holds before it writes anything. When nothing is
+        written, nothing is revoked.
 
         ``expect_unbound`` makes the write conditional on the row holding NO pair, in the same
         statement (BACKLOG #1143). The admin bind clears and then sets in two transactions, so
         without it a second bind landing between them would be overwritten with no audit row and its
-        sessions left live. ``False`` when the row is unknown, or bound while ``expect_unbound``.
+        sessions left live.
 
         Its one caller is :meth:`AuthService.bind_federated_subject`, the administrative bind (BACKLOG
         #1143, ADR 0184). A federated login selects its account by this pair and never writes it.
@@ -2316,7 +2326,7 @@ class AuthStore(Protocol):
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-        require_federated_subject: tuple[str, str] | None = None,
+        require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
@@ -2337,6 +2347,12 @@ class AuthStore(Protocol):
         the login's own ``INSERT`` can land just after that sweep, so the revocation misses it and
         the withdrawn identity keeps a live session. Checking the binding before calling would only
         narrow the window, because the check and the insert would still be two transactions.
+
+        **``(None, None)`` requires an UNBOUND row** (vault BACKLOG #2609). It is the same guard
+        read the other way, for the Windows SSO mint: a bound account is refused that sign-in,
+        and a bind sweeps the sessions that exist when it runs. So a Windows SSO insert that
+        landed after a bind's sweep would leave a session the bind could not see. A row holding
+        either half of a pair is not unbound, and the insert is refused.
 
         Every other caller passes nothing and is byte-identical: no extra read, no extra statement.
         """

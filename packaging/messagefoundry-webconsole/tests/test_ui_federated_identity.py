@@ -259,7 +259,8 @@ async def test_link_is_refused_without_the_grant_and_succeeds_with_it(
     assert await _pair(engine, target) == (ISSUER, "S-1-a")
 
     landed = await c.get(ok.headers["location"])
-    assert "Linked. A federated sign-in with this subject now reaches this account." in landed.text
+    assert "sessions were signed out. A federated sign-in with this subject" in landed.text
+    assert "Windows SSO no longer signs it in." in landed.text
 
 
 async def test_relink_moves_the_pair_and_says_so(
