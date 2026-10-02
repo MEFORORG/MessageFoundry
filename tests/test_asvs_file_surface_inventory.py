@@ -28,7 +28,7 @@ Four derived axes, and the hand-kept parts the doc discloses:
    and must bound each decoder at the engine's ``DEFAULT_MAX_FRAME_BYTES``. Every code unit there that
    builds a ``QFileSystemWatcher`` reads files another party writes, so it must be named in the same
    row, must cap its reads at ``DEFAULT_MAX_MESSAGE_BYTES``, and must not read a file whole. Every
-   module in ``harness/sinks/`` the harness discovers as a sink (public, sets ``KIND``) must be named in
+   module in ``harness/sinks/`` the harness discovers as a sink (public, not a package) must be named in
    the harness sink row, must bound at an engine cap constant (itself, or through a sink module or a
    ``_``-prefixed harness helper it imports), and must not read a file whole. The reconcile loader
    (:data:`HARNESS_FILE_LOADERS`) is hand-kept: it must read only through the capped reader, at a
@@ -225,8 +225,9 @@ def _imports_and_uses(path: Path, unit: str, module: str, cap_name: str) -> bool
     return imported and any(isinstance(n, ast.Name) and n.id == cap_name for n in ast.walk(node))
 
 
-#: The harness's scenario sinks; each is an upload row since the 2026-10-02 owner ruling (vault
-#: BACKLOG #1130) put ``harness/`` inside the ASVS assessed scope.
+#: The harness's scenario sinks; each is an upload row since the owner ruling of 2026-10-02 (R1 of
+#: the vault's ``docs/security/ASVS-OWNER-RULINGS-2026-10-02-1130.md``) put ``harness/`` inside the
+#: ASVS assessed scope.
 _SINKS = _HARNESS / "sinks"
 #: The engine cap constants a sink may bound at. Each is imported from a ``messagefoundry`` leaf.
 _SINK_CAPS = frozenset(
@@ -239,24 +240,14 @@ HARNESS_FILE_LOADERS: dict[str, str] = {"harness/reconcile/compare.py": "load_me
 
 
 def harness_sinks(src: Path, root: Path) -> list[str]:
-    """Repo-relative path of every module in ``src`` the harness discovers as a sink: public (no
-    leading ``_``, as ``harness._discover`` skips) and setting ``KIND`` at top level."""
-    found: list[str] = []
-    for path in sorted(src.glob("*.py")):
-        if path.name.startswith("_"):
-            continue
-        for node in ast.parse(path.read_text(encoding="utf-8")).body:
-            targets = (
-                node.targets
-                if isinstance(node, ast.Assign)
-                else [node.target]
-                if isinstance(node, ast.AnnAssign)
-                else []
-            )
-            if any(isinstance(t, ast.Name) and t.id == "KIND" for t in targets):
-                found.append(path.relative_to(root).as_posix())
-                break
-    return found
+    """Repo-relative path of every module in ``src`` the harness discovers as a sink: exactly what
+    ``harness._discover.family_modules`` imports, a public (no leading ``_``) non-package module.
+    Whether it sets ``KIND`` is not asked: discovery loads it either way."""
+    return [
+        path.relative_to(root).as_posix()
+        for path in sorted(src.glob("*.py"))
+        if not path.name.startswith("_")
+    ]
 
 
 def _cap_hops(path: Path, root: Path, sinks_dir: Path) -> list[Path]:
@@ -294,7 +285,9 @@ def _caps_used(path: Path) -> set[str]:
 
 def unbounded_sinks(sinks: Iterable[str], root: Path, sinks_dir: Path) -> list[str]:
     """Sinks that bound at none of :data:`_SINK_CAPS`, themselves or through one hop, or that read a
-    file whole (``read_text``, ``read_bytes``, or a ``.read()`` method call with no size) in their own
+    file whole. A tripwire, not proof that the cap is enforced: naming the constant is what it checks.
+    Each refusal is exercised by the sink's own behaviour tests (``tests/test_harness_*.py``). Flags
+    (``read_text``, ``read_bytes``, or a ``.read()`` method call with no size) in their own
     module. A bare ``read()`` is not a file: the stream sinks name their ``recv_chunks`` reader so."""
     bad: list[str] = []
     for rel in sinks:
@@ -1200,12 +1193,14 @@ def test_self_test_a_harness_sink_is_found_and_an_unbounded_one_flagged(tmp_path
     assert sinks == [
         "harness/sinks/capped.py",
         "harness/sinks/importonly.py",
+        "harness/sinks/notasink.py",
         "harness/sinks/viahelper.py",
         "harness/sinks/viainit.py",
         "harness/sinks/whole.py",
     ]
     assert unbounded_sinks(sinks, tmp_path, sinks_dir) == [
         f"harness/sinks/importonly.py (bounds at none of {sorted(_SINK_CAPS)})",
+        f"harness/sinks/notasink.py (bounds at none of {sorted(_SINK_CAPS)})",
         f"harness/sinks/viainit.py (bounds at none of {sorted(_SINK_CAPS)})",
         "harness/sinks/whole.py:5 (reads a file whole: read_bytes)",
         "harness/sinks/whole.py:8 (reads a file whole: read)",
