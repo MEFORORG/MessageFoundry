@@ -25,8 +25,9 @@ it is installed. At least two things stay open. A script injected earlier in sta
 process has to import this module and reach the install call first, and a caller that can restart
 the engine can aim for that window. The command line makes the call when
 ``messagefoundry/__main__.py`` is imported, ahead of that module's other imports and for every
-command. What is left is the interpreter's own start-up, loading that module, and this module's
-imports. And the capability underneath is untouched: a process that can write this process's
+command. What is left is at least the interpreter's own start-up, the package's ``__init__``,
+loading that module, and this module's imports, which are most of the part the engine controls.
+And the capability underneath is untouched: a process that can write this process's
 memory can run code in it some other way, and can remove a hook. So an enabled interface with the
 hook in place is reported as a residual (:func:`remote_debug_loosening`), and turning the
 interface off at launch is separate work.
@@ -89,8 +90,9 @@ REMOTE_SCRIPT_EVENT: Final = "cpython.remote_debugger_script"
 _PROBE_EVENT: Final = "messagefoundry.remotedebug.probe"
 
 #: The injecting process chooses the script's name, so the logged copy is bounded. The hook cuts
-#: the name to this length for the queue, and :func:`_report` cuts it again once it is escaped to
-#: ASCII, because an escape is up to ten characters long.
+#: the name to this length for the queue. :func:`_report` cuts its escaped spelling to the same
+#: length, because an escape is up to ten characters long. That cut can fall inside the last
+#: escape.
 _FILE_NAME_LIMIT: Final = 120
 
 #: Refusals waiting for the reporter thread. Past this the refusal is still counted and still
@@ -101,6 +103,7 @@ _log = logging.getLogger(__name__)
 _install_lock = threading.Lock()
 _reports: queue.SimpleQueue[str] = queue.SimpleQueue()
 _refused = 0
+_reporter_started = False
 
 
 class RemoteScriptRefused(RuntimeError):
@@ -146,10 +149,14 @@ def _ascii(name: str) -> str:
     set the stream to replace what it cannot encode, and it then shows ``?`` for the character.
     An ASCII line is written whole by all three, whatever each one's encoding.
 
+    A backslash already in the name is doubled first. Otherwise a file named with the six
+    characters of an escape would be logged the same as the character that escape stands for,
+    and the reader could not tell which file it was.
+
     This covers this module's one line. A lone surrogate in any other log line fails the same two
     sinks the same way.
     """
-    return name.encode("ascii", "backslashreplace").decode("ascii")
+    return name.replace("\\", "\\\\").encode("ascii", "backslashreplace").decode("ascii")
 
 
 def _report(name: str) -> None:
@@ -159,7 +166,7 @@ def _report(name: str) -> None:
         "refused a script that another process injected through the interpreter's remote "
         "debugging (audit event %s, script file name %s). Nothing in it ran.",
         REMOTE_SCRIPT_EVENT,
-        scrub_log_argument(_ascii(name)[:_FILE_NAME_LIMIT]),
+        scrub_log_argument(_ascii(name))[:_FILE_NAME_LIMIT],
     )
 
 
@@ -176,6 +183,20 @@ def _report_refusals() -> None:
 
 def _start_reporter() -> None:
     threading.Thread(target=_report_refusals, name="mefor-remote-debug-report", daemon=True).start()
+
+
+def _ensure_reporter() -> None:
+    """Start the reporter thread, unless an earlier call did. Called with the install lock held."""
+    global _reporter_started
+    if _reporter_started:
+        return
+    # never-raise: the interpreter cannot always start a thread (a thread or process limit). The
+    # command line makes the install call at import, where an exception would end every command
+    # before it could report anything. The hook is in and refuses either way. Without the
+    # reporter a refusal is counted and not logged, and the next install call tries again.
+    with contextlib.suppress(RuntimeError):
+        _start_reporter()
+        _reporter_started = True
 
 
 def _without_own_refusals(
@@ -208,6 +229,9 @@ def install_remote_debug_guard() -> None:
     Call it as early in the process as possible: a script injected before the call runs. A second
     call finds the hook answering and adds nothing, and an audit hook cannot be removed.
 
+    It does not raise. The command line calls it at import, ahead of everything that could report
+    a failure, so a hook that could not go in is left for :func:`remote_debug_posture` to report.
+
     Nothing is added where ``sys.is_remote_debug_enabled()`` is False, which is every child started
     through :func:`messagefoundry.childenv.python_child_argv`. The event cannot fire there.
 
@@ -218,18 +242,20 @@ def install_remote_debug_guard() -> None:
     if not sys.is_remote_debug_enabled():
         return
     with _install_lock:
-        if _guard_answers():
-            return
-        # Quiet first, so no refusal is ever reported with its full path.
-        previous = sys.unraisablehook
-        quiet = sys.unraisablehook = _without_own_refusals(previous)
-        sys.addaudithook(_guard)
         if not _guard_answers():
-            # Dropped: there is nothing to report for, and nothing to quiet.
-            if sys.unraisablehook is quiet:
-                sys.unraisablehook = previous
-            return
-        _start_reporter()
+            # Quiet first, so no refusal is ever reported with its full path.
+            previous = sys.unraisablehook
+            quiet = sys.unraisablehook = _without_own_refusals(previous)
+            # never-raise: a hook already installed may object to this one. The interpreter
+            # swallows a RuntimeError from it and passes on any other exception.
+            with contextlib.suppress(Exception):
+                sys.addaudithook(_guard)
+            if not _guard_answers():
+                # Dropped: there is nothing to report for, and nothing to quiet.
+                if sys.unraisablehook is quiet:
+                    sys.unraisablehook = previous
+                return
+        _ensure_reporter()
 
 
 def remote_debug_posture() -> RemoteDebugPosture:
@@ -255,7 +281,7 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
             "engine's refusal hook is NOT installed. A process the operating system lets attach "
             "to this one, which on Windows includes one running as the same account, could run "
             "Python inside it with sys.remote_exec, with everything it holds (the store key, "
-            "connection secrets, messages in flight). Every `messagefoundry` command installs "
+            "connection secrets, messages in flight). The `messagefoundry` command line installs "
             "the hook as it starts. Start the interpreter with -X disable-remote-debug to turn "
             "the interface off",
         )

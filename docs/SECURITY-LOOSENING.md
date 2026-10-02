@@ -1197,14 +1197,16 @@ This section is kept rather than deleted, because the claim it used to make is t
   where Yama `ptrace_scope` is `1`, as Ubuntu ships it, only a parent process or one with
   `CAP_SYS_PTRACE` can. The interface is on unless the interpreter starts with
   `-X disable-remote-debug` or `PYTHON_DISABLE_REMOTE_DEBUG=1`.
-- **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** Every
-  `messagefoundry` command installs an audit hook as it starts, before it parses its arguments.
+- **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** The
+  `messagefoundry` command line installs an audit hook as it starts, before it parses its
+  arguments, so each of its commands has it. The tray (`messagefoundry-tray`) and the authoring
+  toolkit (`messagefoundry-toolkit`) start through their own entry points and install none.
   The interpreter raises an event before it runs an injected script. The hook raises on that
   event, and the interpreter then drops the script. A refusal logs a WARNING with the script's
   file name, and no audit row. The name is written in ASCII, with a backslash escape for every
-  other character, so no name the injecting process chooses can keep the line out of a log.
-  Where refusals arrive faster than they are logged, lines past a backlog of 64 are dropped.
-  Every refusal is counted, and once one has been refused the entry carries the count.
+  other character, so a character a log sink cannot encode does not keep the line out of that
+  sink. Where refusals arrive faster than they are logged, lines past a backlog of 64 are
+  dropped. Every refusal is counted, and once one has been refused the entry carries the count.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. The hook goes in when the command-line module is imported, ahead of its
@@ -1215,7 +1217,9 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process the
   operating system lets attach could run Python inside the engine, with the store key, the
   connection secrets and the messages in flight. An application that builds the API without
-  `serve` reports this. `serve` would report it only if another audit hook refused the engine's.
+  `serve` reports this, until something in it imports the command-line module, which installs
+  the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
+  only if another audit hook refused the engine's.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process, and
   no API reports that process afterwards. The engine's Python children start with the interface
@@ -1237,10 +1241,12 @@ This section is kept rather than deleted, because the claim it used to make is t
   console script.
 - **Attach debugging goes with it.** `python -m pdb -p <pid>` uses this interface, so it cannot
   attach to `serve` or `supervise`. The same holds for every other `messagefoundry` command,
-  `validate`, `check` and `dryrun` included: the hook goes in before the command is known. There
-  is no switch that turns the hook off. To debug a command, start it under the debugger, as
-  `python -m pdb -m messagefoundry <command>`, or put `breakpoint()` in the config code. Neither
-  uses the interface.
+  `validate`, `check` and `dryrun` included: the hook goes in before the command is known. It
+  also holds for a process of your own that imports `messagefoundry.__main__`. There is no
+  switch that turns the hook off. To debug a command, start it under the debugger, as
+  `python -m pdb -m messagefoundry <command>`, which does not use the interface. That reaches
+  the command's own process. Router and Handler bodies that run in a sandbox worker
+  (`[sandbox].mode = "subprocess"`) are in a child process, which it does not reach.
 
 ---
 
