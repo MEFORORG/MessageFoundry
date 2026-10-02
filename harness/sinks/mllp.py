@@ -12,7 +12,7 @@ from __future__ import annotations
 import socket
 
 from harness.endpoints import Endpoints
-from harness.sinks import Record, Sink
+from harness.sinks import LOOPBACK, Record, Sink
 from harness.sinks._tcp import LoopbackServer, recv_chunks
 from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, build_ack, frame
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -23,7 +23,7 @@ KIND = "mllp"
 class MLLPSink(Sink):
     kind = KIND
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0, *, reply: str | None = "AA") -> None:
+    def __init__(self, host: str = LOOPBACK, port: int = 0, *, reply: str | None = "AA") -> None:
         super().__init__()
         if reply not in (None, "AA", "AE", "AR"):
             raise ValueError(f"reply must be AA, AE, AR or None, got {reply!r}")
@@ -56,4 +56,4 @@ class MLLPSink(Sink):
 
 
 def build(endpoints: Endpoints, key: str) -> Sink:
-    return MLLPSink(endpoints.host, endpoints.port(key))
+    return MLLPSink(LOOPBACK, endpoints.port(key))

@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import socket
+import sys
 import threading
 from collections.abc import Callable
 
@@ -44,7 +45,13 @@ class LoopbackServer:
 
     def start(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Windows reads SO_REUSEADDR as "let another socket share this port", so a sink could silently
+        # co-own a port with the GUI's Receive tab. Exclusive use there; the POSIX meaning (rebind a
+        # port still in TIME_WAIT) is the one wanted everywhere else.
+        if sys.platform == "win32":
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.bind((self.host, self._requested_port))
             listener.listen()
@@ -64,13 +71,18 @@ class LoopbackServer:
             _close_quietly(conn)
         if self._listener is not None:
             _close_quietly(self._listener)
-        for thread in self._threads:
+        with self._lock:
+            threads = list(self._threads)
+        for thread in threads:
             thread.join(timeout=5)
 
     def _spawn(self, target: Callable[[], None]) -> None:
+        # Started BEFORE it is listed, under the lock: stop() snapshots the list under the same lock,
+        # so it can never try to join a thread that has not started.
         thread = threading.Thread(target=target, daemon=True, name="harness-sink")
-        self._threads.append(thread)
-        thread.start()
+        with self._lock:
+            thread.start()
+            self._threads.append(thread)
 
     def _accept_loop(self) -> None:
         assert self._listener is not None
@@ -80,7 +92,12 @@ class LoopbackServer:
             except TimeoutError:
                 continue
             except OSError:
-                return  # the listener was closed by stop()
+                if self.stopping.is_set():
+                    return  # the listener was closed by stop()
+                # A transient accept failure (an aborted handshake, a full descriptor table) must not
+                # end the loop silently, or a scenario waits out its timeout on a dead sink.
+                self.stopping.wait(POLL_SECONDS)
+                continue
             conn.settimeout(POLL_SECONDS)
             with self._lock:
                 self._conns.add(conn)

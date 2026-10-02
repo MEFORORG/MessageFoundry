@@ -2,14 +2,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Serve the REAL ``harness/config`` graphs in-process, on ephemeral ports and temporary dirs.
 
-The graphs read their ports and directories from ``harness/endpoints/`` through
-``MEFOR_HARNESS_<KEY>`` environment variables, so a test can run exactly the config an operator
-serves, not a copy of it, without colliding with a fixed port. :func:`ephemeral_overrides` picks
+The graphs read their ports and directories as engine environment values, which the engine
+overlays from ``MEFOR_VALUE_HARNESS_<KEY>`` variables (``harness/endpoints/`` names them), so a test
+can run exactly the config an operator serves, not a copy of it, without colliding with a fixed
+port. :func:`ephemeral_overrides` picks
 the values; :func:`serve_harness_config` sets the variables, starts the engine and API, and puts
 the environment back on the way out.
 
-Shared by the harness scenario, hostile-content and fuzz tests. The readiness logic deliberately
-reaches ``uvicorn.Server``, ``threading.Thread`` and ``time`` through their modules, so
+Written to be shared by every harness test that needs a served graph. The readiness logic
+deliberately reaches ``uvicorn.Server``, ``threading.Thread`` and ``time`` through their modules, so
 ``test_server_readiness_uses_one_budget_and_always_cleans_up`` can drive it with fakes.
 """
 
@@ -28,6 +29,7 @@ import uvicorn
 from harness import endpoints as harness_endpoints
 from harness.endpoints import PATH, PORT, Endpoints
 from messagefoundry.api import create_managed_app
+from messagefoundry.config.environments import load_environment_values
 
 REPO = Path(__file__).resolve().parents[1]
 HARNESS_CONFIG = REPO / "harness" / "config"
@@ -78,8 +80,18 @@ def serve_harness_config(
     registry = harness_endpoints.registry()
     env = {registry[key].env: value for key, value in overrides.items()}
     with _environment(env):
+        # What `serve --env dev` does: environments/dev.toml overlaid with MEFOR_VALUE_* variables.
+        # Without an active environment the engine resolves every env() to its default and the
+        # overrides above would reach nothing.
+        values = load_environment_values(
+            base_dir=REPO, dir_name="environments", environment="dev", environ=os.environ
+        )
         app = create_managed_app(
-            db_path=tmp_path / "harness.db", config_dir=config_dir, poll_interval=0.05
+            db_path=tmp_path / "harness.db",
+            config_dir=config_dir,
+            poll_interval=0.05,
+            env_values=values,
+            allow_no_auth=True,  # the harness reads the API with no session
         )
         api_port = free_port()
         uv = uvicorn.Server(

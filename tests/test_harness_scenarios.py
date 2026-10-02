@@ -72,7 +72,9 @@ def test_every_registered_scenario_passes_against_the_real_graph(
 ) -> None:
     api_url, eps = server
     with EngineClient(api_url) as client:
-        result = run_scenario(SCENARIOS[name], client, timeout=20.0, endpoints=eps)
+        # Generous: dead_letter rides the real graph's retry policy (3 attempts, 1s and 2s backoff),
+        # and a refused loopback connect costs about 2s per attempt on Windows.
+        result = run_scenario(SCENARIOS[name], client, timeout=60.0, endpoints=eps)
     assert result.ok, result.detail
 
 
@@ -94,7 +96,7 @@ def test_a_sink_scenario_fails_when_nothing_reaches_the_sink(server: tuple[str, 
         "no_echo", "", "ADT", "A05", 2, "processed", sink="mllp", sink_endpoint="mllp_echo"
     )
     with EngineClient(api_url) as client:
-        result = run_scenario(scenario, client, timeout=2.0, endpoints=eps)
+        result = run_scenario(scenario, client, timeout=8.0, endpoints=eps)
     assert not result.ok
     assert "0/2 delivered to the mllp sink" in result.detail
 
@@ -326,7 +328,7 @@ def test_a_scenario_claims_an_outbound_only_through_a_sink() -> None:
 
 
 def test_endpoint_resolution_order_is_override_then_environment_then_default() -> None:
-    env = {"MEFOR_HARNESS_MLLP_IN": "3575"}
+    env = {"MEFOR_VALUE_HARNESS_MLLP_IN": "3575"}
     assert Endpoints(environ={}).port("mllp_in") == 2575
     assert Endpoints(environ=env).port("mllp_in") == 3575
     assert Endpoints({"mllp_in": "4575"}, environ=env).port("mllp_in") == 4575
@@ -340,7 +342,7 @@ def test_endpoint_resolution_order_is_override_then_environment_then_default() -
 
 def test_the_cli_refuses_a_malformed_endpoint(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--scenario", "processed", "--endpoint", "mllp_in"]) == 2
-    assert "bad --endpoint" in capsys.readouterr().err
+    assert "bad endpoint" in capsys.readouterr().err
     assert main(["--scenario", "processed", "--endpoint", "nope=1"]) == 2
 
 
@@ -425,3 +427,103 @@ def test_verify_sink_names_what_did_not_arrive() -> None:
     assert result.detail.endswith("1/2 delivered to the mllp sink")
     fake._add(Record(_hl7("B")))
     assert _verify_sink(scenario, fake, ["A", "B"], 0.2, "").ok
+
+
+def test_the_cli_names_a_malformed_endpoint_value_as_setup(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bad VALUE, not only a bad key, is exit 2 before any traffic -- from --endpoint or from the
+    environment, and for an endpoint the scenario does not even use."""
+    assert main(["--scenario", "processed", "--endpoint", "mllp_in=abc"]) == 2
+    assert "must be a port number" in capsys.readouterr().err
+    monkeypatch.setenv("MEFOR_VALUE_HARNESS_MLLP_ECHO", "99999")
+    assert main(["--scenario", "processed"]) == 2
+    assert "out of the port range" in capsys.readouterr().err
+
+
+def test_the_cli_reports_a_busy_sink_port_as_setup(capsys: pytest.CaptureFixture[str]) -> None:
+    """The documented GUI setup listens on the echo port; a sink that cannot bind is exit 2, not a
+    traceback (and never a silent shared port)."""
+    with MLLPSink() as holder:
+        rc = main(
+            [
+                "--scenario",
+                "mllp_echo_delivered",
+                "--engine",
+                "http://127.0.0.1:9",
+                "--endpoint",
+                f"mllp_echo={holder.port}",
+            ]
+        )
+    assert rc == 2
+    assert capsys.readouterr().err.startswith("SETUP mllp_echo_delivered:")
+
+
+def test_every_sink_binds_loopback_whatever_the_host_endpoint_says() -> None:
+    eps = Endpoints({"host": "0.0.0.0"}, environ={})  # noqa: S104  (the point of the test)
+    for kind in ("mllp",):
+        sink = sinks.build(kind, eps, "mllp_echo")
+        assert isinstance(sink, MLLPSink)
+        assert sink._server.host == sinks.LOOPBACK
+
+
+def test_every_registered_scenario_names_real_drivers_sinks_and_endpoints() -> None:
+    """A scenario that cannot run must not count as coverage: every kind it claims has a harness
+    driver or sink, and every endpoint it names is declared."""
+    declared = set(endpoints.registry())
+    for name, scenario in SCENARIOS.items():
+        if not isinstance(scenario, Scenario):
+            continue
+        assert scenario.driver in drivers.registry(), name
+        assert scenario.inbound in declared, name
+        if scenario.sink is not None:
+            assert scenario.sink in sinks.registry(), name
+            assert scenario.sink_endpoint in declared, name
+
+
+def _graph_env_refs() -> dict[str, object]:
+    """Every ``env("harness_<key>", default=...)`` the served harness/config graphs make, by key."""
+    from messagefoundry.config.wiring import EnvRef, load_config
+
+    registry = load_config(str(Path(__file__).resolve().parents[1] / "harness" / "config"))
+    found: dict[str, object] = {}
+    specs = [c.spec for c in registry.inbound.values()]
+    specs += [c.spec for c in registry.outbound.values()]
+    for spec in specs:
+        for value in spec.settings.values():
+            if isinstance(value, EnvRef) and value.key.startswith("harness_"):
+                found[value.key.removeprefix("harness_")] = value.default
+    return found
+
+
+def test_each_graph_default_equals_its_endpoint_default() -> None:
+    """The graph reads its ports through the engine's env() and the harness reads harness/endpoints;
+    the two defaults are two spellings of one table, so they are held equal here, both ways."""
+    refs = _graph_env_refs()
+    declared = endpoints.registry()
+    assert refs, "the walk found no harness env() reference -- it is not looking at the graph"
+    for key, default in refs.items():
+        assert key in declared, (
+            f"graph reads harness_{key}, which harness/endpoints does not declare"
+        )
+        assert str(default) == declared[key].default, key
+    unread = sorted(set(declared) - set(refs))
+    assert not unread, f"declared endpoints no graph reads: {unread}"
+
+
+def test_the_coverage_graph_imports_nothing_from_the_harness() -> None:
+    """An engine serving harness/config from its own install need not have the harness importable,
+    and `messagefoundry check` refuses an unvetted import (review of vault BACKLOG #2672)."""
+    import ast
+
+    config = Path(__file__).resolve().parents[1] / "harness" / "config"
+    for path in sorted(config.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+                if isinstance(node, ast.ImportFrom)
+                else []
+            )
+            assert not any(n == "harness" or n.startswith("harness.") for n in names), path.name

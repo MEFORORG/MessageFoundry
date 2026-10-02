@@ -82,7 +82,8 @@ python -m harness --coverage                      # which connector kinds the sc
 ```
 
 Pass `--engine <url>` for a non-default API address, `--token <t>` for an auth-enabled engine, and
-`--cacert <pem>` to trust the engine's minted certificate.
+`--cacert <pem>` to trust the engine's minted certificate. A malformed endpoint, or a sink that cannot bind its port (the GUI
+Receive tab already listening on 2576, say), exits 2 as a setup error; a scenario verdict is 0 or 1.
 
 ### Drivers, sinks and endpoints
 
@@ -95,10 +96,16 @@ listed, so a new family is a new file and never an edit to a shared table:
   and records what arrived, byte for byte. Every sink binds loopback, records in memory, and never
   logs a payload.
 - **Endpoints** (`harness/endpoints/<family>.py`) -- the ports and directories a graph under
-  `harness/config/` binds, read by the graph AND by its scenarios, so the two cannot drift. Each
-  resolves as `--endpoint KEY=VALUE`, then the `MEFOR_HARNESS_<KEY>` environment variable, then
-  the documented default (`mllp_in` is 2575, `file_in` is `./harness_io/in`, and so on). The tests
-  serve the real graph with every port ephemeral and every directory temporary.
+  `harness/config/` binds. The graph reads each one through the engine's own `env("harness_<key>",
+  default=...)` and imports nothing from the harness; the harness resolves the same name as
+  `--endpoint KEY=VALUE`, then the `MEFOR_VALUE_HARNESS_<KEY>` environment variable, then the
+  documented default (`mllp_in` is 2575, `file_in` is `./harness_io/in`, and so on). A test holds
+  every graph default equal to its endpoint default. The engine applies `MEFOR_VALUE_*` only with an
+  environment active, so serve with `--env dev` when you move an endpoint. The tests serve the real
+  graph with every port ephemeral and every directory temporary. Relative directories resolve
+  against each process's own working directory, so run the engine and the harness from the same
+  directory, or pass absolute paths to both.
+- Every sink binds 127.0.0.1 only. The `host` endpoint is what drivers and engine outbounds DIAL.
 
 Scenarios live in `harness/scenarios/<family>.py`, each module exporting a `SCENARIOS` tuple; a
 name claimed twice is an error. A scenario declares the (connector kind, direction) pairs it

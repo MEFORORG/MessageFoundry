@@ -6,7 +6,7 @@
 ``python -m harness --list-scenarios``→ list the built-in scenarios.
 ``python -m harness --scenario NAME`` → run one scenario headless against a running engine
                                                 and exit 0 (pass) / 1 (fail) — for CI.
-``python -m harness --coverage``      → print every registered connector kind, by direction,
+``python -m harness --coverage``      -> print every registered connector kind, by direction,
                                                 against the scenarios that cover it (no engine
                                                 needed).
 ``python -m harness --list-profiles`` → list the built-in load profiles.
@@ -368,8 +368,11 @@ def _run_scenario(
     try:
         overrides = dict(_split_endpoint(arg) for arg in endpoint_args or [])
         endpoints = Endpoints(overrides)
+        # Every endpoint, not only this scenario's: a malformed MEFOR_VALUE_HARNESS_* value is a setup
+        # error to name now, not a traceback from inside a driver halfway through the run.
+        endpoints.validate()
     except (KeyError, ValueError) as exc:
-        print(f"bad --endpoint: {exc}", file=sys.stderr)
+        print(f"bad endpoint: {exc}", file=sys.stderr)
         return 2
     try:
         with EngineClient(engine_url, cacert=cacert) as client:
@@ -379,6 +382,11 @@ def _run_scenario(
     except ApiError as exc:
         print(f"FAIL  {name}: {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:
+        # Setup, not a verdict on the engine: a sink could not bind (the GUI Receive tab already
+        # holds the port, say) or a drop directory could not be made.
+        print(f"SETUP {name}: {exc}", file=sys.stderr)
+        return 2
     print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {result.detail}")
     return 0 if result.ok else 1
 

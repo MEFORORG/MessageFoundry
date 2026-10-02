@@ -8,9 +8,11 @@ that sets ``KIND`` (the connector kind it receives from, as the registry spells 
 ``build(endpoints, key)`` returning a :class:`Sink`. Modules are discovered, so a new family is a
 new file.
 
-Every sink binds loopback only. A sink records payloads in memory for the scenario to assert on and
-never logs them: the harness sends synthetic data, but a sink must not become the place where a
-full message body reaches a log.
+Every sink binds 127.0.0.1 (:data:`LOOPBACK`) and nothing else, whatever the ``host`` endpoint
+says -- that key is the address drivers and engine outbounds DIAL -- so a sink never accepts traffic
+from another machine. A family's ``build()`` must keep it that way. A sink records payloads in
+memory for the scenario to assert on and never logs them: the harness sends synthetic data, but a
+sink must not become the place where a full message body reaches a log.
 """
 
 from __future__ import annotations
@@ -21,11 +23,14 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cache
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import ClassVar, Self
 
 from harness._discover import family_modules
 from harness.endpoints import Endpoints
+
+#: The only address a sink binds.
+LOOPBACK = "127.0.0.1"
 
 
 @dataclass(frozen=True)
@@ -99,7 +104,7 @@ def registry() -> Mapping[str, SinkFactory]:
         if kind in found:
             raise ValueError(f"two harness sinks claim connector kind {kind!r}")
         found[kind] = module.build
-    return found
+    return MappingProxyType(found)
 
 
 def build(kind: str, endpoints: Endpoints, key: str) -> Sink:
