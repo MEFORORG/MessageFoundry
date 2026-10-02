@@ -388,7 +388,7 @@ def test_require_mfa_scope_advisory_names_only_the_accounts_it_frees() -> None:
     assert loos["require_mfa_scope"] == (
         "a local account without the Administrator role is single-factor until it enrolls a "
         "second factor. Administrators and directory accounts still owe one; an OIDC sign-in "
-        "meets it with a checked amr/acr claim"
+        "meets it with an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
     )
 
 
@@ -420,7 +420,8 @@ def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
     assert loos["allow_single_factor_admin_when_exposed"] == (
         "an EXPOSED instance under enforcement = enforce may start with [security].require_mfa "
         "off, on an audited warning instead of the refusal. Every account with no second factor "
-        "enrolled is then single-factor over the network"
+        "enrolled is then single-factor over the network, unless an OIDC sign-in carries a "
+        "checked amr/acr claim"
     )
 
 
