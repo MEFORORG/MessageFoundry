@@ -111,7 +111,9 @@ open points settled below.
   either. Escaping keeps the message deliverable and is what the target set's own escape mechanism
   exists for. Refusal is kept for the values escaping cannot fix: text inside an escape sequence has
   no escape of its own, and a segment id is not a leaf. A field holding no such character takes the
-  single `str.translate` it took before, so the common path costs one regular-expression scan more.
+  single `str.translate` it took before, after a substring scan per character that needs escaping.
+  An override that only renames separators needs none: the field separator never appears inside a
+  field's text, so the escape set is empty and the rewrite is the old single translate.
 - **Which re-encode failures are permanent.** All of them on the MLLP override, not only rule 4's,
   and the sibling `hl7_raw_separators` re-encode too. A payload that is not parseable HL7 fails
   identically on every retry under either setting, so a retry only holds the lane. That is ADR
