@@ -44,7 +44,9 @@ The semantics here mirror two *distinct* python-hl7 surfaces the existing code r
 
 from __future__ import annotations
 
+import operator
 import re
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TypedDict
 
@@ -1075,19 +1077,25 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
         raise ValueError(
             "the message's field, component, repetition and subcomponent separators repeat"
         )
-    table: dict[int, str] = {}
-    for source, dest in ((s_rep, t_rep), (s_comp, t_comp), (s_sub, t_sub), (s_esc, t_esc)):
-        table.setdefault(ord(source), dest)
-    # The characters that are data under the source set and a delimiter under the target set. A
-    # source separator or the source escape character is never data in a leaf, so it is left out.
-    codes: dict[str, str] = {}
-    for char, code in ((t_field, "F"), (t_comp, "S"), (t_rep, "R"), (t_sub, "T"), (t_esc, "E")):
-        if char not in (s_comp, s_rep, s_sub, s_esc):
-            codes.setdefault(char, code)
+    # Source separator to target separator, then the escape character; a separator ranks first.
     structure: dict[str, str] = {}
     for source, dest in ((s_rep, t_rep), (s_comp, t_comp), (s_sub, t_sub)):
         structure.setdefault(source, dest)
-    rewrite = _LeafRewrite(table, structure, codes, s_esc, t_esc) if codes else None
+    table = {ord(source): dest for source, dest in structure.items()}
+    table.setdefault(ord(s_esc), t_esc)
+    # The characters that are data under the source set and a delimiter under the target set. A
+    # source separator or the source escape character is never data in a field's text (and the
+    # field separator never appears in it at all), so each is left out. An override that only
+    # renames separators therefore leaves this empty and takes the plain translate.
+    codes: dict[str, str] = {}
+    for char, code in ((t_field, "F"), (t_comp, "S"), (t_rep, "R"), (t_sub, "T"), (t_esc, "E")):
+        if char not in (s_field, s_comp, s_rep, s_sub, s_esc):
+            codes.setdefault(char, code)
+    rewrite: Callable[[str], str] = (
+        _LeafRewrite(table, structure, codes, s_esc, t_esc)
+        if codes
+        else operator.methodcaller("translate", table)
+    )
     lines: list[str] = []
     for index, seg in enumerate(msg["segments"]):
         _ensure_split(msg, index)
@@ -1108,10 +1116,7 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
                 )
             parts = [texts[0]]
             tail = texts[1:]
-        if rewrite is None:
-            parts.extend(text.translate(table) for text in tail)
-        else:
-            parts.extend(rewrite(text) for text in tail)
+        parts.extend(rewrite(text) for text in tail)
         lines.append(t_field.join(parts))
     return "\r".join(lines) + "\r"
 

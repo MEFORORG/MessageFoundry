@@ -421,7 +421,9 @@ _FIRST_KEPT = re.compile(r"\S")
 def _holds_more_than_one_message(text: str) -> bool:
     """Whether ``text`` holds more than one ``MSH`` segment, by the parser's own reading: it strips
     the whitespace around the body, then treats every line whose first three characters are ``MSH``
-    as a header. C-level scans and no copy."""
+    as a header. C-level scans and no copy. The boundary is the one ``split_batch`` splits on
+    (``_MSH_BOUNDARY`` in ``parsing/split.py``), so a File source hands this guard one message at a
+    time; keep the two in step."""
     first = _FIRST_KEPT.search(text)
     if first is None:
         return False

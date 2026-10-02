@@ -112,10 +112,12 @@ open points settled below.
   exists for. Refusal is kept for the values escaping cannot fix: text inside an escape sequence has
   no escape of its own, and a segment id is not a leaf. A field holding no such character takes the
   single `str.translate` it took before, so the common path costs one regular-expression scan more.
-- **Which re-encode failures are permanent.** All of them on the MLLP override, not only rule 4's.
-  A payload that is not parseable HL7 also fails identically on every retry, so a retry only holds
-  the lane. That is ADR 0204's rule: a refusal the payload causes raises the existing permanent
-  class. `NegativeAckError` is a `DeliveryError`, so a caller catching the latter is unaffected.
+- **Which re-encode failures are permanent.** All of them on the MLLP override, not only rule 4's,
+  and the sibling `hl7_raw_separators` re-encode too. A payload that is not parseable HL7 fails
+  identically on every retry under either setting, so a retry only holds the lane. That is ADR
+  0204's rule: a refusal the payload causes raises the existing permanent class, here with code
+  `reencode`. `NegativeAckError` is a `DeliveryError`, so a caller catching the latter is
+  unaffected.
 - **RemoteFileSource (rule 5): it splits, like the File source.** It reads whole files, as the File
   source does, and a remote drop is where a partner's batch file arrives: several `MSH` messages, with
   or without an `FHS`/`BHS` envelope, the shape `samples/messages/adt_batch.hl7` holds. Refusing would
@@ -184,11 +186,13 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_P3_a_literal_target_field_separator_stays_inside_its_field`
   -> `tests/test_data_never_becomes_structure.py::test_every_target_delimiter_found_in_a_leaf_is_escaped`
   -> `tests/test_data_never_becomes_structure.py::test_escapes_and_structure_survive_the_slow_path`
+  -> `tests/test_data_never_becomes_structure.py::test_an_override_that_only_renames_separators_takes_the_plain_translate`
 - **AC-8** -- IF the target delimiters cannot carry a value as data, THEN THE SYSTEM SHALL refuse the
   rewrite with content-free text, and the MLLP delivery SHALL fail permanently before any dial.
   -> `tests/test_data_never_becomes_structure.py::test_a_value_the_target_set_cannot_carry_is_refused`
   -> `tests/test_data_never_becomes_structure.py::test_the_mllp_override_refusal_is_permanent_and_dials_nothing`
   -> `tests/test_data_never_becomes_structure.py::test_a_non_hl7_payload_under_the_override_is_permanent_too`
+  -> `tests/test_data_never_becomes_structure.py::test_a_non_hl7_payload_under_raw_separators_is_permanent_too`
 - **AC-9** -- IF an HL7 v2 body reaching a listener holds more than one `MSH` segment, THEN THE
   SYSTEM SHALL record `ERROR`, answer `AR` where it has an ACK channel, and commit nothing to the
   ingress stage.

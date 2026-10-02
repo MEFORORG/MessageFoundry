@@ -375,6 +375,28 @@ async def test_a_non_hl7_payload_under_the_override_is_permanent_too() -> None:
     assert caught.value.permanent is True
 
 
+async def test_a_non_hl7_payload_under_raw_separators_is_permanent_too() -> None:
+    dest = MLLPDestination(
+        Destination(
+            name="out",
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 1},
+            hl7_raw_separators=True,
+        )
+    )
+    with pytest.raises(NegativeAckError, match="hl7_raw_separators emit failed") as caught:
+        await dest.send("not an HL7 message")
+    assert caught.value.permanent is True and caught.value.code == "reencode"
+
+
+def test_an_override_that_only_renames_separators_takes_the_plain_translate() -> None:
+    # The field separator never appears inside a field's text, so the same field separator under a
+    # new component set needs no escape walk and gives exactly the old single-translate output.
+    src = MSH + CR + "PID|1||A^B~C&D" + CR
+    out = reencode_with_separators(src, ("|", "@", "*", "%", "!"))
+    assert out.split(CR)[1] == "PID|1||A@B*C%D"
+
+
 # --- rule 5: a source that does not split refuses a body with a second MSH (#2560) ----------------
 
 #: Audit probe P6: two messages in one body.

@@ -2091,9 +2091,10 @@ class RemoteFileSource(SourceConnector):
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")
-        # The declared charset, read the way the File source and the listener read it: the batch split
-        # decodes with it to find the MSH boundaries (ADR 0206 rule 5).
-        self._encoding: str = s.get("encoding", "utf-8")
+        # The declared charset, resolved as ingress_guards.ingress_encoding resolves it (an absent or
+        # None setting is utf-8): the batch split decodes with it to find the MSH boundaries (ADR
+        # 0206 rule 5). A name the codec registry lacks makes the split hand the file over whole.
+        self._encoding: str = s.get("encoding") or "utf-8"
         self._poll_seconds: float = float(s.get("poll_seconds", 5.0))
         self._after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self._after_read not in ("move", "delete", "leave"):

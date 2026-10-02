@@ -93,7 +93,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -854,7 +854,11 @@ def _assigned_names(target: ast.expr) -> list[str]:
     return []  # an attribute/subscript target is not a local name this lint can resolve
 
 
-def _scope_assignments(body: Sequence[ast.stmt]) -> dict[str, list[tuple[ast.expr, bool]]]:
+#: A scope's assignments: each name to every ``(value, augmented)`` binding it takes.
+_Env = dict[str, list[tuple[ast.expr, bool]]]
+
+
+def _scope_assignments(body: Sequence[ast.stmt]) -> _Env:
     """Map each name this scope assigns to ``(value, augmented)`` pairs — every binding it takes, not
     only the last one.
 
@@ -979,28 +983,26 @@ def _phi_to_log_hit(call: ast.Call, msg_sym: str) -> bool:
     return any(_references_phi(arg, msg_sym) for arg in checked)
 
 
-def _lookup_scope_envs(tree: ast.Module) -> dict[int, dict[str, list[tuple[ast.expr, bool]]]]:
-    """``id(Call)`` to the assignment env that call should be read against: the assignments of the
-    scope holding it, over the module's own (so a module-level statement constant is visible inside a
-    function, and a same-named local shadows it).
+def _scoped_nodes(tree: ast.Module) -> Iterator[tuple[ast.AST, _Env]]:
+    """Each node in a scope's executable body, with the assignment env it should be read against:
+    the assignments of the scope holding it, over the module's own (so a module-level statement
+    constant is visible inside a function, and a same-named local shadows it).
 
-    Only calls in a scope's executable body get an entry. A call in a signature — a decorator or a
-    default argument — has no scope of its own here and is read as it always was, from its own
-    expression alone."""
-    envs: dict[int, dict[str, list[tuple[ast.expr, bool]]]] = {}
+    A node in a signature — a decorator or a default argument — has no scope of its own here and is
+    not yielded. Shared by ``unsafe-db-lookup`` and ``leaf-to-whole-field``."""
     module_env = _scope_assignments(tree.body)
-    bodies: list[Sequence[ast.stmt]] = [tree.body]
-    bodies += [
-        node.body
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-    for body in bodies:
-        env = {**module_env, **_scope_assignments(body)}
-        for node in _scope_nodes(body):
-            if isinstance(node, ast.Call):
-                envs[id(node)] = env
-    return envs
+    yield from ((node, module_env) for node in _scope_nodes(tree.body))
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            env = {**module_env, **_scope_assignments(fn.body)}
+            yield from ((node, env) for node in _scope_nodes(fn.body))
+
+
+def _lookup_scope_envs(tree: ast.Module) -> dict[int, _Env]:
+    """``id(Call)`` to the assignment env that call should be read against (:func:`_scoped_nodes`).
+    A call in a signature gets no entry and is read as it always was, from its own expression
+    alone."""
+    return {id(node): env for node, env in _scoped_nodes(tree) if isinstance(node, ast.Call)}
 
 
 def _unsafe_lookup_hit(
@@ -1229,11 +1231,12 @@ def _unvetted_import_hits(
 # must be string literals for the AST to know their level; anything else is left alone.
 
 
-def _literal_path(node: ast.expr | None) -> tuple[str, int, int | None, int | None] | None:
-    """``parse_path`` of a string-literal HL7 path, or None for anything else."""
+def _literal_is_leaf(node: ast.expr | None) -> bool | None:
+    """For a string-literal HL7 path, whether it names a component or subcomponent; None for
+    anything else (a dynamic or malformed path, whose level the AST cannot know)."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         try:
-            return parse_path(node.value)
+            return parse_path(node.value)[2] is not None
         except ValueError:
             return None
     return None
@@ -1248,16 +1251,16 @@ def _is_leaf_read(node: ast.AST) -> bool:
         and isinstance(node.func.value, ast.Name)
         and node.args
     ):
-        path = _literal_path(node.args[0])
+        leaf = _literal_is_leaf(node.args[0])
     elif (
         isinstance(node, ast.Subscript)
         and isinstance(node.ctx, ast.Load)
         and isinstance(node.value, ast.Name)
     ):
-        path = _literal_path(node.slice)
+        leaf = _literal_is_leaf(node.slice)
     else:
         return False
-    return path is not None and path[2] is not None
+    return leaf is True
 
 
 def _carries_decoded_leaf(
@@ -1285,14 +1288,15 @@ def _whole_field_write_value(node: ast.AST) -> ast.expr | None:
         and isinstance(node.func.value, ast.Name)
         and len(node.args) >= 2
     ):
-        path = _literal_path(node.args[0])
-        return node.args[1] if path is not None and path[2] is None else None
+        return node.args[1] if _literal_is_leaf(node.args[0]) is False else None
     if isinstance(node, ast.Assign):
         for target in node.targets:
-            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                path = _literal_path(target.slice)
-                if path is not None and path[2] is None:
-                    return node.value
+            if (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and _literal_is_leaf(target.slice) is False
+            ):
+                return node.value
     return None
 
 
@@ -1300,20 +1304,11 @@ def _leaf_to_whole_field_hits(tree: ast.Module) -> list[int]:
     """Line numbers of whole-field writes whose value is a decoded leaf, read against the
     assignments of the scope holding the write (so ``v = msg.field("PID-3.1")`` a line earlier is
     seen, as ``unsafe-db-lookup`` sees a statement composed earlier)."""
-    module_env = _scope_assignments(tree.body)
-    bodies: list[Sequence[ast.stmt]] = [tree.body]
-    bodies += [
-        node.body
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
     hits: list[int] = []
-    for body in bodies:
-        env = {**module_env, **_scope_assignments(body)}
-        for node in _scope_nodes(body):
-            value = _whole_field_write_value(node)
-            if value is not None and _carries_decoded_leaf(value, env):
-                hits.append(getattr(node, "lineno", 0))
+    for node, env in _scoped_nodes(tree):
+        value = _whole_field_write_value(node)
+        if value is not None and _carries_decoded_leaf(value, env):
+            hits.append(getattr(node, "lineno", 0))
     return hits
 
 
