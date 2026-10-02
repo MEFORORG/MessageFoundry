@@ -5448,9 +5448,10 @@ def _protect_key(args: argparse.Namespace) -> int:
             f"machine and cannot be recovered if the host is lost:\n  {key_b64}",
             file=sys.stderr,
         )
-    granted = "SYSTEM" + (f" + {args.grant_account!r}" if args.grant_account else "")
+    granted = f", and {args.grant_account!r} may read it" if args.grant_account else ""
     print(
-        f"Wrote DPAPI-protected key to {out} (read-granted to {granted}).\n"
+        f"Wrote DPAPI-protected key to {out} (restricted to SYSTEM, Administrators and this "
+        f"account{granted}).\n"
         f"Next: set [store].encryption_key_file = {str(out)!r} and unset MEFOR_STORE_ENCRYPTION_KEY. "
         "Leave [store].key_provider at 'auto' or set it to 'dpapi'; 'env' ignores the file. "
         "If the engine runs as a virtual / gMSA account (not LocalSystem), the file must be "
@@ -5974,13 +5975,14 @@ def _refuse_an_unauditable_write(store: Store) -> None:
 def _key_file_access_gate(path: str, *, what: str, remedy: str, enforcing: bool) -> bool:
     """May ``serve`` use the key file at ``path``? ``False`` means refuse the start.
 
-    The file must not be readable by a broad account (``restricted_file.broad_read_problem``, which
-    also reports a file whose access could not be read). Under ``[security].enforcement = enforce``
+    A broad group must not be able to read or change the file
+    (``restricted_file.broad_access_problem``, which also reports a file whose access could not be
+    read). Under ``[security].enforcement = enforce``
     a problem is an error and the answer is ``False``; under ``warn`` it is a warning and the start
     goes on. ``what`` names the file for the operator and ``remedy`` says what to do about it."""
-    from messagefoundry.restricted_file import broad_read_problem
+    from messagefoundry.restricted_file import broad_access_problem
 
-    problem = broad_read_problem(Path(path))
+    problem = broad_access_problem(Path(path))
     if problem is None:
         return True
     if enforcing:
@@ -6000,10 +6002,13 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
     is what keeps the key from the others. ``protect-key`` creates the file restricted; this
     catches one that was moved, copied or re-granted since. A file that is absent is left to the
     key provider, which fails closed on it at store open and says why."""
+    from messagefoundry.secrets_dpapi import dpapi_available
     from messagefoundry.store.keyprovider import provider_key_file
 
     key_file = provider_key_file(settings.store)
-    if key_file is None or not Path(key_file).exists():
+    # Off Windows the file cannot be used at all: the key provider refuses it at store open and says
+    # so, which is the fault the operator needs to hear about.
+    if key_file is None or not dpapi_available() or not Path(key_file).exists():
         return True
     return _key_file_access_gate(
         key_file,
@@ -6032,7 +6037,8 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
         what=f"the generated TLS private key {plan.key_file}",
         remedy=(
             "Restrict it to the account the engine runs as, or delete it and its certificate so "
-            "the next start mints a new pair"
+            "the next start mints a new pair. If the volume itself widens the file on every "
+            "mount, set [api].tls_cert_file to a certificate of your own"
         ),
         enforcing=enforcing,
     )

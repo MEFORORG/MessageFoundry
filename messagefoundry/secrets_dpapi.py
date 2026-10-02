@@ -25,9 +25,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
-#: Key files already warned about as broadly readable, so a process that reads the key many
-#: times (each DR backup pass does) says so once.
-_warned_key_files: set[str] = set()
+#: Key files whose access this process has already checked, so a process that reads the key
+#: many times (each DR backup pass does) checks, and warns, once.
+_checked_key_files: set[str] = set()
 
 # CryptProtectData flags. LOCAL_MACHINE: any principal on THIS machine can unprotect — required so the
 # low-privilege *service account* (not just the installing admin) can read the key. UI_FORBIDDEN: never
@@ -142,23 +142,25 @@ def load_protected_key(path: str | Path) -> str:
     off Windows or :class:`DpapiError` if the file is missing/unreadable/not decryptable here.
 
     Every command that opens the store reads the key here, so this is where a key file a broad
-    account can read is WARNED about, whatever the command (vault BACKLOG #2601). The warning is
-    logged once per file in a process. ``serve`` and ``supervise`` know
+    group can read or change is WARNED about, whatever the command (vault BACKLOG #2601). Each file
+    is checked once in a process, after the key has unprotected. ``serve`` and ``supervise`` know
     ``[security].enforcement``, so under ``enforce`` they refuse such a file before they open the
     store."""
-    from messagefoundry.restricted_file import broad_read_problem
+    from messagefoundry.restricted_file import broad_access_problem
 
     p = Path(path)
     try:
         blob = p.read_bytes()
     except OSError as exc:
         raise DpapiError(f"cannot read encryption_key_file {p}: {exc}") from exc
-    problem = None if str(p) in _warned_key_files else broad_read_problem(p)
-    if problem is not None:
-        _warned_key_files.add(str(p))
-        _log.warning(
-            "the store key file named by [store].encryption_key_file is not restricted: %s. "
-            "Restrict it to the account the engine runs as, SYSTEM and Administrators.",
-            problem,
-        )
-    return dpapi_unprotect(blob).decode("ascii").strip()
+    key = dpapi_unprotect(blob).decode("ascii").strip()
+    if str(p) not in _checked_key_files:
+        _checked_key_files.add(str(p))
+        problem = broad_access_problem(p)
+        if problem is not None:
+            _log.warning(
+                "the store key file named by [store].encryption_key_file is not restricted: %s. "
+                "Restrict it to the account the engine runs as, SYSTEM and Administrators.",
+                problem,
+            )
+    return key

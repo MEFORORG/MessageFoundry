@@ -8,8 +8,8 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
   to replace one that exists. Its access list is read back before a single byte is written. A file
   that could not be created that way is never left behind, and there is no fallback to writing the
   file first and tightening it afterwards.
-* :func:`broad_read_problem` answers, before a key file is used, whether an account outside the
-  intended set can read it.
+* :func:`broad_access_problem` answers, before a key file is used, whether a known broad group
+  can read it or change it.
 
 ``store._secure_file`` is the other mechanism, and it is for files that hold no key: it tightens a
 file that already exists and only logs when it cannot. A file that holds a key must never have that
@@ -48,7 +48,7 @@ from messagefoundry.auth.anchor_path import (
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinPathSecurity
 
-__all__ = ["RestrictedFileError", "broad_read_problem", "write_restricted_file"]
+__all__ = ["RestrictedFileError", "broad_access_problem", "write_restricted_file"]
 
 
 class RestrictedFileError(OSError):
@@ -105,9 +105,20 @@ def _created_mismatch(
 
 # --- the read check, before a key file is used ----------------------------------------------------
 
-#: Rights that let their holder read the file, or give itself the right to: FILE_READ_DATA,
-#: WRITE_DAC, WRITE_OWNER, GENERIC_ALL and GENERIC_READ.
-_READ_REACH_MASK = 0x00000001 | 0x00040000 | 0x00080000 | 0x10000000 | 0x80000000
+#: Rights that let their holder read the file, change it, or give itself the right to. Reading
+#: discloses the key. Changing it matters as much: a machine-scope DPAPI blob can be built by any
+#: account on the host, so an account that can replace the file can substitute a key it knows.
+_REACH_MASK = (
+    0x00000001  # FILE_READ_DATA
+    | 0x00000002  # FILE_WRITE_DATA
+    | 0x00000004  # FILE_APPEND_DATA
+    | 0x00010000  # DELETE
+    | 0x00040000  # WRITE_DAC
+    | 0x00080000  # WRITE_OWNER
+    | 0x10000000  # GENERIC_ALL
+    | 0x40000000  # GENERIC_WRITE
+    | 0x80000000  # GENERIC_READ
+)
 
 #: Groups and logon classes that many accounts hold, beyond the ones the trust-anchor check already
 #: names (``auth.trust_anchors._is_broad_sid``: Everyone, Authenticated Users, Users, Guests, the
@@ -119,45 +130,52 @@ _MORE_BROAD_GROUP_SIDS: frozenset[str] = frozenset(
         "S-1-2-0",  # LOCAL
         "S-1-2-1",  # CONSOLE LOGON
         "S-1-5-1",  # DIALUP
+        "S-1-5-12",  # RESTRICTED
         "S-1-5-13",  # TERMINAL SERVER USER
         "S-1-5-14",  # REMOTE INTERACTIVE LOGON
         "S-1-5-15",  # THIS ORGANIZATION
+        "S-1-5-17",  # IUSR
+        "S-1-5-64-10",  # NTLM Authentication
+        "S-1-5-64-14",  # SChannel Authentication
+        "S-1-5-64-21",  # Digest Authentication
+        "S-1-5-32-568",  # BUILTIN\IIS_IUSRS
         "S-1-5-32-547",  # BUILTIN\Power Users
         "S-1-5-32-555",  # BUILTIN\Remote Desktop Users
         "S-1-5-80-0",  # NT SERVICE\ALL SERVICES
         "S-1-15-2-1",  # ALL APPLICATION PACKAGES
         "S-1-15-2-2",  # ALL RESTRICTED APPLICATION PACKAGES
+        "S-1-18-1",  # Authentication authority asserted identity
+        "S-1-18-2",  # Service asserted identity
     }
 )
-#: Accounts that many unrelated services run as. A key file one of them can read is broad, unless
-#: the engine itself runs as that account.
-_SHARED_SERVICE_ACCOUNT_SIDS: frozenset[str] = frozenset(
-    {
-        "S-1-5-19",  # LOCAL SERVICE
-        "S-1-5-20",  # NETWORK SERVICE
-    }
-)
+#: The relative id of Domain Computers, in any domain: every machine account holds it.
+_DOMAIN_COMPUTERS_RID = "515"
 
 
 def _is_broad_group(sid: str) -> bool:
-    """Whether ``sid`` is a group or logon class that many accounts hold. At least the known ones."""
+    """Whether ``sid`` is a group or logon class that many accounts hold. At least the known ones.
+
+    One predicate for both sides, so the create never writes a grant the check would report. LOCAL
+    SERVICE and NETWORK SERVICE are accounts, not groups, and are not counted here: an engine may
+    run as one, and an operator who grants one has named an account."""
     from messagefoundry.auth.trust_anchors import _is_broad_sid
 
-    return _is_broad_sid(sid.lower()) or sid in _MORE_BROAD_GROUP_SIDS
+    if _is_broad_sid(sid.lower()) or sid in _MORE_BROAD_GROUP_SIDS:
+        return True
+    return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] == _DOMAIN_COMPUTERS_RID
 
 
-def _windows_read_problem(security: _WinPathSecurity, engine_sid: str | None) -> str | None:
-    """Why a broad account can read the file this access list belongs to, or ``None``.
+def _windows_access_problem(security: _WinPathSecurity) -> str | None:
+    """Why a broad group can read or change the file this access list belongs to, or ``None``.
 
-    ``engine_sid`` is the account this process runs as, which is never broad to itself. A list that
-    could not be read is a problem too, and so is an entry of a kind this check cannot interpret: a
-    check that did not finish has not shown the file restricted. Kept free of ctypes so the
-    decision is testable on every platform."""
+    A list that could not be read is a problem too, and so is an entry of a kind this check cannot
+    interpret: a check that did not finish has not shown the file restricted. Kept free of ctypes
+    so the decision is testable on every platform."""
     if security.status != 0:
         detail = f": {security.status_text}" if security.status_text else ""
         return f"its access list could not be read (Win32 error {security.status}{detail})"
     if not security.dacl_present:
-        return "it has no access list at all, so every account on the host can read it"
+        return "it has no access list at all, so every account on the host can read or change it"
     if security.aces is None:
         return "its access list could not be read in full"
     for ace_type, mask, sid in security.aces:
@@ -167,29 +185,30 @@ def _windows_read_problem(security: _WinPathSecurity, engine_sid: str | None) ->
             # A conditional or object allow entry. The reader records neither its rights nor its
             # account, so who it lets in is unknown.
             return "its access list holds a conditional entry this check cannot interpret"
-        if not mask & _READ_REACH_MASK or sid == engine_sid:
-            continue
-        if _is_broad_group(sid) or sid in _SHARED_SERVICE_ACCOUNT_SIDS:
-            return f"{describe_sid(sid)} can read it"
+        if mask & _REACH_MASK and _is_broad_group(sid):
+            return f"{describe_sid(sid)} can read or change it"
     return None
 
 
-def _posix_read_problem(mode: int) -> str | None:
-    """Why an account other than the owner can read a file of this mode, or ``None``."""
-    if mode & (stat.S_IRGRP | stat.S_IROTH):
-        return f"its mode is {stat.S_IMODE(mode):04o}, so accounts other than its owner can read it"
+def _posix_access_problem(mode: int) -> str | None:
+    """Why an account other than the owner can read or change a file of this mode, or ``None``."""
+    if mode & 0o066:  # group or other, read or write
+        return (
+            f"its mode is {stat.S_IMODE(mode):04o}, so accounts other than its owner can read or "
+            "change it"
+        )
     return None
 
 
-def broad_read_problem(path: Path) -> str | None:
-    """Why ``path`` is readable beyond the accounts a key file is for, or ``None`` when it is not.
+def broad_access_problem(path: Path) -> str | None:
+    """Why ``path`` is open beyond the accounts a key file is for, or ``None`` when it is not.
 
-    Windows: an allow entry that lets a known broad group read the file, or take it over. The
-    groups are at least Everyone, Authenticated Users and the local Users group; the whole list is
-    :func:`_is_broad_group` plus the shared service accounts, and it is a list of known groups, not
-    a proof that only the intended accounts can read the file. POSIX: a group or other read bit. A
-    file whose access cannot be read is reported as a problem, and so is, on Windows, a path that
-    is itself a link, because a link carries its own access list and the file behind it was not read.
+    Windows: an allow entry that lets a known broad group read the file, change it, or take it
+    over. The groups are at least Everyone, Authenticated Users and the local Users group; the
+    whole list is :func:`_is_broad_group`, and it is a list of known groups, not a proof that only
+    the intended accounts can reach the file. POSIX: a group or other read or write bit. A file
+    whose access cannot be read is reported as a problem, and so is, on Windows, a path that is
+    itself a link, because a link carries its own access list and the file behind it was not read.
 
     The answer names accounts and modes only, never the path or the file's contents."""
     try:
@@ -202,9 +221,8 @@ def broad_read_problem(path: Path) -> str | None:
 
         if status.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
             return "it is a link, so the access list of the file behind it was not read"
-        probes = _win32_config_source_probes()
-        return _windows_read_problem(probes.read_path(path), probes.self_sid)
-    return _posix_read_problem(status.st_mode)
+        return _windows_access_problem(_win32_config_source_probes().read_path(path))
+    return _posix_access_problem(status.st_mode)
 
 
 # --- creating the file ----------------------------------------------------------------------------
@@ -378,6 +396,9 @@ def _create_restricted_windows(path: Path, read_grants: Sequence[str]) -> int:
 def _resolve_sid(principal: str) -> str:
     """The string SID of ``principal``: an account name, or a SID with or without a leading ``*``.
 
+    A NAME must resolve to one account: a group, an alias or a domain is refused. A SID literal is
+    taken as given.
+
     Every answer comes back from ``ConvertSidToStringSidW``, so what reaches the access list is a
     SID Windows itself rendered and never the caller's text. A name that does not resolve raises
     :class:`RestrictedFileError`: an entry that cannot be written is a failure, not a file created
@@ -453,6 +474,14 @@ def _resolve_sid(principal: str) -> str:
             ctypes.byref(use),
         ):
             raise refusal
+        # SID_NAME_USE: 1 is a user account and 5 a well-known account, which is how SYSTEM and a
+        # service's virtual account resolve. A group, an alias or a bare domain name is not ONE
+        # account, and a bare domain SID is one no token carries, so the grant would reach nobody.
+        if use.value not in (1, 5):
+            raise RestrictedFileError(
+                f"{principal!r} names a group or a domain, not one account, so a key file cannot "
+                "be granted to it. Name the one account the engine runs as"
+            )
         rendered = render(sid_buffer)
     if rendered is None:
         raise refusal

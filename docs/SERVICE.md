@@ -326,13 +326,12 @@ The key is a base64 32-byte secret. Two ways to supply it:
   Then **unset** `MEFOR_STORE_ENCRYPTION_KEY` (the env key takes precedence when both are set). The
   service account `CryptUnprotectData`s the file at startup; a missing/foreign/unreadable file makes
   `serve` fail closed rather than store PHI unencrypted. `protect-key` creates the file
-  already restricted: SYSTEM, Administrators and the minting admin, **plus** read for the one
-  account `--grant-account` names (a virtual / gMSA account). The file does **not** inherit the
-  data-dir ACL, so grant the right service account at mint time (above) rather than relying on the
-  directory. A grant to a broad group such as Users is refused. If the file cannot be created
-  restricted, or `--out` already exists, the command exits non-zero and writes nothing. `serve`
-  checks the file before it uses it; what that check covers, and what it does not, is stated once in
-  [PHI.md](PHI.md), "Key files". To rotate, `protect-key` the new key to a **new** path, point
+  already restricted, with read for the one account `--grant-account` names (a virtual / gMSA
+  account). The file does **not** inherit the data-dir ACL, so grant the right service account at
+  mint time (above) rather than relying on the directory. If the file cannot be created restricted,
+  or `--out` already exists, the command exits non-zero and writes nothing. `serve` checks the file
+  before it uses it. Who the file is restricted to, what that check covers and what it does not are
+  stated once, in [PHI.md](PHI.md), "Key files". To rotate, `protect-key` the new key to a **new** path, point
   `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
   the rotation, once nothing still needs its key.

@@ -28,7 +28,7 @@ from messagefoundry.__main__ import _write_private_key, main
 from messagefoundry.config.wiring import _WinPathSecurity
 from messagefoundry.restricted_file import (
     RestrictedFileError,
-    broad_read_problem,
+    broad_access_problem,
     write_restricted_file,
 )
 from messagefoundry.store.crypto import generate_key
@@ -129,7 +129,7 @@ def test_an_access_list_naming_only_the_intended_accounts_has_no_read_problem() 
         (_ALLOW, _FULL, _CREATOR),
         (_ALLOW, _READ, _SERVICE),
     )
-    assert restricted_file._windows_read_problem(restricted, _SERVICE) is None
+    assert restricted_file._windows_access_problem(restricted) is None
 
 
 @pytest.mark.parametrize(
@@ -146,62 +146,67 @@ def test_an_access_list_naming_only_the_intended_accounts_has_no_read_problem() 
         ((_ALLOW, _READ, "S-1-5-15"), "S-1-5-15"),  # THIS ORGANIZATION
         ((_ALLOW, _READ, "S-1-5-32-555"), "S-1-5-32-555"),  # Remote Desktop Users
         ((_ALLOW, _READ, "S-1-5-80-0"), "S-1-5-80-0"),  # ALL SERVICES
-        # An account many unrelated services run as, when the engine is not that account.
-        ((_ALLOW, _READ, "S-1-5-20"), "Network service (S-1-5-20)"),
+        ((_ALLOW, _READ, "S-1-5-32-568"), "S-1-5-32-568"),  # IIS_IUSRS
+        ((_ALLOW, _READ, "S-1-18-1"), "S-1-18-1"),  # asserted identity, on every domain logon
+        ((_ALLOW, _READ, "S-1-5-21-9-9-9-515"), "S-1-5-21-9-9-9-515"),  # Domain Computers
+        # Changing the file counts as much as reading it: the key could be substituted.
+        ((_ALLOW, 0x00000002, _USERS), f"Users ({_USERS})"),  # FILE_WRITE_DATA
+        ((_ALLOW, 0x00010000, _USERS), f"Users ({_USERS})"),  # DELETE
     ],
 )
 def test_a_broad_account_that_can_read_is_a_problem(ace: tuple[int, int, str], named: str) -> None:
     listed = _security((_ALLOW, _FULL, _SYSTEM), ace)
-    problem = restricted_file._windows_read_problem(listed, _SERVICE)
-    assert problem is not None and named in problem and "can read it" in problem
+    problem = restricted_file._windows_access_problem(listed)
+    assert problem is not None and named in problem and "can read or change it" in problem
 
 
-def test_the_account_the_engine_runs_as_is_never_broad_to_itself() -> None:
-    # An engine running as NETWORK SERVICE reads its own key file. The same entry is a problem
-    # when the engine is some other account (the parametrized case above is that control).
+def test_a_shared_service_account_is_an_account_not_a_broad_group() -> None:
+    # An engine may run as NETWORK SERVICE, and an operator may grant it. The create accepts that
+    # grant, so the check must not then report the file: one predicate serves both sides.
     listed = _security((_ALLOW, _FULL, _SYSTEM), (_ALLOW, _READ, "S-1-5-20"))
-    assert restricted_file._windows_read_problem(listed, "S-1-5-20") is None
-    assert restricted_file._windows_read_problem(listed, None) is not None
+    assert restricted_file._windows_access_problem(listed) is None
+    assert not restricted_file._is_broad_group("S-1-5-20")
+    assert restricted_file._is_broad_group(_USERS)  # the control
 
 
 def test_an_entry_the_check_cannot_interpret_is_a_problem() -> None:
     # A conditional allow entry (type 9) is recorded with no rights and no account, so who it lets
     # in is unknown. That is not a pass. A deny entry (type 1) grants nothing and is the control.
     conditional = _security((_ALLOW, _FULL, _SYSTEM), (9, 0, ""))
-    assert "cannot interpret" in str(restricted_file._windows_read_problem(conditional, None))
+    assert "cannot interpret" in str(restricted_file._windows_access_problem(conditional))
     denied = _security((_ALLOW, _FULL, _SYSTEM), (_DENY, 0, ""))
-    assert restricted_file._windows_read_problem(denied, None) is None
+    assert restricted_file._windows_access_problem(denied) is None
 
 
-def test_a_broad_account_with_no_read_right_is_not_a_read_problem() -> None:
-    # This check is the READ axis. A write-only or deny entry gives nobody the bytes.
-    write_only = _security((_ALLOW, 0x00000002, _USERS))  # FILE_WRITE_DATA
-    assert restricted_file._windows_read_problem(write_only, None) is None
+def test_a_broad_group_that_can_neither_read_nor_change_the_file_is_not_a_problem() -> None:
+    # Reading attributes, or being denied, gives nobody the key and lets nobody replace it.
+    attributes_only = _security((_ALLOW, 0x00000080, _USERS))  # FILE_READ_ATTRIBUTES
+    assert restricted_file._windows_access_problem(attributes_only) is None
     denied = _security((_DENY, 0, ""), (_ALLOW, _FULL, _CREATOR))
-    assert restricted_file._windows_read_problem(denied, None) is None
+    assert restricted_file._windows_access_problem(denied) is None
 
 
 def test_an_access_list_that_could_not_be_read_is_a_problem() -> None:
     assert "could not be read" in str(
-        restricted_file._windows_read_problem(
-            _WinPathSecurity(status=5, status_text="denied"), None
-        )
+        restricted_file._windows_access_problem(_WinPathSecurity(status=5, status_text="denied"))
     )
     assert "no access list" in str(
-        restricted_file._windows_read_problem(_WinPathSecurity(dacl_present=False), None)
+        restricted_file._windows_access_problem(_WinPathSecurity(dacl_present=False))
     )
     assert "in full" in str(
-        restricted_file._windows_read_problem(_WinPathSecurity(owner_sid=_CREATOR), None)
+        restricted_file._windows_access_problem(_WinPathSecurity(owner_sid=_CREATOR))
     )
 
 
-def test_the_posix_read_check_is_the_group_and_other_read_bits() -> None:
-    assert restricted_file._posix_read_problem(stat.S_IFREG | 0o600) is None  # the control
-    assert restricted_file._posix_read_problem(stat.S_IFREG | 0o400) is None
-    assert "0640" in str(restricted_file._posix_read_problem(stat.S_IFREG | 0o640))
-    assert "0604" in str(restricted_file._posix_read_problem(stat.S_IFREG | 0o604))
-    # Group or other WRITE without read is the write axis, which this check does not judge.
-    assert restricted_file._posix_read_problem(stat.S_IFREG | 0o620) is None
+def test_the_posix_check_is_the_group_and_other_read_and_write_bits() -> None:
+    assert restricted_file._posix_access_problem(stat.S_IFREG | 0o600) is None  # the control
+    assert restricted_file._posix_access_problem(stat.S_IFREG | 0o400) is None
+    assert "0640" in str(restricted_file._posix_access_problem(stat.S_IFREG | 0o640))
+    assert "0604" in str(restricted_file._posix_access_problem(stat.S_IFREG | 0o604))
+    assert "0620" in str(restricted_file._posix_access_problem(stat.S_IFREG | 0o620))
+    assert "0602" in str(restricted_file._posix_access_problem(stat.S_IFREG | 0o602))
+    # An execute bit alone gives nobody the key and lets nobody replace it.
+    assert restricted_file._posix_access_problem(stat.S_IFREG | 0o711) is None
 
 
 # --- the Windows arm, for real --------------------------------------------------------------------
@@ -244,7 +249,7 @@ def test_windows_creates_the_file_with_exactly_the_intended_access(
         (_ALLOW, _FULL, creator),
         (_ALLOW, _READ, _SERVICE),
     }
-    assert broad_read_problem(path) is None
+    assert broad_access_problem(path) is None
 
 
 @windows_only
@@ -281,11 +286,24 @@ def test_windows_resolves_an_account_name_and_refuses_one_it_cannot(tmp_path: Pa
     named = tmp_path / "named.key"
     write_restricted_file(named, b"k", read_grants=["NT AUTHORITY\\NETWORK SERVICE"])
     assert (_ALLOW, _READ, "S-1-5-20") in _windows_access(named)[1]
+    # What the create accepts as a grant, the check does not then report.
+    assert broad_access_problem(named) is None
 
     refused = tmp_path / "refused.key"
     with pytest.raises(RestrictedFileError, match="could not be resolved"):
         write_restricted_file(refused, b"k", read_grants=["NO-SUCH-DOMAIN\\no-such-account"])
     assert not refused.exists()
+
+
+@windows_only
+@pytest.mark.parametrize("name", ["NT SERVICE", "BUILTIN"])
+def test_windows_refuses_a_name_that_is_not_one_account(tmp_path: Path, name: str) -> None:
+    # A bare domain resolves to a SID no token carries, so the grant would reach nobody and the
+    # service would fail at its first start. A group is not one account either. The control is the
+    # account name in the test above, which is granted.
+    with pytest.raises(RestrictedFileError, match="not one account"):
+        write_restricted_file(tmp_path / "store.key", b"k", read_grants=[name])
+    assert list(tmp_path.iterdir()) == []
 
 
 @windows_only
@@ -322,19 +340,19 @@ def test_windows_removes_a_file_whose_access_does_not_read_back(
 def test_windows_read_check_on_real_files(tmp_path: Path) -> None:
     restricted = tmp_path / "restricted.key"
     write_restricted_file(restricted, b"k")
-    assert broad_read_problem(restricted) is None  # the control
+    assert broad_access_problem(restricted) is None  # the control
 
     broad = tmp_path / "broad.key"
     broad.write_bytes(b"k")
     _grant_users_read(broad)
-    assert f"Users ({_USERS})" in str(broad_read_problem(broad))
+    assert f"Users ({_USERS})" in str(broad_access_problem(broad))
 
     link = tmp_path / "link.key"
     try:
         os.symlink(restricted, link)
     except OSError:
         return  # this account may not create a symbolic link; the two arms above still ran
-    assert "it is a link" in str(broad_read_problem(link))
+    assert "it is a link" in str(broad_access_problem(link))
 
 
 # --- the POSIX arm, for real ----------------------------------------------------------------------
@@ -352,10 +370,10 @@ def test_posix_creates_the_file_owner_only_whatever_the_umask(tmp_path: Path) ->
         os.umask(previous)
     assert path.read_bytes() == b"KEY-MATERIAL-STAND-IN"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert broad_read_problem(path) is None
+    assert broad_access_problem(path) is None
     # The control: the ordinary create under the same umask is readable by everyone.
     assert stat.S_IMODE(plain.stat().st_mode) & 0o044
-    assert broad_read_problem(plain) is not None
+    assert broad_access_problem(plain) is not None
 
 
 @posix_only
@@ -409,7 +427,7 @@ def test_a_name_that_is_a_link_is_refused_and_nothing_is_created_behind_it(tmp_p
 
 
 def test_a_missing_file_is_a_read_problem_not_a_pass(tmp_path: Path) -> None:
-    assert "could not be examined" in str(broad_read_problem(tmp_path / "absent.key"))
+    assert "could not be examined" in str(broad_access_problem(tmp_path / "absent.key"))
 
 
 # --- the seam the writers share -------------------------------------------------------------------
@@ -455,7 +473,7 @@ def test_the_tls_private_key_is_written_through_the_restricted_create(
     key_path = tmp_path / "key.pem"
     _write_private_key(key_path, b"KEY-MATERIAL-STAND-IN\n")  # the control: the real create works
     assert key_path.read_bytes() == b"KEY-MATERIAL-STAND-IN\n"
-    assert broad_read_problem(key_path) is None
+    assert broad_access_problem(key_path) is None
 
     # A refused create reaches the caller as it is: nothing downgrades it to a logged warning.
     _refuse_the_create(monkeypatch)
@@ -604,6 +622,7 @@ def test_serve_refuses_a_store_key_file_a_broad_account_can_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setattr(dpapi_mod, "dpapi_available", lambda: True)
     key_file = tmp_path / "store.key.dpapi"
     toml = PHI_GATE_PROVISIONS_TOML + f'[store]\nencryption_key_file = "{key_file.as_posix()}"\n'
 
@@ -680,6 +699,7 @@ def test_reading_a_key_file_a_broad_account_can_read_is_warned_about(
     import logging
 
     monkeypatch.setattr(dpapi_mod, "dpapi_unprotect", lambda blob: b"QUJD")
+    monkeypatch.setattr(dpapi_mod, "_checked_key_files", set())
     restricted = tmp_path / "restricted.dpapi"
     write_restricted_file(restricted, b"BLOB")
     with caplog.at_level(logging.WARNING, logger=dpapi_mod.__name__):
@@ -691,7 +711,8 @@ def test_reading_a_key_file_a_broad_account_can_read_is_warned_about(
     _broaden(broad)
     with caplog.at_level(logging.WARNING, logger=dpapi_mod.__name__):
         assert dpapi_mod.load_protected_key(broad) == "QUJD"  # warned, and still read
-    assert "[store].encryption_key_file is not restricted" in caplog.text
+        assert dpapi_mod.load_protected_key(broad) == "QUJD"  # a DR backup pass reads it again
+    assert caplog.text.count("[store].encryption_key_file is not restricted") == 1
 
 
 # --- supervise makes the same checks once, before it spawns a shard -------------------------------
@@ -753,6 +774,7 @@ def test_supervise_refuses_a_broadly_readable_store_key_file_before_it_opens_the
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setattr(dpapi_mod, "dpapi_available", lambda: True)
     key_file = tmp_path / "store.key.dpapi"
     key_file.write_bytes(b"BLOB-STAND-IN")
     _broaden(key_file)
@@ -774,3 +796,33 @@ def test_serve_exits_cleanly_when_the_tls_key_cannot_be_created_restricted(
     assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 2
     err = capsys.readouterr().err
     assert "could not be created restricted" in err and "refusing to start" in err
+
+
+def test_the_store_key_file_check_is_left_to_the_provider_where_dpapi_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Off Windows the file cannot be used at all, and the key provider says so at store open. A
+    # refusal about its access, with a Windows remedy, would hide that fault.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config.settings import load_settings
+
+    key_file = tmp_path / "store.key.dpapi"
+    key_file.write_bytes(b"BLOB-STAND-IN")
+    _broaden(key_file)
+    settings = load_settings(environ={"MEFOR_STORE_ENCRYPTION_KEY_FILE": str(key_file)})
+    monkeypatch.setattr(dpapi_mod, "dpapi_available", lambda: False)
+    assert cli._store_key_file_gate(settings, enforcing=True) is True
+    assert capsys.readouterr().err == ""
+    monkeypatch.setattr(dpapi_mod, "dpapi_available", lambda: True)  # the control
+    assert cli._store_key_file_gate(settings, enforcing=True) is False
+
+
+def test_supervise_exits_cleanly_when_the_tls_key_cannot_be_created_restricted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    _refuse_the_create(monkeypatch)
+    rc, spawned = _supervise(tmp_path, monkeypatch)
+    err = capsys.readouterr().err
+    assert rc == 2 and spawned == []
+    assert "could not be created restricted" in err and "refusing to start the fleet" in err
