@@ -143,3 +143,29 @@ python -m harness --load fanout-baseline --engine URL --token T --report-json ou
 
 Full guide — profile schema, the env knobs, reading the report/SLOs, exit codes, baseline
 comparison, and the backend-comparison recipe — is in [docs/LOAD-TESTING.md](../docs/LOAD-TESTING.md).
+
+## Transport families and hostile content
+
+### Hostile content (MLLP and File)
+
+`harness/scenarios/hostile.py` sends WELL-FORMED HL7 whose field values are hostile to a downstream
+sink: path traversal in the field the File outbound names its file from, SQL and spreadsheet-formula
+metacharacters, markup, raw HL7 escapes, redefined MSH-1/MSH-2 delimiters, MLLP framing bytes, bare
+line breaks, an oversize field and non-ASCII text under MSH-18. The values are data in
+`harness/scenarios/hostile_values.toml`; each is placed with the `Message` API, never by slicing raw
+HL7, and a report names a value by its label, never its content.
+
+Each `hostile_<class>` scenario injects through the MLLP and File drivers (framing bytes through MLLP
+only) into the pass-through graph `harness/config/hostile.py` (ports 2628/2629,
+`./harness_io/hostile_*`). It asserts the disposition; the bytes the MLLP and File sinks received
+(identical to what was sent, except where the engine documents a change: line endings normalized to
+CR, and an MLLP frame ending at its first 0x1C); that every written file is a single name inside its
+directory, with nothing where an unconfined `{MSH-10}.hl7` would have landed outside it; and that
+`/health` answers with every hostile connection still running. A NUL, or a body that does not decode
+on the connection's charset, is a documented ERROR.
+
+`KNOWN_DEFECTS` holds the scenarios an engine defect fails today, outside the registry (so not
+reachable from `--scenario`); `tests/test_harness_hostile.py` runs each as a strict xfail on the
+defect's own signature. Today that is MLLP framing bytes carried in by File and forwarded over
+MLLP, which the peer receives truncated at the end block, with any later start block read as a
+second message.
