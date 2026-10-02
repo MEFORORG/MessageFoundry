@@ -44,6 +44,7 @@ ENC = "^~" + BS + "&"
 MSH = f"MSH|{ENC}|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTRL1|P|2.5"
 MSH2 = f"MSH|{ENC}|FORGED|FAC|RCV|FAC|20260101120000||ADT^A08|CTRL2|P|2.5"
 HEX_EB_SB = BS + "X1C" + BS + BS + "X0B" + BS
+SEPS = ("|", "^", "~", "&", BS)
 CLEAN = MSH + CR + "PID|1||111^^^MRN||DOE^JANE" + CR
 #: Audit probe P1: raw end, CR and start bytes, then a second message, in one body.
 SMUGGLED = (
@@ -216,16 +217,14 @@ def test_every_leaf_escaper_hex_escapes_c0_and_del_except_tab(char: str, escaped
     msg.set("PID-5.2", "JA" + char + "NE")
     assert _pid5(msg) == "DOE^JA" + escaped + "NE"
     assert msg.field("PID-5.2") == "JA" + char + "NE"
-    seps = ("|", "^", "~", "&", BS)
-    assert _builtin_hl7.escape_leaf("a" + char + "b", seps) == "a" + escaped + "b"
+    assert _builtin_hl7.escape_leaf("a" + char + "b", SEPS) == "a" + escaped + "b"
     assert encode_segment("ZXX", ["a" + char + "b"]) == "ZXX|a" + escaped + "b"
 
 
 def test_the_structural_escapes_are_unchanged() -> None:
-    seps = ("|", "^", "~", "&", BS)
     expected = "O" + BS + "S" + BS + "B" + BS + "F" + BS + "x" + BS + "R" + BS + "y"
     expected += BS + "T" + BS + "z" + BS + "E" + BS
-    assert _builtin_hl7.escape_leaf("O^B|x~y&z" + BS, seps) == expected
+    assert _builtin_hl7.escape_leaf("O^B|x~y&z" + BS, SEPS) == expected
 
 
 # --- rule 3: a whole-field write, add_repetition and add_segment refuse 0x0B, 0x1C and NUL --------

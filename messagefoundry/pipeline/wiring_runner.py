@@ -5955,12 +5955,12 @@ class RegistryRunner:
             # handler. NAK AR mirrors the decode/parse-error precedent for a malformed body. An HL7 v2
             # body holding an MLLP frame byte past its start is refused the same way, with its own
             # fixed MSA-3 text (ADR 0205 rule 4).
-            nul_err = exc.reason
+            body_err = exc.reason
             mid = await self.store.record_received(
                 channel_id=ic.name,
                 raw=store_safe_raw(raw, ic.content_type.value, text=text),
                 status=MessageStatus.ERROR,
-                error=nul_err,
+                error=body_err,
                 source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
@@ -5976,7 +5976,7 @@ class RegistryRunner:
                     ack_code="AR",
                     ack_phase="decode",
                     ack_body=None,
-                    detail=nul_err,
+                    detail=body_err,
                 )
             return ack
         except IngressGuardError as exc:

@@ -5,11 +5,9 @@
 The codec moved out of ``transports/`` so a client can import it without registering every
 connector (BACKLOG #1697). Engine callers keep importing it from here.
 
-The two functions defined here are the engine's own framing entry points, and they are why one
-outbound frame holds exactly one message (ADR 0205). :meth:`FrameCodec.frame` itself stays a
-plain wrapper that looks at nothing, because a client such as the test harness frames hostile bytes
-on purpose. A destination frames through :func:`frame_for_delivery`, which refuses; a listener frames
-its reply through :func:`frame_reply`, which never refuses.
+The engine frames through the two functions defined here (ADR 0205), never through
+:meth:`FrameCodec.frame` directly, which stays unchecked because the test harness frames hostile
+bytes on purpose.
 """
 
 from __future__ import annotations

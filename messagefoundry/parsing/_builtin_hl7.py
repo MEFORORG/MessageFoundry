@@ -785,42 +785,40 @@ def escape_expansion_estimate(
     return total
 
 
-#: Code points a leaf write carries as a ``\\Xhh\\`` hex escape rather than raw (ADR 0205 rule 2):
-#: the C0/DEL alphabet of :mod:`messagefoundry.controlchars`, less TAB (benign whitespace) and less CR
-#: and LF, which a write refuses before it gets here. Scanned to U+00FF, as the log scrub table is, so a
-#: deliberate widening of that alphabet reaches this table too; ``\\Xhh\\`` holds one byte, so U+00FF is
-#: also the most it can carry.
-_HEX_ESCAPED_CONTROLS: tuple[int, ...] = tuple(
-    cp for cp in range(0x100) if has_control_char(chr(cp)) and cp not in (0x09, 0x0A, 0x0D)
+#: Code points a leaf write carries as a ``\\Xhh\\`` hex escape (ADR 0205 rule 2): the
+#: :mod:`messagefoundry.controlchars` alphabet less TAB, CR and LF (a write refuses CR and LF first).
+#: Scanned to U+00FF, the most ``\\Xhh\\`` can carry, so a widening of that alphabet reaches here too.
+_HEX_ESCAPED_CONTROLS: tuple[str, ...] = tuple(
+    chr(cp) for cp in range(0x100) if has_control_char(chr(cp)) and cp not in (0x09, 0x0A, 0x0D)
 )
 
 
 @lru_cache(maxsize=32)
-def _leaf_escape_table(seps: tuple[str, str, str, str, str]) -> dict[int, str]:
-    """The one-pass translation table :func:`escape_leaf` applies for one separator set."""
+def _leaf_escaper(seps: tuple[str, str, str, str, str]) -> tuple[re.Pattern[str], dict[str, str]]:
+    """The pattern and replacement table :func:`escape_leaf` applies for one separator set."""
     field_sep, comp_sep, rep_sep, sub_sep, esc = seps
-    table = {cp: f"{esc}X{cp:02X}{esc}" for cp in _HEX_ESCAPED_CONTROLS}
+    table = {ch: f"{esc}X{ord(ch):02X}{esc}" for ch in _HEX_ESCAPED_CONTROLS}
     # The delimiters go in last, so a separator that is itself a control character keeps its
     # structural escape; the escape character goes in very last for the same reason.
     for char, code in ((sub_sep, "T"), (rep_sep, "R"), (comp_sep, "S"), (field_sep, "F")):
-        table[ord(char)] = f"{esc}{code}{esc}"
-    table[ord(esc)] = f"{esc}E{esc}"
-    return table
+        table[char] = f"{esc}{code}{esc}"
+    table[esc] = f"{esc}E{esc}"
+    return re.compile("[" + "".join(re.escape(ch) for ch in table) + "]"), table
 
 
 def escape_leaf(value: str, seps: tuple[str, str, str, str, str]) -> str:
-    """Escape the structural delimiters, the escape char and the control characters in ``value``, so
-    it carries all of them as data.
+    """Escape the structural delimiters, the escape char and the control characters in ``value``.
 
     ``Message._escape_leaf`` delegates here (NOT to python-hl7's ``escape``, which hex-encodes
-    non-ASCII and corrupts CJK/accented names): field / component / repetition / subcomponent /
-    escape become ``\\F\\ \\S\\ \\R\\ \\T\\ \\E\\``, and each C0 control character and DEL except TAB
-    becomes a ``\\Xhh\\`` hex escape (ADR 0205 rule 2), so a value that arrived hex-escaped leaves
-    hex-escaped and a raw frame byte or NUL never reaches the encoded message. Every other character,
-    including code points above U+00FF, passes through, and all of it round-trips via
-    :func:`unescape`. One ``str.translate`` pass, so nothing it inserts is escaped again.
-    """
-    return value.translate(_leaf_escape_table(seps))
+    non-ASCII and corrupts CJK/accented names). The delimiters and escape become
+    ``\\F\\ \\S\\ \\R\\ \\T\\ \\E\\``, and each C0 control and DEL except TAB becomes a ``\\Xhh\\``
+    hex escape (ADR 0205 rule 2). Everything else passes through, and all of it round-trips via
+    :func:`unescape`. One regex pass, so nothing it inserts is escaped again, and a value with
+    nothing to escape costs one scan."""
+    pattern, table = _leaf_escaper(seps)
+    if pattern.search(value) is None:
+        return value
+    return pattern.sub(lambda m: table[m.group()], value)
 
 
 def unescape_separators(value: str, seps: tuple[str, str, str, str, str]) -> str:

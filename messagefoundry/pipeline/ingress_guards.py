@@ -53,6 +53,7 @@ from typing import Any
 
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.wiring import InboundConnection
+from messagefoundry.framing import MLLP_CODEC
 from messagefoundry.parsing import RawMessage, normalize
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import BinaryCarriageError, is_marked
@@ -365,9 +366,8 @@ FRAME_BYTE_REJECTED_REASON = (
     "which a conformant message never holds"
 )
 
-#: The leading run ``Peek.parse`` skips with ``str.lstrip()`` before it looks for ``MSH``. A frame byte
-#: there is tolerated (ADR 0205): the parser drops it on encode, so it never reaches a delivery.
-_LEADING_WHITESPACE = re.compile(r"\s*")
+#: MLLP's start and end bytes, from the codec rule 1 of ADR 0205 checks at delivery.
+_MLLP_FRAME_CHARS = (chr(MLLP_CODEC.start), chr(MLLP_CODEC.end))
 
 
 class IngressFrameByteRejected(IngressBodyRejected):
@@ -382,10 +382,15 @@ class IngressFrameByteRejected(IngressBodyRejected):
 
 
 def _holds_an_embedded_frame_byte(text: str) -> bool:
-    """Whether ``text`` holds ``0x0B`` or ``0x1C`` past the leading run ``Peek.parse`` strips."""
-    lead = _LEADING_WHITESPACE.match(text)
-    start = lead.end() if lead is not None else 0
-    return text.find("\x0b", start) >= 0 or text.find("\x1c", start) >= 0
+    """Whether ``text`` holds ``0x0B`` or ``0x1C`` past the leading run ``Peek.parse`` strips.
+
+    That run is tolerated (ADR 0205): the parser drops it on encode, so it never reaches a delivery.
+    It is found with ``str.lstrip()``, Peek's own call, and only once a frame byte is known to be
+    present, so a clean body costs two scans and no copy."""
+    if not any(ch in text for ch in _MLLP_FRAME_CHARS):
+        return False
+    rest = text.lstrip()
+    return any(ch in rest for ch in _MLLP_FRAME_CHARS)
 
 
 def decode_body(raw: str | bytes, ic: InboundConnection, *, encoding: str) -> str:

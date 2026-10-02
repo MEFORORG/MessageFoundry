@@ -229,8 +229,7 @@ class TcpDestination(DestinationConnector):
             # Zero-I/O byte-crossing backstop (#200) before the first byte (defense in depth against a
             # reload routing PHI around the construction gate).
             self._hop_guard.assert_send()
-            # ADR 0205 rule 1: frame once, before any dial; a payload holding this codec's own
-            # start or end byte is refused permanently and opens no connection.
+            # ADR 0205 rule 1: frame once, before any dial; both paths below only write bytes.
             wire = frame_for_delivery(self.codec, payload, self.encoding, transport="TCP")
             if not self.persistent:
                 return await self._send_once(wire)

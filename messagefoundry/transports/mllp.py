@@ -934,9 +934,7 @@ class MLLPDestination(DestinationConnector):
                         "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
                         f"{safe_exc(exc)}"
                     ) from exc
-            # ADR 0205 rule 1: frame once, here, before any dial. A payload holding the
-            # frame's own start or end byte is refused permanently, so it opens no connection and
-            # cannot discard a healthy persistent one. The four paths below only write these bytes.
+            # ADR 0205 rule 1: frame once, before any dial; the four paths below only write bytes.
             wire = frame_for_delivery(MLLP_CODEC, payload, self.encoding, transport="MLLP")
             if self.no_ack:
                 # BACKLOG #117 (ADR 0124): fire-and-forward — write + drain, no ACK read, deliver on
