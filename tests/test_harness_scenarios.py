@@ -76,6 +76,9 @@ def test_every_registered_scenario_passes_against_the_real_graph(
         # Generous: dead_letter rides the real graph's retry policy (3 attempts, 1s and 2s backoff),
         # and a refused loopback connect costs about 2s per attempt on Windows.
         result = run_scenario(SCENARIOS[name], client, timeout=60.0, endpoints=eps)
+    if result.skipped:
+        # A family whose precondition (an external server, an extra) is absent here: a skip, not a pass.
+        pytest.skip(result.detail)
     assert result.ok, result.detail
 
 
@@ -491,26 +494,59 @@ def test_every_registered_scenario_names_real_drivers_sinks_and_endpoints() -> N
             assert scenario.sink_endpoint in declared, name
 
 
-def _graph_env_refs() -> dict[str, EnvRef]:
-    """Every ``env("harness_<key>", default=...)`` the served harness/config graphs make, by key."""
-    registry = load_config(str(Path(__file__).resolve().parents[1] / "harness" / "config"))
-    found: dict[str, EnvRef] = {}
-    specs = [c.spec for c in registry.inbound.values()]
-    specs += [c.spec for c in registry.outbound.values()]
-    for spec in specs:
-        for value in spec.settings.values():
-            if isinstance(value, EnvRef) and value.key.startswith("harness_"):
-                found[value.key.removeprefix("harness_")] = value
+def _graph_dirs() -> list[Path]:
+    """``harness/config`` itself, plus ``harness/config/<family>/`` for each endpoints family whose
+    graph lives in its own subdirectory because it needs an external server (``database``), so that
+    serving ``harness/config`` without that server stays clean."""
+    from harness._discover import family_modules
+
+    config = Path(__file__).resolve().parents[1] / "harness" / "config"
+    families = (m.__name__.rpartition(".")[2] for m in family_modules("harness.endpoints"))
+    return [config, *(config / f for f in families if (config / f).is_dir())]
+
+
+def _graph_env_refs() -> list[EnvRef]:
+    """Every ``env("harness_<key>", ...)`` the harness graphs make, one per reference, so two graphs
+    reading one key are each checked."""
+    found: list[EnvRef] = []
+    for directory in _graph_dirs():
+        registry = load_config(str(directory))
+        specs = [c.spec for c in registry.inbound.values()]
+        specs += [c.spec for c in registry.outbound.values()]
+        for spec in specs:
+            for value in spec.settings.values():
+                if isinstance(value, EnvRef) and value.key.startswith("harness_"):
+                    found.append(value)
     return found
 
 
 def test_each_graph_default_equals_its_endpoint_default() -> None:
     """The graph reads its ports through the engine's env() and the harness reads harness/endpoints;
-    the two defaults are two spellings of one table, so they are held equal here, both ways."""
+    the two defaults are two spellings of one table, so they are held equal here, both ways.
+
+    A key an endpoints family lists in ``ENVIRONMENT_ONLY`` (a credential) is the one exception: it
+    is not an endpoint, and the graph must read it with NO default, so it never sits in source."""
+    from harness._discover import family_modules
+    from messagefoundry.config.wiring import env
+
+    no_default = env("x").default
+    environment_only = {
+        key
+        for module in family_modules("harness.endpoints")
+        for key in getattr(module, "ENVIRONMENT_ONLY", ())
+    }
     refs = _graph_env_refs()
     declared = endpoints.registry()
     assert refs, "the walk found no harness env() reference -- it is not looking at the graph"
-    for key, ref in refs.items():
+    for ref in refs:
+        key, default = ref.key.removeprefix("harness_"), ref.default
+        if key in environment_only:
+            assert default is no_default, f"harness_{key} is environment-only; drop its default"
+            continue
+        assert default is not no_default, (
+            f"graph reads harness_{key} with no default, and no endpoints family lists it in "
+            "ENVIRONMENT_ONLY"
+        )
         assert key in declared, (
             f"graph reads harness_{key}, which harness/endpoints does not declare"
         )
@@ -518,12 +554,14 @@ def test_each_graph_default_equals_its_endpoint_default() -> None:
         # declared PORT into a whole URL (harness/config/http.py) carries that cast of the declared
         # default instead: the value it would read if the variable held the declared default.
         cast = ref.cast
-        assert str(ref.default) == declared[key].default or (
+        assert str(default) == declared[key].default or (
             cast is not None
-            and type(cast(declared[key].default)) is type(ref.default)
-            and cast(declared[key].default) == ref.default
+            and type(cast(declared[key].default)) is type(default)
+            and cast(declared[key].default) == default
         ), key
-    unread = sorted(set(declared) - set(refs))
+    unread = sorted(
+        (set(declared) | environment_only) - {r.key.removeprefix("harness_") for r in refs}
+    )
     assert not unread, f"declared endpoints no graph reads: {unread}"
 
 
@@ -532,8 +570,7 @@ def test_the_coverage_graph_imports_nothing_from_the_harness() -> None:
     and `messagefoundry check` refuses an unvetted import (review of vault BACKLOG #2672)."""
     import ast
 
-    config = Path(__file__).resolve().parents[1] / "harness" / "config"
-    for path in sorted(config.glob("*.py")):
+    for path in sorted(p for directory in _graph_dirs() for p in directory.glob("*.py")):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             names = (
                 [a.name for a in node.names]
