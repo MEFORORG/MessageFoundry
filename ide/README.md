@@ -132,8 +132,8 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   next run is masked again, and *Hide Revealed Values* hides them sooner. On a masked run the
   `inbound()` summary's tooltip says only how many messages failed; the error text shows on a revealed
   run, because it can quote message data. When a run fails, the lens says so without quoting what
-  the CLI printed, as does every error from a `--json` CLI call; run the command in a terminal to
-  read the output. Use synthetic samples only. Live Debug never contacts a real engine, and the re-run is
+  the CLI printed, and so does an error from a `--json` CLI call that printed no JSON; run the command
+  in a terminal to read the output. The CLI's own `{"error": ...}` message still shows as written. Use synthetic samples only. Live Debug never contacts a real engine, and the re-run is
   debounced (`messagefoundry.liveDebug.debounceMs`).
 - **Cookbook** (*MessageFoundry: Open Cookbook*) — a searchable gallery of solved HL7 routing/transform
   problems (crosswalk a code, split a batch, enrich via a lookup, fan out to several outbounds, …); each

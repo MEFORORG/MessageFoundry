@@ -692,6 +692,44 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
     }
   });
 
+  test("Hide while the reveal lists the sample's messages opens no pick", async () => {
+    let count = 1;
+    let gateNext = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      if (!showPhi && gateNext) {
+        gateNext = false;
+        await gate; // the reveal's own listing run, held open while the user hides
+      }
+      return Array.from({ length: count }, (_v, i) => traceEntry({ source: `a [${i + 1}]` }));
+    };
+    let picks = 0;
+    const picker = async (): Promise<number | undefined> => {
+      picks += 1;
+      return 0;
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", picker);
+    try {
+      await controller.runWith(syntheticSample(), "/ws"); // masked: one message listed
+      count = 2;
+      await controller.revealOnce(); // count mismatch: nothing revealed, the list is dropped
+      gateNext = true;
+      const reveal = controller.revealOnce(); // re-lists with a masked run (held)
+      await waitFor(() => calls.length === 3, 5000);
+      await controller.hideValues(); // cancels; its own masked run lands and re-lists
+      release();
+      await reveal;
+      assert.strictEqual(picks, 0, "a cancelled reveal must not open the which-message pick");
+      assert.ok(!calls.slice(2).includes(true), `no --show-phi run after Hide: ${JSON.stringify(calls)}`);
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
   test("a second reveal while the first is choosing does nothing", async () => {
     let answer!: (index: number | undefined) => void;
     const asked = new Promise<number | undefined>((r) => (answer = r));

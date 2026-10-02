@@ -32,19 +32,24 @@ export const UNTRUSTED_WORKSPACE_STDERR =
 
 /**
  * A CLI result that could not become a value. Its `message` is fixed text plus at most a byte count;
- * the CLI's own output is never in it. `argumentRejected` carries the one fact some callers need from
- * that output, decided here so they never read it: an argument parser refused a flag or a verb, which
- * means the installed engine predates the command (see stepsModel.isUnknownArgumentError and
- * connectionSchemaModel.isEnginePredatesSchema).
+ * the CLI's own output is never in it. Two flags carry the facts some callers need from that output,
+ * decided here so they never read it. `argumentRejected`: an argument parser refused a flag or a
+ * verb, in any common wording (stepsModel.isUnknownArgumentError retries without the flag).
+ * `argparseRejection`: argparse's own two wordings only, which connectionSchemaModel reads as "this
+ * engine predates the command" and must not widen.
  */
 export class CliOutputError extends Error {
   constructor(
     message: string,
     readonly argumentRejected: boolean,
+    readonly argparseRejection: boolean = false,
   ) {
     super(message);
   }
 }
+
+/** Argparse's rejection of a verb or flag it does not have, and nothing broader. */
+const ARGPARSE_REJECTION = /invalid choice|unrecognized arguments/i;
 
 /** The subcommand words of an argv, for a message: our own arguments up to the first flag, at most two. */
 export function commandLabel(args: string[]): string {
@@ -80,8 +85,9 @@ export function parseJsonResult<T>(res: CliResult, args: string[]): T {
     throw new CliOutputError(
       `messagefoundry ${label} exited with code ${res.code} and printed no JSON. Its error output ` +
         `(${byteLength(res.stderr)} bytes) is not shown here because it can quote message data. Run ` +
-        "the command with --json in a terminal to read it.",
+        "the same command with --json in a terminal to read it.",
       looksLikeUnknownArgument(res.stderr),
+      ARGPARSE_REJECTION.test(res.stderr),
     );
   }
   let parsed: unknown;
@@ -91,9 +97,10 @@ export function parseJsonResult<T>(res: CliResult, args: string[]): T {
     throw new CliOutputError(
       `messagefoundry ${label} exited with code ${res.code} and printed ${byteLength(res.stdout)} ` +
         "bytes that are not valid JSON. The output is not shown here because it can quote message " +
-        "data. A print() in a config module can cause this. Run the command with --json in a " +
-        "terminal to read it.",
+        "data. One cause is a print() at the top level of a config module. Run the same command " +
+        "with --json in a terminal to read it.",
       USAGE_ON_STDOUT.test(text) || looksLikeUnknownArgument(res.stderr),
+      USAGE_ON_STDOUT.test(text) || ARGPARSE_REJECTION.test(res.stderr),
     );
   }
   // The CLI prints {"error": "..."} (e.g. on a WiringError) instead of the expected array/object;

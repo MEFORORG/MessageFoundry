@@ -12,8 +12,8 @@
 // No vscode, no I/O.
 //
 // Live-value acquisition (ADR 0076 addendum, 2026-07-10): the trace event/invocation shapes below are
-// imported as TYPES ONLY from liveDebug (erased at compile time — no runtime dependency, so this module
-// stays vscode-free and node-testable). The values come from a SECOND `dryrun --trace json` the provider
+// imported as TYPES ONLY from liveDebugModel (erased at compile time; that module is vscode-free too,
+// so this one stays node-testable). The values come from a SECOND `dryrun --trace json` the provider
 // shells (ADR 0072), never from reaching into LiveDebugController's private trace state.
 import type { TraceInvocation, TraceValue } from "./liveDebugModel";
 

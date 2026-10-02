@@ -377,11 +377,17 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     } else {
       sb.hide();
     }
-    if (this.revealPending || this.choosingReveal) {
+    if (this.revealPending) {
       sb.text = "$(sync~spin) Values: Revealing…";
       sb.command = undefined;
       sb.tooltip =
         "A run with real values is in progress. Run *MessageFoundry: Hide Revealed Values* to cancel it.";
+    } else if (this.choosingReveal) {
+      sb.text = "$(sync~spin) Values: Choosing…";
+      sb.command = undefined;
+      sb.tooltip =
+        "Choosing which message to reveal. No real values are shown or fetched yet. Run " +
+        "*MessageFoundry: Hide Revealed Values* to cancel.";
     } else if (this.shownRunRevealed) {
       const focus = this.revealedFocus;
       sb.text =
@@ -478,12 +484,13 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     this.choosingReveal = true;
     this.updateRevealStatus();
     let focus: RevealFocus | undefined;
+    let cancelledWhileEnabling = false;
     try {
       if ((this.enabling || !this.enabled) && !(await this.enable())) {
         return;
       }
       if (intent !== this.revealIntent) {
-        await this.run(false); // cancelled during the sample pick: Live is on, so run it masked
+        cancelledWhileEnabling = true; // Hide during the sample pick: run masked, after the finally
         return;
       }
       // A save just before the click would otherwise fire a masked run that silently drops this reveal.
@@ -496,7 +503,16 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       this.choosingReveal = false;
       this.updateRevealStatus();
     }
+    if (cancelledWhileEnabling) {
+      await this.run(false); // Live came on with no run; give it its first, masked one
+      return;
+    }
     if (focus && intent === this.revealIntent) {
+      // A save during the choice armed a debounced masked run; it would supersede this reveal.
+      if (this.debounceTimer) {
+        clearTimeout(this.debounceTimer);
+        this.debounceTimer = undefined;
+      }
       await this.run(true, focus);
     }
   }
@@ -520,7 +536,9 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (!this.enabled || !messages || messages.length === 0) {
       if (this.enabled) {
         void vscode.window.showInformationMessage(
-          "MEFOR Live: the masked run gave no message to reveal. Fix the run, then reveal again.",
+          this.running
+            ? "MEFOR Live: a newer run replaced the one listing the sample's messages. Reveal again when it lands."
+            : "MEFOR Live: the masked run gave no message to reveal. Fix the run, then reveal again.",
         );
       }
       return undefined;
@@ -529,7 +547,18 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       return { index: 0, total: 1 };
     }
     const index = await this.pickMessage(messages);
-    return index === undefined ? undefined : { index, total: messages.length };
+    if (index === undefined || intent !== this.revealIntent) {
+      return undefined;
+    }
+    // A save-run that landed during the pick may have re-listed the sample. If its count moved, the
+    // index may name another message, so ask again rather than spawn a --show-phi run to find out.
+    if (this.maskedMessages?.length !== messages.length) {
+      void vscode.window.showInformationMessage(
+        "MEFOR Live: the sample's message count changed while you chose, so nothing was revealed. Reveal again.",
+      );
+      return undefined;
+    }
+    return { index, total: messages.length };
   }
 
   /**
@@ -685,7 +714,9 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
         if (one === null) {
           unmatched = true;
           throw new Error(
-            "the sample's message count changed since it was listed, so nothing was revealed. Reveal again.",
+            focus
+              ? "the sample's message count changed since it was listed, so nothing was revealed. Reveal again."
+              : `the run held ${entries.length} messages and none was chosen, so nothing was revealed.`,
           );
         }
         entries = [one]; // every other message's values are dropped here, before anything renders

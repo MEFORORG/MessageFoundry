@@ -95,6 +95,14 @@ suite("cliJson argument rejection travels as a flag, not as quoted text", () => 
     assert.strictEqual(isEnginePredatesSchema(err), true);
   });
 
+  test("a non-argparse wording retries the lens flag but is not 'engine predates the verb'", () => {
+    // isUnknownArgumentError reads common parser wordings; isEnginePredatesSchema reads argparse's
+    // two only, as it did before the message stopped quoting stderr.
+    const err = failure(result({ stderr: "error: unknown option --contract\n", code: 2 }));
+    assert.strictEqual(isUnknownArgumentError(err), true);
+    assert.strictEqual(isEnginePredatesSchema(err), false);
+  });
+
   test("any other failure is not an argument rejection (control arm)", () => {
     const err = failure(result({ stderr: "ValueError: bad sample\n", code: 1 }));
     assert.strictEqual(err.argumentRejected, false);

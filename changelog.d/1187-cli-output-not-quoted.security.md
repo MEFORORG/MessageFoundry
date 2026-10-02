@@ -1,5 +1,5 @@
-- **The IDE's error messages no longer quote what the CLI printed.** When a `--json` command's
-  stdout is not JSON, or is empty, the message now names the command, its exit code and a byte
+- **An IDE error from a `--json` CLI call no longer quotes the CLI's output.** When the command's
+  stdout is not JSON, or is empty, the message now names the subcommand, its exit code and a byte
   count, and says to run the command in a terminal to read the output. Before, the message quoted
   the start of stdout (through Node's JSON parse error) or the whole stderr. That text could carry
   message data, and it showed in the Live Debug lens title, the status-bar tooltip and the Test
