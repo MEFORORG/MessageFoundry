@@ -35,13 +35,18 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.lens import parse_source, rewrite_source
+from messagefoundry.lens import (
+    REFUSAL_COLUMN_LIMIT,
+    LensRewriteError,
+    parse_source,
+    rewrite_source,
+)
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing import split as split_mod
 from messagefoundry.parsing.message import Message, reencode_with_separators
 from messagefoundry.parsing.split import split_batch, split_batch_bytes
 from messagefoundry.pipeline import ingress_guards, wiring_runner
-from messagefoundry.pipeline.dryrun import dry_run
+from messagefoundry.pipeline.dryrun import dry_run, split_messages
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.file import FileSource
@@ -653,6 +658,18 @@ def test_a_first_chunk_that_is_not_an_envelope_is_kept_for_the_parser() -> None:
     assert len(parts) == 3 and parts[0] == "JUNK|1"
     enveloped = split_batch("FHS|" + ENC + CR + "BHS|" + ENC + CR + "".join(THREE[:2]))
     assert [p.split("|")[9] for p in enveloped] == ["CTRL1", "CTRL2"]
+    # Only the envelope header lines are dropped; a segment after them is kept for the parser.
+    stray = split_batch("BHS|" + ENC + CR + "EVN|junk" + CR + "".join(THREE[:2]))
+    assert len(stray) == 3 and stray[0] == "EVN|junk"
+
+
+def test_the_dry_run_split_keeps_a_bom_led_first_message_as_the_live_split_does() -> None:
+    raw = (chr(0xFEFF) + "".join(THREE)).encode("utf-8")
+    parts = split_messages(raw)
+    assert [p.decode("utf-8") for p in parts] == [
+        m.decode("utf-8") for m in split_batch_bytes(raw, "utf-8")
+    ]
+    assert parts[0].startswith(b"MSH|")
 
 
 async def test_the_file_source_keeps_a_bom_led_first_message(tmp_path: Path) -> None:
@@ -808,6 +825,21 @@ def test_a_copy_whose_destination_is_edited_to_a_whole_field_writes_with_set_dat
     assert 'msg.set("NK1-3.1", msg.field("PID-5.1") or "")' in out
 
 
+def test_a_copy_re_pick_that_would_pass_the_column_limit_is_refused() -> None:
+    # 95 columns as written; set_data would make it 100+, which ruff would re-wrap.
+    line = (
+        '    msg.set("PV1-19", msg.field("PID-3", occurrence=an_occurrence) or "", occurrence=n)\n'
+    )
+    pad = 95 - len(line.rstrip("\n"))
+    line = line.replace("an_occurrence", "an_occurrence" + "x" * pad)
+    source = LENS_SOURCE + line
+    row = _copy_rows(source)[0]
+    edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
+    with pytest.raises(LensRewriteError) as caught:
+        rewrite_source(source, {**edit, "params": {"src": "PID-3.1"}})
+    assert caught.value.code == REFUSAL_COLUMN_LIMIT
+
+
 # --- review repair: the lint follows the value, not every read near it (#2558) --------------------
 
 
@@ -839,6 +871,8 @@ def test_the_lint_ignores_a_leaf_that_does_not_flow_into_the_value(
         'msg.set("PV1-19", str(msg.field("PID-3.1")))',
         'msg.set("PV1-19", next(r for r in [msg.field("PID-3.1")] if r))',
         'msg.set("PV1-19", (msg.field("PID-3.1") or "")[:3])',
+        'msg.set("PV1-19", (lambda: msg.field("PID-3.1"))())',
+        'msg.set("PV1-19", {msg.field("PID-3.1"): 1}.popitem()[0])',
     ],
 )
 def test_the_lint_still_flags_a_leaf_that_flows_into_the_value(tmp_path: Path, line: str) -> None:

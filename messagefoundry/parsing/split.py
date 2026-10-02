@@ -36,7 +36,7 @@ __all__ = ["encode_batch", "split_batch", "split_batch_bytes", "split_by_obr"]
 # segment id is always exactly three chars, so only an ``MSH`` segment starts with the literal "MSH".
 _MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
 
-#: The batch-envelope headers a first chunk may open with; neither is a message.
+#: The batch-envelope header lines a first chunk may open with; neither is a message.
 _ENVELOPE_HEADERS = ("FHS", "BHS")
 
 #: Codecs (by ``codecs.lookup`` name) that write every ASCII character as that one byte and use no
@@ -50,14 +50,14 @@ def split_batch(raw: str | bytes) -> list[str]:
 
     A real file connection delivers each ``MSH``-delimited message separately; mirror that so a
     batch file (or an ``FHS``/``BHS`` envelope wrapping several messages) yields every message, in
-    file order — not just the first. Each returned message is ``\r``-delimited. A leading
-    ``FHS``/``BHS`` envelope header before the first ``MSH`` is dropped, since each split message is
-    routed on its own and the batch framing has no per-message meaning.
+    file order — not just the first. Each returned message is ``\r``-delimited. The leading
+    ``FHS``/``BHS`` envelope header lines before the first ``MSH`` are dropped, since each split
+    message is routed on its own and the batch framing has no per-message meaning.
 
-    **No message is dropped.** Only the first chunk can come before an ``MSH``, and it is read past
-    whitespace and a byte order mark (U+FEFF). An ``MSH``-led first chunk is a message, starting at
-    its ``MSH``. Any other first chunk that is not an envelope header is kept as it is, so the parser
-    records its ``ERROR`` rather than the split discarding what the sender sent.
+    **No message is dropped.** Only the first chunk can come before an ``MSH``. It is read past
+    whitespace, a byte order mark (U+FEFF) and those envelope header lines. What remains is a
+    message when it starts with ``MSH``, and is otherwise kept as one too, so the parser records its
+    ``ERROR`` rather than the split discarding what the sender sent.
 
     A payload with a single message round-trips unchanged (a one-element list); an empty/whitespace
     payload yields the normalized text as the sole element (the caller — e.g. the parser — then
@@ -68,10 +68,10 @@ def split_batch(raw: str | bytes) -> list[str]:
     # Every later chunk is the boundary's own CR, then MSH.
     messages = [chunk[1:] for chunk in rest]
     head = first.lstrip(_LEADING_WS_STR)  # the leading noise the content sniff tolerates
-    if head.startswith("MSH"):
+    while head.startswith(_ENVELOPE_HEADERS):
+        head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
+    if head:
         messages.insert(0, head)
-    elif head and not head.startswith(_ENVELOPE_HEADERS):
-        messages.insert(0, first)
     return messages or [text]
 
 

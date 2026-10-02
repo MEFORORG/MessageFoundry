@@ -1232,6 +1232,8 @@ def _unvetted_import_hits(
 def _literal_is_leaf(node: ast.expr | None) -> bool | None:
     """For a string-literal HL7 path, whether it names a component or subcomponent; None for
     anything else (a dynamic or malformed path, whose level the AST cannot know)."""
+    # Imported here, as every engine import in this module is, so `messagefoundry check` loads
+    # only what the gate it runs needs.
     from messagefoundry.parsing.peek import parse_path
 
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -1305,7 +1307,7 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
         return True
     if isinstance(node, ast.Name):
         return node.id in tainted
-    if isinstance(node, (ast.Constant, ast.Compare, ast.Lambda)):
+    if isinstance(node, (ast.Constant, ast.Compare)):
         return False
     if isinstance(node, ast.IfExp):
         return _flows(node.body, tainted) or _flows(node.orelse, tainted)
@@ -1317,8 +1319,6 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
         return _comprehension_flows(node, node.elt, tainted)
     if isinstance(node, ast.DictComp):
         return _comprehension_flows(node, node.value, tainted)
-    if isinstance(node, ast.Dict):
-        return any(_flows(value, tainted) for value in node.values)
     if isinstance(node, ast.Call):
         args: list[ast.expr] = [*node.args, *(kw.value for kw in node.keywords)]
         func = node.func
@@ -1330,7 +1330,8 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
             if func.attr in _KEY_FIRST_METHODS:
                 args = args[1:]
         return _flows(func, tainted) or any(_flows(arg, tainted) for arg in args)
-    # BinOp, BoolOp, JoinedStr, FormattedValue, List, Tuple, Set and anything unforeseen.
+    # BinOp, BoolOp, JoinedStr, FormattedValue, List, Tuple, Set, Dict (keys too: a dict's keys
+    # can come back out as values), Lambda (its body may be called) and anything unforeseen.
     return any(_flows(child, tainted) for child in ast.iter_child_nodes(node))
 
 

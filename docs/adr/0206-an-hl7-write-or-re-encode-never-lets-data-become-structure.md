@@ -111,7 +111,8 @@ open points settled below.
   `code` row, because `set_field` means `set`. An edit of a copy row's `src` or `dst` re-picks the
   write the same way, so a source edited from a leaf to a whole field goes back to `set`, and one
   edited the other way goes to `set_data`. At a literal leaf destination the two writes are the same,
-  so there the method is left as written. ADR 0106's palette table still shows the old shape as
+  so there the method is left as written. A re-pick that would push the line past the column limit
+  is refused, since the lens never wraps a line itself. ADR 0106's palette table still shows the old shape as
   the record of that decision; `docs/STEPS-PALETTE.md` shows the new one.
 - **The lint's reach (rule 3).** It follows the value's data flow: the written expression, and
   every binding in the write's own scope of a name that flows into it, as `unsafe-db-lookup`
@@ -167,9 +168,11 @@ open points settled below.
 - **No leading message is dropped by the split.** `split_batch` used to keep only chunks that began
   with `MSH`, so a file starting with a byte order mark, a space or a tab lost its first message
   when it held three or more, and with two the whole file went over as one `ERROR`. Now the first
-  chunk is read past whitespace and a byte order mark (U+FEFF): an `MSH`-led one is a message, an
-  `FHS` or `BHS` envelope header is dropped, and anything else is kept so the parser records its
-  `ERROR`. The File source calls `split_batch` too, so it is fixed by the same change. A file holding
+  chunk is read past whitespace, a byte order mark (U+FEFF) and its `FHS`/`BHS` envelope header
+  lines. What remains is a message when it starts with `MSH`, and is otherwise kept so the parser
+  records its `ERROR`. The File source calls `split_batch` too, so it is fixed by the same change.
+  The dry-run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8 byte order mark is
+  three characters, so it strips that mark first and splits as the live sources do. A file holding
   one message with a leading byte order mark is still handed over whole, and the parser still
   refuses it; that is unchanged here.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
@@ -230,6 +233,7 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_a_copy_edited_from_a_leaf_to_a_whole_field_source_writes_with_set`
   -> `tests/test_data_never_becomes_structure.py::test_a_copy_edited_from_a_whole_field_to_a_leaf_source_writes_with_set_data`
   -> `tests/test_data_never_becomes_structure.py::test_a_copy_whose_destination_is_edited_to_a_whole_field_writes_with_set_data`
+  -> `tests/test_data_never_becomes_structure.py::test_a_copy_re_pick_that_would_pass_the_column_limit_is_refused`
 - **AC-7** -- WHEN the delimiter override rewrites a message, THE SYSTEM SHALL keep every leaf reading
   the same under the target set: a target delimiter inside a leaf is escaped with the target escape
   character, a separator escape is decoded against the source set and re-escaped against the target
@@ -276,6 +280,7 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_split_batch_keeps_a_first_message_led_by_noise`
   -> `tests/test_data_never_becomes_structure.py::test_a_first_chunk_that_is_not_an_envelope_is_kept_for_the_parser`
   -> `tests/test_data_never_becomes_structure.py::test_the_file_source_keeps_a_bom_led_first_message`
+  -> `tests/test_data_never_becomes_structure.py::test_the_dry_run_split_keeps_a_bom_led_first_message_as_the_live_split_does`
   -> `tests/test_message_split.py`
 
 ## Options considered

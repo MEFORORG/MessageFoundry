@@ -51,6 +51,7 @@ from messagefoundry.parsing import (
     validate,
 )
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+from messagefoundry.parsing.sniff import _lstrip_bom_ws
 from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
@@ -1024,7 +1025,10 @@ def split_messages(raw: bytes) -> list[bytes]:
     decodes before splitting — and still strictly better than the UTF-8/``replace`` decode this
     replaced, which turned such a payload into mojibake before anything looked at it.
     """
-    messages = split_batch(raw.decode("latin-1"))
+    # A UTF-8 byte order mark reads as three characters in the latin-1 view, so split_batch could
+    # not see past it as the live split, which decodes first, does (ADR 0206). Strip it, with the
+    # whitespace around it, before the view.
+    messages = split_batch(_lstrip_bom_ws(raw).decode("latin-1"))
     # A non-batch payload goes back byte-identical, as the File source hands one off.
     if len(messages) == 1:
         return [raw]

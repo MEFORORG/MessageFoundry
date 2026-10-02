@@ -2580,8 +2580,30 @@ def _apply_set_params(
     if any(isinstance(v, dict) and set(v) == {"parts"} for v in params.values()):
         _refuse_overlong_template_lines(src, result, line_start, line_end)
     if row.get("action") == "copy_field" and ("src" in params or "dst" in params):
-        result = _repick_copy_write(result, line_start, line_end)
+        repicked = _repick_copy_write(result, line_start, line_end)
+        if repicked != result:
+            _refuse_overlong_repick(result, repicked, line_start, line_end)
+        result = repicked
     return result
+
+
+def _refuse_overlong_repick(result: str, repicked: str, line_start: int, line_end: int) -> None:
+    """Refuse a Copy Field re-pick that pushes one of the row's lines past the column limit.
+
+    ``set`` to ``set_data`` adds five columns, and the lens never wraps a line itself, so a line it
+    would push past the limit is refused rather than left for ``ruff format`` to re-wrap, as
+    :func:`_refuse_overlong_template_lines` refuses a template."""
+    old_lines, new_lines = _physical_lines(result), _physical_lines(repicked)
+    for i in range(line_start - 1, line_end):
+        new = _display_width(new_lines[i])
+        if new > _MAX_LINE_LENGTH and new > _display_width(old_lines[i]):
+            raise LensRewriteError(
+                f"this edit would make line {i + 1} {new} columns wide, past the "
+                f"{_MAX_LINE_LENGTH}-column limit: a copy from a component or subcomponent writes "
+                "with msg.set_data (ADR 0206), which is longer than msg.set - shorten the paths, or "
+                "edit it as text",
+                code=REFUSAL_COLUMN_LIMIT,
+            )
 
 
 def _repick_copy_write(source: str, line_start: int, line_end: int) -> str:
@@ -2599,23 +2621,24 @@ def _repick_copy_write(source: str, line_start: int, line_end: int) -> str:
         tree = ast.parse(source)
     except SyntaxError:
         return source
-    for stmt in ast.walk(tree):
-        if (
-            isinstance(stmt, ast.Expr)
-            and stmt.lineno == line_start
-            and stmt.end_lineno == line_end
-            and isinstance(stmt.value, ast.Call)
-            and isinstance(stmt.value.func, ast.Attribute)
-        ):
-            break
-    else:
+    # The copy statement spanning exactly the row's lines. Two copies sharing those lines (``;``)
+    # cannot be told apart here, so neither is touched.
+    found = [
+        (stmt.value.func, native)
+        for stmt in ast.walk(tree)
+        if isinstance(stmt, ast.Expr)
+        and stmt.lineno == line_start
+        and stmt.end_lineno == line_end
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Attribute)
+        and (native := _recognize_native_method(stmt.value)) is not None
+        and native.action == "copy_field"
+    ]
+    if len(found) != 1:
         return source
-    native = _recognize_native_method(stmt.value)
-    if native is None or native.action != "copy_field":
-        return source
+    func, native = found[0]
     slots = dict(native.slots)
     src, dst = (getattr(slots[name], "value", None) for name in ("src", "dst"))
-    func = stmt.value.func
     if not isinstance(src, str) or _is_leaf_literal(dst) or func.end_col_offset is None:
         return source
     want = _copy_write_method(src)
