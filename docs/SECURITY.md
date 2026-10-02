@@ -2014,8 +2014,8 @@ row written before `sessions.auth_mechanism` existed. An OIDC session never reac
 factor follows the rule in [Multi-factor authentication](#multi-factor-authentication-totp-wp-14).
 It shares the local account's rule, with two differences. First, while `[security].require_mfa` is
 on, a directory session that proved no factor at sign-in owes an engine factor under either
-`require_mfa_scope` value. That is every Kerberos session, and an OIDC session minted while
-`[auth].oidc_require_mfa_claim` is off. Second, an OIDC sign-in meets its factor at mint on the
+`require_mfa_scope` value. That includes at least every Kerberos session and an OIDC session minted
+while `[auth].oidc_require_mfa_claim` is off. Second, an OIDC sign-in meets its factor at mint on the
 identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` is on, the default
 (BACKLOG #1144).
 

@@ -313,8 +313,9 @@ used MFA. So while `[security].require_mfa` is on, a Kerberos user enrolls an en
 passkey) and proves it. A **federated OIDC sign-in** meets the factor when the IdP's signed `amr` or
 `acr` claim carries a value the engine accepts: one in `[auth].oidc_mfa_amr_values` (default `mfa`)
 or `[auth].oidc_required_acr_values`. That holds while `[auth].oidc_require_mfa_claim` is on, the
-default, and it is where your **Conditional Access** counts. With that setting off, an OIDC session
-owes an engine factor, as a Kerberos session does. An **MFA-terminating reverse proxy** in front adds a layer, but the engine does not read it as a second
+default, and it is where your **Conditional Access** counts. With that setting off and
+`require_mfa` on, an OIDC session owes an engine factor, as a Kerberos session does. An
+**MFA-terminating reverse proxy** in front adds a layer, but the engine does not read it as a second
 factor. [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states the full rule.
 `require_mfa` is on by default for every account, so leave it on.
 

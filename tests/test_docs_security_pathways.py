@@ -2487,10 +2487,13 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
         "docs/CONTAINER-EXPOSURE-EVALUATION.md": (
             "Production-PHI + local accounts",
             "production-PHI MFA refusal",
+            "required on a production PHI instance with local admins",
+            "quiet on synthetic",
         ),
-        "docs/REMOTE-CONSOLE.md": ("TOTP MFA) or AD/LDAP",),
+        "docs/REMOTE-CONSOLE.md": ("TOTP MFA) or AD/LDAP", "A non-PHI instance is silent."),
         "docker/compose.yaml": (
             "required for local Administrator accounts on an exposed PHI bind",
+            "MFA-for-local-admins",
         ),
         "docker/k8s/ha-postgres.yaml": ("local-admin MFA on an exposed PHI bind",),
         "docker/k8s/statefulset.yaml": ("local-admin MFA on an exposed PHI bind",),
@@ -2504,9 +2507,10 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
             )
     doc = _flat(_doc_text())
     assert (
-        "a directory session that proved no factor at sign-in owes an engine factor under either "
-        "`require_mfa_scope` value. That is every Kerberos session, and an OIDC session minted "
-        "while `[auth].oidc_require_mfa_claim` is off." in doc
+        "First, while `[security].require_mfa` is on, a directory session that proved no factor "
+        "at sign-in owes an engine factor under either `require_mfa_scope` value. That includes "
+        "at least every Kerberos session and an OIDC session minted while "
+        "`[auth].oidc_require_mfa_claim` is off." in doc
     ), (
         "docs/SECURITY.md's Browser AD login paragraph must state the directory rule (BACKLOG #1133)."
     )

@@ -194,9 +194,8 @@ account is not exempt from the engine's second factor
 - `[security].require_mfa` is **on by default**, and MFA is an access gate: an enrolled-pending session
   gets `403` + `X-MFA-Required: 1` on every authorized route. **Leave it on** — that default, not the
   startup gate below, is the control.
-- The startup gate is narrower than it looks. On an exposed **PHI** instance — any of `dev`/`staging`/
-  `prod`, since all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) —
-  an explicit `[security].require_mfa = false` **refuses to start**, but only when
+- The startup gate is narrower than it looks. On an exposed instance, an explicit
+  `[security].require_mfa = false` **refuses to start**, but only when
   `[security].enforcement = enforce` (the default) **and**
   `[security].allow_single_factor_admin_when_exposed` is not set
   ([`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block). Either switch turns the

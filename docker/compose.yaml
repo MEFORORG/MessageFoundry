@@ -72,7 +72,7 @@ services:
     image: messagefoundry:latest
 
     # serve loads the config modules from /config and runs the 'prod' environment (production posture:
-    # PHI-at-rest fail-closed, deny-by-default egress, MFA-for-local-admins). env() value files resolve
+    # PHI-at-rest fail-closed, deny-by-default egress, MFA on for every account). env() value files resolve
     # under /config/environments/ (MEFOR_ENVIRONMENTS_BASE_DIR is /config in the image).
     command: ["serve", "--config", "/config", "--env", "prod"]
 

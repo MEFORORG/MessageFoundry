@@ -444,7 +444,7 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
 - [ ] **For Active Directory:** use **LDAPS** with a trusted CA, never set `MEFOR_ALLOW_INSECURE_TLS`
       in production, and configure the directory's lockout/complexity policy. The engine never takes
       a directory password at sign-in, so it cannot count those guesses. Its own lockout still counts
-      a directory account's engine TOTP and recovery codes and its step-up re-binds, and a locked
+      a directory account's engine TOTP and recovery codes and its step-up re-binds. A locked
       account cannot sign in ([the lockout rule](SECURITY.md#authentication-pathways--comparative-strength)).
       Keep the engine's **native second factor**
       (`[security].require_mfa`, WP-14, **on by default**) on. It covers directory accounts too:
