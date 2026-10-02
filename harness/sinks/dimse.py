@@ -149,6 +149,14 @@ class DimseSink(Sink):
             payload = buffer.getvalue()
         except Exception as exc:  # noqa: BLE001 - untrusted object; record it and answer anyway
             meta["decode_error"] = type(exc).__name__
+        if len(payload) > self.max_object_bytes:
+            # The engine's second charge: the preamble, DICM and file meta are not in the raw count.
+            meta["refused"] = (
+                f"{len(payload)} bytes re-encoded, over the {self.max_object_bytes}-byte cap"
+            )
+            meta["status"] = f"{CANNOT_UNDERSTAND:04X}"
+            self._add(Record(b"", meta))
+            return CANNOT_UNDERSTAND
         self._add(Record(payload, meta))
         return self.status
 

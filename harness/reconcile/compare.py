@@ -87,25 +87,29 @@ def load_messages(
 
     Each file is capped at ``max_file_bytes`` (default :data:`DEFAULT_MAX_LOAD_FILE_BYTES`) and refused
     with :class:`LoadError` over it, before it is read whole; so is a named path that is not a regular
-    file. In a directory, only regular files are read, and anything else in it is skipped."""
+    file. In a directory the cap is a TOTAL across its files, since every message is held at once;
+    only regular files are read, and anything else in it is skipped."""
     if max_file_bytes <= 0:
         raise ValueError(f"max_file_bytes must be a positive byte count, got {max_file_bytes}")
     p = Path(path)
     if p.is_dir():
         out: list[str] = []
+        left = max_file_bytes
         for child in sorted(p.iterdir()):
             if child.is_file():
-                out.extend(_split_batch(_read(child, max_file_bytes).decode("latin-1")))
+                data = _read(child, left)
+                left -= len(data)
+                out.extend(_split_batch(data.decode("latin-1")))
         return out
-    raw = _read(p, max_file_bytes)
+    # Decode straight away, so the bytes are not held beside the text while it is split.
     if p.suffix == ".jsonl":
         msgs: list[str] = []
-        for line in raw.decode("utf-8").splitlines():
+        for line in _read(p, max_file_bytes).decode("utf-8").splitlines():
             line = line.strip()
             if line:
                 msgs.append(json.loads(line)["raw"])
         return msgs
-    return _split_batch(raw.decode("latin-1"))
+    return _split_batch(_read(p, max_file_bytes).decode("latin-1"))
 
 
 def _split_batch(text: str) -> list[str]:

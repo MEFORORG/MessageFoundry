@@ -87,8 +87,9 @@ CREATE_TABLES = (
 )
 INSERT_INBOX = f"INSERT INTO {INBOX} (payload) VALUES (?)"
 OUTBOX_HIGH_WATER = f"SELECT COALESCE(MAX(id), 0) FROM {OUTBOX}"
-#: The most characters one outbox payload may hold and still be read by the database sink: the
-#: engine's per-message cap, measured in characters as the engine measures a decoded text body.
+#: The most UTF-16 code units one outbox payload may hold and still be read by the database sink:
+#: the engine's per-message cap. A code unit is a character outside the astral planes, where the
+#: engine counts characters, so this never admits more than the engine's own count would.
 MAX_OUTBOX_PAYLOAD_CHARS = DEFAULT_MAX_MESSAGE_BYTES
 #: The sink's read. A payload over the cap is withheld by the SERVER (NULL in its place, with its
 #: length in UTF-16 code units beside it), so an oversized row is never fetched into the harness.

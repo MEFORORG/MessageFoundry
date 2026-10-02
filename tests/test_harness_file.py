@@ -136,6 +136,27 @@ def test_watcher_refuses_anything_but_a_regular_file(qapp: Any, tmp_path: Path) 
     assert refused == ["dir.hl7: not a regular file; not read"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privilege on Windows")
+def test_watcher_does_not_follow_a_symlink(qapp: Any, tmp_path: Path) -> None:
+    """A writer to the watched directory must not point the pane at a file of the operator's."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text(_MSG, encoding="utf-8")
+    watched = tmp_path / "watched"
+    watcher = FolderWatcher()
+    got: list[Any] = []
+    refused: list[str] = []
+    watcher.received.connect(got.append)
+    watcher.refused.connect(refused.append)
+    assert watcher.start(str(watched))
+    try:
+        (watched / "link.hl7").symlink_to(outside)
+        watcher._scan()
+    finally:
+        watcher.stop()
+    assert got == []
+    assert refused == ["link.hl7: not a regular file; not read"]
+
+
 def test_file_panel_counts_a_refused_file_beside_the_watch_state(qapp: Any, tmp_path: Path) -> None:
     panel = FilePanel()
     panel._watch_dir.setText(str(tmp_path))

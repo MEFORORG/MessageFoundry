@@ -92,13 +92,17 @@ class DatabaseSink(Sink):
             for row_id, control_id, message_type, payload, length in self._read():
                 self._high_water = max(self._high_water, int(row_id))
                 meta = {"id": str(row_id), "control_id": control_id, "message_type": message_type}
-                # The attribute can only lower the cap: the read withholds anything over the
-                # server-side cap whatever it says, and a withheld payload names that cap.
-                cap = min(self.max_payload_chars, _database.MAX_OUTBOX_PAYLOAD_CHARS)
+                # Both checks count UTF-16 code units, as the server's DATALENGTH / 2 does. The
+                # attribute can only lower the cap; a withheld payload names the server's cap.
                 if payload is None:
-                    cap = _database.MAX_OUTBOX_PAYLOAD_CHARS
-                if payload is None or len(str(payload)) > cap:
-                    meta["refused"] = f"{length} characters, over the {cap}-character cap; not read"
+                    cap, units = _database.MAX_OUTBOX_PAYLOAD_CHARS, length
+                else:
+                    cap = min(self.max_payload_chars, _database.MAX_OUTBOX_PAYLOAD_CHARS)
+                    units = len(str(payload).encode("utf-16-le")) // 2
+                if payload is None or units > cap:
+                    meta["refused"] = (
+                        f"{units} UTF-16 code units, over the {cap}-unit cap; not read"
+                    )
                     self._add(Record(b"", meta))
                     continue
                 self._add(Record(str(payload).encode("utf-8"), meta))

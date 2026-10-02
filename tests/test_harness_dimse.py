@@ -162,6 +162,17 @@ def test_the_sink_refuses_an_over_cap_object_before_decode_and_records_the_refus
     assert "decode_error" not in records[1].meta
 
 
+def test_the_sink_charges_the_re_encoded_object_too() -> None:
+    """The raw Data Set leaves out the preamble, DICM and file meta, so an object can pass the raw
+    charge and still be over the cap once re-encoded; the engine's SCP charges both, and so does this."""
+    (payload,), _ = make_datasets(1)
+    with DimseSink(max_object_bytes=len(payload) - 1) as sink:
+        (out,) = _driver_for(sink).inject([payload])
+        (record,) = sink.wait_for(lambda rs: len(rs) == 1, 5.0)
+    assert status_of(out) == CANNOT_UNDERSTAND
+    assert record.payload == b"" and "re-encoded" in record.meta["refused"]
+
+
 def test_the_sink_refuses_a_deflated_object_that_inflates_past_the_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -57,6 +57,10 @@ def read_capped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[
             return b"", NOT_REGULAR
         if st.st_size > cap:
             return b"", _over(st.st_size, cap)
+        if hasattr(os, "O_NONBLOCK"):
+            # Non-blocking was only for the open; a filesystem that honoured it on a regular file
+            # could otherwise answer a read with nothing (EAGAIN), which a buffered read returns as None.
+            os.set_blocking(fh.fileno(), True)
         # One byte past the size it reported, then top up to one past the cap only if it grew, so
         # a small file costs a small read and a growing one is caught without reading it whole.
         data = fh.read(st.st_size + 1)

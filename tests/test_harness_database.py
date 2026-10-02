@@ -352,13 +352,23 @@ def test_the_sink_reads_no_payload_over_the_cap_and_records_the_refusal(
             (1, "C1", "ADT^A05", None, cap + 1),  # withheld by the server
             (2, "C2", "ADT^A05", "MSH|ab", 6),  # fetched, but over the sink's own cap
             (3, "C3", "ADT^A05", "MSH|a", 5),  # at the cap: kept
+            (
+                4,
+                "C4",
+                "ADT^A05",
+                "\U0001f600" * 3,
+                6,
+            ),  # 3 characters, 6 code units, as the server counts
         ]
         records = sink.records()
-    assert [r.meta["control_id"] for r in records] == ["C1", "C2", "C3"]
-    assert [r.payload for r in records] == [b"", b"", b"MSH|a"]
+    assert [r.meta["control_id"] for r in records] == ["C1", "C2", "C3", "C4"]
+    assert [r.payload for r in records] == [b"", b"", b"MSH|a", b""]
+    assert records[3].meta["refused"].startswith("6 UTF-16 code units, over the 5-unit cap")
     # A withheld payload names the server-side cap, which the attribute cannot raise or hide.
-    assert records[0].meta["refused"].startswith(f"{cap + 1} characters, over the {cap}-character")
-    assert records[1].meta["refused"].startswith("6 characters, over the 5-character cap")
+    assert (
+        records[0].meta["refused"].startswith(f"{cap + 1} UTF-16 code units, over the {cap}-unit")
+    )
+    assert records[1].meta["refused"].startswith("6 UTF-16 code units, over the 5-unit cap")
     assert "refused" not in records[2].meta
     assert "MSH" not in records[1].meta["refused"]  # the refusal never quotes the payload
 

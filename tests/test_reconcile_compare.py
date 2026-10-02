@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -83,15 +84,27 @@ def test_load_messages_refuses_a_file_over_the_cap_in_each_shape(tmp_path: Path)
     assert over.value.over_cap
     if hasattr(os, "mkfifo"):  # POSIX: a FIFO is refused unread, never blocked on
         os.mkfifo(tmp_path / "pipe.hl7")
-        with pytest.raises(LoadError, match="not a regular file") as odd:
-            load_messages(tmp_path / "pipe.hl7")
-        assert not odd.value.over_cap
+        caught: list[BaseException] = []
+
+        def load_fifo() -> None:
+            try:
+                load_messages(tmp_path / "pipe.hl7")
+            except LoadError as exc:
+                caught.append(exc)
+
+        worker = threading.Thread(target=load_fifo, daemon=True)
+        worker.start()
+        worker.join(5.0)
+        assert not worker.is_alive(), "blocked on a FIFO"
+        assert len(caught) == 1 and "not a regular file" in str(caught[0])
+        assert isinstance(caught[0], LoadError) and not caught[0].over_cap
     d = tmp_path / "exp"
     d.mkdir()
     (d / "1.hl7").write_bytes(one)
     (d / "2.hl7").write_bytes(one + one)
     with pytest.raises(LoadError, match="2.hl7"):
-        load_messages(d, max_file_bytes=len(one))
+        load_messages(d, max_file_bytes=len(one) * 2)  # a TOTAL across the directory: 3 > 2
+    assert len(load_messages(d, max_file_bytes=len(one) * 3)) == 3
     with pytest.raises(ValueError, match="positive"):
         load_messages(batch, max_file_bytes=0)
 
@@ -108,6 +121,9 @@ def test_compare_cli_reports_an_over_cap_input_and_exits_two(
     assert reconcile_main(argv) == 0  # the default cap reads it; the same pair is clean
     with pytest.raises(SystemExit):
         reconcile_main([*argv, "--max-file-bytes", "0"])
+    missing = ["compare", "--mefor", str(tmp_path / "nope.hl7"), "--corepoint", str(batch)]
+    assert reconcile_main(missing) == 2  # unreadable input is 2, never 1 ("outputs differ")
+    assert "could not be read (FileNotFoundError)" in capsys.readouterr().err
 
 
 def test_reconcile_identical_is_clean() -> None:

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -48,11 +50,22 @@ def test_a_directory_is_not_regular(tmp_path: Path) -> None:
     assert read_capped(tmp_path / "d.hl7", 1024) == (b"", NOT_REGULAR)
 
 
+def _within(seconds: float, fn: Callable[[], object]) -> object:
+    """``fn()``'s result, or a failure if it has not returned in ``seconds``: a FIFO that is opened
+    blocking waits for a writer forever, and a regression must fail, not hang the run."""
+    box: list[object] = []
+    worker = threading.Thread(target=lambda: box.append(fn()), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), "blocked on a FIFO"
+    return box[0]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFO")
 def test_a_fifo_is_refused_without_blocking(tmp_path: Path) -> None:
     fifo = tmp_path / "p.hl7"
     os.mkfifo(fifo)
-    assert read_capped(fifo, 1024) == (b"", NOT_REGULAR)
+    assert _within(5.0, lambda: read_capped(fifo, 1024)) == (b"", NOT_REGULAR)
 
 
 def test_a_file_swapped_for_a_bigger_one_after_the_stat_is_judged_on_the_handle(
@@ -93,7 +106,10 @@ def test_a_symlink_is_not_followed_when_asked(tmp_path: Path) -> None:
     link = tmp_path / "l.hl7"
     link.symlink_to(target)
     assert read_capped(link, 1024, follow_symlinks=False) == (b"", NOT_REGULAR)
-    assert read_capped(link, 1024) == (_BODY, "")  # followed by default, as the watch pane does
+    assert read_capped(link, 1024) == (
+        _BODY,
+        "",
+    )  # followed by default; the reconcile loader relies on it
 
 
 # --- the File sink -----------------------------------------------------------------------------------
@@ -116,3 +132,16 @@ def test_the_file_sink_records_an_over_cap_file_as_refused_and_unread(tmp_path: 
     assert by_name["ok.hl7"].payload == _BODY and "refused" not in by_name["ok.hl7"].meta
     assert by_name["big.hl7"].payload == b""
     assert by_name["big.hl7"].meta["refused"].endswith(f"over the {len(_BODY)}-byte cap; not read")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privilege on Windows")
+def test_the_file_sink_does_not_follow_a_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(_BODY)
+    out = tmp_path / "out"
+    out.mkdir()
+    with FileSink(out) as sink:
+        (out / "ok.hl7").write_bytes(_BODY)
+        (out / "link.hl7").symlink_to(outside)
+        names = [r.meta["name"] for r in sink.records()]
+    assert len(names) >= 1 and names == ["ok.hl7"]
