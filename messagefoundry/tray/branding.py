@@ -38,6 +38,7 @@ import sys
 from ctypes import wintypes
 from pathlib import Path
 
+from messagefoundry.childenv import engine_environment, python_child_argv
 from messagefoundry.tray import __version__
 
 log = logging.getLogger("messagefoundry.tray.branding")
@@ -342,7 +343,13 @@ def relaunch_branded() -> bool:
     if branded is None:
         return False
     try:
-        child = subprocess.Popen([str(branded), "-m", "messagefoundry.tray"], close_fds=True)  # nosec B603 - fixed argv (our own branded launcher + module name), shell=False
+        # Started like the engine's Python children (vault BACKLOG #2801); childenv says what the
+        # command line and the environment do. The tray keeps the user's whole environment.
+        child = subprocess.Popen(  # nosec B603 - fixed argv (our own branded launcher, the child interpreter flags, our own bootstrap script, a module name), shell=False
+            python_child_argv("messagefoundry.tray", executable=str(branded)),
+            env=engine_environment(),
+            close_fds=True,
+        )
     except OSError:
         log.exception("could not relaunch via %s", branded)
         return False
