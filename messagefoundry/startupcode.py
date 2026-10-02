@@ -424,18 +424,24 @@ def _can_add_files(directory: Path) -> bool | None:
     effective ids where the platform supports that, and a read-only file system answers no.
 
     So the answer is about the token that asks, never a reading of the access list.
-    ``tests/test_startup_code_inventory.py`` asks under a write-restricted copy of its own token,
-    the kind the service gets: a directory that only Users may write then answers no.
+    ``tests/test_startup_code_inventory.py`` asks under a write-restricted copy of its own token:
+    a directory that only Users may write then answers no.
 
     **A privilege can answer yes where the access list says no.** A directory can only be opened
     with backup semantics, and on such an open Windows grants write access to a token that holds
     the restore privilege switched on, whatever the directory's permissions are. That yes is
-    true of the process: code in it could create the file the same way. The installed service's
-    token keeps one privilege, and it is not that one, so there the access list decides. An
-    elevated administrator's process may hold it.
+    true of the process: code in it could create the file the same way. An elevated
+    administrator's process may hold it. A service the installer gave a privilege list does not
+    (``docs/SERVICE.md``, "Restrict the service token"), so there the access list decides.
 
-    It does not ask whether an EXISTING file in the directory can be rewritten. A start-up file
-    the account owns inside a directory it cannot add to is not seen here."""
+    What it does not see, at least:
+
+    * A privilege the token holds switched OFF. The answer is no, though code in the process
+      could switch it on.
+    * An existing file that can be rewritten. A start-up file the account owns, inside a
+      directory it cannot add to, is not seen.
+    * A grant of the add rights alone. Windows adds the rights to read attributes and to wait on
+      the handle to every open, so a directory that grants only the add rights answers no."""
     if sys.platform != "win32":
         try:
             effective = os.access in os.supports_effective_ids

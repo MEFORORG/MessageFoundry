@@ -347,13 +347,16 @@ def test_a_directory_this_process_can_write_reads_as_writable(tmp_path: Path) ->
 
 
 def _plain_attempts(directory: Path) -> dict[str, bool]:
-    """Whether an ordinary create of a file, and of a folder, works in ``directory`` right now.
-    Real attempts, undone at once: they are what the check is compared against."""
+    """Whether a new file, and a new folder, can really be made in ``directory`` right now. Real
+    attempts, undone at once: they are what the check is compared against.
+
+    Only the file create is free of privilege. On Windows a folder create asks for backup
+    semantics by itself, so a token with the restore privilege switched on makes one anywhere."""
     made = {"a file": False, "a folder": False}
     target = directory / f"attempt-{os.getpid()}.tmp"
     try:
-        target.write_bytes(b"")
-        made["a file"] = True
+        with open(target, "xb"):  # exclusive: an existing file must not pass as a new one
+            made["a file"] = True
         target.unlink()
     except OSError:
         pass
@@ -404,7 +407,72 @@ def _backup_intent_attempt(directory: Path) -> bool:
     return True
 
 
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
+
+
+class _PRIVILEGE_SET_ONE(ctypes.Structure):
+    _fields_ = [
+        ("PrivilegeCount", ctypes.c_uint32),
+        ("Control", ctypes.c_uint32),
+        ("Luid", _LUID),
+        ("Attributes", ctypes.c_uint32),
+    ]
+
+
+def _privilege_switched_on(name: str) -> bool | None:
+    """Whether this process's token holds privilege ``name`` switched on. None when that could not
+    be read. Only ever used to say WHY a create worked; no assertion rests on it but its own."""
+    if sys.platform != "win32":  # also what narrows the ctypes names below for mypy
+        raise RuntimeError("a token privilege is a Windows notion")
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    advapi32.OpenProcessToken.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.LookupPrivilegeValueW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.POINTER(_LUID),
+    ]
+    advapi32.PrivilegeCheck.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_PRIVILEGE_SET_ONE),
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+    token_query = 0x0008
+    token = ctypes.c_void_p()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
+    ):
+        return None
+    try:
+        wanted = _PRIVILEGE_SET_ONE(PrivilegeCount=1, Control=1)  # 1: all of them are necessary
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(wanted.Luid)):
+            return None
+        held = ctypes.c_int32(0)
+        if not advapi32.PrivilegeCheck(token, ctypes.byref(wanted), ctypes.byref(held)):
+            return None
+        return bool(held.value)
+    finally:
+        kernel32.CloseHandle(token)
+
+
 _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows tokens and DACLs")
+
+
+@_windows_only
+def test_the_privilege_reader_tells_a_privilege_that_is_on_from_one_that_is_not() -> None:
+    """The reader only feeds a warning, so its own control is here. Every token has the
+    change-notify privilege switched on. No test process is expected to hold the one that creates
+    tokens, and a name Windows does not know is unreadable, not off."""
+    assert _privilege_switched_on("SeChangeNotifyPrivilege") is True
+    assert _privilege_switched_on("SeCreateTokenPrivilege") is False
+    assert _privilege_switched_on("SeNoSuchPrivilege") is None
 
 
 @_windows_only
@@ -417,13 +485,14 @@ def test_the_windows_write_check_agrees_with_a_real_attempt_behind_a_deny_entry(
     THAT DIFFERENCE IS WHY THIS TEST CHANGED. It used to assert that a deny entry makes the check
     answer no. On a hosted Windows runner the test process is an elevated administrator, and the
     check answered yes on both Server legs. So the last arm now makes the attempts itself and
-    holds the check to their result, whichever it is, and says in a warning which attempts
-    worked. The likely way through a deny entry is the restore privilege, which Windows honours
-    on a create that asks for backup semantics; that reading is the hosted leg's to give, and
-    this machine's unelevated shell cannot give it.
+    holds the check to their result, whichever it is. Where a create worked it warns with which
+    ones, and with whether the restore privilege is switched on. That privilege is the likely way
+    through a deny entry: Windows honours it on a create that asks for backup semantics. The
+    reading is the hosted leg's to give. This machine's unelevated shell cannot give it.
 
-    Every arm runs on every Windows host. The arm where the answer must be no, whoever runs the
-    suite, is the next test, which asks under a token with its privileges removed."""
+    On a host whose process holds that privilege this test can only catch a check that says no
+    too often. The arms where the answer must be no, whoever runs the suite, are in the next
+    test, which asks under tokens with their privileges removed."""
     if shutil.which("icacls") is None:
         pytest.skip("SKIP (nothing run): icacls not on PATH")
     locked = tmp_path / "locked"
@@ -437,9 +506,10 @@ def test_the_windows_write_check_agrees_with_a_real_attempt_behind_a_deny_entry(
             capture_output=True,
         )
 
-    # CONTROL: writable before any entry, by the check and by a real attempt.
+    # CONTROL: writable before any entry, by the check and by each kind of real attempt.
     assert startupcode._can_add_files(locked) is True
     assert _plain_attempts(locked) == {"a file": True, "a folder": True}
+    assert _backup_intent_attempt(locked) is True
     try:
         # A customize module may be a package, so the right to add a folder counts as well.
         deny("WD")
@@ -457,59 +527,80 @@ def test_the_windows_write_check_agrees_with_a_real_attempt_behind_a_deny_entry(
         if worked:
             warnings.warn(
                 "behind an entry that denies Everyone the rights to add a file and a folder, "
-                f"this process still created: {', '.join(worked)}. The write check answered "
-                "yes, which is the true answer for this token. The arm where the answer is no "
-                "ran under a privilege-stripped token instead.",
+                f"this process still created: {', '.join(worked)}. SeRestorePrivilege switched "
+                f"on: {_privilege_switched_on('SeRestorePrivilege')}. The write check answered "
+                "yes, which is the true answer for this token.",
                 stacklevel=1,
             )
     finally:
         subprocess.run(["icacls", str(locked), "/remove:d", "*S-1-1-0"], capture_output=True)
 
 
-#: Run under another token by the next test. It reports, for each directory, what the write check
-#: said and whether an ordinary create really worked.
+#: Run under another token by the next test. For each directory it reports what the write check
+#: said, and whether a new file and a new folder could really be made. Anything that goes wrong is
+#: written into the report, because the child has no console to say it on.
 _WRITE_CHECK_CHILD = """\
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
 
-from messagefoundry import startupcode
+engine_root, report, *directories = sys.argv[1:]
+try:
+    # The copy of the engine the parent test imported, whatever this interpreter has installed.
+    sys.path.insert(0, engine_root)
+    from messagefoundry import startupcode
 
+    def made(directory, folder):
+        target = os.path.join(directory, "attempt-%d" % os.getpid())
+        try:
+            if folder:
+                os.mkdir(target)
+                os.rmdir(target)
+            else:
+                os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                os.remove(target)
+        except OSError:
+            return False
+        return True
 
-def really(directory):
-    target = os.path.join(directory, "attempt-%d.tmp" % os.getpid())
-    try:
-        os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except OSError:
-        return False
-    os.remove(target)
-    return True
-
-
-report, *directories = sys.argv[1:]
-readings = {Path(d).name: [startupcode._can_add_files(Path(d)), really(d)] for d in directories}
-Path(report).write_text(json.dumps(readings), encoding="utf-8")
+    payload = {
+        "readings": {
+            Path(d).name: [startupcode._can_add_files(Path(d)), made(d, False), made(d, True)]
+            for d in directories
+        }
+    }
+except BaseException:
+    payload = {"error": traceback.format_exc()}
+Path(report).write_text(json.dumps(payload), encoding="utf-8")
 """
 
 
 @_windows_only
 def test_the_windows_write_check_follows_the_token_that_asks(tmp_path: Path) -> None:
-    """The engine service runs under a write-restricted token with one privilege (the installer
-    sets both). The check must answer for THAT token, not for the account's permissions on paper.
+    """The check must answer for the token that asks, not for the account's permissions on paper.
+    The installer gives the default service account a write-restricted token with a one-entry
+    privilege list (``docs/SERVICE.md``, "Restrict the service token"), so that is one of the
+    tokens asked here.
 
-    Three directories, read by three tokens, and each reading is paired with a real create:
+    Five directories, read under two stand-in tokens, and each reading is the check beside a real
+    file create and a real folder create:
 
-    * ``by-name`` grants this account by name. Every token may add a file.
-    * ``by-group`` grants only Users and Authenticated Users. An ordinary token may add a file. A
-      write-restricted one may not: that is the restriction, and a check that read the access
-      list alone would say yes.
-    * ``not-granted`` gives this account read access only. A token with its privileges removed may
-      not add a file, on any host, an elevated runner included. This is the arm that must say no.
+    * ``by-name`` grants this account by name. Both tokens may add to it.
+    * ``by-group`` grants only Users and Authenticated Users. A token with its privileges removed
+      may add to it. A write-restricted one may not: that is the restriction, and a check that
+      read the access list alone would say yes.
+    * ``not-granted`` gives this account read access only. Neither token may add to it.
+    * ``deny-file`` denies Everyone the right to add a file and not the right to add a folder. A
+      customize module may be a package, so the check must still say yes.
+    * ``deny-both`` denies both rights. The check must say no.
 
-    The stand-in tokens are copies of this process's own (``tests/_restricted_token.py``), so no
-    elevation is needed and the same arms run on a developer's machine and on a hosted runner."""
-    # Imported here: those two modules are test files too, and only this Windows-only test needs
+    The stand-in tokens are copies of this process's own (``tests/_restricted_token.py``) with
+    every privilege but one removed. So no elevation is needed, no privilege can answer for the
+    access list, and the same arms run on a developer's machine and on an elevated hosted runner.
+    These are the arms that can catch a check that says yes too often there."""
+    # Imported here: these modules are test files too, and only this Windows-only test needs
     # them. The DACL builder also removes an explicit OWNER RIGHTS entry, which a hosted runner's
     # temp directory can carry and which would let a child write as the directory's owner.
     from tests._restricted_token import (
@@ -518,31 +609,44 @@ def test_the_windows_write_check_follows_the_token_that_asks(tmp_path: Path) -> 
         spawn_restricted,
     )
     from tests.test_service_token_hardening import _probe, _stand_in_sids
-    from tests.test_store_trio_acl import _build_dir_dacl
+    from tests.test_store_trio_acl import _build_dir_dacl, _icacls, _release
+    from tests.test_store_trio_acl import _run as run_checked
 
     probe = _probe()
     me, restricting = _stand_in_sids(probe)
     script = tmp_path / "write_check_child.py"
     script.write_text(_WRITE_CHECK_CHILD, encoding="utf-8")
-    by_name, by_group, not_granted, reports = (
-        tmp_path / name for name in ("by-name", "by-group", "not-granted", "reports")
-    )
-    directories = (by_name, by_group, not_granted)
+    engine_root = str(Path(startupcode.__file__).resolve().parents[1])
+    names = ("by-name", "by-group", "not-granted", "deny-file", "deny-both")
+    by_name, by_group, not_granted, deny_file, deny_both = (tmp_path / name for name in names)
+    reports = tmp_path / "reports"
+    directories = (by_name, by_group, not_granted, deny_file, deny_both)
     for directory in (*directories, reports):
         directory.mkdir()
-    system = "*S-1-5-18:(OI)(CI)F"
+    system, mine = "*S-1-5-18:(OI)(CI)F", f"*{me}:(OI)(CI)M"
+    everyone = "*S-1-1-0"
     try:
-        _build_dir_dacl(by_name, f"*{me}:(OI)(CI)M", system)
+        _build_dir_dacl(by_name, mine, system)
         _build_dir_dacl(by_group, *(f"*{sid}:(OI)(CI)M" for sid in probe.BROAD_GROUPS), system)
         _build_dir_dacl(not_granted, f"*{me}:(OI)(CI)RX", system)
-        _build_dir_dacl(reports, f"*{me}:(OI)(CI)M", system)
+        _build_dir_dacl(deny_file, mine, system)
+        run_checked([_icacls(), str(deny_file), "/deny", f"{everyone}:(WD)"])
+        _build_dir_dacl(deny_both, mine, system)
+        run_checked([_icacls(), str(deny_both), "/deny", f"{everyone}:(WD,AD)"])
+        _build_dir_dacl(reports, mine, system)
 
         def under(name: str, restricting_sids: list[str], flags: int) -> dict[str, list[bool]]:
             report = reports / f"{name}.json"
-            argv = [sys.executable, "-B", str(script), str(report), *map(str, directories)]
-            child = spawn_restricted(argv, restricting_sids=restricting_sids, flags=flags)
-            assert child.wait(120) == 0, f"the {name} child failed"
-            readings: dict[str, list[bool]] = json.loads(report.read_text(encoding="utf-8"))
+            argv = [sys.executable, "-B", str(script), engine_root, str(report)]
+            child = spawn_restricted(
+                [*argv, *map(str, directories)], restricting_sids=restricting_sids, flags=flags
+            )
+            # Well inside the per-test time limit, twice over, so a hung child is reported here.
+            exit_code = child.wait(25)
+            assert report.exists(), f"the {name} child wrote no report (exit code {exit_code})"
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            assert "error" not in payload, f"the {name} child failed:\n{payload['error']}"
+            readings: dict[str, list[bool]] = payload["readings"]
             return readings
 
         # The token the hardened service gets, and one that only has its privileges removed.
@@ -553,18 +657,22 @@ def test_the_windows_write_check_follows_the_token_that_asks(tmp_path: Path) -> 
             for d in (by_name, by_group)
         }
     finally:
+        for directory in (deny_file, deny_both):
+            subprocess.run([_icacls(), str(directory), "/remove:d", everyone], capture_output=True)
         for directory in (*directories, reports):
-            subprocess.run(
-                ["icacls", str(directory), "/inheritance:e", "/grant", f"*{me}:(OI)(CI)F"],
-                capture_output=True,
-            )
+            _release(directory, me)
 
-    yes, no = [True, True], [False, False]  # [the check, a real create]: they must agree
-    assert hardened == {"by-name": yes, "by-group": no, "not-granted": no}, hardened
-    assert stripped == {"by-name": yes, "by-group": yes, "not-granted": no}, stripped
+    # [the check, a new file was made, a new folder was made]
+    yes, no, folder_only = [True, True, True], [False, False, False], [True, False, True]
+    denied = {"not-granted": no, "deny-file": folder_only, "deny-both": no}
+    assert hardened == {"by-name": yes, "by-group": no, **denied}, hardened
+    assert stripped == {"by-name": yes, "by-group": yes, **denied}, stripped
+    # In every reading the check said yes exactly when a real create worked.
+    for reading in (*hardened.values(), *stripped.values()):
+        assert reading[0] is (reading[1] or reading[2]), (hardened, stripped)
     # CONTROL: the same by-group directory is writable to this process, so the hardened token's
     # refusal there comes from the restriction and not from the directory.
-    assert ordinary == {"by-name": yes, "by-group": yes}, ordinary
+    assert ordinary == {"by-name": [True, True], "by-group": [True, True]}, ordinary
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX arm of the check")

@@ -1297,6 +1297,13 @@ This section is kept rather than deleted, because the claim it used to make is t
   and it would run at the next start, ahead of the check that looks for it.
   `startup_directory_unchecked` says the engine could not tell. Neither is a clean reading. An
   import-path entry that is an archive is not checked.
+  **The answer is the running process's, not a reading of the permissions.** On Windows the
+  engine opens each directory and lets Windows judge its token. So a write-restricted service
+  token reads as it really is. And an engine started from an elevated session whose token holds
+  the restore privilege switched on reads every directory as writable, whatever the permissions
+  say, because that process could write there. Changing permissions does not clear that one; a
+  service the installer set up does not hold the privilege
+  ([`SERVICE.md`](SERVICE.md#restrict-the-service-token)).
 - **The inventory is detection. The directory's permissions are the prevention.** Start-up code
   runs before any engine code, so a planted file could change what the inventory reads or skip
   it. And the list of expected files sits in the directory it describes, so whoever can write the
