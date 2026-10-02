@@ -467,11 +467,7 @@ def _judge_crl(
             elif (refused := held.refusal(cert.path, crl_fingerprint(pem))) is not None:
                 # BACKLOG #299: the reload pass tried the file on the running hop and refused it.
                 why = "that differs from the file, which the engine refused to apply to it"
-                remedy = f"Reason: {refused.reason}. " + (
-                    "Restart the engine to apply the file"
-                    if refused.restart_applies
-                    else "Fix the file: the engine would refuse to start on it too"
-                )
+                remedy = f"Reason: {refused.reason}. {refused.remedy}"
             else:
                 # The reload pass applies a replaced file to the running hop within about a minute
                 # (pipeline/crl_reload.py); a restart applies it at once.

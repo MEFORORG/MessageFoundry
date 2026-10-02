@@ -70,7 +70,7 @@ from messagefoundry.config.loaded_crls import (
     replace_held_copy,
 )
 from messagefoundry.config.tls_policy import crl_label, judge_crl_bytes
-from messagefoundry.pki import CrlBlock, read_crl_blocks
+from messagefoundry.pki import CrlBlock
 
 __all__ = [
     "RELOAD_INTERVAL_SECONDS",
@@ -176,61 +176,76 @@ def _reload_path(
     if not stale:
         clear_reload_refusal(path)
         return None
+    prior = reload_refusal(path, fingerprint)
+    if prior is not None and not prior.restart_applies:
+        # Refused on the file's own content, which cannot change until the file does. Only a
+        # supersede refusal is retried, because a CRL not yet in effect comes into effect.
+        return ReloadOutcome(path, 0, prior)
     setting = next((held.setting for _, held in stale if held.setting), None)
     label = crl_label(path, setting)
-    refusals: list[tuple[str, bool]] = []
+    reason: str | None = None
+    restart_applies = True
     reloaded = 0
+
+    def refuse(why: str, *, applies: bool) -> None:
+        nonlocal reason, restart_applies
+        reason = reason or why
+        restart_applies = restart_applies and applies
+
     try:
-        facts = judge_crl_bytes(pem, label=label, now=now)
-        blocks = tuple(read_crl_blocks(pem))
-        with tempfile.TemporaryDirectory(prefix="mefor-crl-") as private:
-            # The live load reads this private copy of the judged bytes, never the operator's file a
-            # second time, so a file swapped after the judgement cannot reach a live context.
-            copy = Path(private) / "crl.pem"
-            copy.write_bytes(pem)
-            certificates = _certificates_in(copy, label=label)
-            for ctx, held in stale:
-                why = supersede_refusal(held.blocks, blocks, now=now)
-                if why is not None:
-                    refusals.append((f"{label}: {why}", True))
-                    continue
-                if certificates - set(ctx.get_ca_certs(binary_form=True)):
-                    refusals.append(
-                        (
+        facts, blocks = judge_crl_bytes(pem, label=label, now=now)
+        # The cheap rule first: a rollback refuses every context without touching a file.
+        verdicts: dict[tuple[CrlBlock, ...], str | None] = {}
+        ready: list[tuple[ssl.SSLContext, HeldCrl]] = []
+        for ctx, held in stale:
+            if held.blocks not in verdicts:
+                verdicts[held.blocks] = supersede_refusal(held.blocks, blocks, now=now)
+            why = verdicts[held.blocks]
+            if why is None:
+                ready.append((ctx, held))
+            else:
+                refuse(f"{label}: {why}", applies=True)
+        if ready:
+            with tempfile.TemporaryDirectory(prefix="mefor-crl-") as private:
+                # The live load reads this private copy of the judged bytes, never the operator's
+                # file a second time, so a file swapped after the judgement cannot reach a context.
+                copy = Path(private) / "crl.pem"
+                copy.write_bytes(pem)
+                certificates = _certificates_in(copy, label=label)
+                for ctx, held in ready:
+                    if certificates and certificates - set(ctx.get_ca_certs(binary_form=True)):
+                        refuse(
                             f"{label} carries a certificate this hop does not already trust; "
                             "loading it would make it a trust anchor. Give this setting a bare "
                             "CRL (BACKLOG #1890)",
-                            False,
+                            applies=False,
                         )
-                    )
-                    continue
-                try:
-                    _apply(ctx, copy, pem)
-                except RuntimeError:
-                    log.critical(
-                        "crl_reload: %s changed a running hop's trust store unexpectedly while "
-                        "it was being applied. Restart the engine",
-                        label,
-                        exc_info=True,
-                    )
-                    refusals.append((f"{label}: the reload failed; restart the engine", False))
-                    continue
-                replaced = HeldCrl(held.path_key, fingerprint, facts, held.setting, blocks)
-                if replace_held_copy(ctx, held, replaced):
-                    reloaded += 1
+                        continue
+                    try:
+                        _apply(ctx, copy, pem)
+                    except RuntimeError:
+                        log.critical(
+                            "crl_reload: %s changed a running hop's trust store unexpectedly "
+                            "while it was being applied. Restart the engine",
+                            label,
+                            exc_info=True,
+                        )
+                        refuse(f"{label}: the reload failed; restart the engine", applies=False)
+                        continue
+                    replaced = HeldCrl(held.path_key, fingerprint, facts, held.setting, blocks)
+                    if replace_held_copy(ctx, held, replaced):
+                        reloaded += 1
     except ValueError as exc:
         # The file fails a rule a start applies, so a restart would refuse it too.
-        refusals.append((str(exc), False))
+        refuse(str(exc), applies=False)
     if reloaded:
         log.info(
             "crl_reload: applied %s to %d running TLS context(s) without a restart", label, reloaded
         )
-    if not refusals:
+    if reason is None:
         clear_reload_refusal(path)
         return ReloadOutcome(path, reloaded, None)
-    reason = refusals[0][0]
-    refusal = ReloadRefusal(fingerprint, reason, all(applies for _, applies in refusals))
-    prior = reload_refusal(path, fingerprint)
+    refusal = ReloadRefusal(fingerprint, reason, restart_applies)
     record_reload_refusal(path, refusal)
     if prior is None or prior.reason != reason:
         # Once per file version: the pass repeats every minute, and the monitor carries it after.
@@ -239,9 +254,7 @@ def _reload_path(
             "which keep the copy they hold: %s. %s",
             len(stale) - reloaded,
             reason,
-            "A restart applies the file"
-            if refusal.restart_applies
-            else "Fix the file: the engine would refuse to start on it too",
+            refusal.remedy,
         )
     return ReloadOutcome(path, reloaded, refusal)
 
@@ -300,10 +313,8 @@ class CrlReloadRunner:
         self._task = None
         if task is not None:
             task.cancel()
-            try:  # noqa: SIM105
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
 
     async def _run(self) -> None:
         # Sleep first: every context was just built from the file as it is now.

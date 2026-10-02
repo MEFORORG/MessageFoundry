@@ -34,7 +34,7 @@ __all__ = [
     "CertFacts",
     "CrlBlock",
     "CrlFacts",
-    "read_crl_blocks",
+    "judge_every_crl",
     "read_crl_facts",
     "read_every_crl_facts",
     "read_soonest_crl_facts",
@@ -167,6 +167,14 @@ def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
 
     Raises ``ValueError`` when the bytes carry no CRL at all -- a configured-but-CRL-less file must
     never degrade to "revocation checking silently off"."""
+    crl, nxt = _parse_first_crl(pem)
+    return _crl_facts(crl, nxt, now)
+
+
+def _parse_first_crl(
+    pem: bytes,
+) -> tuple[x509.CertificateRevocationList, datetime.datetime]:
+    """The first ``X509 CRL`` block of ``pem``, parsed, with its ``nextUpdate``."""
     start = pem.find(_CRL_BEGIN)
     if start < 0:
         raise ValueError(_NO_CRL)
@@ -180,6 +188,10 @@ def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
         # expiring, which would silence the freshness control entirely. Refuse rather than
         # inherit an unbounded lifetime.
         raise ValueError("the CRL carries no nextUpdate, so its freshness cannot be checked")
+    return crl, nxt
+
+
+def _crl_facts(crl: x509.CertificateRevocationList, nxt: datetime.datetime, now: float) -> CrlFacts:
     return CrlFacts(
         issuer=crl.issuer.rfc4514_string(),
         next_update_iso=nxt.isoformat(),
@@ -228,33 +240,7 @@ def read_every_crl_facts(pem: bytes, *, now: float) -> list[CrlFacts]:
     OpenSSL was measured to use a newer delta CRL as if it were complete. Revocations listed only
     in the base CRL were then dropped, and a revoked client was accepted. Give the setting base
     CRLs only."""
-    blocks = list(_crl_blocks(pem))
-    if not blocks:
-        raise ValueError(_NO_CRL)
-    facts: list[CrlFacts] = []
-    for index, block in enumerate(blocks, start=1):
-        where = f"CRL block {index} of {len(blocks)}"
-        try:
-            facts.append(read_crl_facts(block, now=now))
-            if _is_delta_crl(block):
-                raise ValueError(
-                    "it is a delta CRL, which OpenSSL would read as a complete CRL and so drop "
-                    "every revocation listed only in its base CRL; give base CRLs only"
-                )
-        except ValueError as exc:
-            raise ValueError(f"{where} cannot be judged: {exc}") from exc
-    return facts
-
-
-def _is_delta_crl(block: bytes) -> bool:
-    """Whether the PEM CRL ``block`` carries a Delta CRL Indicator (RFC 5280 section 5.2.4)."""
-    try:
-        x509.load_pem_x509_crl(block).extensions.get_extension_for_class(x509.DeltaCRLIndicator)
-    except x509.ExtensionNotFound:
-        return False
-    except x509.DuplicateExtension as exc:
-        raise ValueError(f"the CRL carries a duplicate extension: {exc}") from exc
-    return True
+    return [facts for facts, _ in judge_every_crl(pem, now=now)]
 
 
 @dataclass(frozen=True)
@@ -273,27 +259,49 @@ class CrlBlock:
     fingerprint: bytes
 
 
-def read_crl_blocks(pem: bytes) -> list[CrlBlock]:
-    """Every CRL in ``pem``, in file order, as :class:`CrlBlock` (BACKLOG #299).
+def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]]:
+    """:func:`read_every_crl_facts`, with each CRL's :class:`CrlBlock` beside its facts.
 
-    Call it on bytes :func:`read_every_crl_facts` has already accepted. It raises ``ValueError`` on a
-    block with no ``nextUpdate`` and lets a parse error through, so it is no substitute for that
-    function's checks."""
-    blocks: list[CrlBlock] = []
-    for block in _crl_blocks(pem):
-        crl = x509.load_pem_x509_crl(block)
-        nxt = crl.next_update_utc
-        if nxt is None:
-            raise ValueError("the CRL carries no nextUpdate, so its freshness cannot be checked")
-        blocks.append(
-            CrlBlock(
-                issuer=crl.issuer.rfc4514_string(),
-                this_update=crl.last_update_utc,
-                next_update=nxt,
-                fingerprint=crl.fingerprint(hashes.SHA256()),
+    The same refusals, from one parse of each block. A context load that records its copy
+    (``harden_crl_check``) and the running-hop reload both need the blocks (BACKLOG #299)."""
+    blocks = list(_crl_blocks(pem))
+    if not blocks:
+        raise ValueError(_NO_CRL)
+    judged: list[tuple[CrlFacts, CrlBlock]] = []
+    for index, block in enumerate(blocks, start=1):
+        where = f"CRL block {index} of {len(blocks)}"
+        try:
+            crl, nxt = _parse_first_crl(block)
+            if _is_delta_crl(crl):
+                raise ValueError(
+                    "it is a delta CRL, which OpenSSL would read as a complete CRL and so drop "
+                    "every revocation listed only in its base CRL; give base CRLs only"
+                )
+        except ValueError as exc:
+            raise ValueError(f"{where} cannot be judged: {exc}") from exc
+        judged.append(
+            (
+                _crl_facts(crl, nxt, now),
+                CrlBlock(
+                    issuer=crl.issuer.rfc4514_string(),
+                    this_update=crl.last_update_utc,
+                    next_update=nxt,
+                    fingerprint=crl.fingerprint(hashes.SHA256()),
+                ),
             )
         )
-    return blocks
+    return judged
+
+
+def _is_delta_crl(crl: x509.CertificateRevocationList) -> bool:
+    """Whether ``crl`` carries a Delta CRL Indicator (RFC 5280 section 5.2.4)."""
+    try:
+        crl.extensions.get_extension_for_class(x509.DeltaCRLIndicator)
+    except x509.ExtensionNotFound:
+        return False
+    except x509.DuplicateExtension as exc:
+        raise ValueError(f"the CRL carries a duplicate extension: {exc}") from exc
+    return True
 
 
 def soonest_crl(facts: list[CrlFacts]) -> CrlFacts:

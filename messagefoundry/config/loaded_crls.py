@@ -112,6 +112,13 @@ class ReloadRefusal:
     reason: str
     restart_applies: bool
 
+    @property
+    def remedy(self) -> str:
+        """What the operator does next, in the words both the reload and the monitor log."""
+        if self.restart_applies:
+            return "Restart the engine to apply the file"
+        return "Fix the file: the engine would refuse to start on it too"
+
 
 # Keyed by context, held weakly: an entry lives exactly as long as its context. A context may load
 # more than one CRL file in principle, so each value is a tuple; overwriting would drop a copy and
@@ -151,27 +158,28 @@ def record_crl_load(
         _HELD[ctx] = (*_HELD.get(ctx, ()), held)
 
 
-def _copy_items() -> list[tuple[ssl.SSLContext, tuple[HeldCrl, ...]]]:
-    """A copy of the registry, taken under the lock.
+def _copy() -> tuple[list[tuple[ssl.SSLContext, tuple[HeldCrl, ...]]], dict[str, ReloadRefusal]]:
+    """A copy of the registry and the refusals, taken under one hold of the lock.
 
     A context collected while the copy is taken can make ``WeakKeyDictionary`` raise
     ``RuntimeError``, since its removal callback does not take this lock. The copy is retried rather
     than letting one pass fall back to the file alone, which is the gap this module closes."""
-    for _ in range(3):
+    attempts = 4
+    for attempt in range(attempts):
         try:
             with _LOCK:
-                return list(_HELD.items())
+                return list(_HELD.items()), dict(_REFUSED)
         except RuntimeError:
-            continue
-    with _LOCK:
-        return list(_HELD.items())
+            if attempt == attempts - 1:
+                raise
+    raise AssertionError("unreachable")
 
 
 def held_contexts() -> list[tuple[ssl.SSLContext, HeldCrl]]:
     """Every live context and each CRL load it holds, one pair per load.
 
     The pairs hold the contexts STRONGLY, so a caller keeps the list for one pass only."""
-    return [(ctx, held) for ctx, loads in _copy_items() for held in loads]
+    return [(ctx, held) for ctx, loads in _copy()[0] for held in loads]
 
 
 def replace_held_copy(ctx: ssl.SSLContext, old: HeldCrl, new: HeldCrl) -> bool:
@@ -244,9 +252,7 @@ class HeldCrlSnapshot:
 
 def snapshot() -> HeldCrlSnapshot:
     """The copies live contexts hold now, and the reload refusals that explain any still old."""
-    items = _copy_items()
-    with _LOCK:
-        refusals = dict(_REFUSED)
+    items, refusals = _copy()
     return HeldCrlSnapshot([held for _, loads in items for held in loads], refusals)
 
 

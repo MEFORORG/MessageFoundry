@@ -73,7 +73,7 @@ TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 MIRRORED_CONNECTION_SETTING = "connection_name"
 
 if TYPE_CHECKING:
-    from messagefoundry.pki import CrlFacts
+    from messagefoundry.pki import CrlBlock, CrlFacts
 
 __all__ = [
     "APPROVED_KEX_GROUPS",
@@ -354,7 +354,7 @@ def harden_crl_check(
         )
 
     pem = path.read_bytes()
-    facts = judge_crl_bytes(pem, label=label, now=time.time())
+    facts, blocks = judge_crl_bytes(pem, label=label, now=time.time())
 
     certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
@@ -391,11 +391,7 @@ def harden_crl_check(
         )
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
-        from messagefoundry.pki import read_crl_blocks
-
-        record_crl_load(
-            ctx, crl_file, pem, facts, setting=setting, blocks=tuple(read_crl_blocks(pem))
-        )
+        record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
 
 
 def crl_label(crl_file: str, setting: str | None) -> str:
@@ -405,8 +401,9 @@ def crl_label(crl_file: str, setting: str | None) -> str:
     return f"{setting} ({crl_file!r})" if setting else f"CRL file {crl_file!r}"
 
 
-def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> CrlFacts:
-    """Refuse CRL bytes no context may load, and return the facts of the soonest-expiring block.
+def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> tuple[CrlFacts, tuple[CrlBlock, ...]]:
+    """Refuse CRL bytes no context may load. Return the facts of the soonest-expiring block, and
+    every block, which a context that records its copy needs (BACKLOG #299).
 
     The freshness half of :func:`harden_crl_check`, shared with the running-hop reload
     (:mod:`messagefoundry.pipeline.crl_reload`, BACKLOG #299) so a replacement CRL meets exactly the
@@ -415,13 +412,13 @@ def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> CrlFacts:
     that cannot be judged, or a delta CRL, refuses rather than being skipped, because this decides a
     load. An expired CRL refuses, because past ``nextUpdate`` it fails every peer, not only revoked
     ones. Raises ``ValueError`` led by ``label``."""
-    from messagefoundry.pki import read_every_crl_facts, soonest_crl
+    from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:
-        every = read_every_crl_facts(pem, now=now)
+        judged = judge_every_crl(pem, now=now)
     except ValueError as exc:
         raise ValueError(f"{label}: {exc}") from exc
-    facts = soonest_crl(every)
+    facts = soonest_crl([every for every, _ in judged])
     if facts.expired:
         raise ValueError(
             f"{label} holds a CRL (issuer {facts.issuer!r}) that expired at "
@@ -429,7 +426,7 @@ def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> CrlFacts:
             "refuses EVERY peer certificate it judges, not only revoked ones. Refresh it, or "
             "remove it if a newer CRL for that issuer is already in the file"
         )
-    return facts
+    return facts, tuple(block for _, block in judged)
 
 
 def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:

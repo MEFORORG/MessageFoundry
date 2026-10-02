@@ -55,7 +55,7 @@ from messagefoundry.pipeline.crl_reload import (
     reload_replaced_crls,
     supersede_refusal,
 )
-from messagefoundry.pki import CrlBlock, read_crl_blocks, read_soonest_crl_facts
+from messagefoundry.pki import CrlBlock, judge_every_crl, read_soonest_crl_facts
 from tests.test_cert_expiry import _RecordingSink
 from tests.test_crl_bundle_anchors import _ku
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -407,9 +407,9 @@ def test_the_superseding_rule() -> None:
     assert supersede_refusal([], [_block("CN=a", 1, 30, b"new")], now=now)  # held unknown
 
 
-def test_read_crl_blocks_names_each_block(pki: _Pki) -> None:
+def test_judge_every_crl_names_each_block(pki: _Pki) -> None:
     pem = pki.crl.read_bytes() + _fresher(pki)
-    blocks = read_crl_blocks(pem)
+    blocks = [block for _, block in judge_every_crl(pem, now=time.time())]
     assert [b.issuer for b in blocks] == ["CN=mefor-299-reload-ca"] * 2
     assert blocks[0].this_update < blocks[1].this_update
     assert blocks[0].fingerprint != blocks[1].fingerprint
