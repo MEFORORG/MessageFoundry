@@ -39,8 +39,20 @@ import sys
 _PACKAGE = "messagefoundry"
 
 
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
 def _same(a: str, b: str) -> bool:
-    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    return _norm(a) == _norm(b)
+
+
+def _inside(path: str, parent: str) -> bool:
+    path, parent = _norm(path), _norm(parent)
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:  # Windows: different drives
+        return False
 
 
 def _load_this_build(package_dir: str) -> None:
@@ -56,14 +68,6 @@ def _load_this_build(package_dir: str) -> None:
     spec.loader.exec_module(module)
 
 
-def _inside(path: str, parent: str) -> bool:
-    path, parent = (os.path.normcase(os.path.abspath(p)) for p in (path, parent))
-    try:
-        return os.path.commonpath([path, parent]) == parent
-    except ValueError:  # Windows: different drives
-        return False
-
-
 def _place_package_root() -> None:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if any(entry and _same(entry, root) for entry in sys.path):
@@ -74,10 +78,13 @@ def _place_package_root() -> None:
     # the whole standard library sits inside it, so it cannot rule an entry out.
     nested_sites = [s for s in site_dirs if not any(_same(s, base) for base in bases)]
 
+    def site_dir(entry: str) -> bool:
+        return any(_same(entry, s) for s in site_dirs)
+
     def standard_library(entry: str) -> bool:
         return (
             any(_inside(entry, base) for base in bases)
-            and not any(_same(entry, s) for s in site_dirs)
+            and not site_dir(entry)
             and not any(_inside(entry, s) for s in nested_sites)
         )
 
@@ -92,7 +99,7 @@ def _place_package_root() -> None:
         (
             index
             for index, entry in enumerate(sys.path)
-            if index > last_stdlib and entry and any(_same(entry, s) for s in site_dirs)
+            if index > last_stdlib and entry and site_dir(entry)
         ),
         len(sys.path),
     )
