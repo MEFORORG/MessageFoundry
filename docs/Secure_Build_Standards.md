@@ -10,8 +10,8 @@
 | **Applies to** | Any project developed under the SDS. Each project records its graded result in its own scorecard; MessageFoundry (MEFOR) is the reference implementation ([Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md)). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local security owner. |
 | **Status** | Draft for review |
-| **Version** | 0.7 |
-| **Date** | September 24, 2026 |
+| **Version** | 0.8 |
+| **Date** | October 2, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material change to the evidence base behind the rubric (new metric studies, a new framework version, a change to the enforcement model). |
 | **Aligns to** | NIST SP 800-218 (SSDF) producer practices · SP 800-115 (technical security testing) · SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Companion to the SDS, the [AI-build companion](Secure_AI_Development_Standards.md), and [Code Quality](Code_Quality_Standards.md). Confers no certification — NIST and OWASP issue no certificate, and a self-assessment is not one. |
@@ -81,7 +81,7 @@ Each failure mode maps to a numbered signal in [§4](#4-the-rubric--the-12-signa
 | **Point-in-time scorecard read as current posture** — a dated snapshot quoted as if it describes HEAD. | **Signal 11** — dated snapshots, supersede notes, and a single canonical verdict-of-record. |
 | **Conflicting sources of truth** — a rosier scorecard survives beside the canonical one. | **Signal 11** — reconcile to the sole verdict-of-record; retire or annotate superseded docs so only one composite can be cited. |
 | **Control-parity gap** — a guard covers the prompted path and silently misses its sibling. | **Signals 3 & 6** — enumerate sibling ingress/publish paths and encode the control as one deterministic check shared across them (AI companion §3, control-asymmetry rule). |
-| **Insecure code + author overconfidence under solo self-review** — the maintainer reviews their own AI-authored code and waves it through. | **Signal 3** + SDS PW.7 — blocking SAST/SCA that cannot be waived, with AI-assisted review as a compensating control, never the primary one. (Stanford CCS'23: overconfidence bites hardest when the author reviews their own model output.) |
+| **Insecure code + author overconfidence under solo self-review** — the session that wrote the code runs the review of it, no human reads every diff, and the code is waved through. | **Signal 3** + SDS PW.7 — blocking SAST/SCA that cannot be waived, with AI-assisted review as a compensating control, never the primary one. (Stanford CCS'23: overconfidence bites hardest when the author reviews their own model output.) |
 | **Hallucinated / typosquatted dependencies (slopsquatting)** — a model suggests a plausible package that is malicious or nonexistent. | **Signal 4** — dependency and supply-chain integrity: a hash-locked lockfile, `--require-hashes` install, and a verify-before-add provenance gate (AI companion §6.4). |
 | **Advisory-scanner theater — scoped-green is not the gate** — counting non-blocking jobs as coverage. | **Signal 3** — distinguish blocking from advisory jobs; the verdict rests only on blocking-from-clean-baseline gates (AI companion §3, scoped-green rule). |
 | **Deferred-control drift** — an off-by-default control read as active, or (the inverse trap) a fail-closed control mis-read as inert. | **Signal 6** — a secure-default audit that scores "built" separately from "on-by-default", and "off" separately from "fail-closed". |
@@ -90,7 +90,7 @@ Each failure mode maps to a numbered signal in [§4](#4-the-rubric--the-12-signa
 
 ## 4. The rubric — the 12 signals that separate a secure build from security theater
 
-Each signal is a risk, a control, and a measure. It is tagged by gate type and by the document that owns it. Gate types: deterministic (machine-checked, red-on-regression), advisory (a human arbitrates the finding), and process (an exercised program, not a file). A scorecard built from this rubric only checks that a control is present and honestly claimed. It cites the SDS and the project's conformance and ASVS evidence for per-requirement verdicts rather than re-deriving them.
+Each signal is a risk, a control, and a measure. It is tagged by gate type and by the document that owns it. Gate types: deterministic (machine-checked, red-on-regression), advisory (a finding is judged, not machine-enforced; in MEFOR an AI session judges it first and the owner rules on what is routed to them, as [`../CLAUDE.md`](../CLAUDE.md) section 5 states), and process (an exercised program, not a file). A scorecard built from this rubric only checks that a control is present and honestly claimed. It cites the SDS and the project's conformance and ASVS evidence for per-requirement verdicts rather than re-deriving them.
 
 The signals fall into two layers, and the split is the whole point.
 
@@ -218,6 +218,7 @@ Two things are new here. Signal 11 is the claims-register and single-verdict-of-
 
 | Version | Date | Notes |
 | --- | --- | --- |
+| 0.8 | October 2, 2026 | **Review wording matches the process (owner ruling).** The overconfidence risk row said "the maintainer reviews their own AI-authored code", and the advisory gate type said "a human arbitrates the finding". Both now say what the process in [`../CLAUDE.md`](../CLAUDE.md) section 5 does. No signal or grade changed. |
 | 0.7 | September 24, 2026 | **Signal 10 no longer caps the grade (owner ruling 2026-09-24).** Signal 10 became a desired state in 0.6, but §4 and §5 still said its absence withholds an A. Both now say it is recorded as Absent and does not cap the composite grade. The executive summary and the §6 mapping say the same. |
 | 0.6 | September 23, 2026 | **Signal 10 is a desired state, not a requirement (owner ruling 2026-09-23).** The row required an independent review + penetration test + DAST "before production or off-loopback". It now names that engagement as the desired state and says an internal or self-run pass does not meet it. The §6 mapping called signal 10 an "ASVS L3 verification mandate"; ASVS 5.0 L3 does not require independent review, so that cell was false and is corrected. The grading model is unchanged. |
 | 0.5 | July 14, 2026 | **Split into a reusable standard + a per-project scorecard.** This document is now the project-agnostic rubric; MEFOR's graded result moved to the separate [Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md). All MEFOR-specific content (the placement table, evidence citations, verdict, ranked gaps, grade history) lives there. No change to the twelve signals, the anti-metric rule, or the companion mapping. |
