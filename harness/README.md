@@ -337,3 +337,24 @@ arrived after it through the audited raw-body route (`surface="harness"`) and ma
 SOPInstanceUID. That needs a token with `messages:view_raw` as well as `messages:read`.
 `harness/scenarios/dimse.py` lists the scenarios: delivered, retried-then-dead-lettered, and
 refused-then-dead-lettered, each also counting the C-STOREs that reached the sink.
+
+### Email and Direct (SMTP outbound)
+
+`harness/config/email.py` takes MLLP on `email_in` (2660) and mails each ADT message to the
+loopback SMTP sink on `email_smtp` (2661): ADT^A31 goes to a recipient the
+`email_rejected_recipient` scenario makes the sink refuse with 550 at RCPT (dead-lettered, every
+attempt refused), and every other ADT trigger goes to `clinic@harness.invalid` (`email_delivered`).
+The hop is cleartext and declared so with `cleartext_accepted`; the graph's docstring says what
+that declaration does and does not cover, and which egress allowlist entry it needs. The sink
+(`harness/sinks/email.py`) is a minimal RFC 5321 server with no
+dependency: EHLO/HELO, MAIL, RCPT, DATA with dot-unstuffing, RSET, NOOP, QUIT, and STARTTLS when
+handed a server-side TLS context. It records the envelope and the message as submitted.
+
+`harness/config/direct/` is the Direct (S/MIME over STARTTLS) graph. A Direct outbound loads its
+keys and certificates when it is built, so that graph is served on its own with trust material
+minted for the run (its docstring names the five `MEFOR_VALUE_DIRECT_*` values), and
+`tests/test_harness_email.py` is where it runs: the sink receives an enveloped-data message over
+STARTTLS that decrypts with the partner's key and carries the sender's signature. It is not a
+registered scenario: a scenario runs against an engine that is already serving, and this one
+needs certificates minted before that engine starts, plus a sink TLS context matching them. So
+`--coverage` does not count the Direct outbound.
