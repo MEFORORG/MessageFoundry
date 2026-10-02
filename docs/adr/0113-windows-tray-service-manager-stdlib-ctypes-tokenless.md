@@ -403,6 +403,19 @@ This covers the relaunched child only. The first tray process starts however its
 and autostart writes `pythonw -m messagefoundry.tray`, so that process still has the working directory
 on its import path. When branding is unavailable, that first process runs the whole tray.
 
+**Narrowed the same day by vault BACKLOG #2822.** Autostart now writes the command line from
+`childenv.python_child_argv` too: the absolute `pythonw.exe`, `-P -X disable-remote-debug`, then the
+bootstrap script by its absolute path. A script start never searches the working directory, so the
+login start no longer depends on the folder Windows starts it in. The limit above now holds only for
+a tray started by hand, as `messagefoundry-tray` or `pythonw -m messagefoundry.tray`. Windows still
+hands the login start the user's environment unfiltered, so an empty or relative `PYTHONPATH` entry
+of the user's own would put the working directory back. `tests/test_tray_shell.py` pins the command
+and reads it back through Windows' own parser. `tests/test_tray_branding.py` starts a real process
+from that command, and a real branded child through `relaunch_branded`, each from a working
+directory holding a decoy package. `tests/test_dependency_boundaries.py` checks on every
+interpreter, the 3.14 floor included, that `tray.branding`, `tray.autostart` and the bootstrap load
+no engine module beyond `childenv` and nothing outside the standard library.
+
 This adds `messagefoundry.childenv` to the tray-importable list, on the same terms as the modules above. It
 is accepted because `childenv` imports only the standard library, so it brings none of the packages the
 tray must never import. `tests/test_tray_branding.py` pins the command line and the environment.

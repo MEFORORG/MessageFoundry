@@ -1216,6 +1216,15 @@ This section is kept rather than deleted, because the claim it used to make is t
   created, against about 210 ms when `serve` installed it as its first step. The interpreter's
   own start-up, about 20 ms there, cannot be covered from inside the engine. And a process that
   can write the engine's memory can run code in it by other means, and can remove a hook.
+- **The tray has no hook, so how it started decides whether the interface is on.** No entry
+  reports the tray's process. Two of its starts go through the child bootstrap with
+  `-X disable-remote-debug`, so the interface is off before any tray code runs. One is the branded
+  relaunch, `MessageFoundryTray.exe`. The other is the first process when autostart starts it at
+  login (vault BACKLOG #2822). That holds whether the relaunch then works or the first process
+  runs the tray unbranded. A tray started by hand, as `messagefoundry-tray` or
+  `pythonw -m messagefoundry.tray`, has the interface on. That process hands over to the branded
+  relaunch. Where branding is unavailable, or the branded child exits at once, it runs the whole
+  tray itself with the interface on.
 - **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process the
   operating system lets attach could run Python inside the engine, with the store key, the
   connection secrets and the messages in flight. An application that builds the API without

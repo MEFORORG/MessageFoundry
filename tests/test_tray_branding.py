@@ -173,9 +173,8 @@ def test_the_login_command_starts_a_real_first_process_through_the_bootstrap(
     probe_dir, cwd, report = _probe_layout(tmp_path)
     command = autostart.launcher_command(sys.executable)
     assert command.endswith(" messagefoundry.tray"), command
-    command = command.removesuffix("messagefoundry.tray") + " ".join(
-        [_PROBE_MODULE, autostart._run_key_argument(str(report))]
-    )
+    # A temporary path holds no quote, and does not end in a backslash.
+    command = command.removesuffix("messagefoundry.tray") + f'{_PROBE_MODULE} "{report}"'
     env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONSAFEPATH"}
     env["PYTHONPATH"] = str(probe_dir)
     done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
