@@ -38,7 +38,7 @@ import pytest
 
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import SqlServerStore
-from messagefoundry.store.store import AuditAppend
+from messagefoundry.store.store import AppendedAuditRow, AuditAppend
 
 # The three methods are deliberately NOT the two the original lead named: mark_done is included to
 # pin that the guarantee is a property of the _acquire chokepoint, not of two patched call sites.
@@ -256,9 +256,9 @@ def _audit_store(ops: list[str], *, rollback_fails: bool) -> tuple[SqlServerStor
     store = _make_store(conn, ops)
     store._audit_lock = asyncio.Lock()
 
-    async def _append(cur: object, action: str, **kwargs: object) -> tuple[int, str]:
+    async def _append(cur: object, action: str, **kwargs: object) -> AppendedAuditRow:
         ops.append("insert")
-        return 1, "hash"
+        return AppendedAuditRow(1, 1, "hash")
 
     async def _commit(c: object) -> None:
         raise RuntimeError("commit lost")

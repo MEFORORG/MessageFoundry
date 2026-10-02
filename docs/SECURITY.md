@@ -216,7 +216,8 @@ writes its first audit row, so it needs `MEFOR_STORE_ENCRYPTION_KEY` (or `[store
 in its own environment. The key in the service's NSSM environment is not visible to your shell. Use
 that same key; do not generate a new one. With no key the command refuses, under the same condition
 that makes `serve` refuse to start (BACKLOG #1905), because an audit chain that starts keyless stays
-keyless. A store already in that state is reported as
+keyless, and a store that holds a key reports such a chain as broken. A store already in that state
+is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
 
 Four properties are load-bearing rather than incidental:
@@ -554,8 +555,8 @@ backend hops that present a static credential or none (the *Delegated identity* 
 
 | Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
 |---|---|---|---|
-| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log` and `audit_chain_meta`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
-| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log` and `audit_chain_meta`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
+| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
+| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
 | Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>` | No: printed, not probed |
 | Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key | No: printed, not probed |
@@ -610,7 +611,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 |---|---|---|---|---|---|
 | Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
-| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rekey_audit`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
@@ -3761,7 +3762,7 @@ reasons are in `messagefoundry/auth/audit_visibility.py`.
   `LOG_SILENT_EVENT_TYPES` in `messagefoundry/auth/notifications.py`.
 - **The audit copies in the log are withheld from a reader without `users:manage`.** The off-box
   tee writes every audit row into the application log, the lock rows included, each with its row
-  number. `GET /logs/tail` drops all of those copies for such a reader before it pages, so
+  number and its sequence number. `GET /logs/tail` drops all of those copies for such a reader before it pages, so
   `total_lines` does not count them. Dropping only the lock rows would leave numbered gaps. That
   reader reads the trail, if it may, through `GET /audit`.
 
@@ -3827,15 +3828,23 @@ key derived from the store key. Someone who can write rows but does not hold the
 recompute it. Under `cipher_provider = "vault_transit"` the MAC is computed inside Transit instead.
 On a keyless row the digest is plain SHA-256, which anyone who can write the table can recompute.
 So a keyless chain shows corruption or a careless edit, not a rewrite by someone who can write the
-table. A store that has a key can still hold a keyless chain, or one keyed only from a later row
-on. [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, says
-which rows are keyed. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless digest
-only, and it said any such change is detectable without that condition. Verify the chain with
+table. **A store that holds a key requires every audit row keyed, from the first.** Row 1 of its
+chain is a genesis row, written at the store's first start, that names the key the chain begins
+under. Every row carries its position in the chain, `seq`, inside its MAC: `seq` starts at 1 and
+rises by one, so a missing, repeated or renumbered row is a reported break. Nothing in the database
+says where keying starts, so nothing there can be changed to move it. A row written without a key
+is a reported break on a keyed store, and no command re-keys one (ADR 0193 and ADR 0194, both
+amended 2026-10-01). [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit
+chain* row, says the same. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless
+digest only, and it said any such change is detectable without that condition. It then read *"A
+store that has a key can still hold a keyless chain, or one keyed only from a later row on"*; that
+was true until the keyed-from mark was removed. Verify the chain with
 `messagefoundry audit-verify` — exit 0 means at least that no surviving row was edited or
 reordered by someone who could not recompute the chain. Run it with the store key in its
-environment: a keyed chain cannot be verified without that key, and the verify fails. Exit 0 does
-not say the chain is keyed. A store that has a key and opens onto a keyless chain is reported
-apart from the verify, as
+environment: a keyed chain cannot be verified without that key, and the verify fails. With the key,
+exit 0 also means every row is keyed. With no key, which only the keyless store mode allows, exit 0
+covers a keyless chain and says no more than the paragraph above. A store that has a key and opens
+onto keyless rows fails the verify, and is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
 **A scheduled job reads the exit code and nothing else, so
 these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
@@ -3849,9 +3858,14 @@ pass; pass `--allow-empty` to accept it as one on an instance that has not logge
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
 exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
 non-audit-database paths. It does **not** mean nothing was removed: deleting the *newest*
-rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation. For
+rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation.
+The sequence number does not change that: it shows a row missing from the middle, not rows missing
+from the end. A log emptied altogether is the same case, since the next start writes a new genesis
+row. Only a value held outside the database shows either. For
 that, snapshot `messagefoundry audit-anchor` (`COUNT:HEAD`) and pass it back as `messagefoundry
-audit-verify --expected-anchor`. It is an exact point-in-time seal, which fixes what it is for: it
+audit-verify --expected-anchor`. `COUNT` is the newest row's sequence number, which on an intact
+chain is the row count, and the off-box audit record carries the same pair as `seq` and `row_hash`.
+It is an exact point-in-time seal, which fixes what it is for: it
 seals a chain **at rest across a gap** — quiesce the engine, anchor, hold the value off-box, re-verify
 while the chain is still quiesced (a maintenance window, a DB move, a backup/restore, a custodian
 hand-off). Anchoring and re-verifying in one breath compares a value to itself, and a held anchor
@@ -3862,9 +3876,10 @@ rows; for continuous coverage the off-box tee is still the control ([BACKLOG #32
 startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a
 row it could repair can no longer be written. The `client` address is folded **inside** the chained
 payload — deliberately, since attribution an attacker could rewrite without breaking tamper-evidence
-would be worse than none — as a **conditional trailing element**, appended only when non-`NULL`. A
-row with no client therefore hashes exactly as it did before the column existed, so legacy rows keep
-verifying byte-identically and one chain spans both formats across the upgrade. This is in-DB tamper-*evidence*, not prevention —
+would be worse than none. The payload is a fixed list of eight named, typed fields: `seq`, the
+previous row's hash, `ts`, `actor`, `action`, `channel_id`, `detail` and `client`. A `NULL` and an
+empty string encode differently. No earlier `audit_log` layout is converted: a store whose table
+lacks `seq` is refused at open. This is in-DB tamper-*evidence*, not prevention —
 restrict the store/file ACL (and run least-privilege; see [SERVICE.md](SERVICE.md)) so the log can't
 be rewritten in the first place.
 

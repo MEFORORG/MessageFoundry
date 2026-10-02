@@ -1750,18 +1750,22 @@ HKDF-derived subkey (`mefor/audit-chain/v1`), which that actor cannot forge with
 `cipher_provider = "vault_transit"` the MAC is computed **inside** Transit instead (`audit_mac_key()` is
 `None` there **by design** — that is not the keyless case).
 
-**Having a key today does not mean the chain is keyed.** A store first opened with a store key is
-keyed from row 1. A chain that began keyless stays keyless after you add a key, and
-`messagefoundry rekey-audit` keys only the rows written after it runs. The rule is stated once, in
-[ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, and
+**A store that holds a key requires every audit row keyed.** A store first opened with a store key
+writes a genesis row as row 1, which names the key the chain begins under, and every row after it
+is keyed and numbered. A chain that began keyless stays keyless: adding a key later re-keys
+nothing, and no command does. The keyed store then reports that chain as broken, because a row it
+cannot check under a key is a row a writer with no key could have recomputed. The rule is stated
+once, in [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, and
 [ADR 0194](adr/0194-refuse-to-start-a-keyless-audit-chain-at-the-store-open-seam.md) records how every
-command refuses to start one without the opt-out. A store that has a key but opens onto a keyless chain
-logs a WARNING at open that names `rekey-audit`, and `GET /security/posture` lists it as the loosening
+command refuses to start one without the opt-out. A store that has a key but opens onto keyless rows
+logs an ERROR at open, fails `audit-verify`, and `GET /security/posture` lists it as the loosening
 `audit_chain_unkeyed`. The startup loosening warning and `messagefoundry security show` do not read the
 open store, so they do not show it. Check the key (`[store].encryption_key` / `encryption_key_file`)
 and the posture read-out before you record "tamper-evident audit log" in a risk register. This
 paragraph used to say that a key makes the chain an HMAC and that a normally-configured deployment
-does get the keyed chain; both skipped the keyless-start case (BACKLOG #1906).
+does get the keyed chain; both skipped the keyless-start case (BACKLOG #1906). **CORRECTED
+2026-10-01:** it then said `messagefoundry rekey-audit` keys the rows written after it runs. That
+command is removed, with the mark it set.
 
 **And a bare walk does not catch a truncated tail.** `verify_audit_chain` detects modified or deleted
 **older** rows, but deleting the **newest** rows leaves a prefix that still chains cleanly, so a bare

@@ -1047,24 +1047,25 @@ This section is kept rather than deleted, because the claim it used to make is t
 ### `audit_chain_unkeyed` — the store has a key, but its audit chain is keyless
 
 > **An OBSERVATION, not a switch.** Nobody sets this. The store reports it when it opens with a key
-> (or an isolated-module MAC) onto an audit chain that has rows but no keying watermark. BACKLOG #1905.
-- **What you lose:** tamper evidence against forgery. Every existing audit row is plain SHA-256, so
-  anyone who can write `audit_log` can rewrite a row and recompute the chain, and `audit-verify`
-  reports it clean. A keyed chain would need the store key to do that.
+> (or an isolated-module MAC) onto an audit chain whose first row is not a genesis row naming its
+> key, so the chain holds keyless rows. BACKLOG #1905.
+- **What you lose:** tamper evidence against forgery for those rows. A keyless audit row is plain
+  SHA-256, so anyone who can write `audit_log` could have rewritten it and recomputed the chain. A
+  store that holds a key requires every audit row keyed, so `audit-verify` reports this chain as
+  broken at its first row.
 - **How it happens:** rows were written while no key was in hand, then a key was added. Opening with
-  a key keys a store only when its `audit_log` is empty, and never re-keys rows that already exist,
-  because that would bless a forged row. The documented install order used to produce this: run
-  `provision-admin` with the key only in the service's environment, and the first audit row is
-  keyless. `provision-admin` now refuses under the same condition `serve` refuses to start.
-- **It is never silent:** a WARNING each time the store opens, naming `messagefoundry rekey-audit`,
-  and an `audit_chain_unkeyed` entry in `GET /security/posture`. It is not in the serve-time
-  settings warning or `messagefoundry security show`, because neither opens the store.
-- **How to clear it:** stop the engine, then run `messagefoundry rekey-audit` with the key
-  configured. A running engine keeps the watermark it read at open, so it would go on appending
-  keyless rows above the new one and the next verify would report a break. `rekey-audit` verifies the
-  existing chain first, refuses a broken one, and keys every row after it. The existing rows keep
-  their SHA-256 hashes, but the first keyed row folds in the last keyless hash, so a later edit to
-  any earlier row breaks the keyed suffix.
+  a key starts a keyed chain only when `audit_log` is empty, and never re-keys rows that already
+  exist, because that would bless whatever they say today. Running `provision-admin` with the key
+  only in the service's environment used to produce this. `provision-admin` now refuses under the
+  same condition `serve` refuses to start. The other cause is a chain that was altered.
+- **It is never silent:** an ERROR each time the store opens, a failed `audit-verify`, and an
+  `audit_chain_unkeyed` entry in `GET /security/posture`. It is not in the serve-time settings
+  warning or `messagefoundry security show`, because neither opens the store. Rows the engine
+  appends in this state are keyed under the active key, and `rotate-key` refuses its audit step.
+- **How to clear it:** no command clears it, because none can key a row that was written without
+  a key. If the store was first started without its key, start a new store with the key
+  configured. Otherwise treat the chain as altered and investigate. **CORRECTED 2026-10-01:** this
+  entry told you to run `messagefoundry rekey-audit`. That command is removed.
 - **On a store with no key at all this entry never fires.** That chain is keyless by the audited
   at-rest opt-out, which `allow_unencrypted_phi` already reports.
 

@@ -260,8 +260,9 @@ def test_the_parser_offers_no_rekey_audit_command() -> None:
     parser, dispatch = _build_parser()
     choices: set[str] = set()
     for action in parser._actions:
-        if isinstance(getattr(action, "choices", None), dict):
-            choices |= set(action.choices)
+        table = getattr(action, "choices", None)
+        if isinstance(table, dict):
+            choices |= set(table)
     for commands in (choices, set(dispatch)):
         assert {"audit-verify", "audit-anchor", "rotate-key"} <= commands
         assert "rekey-audit" not in commands

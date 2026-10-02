@@ -62,6 +62,16 @@ HMAC-SHA256 when a store key is set, else keyless SHA-256.
 > refusal that stops a command starting one without the opt-out. No other passage in this memo cites
 > the sentence.
 
+> **CORRECTION (2026-10-01, vault BACKLOG #2594).** The chain this memo measured has changed, so
+> read its code quotes and its measurements as dated. `rekey-audit` is removed, and a store that
+> holds a key never writes a keyless row. Every row now carries `seq`, its position in the chain,
+> inside the payload; the verifier walks in `seq` order and requires it to start at 1 and rise by
+> one. Row 1 of a keyed chain is a genesis row. `row_hash` is `NOT NULL`. The row `id` is still not
+> in the payload. So a deletion shape that removes the oldest rows now also removes the genesis
+> row and leaves `seq` starting above 1, which the verifier reports. Re-measure each lever against
+> the current chain before choosing one. The change is recorded in
+> [ADR 0193](0193-audit-chain-key-ranges-survive-a-store-key-rotation.md), amendment 2026-10-01.
+
 **The row `id` is not in the payload.** The only link between two rows is the earlier row's stored
 `row_hash`, folded in as `prev_hash`. `record_audit` (`:7603`) reads that head under the store lock
 immediately before it inserts:
