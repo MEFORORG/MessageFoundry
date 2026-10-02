@@ -50,8 +50,7 @@ section reference.
 | | `allow_unencrypted_phi_under_strict_enforcement` | `false` |
 | In-use data protection | `memory_encryption_operator_declared` | `false` (ADR 0152 — *not* a loosening: it ASSERTS a host property rather than giving one up. Its absence on an exposed PHI instance warns at every start) |
 | | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property that cannot be satisfied on Windows) |
-| Sign-in & identity | `require_sign_in` | `true` |
-| | `require_mfa` | `true` |
+| Sign-in & identity | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
@@ -257,13 +256,24 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   longer enough** — keyless start additionally requires `allow_unencrypted_phi_under_strict_enforcement = true`
   (below), otherwise `serve` exits 2.
 
-### `require_sign_in = false` — disable authentication
-- **What you lose:** every request runs as a full-privilege *system* identity; no RBAC.
-- **When acceptable:** a **loopback-only** embedding/dev harness.
-- **Compensating controls:** a loopback bind with no declared TLS terminator only.
-- **Still refused:** an exposed instance with auth off — a non-loopback bind, **or** a loopback bind behind a
-  declared TLS terminator — is a **hard refuse** — serving full-privilege admin to the network is never one "I
-  accept the risk" away, at any posture.
+### `require_sign_in` — RETIRED, and refused at load
+This section is kept rather than deleted, because the compensating control it named rested on a
+false premise.
+- **It said:** turning sign-in off was acceptable for a loopback-only embedding or dev harness, with
+  *"a loopback bind with no declared TLS terminator"* as the compensating control.
+- **Why it went (vault BACKLOG #2719):** a loopback bind limits who can reach the API, not who did.
+  Every request ran as one shared system identity, so each audit row named the same actor and the
+  same address, and one local user could not be told from another or from a process. Every
+  instance carries patient data (ADR 0186), so the mode had no in-scope use. It could not repair
+  an account either: with no auth service, creating an account, unbinding one and reading the audit
+  log all answered 503.
+- **What replaced it:** nothing. `serve` refuses to start with sign-in off, on every bind, at any
+  `enforcement` level. A config or environment that still sets `[security].require_sign_in`, or the
+  `[auth].enabled` key it had replaced, is refused at load as REMOVED. For a site whose every
+  Administrator signs in through an outside service, the answer is a local Administrator made
+  before the outage ([SECURITY.md](SECURITY.md#keep-a-local-administrator)).
+- **For embedders and tests only:** the app factories still take `allow_no_auth=True`. `serve` never
+  passes it.
 
 ### `require_mfa = false` — single-factor admin
 - **What you lose:** the Administrator role authenticates with a password only (no native TOTP second
@@ -359,8 +369,8 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **Compensating controls:** front the admin surface with an MFA-enforcing proxy; prefer `require_mfa = true`
   (native TOTP); enable `admin_new_ip_step_up`. A startup **AUDIT** line records the override and the posture
   view (`GET /security/posture`) names it.
-- **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, auth-off to
-  the network, open egress, unbounded retention) — this ack lifts **only** the single-factor-admin refusal,
+- **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, auth off on
+  any bind, open egress, unbounded retention) — this ack lifts **only** the single-factor-admin refusal,
   and only at exposure. `require_mfa` off on a **loopback** bind was never refused (no exposure), so this ack
   is a no-op there.
 
@@ -445,8 +455,8 @@ is refused, so an opt-out does nothing and is not reported.
   is `enforce`-equivalent already).
 - **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings + startup
   **AUDIT** line + posture view keep the deviation visible.
-- **Still refused (even at `warn`):** the **no-auth-to-the-network** hard refuse (`require_sign_in = false` on
-  an exposed instance — a non-loopback bind, or a loopback bind behind a declared TLS terminator) is
+- **Still refused (even at `warn`):** the **no-auth** hard refuse (sign-in off, on any bind, loopback
+  included; vault BACKLOG #2719) is
   unconditional at **any** enforcement level — `enforcement = warn` does **not** open it — and the unconditional ePHI audit floor is untouched. A declared TLS terminator whose proxy-to-engine hop is plaintext (no `[api].tls_cert_file`) also still needs `[api].plaintext_upstream_hop_acknowledged` at any enforcement level (BACKLOG #1179; [CONFIGURATION.md](CONFIGURATION.md) `[api]` table). `enforcement` is **binary** (no `off`), and **nothing silences a
   cleartext hop entirely any more**: [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
   removed the data label from that decision and [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed the label itself. The
@@ -558,7 +568,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 > inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
 > #2354). A loopback `ldap://` address is refused too.
 > It is reported only while a plain bind is live, which needs at least `ad_enabled`,
-> `[security].require_sign_in` and an `ad_server` that is not `ldaps://`.
+> sign-in (always on under `serve`) and an `ad_server` that is not `ldaps://`.
 - **What you lose:** the encryption and the server authentication on the AD hop. Both binds are SIMPLE
   binds, so the service-account password and the password of every user who signs in or steps up cross
   the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
@@ -572,8 +582,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
-> **Conditional** on sign-in. With `[security].require_sign_in = false` there is no session for the signal to
-> guard, so it is reported **only** while auth is on. The default is `true` since BACKLOG #288
+> **Conditional** on sign-in. An app an embedder builds with sign-in off has no session for the signal to
+> guard, so it is reported **only** while auth is on, which `serve` always is. The default is `true` since BACKLOG #288
 > (owner ruling 2026-09-26); before that it shipped off, with an exposure-time advisory.
 - **What you lose:** a session token presented from a **client address it has not verified from**
   can perform a sensitive admin action on the strength of the ordinary step-up window alone. Nothing
@@ -589,8 +599,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
 
 ### `[auth].login_rate_limit_enabled = false`, or a limit looser than its default — sign-in attempts go less paced
-> **Conditional** on sign-in, like `admin_new_ip_step_up`: with `[security].require_sign_in = false` there
-> is no sign-in to limit. Each of these values is reported under its own key
+> **Conditional** on sign-in, like `admin_new_ip_step_up`: an app an embedder builds with sign-in off has
+> no sign-in to limit, and `serve` always requires it. Each of these values is reported under its own key
 > ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). The owner ruled on 2026-09-27 that a silent weakening here
 > keeps ASVS 6.1.1 at partial.
 >
@@ -1271,7 +1281,6 @@ chapter was not part of the verification above.
 | `serve_web_console`, `web_console_public_address` | V13 Configuration · V3 Web Frontend Security | **SC-7** Boundary Protection · **AC-3** Access Enforcement | §164.312(a)(1) Access Control |
 | `encrypt_stored_data`, `allow_unencrypted_phi` | V11 Cryptography | **SC-28** Protection of Information at Rest · **SC-13** Cryptographic Protection | §164.312(a)(2)(iv) Encryption and Decryption |
 | `allow_unencrypted_phi_under_strict_enforcement` (strict-enforcement ack) | V11 Cryptography | **SC-28** Protection of Information at Rest · **SC-13** Cryptographic Protection | §164.312(a)(2)(iv) Encryption and Decryption |
-| `require_sign_in` | V6 Authentication | **IA-2** Identification and Authentication (Organizational Users) | §164.312(d) Person or Entity Authentication |
 | `require_mfa` | V6 Authentication (multi-factor) | **IA-2(1)/(2)** MFA to Privileged / Non-Privileged Accounts | §164.312(d) Person or Entity Authentication |
 | `allow_single_factor_admin_when_exposed` (production ack) | V6 Authentication (multi-factor) | **IA-2(1)/(2)** MFA to Privileged / Non-Privileged Accounts | §164.312(d) Person or Entity Authentication |
 | `sign_out_after_idle_minutes`, `max_session_hours` | V7 Session Management | **AC-12** Session Termination | §164.312(a)(2)(iii) Automatic Logoff |

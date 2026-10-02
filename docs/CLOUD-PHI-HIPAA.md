@@ -131,7 +131,8 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 
 ## 6. Identity, access, audit
 
-- **Authentication required + MFA.** `MEFOR_SECURITY_REQUIRE_SIGN_IN=true`; `MEFOR_SECURITY_REQUIRE_MFA=true` for local
+- **Authentication required + MFA.** Sign-in is always on, and `serve` refuses to start without it
+  (vault BACKLOG #2719). `MEFOR_SECURITY_REQUIRE_MFA=true` for local
   Administrator accounts on an exposed PHI bind (the startup gate **refuses** a production-PHI off-loopback
   bind with local admins and `require_mfa=false`). AD/Entra MFA stays delegated to your IdP.
 - **Deny-by-default egress.** `MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true` + the `MEFOR_EGRESS_ALLOWED_*` lists, so a

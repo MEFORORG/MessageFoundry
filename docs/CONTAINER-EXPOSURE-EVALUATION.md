@@ -130,7 +130,7 @@ bind host is all that matters.
 
 | Topology | Bind address in container (`[security].listen_address`) | API gate outcome | Required config |
 |---|---|---|---|
-| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); `[security].require_sign_in = true` |
+| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); sign-in is always on (vault BACKLOG #2719) |
 | (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP) **and** `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055); no in-process cert needed |
 | (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — upstream branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** `plaintext_upstream_hop_acknowledged=true` (**refused** without it, in every mode, unless an operator `tls_cert_file` makes the engine serve that hop over TLS); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
@@ -161,7 +161,6 @@ are **refused at config load**, so copy these, not the pre-0118 shapes):
 [security]
 local_access_only = false
 listen_address = "0.0.0.0"
-require_sign_in = true
 require_mfa = true                            # required on a production PHI instance with local admins
 
 [api]
