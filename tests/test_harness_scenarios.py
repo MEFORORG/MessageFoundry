@@ -42,7 +42,7 @@ from harness.sinks.mllp import MLLPSink
 from messagefoundry.apiclient import EngineClient
 from messagefoundry.config.wiring import EnvRef, load_config
 from messagefoundry.parsing.message import Message
-from tests._harness_engine import ephemeral_overrides, serve_harness_config
+from tests._harness_engine import HARNESS_CONFIG, ephemeral_overrides, serve_harness_config
 
 
 def _as_client(fake: object) -> EngineClient:
@@ -67,7 +67,9 @@ def test_the_registry_still_holds_the_original_five_scenarios() -> None:
     assert set(_ORIGINAL_FIVE) <= set(SCENARIOS)
 
 
-@pytest.mark.parametrize("name", sorted(SCENARIOS))
+# A scenario whose graph lives in a harness/config SUBDIRECTORY (BaseScenario.graph) runs in its
+# family's own test, which serves that graph and provides what it needs; the rest run here.
+@pytest.mark.parametrize("name", sorted(n for n, s in SCENARIOS.items() if not s.graph))
 def test_every_registered_scenario_passes_against_the_real_graph(
     server: tuple[str, Endpoints], name: str
 ) -> None:
@@ -498,14 +500,16 @@ def test_every_registered_scenario_names_real_drivers_sinks_and_endpoints() -> N
 
 
 def _graph_dirs() -> list[Path]:
-    """``harness/config`` itself, plus ``harness/config/<family>/`` for each endpoints family whose
-    graph lives in its own subdirectory because it needs an external server (``database``), so that
-    serving ``harness/config`` without that server stays clean."""
+    """``harness/config`` itself, plus each family subdirectory: one named after an endpoints family
+    (``harness/config/database/``), and one a registered scenario names as its ``graph``. A family's
+    graph lives in a subdirectory when it needs an external server or material, so that serving
+    ``harness/config`` without it stays clean."""
     from harness._discover import family_modules
 
-    config = Path(__file__).resolve().parents[1] / "harness" / "config"
-    families = (m.__name__.rpartition(".")[2] for m in family_modules("harness.endpoints"))
-    return [config, *(config / f for f in families if (config / f).is_dir())]
+    families = {m.__name__.rpartition(".")[2] for m in family_modules("harness.endpoints")}
+    families |= {s.graph for s in SCENARIOS.values() if s.graph}
+    subdirs = sorted(HARNESS_CONFIG / f for f in families if (HARNESS_CONFIG / f).is_dir())
+    return [HARNESS_CONFIG, *subdirs]
 
 
 def _graph_env_refs() -> list[EnvRef]:

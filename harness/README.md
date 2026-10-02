@@ -358,3 +358,32 @@ STARTTLS that decrypts with the partner's key and carries the sender's signature
 registered scenario: a scenario runs against an engine that is already serving, and this one
 needs certificates minted before that engine starts, plus a sink TLS context matching them. So
 `--coverage` does not count the Direct outbound.
+
+### Remote file (SFTP)
+
+`remotefile_poll_in` and `remotefile_write_out` exercise the engine's REMOTEFILE connector over
+SFTP, in both directions, against a real in-process SSH server (`harness/sinks/_sftp_server.py`,
+paramiko's server classes, so they need the `[sftp]` extra). The server is the remotefile sink: it
+binds 127.0.0.1 on `remotefile_sftp` (default 2670) and serves a temporary directory holding
+`/inbox`, which the engine's inbound polls and the remotefile driver uploads into over SFTP, and
+`/outbox`, which the engine's outbound writes. `remotefile_write_out` checks each written file
+equals the upload byte for byte and sits directly in `/outbox`.
+
+Host-key verification stays on. Each run mints a throwaway host key and pins it into the
+`remotefile_known_hosts` file, which the engine and the driver both verify against; the rule about
+the insecure escape, and the one known cause of a refused pin, are in
+[`sinks/_sftp_server.py`](sinks/_sftp_server.py). The one password comes from
+`MEFOR_VALUE_REMOTEFILE_HARNESS_PASSWORD`, set for both the engine and the harness. The graph reads
+it without a default, so it lives in its own subdirectory and `serve --config harness/config` does
+not load it:
+
+```powershell
+$env:MEFOR_VALUE_REMOTEFILE_HARNESS_PASSWORD = "<any throwaway value>"
+python -m messagefoundry serve --config harness/config/remotefile --env dev
+python -m harness --scenario remotefile_write_out --engine URL --token T
+```
+
+With no scenario running there is no server, and the inbound logs one failed poll per second and
+retries. A missing extra or password is a SETUP error (exit 2), never a pass. FTP and FTPS are not
+covered: there is no stdlib FTP server, and the reputable in-process one (pyftpdlib) is not a
+dependency here.
