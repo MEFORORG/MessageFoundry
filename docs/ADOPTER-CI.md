@@ -22,6 +22,115 @@
 
 ---
 
+## How a config change moves from dev to staging to prod
+
+This diagram answers one question: how would a change to Connections, Routers and Handlers reach
+production safely? A deploying site would keep one config repo and run one engine instance per
+environment. The same reviewed commit goes to every instance. What differs per instance stays out
+of the graph: the environment's values, the instance's own `messagefoundry.toml`, and its secrets.
+
+```mermaid
+flowchart TB
+  classDef cfg fill:#f1f8e9,stroke:#9e9d24,color:#1f2400;
+  classDef devtool fill:#e0f2f1,stroke:#00796b,color:#06302b;
+  classDef opstool fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+
+  subgraph AUTHOR["Config repo: a change on a branch"]
+    LOGIC["Python modules in the config directory<br/>Routers and Handlers, and Connections written as code"]:::cfg
+    CONNS["connections.toml in the config directory<br/>Connection transport settings written as data"]:::cfg
+    VALUES["environments/dev.toml, staging.toml, prod.toml<br/>non-secret values for env() lookups"]:::cfg
+    FIXTURES["Synthetic HL7 fixtures<br/>messages/sets"]:::cfg
+  end
+
+  subgraph CHECK["messagefoundry check, run by the pull request CI"]
+    VALIDATE["validate<br/>the graph loads and every name resolves"]:::devtool
+    DRYRUN["dryrun<br/>each fixture routes without an error"]:::devtool
+    POSTURE["posture, build-check and the other required checks<br/>resolve the active environment, refuse what serve would refuse"]:::devtool
+    LINT["Advisory checks<br/>config lints, plus ruff and mypy when enabled"]:::devtool
+  end
+
+  MERGED(["The reviewed commit merges to main"]):::ext
+
+  PLACE["The site places the merged commit<br/>in that instance's config directory"]:::ext
+
+  subgraph PROMOTE["Promote to one instance: the promote command in the VS Code extension"]
+    LOCAL["Stage<br/>validate the workspace config"]:::opstool
+    TARGET["Target<br/>pick the environment and its engine instance"]:::opstool
+    PREFLIGHT["Pre-flight<br/>a dry-run reload resolves that environment's env() values"]:::opstool
+    APPLY["Confirm and apply<br/>the engine swaps in the new graph in one step"]:::opstool
+  end
+
+  subgraph INSTANCES["One engine instance per environment, all on the same commit"]
+    DEV["dev instance<br/>serve --env dev<br/>reads environments/dev.toml"]:::core
+    STAGING["staging instance<br/>serve --env staging<br/>reads environments/staging.toml"]:::core
+    PROD["prod instance<br/>serve --env prod<br/>reads environments/prod.toml"]:::core
+  end
+
+  SECRETS["MEFOR_VALUE_ environment variables<br/>secrets, set on each instance"]:::ext
+
+  LOGIC --> VALIDATE
+  CONNS --> VALIDATE
+  VALUES -->|"the active environment's file only"| POSTURE
+  FIXTURES --> DRYRUN
+  VALIDATE --> DRYRUN
+  DRYRUN --> POSTURE
+  POSTURE --> LINT
+  LINT -->|"every required check passed"| MERGED
+  MERGED --> PLACE
+  PLACE --> LOCAL
+  LOCAL --> TARGET
+  TARGET --> PREFLIGHT
+  PREFLIGHT --> APPLY
+  APPLY -->|"first"| DEV
+  DEV -->|"repeat the promote steps for staging"| STAGING
+  STAGING -->|"repeat the promote steps for prod"| PROD
+  SECRETS -.-> DEV
+  SECRETS -.-> STAGING
+  SECRETS -.-> PROD
+```
+
+**Legend.** Each group's title says what its boxes are. The rounded box is an event. The site does
+the Place step by its own means. The promote command does not do it. A dotted arrow is a value
+that never enters the repo. The check group shows at least the checks that matter to
+promotion. `run_checks` in [`checks.py`](../messagefoundry/checks.py) holds the full set, and says
+which ones block.
+
+What each stage would do for a site:
+
+1. **Author.** Routers and Handlers are Python. A Connection is Python too, or a `connections.toml`
+   entry. Either form reads a per-environment value by key: `env("key")` in Python,
+   `{ env = "key" }` in TOML. So one graph serves every environment.
+2. **Gate.** The pull request runs `messagefoundry check`. Section 2 below describes the
+   scaffolded workflow. `run_checks` in `checks.py` is the source of record for what runs and what
+   blocks.
+3. **Merge.** The site would protect `main`, so only a commit that passed the gate lands there.
+4. **Place the commit.** The promote command does not copy files to a remote engine. A remote
+   instance reloads from its own `--config` directory, so the site first places the merged commit
+   there. Skip this, and the engine reloads the config it already had. For an engine on the same
+   machine, the command sends the workspace's config path instead. The engine refuses a path
+   outside its allowed reload roots. So promote from a checkout of the merged commit.
+5. **Promote.** The VS Code extension's promote command then asks that engine to reload. Its
+   command id is `messagefoundry.promote`. Type "Promote" in the Command Palette to find it. The
+   Stage step validates the workspace copy, not the placed copy. The pre-flight is a dry run: the
+   engine resolves its own environment's values and swaps nothing. A value the target lacks fails
+   here, before anything goes live. The gate resolves only the one environment its own settings
+   name, so the pre-flight is where each target's values are checked.
+6. **Apply.** The pre-flight and the apply call the same reload route. Both need the
+   `config:deploy` permission and a recent step-up sign-in
+   ([SECURITY.md](SECURITY.md#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
+   The engine audits every reload and every dry run. Where the site turns on dual control for
+   reloads, the engine holds the swap until a second user approves.
+
+The engine's built-in environment names are `dev`, `staging` and `prod`. `messagefoundry init`
+writes `environments/dev.toml` and `environments/prod.toml`. A site that runs a staging instance
+would add `environments/staging.toml` with the same keys. With several named targets
+set, the promote command asks which one to use. With none set, it uses the one engine URL in its
+settings.
+
+---
+
 ## 1. The setup: CI is scoped to *your* repo
 
 Under [ADR 0017](adr/0017-consumer-deployment-model.md), an adopter does not fork or edit the

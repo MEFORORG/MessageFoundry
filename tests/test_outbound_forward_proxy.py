@@ -75,7 +75,10 @@ _PROD = HopPosture(enforcing=True)  # enforcing → the cleartext-proxy-hop guar
 PROXY = "http://proxy.example.com:3128"
 LOOPBACK_PROXY = "http://127.0.0.1:3128"  # a local auth proxy (cntlm) — allowed under any posture
 HTTPS_DEST = "https://api.example.com/ingest"
-HTTP_DEST_LOOPBACK = "http://127.0.0.1:8000/x"
+# Off-box on purpose. A loopback destination is never proxied (vault BACKLOG #2579), so a test of the
+# proxy path needs a destination the proxy would carry. A reserved name that never resolves: the
+# proxy is the only host these tests dial, and a regression that dialled direct would fail fast.
+HTTP_DEST = "http://api.partner.invalid/x"
 
 _FACTORY = {
     ConnectorType.REST: Rest,
@@ -231,7 +234,8 @@ def test_digest_https_and_ntlm_windows_refused() -> None:
     # Digest against an http destination is supported (reactive handler folded into the opener).
     dest = _build(
         ConnectorType.REST,
-        HTTP_DEST_LOOPBACK,
+        HTTP_DEST,
+        accepted=True,  # the destination hop is cleartext http and off-box (ADR 0153)
         proxy=LOOPBACK_PROXY,
         proxy_user="pu",
         proxy_password="pw",
@@ -315,7 +319,7 @@ class _DigestProxy:
 
 
 def _digest_proxy_opener(
-    monkeypatch: pytest.MonkeyPatch, proxy_url: str, *, dest_url: str = HTTP_DEST_LOOPBACK
+    monkeypatch: pytest.MonkeyPatch, proxy_url: str
 ) -> urllib.request.OpenerDirector:
     """A REST destination's per-connection opener, with Digest proxy auth against ``proxy_url``.
 
@@ -324,7 +328,8 @@ def _digest_proxy_opener(
     monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
     dest = _build(
         ConnectorType.REST,
-        dest_url,
+        HTTP_DEST,
+        accepted=True,  # the destination hop is cleartext http and off-box (ADR 0153)
         proxy=proxy_url,
         proxy_user="pu",
         proxy_password="pw",
@@ -338,7 +343,7 @@ def _open_through_digest_proxy(
 ) -> urllib.response.addinfourl:
     """Send one request through a REST destination's per-connection opener to ``proxy``."""
     opener = _digest_proxy_opener(monkeypatch, proxy.url)
-    return opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)
+    return opener.open(urllib.request.Request(HTTP_DEST), timeout=10)
 
 
 @pytest.mark.parametrize(
@@ -376,11 +381,14 @@ def test_proxy_digest_handler_answers_sha256() -> None:
     handler answers nothing on a request that went direct."""
     handler = _ProxyDigestRecipe(LOOPBACK_PROXY, "pu", "pw").build()
     assert isinstance(handler, urllib.request.ProxyDigestAuthHandler)
-    req = urllib.request.Request(HTTP_DEST_LOOPBACK)
+    req = urllib.request.Request(HTTP_DEST)
     req.set_proxy("127.0.0.1:3128", "http")
     chal = {"realm": "r", "nonce": "n", "algorithm": "SHA-256"}
     result = handler.get_authorization(req, chal)
     assert result and 'algorithm="SHA-256"' in result
+    # The same handler and challenge on a request that was NOT routed through the proxy: no answer.
+    # This is the off-box case, where urllib's own bypass list sent the request direct.
+    assert handler.get_authorization(urllib.request.Request(HTTP_DEST), chal) is None
     planted = "planted-proxy-secret"
     recipe = _ProxyDigestRecipe(f"http://pu:{planted}@127.0.0.1:3128", "pu", planted)
     assert planted not in repr(recipe)
@@ -407,16 +415,20 @@ def test_a_407_on_a_request_that_bypassed_the_proxy_gets_no_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The credential lookup matches any URL, so the handler must refuse to answer a 407 on a
-    request that went DIRECT. urllib sends one direct when its proxy_bypass matches the host, and
-    that 407 came from the destination or the cleartext hop to it. Answering would hand the proxy
-    password's digest, over a nonce the other side chose, to whoever sent the 407."""
+    request that went DIRECT. That 407 came from the destination or the cleartext hop to it.
+    Answering would hand the proxy password's digest, over a nonce the other side chose, to whoever
+    sent the 407.
+
+    The opener is built for an off-box destination, so it carries the proxy Digest handler. The
+    request then goes to a loopback origin, which the opener dials direct (vault BACKLOG #2579).
+    The other way a request goes direct, urllib's own bypass list, needs an off-box host that
+    answers; ``test_proxy_digest_handler_answers_sha256`` covers that one at the handler.
+    """
     with _DigestProxy("SHA-256") as origin:
-        dest_url = f"{origin.url}/x"
-        opener = _digest_proxy_opener(monkeypatch, LOOPBACK_PROXY, dest_url=dest_url)
-        # Now route this host direct, past the proxy, as a bypass entry would.
-        monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
+        opener = _digest_proxy_opener(monkeypatch, LOOPBACK_PROXY)
+        assert any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in opener.handlers)
         with pytest.raises(urllib.error.HTTPError) as ei:
-            opener.open(urllib.request.Request(dest_url), timeout=10)
+            opener.open(urllib.request.Request(f"{origin.url}/x"), timeout=10)
         ei.value.close()
     assert ei.value.code == 407
     assert origin.answered == [], "the proxy credential was sent to a host that is not the proxy"
@@ -443,10 +455,10 @@ def test_repeated_refusals_do_not_wedge_the_connection(
         opener = _digest_proxy_opener(monkeypatch, proxy.url)
         for _ in range(8):
             with pytest.raises(HttpAuthError, match=refusal):
-                opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)
+                opener.open(urllib.request.Request(HTTP_DEST), timeout=10)
         assert proxy.answered == []
         proxy.challenge = 'Digest realm="r", nonce="n0nce", qop="auth", algorithm=SHA-256'
-        with opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10) as resp:
+        with opener.open(urllib.request.Request(HTTP_DEST), timeout=10) as resp:
             assert resp.status == 200
 
 
@@ -459,7 +471,7 @@ def test_a_rejected_proxy_credential_is_answered_once_not_six_times(
     with _DigestProxy("SHA-256", password="not-the-configured-one") as proxy:
         opener = _digest_proxy_opener(monkeypatch, proxy.url)
         with pytest.raises(urllib.error.HTTPError) as ei:
-            opener.open(urllib.request.Request(HTTP_DEST_LOOPBACK), timeout=10)
+            opener.open(urllib.request.Request(HTTP_DEST), timeout=10)
         ei.value.close()
     assert ei.value.code == 407
     assert len(proxy.answered) == 1
@@ -491,7 +503,7 @@ def test_parameter_names_are_matched_case_insensitively() -> None:
     """RFC 7235 parameter names are case-insensitive. urllib reads lowercase keys only, so an
     ``Algorithm=SHA-256`` challenge was refused as if it named MD5."""
     handler = _ProxyDigestRecipe(LOOPBACK_PROXY, "pu", "pw").build()
-    req = urllib.request.Request(HTTP_DEST_LOOPBACK)
+    req = urllib.request.Request(HTTP_DEST)
     req.set_proxy("127.0.0.1:3128", "http")
     chal = {"Realm": "r", "Nonce": "n", "Algorithm": "SHA-256"}
     result = handler.get_authorization(req, chal)
@@ -560,29 +572,31 @@ def test_intranet_bypass() -> None:
 
 
 def test_intranet_bypass_ipv6() -> None:
-    """A ``::1`` / ``2001:db8::1`` bypass entry matches its IPv6 destination — ``urlsplit().hostname``
-    returns the UNBRACKETED, port-less literal, so the match must not truncate at the first colon."""
-    # ::1 bypasses an https://[::1]:8443/ destination (no proxy handler, no credential).
+    """A ``2001:db8::1`` bypass entry matches its IPv6 destination — ``urlsplit().hostname``
+    returns the UNBRACKETED, port-less literal, so the match must not truncate at the first colon.
+
+    The destination is off-box on purpose. ``::1`` is loopback, which goes direct with no list
+    entry (vault BACKLOG #2579), so it would pass here whatever the bypass list did."""
+    # 2001:db8::1 bypasses an https://[2001:db8::1]:8443/ destination (no proxy handler, no credential).
     dest = _build(
         ConnectorType.REST,
-        "https://[::1]:8443/x",
+        "https://[2001:db8::1]:8443/x",
         proxy=LOOPBACK_PROXY,
         proxy_user="pu",
         proxy_password="pw",
-        proxy_no_proxy=["::1"],
+        proxy_no_proxy=["2001:db8::1"],
     )
     assert dest._opener is _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
     assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
-    # A DIFFERENT IPv6 host is NOT bypassed → still proxied (the truncation bug would have bypassed it,
-    # since "2001:db8::2".split(":")[0] == "2001" would never equal the "::1" entry either — but the
-    # positive case above is what the old code broke; assert the negative to pin correctness both ways).
+    # A DIFFERENT IPv6 host is NOT bypassed → still proxied. The positive case above is what the
+    # truncation bug broke; assert the negative to pin correctness both ways.
     dest2 = _build(
         ConnectorType.REST,
         "https://[2001:db8::2]:8443/x",
         proxy=LOOPBACK_PROXY,
         proxy_user="pu",
         proxy_password="pw",
-        proxy_no_proxy=["::1"],
+        proxy_no_proxy=["2001:db8::1"],
     )
     assert dest2._opener is not _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
     assert "Proxy-Authorization" in dest2._headers  # type: ignore[attr-defined]

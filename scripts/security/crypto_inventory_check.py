@@ -781,6 +781,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/security_notify.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/wiring_runner.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # Vault BACKLOG #2579: reads the cleartext-hop authority's loopback predicate
+    # (is_loopback_hop_host), so a proxy handler never carries a hop that authority calls on-box.
+    # Builds no context and calls no crypto.
+    "messagefoundry/transports/bounded_read.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/database.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/transports/http_auth.py": frozenset({"messagefoundry.config.tls_policy"}),
     # BACKLOG #1923: the fed.idp_revocation row reads the OIDC legs' revocation-guard decisions
@@ -849,6 +853,11 @@ IMPORT_ONLY: dict[str, str] = {
     "messagefoundry/transports/base.py": (
         "hands a caller's ssl context to asyncio.open_connection and tells an SSLError from an "
         "OSError; builds and decides nothing (its INVENTORY row says why that is the right shape)"
+    ),
+    "messagefoundry/transports/bounded_read.py": (
+        "INSTRUMENT LIMIT. Decides that a hop the cleartext authority calls on-box is never sent "
+        "through a web proxy (is_loopback_hop_host): a hop-routing decision with no crypto-shaped "
+        "call in it"
     ),
     "messagefoundry/transports/http_auth.py": (
         "carries a trust anchor and a hop posture to the refusal checks; the OAuth2 token hop's "
