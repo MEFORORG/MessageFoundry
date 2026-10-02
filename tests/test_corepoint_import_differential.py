@@ -123,6 +123,17 @@ class _Demoted(Control):
     was: str = ""
 
 
+def _held_a_send(steps: tuple[Step, ...]) -> bool:
+    for step in steps:
+        if not isinstance(step, Control) or step.kind == "disabled":
+            continue
+        if getattr(step, "was", "") == "send":
+            return True
+        if _held_a_send(step.body) or any(_held_a_send(b.body) for b in step.branches):
+            return True
+    return False
+
+
 def _label_statement(elem: Element) -> str:
     tag = _local(elem.tag).lower()
     if tag == "line":
@@ -166,6 +177,7 @@ _BARE_MARKER = "and step.kind in _BRANCH_PARENT and not step.body:\n"
 _BRANCH_BODY = "branches.append(replace(marker, body=tuple(steps[start:i])))\n"
 _LAST_BRANCH_BODY = "branches.append(replace(marker, body=tuple(steps[start:])))\n"
 _BRANCH_GROUP = "any(isinstance(s, Control) and s.kind == kind for s in body):\n"
+_INLINE_FORM = "    inline_sends = _has_inline_send(h.steps)\n"
 _UNKNOWN_ARM = "    if tag.lower() not in _STATEMENT_TAGS:\n"
 _UNKNOWN_RETURN = '        return [Control("unknown", tag, statement or note, body=tuple(body))]\n'
 _BLOCK_RETURN = "return [Control(kind, source, statement or note or tag, body=tuple(body))]\n"
@@ -218,6 +230,10 @@ _STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
     # them. Written apart from the head, which asks one function for the kind and tests the
     # marker's body with ``all``.
     (_BRANCH_GROUP, _BRANCH_GROUP.replace("s.kind", 'getattr(s, "was", s.kind)')),
+    # A handler keeps the form it had. A demoted send label still selects the ``sends`` list, or
+    # taking away the only send the render reaches would bring in the trailing ``return Send``,
+    # which delivers every destination in the tree, rendered or not.
+    (_INLINE_FORM, _INLINE_FORM.replace("\n", " or _held_a_send(h.steps)\n")),
     (
         _BARE_MARKER,
         _BARE_MARKER.replace(
@@ -1167,6 +1183,21 @@ def _live_sends(src: str) -> list[tuple[int, str, str]]:
         (len(m.group(1)), m.group(2), m.group(3))
         for m in map(_LIVE_SEND.match, src.splitlines())
         if m is not None
+    ]
+
+
+_RETURNED_SEND = re.compile(r'Send\("([^"]+)", msg\)')
+
+
+def _trailing_sends(src: str) -> list[str]:
+    """Every destination a handler's closing ``return`` delivers to. :func:`_live_sends` reads the
+    ``sends.append`` lines alone, and a handler with no send the render reaches ends on a
+    ``return Send(...)`` for every destination in its tree."""
+    return [
+        dest
+        for line in src.splitlines()
+        if line.startswith("    return ")
+        for dest in _RETURNED_SEND.findall(line)
     ]
 
 
@@ -2242,6 +2273,7 @@ _NESTED_WRAPPERS = {
     "innermost-of-3": "<List><List><List{S}/></List></List>",
     "middle-of-3": "<List><List{S}><List/></List></List>",
     "outermost-of-3": "<Actions{S}><List><List/></List></Actions>",
+    "filled-one": f"<List{{S}}>{_FILLED}</List>",
     "filled-inner-of-2": f"<List><List{{S}}>{_FILLED}</List></List>",
     "filled-outer-of-2": f"<List{{S}}><List>{_FILLED}</List></List>",
     "filled-beside-the-inner-of-2": f"<List>{_FILLED}<List{{S}}/></List>",
@@ -2356,6 +2388,20 @@ def _label_statement_shapes() -> Iterator[Shape]:
                 "%ADT",
                 (Raw(group + after),),
             )
+    # Code review of the repair, round 2. A send label beside a send the render never reaches:
+    # main does not render a branch held by another branch. Demoting the label takes away the
+    # handler's only visible send, and the handler must not fall back to the closing
+    # ``return Send``, which would deliver the unrendered one for every message.
+    opener = _esc('Matching "M0"')
+    held = _line('Matching "M0"') + _line("MsgSend %ADT [OB_HIDDEN]")
+    hidden = f'<Case><Block Data="{opener}">{held}</Block>'
+    for tag in ("Block", "Call"):
+        label = f'<{tag} Data="MsgSend %ADT [OB_LABEL]"/>'
+        yield Shape(
+            f"2632-{tag}-send-beside-a-send-main-never-renders",
+            "%ADT",
+            (Raw(hidden + label + "</Case>"),),
+        )
     # A keyword span that does not lead a Block's label, and a table verb that does not lead it:
     # both still read as a label.
     connective = f"Copy patient {_kw('to')} output"
@@ -2772,7 +2818,7 @@ def _amendment_changes(shape: Shape) -> bool:
 
     It changes a list only when an element in it may carry a statement off a ``<Line>``, by a
     reading written apart from the rule and wider than it. And where it changes a list it only
-    narrows. It adds no live send and no vocabulary call. It counts at least one more step
+    narrows. It adds no live send, inline or in the closing ``return``, and no vocabulary call. It counts at least one more step
     unmapped, with the marker's reason in the module. The one exception is a list whose counts stay
     as they were: a statement under a ``@Disabled`` ancestor, or on an unmodelled tag beside no send
     the scan reads. There only comment lines change."""
@@ -2782,6 +2828,7 @@ def _amendment_changes(shape: Shape) -> bool:
         return False
     assert _may_carry_a_label_statement(xml), shape.name
     assert not Counter(_live_sends(now[0])) - Counter(_live_sends(was[0])), shape.name
+    assert not Counter(_trailing_sends(now[0])) - Counter(_trailing_sends(was[0])), shape.name
     calls = Counter(_VOCABULARY_CALL.findall(was[0]))
     assert not Counter(_VOCABULARY_CALL.findall(now[0])) - calls, shape.name
     if _unmapped(now) > _unmapped(was):
@@ -2886,14 +2933,28 @@ _RAW_DATA = (
         "ForEach %ADT/OBX $o",
     ),
 )
+#: Role-marked statements, so the keyword half of the rule and the handle scan are in play.
+_RAW_MARKED = tuple(
+    data
+    for data in (
+        _leaf_data(Clone(_ADT, _OUT, 1), "%ADT"),
+        _leaf_data(SendS(_OUT, "OB_R"), "%ADT"),
+        _leaf_data(Unread("merge", _NEW, _ADT), "%ADT"),
+    )
+    if data is not None
+)
+#: One element in ten is switched off, and one in ten carries an operator's comment.
+_RAW_EXTRA = (*[""] * 8, ' Disabled="1"', ' Comment="note"')
 _RAW = 4000
 
 
 def _raw_element(rng: random.Random, depth: int) -> str:
     """One element of any tag, with any ``@Data``, around up to three more. No grammar: a branch
-    verb on a container, a statement on a wrapper, a wrapper in a branch line."""
-    tag, data = rng.choice(_RAW_TAGS), rng.choice(_RAW_DATA)
+    verb on a container, a statement on a wrapper, a wrapper in a branch line. Not every spelling:
+    one casing per tag, and three role-marked statements."""
+    tag, data = rng.choice(_RAW_TAGS), rng.choice((*_RAW_DATA, *_RAW_MARKED))
     attr = f' Data="{_esc(data)}"' if data is not None else ""
+    attr += rng.choice(_RAW_EXTRA)
     if depth == 0 or rng.random() < 0.3:
         return f"<{tag}{attr}/>"
     children = "".join(_raw_element(rng, depth - 1) for _ in range(rng.randint(0, 3)))
@@ -2921,11 +2982,11 @@ _STRUCTURE_SHAPES = _structure_shapes()
 def test_no_branch_main_adopts_is_orphaned(chunk: int) -> None:
     """The acceptance rule of the repair to PR 1938, and more than it: the amendment changes the
     shape of no tree. See :func:`_structure_moved`."""
-    moved = [
-        line
-        for name, xml in _STRUCTURE_SHAPES[chunk::_CHUNKS]
-        for line in _structure_moved(name, xml)
-    ]
+    shapes = _STRUCTURE_SHAPES[chunk::_CHUNKS]
+    assert len(shapes) >= (len(_SHAPES) + _RAW) // _CHUNKS
+    moved: list[str] = []
+    for name, xml in shapes:
+        moved.extend(_structure_moved(name, xml))
     assert not moved, "\n".join(moved[:20]) + f"\n... {len(moved)} in all"
 
 

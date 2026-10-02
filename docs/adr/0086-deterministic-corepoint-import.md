@@ -482,9 +482,14 @@ Whether Corepoint runs such a statement is not known. So:
   review of it found the other two places above, each with a branch main keeps dead that
   rendered live. Moving one marker, and then guarding one test, were both too narrow. The rule
   is now stated for the whole tree, and a test compares that tree with main's.
+- A demoted send label still selects the handler's `sends` list. A handler with no send the
+  render reaches ends on a `return Send(...)` for every destination in its tree, rendered or not.
+  So taking away a handler's only visible send must not move it to that form. *Corrected
+  2026-10-02 (code review of the repair, round 2):* it did, and a send the render never reaches
+  was then delivered for every message. The last limit below says where such a send comes from.
 - Nothing is mapped for it, and it is never emitted as a write or a delivery.
-- The scan holds no handle for the whole list. Every role-parsed send in it raises, and no
-  role-parsed field write maps onto `msg`. So a clone or a send counts only on a `<Line>`.
+- The scan holds no handle for the whole list. Every role-parsed send the render reaches raises,
+  and no role-parsed field write maps onto `msg`. So a clone or a send counts only on a `<Line>`.
 
 That fails toward the visible side: a clone such a statement names is never treated as made, and an
 overwrite it names is never ignored. The scan is never more permissive than it was.
@@ -517,6 +522,15 @@ At least these limits remain:
 - A wrapper that holds a statement of its own, between a construct and its sibling branch, orphans
   that branch. main does the same whatever the wrapper's `@Data`, and this amendment leaves it as
   it found it. `test_a_wrappers_marker_changes_nothing_where_main_already_orphans` pins that.
+- Where main never renders an element, this amendment does not either. main keeps a branch held
+  by another branch in the tree, and neither renders it nor counts it. A statement off a `<Line>`
+  in there gets no marker and no count, as nothing in there gets one. A send in there is still
+  collected as a destination. A handler with no send the render reaches then delivers to it in
+  its closing `return`, role-marked or not. That is main's defect and it is not repaired here.
+  It is where "every role-parsed send in the list raises" does not hold. One list that shows it:
+  a `<Loop Data="Catch">` holding a `<Call Data="ElseIf (y)">`, which holds `<Line Data="Else"/>`
+  and a `MsgSend`. main and the head both end that handler on `return Send(...)` and count one
+  step.
 
 The differential guard compares a gate-declined list with step 1. That step 1 path now carries this
 rule. So the guard runs the vendored step 1 file with one amendment made as it loads. The file
@@ -525,7 +539,10 @@ the rule copied as text, so a later change to the head's rule turns the guard re
 amended on purpose. Two more tests run the battery against the file exactly as vendored. They check
 that the amendment changes only lists that may carry a statement off a `<Line>`, by a wider reading
 written apart from the rule. Where it changes a list it must only narrow: no new live send, no new
-vocabulary call, and one more unmapped step, or else only comment lines change.
+vocabulary call, and one more unmapped step, or else only comment lines change. A live send is
+read inline and in the handler's closing `return`. *Corrected 2026-10-02 (code review of the
+repair, round 2):* the bound read the inline form alone, so it could not see a closing
+`return Send(...)` that the amendment added.
 
 That bound is what catches a rule that is wrong in the head and in its copy alike, where the
 head-equals-baseline check is blind. It missed the wrapper defect twice, each time for want of a
@@ -545,30 +562,35 @@ amended baseline and with the head. It compares the shape of the three trees: ev
 with its body and its branches, label markers left out, a demoted label read as the kind it had.
 The shapes must be equal. The head is held to that wherever the gate is closed. The test runs
 over the battery, and over 4,000 lists drawn with no grammar: any tag, any `@Data` from a pool of
-statements, conditions and branch verbs, nested four deep. The bound sees an orphan only through
-a live send or a vocabulary call in its body. This test needs neither. It is still a sample: it
-shows no difference on the lists it draws, not that none exists.
+statements, conditions and branch verbs, nested four deep. Three of the statements carry role
+markup, one element in ten is `@Disabled`, and one in ten has a `@Comment`. The bound sees an
+orphan only through a live send or a vocabulary call in its body. This test needs neither. It is
+still a sample, with one casing per tag and a small pool. It shows no difference on the lists it
+draws, not that none exists.
 
-Measured 2026-10-02 at the repaired head. The battery holds 8,073 shapes, 617 of them fixed seeds,
-and the amendment changes 751. The repair added 105 seeds. Each row puts part of the repair back
+Measured 2026-10-02 at the repaired head. The battery holds 8,083 shapes, 627 of them fixed seeds,
+and the amendment changes 761. The repair added 115 seeds. Each row puts part of the repair back
 and counts the lists that fail. "Head alone" changes the head only, which the
 head-equals-baseline check sees. "Both" changes the head and the baseline copy alike, which that
 check cannot see. The shape test is counted on the battery and on its 4,000 raw lists.
 
 | What is put back | Head alone | Both: the bound | Both: shape, battery | Both: shape, raw |
 |---|---|---|---|---|
-| the whole repair, so the rule at `880f431d94` | 111 | 50 | 53 | 125 |
-| a sibling adoption sees a marker as a step | 70 | 70 | 70 | 2 |
-| the same, and a wrapper moves its marker one step back (round 2) | 78 | 43 | 43 | 0 |
+| the whole repair, so the rule at `880f431d94` | 121 | 52 | 53 | 178 |
+| a sibling adoption sees a marker as a step | 70 | 70 | 70 | 5 |
+| the same, and a wrapper moves its marker one step back (round 2) | 86 | 43 | 43 | 0 |
 | a branch marker holding a label marker opens no branch | 4 | 1 | 4 | 7 |
-| the branch-group test reads the rendered kind | 12 | 12 | 12 | 14 |
-| a send label nests its body | 2 | 2 | 2 | 116 |
+| the branch-group test reads the rendered kind | 12 | 12 | 12 | 13 |
+| a send label nests its body | 2 | 2 | 2 | 169 |
+| a demoted send label no longer selects the `sends` list | 2 | 2 | 0 | 0 |
 | a `<Call>` carrying a statement stays a call | 23 | 0 | 0 | 0 |
 
-With the repair in place every count is zero. The last row changes no shape and adds no live
-code on these lists: with the kind remembered, a Call that stays a call only counts a label as a
-mapped call. So only the head-equals-baseline check and a unit test see it. That is a reading of
-this battery, not a proof about the change.
+With the repair in place every count is zero. Two rows show what each check cannot see. A send
+label that drops the `sends` list changes no shape, so only the bound sees it, and only on the
+two seeds written for it. A Call that stays a call changes no shape and adds no live code on
+these lists: with the kind remembered, it only counts a label as a mapped call, so only the
+head-equals-baseline check and a unit test see it. Both are readings of this battery, not
+proofs about the change.
 
 The measurement below is older. It was taken the same day at `880f431d94`, before the repair, and
 was not run again. The battery then held 7,968 shapes, 512 of them fixed seeds. The 181 seeds new
