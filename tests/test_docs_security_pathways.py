@@ -2445,3 +2445,37 @@ def test_the_tenth_sweep_states_the_mfa_scope_reach_for_both_account_kinds() -> 
         "docs/EARLY-ADOPTER-GUIDE.md says a directory account is in scope like any other again; "
         "under `administrators` a directory session with no proven factor owes more (BACKLOG #1133)."
     )
+
+
+def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
+    """ASVS 6.1.3 was held at partial an eleventh time (BACKLOG #1133) on one SECURITY.md sentence:
+    the engine's own second factor "binds a directory account like any other". Under
+    `administrators` a directory session that proved no factor owes more than a local account does,
+    and an OIDC sign-in meets its factor on the IdP's claim, so it is not the local rule. Five
+    sentences in three other operator docs said directory MFA is delegated, which
+    `_unverified_session_owes_factor` contradicts while `require_mfa` is on. The probes earlier in
+    this file pin the code; these assertions red if an old phrasing returns."""
+    retired_by_doc = {
+        "SECURITY.md": ("binds a directory account like any other",),
+        "DEPLOYMENT.md": (
+            "AD/Entra MFA stays delegated",
+            "so MEFOR does not re-implement",
+            "workstation logon was already MFA'd",
+        ),
+        "PHI.md": ("AD MFA delegated", "native TOTP MFA built for local accounts"),
+        "CLOUD-PHI-HIPAA.md": ("AD/Entra MFA stays delegated",),
+    }
+    for name, retired in retired_by_doc.items():
+        text = _flat((_ROOT / "docs" / name).read_text(encoding="utf-8"))
+        for phrase in retired:
+            assert phrase not in text, (
+                f"docs/{name} says {phrase!r} again; while `require_mfa` is on, a directory session "
+                "that proved no factor owes an engine one (BACKLOG #1133)."
+            )
+    doc = _flat(_doc_text())
+    assert (
+        "While `[security].require_mfa` is on, a Kerberos session owes an engine factor under "
+        "either `require_mfa_scope` value." in doc
+    ), (
+        "docs/SECURITY.md's Browser AD login paragraph must state the directory rule (BACKLOG #1133)."
+    )
