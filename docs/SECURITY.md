@@ -2011,8 +2011,8 @@ never per navigation. The directory bind **as the user** survives only as the st
 `POST /ui/reauth` and `POST /me/reauth`, where it re-proves a session **Kerberos** minted, or a session
 row written before `sessions.auth_mechanism` existed. An OIDC session never reaches it: it steps up at the IdP instead (`POST /ui/reauth/oidc`; see
 [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)). A directory account's second
-factor follows the rule in [Multi-factor authentication](#multi-factor-authentication-totp-wp-14),
-which is not the local account's rule. While `[security].require_mfa` is on, a Kerberos session
+factor follows the rule in [Multi-factor authentication](#multi-factor-authentication-totp-wp-14).
+It shares the local account's rule, with two differences. While `[security].require_mfa` is on, a Kerberos session
 owes an engine factor under either `require_mfa_scope` value. An OIDC sign-in meets its factor at
 mint on the identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` is on,
 the default (BACKLOG #1144).

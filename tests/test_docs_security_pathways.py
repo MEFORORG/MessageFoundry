@@ -2451,25 +2451,28 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
     """ASVS 6.1.3 was held at partial an eleventh time (BACKLOG #1133) on one SECURITY.md sentence:
     the engine's own second factor "binds a directory account like any other". Under
     `administrators` a directory session that proved no factor owes more than a local account does,
-    and an OIDC sign-in meets its factor on the IdP's claim, so it is not the local rule. Five
-    sentences in three other operator docs said directory MFA is delegated, which
+    and an OIDC sign-in meets its factor on the IdP's claim, so it is not the local rule. At least
+    seven sentences in five other operator docs said directory MFA is delegated, which
     `_unverified_session_owes_factor` contradicts while `require_mfa` is on. The probes earlier in
-    this file pin the code; these assertions red if an old phrasing returns."""
+    this file pin the code; these assertions red if an old phrasing returns. ADRs are dated records
+    and are not read here."""
     retired_by_doc = {
-        "SECURITY.md": ("binds a directory account like any other",),
-        "DEPLOYMENT.md": (
+        "docs/SECURITY.md": ("binds a directory account like any other",),
+        "docs/DEPLOYMENT.md": (
             "AD/Entra MFA stays delegated",
             "so MEFOR does not re-implement",
             "workstation logon was already MFA'd",
         ),
-        "PHI.md": ("AD MFA delegated", "native TOTP MFA built for local accounts"),
-        "CLOUD-PHI-HIPAA.md": ("AD/Entra MFA stays delegated",),
+        "docs/PHI.md": ("AD MFA delegated", "native TOTP MFA built for local accounts"),
+        "docs/CLOUD-PHI-HIPAA.md": ("AD/Entra MFA stays delegated",),
+        "docs/EARLY-ADOPTER-GUIDE.md": ("AD/Entra MFA is enforced by your directory;",),
+        "docker/README.md": ("AD-only shops delegate MFA",),
     }
     for name, retired in retired_by_doc.items():
-        text = _flat((_ROOT / "docs" / name).read_text(encoding="utf-8"))
+        text = _flat((_ROOT / name).read_text(encoding="utf-8"))
         for phrase in retired:
             assert phrase not in text, (
-                f"docs/{name} says {phrase!r} again; while `require_mfa` is on, a directory session "
+                f"{name} says {phrase!r} again; while `require_mfa` is on, a directory session "
                 "that proved no factor owes an engine one (BACKLOG #1133)."
             )
     doc = _flat(_doc_text())
