@@ -13,11 +13,22 @@
   **The context constructions §7 once listed as ungraded are GRADED as of 2026-09-27, under BACKLOG
   #1498, in §7.1.** That grading built no guard. It found originating hops that need one, rows that
   needed an owner answer, and hops its reads could not see; §7.1 names each and holds the counts.
-  **#1498 stays open until three things hold.** Each hop §7.1 grades *Needs a guard* has a tracking
-  item of its own. The hops §7.1's reads could not see are graded or tracked. Each row §7.1 grades
-  *Owner question* is answered or tracked. The owner has since answered one of those §7.1 rows, the
-  apiclient `cacert` branch (2026-09-27); §7.1 says which are still open. The ADR's other open owner
-  questions (§1.1, §2.1) do not hold #1498 open.
+  **Every open row §7.1 names now has a tracker, BACKLOG #2193 or #2194, so those rows no longer
+  need #1498 open.** The Lander filed both on 2026-09-27 for Manager batch 164. This ADR names them
+  as of 2026-10-02. §7.1 says which rows each covers. **A hop §7.1 never found has no tracker,**
+  including any no-context hop beyond those #2194 lists. Two rows §7.1 grades *Guarded* carry open
+  defects, #2188 and #2169, which §7.1 points to. The open owner questions in §1.1 and §2.1 do not
+  hold #1498 open.
+  *Until 2026-10-02 this paragraph read: "#1498 stays open until three things hold. Each hop §7.1
+  grades *Needs a guard* has a tracking item of its own. The hops §7.1's reads could not see are
+  graded or tracked. Each row §7.1 grades *Owner question* is answered or tracked. The owner has
+  since answered one of those §7.1 rows, the apiclient `cacert` branch (2026-09-27); §7.1 says which
+  are still open. The ADR's other open owner questions (§1.1, §2.1) do not hold #1498 open."*
+  A Builder for Manager batch 188 read the three against vault `origin/main` `e505b698e`. The
+  first is met by substitution: one shared row, #2193, with a checklist line per hop rather than an
+  item per hop. The second is met only for the hops §7.1 names. The third is met, by an owner answer
+  and by #2193. The rule this ADR now follows is the #1498 ledger banner of 2026-10-01, written by
+  the Special seat in an owner-directed ledger sweep: *"Close once the ADR names both"*.
   **Three of this document's own premises
   moved under the §4.3 build and are corrected in place rather than rewritten** — see §4.3's amendment and
   the notice in §1.4. One of them reached a *decision* and not only evidence: §2.1 declined a
@@ -600,7 +611,9 @@ lands on the not-PHI ALLOW arm and gets nothing.
 > population (§7), not to the three hops this section names. So read "built" as three hops guarded,
 > not as the rider finished. **The rider's number is #1498, not a
 > fresh allocation** — the text below says to allocate one when the build starts, and it predates
-> #1498, which was filed to be this rider's tracking item.
+> #1498, which was filed to be this rider's tracking item. *(Added 2026-10-02.)* The open rows §7.1
+> names in the rider's wider population are tracked by BACKLOG #2193 and #2194. The Status says
+> what neither tracks.
 >
 > **Correction 1 — the SMART hop was withdrawn on a ground that does not reach it.** §1.3, §1.6 and §7
 > withdrew the SMART row because `transports/smart.py` contains **zero `ssl` usage**. That measurement
@@ -827,8 +840,12 @@ live. Four more reads cover what that pattern cannot see:
 lives in each caller, not in the construction. So the shared opener gets one row per caller, and
 those rows do not all agree.
 
-**The grades.** Each row gets exactly one of seven grades. Once a hop graded *Needs a guard* has a
-tracking item, its row reads *Needs a guard, tracked by* that item. No row names one yet.
+**The grades.** Each row gets exactly one of eight grades. *(This read "seven" until 2026-10-02.
+The BACKLOG #2494 correction of 2026-09-30 added the eighth in the table but not in this list.)*
+Once a hop graded *Needs a guard* has a tracking item, its row reads *Needs a guard, tracked by*
+that item. Every such row names BACKLOG #2193. *(Until 2026-10-02 this read "No row names one
+yet".)* #2193 lets its builder close a line as "should not be guarded". For any row here, that is a
+proposed accept, and only an owner ruling makes it one.
 
 - *Guarded* names the guard.
 - *Needs a guard* is the default §4.3 prescribes for an unguarded verifying hop.
@@ -842,16 +859,18 @@ tracking item, its row reads *Needs a guard, tracked by* that item. No row names
 - *Accepted by the owner* means the owner ruled the gap acceptable. The row names the ruling's date,
   where it was given, and the trigger that reopens it. *(Added after `ad41441ec`, where this list had
   six grades and read "No row is graded as accepted".)*
+- *Not a separate hop* means the construction builds the context another row's hop handshakes on,
+  so that row's grade covers it.
 
 | Construction or hop (file, symbol) | What crosses | Grade | Why |
 |---|---|---|---|
 | `transports/mllp.py`, `_mllp_ssl_context`, client arm, `tls_verify=true` | HL7 message bodies | **Guarded** | `RevocationHopGuard.capture` in the MLLP destination, taken only when the context verifies |
 | `transports/mllp.py`, `_mllp_ssl_context`, client arm, `tls_verify=false` | HL7 message bodies | **Verify-off** | refused on an enforcing instance even with the escape set (#200) |
-| rest.py's shared opener and `_expiry_relaxed_opener`; `transports/soap.py`, `_client_cert_opener`, as used by the REST, SOAP, FHIR and DICOMweb destinations | message bodies, and any credential the destination sends | **Guarded** | `refuse_unrevoked_verified_hop` in each destination's `__init__`, on its verifying branch, whichever opener serves the hop |
-| `transports/smart.py`, `_TokenEndpointProvider._open_token_hop` (the shared opener, or a per-provider one), as used by `SmartBackendTokenProvider` (the SMART token endpoint) | the signed `client_assertion` | **Guarded** | `refuse_unrevoked_verified_hop`, called in `_open_token_hop` (§4.3, correction 1; one call site for both token hops since BACKLOG #2115) |
+| rest.py's shared opener and `_expiry_relaxed_opener`; `transports/soap.py`, `_client_cert_opener`, as used by the REST, SOAP, FHIR and DICOMweb destinations | message bodies, and any credential the destination sends | **Guarded** | `refuse_unrevoked_verified_hop` in each destination's `__init__`, on its verifying branch, whichever opener serves the hop. *(Added 2026-10-02: open defect BACKLOG #2188. The guard runs before the opener is built, so a CRL that reaches the hop cannot relax the refusal.)* |
+| `transports/smart.py`, `_TokenEndpointProvider._open_token_hop` (the shared opener, or a per-provider one), as used by `SmartBackendTokenProvider` (the SMART token endpoint) | the signed `client_assertion` | **Guarded** | `refuse_unrevoked_verified_hop`, called in `_open_token_hop` (§4.3, correction 1; one call site for both token hops since BACKLOG #2115). *(Added 2026-10-02: open defect BACKLOG #2169, on this row and the OAuth2 row below. With an ECH sidecar set, the guard reads a context that never checks the token peer, so a CRL can relax the refusal.)* |
 | the same `_open_token_hop`, as used by `OAuth2ClientCredentialsProvider` in `transports/http_auth.py` (the OAuth2 client-credentials token hop) | the client secret, the access token | **Guarded** | the same `refuse_unrevoked_verified_hop` call (BACKLOG #2112, PR 1670). It was unguarded at `800cb7461`. `http_auth.py` builds no opener of its own since BACKLOG #2115 |
-| the shared opener, as used by `FhirLookupExecutor` in `transports/fhir.py` (the `fhir_lookup` read) | a static bearer or basic credential, or a SMART-minted access token; FHIR resources back | **Needs a guard** | the file's only revocation call is in the FHIR destination. A lookup connection is not a destination |
-| the shared opener, as used by `transports/ai_broker.py` | the `[ai]` API key; code sent for assistance | **Needs a guard** | no revocation call in the file |
+| the shared opener, as used by `FhirLookupExecutor` in `transports/fhir.py` (the `fhir_lookup` read) | a static bearer or basic credential, or a SMART-minted access token; FHIR resources back | **Needs a guard, tracked by #2193** | the file's only revocation call is in the FHIR destination. A lookup connection is not a destination |
+| the shared opener, as used by `transports/ai_broker.py` | the `[ai]` API key; code sent for assistance | **Needs a guard, tracked by #2193** | no revocation call in the file |
 | `transports/email.py`, through `build_smtp_tls_context` | message bodies, the SMTP AUTH credential | **Guarded** | `RevocationHopGuard.capture` in the EMAIL destination |
 | `auth/oidc_http.py`, `build_idp_opener` | the client secret, the authorization code | **Guarded** | `_refuse_idp_revocation` in `auth/service.py` (BACKLOG #1887) |
 | `logging_setup.py`, `_build_tls_context`, `forward.tls_verify=true` | audit records | **Guarded** | `_refuse_forward_revocation` (BACKLOG #1498, §4.3) |
@@ -860,15 +879,15 @@ tracking item, its row reads *Needs a guard, tracked by* that item. No row names
 | `store/postgres.py`, `_build_ssl`, `trust_server_certificate` branch | the whole PHI store | **Verify-off** | refused on an enforcing instance before any context is built |
 | `transports/rest.py`, `_insecure_opener` | message bodies | **Verify-off** | the dev escape, clamped by ADR 0092 |
 | `config/tls_policy.py`, `build_smtp_tls_context`, `verify=False` arm | message bodies, alerts | **Verify-off** | EMAIL and DIRECT refuse it through ADR 0092's clamp. The alert sink cannot read that clamp, so on an enforcing instance the serve gate refuses it unless `[security].allow_unverified_alert_smtp_tls` is set |
-| `transports/dicom.py`, `_client_ssl_context` (the C-STORE SCU) | imaging objects | **Needs a guard** | a verifying PHI hop. Its only hop guard is an `InsecureHopGuard`, taken when TLS is off. An opt-in CRL can already reach it through `[tls].crl_file` on the trust anchor |
-| `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm | message files, the FTP login | **Needs a guard** | the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP |
+| `transports/dicom.py`, `_client_ssl_context` (the C-STORE SCU) | imaging objects | **Needs a guard, tracked by #2193** | a verifying PHI hop. Its only hop guard is an `InsecureHopGuard`, taken when TLS is off. An opt-in CRL can already reach it through `[tls].crl_file` on the trust anchor |
+| `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm | message files, the FTP login | **Needs a guard, tracked by #2193** | the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP |
 | `transports/remotefile.py`, `_ftps_ssl_context`, `tls_verify=false` arm | message files, the FTP login | **Verify-off** | refused on an enforcing instance even with the escape set |
-| `auth/ldap.py`, `ldap3.Tls` in `_server`, `ad_tls_verify=true` | the service-account and user passwords | **Needs a guard** | a verifying credential hop, built outside the connector gate like the OIDC legs. **No CRL setting reaches it.** This read "`ldap3.Tls` holds no `SSLContext`, so `harden_crl_check` has nothing to act on". Since BACKLOG #2494 the engine builds that context, and it simply loads no CRL (CORRECTED 2026-09-30) |
+| `auth/ldap.py`, `ldap3.Tls` in `_server`, `ad_tls_verify=true` | the service-account and user passwords | **Needs a guard, tracked by #2193** | a verifying credential hop, built outside the connector gate like the OIDC legs. **No CRL setting reaches it.** This read "`ldap3.Tls` holds no `SSLContext`, so `harden_crl_check` has nothing to act on". Since BACKLOG #2494 the engine builds that context, and it simply loads no CRL (CORRECTED 2026-09-30) |
 | `auth/ldap.py`, `ad_tls_verify=false` | the same passwords | **Verify-off** | refused on an enforcing instance (#329) |
 | `config/tls_policy.py`, `assert_ldap3_tls_suites` | the same passwords | **Not a separate hop** | since BACKLOG #2494 it builds the context the LDAPS row above handshakes on; it was a replica that never handshook (CORRECTED 2026-09-30) |
-| `pipeline/alert_sinks.py`, `send_plain_email`, through `build_smtp_tls_context` | alert bodies and per-user security-event notices (`pipeline/security_notify.py` sends through it too), the SMTP AUTH credential | **Needs a guard** | a verifying credential hop with no revocation guard, built outside the connector gate |
-| `pipeline/alert_sinks.py`, `_build_no_redirect_opener`, through `build_asserted_https_handler` (the alert webhook) | alert bodies; a Slack or Teams hook carries its secret in the URL | **Needs a guard** | a verifying credential hop with no revocation guard |
-| `transports/direct.py`, through `build_smtp_tls_context` | S/MIME-protected bodies, the SMTP AUTH credential | **Owner question** | a shipped comment declines the guard because S/MIME protects the body. That reason covers the body. It does not cover the AUTH credential when a username is set |
+| `pipeline/alert_sinks.py`, `send_plain_email`, through `build_smtp_tls_context` | alert bodies and per-user security-event notices (`pipeline/security_notify.py` sends through it too), the SMTP AUTH credential | **Needs a guard, tracked by #2193** | a verifying credential hop with no revocation guard, built outside the connector gate |
+| `pipeline/alert_sinks.py`, `_build_no_redirect_opener`, through `build_asserted_https_handler` (the alert webhook) | alert bodies; a Slack or Teams hook carries its secret in the URL | **Needs a guard, tracked by #2193** | a verifying credential hop with no revocation guard |
+| `transports/direct.py`, through `build_smtp_tls_context` | S/MIME-protected bodies, the SMTP AUTH credential | **Owner question** | a shipped comment declines the guard because S/MIME protects the body. That reason covers the body. It does not cover the AUTH credential when a username is set. *(Added 2026-10-02.)* #2193 tracks this row with a checklist line: guard the AUTH credential leg, and leave the S/MIME decline as it is. Manager batch 164 chose that line, as #2193 records. Building it reverses the shipped decline for the credential leg, and the grade then moves to *Guarded*. Declining it is an accept, which needs an owner ruling |
 | `apiclient/client.py`, `_build_verify_context`, `truststore` branch | session credentials | **Scoped out by this ADR** | §5 and §9: the OS verifier builds the chain |
 | `apiclient/client.py`, `_build_verify_context`, `cacert` branch | the login password, session tokens, message views | **Accepted by the owner (owner ruling 2026-09-27)** | a stdlib context, so §5 does not reach it. `RevocationHopGuard` keys on the engine's hop posture, which a client process does not hold, so no existing guard fits. Pinned to the engine's own self-signed certificate (ADR 0172), it has no issuer to revoke it. Pinned to a CA bundle, a revoked engine certificate would still verify. The owner accepted that CA-bundle gap. The ruling was an AskUserQuestion answer in Manager session `1a2e1f9a-6106-48d4-b09f-4f97d75d8780`. **Re-score trigger, in the ruling's words: "when the engine binds beyond loopback or a CA-bundle pin becomes the documented setup".** Both already exist as opt-ins. Remote access is supported and off by default (`docs/REMOTE-CONSOLE.md`). The `_build_verify_context` docstring says `cacert` takes a CA bundle or a self-signed engine certificate. The ruling does not say whether a site taking an opt-in fires the trigger. *(Graded Owner question at `ad41441ec`.)* |
 | `tray/probe.py`, `_pinned_context` and `build_verify` | nothing | **Not a PHI or credential hop** | tokenless `GET /health` and `GET /ui` only |
@@ -891,18 +910,20 @@ shape, and none carries a revocation guard:**
 - the Vault secret provider (`config/secretprovider_vault.py`) and key provider
   (`store/keyprovider_vault.py`), both through `hvac` and `requests`.
 
-Grading them is a separate pass. Note one fact it will meet: no CRL reaches the two `requests`-based
-Vault clients today, because both build a default `TrustAnchorPolicy`, which carries none.
+Grading them is a separate pass, tracked by BACKLOG #2194 for these hops only. Note one fact the
+pass will meet: no CRL reaches the two `requests`-based Vault clients today, because both build a default `TrustAnchorPolicy`, which carries none.
 `requests_verify_from_anchor` in `tls_policy.py` would refuse an anchor's `crl_file` if one ever
 reached them.
 
 **The counts.** At least seven hops need a guard: the FHIR lookup, the AI broker, the DICOM SCU,
-FTPS, LDAPS, the alert and security-notice SMTP hop, and the alert webhook. This ADR names no
-tracking item for any of them, so they are named here by subject only. Check the backlog ledger
-before filing one. One row needs an owner answer: DIRECT. One row is accepted by the owner: the
-apiclient `cacert` branch (2026-09-27). *(At `ad41441ec` this read "Two rows need an owner
-answer".)* At least six hops fall outside the reads and are ungraded. **Do not read this
-table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
+FTPS, LDAPS, the alert and security-notice SMTP hop, and the alert webhook. BACKLOG #2193 tracks
+all seven, one checklist line per hop. One row needs an owner answer: DIRECT. #2193 also tracks
+it, and its row says what stays open. One row is accepted by the owner: the apiclient `cacert`
+branch (2026-09-27). *(At `ad41441ec` this read "Two rows need an owner answer".)* At least six
+hops fall outside the reads and are ungraded. BACKLOG #2194 tracks grading the hops listed above.
+*(Until 2026-10-02 this paragraph read "This ADR names no tracking item for any of them, so they
+are named here by subject only. Check the backlog ledger before filing one.")* **Do not read
+this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
 
 ## 8. Sources that are stale, and must not be cited as current
 
