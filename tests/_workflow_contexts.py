@@ -72,6 +72,25 @@ def jobs_of(name: str) -> dict[str, dict[str, Any]]:
     return {k: (v or {}) for k, v in (load_workflow(name).get("jobs") or {}).items()}
 
 
+def step_script(workflow: str, job: str, name_starts: str) -> tuple[int, str]:
+    """The position of one step in ``job`` and its ``run`` script without the comment lines.
+
+    Read from the parsed workflow, so a needle a test looks for cannot be met by a YAML comment
+    above the step or by a comment inside it. The step is found by the start of its name, and
+    exactly one must match. A name with unbalanced brackets is refused: an unquoted `` #`` starts a
+    YAML comment and cuts the name short without an error.
+    """
+    steps = jobs_of(workflow)[job]["steps"]
+    found = [i for i, s in enumerate(steps) if str(s.get("name", "")).startswith(name_starts)]
+    assert len(found) == 1, f"expected one {job} step named {name_starts!r}, found {len(found)}"
+    name = str(steps[found[0]]["name"])
+    assert name.count("(") == name.count(")"), (
+        f"the step name is cut short; an unquoted ' #' starts a YAML comment: {name!r}"
+    )
+    lines = str(steps[found[0]]["run"]).splitlines()
+    return found[0], "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+
+
 def on_block(parsed: dict[Any, Any]) -> dict[str, Any]:
     """A parsed workflow's ``on:`` triggers, normalised to ``{trigger: config}``.
 

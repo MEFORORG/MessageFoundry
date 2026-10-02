@@ -94,6 +94,7 @@ from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
 from messagefoundry.service_status import is_safe_service_name
+from messagefoundry.startupcode import StartupPosture, startup_loosenings
 
 __all__ = [
     "StoreBackend",
@@ -6819,6 +6820,7 @@ def security_loosenings(
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
+    startup: StartupPosture | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -6842,7 +6844,8 @@ def security_loosenings(
     with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
     ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
-    the engine process (vault BACKLOG #2700), and
+    the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
+    interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
@@ -6903,6 +6906,12 @@ def security_loosenings(
     hook is installed. It is a fact about one process, so only a caller running IN the engine
     process passes a reading (``serve``, ``GET /security/posture``). ``None`` means this call site
     is some other process (``messagefoundry security show``), which says so in its own output.
+
+    ``startup`` is the second PROCESS observation (vault BACKLOG #2701), from
+    :func:`messagefoundry.startupcode.startup_posture`: whether the interpreter was started in
+    isolated mode, the start-up code (``.pth`` import lines, ``sitecustomize``) it does not know,
+    and whether the engine's own account can write the directories that code is read from.
+    ``None`` has the meaning it has for ``remote_debug``, for the same reason.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -7438,6 +7447,10 @@ def security_loosenings(
     # The wording lives beside the hook, in one place for this registry and `supervise`.
     if remote_debug is not None and (entry := remote_debug_loosening(remote_debug)) is not None:
         out.append(entry)
+    # --- the engine PROCESS's observed launch and start-up code (vault BACKLOG #2701). The same
+    # kind of observation, with its wording beside its reader for the same reason.
+    if startup is not None:
+        out.extend(startup_loosenings(startup))
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.

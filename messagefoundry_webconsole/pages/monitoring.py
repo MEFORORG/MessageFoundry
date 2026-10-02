@@ -25,6 +25,7 @@ from messagefoundry.api.models import (
     DrStatus,
     GraphResponse,
     IntegrityResult,
+    InterpreterView,
     MetricsHistoryResponse,
     SecurityPosture,
     ServiceStatusInfo,
@@ -77,6 +78,43 @@ def _fips(value: bool | None) -> str:
     if value is None:
         return "undeterminable"
     return "reported active" if value else "reported inactive"
+
+
+def _interpreter_rows(interpreter: InterpreterView | None) -> list[list[object]]:
+    """The status rows for how the engine process was started (vault BACKLOG #2701, #2700).
+
+    None is a posture built without the reading. It renders as a dash in every row, never as a
+    hardened launch. Counts only: the file names are in ``GET /security/posture`` and in the
+    loosening list below. A directory the engine could not check is counted apart, so "not
+    checked" never reads as "not writable"."""
+    isolated, remote, startup = (
+        "Interpreter: isolated mode (-I)",
+        "Interpreter: remote debugging (PEP 768)",
+        "Interpreter: start-up code",
+    )
+    if interpreter is None:
+        return [[label, _opt(None)] for label in (isolated, remote, startup)]
+    unexpected = sum(1 for item in interpreter.startup_code if not item.expected)
+    if not interpreter.remote_debug_enabled:
+        remote_state = "off"
+    elif interpreter.remote_debug_guard_installed:
+        remote_state = "on, injected scripts refused"
+    else:
+        remote_state = "ON, NOT GUARDED"
+    directories = (
+        f"{len(interpreter.writable_startup_dirs)} of {len(interpreter.startup_dirs)} start-up "
+        "directories writable by the engine"
+    )
+    if interpreter.unchecked_startup_dirs:
+        directories += f", {len(interpreter.unchecked_startup_dirs)} NOT CHECKED"
+    return [
+        [isolated, _yn(interpreter.isolated)],
+        [remote, remote_state],
+        [
+            startup,
+            f"{len(interpreter.startup_code)} found, {unexpected} not expected; {directories}",
+        ],
+    ]
 
 
 def _memenc(value: bool | None) -> str:
@@ -513,6 +551,9 @@ def status(
             # inherited from OpenSSL's default (inherited until Python 3.15). getattr-with-default is
             # defensive, not cross-seam compat (one supported seam, #279), so a None renders as a dash.
             ["TLS key-exchange groups (reported)", _opt(getattr(posture, "kex_groups", None))],
+            # How this engine process was started (vault BACKLOG #2701, #2700). A reading of the
+            # process that answered, like the rows above; an engine shard reports its own.
+            *_interpreter_rows(getattr(posture, "interpreter", None)),
             # Platform memory-encryption read-out (report-only, ADR 0152 Phase 1 / ASVS 11.7.1).
             # Wording is a security property here: every label says "self-reported", and capability
             # ("this silicon can") is a SEPARATE row from activation ("this guest is"), because a

@@ -279,12 +279,17 @@ from typing import Any
 #: console re-asserts that gate on its own two routes in the same change. The digest did not move:
 #: it records a handler's name, not its gate.
 #:
+#: Vault BACKLOG #2701 / #2700: ``SecurityPosture`` gained the additive ``interpreter`` field, the
+#: new ``InterpreterView`` with its nested ``StartupCodeItemView``: how the engine process was
+#: started (isolated mode, remote debugging) and the start-up code its interpreter runs. The status
+#: page renders it. The field has a default; the digest moved because the DTO surface grew.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "32ad621e6081555e"
+ENGINE_UI_SEAM: str = "0373347d22a1c64b"
 
 
 @dataclass(frozen=True, slots=True)

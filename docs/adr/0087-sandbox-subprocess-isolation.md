@@ -398,8 +398,8 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   environment that somebody chose. The other processes the engine starts, which run fixed system
   tools, still inherit; the guard below lists each with its reason. The sandbox worker gets an
   allowlist, and no `MEFOR_*` variable except one switch its own `load_config` reads. The worker and
-  the engine shards also start with `-P`, which keeps the engine's working directory off their
-  import path, and with the interpreter's remote debugging disabled.
+  the engine shards also start by running a script, which keeps the engine's working directory off
+  their import path. They start with `-P` and with the interpreter's remote debugging disabled.
   `messagefoundry/childenv.py` is the source of
   record for what each child gets and why; the `[sandbox]` and `[dr]` sections of
   [CONFIGURATION.md](../CONFIGURATION.md) say what an operator sees. A guard in
