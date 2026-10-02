@@ -1,6 +1,9 @@
 # 0193 — Audit chain key ranges survive a store key rotation
 
-- **Status:** Accepted (2026-09-23) -- built with the change.
+- **Status:** Accepted (2026-09-23) -- built with the change. **Amended 2026-10-01** by owner
+  ruling: see *Amendment 2026-10-01* at the end. Decision items 2 and 8, the field names in item
+  3's closing record, and the first sentence of *Negative / risks* are superseded there. The text
+  below is kept as it was decided.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the
   keyed chain and its watermark), [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)
@@ -155,3 +158,151 @@ Five residuals are recorded rather than solved:
 
 **Out of scope** -- vault row #1165's algorithm epoch (digest and KDF label per range); this ADR
 records a KEY per range, and the range row's `detail` is JSON so a later field can be added.
+
+---
+
+## Amendment 2026-10-01 -- the first range is named inside the chain, and every row carries a sequence number
+
+- **Status:** Accepted by owner ruling (2026-10-01) -- built with the change (vault BACKLOG #2594).
+- **Supersedes:** Decision items 2 and 8; the field names in item 3's closing record, which now
+  counts in sequence numbers (item 6 below); the keyless-prefix reasoning in item 4; and the first
+  sentence of *Negative / risks*. Item 7 gains the genesis row (item 9 below). The rest stands.
+
+### Why
+
+This ADR set a constraint for every range after the first: *the range record must not be a
+redirect*, so it lives inside the MAC'd chain. The first range did not meet that constraint. Its
+key, and the row from which the chain counted as keyed, were recorded in `audit_chain_meta`, a
+table beside the chain that nothing authenticated. The *Negative / risks* paragraph weighed the key
+id held there and did not weigh the keyed-from mark in the same row. That mark decided which rows
+the verifier checked under a key. A record outside the chain that decides what verification checks
+is the shape this ADR rejected as option 3, and the first range was left with it.
+
+The chain also had no coordinate inside its MAC. The row `id` was not in the payload, the off-box
+tee sent the `id`, and the anchor took a row count, so three numbers named a row and none was
+authenticated.
+
+### What changes
+
+1. **`audit_chain_meta` is removed, on all three backends.** Nothing in the database says where
+   keying starts.
+2. **Whether a chain is keyed is decided by the process.** A handle that holds a keying secret (a
+   store key, or the isolated-module MAC) MACs every row it appends and requires every row it
+   verifies to be keyed, from the first. A row it cannot check under a key is a reported break.
+3. **Row 1 of a keyed chain is a genesis row.** Its action is `audit.key_epoch`, it is MAC'd under
+   the first range's key, and its detail names that key. A handle that holds a key writes it at its
+   first writable open of an empty log. The append requires the log to be empty, so on a server
+   database a second engine opening the same fresh store writes nothing and adopts the row already
+   there. A read-only open writes nothing. The detail is a JSON record, so a later field can be
+   added beside the key id.
+4. **A handle with no key learns from the genesis row that the chain is keyed.** It refuses to
+   append to it, and reports that it cannot verify it.
+5. **Every row carries `seq` inside its MAC.** `audit_log.seq` is `NOT NULL` and `UNIQUE`. On
+   PostgreSQL and SQL Server a `CHECK` also refuses a value below 1, to a role that cannot alter
+   the table. SQLite carries no such `CHECK`: every writer of a SQLite file can switch one off,
+   and a row that broke it would fail the store's integrity check, where it is the audit
+   verify's to report. It
+   starts at 1 and each append takes the head's `seq` plus one. On PostgreSQL and SQL Server the
+   head is read under the lock every append already takes in the database (the advisory lock, the
+   applock), so the number is safe across engine shards and cluster nodes. On SQLite the writer
+   lock belongs to one handle, so a second connection to the same file, such as a CLI command run
+   beside the engine, can append in between. The `UNIQUE` constraint refuses the second insert,
+   and the append reads the head again while it holds SQLite's write lock.
+   The verifier walks in `seq` order and requires the numbers to start at 1 and rise by one. The
+   row `id` stays a surrogate key outside the chain: a rolled-back insert can skip an `id`, and
+   nothing in the chain reads it.
+6. **One coordinate.** A range's closing record names its range by `from_seq` and `to_seq`, and its
+   digest covers each row's `seq`. An anchor is the newest row's `seq` and hash. The off-box tee
+   sends `seq` beside `row_hash`, so a collector's record is an anchor the verifier takes
+   unchanged.
+7. **The MAC input is a fixed list of named, typed, length-prefixed fields:** `seq`, the previous
+   row's hash, `ts`, `actor`, `action`, `channel_id`, `detail`, `client`. `NULL`, the empty string
+   and the text `None` encode differently. The conditional trailing `client` element of
+   [ADR 0150](0150-client-address-on-audit-entries.md) is gone with the rows it kept compatible:
+   `client` is always in the payload.
+8. **`rekey-audit` is deleted** (item 8). On a store that holds a key no keyless chain is
+   accepted, so the command has nothing to do. Making it rewrite every `row_hash` under the key was
+   rejected: that needs `UPDATE` on `audit_log`, which the runtime login is denied
+   ([DEPLOY-SERVER-DB.md](../DEPLOY-SERVER-DB.md), owner ruling R16); it would give a key to
+   whatever each row says on the day it runs; and it would break every recorded anchor.
+9. **The open authenticates the genesis row** (item 7): its MAC must verify under the key it names
+   whenever that key is held. If it does not, new rows go under the active key, never the key
+   that row names, the store logs an ERROR, and `rotate-key` refuses. Item 7 and AC-5 say the
+   same of a range row that fails, in the words *new rows go under the ACTIVE key*. The code has
+   always been narrower there, and this amendment leaves it so: after a failed range row, new
+   rows stay under the last range that did authenticate when its key is held, and go under the
+   active key only when it is not.
+10. **A store that holds a key and opens onto keyless rows** logs an ERROR, sets the
+    `audit_chain_unkeyed` posture entry, keys every row it appends, and fails `audit-verify`. No
+    command converts those rows.
+11. **No earlier `audit_log` layout is converted.** `seq` is inside every row's MAC, so no `ALTER`
+    can supply it for rows already written. SQLite refuses such a store at open and names the
+    missing column. There is no installed base (CLAUDE.md section 0), so nothing is migrated.
+
+Owner ruling R16's table list becomes `audit_log` alone. Everything the engine writes to the chain
+is an inserted row, the genesis row and a rotation's range row included, so the runtime login
+still needs `INSERT` and `SELECT` there and nothing more.
+
+### What item 4's `prev_hash` link is for now
+
+Item 4 added `prev_hash` because keyless rows could sit below the first keyed range, tied in only by
+that range's first MAC. A keyed chain has no such rows now: the genesis row opens the first range
+at row 1, so every row sits in a range and under a closing digest. The link check stays. It costs
+one comparison per rotation, and it still ties each range to the row before it without that
+range's key.
+
+### Acceptance criteria, as amended
+
+- **AC-3**, second arm -- IF the genesis row is rewritten to name another configured key, THEN THE
+  SYSTEM SHALL report a break. Same test, new subject:
+  `tests/test_audit_key_rotation.py::test_a_forged_range_meta_is_caught`
+- **AC-6** -- the `rekey-audit` arm is withdrawn with the command, and its test is deleted. The
+  `rotate-key` arm stands.
+- **AC-7** -- the two keyless-prefix tests are deleted with the state they built. The link is still
+  pinned by `test_a_key_holders_range_row_that_misstates_its_link_is_caught`, and the proof through
+  more than one dropped key by
+  `test_editing_the_oldest_range_is_caught_with_two_keys_dropped`.
+- **AC-8** -- WHILE a process holds a keying secret, IF any audit row is unkeyed, or the chain does
+  not open with a genesis row, THEN `verify_audit_chain` SHALL report a break.
+  → `tests/audit_chain_cases.py::keyless_rows_on_a_keyed_store_are_a_reported_break`
+  → `tests/audit_chain_cases.py::a_chain_recomputed_without_the_key_is_reported`
+  → `tests/audit_chain_cases.py::a_chain_with_its_genesis_row_removed_is_reported`
+- **AC-9** -- IF `seq` does not start at 1 and rise by one, THEN `verify_audit_chain` SHALL report a
+  break at the position where the numbers stop matching.
+  → `tests/audit_chain_cases.py::a_renumbered_or_missing_row_is_reported`
+- **AC-10** -- WHEN a handle with no keying secret opens a keyed chain, THE SYSTEM SHALL refuse its
+  append and write nothing.
+  → `tests/audit_chain_cases.py::a_handle_with_no_key_refuses_to_append_to_a_keyed_chain`
+- **AC-11** -- WHEN two handles open one fresh keyed store, THE SYSTEM SHALL hold exactly one
+  genesis row and no two rows SHALL share a `seq`.
+  → `tests/audit_chain_cases.py::two_opens_of_a_fresh_keyed_store_share_one_genesis_row`
+- **AC-12** -- THE SYSTEM SHALL have no `audit_chain_meta` table and no `rekey-audit` command.
+  → `tests/test_audit_chain_genesis.py::test_no_backend_schema_or_statement_names_the_removed_table`
+  → `tests/test_audit_chain_genesis.py::test_the_parser_offers_no_rekey_audit_command`
+
+The cases in `tests/audit_chain_cases.py` run on SQLite from `tests/test_audit_chain_genesis.py`,
+on PostgreSQL from `tests/test_postgres_store.py` and on SQL Server from
+`tests/test_sqlserver_store.py`. The last two need a live server, so they run on the CI legs that
+have one and are skipped elsewhere.
+
+### What this amendment does not do
+
+- **It does not show rows cut off the end of the chain.** A shorter chain still verifies, and so
+  does a log emptied altogether, because the next start writes a new genesis row. The sequence
+  number shows a row missing from the middle, not rows missing from the end. Only an anchor held
+  outside the database shows either, and on the shipped defaults none is kept
+  (`[integrity].audit_verify_on_start` is off and `audit_anchor_file` is empty). The engine writing
+  that anchor off the host is a later slice.
+- **It does not bind the chain to one store.** The genesis row carries no store identity and the
+  audit key does not derive from one. A decision recorded on 2026-10-01 puts the store identity in
+  the outside anchor, not in the database, because a value kept in the database moves with the
+  rows it is meant to identify. That is a named later slice, and it is not built here. Until then
+  a chain is not told apart from another store's chain under the same key.
+- **It does not separate the audit key from the store key.** The audit key is still derived from
+  the store key, so verifying the chain needs the key that decrypts the store. A later slice.
+- **It does not change the residuals recorded above** for a rewrite under a configured key, for the
+  newest handover once its outgoing key is dropped, or for `vault_transit`, where the engine still
+  sees one range and Transit's own key versioning stays outside this ADR.
+- **It does not remove the keyless store mode.** A store opened with no key, under the audited
+  opt-outs, still has a wholly keyless chain, and its posture says so. The owner has ruled that
+  mode is to be removed; that is a separate, later change.

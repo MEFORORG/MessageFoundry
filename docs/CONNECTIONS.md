@@ -735,7 +735,7 @@ def route(msg):
 | `poll_max_files` | in | `500` | most files one scan will take. The rest stay in the drop directory and the next scan takes them — a **deferral, not a drop**: nothing is quarantined, errored, or left unaccounted for. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings) for the number and when to raise it. `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate the directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. **No mkdir** — a merely-missing dir fails. **In:** a `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. **Out:** the target must already exist and accept a write, and is then **never created** — not at start, not on write (a delivery into a vanished dir fails retryably instead), and not by `POST /connections/{name}/test`. Left off (the default) the outbound target is still created on first write, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read/failed files go |
-| `filename` | out | `{MSH-10}.hl7` | output name (supports `{HL7-path}` placeholders). Resolved values are sanitized to a **single safe filename** — path separators/unsafe chars stripped, leading dots removed, and `.`/`..`/reserved device names fall back — so a message field can never write outside the directory. |
+| `filename` | out | `{MSH-10}.hl7` | output name (supports `{HL7-path}` placeholders). Resolved values are sanitized to a **single safe filename** — path separators/unsafe chars stripped, leading dots removed, trailing dots and spaces stripped, and `.`/`..`/reserved device names fall back — so a message field can never write outside the directory. The final name, `.gz` included, is capped at **200 UTF-8 bytes**; a longer one falls back to `message.hl7` (ADR 0204). **Out:** a deep `directory` lowers the cap to the room left under the platform path limit (logged once when the connection is built), and a directory with no room for the fallback, or a template whose fixed text is over the cap, is refused when the connection is built. |
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (collisions are resolved by an **atomic** exclusive create, so concurrent writes never clobber) |
 | `encoding` | both | `utf-8` | file charset (write) |
 | `credential_username` | both | — (unset) | **Windows-only** alternate share identity (ADR 0132, #111): `user`, `DOMAIN\user`, or a `user@domain` UPN. Unset = the engine service-account identity (byte-identical). |
@@ -2324,7 +2324,7 @@ Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `
 `DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
 or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
 connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
-`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
+`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<3.1`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
 extra** (it stores the object as opaque bytes over the shared `rest.py` HTTP plumbing). Still out of scope:
 MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
@@ -3622,7 +3622,7 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 3. *Transform:* v2 ↔ C‑CDA helpers (the high‑value, high‑effort part).
 
 **Dependency note.** A modeled lane means a new parser/validator dependency. The shipped lanes each ride an
-optional extra — `[dicom]` (`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<4`, pure‑Python, no numpy), `[fhir]`
+optional extra — `[dicom]` (`pydicom>=3.0.2,<3.1` + `pynetdicom>=3.0.4,<3.1`, pure‑Python, no numpy), `[fhir]`
 (`fhir.resources` + `fhir-core` + `fhirpathpy`), `[x12]` (`pyx12`), and `[xml]` (`lxml` + `xmlschema` + `signxml`) — all
 lazily imported, so an install that never touches a lane pays nothing. Still to be *evaluated*, not yet
 chosen: an **NCPDP** parser (the XML/CDA question is settled — `lxml` is in tree under `[xml]`). Per the

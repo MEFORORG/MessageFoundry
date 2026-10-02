@@ -557,6 +557,14 @@ dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<4"]
 dicomweb = ["dicomweb-client"]
 ```
 
+> **CORRECTED 2026-10-02: the upper bounds in this ADR are the ones it was accepted with, and both
+> have since tightened.** Wherever this ADR gives the extra's own specifier as
+> `pynetdicom>=3.0.4,<4` or `pydicom>=3.0.2,<4`, the extra now caps that package below 3.1.
+> `pydicom` moved first (BACKLOG #1926), then `pynetdicom` (vault BACKLOG #2713). The floors are
+> unchanged. So is `pydicom>=3,<4` where it appears: that is pynetdicom's own requirement. The
+> comment above the `[dicom]` extra in [pyproject.toml](../../pyproject.toml) is the source of
+> record for the current range, the reason for each cap, and the steps to raise the pynetdicom one.
+
 Follow DEP-1 ([CLAUDE.md](../../CLAUDE.md) §7, memory `depadd-relock-gotcha`). **Dep-vet CLEARED all three
 (coordinator, 2026-06-20)** with these locked outcomes: **`pydicom` = MIT AND BSD-3-Clause** (MIT code + vendored
 GDCM/CREATIS data-dictionary files; record the GDCM/CREATIS BSD-3 attribution in **NOTICE**, PEP 639),

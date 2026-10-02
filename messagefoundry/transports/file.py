@@ -23,6 +23,7 @@ import errno
 import functools
 import hashlib
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -56,6 +57,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     DestinationStartupError,
     InboundHandler,
+    NegativeAckError,
     SourceConnector,
     SourceStartupError,
     encode_wire_body,
@@ -132,20 +134,118 @@ _SUPPORTED_COMPRESSION = frozenset({"gzip"})
 
 _PLACEHOLDER = re.compile(r"\{([A-Z][A-Z0-9]{2}-\d+(?:\.\d+){0,2})\}")
 # Strip characters that are unsafe in filenames on Windows and POSIX alike (path separators
-# included, so a resolved value can never introduce a directory component).
-_UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-# Windows reserved device names (case-insensitive, optionally with an extension) — never usable.
-_RESERVED = {
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
+# included, so a resolved value can never introduce a directory component). A lone surrogate is
+# unsafe too: it has no encoding, so a POSIX write of it would raise outside the DeliveryError
+# contract (ADR 0204).
+_UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f\ud800-\udfff]')
+#: The longest final file name a destination writes, in UTF-8 bytes, suffix included (ADR 0204).
+#: The common per-component limit is 255: bytes on ext4 and XFS, UTF-16 units on NTFS. A UTF-8 byte
+#: count is never below the UTF-16 unit count, so one byte cap holds on both. The 55 bytes left under
+#: 255 cover the names a destination derives from this one: the remote upload's temp,
+#: ``.{name}.{32 hex}.part``, adds 39, and a collision counter ``-N`` adds a few more.
+FILENAME_MAX_BYTES = 200
+
+#: Room a local destination keeps in its path budget for a derived name: the ``-N`` collision
+#: counter, or the ``mkstemp`` temp ``tmpXXXXXXXX.part``, which is 16 characters.
+_DERIVED_NAME_HEADROOM = 16
+
+#: The name a destination falls back to when a rendered name is unusable.
+_FALLBACK_NAME = "message.hl7"
+
+#: The longest usable path, in the platform's path units, when nothing better is known. Each is the
+#: platform constant less its terminating NUL: Windows ``MAX_PATH`` 260, macOS 1024, Linux 4096.
+_WIN_MAX_PATH = 259
+_WIN_LONG_PATH = 32766
+_DARWIN_PATH_MAX = 1023
+_POSIX_PATH_MAX = 4095
 
 
-def render_filename(template: str, payload: str, *, fallback: str) -> str:
+def _name_bytes(name: str) -> int:
+    """The length of ``name`` in UTF-8 bytes. ``surrogatepass`` so a measure never raises."""
+    return len(name.encode("utf-8", "surrogatepass"))
+
+
+@functools.cache
+def _windows_long_paths_enabled() -> bool:
+    """Whether Windows lets this process open a path past ``MAX_PATH`` without the long-path prefix.
+
+    Two things decide it: the ``LongPathsEnabled`` registry value, and whether the host executable
+    declares itself long-path aware. ``RtlAreLongPathsEnabled`` answers for both, which the registry
+    value alone does not. Asked once: Windows fixes the answer at process start. A failed call counts
+    as off, which only makes the name budget smaller."""
+    if sys.platform != "win32":
+        return False
+    try:
+        query = ctypes.WinDLL("ntdll").RtlAreLongPathsEnabled
+    except (OSError, AttributeError):
+        return False
+    query.restype = ctypes.c_ubyte
+    query.argtypes = []
+    return bool(query())
+
+
+def _path_limit(absolute: str) -> int:
+    """The longest path this platform opens, in its own path units, for a path like ``absolute``."""
+    if sys.platform == "win32":
+        if absolute.startswith("\\\\?\\") or _windows_long_paths_enabled():
+            return _WIN_LONG_PATH
+        return _WIN_MAX_PATH
+    if sys.platform == "darwin":
+        return _DARWIN_PATH_MAX
+    return _POSIX_PATH_MAX
+
+
+def _path_units(path: str) -> int:
+    """The length of ``path`` in the units the platform limit counts: UTF-16 on Windows, bytes else."""
+    if sys.platform == "win32":
+        return len(path.encode("utf-16-le", "surrogatepass")) // 2
+    return _name_bytes(path)
+
+
+def _name_budget(directory: Path, suffix: str) -> int:
+    """The byte cap for a file name written into ``directory`` (ADR 0204, rules 2 and 4).
+
+    It is :data:`FILENAME_MAX_BYTES`, made smaller when the directory's absolute path leaves less room
+    under the platform path limit. A directory that leaves no room for the fallback name with
+    ``suffix`` raises ``ValueError``: every message would fail there, so the configuration is
+    refused when the connector is built, not retried at delivery."""
+    needs = _FALLBACK_NAME + suffix
+    absolute = os.path.abspath(directory)
+    room = _path_limit(absolute) - _path_units(absolute) - 1 - _DERIVED_NAME_HEADROOM
+    budget = min(FILENAME_MAX_BYTES, room)
+    if budget < _name_bytes(needs):
+        raise ValueError(
+            f"file destination directory {directory} is too deep for this platform's path limit: "
+            f"it leaves {max(budget, 0)} bytes for a file name, fewer than the "
+            f"{_name_bytes(needs)} the fallback name {needs!r} needs"
+        )
+    return budget
+
+
+def _with_suffix(base: str, suffix: str) -> str:
+    """``base`` with ``suffix`` appended, unless it already ends with it."""
+    return base if base.endswith(suffix) else base + suffix
+
+
+def _check_template_fits(template: str, suffix: str, max_bytes: int) -> None:
+    """Refuse a template whose fixed text alone, with ``suffix``, is over ``max_bytes``: every message
+    would fall back, so the configuration is refused when the connector is built (ADR 0204)."""
+    fixed = _with_suffix(_sanitize(_PLACEHOLDER.sub("", template)).rstrip(". "), suffix)
+    if _name_bytes(fixed) > max_bytes:
+        raise ValueError(
+            f"filename template's fixed text is {_name_bytes(fixed)} bytes, over the "
+            f"{max_bytes}-byte cap for its directory, so every message would fall back"
+        )
+
+
+def render_filename(
+    template: str,
+    payload: str,
+    *,
+    fallback: str,
+    suffix: str = "",
+    max_bytes: int = FILENAME_MAX_BYTES,
+) -> str:
     """Resolve ``{HL7-path}`` placeholders in ``template`` against ``payload``, producing a single
     safe filename (never a path).
 
@@ -153,7 +253,14 @@ def render_filename(template: str, payload: str, *, fallback: str) -> str:
     so a delivery never fails merely because a name couldn't be built. The result is constrained to
     one path component: unsafe characters are stripped, leading dots removed, and ``.``/``..``/empty
     or a reserved device name falls back — so an attacker-controlled field can't write outside the
-    target directory or shadow ``.processed``/``.error`` (FILE-1)."""
+    target directory or shadow ``.processed``/``.error`` (FILE-1).
+
+    ADR 0204 adds three things. Trailing dots and spaces are stripped before the reserved-name test,
+    because Windows strips them when it opens a name, so ``NUL .hl7`` would open the device. The
+    test is :func:`ntpath.isreserved`, which also knows ``CONIN$`` and the superscript-digit ports.
+    ``suffix`` is appended here, not by the caller, so the length test sees the final name. And a
+    final name longer than ``max_bytes`` UTF-8 bytes falls back, so a long field never reaches the
+    filesystem. The caller keeps ``fallback`` plus ``suffix`` within ``max_bytes``."""
     try:
         peek: Peek | None = Peek.parse(payload)
     except HL7PeekError:
@@ -179,10 +286,21 @@ def render_filename(template: str, payload: str, *, fallback: str) -> str:
             value = None
         return _sanitize(value) if value else fallback
 
-    name = _sanitize(_PLACEHOLDER.sub(repl, template))
-    stem = name.split(".", 1)[0].upper()
-    if not name or name in (".", "..") or stem in _RESERVED:
-        return fallback
+    # Rule 3: strip the trailing dots and spaces Windows would drop, then test what is left.
+    name = _sanitize(_PLACEHOLDER.sub(repl, template)).rstrip(". ")
+    if not name or ntpath.isreserved(name):
+        return _with_suffix(fallback, suffix)
+    name = _with_suffix(name, suffix)
+    size = _name_bytes(name)
+    if size > max_bytes:
+        # Rule 2: the final name, suffix included, is judged in encoded bytes before any write. The
+        # length is logged and the value is not: a template may name a field that carries PHI.
+        logger.warning(
+            "rendered output filename is %d bytes, over the %d-byte cap; using the fallback name",
+            size,
+            max_bytes,
+        )
+        return _with_suffix(fallback, suffix)
     return name
 
 
@@ -280,6 +398,25 @@ class FileDestination(DestinationConnector):
         # Optional outbound compression (ADR 0123): "gzip" gzips the encoded body and appends `.gz` to
         # the rendered name; None (default) is byte-identical to before. Single-stream gzip only.
         self.compress: str | None = _validate_compression(s.get("compress"), "compress")
+        # ADR 0204: the name cap for this directory, judged once here where the platform path limit is
+        # known. A directory too deep for even the fallback name is refused now (rule 4).
+        self._suffix = ".gz" if self.compress == "gzip" else ""
+        self._name_max_bytes = _name_budget(self.directory, self._suffix)
+        _check_template_fits(self.filename_template, self._suffix, self._name_max_bytes)
+        if self._name_max_bytes < FILENAME_MAX_BYTES:
+            # Said once, here, because a smaller cap makes ordinary names fall back, and with
+            # overwrite on each fallback replaces the last.
+            logger.warning(
+                "file destination %s: the directory path leaves %d bytes for a file name, under the "
+                "usual %d; longer names fall back to %r%s",
+                self.directory,
+                self._name_max_bytes,
+                FILENAME_MAX_BYTES,
+                _FALLBACK_NAME + self._suffix,
+                ", and overwrite is on, so each fallback replaces the last"
+                if self._overwrite
+                else "",
+            )
         # Set once a directory fsync has failed here, so it is logged once and not retried (#1618).
         self._dir_fsync_unsupported = False
 
@@ -372,15 +509,31 @@ class FileDestination(DestinationConnector):
 
     def _write(self, payload: str) -> None:
         self._ensure_directory()
-        name = render_filename(self.filename_template, payload, fallback="message.hl7")
-        if self.compress == "gzip" and not name.endswith(".gz"):
-            # Signal the on-disk format so a downstream reader (or a gunzip source) knows to unpack.
-            name = f"{name}.gz"
+        # The `.gz` suffix signals the on-disk format to a downstream reader (or a gunzip source). It
+        # is passed in, not appended after, so the length cap sees the final name (ADR 0204).
+        name = render_filename(
+            self.filename_template,
+            payload,
+            fallback=_FALLBACK_NAME,
+            suffix=self._suffix,
+            max_bytes=self._name_max_bytes,
+        )
         target = self.directory / name
         # Defence in depth atop the filename sanitization (FILE-1): never write outside the
-        # configured directory even if a name somehow carried a path component.
+        # configured directory even if a name somehow carried a path component. A name that itself
+        # carries a separator or is a dot name came from the message, and a retry renders it again:
+        # permanent (ADR 0204, rule 1). A resolve that lands outside for any other reason, such as a
+        # link at the name or a share that changed form between the two resolves, is the
+        # environment, and stays transient. Neither error quotes the name, which reaches the store's
+        # last_error and may carry PHI.
+        if "/" in name or "\\" in name or name in (".", ".."):
+            raise NegativeAckError(
+                "file: refusing a file name that is not a single path component",
+                code="filename",
+                permanent=True,
+            )
         if self.directory.resolve() not in target.resolve().parents:
-            raise DeliveryError(f"refusing to write outside the destination directory: {name!r}")
+            raise DeliveryError("file: refusing to write outside the destination directory")
         data = encode_wire_body(payload, self.encoding, transport="file")
         if self.compress == "gzip":
             # Deterministic (mtime=0) so a re-delivery of the same body writes identical bytes.

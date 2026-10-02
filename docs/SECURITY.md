@@ -157,6 +157,39 @@ store vouches for. `serve --allow-insecure-bind`, or its config twin `[security]
 unauthenticated full access — or to silently void the loopback assumption by changing
 `[security].local_access_only` / `listen_address` (SYS-1).
 
+**Sign-in is checked before the request body is read (vault BACKLOG #2739).** FastAPI reads and
+decodes a declared request body before it runs a route's dependencies, and the `require*()` gate
+is a dependency. Left alone, a gated JSON route that declares a body would answer a caller with no
+session from the body parser. The answer would be **422** for JSON that does not parse, or **400**
+for bytes that cannot be read. The engine's route class, `AuthenticatedBeforeBodyRoute`
+(`messagefoundry/api/security.py`), stops that. On a gated route that declares a body, it runs
+the gate's authentication step before FastAPI reads the body. The guards that sit ahead of the
+gate run first, in the order FastAPI would run them. So a caller with no identity gets the gate's
+own refusal whatever the body holds. The response does not say whether the body parsed, or whether
+the route takes a body.
+
+- `create_app` sets the class on the app's router. Each route registered on the app gets the
+  check with nothing to remember, and no list of routes is kept.
+- Some route shapes are not covered, and the engine has none of them. The class docstring is the
+  one list. It names at least a route added through `include_router`, a gate nested inside
+  another dependency, and an unmarked dependency ahead of a gate. An embedder who adds routes in
+  one of those ways must check them.
+- The gate itself does not change. After the body is read it runs in full, as before: sign-in
+  again, then the password and factor checks, the permission check and its audit rows, pacing and
+  step-up. So a signed-in caller that the gate then refuses still gets the parser's answer first
+  for a body that does not parse.
+- Nothing is handed from the early check to the gate. A session that ends while the body is
+  arriving is refused by the gate. The price is one more identity lookup for a signed-in
+  request to a route with a body. That lookup reads the session, its user and the user's roles.
+  It writes nothing, so it does not move the session's idle clock.
+- A route with no gate is not touched. `POST /auth/login` has to parse a body from a caller with
+  no session. A gated route that declares no body is not touched either, because FastAPI already
+  runs its gate first. That includes the web console's `/ui` routes, which read their forms
+  inside the handler.
+
+`tests/test_auth_before_body.py` tests the mechanism. `tests/test_preauth_malformed_body.py` pins
+what an unauthenticated caller gets on every operation that takes a body.
+
 **The proxy-to-engine hop is yours to secure, and `serve` makes you say so (BACKLOG #1179).** With
 `tls_terminated_upstream`, the proxy terminates TLS and the engine mints no certificate
 ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
@@ -217,7 +250,8 @@ writes its first audit row, so it needs `MEFOR_STORE_ENCRYPTION_KEY` (or `[store
 in its own environment. The key in the service's NSSM environment is not visible to your shell. Use
 that same key; do not generate a new one. With no key the command refuses, under the same condition
 that makes `serve` refuse to start (BACKLOG #1905), because an audit chain that starts keyless stays
-keyless. A store already in that state is reported as
+keyless, and a store that holds a key reports such a chain as broken. A store already in that state
+is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
 
 Four properties are load-bearing rather than incidental:
@@ -555,8 +589,8 @@ backend hops that present a static credential or none (the *Delegated identity* 
 
 | Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
 |---|---|---|---|
-| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log` and `audit_chain_meta`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
-| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log` and `audit_chain_meta`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
+| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
+| Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
 | Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>` | No: printed, not probed |
 | Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key | No: printed, not probed |
@@ -615,7 +649,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 |---|---|---|---|---|---|
 | Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
-| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rekey_audit`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
@@ -683,7 +717,9 @@ route handler only when all of them pass.
    cookie** serves the `/ui` routes and a same-origin browser's `/ws/stats` handshake. The JSON API's
    `require*()` gates never read the cookie. `/ws/stats` accepts two planes, cookie first and
    header token second; the WebSocket note under the gate table below has the order.
-3. **The `require*()` deny-by-default ladder**, in this order: **503** `authentication is not configured`
+3. **The `require*()` deny-by-default ladder.** Its first two rungs, the 503 and the 401, answer
+   before the request body is read; [Enforcement model](#enforcement-model) says how. The ladder
+   runs in this order: **503** `authentication is not configured`
    when no enabled `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
    required` when the identity is flagged `must_change_password` and the path is not must-change
@@ -2009,8 +2045,13 @@ sign-in mints one session, so the AD role-resync and revocation side effect fire
 never per navigation. The directory bind **as the user** survives only as the step-up re-bind at
 `POST /ui/reauth` and `POST /me/reauth`, where it re-proves a session **Kerberos** minted, or a session
 row written before `sessions.auth_mechanism` existed. An OIDC session never reaches it: it steps up at the IdP instead (`POST /ui/reauth/oidc`; see
-[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)). MFA is
-**not** delegated: the engine's own second factor binds a directory account like any other
+[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)). A directory account's second
+factor follows the rule in [Multi-factor authentication](#multi-factor-authentication-totp-wp-14).
+It shares the local account's rule, with at least two differences. First, while `[security].require_mfa` is
+on, a directory session that proved no factor at sign-in owes an engine factor under either
+`require_mfa_scope` value. That includes at least every Kerberos session and an OIDC session minted
+while `[auth].oidc_require_mfa_claim` is off. Second, an OIDC sign-in meets its factor at mint on the
+identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` is on, the default
 (BACKLOG #1144).
 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
@@ -2589,6 +2630,8 @@ flowchart TB
   steps that come before the ladder and the conditions on each rung.
 - Not every route takes this path. [Enforcement model](#enforcement-model) lists the routes that
   need no session, and the one route that authenticates by client certificate.
+- On a route that declares a body, the session check runs before the body is read and again
+  after it. The checks below it run after.
 - The six-sided boxes are checks, and they run from top to bottom. Each account check lets a short
   list of self-service routes through. That lets a person change the password, prove the factor or
   set the address.
@@ -3824,7 +3867,7 @@ reasons are in `messagefoundry/auth/audit_visibility.py`.
   `LOG_SILENT_EVENT_TYPES` in `messagefoundry/auth/notifications.py`.
 - **The audit copies in the log are withheld from a reader without `users:manage`.** The off-box
   tee writes every audit row into the application log, the lock rows included, each with its row
-  number. `GET /logs/tail` drops all of those copies for such a reader before it pages, so
+  number and its sequence number. `GET /logs/tail` drops all of those copies for such a reader before it pages, so
   `total_lines` does not count them. Dropping only the lock rows would leave numbered gaps. That
   reader reads the trail, if it may, through `GET /audit`.
 
@@ -3890,15 +3933,23 @@ key derived from the store key. Someone who can write rows but does not hold the
 recompute it. Under `cipher_provider = "vault_transit"` the MAC is computed inside Transit instead.
 On a keyless row the digest is plain SHA-256, which anyone who can write the table can recompute.
 So a keyless chain shows corruption or a careless edit, not a rewrite by someone who can write the
-table. A store that has a key can still hold a keyless chain, or one keyed only from a later row
-on. [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, says
-which rows are keyed. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless digest
-only, and it said any such change is detectable without that condition. Verify the chain with
+table. **A store that holds a key requires every audit row keyed, from the first.** Row 1 of its
+chain is a genesis row, written at the store's first start, that names the key the chain begins
+under. Every row carries its position in the chain, `seq`, inside its MAC: `seq` starts at 1 and
+rises by one, so a missing, repeated or renumbered row is a reported break. Nothing in the database
+says where keying starts, so nothing there can be changed to move it. A row written without a key
+is a reported break on a keyed store, and no command re-keys one (ADR 0193 and ADR 0194, both
+amended 2026-10-01). [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit
+chain* row, describes the digest and the key it uses. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless
+digest only, and it said any such change is detectable without that condition. It then read *"A
+store that has a key can still hold a keyless chain, or one keyed only from a later row on"*; that
+was true until the keyed-from mark was removed. Verify the chain with
 `messagefoundry audit-verify` — exit 0 means at least that no surviving row was edited or
 reordered by someone who could not recompute the chain. Run it with the store key in its
-environment: a keyed chain cannot be verified without that key, and the verify fails. Exit 0 does
-not say the chain is keyed. A store that has a key and opens onto a keyless chain is reported
-apart from the verify, as
+environment: a keyed chain cannot be verified without that key, and the verify fails. With the key,
+exit 0 also means every row is keyed. With no key, which only the keyless store mode allows, exit 0
+covers a keyless chain and says no more than the paragraph above. A store that has a key and opens
+onto keyless rows fails the verify, and is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
 **A scheduled job reads the exit code and nothing else, so
 these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
@@ -3912,9 +3963,14 @@ pass; pass `--allow-empty` to accept it as one on an instance that has not logge
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
 exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
 non-audit-database paths. It does **not** mean nothing was removed: deleting the *newest*
-rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation. For
+rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation.
+The sequence number does not change that: it shows a row missing from the middle, not rows missing
+from the end. A log emptied altogether is the same case, since the next start writes a new genesis
+row. Only a value held outside the database shows either. For
 that, snapshot `messagefoundry audit-anchor` (`COUNT:HEAD`) and pass it back as `messagefoundry
-audit-verify --expected-anchor`. It is an exact point-in-time seal, which fixes what it is for: it
+audit-verify --expected-anchor`. `COUNT` is the newest row's sequence number, which on an intact
+chain is the row count, and the off-box audit record carries the same pair as `seq` and `row_hash`.
+It is an exact point-in-time seal, which fixes what it is for: it
 seals a chain **at rest across a gap** — quiesce the engine, anchor, hold the value off-box, re-verify
 while the chain is still quiesced (a maintenance window, a DB move, a backup/restore, a custodian
 hand-off). Anchoring and re-verifying in one breath compares a value to itself, and a held anchor
@@ -3925,9 +3981,10 @@ rows; for continuous coverage the off-box tee is still the control ([BACKLOG #32
 startup backfill that used to chain pre-feature rows was deleted with it (BACKLOG #1198), because a
 row it could repair can no longer be written. The `client` address is folded **inside** the chained
 payload — deliberately, since attribution an attacker could rewrite without breaking tamper-evidence
-would be worse than none — as a **conditional trailing element**, appended only when non-`NULL`. A
-row with no client therefore hashes exactly as it did before the column existed, so legacy rows keep
-verifying byte-identically and one chain spans both formats across the upgrade. This is in-DB tamper-*evidence*, not prevention —
+would be worse than none. The payload is a fixed list of eight named, typed fields: `seq`, the
+previous row's hash, `ts`, `actor`, `action`, `channel_id`, `detail` and `client`. A `NULL` and an
+empty string encode differently. No earlier `audit_log` layout is converted: a store whose table
+lacks `seq` is refused at open. This is in-DB tamper-*evidence*, not prevention —
 restrict the store/file ACL (and run least-privilege; see [SERVICE.md](SERVICE.md)) so the log can't
 be rewritten in the first place.
 
@@ -4068,9 +4125,10 @@ Two controls answer it, and they differ in strength:
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
 - **The engine process itself refuses the script.** `serve` and `supervise` start through a
-  console-script launcher, which cannot pass that option. So each installs an audit hook as its
-  first step (`messagefoundry/remotedebug.py`). The interpreter raises an event before it runs an
-  injected script, the hook raises on it, and the interpreter drops the script.
+  console-script launcher, which cannot pass that option. So the command line installs an audit
+  hook as it starts, for every command (`messagefoundry/remotedebug.py`). The interpreter raises
+  an event before it runs an injected script, the hook raises on it, and the interpreter drops
+  the script.
 
 The hook is the weaker of the two, so an engine that starts with the interface on reports it as
 the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported, what

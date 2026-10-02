@@ -19,15 +19,18 @@ Two independent classes of copy-paste defect, both of which have actually shippe
    and guarded by ``test_every_runbook_connections_toml_block_loads`` instead.
 
 The runbook's ``## Tamper-evident audit chain (ASVS 16.4.2)`` section prints a copy-pasteable
-``messagefoundry <subcommand>`` command an operator runs to key an existing keyless audit chain. It
-once printed the *store-method* name (``rekey_audit_chain``) rather than the *CLI subcommand*
-(``rekey-audit``); argparse rejects the method name as an "invalid choice", so an operator following
-the runbook verbatim got an error. This module pins the runbook command to the real CLI registry so
-that class of defect can't drift back in:
+``messagefoundry <subcommand>`` command an operator runs against the audit chain. It once printed
+a *store-method* name (``rekey_audit_chain``) rather than a *CLI subcommand*; argparse rejects the
+method name as an "invalid choice", so an operator following the runbook verbatim got an error.
+That method and its ``rekey-audit`` command were then removed (vault BACKLOG #2594): a store that
+holds a key keys its chain from its first row, and nothing keys a chain in place. This module pins
+the runbook command to the real CLI registry so neither defect can drift back in:
 
 * the ``messagefoundry <cmd>`` invocation in the 16.4.2 section names a **registered** subcommand
-  (checked against the authoritative dispatch table in :mod:`messagefoundry.__main__`); and
-* the store-method name ``rekey_audit_chain`` is **not** presented anywhere as a CLI command.
+  (checked against the authoritative dispatch table in :mod:`messagefoundry.__main__`), which a
+  runbook still printing the removed command fails;
+* the section instructs ``audit-verify``, the command that reads the chain; and
+* neither removed name is presented anywhere as a CLI command.
 
 Structural assertion over the Markdown runbook + the CLI registry — no engine behaviour is exercised.
 """
@@ -59,10 +62,12 @@ if not _DOC.exists():
     )
 
 _SECTION_HEADING = "## Tamper-evident audit chain (ASVS 16.4.2)"
-# The store METHOD name (store/store.py), which is NOT a CLI subcommand — must never appear as a command.
+# A removed store METHOD name, which never was a CLI subcommand — must never appear as a command.
 _STORE_METHOD_NAME = "rekey_audit_chain"
-# The correct registered subcommand the section must instruct.
-_EXPECTED_SUBCOMMAND = "rekey-audit"
+# The removed CLI subcommand (vault BACKLOG #2594): the runbook must not instruct it either.
+_REMOVED_SUBCOMMAND = "rekey-audit"
+# The registered subcommand the section must instruct: the one that verifies the chain.
+_EXPECTED_SUBCOMMAND = "audit-verify"
 
 # A fenced code block: ```<info>\n ... \n``` (the info string, e.g. ``toml``/``python``, is discarded).
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
@@ -101,7 +106,7 @@ def test_runbook_audit_command_names_a_registered_cli_subcommand() -> None:
             f"runbook prints `{cmd}` but {sub!r} is not a registered CLI subcommand "
             f"(messagefoundry/__main__.py _DISPATCH / sub.add_parser). Registered: {sorted(_DISPATCH)}"
         )
-    # The section exists to instruct the audit-rekey migration; that subcommand must be the one present.
+    # The section exists to instruct verifying the chain; that subcommand must be present.
     assert _EXPECTED_SUBCOMMAND in subcommands, (
         f"the 16.4.2 section must instruct `messagefoundry {_EXPECTED_SUBCOMMAND}`; "
         f"found instead: {subcommands}"
@@ -109,13 +114,15 @@ def test_runbook_audit_command_names_a_registered_cli_subcommand() -> None:
 
 
 def test_runbook_does_not_present_store_method_name_as_a_cli_command() -> None:
-    # `rekey_audit_chain` is the store method, not a CLI subcommand; argparse rejects it as an invalid
-    # choice. Guard the whole doc against the method name drifting back into a copy-pasteable command.
+    # `rekey_audit_chain` was a store method, never a CLI subcommand, and `rekey-audit` is a removed
+    # one; argparse rejects each as an invalid choice. Guard the whole doc against either drifting
+    # back into a copy-pasteable command.
     text = _DOC.read_text(encoding="utf-8")
-    assert f"messagefoundry {_STORE_METHOD_NAME}" not in text, (
-        f"the runbook presents the store-method name `{_STORE_METHOD_NAME}` as a CLI command; "
-        f"the registered subcommand is `{_EXPECTED_SUBCOMMAND}`"
-    )
+    for gone in (_STORE_METHOD_NAME, _REMOVED_SUBCOMMAND):
+        assert f"messagefoundry {gone}" not in text, (
+            f"the runbook presents `{gone}` as a CLI command; it is not one. "
+            f"The registered subcommand is `{_EXPECTED_SUBCOMMAND}`"
+        )
     for cmd in _cli_invocations(_audit_section()):
         assert _STORE_METHOD_NAME not in cmd, (
             f"store-method name leaked into a CLI invocation: {cmd!r}"

@@ -5644,7 +5644,7 @@ class SecuritySettings(_Section):
     # to every local account (ASVS 6.3.3); "administrators" restores the pre-6.3.3 posture.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     allow_single_factor_admin_when_exposed: bool = (
-        False  # ADR 0140: permit single-factor admin on an EXPOSED production-PHI bind
+        False  # ADR 0140: lift the require_mfa-off refusal at exposure under enforcement = enforce
     )
     sign_out_after_idle_minutes: int = 30
     max_session_hours: int = 12
@@ -6875,8 +6875,8 @@ def security_loosenings(
     DEVIATION is what the observation found, exactly as with the connection-scoped entries.
 
     ``audit_chain_unkeyed`` is the second store OBSERVATION (BACKLOG #1905), from the open store's
-    ``audit_chain_unkeyed()``: the store holds a key, yet its audit chain is keyless SHA-256 because
-    rows were written before any key was in hand, and a keyed open never re-keys existing rows.
+    ``audit_chain_unkeyed()``: the store holds a key, yet its audit chain does not open with a
+    genesis row naming that key, so it holds keyless rows. Nothing re-keys existing rows.
     ``None`` has the same meaning as for ``store_privilege`` -- no store is open at this call site, so
     nothing was observed -- and is never read as a clean result.
 
@@ -7010,12 +7010,15 @@ def security_loosenings(
                 "(loopback-only; a non-loopback bind refuses)",
             )
         )
+    # Vault BACKLOG #2798: each text names only the accounts its switch frees; the tests say why.
     if not sec.require_mfa:
         out.append(
             (
                 "require_mfa",
-                "every account is single-factor — no engine second factor is required, and a "
-                "directory session is admitted on a ticket that asserts no strength",
+                "an account with no second factor enrolled is single-factor, so a Kerberos session "
+                "enters on a ticket that asserts no strength. An enrolled account must still "
+                "satisfy its factor, and an OIDC sign-in still needs a checked amr/acr claim while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7024,15 +7027,20 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa_scope",
-                "only Administrators must enroll a second factor — every other account, local or "
-                "directory, is single-factor until it opts in by enrolling",
+                "a local account without the Administrator role is single-factor until it enrolls "
+                "a second factor. Administrators and directory accounts still owe one; an OIDC "
+                "sign-in meets it with an amr/acr claim checked while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:
         out.append(
             (
                 "allow_single_factor_admin_when_exposed",
-                "single-factor admin is permitted on an EXPOSED production-PHI bind — no second factor over the network",
+                "an EXPOSED instance under enforcement = enforce may start with "
+                "[security].require_mfa off, on an audited warning instead of the refusal. Every "
+                "account with no second factor enrolled is then single-factor over the network, "
+                "unless an OIDC sign-in carries a checked amr/acr claim",
             )
         )
     if not sec.encrypt_stored_data:
@@ -7402,18 +7410,19 @@ def security_loosenings(
                 )
             )
     # --- the AUDIT CHAIN's observed keying (BACKLOG #1905). An observation, like the entry above: no
-    # switch declares it. A store that holds a key but opened onto a keyless chain with rows carries
-    # tamper-evidence an attacker with write access can forge, and nothing else in this registry
+    # switch declares it. A store that holds a key but opened onto a chain that holds keyless rows
+    # carries rows a writer with no key could have recomputed, and nothing else in this registry
     # would say so -- the at-rest entries report a MISSING key, and here the key is present.
     if audit_chain_unkeyed:
         out.append(
             (
                 "audit_chain_unkeyed",
-                "the audit chain is keyless SHA-256 although a store key is configured -- its rows "
-                "were written before the key was in hand, and opening with a key does not re-key "
-                "existing rows, so anyone who can write audit_log can forge a row that verifies "
-                "clean; stop the engine and run `messagefoundry rekey-audit` to verify the chain and "
-                "key every row after it",
+                "the audit chain holds keyless rows although a store key is configured -- it does "
+                "not open with a genesis row naming its key. A store that holds a key requires "
+                "every audit row keyed, so `messagefoundry audit-verify` reports this chain as "
+                "broken, and no command converts the earlier rows. If the store was first started "
+                "without its key, start a new store with the key configured; otherwise treat the "
+                "chain as altered",
             )
         )
     # --- the engine PROCESS's observed remote-debugging state (vault BACKLOG #2700). An observation

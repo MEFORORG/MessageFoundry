@@ -54,11 +54,18 @@ from harness.load.connscale.runner import (
     _reconcile,
 )
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
-from harness.load.failover import EngineNode, _await_port
+from harness.load.enginepoll import (
+    SIGN_IN_ERRORS,
+    EnginePoller,
+    EngineSample,
+    rig_client,
+    sample_until_reconciled,
+)
+from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.rigadmin import RIG_SESSION
 
 if TYPE_CHECKING:
     from messagefoundry.api.models import ConnectionRow
@@ -446,7 +453,7 @@ async def _run_one_step(
             )
         )
 
-    poller = EnginePoller([n.url for n in nodes], token=None, origin=time.perf_counter())
+    poller = EnginePoller([n.url for n in nodes], token=RIG_SESSION, origin=time.perf_counter())
     samples: list[EngineSample] = []
     aggregate_rate = per_conn_rate * count_per_engine  # per-engine offered rate
     try:
@@ -462,10 +469,16 @@ async def _run_one_step(
         #     loser blows the 30s command timeout and fails startup (observed rc=2 at N>=4, N=16
         #     never started). Serial start+gate removes the convoy for a few seconds per engine —
         #     negligible for a measurement tool, and the steady-state measurement is unaffected.
-        for node in nodes:
-            await node.start()
-            await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
-        await poller.open()
+        #     The engines share ONE store, so the first start provisions the rig Administrator
+        #     and the rest skip that step: it would only find the account already there.
+        #     A refused provisioning or sign-in is a setup failure, reported as the others are.
+        try:
+            for index, node in enumerate(nodes):
+                await node.start(provision=index == 0)
+                await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
+            await poller.open()
+        except (FailoverError, *SIGN_IN_ERRORS) as exc:
+            raise ConnScaleError(f"the engines did not start signed in: {exc}") from exc
         await poller.sample_once()  # aggregate baseline
 
         # Preflight EVERY engine's inbound block (first + last port bound, all N rows reported), so the
@@ -664,12 +677,12 @@ async def _await_inbound_rows_all(
 
 
 def _inbound_rows_per_node(nodes: list[EngineNode]) -> list[int]:
-    from messagefoundry.apiclient import ApiError, EngineClient
+    from messagefoundry.apiclient import ApiError
 
     counts: list[int] = []
     for node in nodes:
         try:
-            client = EngineClient(node.url, cacert=node.cacert)
+            client = rig_client(node.url, cacert=node.cacert)
             try:
                 rows = client.connections()
             finally:
@@ -700,7 +713,7 @@ async def _attribute_engines(
 def _attribute_engines_sync(
     nodes: list[EngineNode], engine_index_base: int = 0
 ) -> list[EngineAttribution]:
-    from messagefoundry.apiclient import ApiError, EngineClient
+    from messagefoundry.apiclient import ApiError
 
     out: list[EngineAttribution] = []
     for k, node in enumerate(nodes):
@@ -710,7 +723,7 @@ def _attribute_engines_sync(
         foreign_rows = 0
         reads = 0
         try:
-            client = EngineClient(node.url, cacert=node.cacert)
+            client = rig_client(node.url, cacert=node.cacert)
             try:
                 rows = client.connections()
                 reasons = _reveal_failed_reasons(client, rows)
@@ -824,13 +837,13 @@ def _build_ms_corpus(ids: ControlIds):  # type: ignore[no-untyped-def]
 def _apply_cluster_env(
     env: dict[str, str], *, cluster_enabled: bool, node_id: str
 ) -> dict[str, str]:
-    """The three insecure-test escapes on EVERY engine; ``[cluster]`` OFF (PRIMARY sweep: all N engines
-    write simultaneously with disjoint rows) or ON (the lease-protocol comparison arm)."""
+    """The two insecure-test escapes on EVERY engine; ``[cluster]`` OFF (PRIMARY sweep: all N engines
+    write simultaneously with disjoint rows) or ON (the lease-protocol comparison arm). Sign-in is not
+    among them: every engine serves with it on, and ``EngineNode`` provisions the rig Administrator."""
     env = dict(env)
-    # Loopback API + no auth + the config-source/TLS escapes so `serve --host 127.0.0.1` starts clean.
+    # Loopback API + the config-source/TLS escapes so `serve --host 127.0.0.1` starts clean.
     env["MEFOR_ALLOW_INSECURE_TLS"] = "1"
     env["MEFOR_ALLOW_INSECURE_CONFIG_SOURCE"] = "1"
-    env["MEFOR_SECURITY_REQUIRE_SIGN_IN"] = "false"
     if cluster_enabled:
         env["MEFOR_CLUSTER_ENABLED"] = "true"
         env["MEFOR_CLUSTER_NODE_ID"] = node_id

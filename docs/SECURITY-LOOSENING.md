@@ -1165,24 +1165,25 @@ This section is kept rather than deleted, because the claim it used to make is t
 ### `audit_chain_unkeyed` — the store has a key, but its audit chain is keyless
 
 > **An OBSERVATION, not a switch.** Nobody sets this. The store reports it when it opens with a key
-> (or an isolated-module MAC) onto an audit chain that has rows but no keying watermark. BACKLOG #1905.
-- **What you lose:** tamper evidence against forgery. Every existing audit row is plain SHA-256, so
-  anyone who can write `audit_log` can rewrite a row and recompute the chain, and `audit-verify`
-  reports it clean. A keyed chain would need the store key to do that.
+> (or an isolated-module MAC) onto an audit chain that has rows but no genesis row at sequence
+> number 1, so the chain holds keyless rows. BACKLOG #1905.
+- **What you lose:** tamper evidence against forgery for those rows. A keyless audit row is plain
+  SHA-256, so anyone who can write `audit_log` could have rewritten it and recomputed the chain.
+  `audit-verify` reports this chain as broken at its first row. The rule it applies is stated
+  once, in [SECURITY.md](SECURITY.md) under *Tamper-evidence*.
 - **How it happens:** rows were written while no key was in hand, then a key was added. Opening with
-  a key keys a store only when its `audit_log` is empty, and never re-keys rows that already exist,
-  because that would bless a forged row. The documented install order used to produce this: run
-  `provision-admin` with the key only in the service's environment, and the first audit row is
-  keyless. `provision-admin` now refuses under the same condition `serve` refuses to start.
-- **It is never silent:** a WARNING each time the store opens, naming `messagefoundry rekey-audit`,
-  and an `audit_chain_unkeyed` entry in `GET /security/posture`. It is not in the serve-time
-  settings warning or `messagefoundry security show`, because neither opens the store.
-- **How to clear it:** stop the engine, then run `messagefoundry rekey-audit` with the key
-  configured. A running engine keeps the watermark it read at open, so it would go on appending
-  keyless rows above the new one and the next verify would report a break. `rekey-audit` verifies the
-  existing chain first, refuses a broken one, and keys every row after it. The existing rows keep
-  their SHA-256 hashes, but the first keyed row folds in the last keyless hash, so a later edit to
-  any earlier row breaks the keyed suffix.
+  a key starts a keyed chain only when `audit_log` is empty, and never re-keys rows that already
+  exist, because that would bless whatever they say today. Running `provision-admin` with the key
+  only in the service's environment used to produce this. `provision-admin` now refuses under the
+  same condition `serve` refuses to start. The other cause is a chain that was altered.
+- **It is never silent:** an ERROR each time the store opens, a failed `audit-verify`, and an
+  `audit_chain_unkeyed` entry in `GET /security/posture`. It is not in the serve-time settings
+  warning or `messagefoundry security show`, because neither opens the store. Rows the engine
+  appends in this state are keyed under the active key, and `rotate-key` refuses its audit step.
+- **How to clear it:** no command clears it, because none can key a row that was written without
+  a key. If the store was first started without its key, start a new store with the key
+  configured. Otherwise treat the chain as altered and investigate. **CORRECTED 2026-10-01:** this
+  entry told you to run `messagefoundry rekey-audit`. That command is removed.
 - **On a store with no key at all this entry never fires.** That chain is keyless by the audited
   at-rest opt-out, which `allow_unencrypted_phi` already reports.
 
@@ -1197,27 +1198,37 @@ This section is kept rather than deleted, because the claim it used to make is t
   where Yama `ptrace_scope` is `1`, as Ubuntu ships it, only a parent process or one with
   `CAP_SYS_PTRACE` can. The interface is on unless the interpreter starts with
   `-X disable-remote-debug` or `PYTHON_DISABLE_REMOTE_DEBUG=1`.
-- **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** `serve` and
-  `supervise` each install an audit hook as their first step. The interpreter raises an event
-  before it runs an injected script. The hook raises on that event, and the interpreter then drops
-  the script. A refusal logs a WARNING with the script's file name, and no audit row. Where
-  refusals arrive faster than they are logged, lines past a backlog of 64 are dropped. Every
-  refusal is counted, and once one has been refused the entry carries the count.
+- **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** The
+  `messagefoundry` command line installs an audit hook as it starts, before it parses its
+  arguments, so each of its commands has it. The tray (`messagefoundry-tray`) and the authoring
+  toolkit (`messagefoundry-toolkit`) start through their own entry points and install none.
+  The interpreter raises an event before it runs an injected script. The hook raises on that
+  event, and the interpreter then drops the script. A refusal logs a WARNING with the script's
+  file name, and no audit row. The name is written in printable ASCII. Every other character,
+  and the backslash itself, is written as a backslash escape. So a character a log sink cannot
+  encode does not keep the line out of that sink. Where refusals arrive faster than they are
+  logged, lines past a backlog of 64 are dropped. Every refusal is counted, and once one has
+  been refused the entry carries the count.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
-  aim for that window. And a process that can write the engine's memory can run code in it by
-  other means, and can remove a hook.
+  aim for that window. The hook goes in when the command-line module is imported, ahead of its
+  other imports. On one Windows development machine that was about 55 ms after the process was
+  created, against about 210 ms when `serve` installed it as its first step. The interpreter's
+  own start-up, about 20 ms there, cannot be covered from inside the engine. And a process that
+  can write the engine's memory can run code in it by other means, and can remove a hook.
 - **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process the
   operating system lets attach could run Python inside the engine, with the store key, the
   connection secrets and the messages in flight. An application that builds the API without
-  `serve` reports this. `serve` would report it only if another audit hook refused the engine's.
+  `serve` reports this, until something in it imports the command-line module, which installs
+  the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
+  only if another audit hook refused the engine's.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process, and
   no API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
-  line says so. Other commands, such as `rotate-key` and `backup`, install no hook and report
-  nothing.
+  line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook
+  for their own process and report nothing.
 - **A default start reports `remote_debug_enabled`.** `messagefoundry serve` runs through a
   console-script launcher, which cannot pass an interpreter option, so the interface stays on. The
   installed service and the container image start the same way, and neither sets the option or the
@@ -1231,7 +1242,13 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **It is not refused**, at any `enforcement` level. A refusal would stop every start through the
   console script.
 - **Attach debugging goes with it.** `python -m pdb -p <pid>` uses this interface, so it cannot
-  attach to `serve` or `supervise`. There is no switch that turns the hook off.
+  attach to `serve` or `supervise`. The same holds for every other `messagefoundry` command,
+  `validate`, `check` and `dryrun` included: the hook goes in before the command is known. It
+  also holds for a process of your own that imports `messagefoundry.__main__`. There is no
+  switch that turns the hook off. To debug a command, start it under the debugger, as
+  `python -m pdb -m messagefoundry <command>`, which does not use the interface. That reaches
+  the command's own process. Router and Handler bodies that run in a sandbox worker
+  (`[sandbox].mode = "subprocess"`) are in a child process, which it does not reach.
 
 ---
 

@@ -68,6 +68,11 @@ with atheris.instrument_imports():
         # `FuzzTarget.available`, so nothing is silently skipped.
         import pydicom  # noqa: F401
 
+    # The same side-effect trick for the HTTP listener, which `fuzz.targets` imports lazily: loading
+    # it pulls in every connector, so it is loaded (and instrumented) here only when it is the target.
+    if os.environ.get("MEFOR_FUZZ_TARGET") == "http_request":
+        import messagefoundry.transports.http_listener  # noqa: F401
+
     from fuzz.targets import (
         REFUSAL_EXIT,
         TARGETS_BY_NAME,

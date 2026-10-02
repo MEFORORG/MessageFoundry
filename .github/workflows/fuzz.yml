@@ -81,6 +81,10 @@ on:
     # bottleneck, so this must not cost a slot on a pull request that cannot have changed its result.
     paths:
       - "messagefoundry/parsing/**"
+      - "messagefoundry/framing.py"
+      - "messagefoundry/mllpcodec.py"
+      - "messagefoundry/transports/http_listener.py"
+      - "messagefoundry/transports/x12.py"
       - "fuzz/**"
       - "tests/test_fuzz_targets.py"
       - ".github/workflows/fuzz.yml"
@@ -106,9 +110,13 @@ jobs:
   parsers:
     name: parser fuzzing (advisory)
     runs-on: ubuntu-latest
-    # Bounds the whole job well above the sum of the per-target budgets (4 targets x 300s nightly =
-    # 20 minutes) so a hung install cannot sit on a runner, while never truncating a healthy pass.
-    timeout-minutes: 30
+    # Bounds the whole job well above the sum of the per-target budgets (9 targets x 300s nightly =
+    # 45 minutes) so a hung install cannot sit on a runner, while never truncating a healthy pass.
+    # Raised from 30 when the target list grew from four to nine (vault BACKLOG #2683): at 30 the
+    # nightly would have been killed around its sixth target (five 300s budgets plus the install use
+    # most of 30 minutes; the per-target startup is not measured here), before the sentinel the
+    # reporting steps rely on was written. Move this with the target list.
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -172,7 +180,7 @@ jobs:
           # OTHER non-zero exit means libFuzzer ran and something escaped a parser's contract.
           # Collapsing the two was a real misreport: a failed `[dicom]` install published a parser
           # finding that never happened, and the log said so in those words.
-          for target in hl7_peek hl7_tree x12_peek dicom_peek; do
+          for target in hl7_peek hl7_tree x12_peek dicom_peek stream_frames x12_frames http_request compression binary_carriage; do
             echo "=== ${target}: ${FUZZ_SECONDS}s ==="
             status=0
             MEFOR_FUZZ_TARGET="${target}" python -m fuzz.fuzz_parsers \

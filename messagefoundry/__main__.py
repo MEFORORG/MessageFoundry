@@ -21,27 +21,44 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 
 from __future__ import annotations
 
+from messagefoundry.remotedebug import (
+    install_remote_debug_guard,
+    remote_debug_loosening,
+    remote_debug_posture,
+)
+
+# Vault BACKLOG #2742: the hook that refuses an injected script goes in HERE, at import, ahead of
+# every other import and of argument parsing, so every subcommand has it. Put nothing above this
+# call: a script injected before it runs. `messagefoundry/remotedebug.py` says what the hook does
+# and what stays open. Anything that imports this module gets the hook too, for the life of its
+# process: the test suite does, and so does `api/tls.py` inside an engine that already has it.
+#
+# `_serve` and `_supervise` still make the same call first. Their comments describe the window
+# as it was before this call existed; with this one in place theirs normally adds nothing.
+install_remote_debug_guard()
+
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
 # open a store or read a service TOML use these. The rest below runs on every command or is the
 # logging chain, so it stays eager. The heavy import is deferred in config/__init__.py.
 __lazy_modules__ = ["sqlite3", "tomllib"]
 
-import argparse
-import contextlib
-import functools
-import json
-import logging
-import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
-import sys
-import tomllib  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
-from collections.abc import Mapping, Sequence
-from pathlib import (
+# E402 on each import below: they follow the install call above on purpose.
+import argparse  # noqa: E402
+import contextlib  # noqa: E402
+import functools  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import sqlite3  # noqa: E402  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
+import sys  # noqa: E402
+import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
+from collections.abc import Mapping, Sequence  # noqa: E402
+from pathlib import (  # noqa: E402
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast  # noqa: E402
 
-from messagefoundry import __version__
-from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR 0201 slice 1)
+from messagefoundry import __version__  # noqa: E402
+from messagefoundry.cli_common import (  # noqa: E402  # the shared CLI shell and helpers (ADR 0201 slice 1)
     Dispatch,
     HelpFormatter,
     _emit_error,
@@ -53,21 +70,19 @@ from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR
     first_command,
     run_cli,
 )
-from messagefoundry.cli_surface import CLI_TIERS, TOOLKIT_COMMAND  # pure data, stdlib-only imports
-from messagefoundry.console_streams import harden_console_streams
-from messagefoundry.logging_setup import (
+from messagefoundry.cli_surface import (  # noqa: E402  # pure data, stdlib-only imports
+    CLI_TIERS,
+    TOOLKIT_COMMAND,
+)
+from messagefoundry.console_streams import harden_console_streams  # noqa: E402
+from messagefoundry.logging_setup import (  # noqa: E402
     LOG_LEVELS,
     LogFile,
     SyslogForward,
     configure_logging,
     query_sntp_offset,
 )
-from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.remotedebug import (
-    install_remote_debug_guard,
-    remote_debug_loosening,
-    remote_debug_posture,
-)
+from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
 
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
@@ -897,7 +912,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--expected-anchor",
         default=None,
         metavar="COUNT:HEAD",
-        help="also compare against an anchor previously printed by 'audit-anchor'. The hash-chain "
+        help="also compare against an anchor previously printed by 'audit-anchor' (COUNT is the "
+        "newest row's sequence number, which the off-box audit record carries as 'seq'). The hash-chain "
         "walk alone CANNOT see a truncated tail (the surviving prefix still chains cleanly); this "
         "is what detects it",
     )
@@ -922,18 +938,6 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     audit_anchor.add_argument("--db", default=None, help="store path (overrides [store].path)")
     audit_anchor.add_argument("--json", action="store_true", help="emit JSON")
-
-    rekey_audit = sub.add_parser(
-        "rekey-audit",
-        help="enable HMAC keying of an existing keyless audit chain (#190-D migration; non-silent, "
-        "re-verifies first, requires the store encryption key — run with the engine stopped)",
-    )
-    rekey_audit.add_argument(
-        "--service-config",
-        default=None,
-        help="service settings TOML (default: ./messagefoundry.toml if present)",
-    )
-    rekey_audit.add_argument("--db", default=None, help="store path (overrides [store].path)")
 
     rotate_key = sub.add_parser(
         "rotate-key",
@@ -3135,12 +3139,15 @@ def _serve(args: argparse.Namespace) -> int:
         if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
             print(
                 f"error: {exposure_desc} on a {'production ' if production else ''}PHI "
-                f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — the "
-                "Administrator role would authenticate with a single factor over the network. "
+                f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — every "
+                "account with no second factor enrolled, Administrators included, would "
+                "authenticate with a single factor over the network, unless an OIDC sign-in "
+                "carries a checked amr/acr claim. "
                 "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
-                "API (on an AD-only deployment it binds directory principals too, each enrolling "
-                "an engine factor); or set [security].allow_single_factor_admin_when_exposed=true to "
-                "deliberately permit single-factor admin at exposure (audited).",
+                "API (on an AD-only deployment it binds directory principals too: each enrolls an "
+                "engine factor unless its OIDC sign-in carries a checked amr/acr claim); or set "
+                "[security].allow_single_factor_admin_when_exposed=true to deliberately permit "
+                "single-factor sign-in at exposure (audited).",
                 file=sys.stderr,
             )
             return 2
@@ -3151,16 +3158,18 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).warning(
                 "AUDIT: %s on a %sPHI instance (environment %r) with [security].require_mfa "
                 "off, permitted because [security].allow_single_factor_admin_when_exposed=true — every "
-                "account in [security].require_mfa_scope is single-factor over the network.",
+                "account with no second factor enrolled is single-factor over the network, unless "
+                "an OIDC sign-in carries a checked amr/acr claim.",
                 exposure_desc,
                 "production " if production else "",
                 env_name,
             )
         print(
             f"warning: {exposure_desc} in a PHI-carrying "
-            f"environment ({env_name!r}) with [security].require_mfa off — every account in "
-            "[security].require_mfa_scope is single-factor over the network. Enable [security].require_mfa=true (WP-14 native TOTP) "
-            "before exposure.",
+            f"environment ({env_name!r}) with [security].require_mfa off — every account with no "
+            "second factor enrolled is single-factor over the network, unless an OIDC sign-in "
+            "carries a checked amr/acr claim. Enable "
+            "[security].require_mfa=true (WP-14 native TOTP) before exposure.",
             file=sys.stderr,
         )
 
@@ -3185,8 +3194,8 @@ def _serve(args: argparse.Namespace) -> int:
             "warning: [security].web_console_public_address is set with no declared TLS terminator "
             "on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
-            "UNDECLARED reverse proxy, every account in [security].require_mfa_scope is single-factor over "
-            "the network and "
+            "UNDECLARED reverse proxy, every account with no second factor enrolled is single-factor "
+            "over the network (unless an OIDC sign-in carries a checked amr/acr claim) and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
             "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
             "trusted_proxies, or set [security].require_mfa=true.",
@@ -6161,8 +6170,9 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     ``serve``, and ``provision-admin`` since BACKLOG #1905. Before that item the decision lived inline in
     ``serve`` alone, so the documented install order -- ``provision-admin`` before the first ``serve``,
     with the key in the service environment rather than the operator's shell -- opened the store with
-    no key, wrote the first audit row as keyless SHA-256, and left a chain that a later keyed open never
-    keys (``_load_audit_chain_meta`` auto-keys only an EMPTY ``audit_log``).
+    no key, wrote the first audit row as keyless SHA-256, and left a chain that a later keyed open
+    reports as broken: a store that holds a key requires every audit row keyed, and only an EMPTY
+    ``audit_log`` gets a genesis row.
 
     ``None`` covers two cases: a key is configured, or one of the audited opt-outs applies (the caller
     then proceeds keyless and says so). The WORDING stays with each caller, because the remedy differs:
@@ -7228,68 +7238,6 @@ def _audit_anchor(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0
-
-
-def _rekey_audit(args: argparse.Namespace) -> int:
-    """Enable HMAC keying of an EXISTING keyless audit chain (#190-D migration).
-
-    This is the owner-visible fork the spec asked for: fresh encrypted stores auto-key from row 1, but
-    an already-deployed keyless encrypted store only becomes keyed through this explicit, **non-silent**
-    step — never on ``open()``. It requires the store encryption key (``MEFOR_STORE_ENCRYPTION_KEY``),
-    FIRST re-verifies the existing keyless chain (refusing to bless a broken/forged one), then sets the
-    keying watermark to the next id without rewriting any existing ``row_hash``. Run with the engine
-    stopped so no concurrent append races the watermark move."""
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
-    from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import (
-        KeylessAuditChainRefused,
-        StoreNotFoundError,
-        open_store,
-    )
-
-    cli: dict[str, dict[str, object]] = {}
-    if args.db is not None:
-        cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    # Refuse to create-and-key a fresh empty SQLite DB from a typo'd path or a zero-byte file
-    # (mirrors the _audit_verify guard).
-    refused = _refuse_a_store_that_is_not_an_audit_log(
-        is_sqlite=settings.store.backend == StoreBackend.SQLITE,
-        path=settings.store.path,
-        refusal="refusing to create one",
-        as_json=False,  # rekey-audit has no --json
-    )
-    if refused is not None:
-        return refused
-
-    async def run() -> tuple[bool, str]:
-        # warn_unkeyed_chain=False (#1916): the keyless-chain WARNING names this command as its remedy.
-        store = await open_store(
-            settings.store,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-            warn_unkeyed_chain=False,
-        )
-        try:
-            return await store.rekey_audit_chain()
-        finally:
-            await store.close()
-
-    try:
-        ok, message = run_guarded(run())
-    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780: could not start
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=False)
-    print(("OK: " if ok else "FAIL: ") + message)
-    return 0 if ok else 1
 
 
 class _OfflineProbe(NamedTuple):
@@ -8705,7 +8653,6 @@ _DISPATCH = {
     "check-privileges": _check_privileges,
     "audit-verify": _audit_verify,
     "audit-anchor": _audit_anchor,
-    "rekey-audit": _rekey_audit,
     "rotate-key": _rotate_key,
     "backup": _backup,
     "restore-verify": _restore_verify,

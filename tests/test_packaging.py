@@ -238,7 +238,7 @@ def test_no_force_include_entry_outlives_the_file_it_names() -> None:
 
     hatchling does not filter a force-include source for existence -- ``recurse_forced_files`` raises
     ``FileNotFoundError: Forced include not found: <path>`` outright. Nothing in PR CI runs a build, so
-    deleting ``harness/scenarios.py`` without editing the map goes green the whole way to
+    deleting ``harness/compose.py`` without editing the map goes green the whole way to
     ``release-harness``, which then fails mid-release. The whole-directory map this replaced could not
     fail that way, so the enumeration introduced it and this assertion is what pays for it.
 
@@ -635,7 +635,7 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
     Its ``[tool.hatch.version].path`` is the ENGINE's ``__init__.py``, so the harness wheel and the
     engine it depends on carry the same version by construction. A bare ``messagefoundry[harness]``
     did not express "any engine works", it expressed nothing, while the truth available at build time
-    was an exact version. harness/monitor.py and harness/scenarios.py import
+    was an exact version. harness/monitor.py and harness/scenarios/ import
     ``messagefoundry.apiclient`` at module level, so an engine without it installs cleanly and then
     fails on the operator's first command.
 

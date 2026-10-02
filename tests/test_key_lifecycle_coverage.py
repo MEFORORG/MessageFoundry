@@ -233,6 +233,11 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/pipeline/reference_sync.py": _POSTURE_ONLY,
     "harness/load/connscale/runner.py": _POSTURE_ONLY,
     "harness/load/shardcert.py": _POSTURE_ONLY,
+    # Vault BACKLOG #2719: the per-run rig password is a credential, hashed by argon2id like any
+    # local account's. It is classified the same way in tests/test_key_usage_scope_inventory.py.
+    "harness/load/rigadmin.py": "draws a per-run rig Administrator password (a credential, not a "
+    "key) and signs in over a verifying TLS context; it loads, mints and holds no private or "
+    "secret key",
     "messagefoundry/pipeline/security_notify.py": _POSTURE_ONLY,
     "messagefoundry/pipeline/wiring_runner.py": _POSTURE_ONLY,
     "messagefoundry/api/app.py": _POSTURE_ONLY,

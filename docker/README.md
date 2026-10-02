@@ -136,8 +136,10 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
   Because raw-TCP/X12 have no TLS to enable, the only way past the gate is a loopback bind, OS-level
   firewall/segmentation, or `serve --allow-insecure-bind` (a loud dev-only escape) — keep them
   loopback-bound or front them with a TLS-terminating TCP proxy.
-- **`require_mfa=true` for production + local accounts.** A production-PHI off-loopback bind with local
-  accounts and `require_mfa=false` is **refused at startup** (AD-only shops delegate MFA). Set it true.
+- **Keep `require_mfa=true`, the default.** It covers directory accounts too
+  ([the rule](../docs/SECURITY.md#multi-factor-authentication-totp-wp-14)). An exposed instance with
+  `require_mfa=false` is **refused at startup** under the shipped `enforce`, unless
+  `[security].allow_single_factor_admin_when_exposed` is set.
 - **Never bake `MEFOR_ALLOW_INSECURE_TLS`** — it disables outbound/peer TLS verification across **all**
   transports (store incl. Postgres/SQL Server, MLLP-outbound, REST/SOAP/FHIR/SMART/DATABASE, SFTP host-key,
   LDAP, alert webhooks). It is a CI-only switch for self-signed test containers.
@@ -149,6 +151,6 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
 ## CI
 
 The `docker-smoke` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds the slim image
-and a baked test image ([`smoke/`](smoke/)), serves it loopback + auth-off, sends one synthetic ADT^A01
+and a baked test image ([`smoke/`](smoke/)), serves it loopback + signed in, sends one synthetic ADT^A01
 over MLLP, asserts it finalizes to **PROCESSED** (not merely RECEIVED), and verifies a graceful
 `docker stop`. It is the engine's first non-Windows runtime gate.

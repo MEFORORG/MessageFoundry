@@ -343,8 +343,7 @@ def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
         # rendering would come back with its keywords redacted.
         sqlserver._rcsi_remedy("mefor_test"),
         sqlserver._options_remedy("mefor_test", [name for name, _ in sqlserver._DATABASE_OPTIONS]),
-        store.AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK,
-        store.AUDIT_CHAIN_META_ROW_CHANGED,
+        store.AUDIT_CHAIN_KEYLESS_ROWS,
     ]
     # An audit-table grant is built by a helper and joined into a refusal later, out of the scan.
     texts += [

@@ -54,27 +54,26 @@ _RUN_TIMEOUT_SECONDS = 30.0
 
 @pytest.fixture
 async def clean_audit_store() -> AsyncIterator[Any]:
-    """A store handle over an audit_log and audit_chain_meta cleared to a clean slate.
+    """A store handle over an ``audit_log`` cleared to a clean slate.
 
-    The watermark table goes first and the in-memory copy is re-synced after it: a keying watermark
-    left by another test would fail-close every keyless ``record_audit`` in this module (#190), and
-    the handle caches it at open.
+    The handle reads the chain's state at open. A keyed chain left by another test would make
+    every keyless ``record_audit`` in this module refuse, so the state is read again once the log
+    is empty. A keyless handle writes nothing there.
     """
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.sqlserver import SqlServerStore
+    from messagefoundry.store.store import load_audit_chain
 
     store = await SqlServerStore.open(load_settings(environ=os.environ).store)
-    await _truncate_audit(store, include_watermark=True)
-    store._audit_keyed_from = None
+    await _truncate_audit(store)
+    await load_audit_chain(store, read_only=False)
     yield store
     await store.close()
 
 
-async def _truncate_audit(store: Any, *, include_watermark: bool) -> None:
+async def _truncate_audit(store: Any) -> None:
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
-        if include_watermark:
-            await cur.execute("DELETE FROM audit_chain_meta")
         await cur.execute("DELETE FROM audit_log")
         await conn.commit()
 
@@ -125,7 +124,7 @@ async def test_two_processes_appending_audit_rows_cannot_fork_the_chain(
         _await_ready(procs, ready_files)
         # Both stores are open and idle, so the table is empty AT THE MOMENT the appends start:
         # a fresh chain from prev="" is what verify_audit_chain walks.
-        await _truncate_audit(store, include_watermark=False)
+        await _truncate_audit(store)
         go.write_text("go", encoding="utf-8")
         for proc in procs:
             out, err = proc.communicate(timeout=_RUN_TIMEOUT_SECONDS)

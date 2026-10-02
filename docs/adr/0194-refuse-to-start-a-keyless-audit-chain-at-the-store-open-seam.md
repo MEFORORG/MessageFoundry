@@ -1,6 +1,8 @@
 # 0194 — Refuse to start a keyless audit chain at the store-open seam
 
-- **Status:** Accepted (2026-09-24) -- built with the change.
+- **Status:** Accepted (2026-09-24) -- built with the change. **Amended 2026-10-01** by owner
+  ruling: see *Amendment 2026-10-01* at the end. Decision steps 2, 4 and 5 are changed there. The
+  text below is kept as it was decided.
 - **Date:** 2026-09-24
 - **Related:** BACKLOG #1916 (the defect), #1905 (the CLI gate this generalises), #190 (the keyed
   chain and its watermark), [ADR 0193](0193-audit-chain-key-ranges-survive-a-store-key-rotation.md)
@@ -127,3 +129,47 @@ loud rather than silent, so it is recorded here rather than closed.
 - The backend `.open` classmethods decide nothing. They are library primitives, and the tests use
   them to build fixtures. `Engine.create(db_path)` is the one product caller of one, and it is the
   documented tests and embedding convenience.
+
+---
+
+## Amendment 2026-10-01 -- the seam reads no keying mark, and the warning switch is gone
+
+- **Status:** Accepted by owner ruling (2026-10-01) -- built with the change (vault BACKLOG #2594).
+- **Changes:** Decision steps 2, 4 and 5, one sentence of the Context, one rejected option and one
+  consequence. The seam itself, its refusing default and its source guard stand.
+
+[ADR 0193](0193-audit-chain-key-ranges-survive-a-store-key-rotation.md), as amended the same day,
+removes the keying mark this ADR read and the `rekey-audit` command it named. A keyed chain now
+opens with a genesis row that names its key, and a store that holds a key requires every audit row
+keyed.
+
+1. **Context.** *"A chain that starts keyless stays keyless until an operator runs `rekey-audit`"*
+   now ends at *stays keyless*. No command keys a chain in place, and a store that holds a key
+   reports a chain with keyless rows as broken. That raises the cost of a keyless start, which is
+   the thing this ADR refuses.
+2. **Step 2.** The refused state is: the opened store holds no keying secret, and `audit_log` is
+   empty. The third condition, *no keying watermark is recorded*, is gone with the mark. A keyed
+   chain is never empty, because it holds its genesis row, so an empty log is always one nobody
+   has started. *"A keyed open still keys it from row 1"* now reads: a keyed open writes its
+   genesis row into the empty log.
+3. **Step 4.** The case `audit_append_refusal()` was added for, *an empty chain that is already
+   keyed, opened with no key*, cannot exist. The case it covers now is a keyed chain opened with
+   no key. The handle reads from the genesis row that the chain is keyed, and the same method
+   answers that its append would be refused. `provision-admin`, `admin-unlock` and `backup` still
+   ask it before their first write.
+4. **Step 5 is withdrawn.** `open_store(warn_unkeyed_chain=...)` is removed. Its one caller was
+   `rekey-audit`. A store that holds a key and opens onto keyless rows logs an ERROR on every open,
+   and no command silences it.
+5. **The recorded race stands, reworded.** `admin-unlock` run with the opt-out and no key, while
+   `serve` starts for the first time with a key, can still read an empty log and append after
+   `serve` wrote its genesis row. That append is a keyless row in a keyed chain, which
+   `audit-verify` reports. It is recorded, not closed, as before.
+6. **Rejected option.** *"Auto-key the chain at open when rows exist"* stays rejected. Its last
+   sentence, *"`rekey-audit` stays the explicit, chain-verifying step"*, is withdrawn: nothing keys
+   rows that already exist.
+7. **Consequences.** `rekey-audit` leaves the list of commands that exit 2 on a fresh keyless
+   store, and leaves the source guard's list of CLI openers.
+
+**What comes next.** The owner has also ruled that the keyless store mode is to be removed. When
+that lands no store opens without a key, and this ADR's refusal has nothing left to refuse. That is
+a separate, later change, and until it lands this ADR is what stops a keyless start.

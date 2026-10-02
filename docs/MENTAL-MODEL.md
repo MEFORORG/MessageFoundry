@@ -269,7 +269,7 @@ The standalone PySide6 **test harness** is the deliberate exception. It’s a se
 
 This engine carries PHI, so security is built, not bolted on:
 
-- **Auth + RBAC** — local + AD (LDAP/Kerberos) users, built-in roles (plus custom roles, ADR 0045), deny-by-default per-route permissions, opaque sessions, native TOTP MFA **and** browser WebAuthn passkeys (ADR 0068, the \[webauthn\] extra) for local accounts, full audit (auth/, api/, docs/SECURITY.md).
+- **Auth + RBAC** — local + AD (LDAP/Kerberos) users, built-in roles (plus custom roles, ADR 0045), deny-by-default per-route permissions, opaque sessions, native TOTP MFA **and** browser WebAuthn passkeys (ADR 0068, the \[webauthn\] extra) for local and directory accounts, full audit (auth/, api/, docs/SECURITY.md).
 
 - **Encryption-at-rest** — message bodies are AES-256-GCM encrypted in the store.
 
@@ -537,7 +537,7 @@ The runtime core is around twenty packages; everything past it is an **opt-in ex
 | \[dicom\] | pynetdicom, pydicom | DICOM C-STORE SCP/SCU connectors + the headers/SR codec (no pixel data, so no numpy). |
 | \[x12\] | pyx12 | Opt-in *strict* X12 validation; the tolerant X12 peek/parse hot path needs nothing. |
 | \[xml\] | lxml, xmlschema, signxml | XML/SOAP accessors, XSD validation, and XML-DSig signatures. |
-| \[webauthn\] | webauthn | Browser passkeys (WebAuthn/FIDO2) as a second factor for local accounts. |
+| \[webauthn\] | webauthn | Browser passkeys (WebAuthn/FIDO2) as a second factor for local and directory accounts. |
 | \[vault\] | hvac | The HashiCorp Vault key provider — envelope-decrypt the store’s data key via Vault Transit. |
 | \[otel\] | opentelemetry-sdk, opentelemetry-exporter-otlp | Optional OpenTelemetry export; the Prometheus /metrics path needs none of it. |
 | \[dev\] | pytest (+ asyncio / timeout / rerun plugins), ruff, mypy | Tests, lint/format, and strict type-checking. |

@@ -136,10 +136,12 @@ threads, so a future free-threading adoption knows exactly what to harden.
 
 ### Module-level registries — populated at import, read-only at runtime → SAFE
 
-* `messagefoundry/transports/base.py:244-245` — `_SOURCES` / `_DESTINATIONS` dicts, mutated only by
+* `messagefoundry/transports/base.py` — `_SOURCES` / `_DESTINATIONS` dicts, mutated only by
   `register_source` / `register_destination`. Every call site is at **module import time** (bottom of
-  each `transports/*.py`, e.g. `mllp.py:699-700`, `file.py:553-554`, `dicom.py:584-585`). After import
-  they are **read-only** (`build_source`/`build_destination` only read). Read-only-after-import dicts
+  each `transports/*.py` connector module). After import
+  they are **read-only** (`build_source`/`build_destination` look up one key; `registered_kinds`
+  copies each dict into a frozenset, one after the other, so its answer is not an atomic snapshot
+  of both and it too relies on registration finishing at import). Read-only-after-import dicts
   are safe under free-threading — no runtime mutation, no race. **No change needed.**
 * Other module-level constants found by the audit (`mllp.py:_CODES`, `file.py:_RESERVED`,
   `parsing/x12/message.py:_ENVELOPE_SEGMENTS`, `parsing/dicom/peek.py:_PEEK_TAGS`,
