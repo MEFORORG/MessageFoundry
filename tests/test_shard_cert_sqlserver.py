@@ -29,6 +29,7 @@ import os
 import pytest
 
 from harness.load.shardcert import ShardCertReport, run_shardcert
+from tests._rig_store import reset_accounts
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -68,6 +69,8 @@ def test_shardcert_baseline_no_loss() -> None:
     FIFO / no stranded — the single-consumer assignment drains every shared lane exactly once."""
     import asyncio
 
+    # The fleet provisions its own rig Administrator, so the shared store may hold none yet.
+    asyncio.run(reset_accounts("sqlserver"))
     report = asyncio.run(
         run_shardcert(
             dests=6,
@@ -90,6 +93,8 @@ def test_shardcert_kill_leg_scoped_recovery() -> None:
     only its lanes, siblings untouched, fleet drains with zero acknowledged loss + per-lane FIFO."""
     import asyncio
 
+    # The fleet provisions its own rig Administrator, so the shared store may hold none yet.
+    asyncio.run(reset_accounts("sqlserver"))
     report = asyncio.run(
         run_shardcert(
             dests=6,

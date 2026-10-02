@@ -17,6 +17,7 @@ deliberately reaches ``uvicorn.Server``, ``threading.Thread`` and ``time`` throu
 from __future__ import annotations
 
 import os
+import random
 import socket
 import threading
 import time
@@ -39,12 +40,56 @@ HARNESS_CONFIG = REPO / "harness" / "config"
 START_TIMEOUT_SECONDS = 40.0
 
 
+#: The port window the served harness graphs take their listeners from. A port the KERNEL assigns
+#: (``bind(0)``) and then releases can be handed to an unrelated socket a moment later, and a served
+#: harness graph releases about thirty of them before the engine binds them; under pytest-xdist that
+#: collided often enough to fail a run. This window sits below every OS ephemeral floor (Linux
+#: 32768, Windows and macOS 49152), so the kernel never hands one out, and above the connscale
+#: windows that end at 31700 (tests/_connscale_ports.py, which records how the band was measured).
+PORT_LO = 31700
+PORT_HI = 32700
+
+#: The narrowest slice a worker gets. One served graph takes about thirty ports (every PORT endpoint
+#: plus the API), so a slice must hold more than one graph's worth or a single graph could be handed
+#: the same port twice. Past the worker count the window can hold at this width, workers share
+#: slices, and the random start below keeps them apart.
+MIN_SLICE = 64
+
+_cursor: int | None = None
+
+
+def _worker_slice() -> range:
+    """This pytest-xdist worker's share of the window. Outside xdist the whole window is one slice."""
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    count = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1") or "1")
+    index = int(worker[2:]) if worker.startswith("gw") and worker[2:].isdigit() else 0
+    slots = max(1, min(count, (PORT_HI - PORT_LO) // MIN_SLICE))
+    width = (PORT_HI - PORT_LO) // slots
+    start = PORT_LO + (index % slots) * width
+    return range(start, start + width)
+
+
 def free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = int(s.getsockname()[1])
-    s.close()
-    return port
+    """The next port in this worker's slice that binds right now. The walk starts at a RANDOM point in
+    the slice, once per process, so two processes on one host -- two worktrees running the harness
+    tests at once, or two workers sharing a slice -- do not draw the same sequence; it then walks in
+    order and wraps. Raises :class:`RuntimeError` when no port in the slice binds."""
+    global _cursor
+    ports = _worker_slice()
+    if _cursor is None or _cursor not in ports:
+        _cursor = ports.start + random.randrange(len(ports))
+    for _ in range(len(ports)):
+        port = _cursor
+        _cursor = ports.start + (_cursor - ports.start + 1) % len(ports)
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        finally:
+            probe.close()
+        return port
+    raise RuntimeError(f"no free port in {ports.start}-{ports.stop - 1}")
 
 
 def ephemeral_overrides(tmp_path: Path) -> dict[str, str]:

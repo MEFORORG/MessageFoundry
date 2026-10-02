@@ -572,6 +572,13 @@ async def run_batch_engine(
             install_executor_shim=False,
             db_path=None,  # batch is SQL-Server-scoped: the store comes from MEFOR_STORE_*
         )
+        # RIGS SIGN IN, AND THIS RIG'S DRIVE IS SPLIT OVER PROCESSES. Each of the driver's `procs`
+        # connscale-remote processes holds its own session as the one rig Administrator. The engine
+        # keeps five sessions for a user by default and ends the oldest past that, so a sixth
+        # process would end the first one's session, which would sign in again and end the next.
+        # So the cap is sized to the fleet this cell advertises, doubled for a process that signs
+        # in again. setdefault, so an operator's own value stands.
+        node_env.setdefault("MEFOR_AUTH_MAX_SESSIONS_PER_USER", str(2 * procs + 2))
         node = EngineNode(
             f"batch-{cell.cell_id}", api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
         )
@@ -661,9 +668,17 @@ async def _run_remote_proc(argv: list[str], report_path: Path, cwd: Path) -> dic
         *argv,
         cwd=str(cwd),
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    await proc.wait()
+    _, said = await proc.communicate()
+    if not report_path.exists():
+        # The process writes its report only when it ran. One that could not start (a band layout
+        # it refused, a sign-in the engine refused) says why on stderr and writes nothing, and that
+        # reason used to be discarded, leaving a bare FileNotFoundError.
+        reason = said.decode("utf-8", "replace").strip()[-600:] or "it said nothing on stderr"
+        raise ConnScaleError(
+            f"connscale-remote exited {proc.returncode} and wrote no report: {reason}"
+        )
     data = json.loads(report_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ConnScaleError(f"connscale-remote report {report_path} is not a JSON object")

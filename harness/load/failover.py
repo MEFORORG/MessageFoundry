@@ -48,6 +48,7 @@ from typing import IO, Any
 
 import httpx
 
+from harness.load import rigadmin
 from harness.load.corpus import build_corpus
 from harness.load.correlator import Correlator
 from harness.load.failover_track import FailoverTracker, LeadershipTracker
@@ -157,6 +158,14 @@ class EngineNode:
         # not covered: on a writable Windows checkout its shell must carry both variables.
         if sys.platform == "win32":
             self._env.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
+        # RIGS SIGN IN (harness.load.rigadmin). The node serves with sign-in on, whatever the calling
+        # shell holds: `start` provisions the rig Administrator in this node's store first, and the
+        # API reads below carry that account's session. The rig password stays out of the engine's
+        # environment; only the provisioning child is handed it.
+        self._env.pop("MEFOR_SECURITY_REQUIRE_SIGN_IN", None)
+        self._env.pop(rigadmin.ADMIN_PASS_ENV, None)
+        for name, value in rigadmin.SERVE_ENV.items():
+            self._env.setdefault(name, value)
         self._config_dir = config_dir
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
@@ -179,7 +188,23 @@ class EngineNode:
                 prefix=f"mefor-failover-{node_id}-", suffix=".log", delete=False
             )
 
-    async def start(self) -> None:
+    async def provision(self) -> None:
+        """Provision the rig Administrator in this node's store, under this node's own settings.
+
+        A store that already has one is left alone: the second node of a shared store meets that on
+        every run. A store that held an Administrator BEFORE this run refuses the rig's sign-in
+        later, and :mod:`harness.load.rigadmin` says what to do then."""
+        try:
+            await asyncio.to_thread(rigadmin.provision, env=self._env, cwd=self._cwd)
+        except rigadmin.RigAdminError as exc:
+            raise FailoverError(f"node {self.node_id}: {exc}") from exc
+
+    async def start(self, *, provision: bool = True) -> None:
+        """Start the ``serve`` subprocess. ``provision=False`` skips the account step, for a
+        RESTART on a store this run already provisioned: the step costs a process start, and a
+        restart leg times its recovery."""
+        if provision:
+            await self.provision()
         self._proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -249,20 +274,41 @@ class EngineNode:
             return ""
         return data[-limit:].decode("utf-8", "replace")
 
-    # --- API reads (auth is disabled on the test nodes, so no token is needed) ---
+    # --- API reads (/health needs no session; the rest are read as the rig Administrator) ---
 
     async def healthy(self, client: httpx.AsyncClient) -> bool:
         return (await _get_json(client, f"{self.url}/health")) is not None
 
+    async def _signed_in_json(self, client: httpx.AsyncClient, path: str) -> dict[str, Any] | None:
+        """GET ``path`` with the rig session; ``None`` if the node is unreachable, as before.
+
+        A node that refuses the session (401) is asked again once with a renewed one. A sign-in the
+        engine REFUSES is not "unreachable" and is not swallowed: it raises ``FailoverError``, the
+        setup failure every runner over this class already reports, with the reason."""
+        url = f"{self.url}{path}"
+        try:
+            token = await asyncio.to_thread(rigadmin.session_token, self.url, cacert=self.cacert)
+            status, body = await _get_status_json(client, url, token)
+            if status == 401:
+                token = await asyncio.to_thread(
+                    rigadmin.renew_session, self.url, token, cacert=self.cacert
+                )
+                status, body = await _get_status_json(client, url, token)
+        except rigadmin.RigUnreachable:
+            return None
+        except rigadmin.RigSignInRefused as exc:
+            raise FailoverError(f"node {self.node_id}: {exc}") from exc
+        return body if status == 200 else None
+
     async def role(self, client: httpx.AsyncClient) -> str | None:
         """``"primary"`` / ``"standby"`` / ``"single-node"`` from ``/cluster/status``; ``None`` if the
         node is unreachable (down, killed, or still starting)."""
-        data = await _get_json(client, f"{self.url}/cluster/status")
+        data = await self._signed_in_json(client, "/cluster/status")
         role = data.get("role") if data else None
         return role if isinstance(role, str) else None
 
     async def stats(self, client: httpx.AsyncClient) -> NodeStats | None:
-        data = await _get_json(client, f"{self.url}/stats")
+        data = await self._signed_in_json(client, "/stats")
         if data is None:
             return None
         by = data.get("outbox_by_status", {})
@@ -279,17 +325,26 @@ class EngineNode:
 async def _get_json(client: httpx.AsyncClient, url: str) -> dict[str, Any] | None:
     """GET ``url`` and return the JSON object, or ``None`` on any error / non-200 (a killed or
     still-starting node just refuses the connection — that's expected, never raised)."""
+    status, body = await _get_status_json(client, url, None)
+    return body if status == 200 else None
+
+
+async def _get_status_json(
+    client: httpx.AsyncClient, url: str, token: str | None
+) -> tuple[int | None, dict[str, Any] | None]:
+    """GET ``url``, with ``token`` as the bearer when given. Returns ``(status, JSON object)``:
+    the status is ``None`` when the node did not answer, and the object is ``None`` unless the
+    answer was a JSON object."""
+    headers = {"Authorization": f"Bearer {token}"} if token else None
     try:
-        resp = await client.get(url)
+        resp = await client.get(url, headers=headers)
     except httpx.HTTPError:
-        return None
-    if resp.status_code != 200:
-        return None
+        return None, None
     try:
         body = resp.json()
     except ValueError:
-        return None
-    return body if isinstance(body, dict) else None
+        body = None
+    return resp.status_code, body if isinstance(body, dict) else None
 
 
 # --- run configuration -------------------------------------------------------
@@ -520,8 +575,10 @@ async def run_failover_load(
     async with httpx.AsyncClient(timeout=4.0, verify=harness_ssl_context()) as client:
         try:
             await sink.start()
-            for node in nodes:
-                await node.start()
+            # Both nodes share ONE store. The first start provisions the rig Administrator, alone,
+            # before either engine opens that store; the second has nothing to provision.
+            for index, node in enumerate(nodes):
+                await node.start(provision=index == 0)
             await _await_all_healthy(nodes, client, timeout=election_timeout)
             leader = await _await_single_leader(nodes, client, timeout=election_timeout)
             notes.append(f"elected {leader.node_id} as the initial primary")
@@ -793,7 +850,6 @@ def _node_env(
     env["MEFOR_CLUSTER_HEARTBEAT_SECONDS"] = repr(fo.heartbeat_seconds)
     env["MEFOR_CLUSTER_LEADER_FENCE_TIMEOUT_SECONDS"] = repr(fo.leader_fence_timeout_seconds)
     env["MEFOR_CLUSTER_LEADER_LEASE_TTL_SECONDS"] = repr(fo.leader_lease_ttl_seconds)
-    env["MEFOR_SECURITY_REQUIRE_SIGN_IN"] = "false"  # no token needed for the harness's API reads
     # A clustered node drives concurrent background work against the pool (the validator requires >= 2,
     # >= 3 for Postgres). Force headroom regardless of what the CI store env set.
     try:
