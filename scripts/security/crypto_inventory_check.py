@@ -1517,6 +1517,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via harness.load.tlsmat",
         }
     ),
+    # The harness SMTP sink answers STARTTLS by wrapping the accepted socket with a server-side
+    # context its CALLER builds and passes in (non-prod, loopback only). It imports no crypto module,
+    # owns no key and decides no TLS policy: the test that mints the throwaway certificate does.
+    "harness/sinks/email.py": frozenset({"tls_context:.wrap_socket()"}),
     "messagefoundry/api/auth_routes.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
     "messagefoundry/tray/poller.py": frozenset({"tls_context:via messagefoundry.tray.probe"}),
     "messagefoundry/verify/federation.py": frozenset(
