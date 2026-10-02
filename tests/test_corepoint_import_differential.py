@@ -20,7 +20,11 @@ hostile handle spellings. Each shape is rendered to XML and imported twice: by t
 by the step 1 importer, vendored byte-for-byte from main at ``bca583f2a`` (blob ``b88e7152``) as
 ``tests/fixtures/corepoint/step1_corepoint_import.py.txt``. A vendored copy, not ``git show
 origin/main``, because once step 2 merges ``origin/main`` IS the head, and the comparison would become
-the head against itself; and because a CI checkout need not hold that ref.
+the head against itself; and because a CI checkout need not hold that ref. The vendored file is never
+edited. The baseline the guard runs is that file plus the amendments in ``_STEP1_AMENDMENTS``, made
+as it loads: the changes the step 1 code path has gained on purpose since that tree. There is one,
+BACKLOG #2632, and ``test_the_amendment_changes_only_a_list_holding_a_statement_label`` bounds what
+it may change against the file exactly as vendored.
 
 **The invariant (the whole-list gate, ADR 0086).** For every shape, EITHER the head's generated
 module and summary counts are step 1's byte for byte (the gate is closed), OR the guard's own
@@ -58,11 +62,13 @@ All fixtures are synthetic. The shapes come from a fixed seed, so a failure is r
 from __future__ import annotations
 
 import hashlib
+import html
 import random
 import re
 import sys
 import types
 import unicodedata
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,18 +92,88 @@ def _step1_bytes() -> bytes:
     return _STEP1_PATH.read_bytes().replace(b"\r\n", b"\n")
 
 
-def _load_step1() -> Any:
-    name = "_mefor_corepoint_import_step1"
+# What the step 1 code path has gained since that tree, as ``(text the vendored file holds exactly
+# once, what replaces it)``. The vendored file itself is never edited: its blob id stays pinned, and
+# the baseline the guard runs is that file with these replacements made when it loads.
+#
+# BACKLOG #2632, the one amendment so far. A container whose ``@Data`` is a statement used to render
+# as a label, or as the text of a dead condition, while the handle scan counted its clone. The step 1
+# path now marks that statement as a counted TODO and holds no handle for the list. A list the gate
+# declines takes that path, so "renders as step 1" has to mean this path, or the guard would fail on
+# the repair itself. The rule is copied here as text, apart from the head, so a later change to the
+# head's rule turns the guard red until someone amends this copy on purpose.
+_LABEL_RULE = """\
+_STATEMENT_VERBS = frozenset(
+    {"itemappend", "itemclear", "itemcopy", "msgcreate", "msglog", "msgsend", "msgtreecopy"}
+)
+_LABEL_STATEMENT_WHY = (
+    "written where its container's label or condition belongs, and whether Corepoint runs it there "
+    "is not known; nothing is mapped for it, and no handle in this action-list is taken to be msg"
+)
+
+
+def _label_statement(tag: str, roles: tuple[RoleToken, ...], verb: str) -> str:
+    kind = _CONTAINER_KIND_BY_TAG.get(tag.lower())
+    if kind is None:
+        return ""
+    lowered = verb.lower()
+    if _statement_kind(tag, verb) == _KIND_BY_VERB.get(lowered):
+        return ""
+    if lowered in _STATEMENT_VERBS or (kind == "block" and _role_verb(roles)):
+        return verb
+    return ""
+
+
+"""
+_SOURCE_LABEL_DEF = "def _source_label(tag: str, verb: str) -> str:\n"
+_SCAN_SKIP = (
+    "        if not tokens:\n            continue  # markup-free: no handle roles to learn from\n"
+)
+_BLOCK_ARM = '    if kind in ("block", "call"):\n'
+_BLOCK_RETURN = "return [Control(kind, source, statement or note or tag, body=tuple(body))]\n"
+_CONSTRUCT_RETURN = "    return [Control(kind, source, detail, body=inner, branches=branches)]\n"
+_STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
+    # The rule itself, just after ``_statement_kind``, which it calls.
+    (_SOURCE_LABEL_DEF, _LABEL_RULE + _SOURCE_LABEL_DEF),
+    # The scan: a list holding such a statement holds no handle at all.
+    (
+        _SCAN_SKIP,
+        "        if _label_statement(\n"
+        "            _local(elem.tag), tokens, _statement_verb(tokens, _split_verb(strip_markup(data))[0])\n"
+        "        ):\n"
+        "            return frozenset(), frozenset()\n" + _SCAN_SKIP,
+    ),
+    # The render: a counted TODO ahead of the container's body, or ahead of the construct.
+    (
+        _BLOCK_ARM,
+        "    carried = _label_statement(tag, roles, verb)\n"
+        "    marker: list[Step] = [UnmappedAction(carried, _LABEL_STATEMENT_WHY)] if carried else []\n"
+        + _BLOCK_ARM,
+    ),
+    (_BLOCK_RETURN, _BLOCK_RETURN.replace("body=tuple(body)", "body=(*marker, *body)")),
+    (_CONSTRUCT_RETURN, _CONSTRUCT_RETURN.replace("[Control(", "[*marker, Control(")),
+)
+
+
+def _load_step1(name: str, amendments: tuple[tuple[str, str], ...]) -> Any:
     if name in sys.modules:
         return sys.modules[name]
+    source = _step1_bytes().decode("utf-8")
+    for found, replacement in amendments:
+        # Exactly once, so an amendment can neither miss nor land somewhere it was not meant to.
+        assert source.count(found) == 1, f"the vendored step 1 file holds {found!r} other than once"
+        source = source.replace(found, replacement)
     module = types.ModuleType(name)
     # dataclasses resolve string annotations through sys.modules, so register before running it.
     sys.modules[name] = module
-    exec(compile(_step1_bytes().decode("utf-8"), str(_STEP1_PATH), "exec"), module.__dict__)
+    exec(compile(source, str(_STEP1_PATH), "exec"), module.__dict__)
     return module
 
 
-step1: Any = _load_step1()
+#: The baseline: the step 1 code path as it stands, which a gate-declined list must match.
+step1: Any = _load_step1("_mefor_corepoint_import_step1", _STEP1_AMENDMENTS)
+#: The vendored tree exactly as main held it, with no amendment. Only the amendment's own test reads it.
+step1_as_vendored: Any = _load_step1("_mefor_corepoint_import_step1_as_vendored", ())
 
 
 def test_the_step1_fixture_is_mains_step1_importer_byte_for_byte() -> None:
@@ -1818,6 +1894,7 @@ def _seed_shapes() -> Iterator[Shape]:
         )
     yield from _round3_shapes()
     yield from _gate_review_shapes()
+    yield from _label_statement_shapes()
     # The Lander's QA of db8873d19e, pre-existing on main: a line between an If and its Else.
     for between in (
         "<Line/>",
@@ -2059,6 +2136,49 @@ def _gate_review_shapes() -> Iterator[Shape]:
         for _ in range(depth - 1):
             nested = Block((nested,))
         yield Shape(f"gate-review-nested-{depth}", "%ADT", (nested,))
+
+
+_CONTAINER_TAGS = ("Block", "Call", "Case", "Foreach", "If", "Loop", "Try")
+
+
+def _label_statement_shapes() -> Iterator[Shape]:
+    """BACKLOG #2632: a statement where a container's label or condition belongs, on each of the
+    seven container tags. The random shapes put one on a ``<Block>`` only, and only ever a
+    ``MsgTreeCopy``, so without these seeds a change to the rule for a construct, or for a verb the
+    exporter styled as a keyword, would pass the guard untested."""
+    out = H("%OUT")
+    clone = _leaf_data(Clone(_ADT, out, 1), "%ADT")
+    write = _leaf_data(Write(_ADT, "W3Z"), "%ADT")
+    assert clone is not None and write is not None
+    # A verb outside the importer's table, styled as a keyword: a statement on a Block alone.
+    merge = _leaf_data(Unread("merge", _NEW, _ADT), "%ADT")
+    assert merge is not None
+
+    def carrying(tag: str, data: str, body: tuple[Node, ...] = ()) -> Raw:
+        return Raw(f'<{tag} Data="{_esc(data)}"><List>{_render(body, "%ADT")}</List></{tag}>')
+
+    for tag in _CONTAINER_TAGS:
+        yield Shape(f"2632-{tag}-clone", "%ADT", (carrying(tag, clone), SendS(out, "OB_OUT")))
+        yield Shape(f"2632-{tag}-write", "%ADT", (carrying(tag, write), SendS(_ADT, "OB_IN")))
+        yield Shape(f"2632-{tag}-keyword", "%ADT", (carrying(tag, merge), SendS(_ADT, "OB_IN")))
+        yield Shape(
+            f"2632-{tag}-clone-over-a-body",
+            "%ADT",
+            (
+                carrying(tag, clone, (Write(out, "W4Z"), SendS(out, "OB_BODY"))),
+                SendS(_ADT, "OB_IN"),
+            ),
+        )
+        yield Shape(
+            f"2632-{tag}-flat-copy-over-the-input",
+            "%ADT",
+            (carrying(tag, "MsgTreeCopy %NEW/ to %ADT/"), SendS(_ADT, "OB_IN")),
+        )
+        yield Shape(
+            f"2632-{tag}-flat-lowercase-send",
+            "%ADT",
+            (carrying(tag, 'msgsend %OUT to connection "OB_LABEL"'), SendS(_ADT, "OB_IN")),
+        )
 
 
 # --- the guard ------------------------------------------------------------------------------------
@@ -2426,6 +2546,93 @@ def test_the_walker_tells_the_gate_apart_on_its_own_seeds() -> None:
     spoiled = [s for s in _round3_shapes() if "write-after-send" not in s.name]
     assert len(spoiled) == 20
     assert not any(_fully_understood(_render(s.nodes, s.inp)) for s in spoiled)
+
+
+# --- the baseline's one amendment (BACKLOG #2632) -------------------------------------------------
+
+_STATEMENT_WORD = re.compile(
+    "itemappend|itemclear|itemcopy|msgcreate|msglog|msgsend|msgtreecopy", re.IGNORECASE
+)
+_ANY_TAG = re.compile(r"<[^<>]*>")
+_VOCABULARY_CALL = re.compile(r"^\s*(?:set_field|append_to_field|copy_field)\(.*$", re.MULTILINE)
+
+
+def _may_carry_a_label_statement(xml: str) -> bool:
+    """Whether some container's ``@Data`` could be a statement. Written apart from the importer and
+    WIDER than its rule on purpose: any container, live or not, whose ``@Data`` names one of the
+    seven statement verbs anywhere, or holds a ``keyword`` span."""
+    from messagefoundry._vendor.defusedxml.ElementTree import fromstring
+
+    for elem in fromstring(_package(xml)).iter():
+        if elem.tag.rsplit("}", 1)[-1].title() not in _CONTAINER_TAGS:
+            continue
+        for key, data in elem.attrib.items():
+            if key.rsplit("}", 1)[-1].lower() == "data" and (
+                "keyword" in data or _STATEMENT_WORD.search(html.unescape(_ANY_TAG.sub("", data)))
+            ):
+                return True
+    return False
+
+
+def _unmapped(out: tuple[str, tuple[object, ...]]) -> int:
+    """How many steps the summary counts unmapped, over every handler."""
+    total = 0
+    for counts in out[1]:
+        assert isinstance(counts, tuple) and isinstance(counts[1], list)
+        total += len(counts[1])
+    return total
+
+
+def _amendment_changes(shape: Shape) -> bool:
+    """Whether the amended baseline renders ``shape`` otherwise than the vendored tree does, having
+    checked that the change is one the amendment may make.
+
+    It changes a list only when a container in it may carry a statement, by a reading written
+    apart from the rule and wider than it. And where it changes a list it only narrows. It adds no
+    live send and no vocabulary call. It marks at least one more step unmapped, with the marker in
+    the module. The one exception is a statement under a ``@Disabled`` ancestor: nothing there is
+    live, so the counts stay as they were and the commented preview gains a line."""
+    xml = _render(shape.nodes, shape.inp)
+    was, now = _generate(step1_as_vendored, xml), _generate(step1, xml)
+    if now == was:
+        return False
+    assert _may_carry_a_label_statement(xml), shape.name
+    assert not Counter(_live_sends(now[0])) - Counter(_live_sends(was[0])), shape.name
+    calls = Counter(_VOCABULARY_CALL.findall(was[0]))
+    assert not Counter(_VOCABULARY_CALL.findall(now[0])) - calls, shape.name
+    if _unmapped(now) > _unmapped(was):
+        assert step1._LABEL_STATEMENT_WHY in now[0], shape.name
+        return True
+    was_lines, now_lines = Counter(was[0].splitlines()), Counter(now[0].splitlines())
+    assert now[1] == was[1] and not was_lines - now_lines, shape.name
+    assert all(line.lstrip().startswith("#") for line in now_lines - was_lines), shape.name
+    return True
+
+
+@pytest.mark.parametrize("chunk", range(_CHUNKS))
+def test_the_amendment_changes_only_a_list_holding_a_statement_label(chunk: int) -> None:
+    """The baseline is main's step 1 tree plus one amendment, so this test bounds what the amendment
+    may change, against the tree exactly as vendored: see :func:`_amendment_changes`."""
+    for shape in _SHAPES[chunk::_CHUNKS]:
+        _amendment_changes(shape)
+
+
+def test_the_amendment_reaches_every_seed_written_for_it() -> None:
+    """The bound above is not vacuous: the seed that recorded the defect and a statement on each of
+    the seven tags all change. Two kinds of seed change on some tags only. A verb styled as a
+    keyword is a statement on a ``<Block>`` alone. And a ``<Block>`` or a ``<Call>`` renders a send
+    itself, as step 1 always did, so a send there is no label statement."""
+    recorded = next(s for s in _SHAPES if s.name == "d26545d6f-open-1-block-label")
+    assert _amendment_changes(recorded)
+    for shape in _label_statement_shapes():
+        _, tag, kind = shape.name.split("-", 2)
+        if kind == "keyword":
+            expected = tag == "Block"
+        elif kind == "flat-lowercase-send":
+            expected = tag not in ("Block", "Call")
+        else:
+            expected = True
+        assert _amendment_changes(shape) is expected, shape.name
 
 
 @pytest.mark.parametrize("chunk", range(_CHUNKS))
