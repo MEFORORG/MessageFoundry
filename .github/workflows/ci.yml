@@ -4024,8 +4024,9 @@ jobs:
       # on a real service (docs/SERVICE.md "Restrict the service token" records what that
       # showed). Reading 3 was never judged: the step read the exit code of the start command and
       # stopped. The comment at that command says why that code says nothing here. So the rule
-      # on the probe's report has not yet met a real report, and a red there is a finding about
-      # what the hardened token can do, to be read and not re-run.
+      # on the probe's report has not yet met a real report. A first red there may be the rule
+      # or this step and not the token: the step prints the whole report, so read it and say
+      # which it is before anything is changed. Do not re-run it to see if it passes.
       #
       # "Invalid account name!" from the two set commands below is noise. This copy prints it on
       # any set made once the service runs as a virtual account, and still makes the change. The
@@ -4034,6 +4035,9 @@ jobs:
       # The name is quoted: unquoted, YAML reads " #2702)" as a comment and cuts the name there.
       - name: "Verify the service token is restricted (vault BACKLOG #2702)"
         run: |
+          # Two commands below exit non-zero on a run that worked, and say so where they are
+          # called. Set here so that never depends on the runner's default for this preference.
+          $PSNativeCommandUseErrorActionPreference = $false
           $privilege = "SeChangeNotifyPrivilege"
           $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
           function Assert-Native([string]$What) {
@@ -4108,8 +4112,16 @@ jobs:
           Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
           # The report is the only witness that THIS start worked, so an older one must not be there.
           if (Test-Path -LiteralPath $report) { throw "a report from an earlier run could not be removed: $report" }
+          # The stop's exit code is not read either: it comes from the same short wait as the
+          # start's, described below, and the engine may take up to 15 seconds to drain. The
+          # Service Control Manager is asked instead, the way the installer's own stop is checked.
           & "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry
-          Assert-Native "stopping the engine"
+          $global:LASTEXITCODE = 0
+          foreach ($i in 1..60) {
+            if ((Get-Service -Name MessageFoundry).Status -eq "Stopped") { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ((Get-Service -Name MessageFoundry).Status -ne "Stopped") { throw "the engine did not stop within 30 seconds" }
           # The engine's program and parameters are saved, raw, and put back once the probe has
           # reported. The service reads them only when it starts, so the probe keeps running,
           # and the uninstall step below reads the ENGINE's registration, as it did before this

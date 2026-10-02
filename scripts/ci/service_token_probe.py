@@ -373,11 +373,15 @@ def try_alternate_credential(granted: Path, denied: Path) -> dict[str, Any]:
         return {"ran": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def under_credential() -> dict[str, Any]:
-        return {
-            "thread_token": read_thread_token(),
-            "granted": try_write(granted),
-            "denied": try_write(denied),
-        }
+        # The writes come first and never raise. The token read is this probe's own instrument:
+        # when IT fails, that is recorded as such, and not as the credential call failing.
+        result: dict[str, Any] = {"granted": try_write(granted), "denied": try_write(denied)}
+        try:
+            result["thread_token"] = read_thread_token()
+        except OSError as exc:
+            result["thread_token"] = None
+            result["thread_token_error"] = str(exc)
+        return result
 
     async def run() -> dict[str, Any]:
         # A value made up on the spot. Nobody holds it, and no account is named by it.
@@ -529,7 +533,12 @@ def inside_problems(
         else:
             thread = cred.get("thread_token")
             level = thread["impersonation_level"] if thread else None
-            if level is None or level < _SECURITY_IMPERSONATION:
+            if cred.get("thread_token_error"):
+                problems.append(
+                    "the thread token under the alternate credential could not be read "
+                    f"({cred['thread_token_error']}); that is this probe's reading failing"
+                )
+            elif level is None or level < _SECURITY_IMPERSONATION:
                 problems.append(
                     f"the alternate-credential thread ran at impersonation level {level}, below "
                     f"{_SECURITY_IMPERSONATION}: Windows refused the impersonation"
@@ -563,7 +572,10 @@ def _check_read(args: argparse.Namespace) -> int:
         failed = failed or bool(problems)
     control = read_token(args.control_pid)
     print(json.dumps(control, indent=2))
-    if not token_problems(control, **rule):
+    # The control is judged as if its own account were the service's. It always runs as someone
+    # else, so judged against the real service SID it would fail on the account alone, and would
+    # no longer show that the three readings of the token's shape can tell it apart.
+    if not token_problems(control, service_sid=control["user"], privileges=args.privilege):
         print(
             f"FAIL: CONTROL: process {args.control_pid} is not the service and still reads as "
             "hardened, so this reader cannot tell a hardened token from any other"

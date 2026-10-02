@@ -602,6 +602,8 @@ def _broken(path: list[str], value: Any) -> dict[str, Any]:
         # Windows answers a refused impersonation with an identification-level token and a success.
         (["wincred", "thread_token", "impersonation_level"], 1, "refused the impersonation"),
         (["wincred", "granted", "wrote"], False, "under the alternate credential"),
+        # The probe's own read failing is named as that, and not as the credential call failing.
+        (["wincred", "thread_token_error"], "OSError: 5", "this probe's reading failing"),
         (["probe_errors"], {"token": "OSError: 5"}, "the token step failed"),
     ],
 )
@@ -712,13 +714,13 @@ def test_the_smoke_leg_reads_the_token_it_asked_for() -> None:
 
 
 def test_the_smoke_leg_judges_the_probe_start_by_its_report() -> None:
-    """The first hosted run of this step failed on the exit code of the start command, on both
-    runners (merge-group run 36981542600). The service holds START_PENDING for its AppThrottle and
-    the command gives up first, so it exits 1 on a start that works: the same run printed the same
-    line for the engine's own start. The start is judged by the report the probe writes.
+    """The step's first hosted run failed on the exit code of the start command, which is 1 on a
+    start that works. The comment at that command in ci.yml says why; it is not restated here.
+    The start is judged by the report the probe writes.
 
-    So no line may read the exit code of a start, and the step must still fail without a report.
-    The set lines are the control: their exit code is real, and each one is still read.
+    So the start's exit code is cleared on the very next line, the step still fails without a
+    report, and the same holds for the stop, which is judged by the Service Control Manager. The
+    set lines are the control: their exit code is real, and each one is still read.
     """
     lines = _smoke_step_script("Verify the service token is restricted").splitlines()
     follows = {
@@ -727,9 +729,12 @@ def test_the_smoke_leg_judges_the_probe_start_by_its_report() -> None:
             for i, line in enumerate(lines[:-1])
             if f'nssm.exe" {verb} MessageFoundry' in line
         ]
-        for verb in ("start", "set")
+        for verb in ("start", "stop", "set")
     }
     assert len(follows["start"]) == 1 and len(follows["set"]) == 2, follows
+    assert follows["stop"] == ["$global:LASTEXITCODE = 0"], (
+        f"the stop's exit code is not cleared at once: {follows['stop']}"
+    )
     # CLEARED, and on the very next line. A check that only forbade Assert-Native there would
     # pass a read two lines down, where the start's stale 1 would fail every run.
     assert follows["start"][0] == "$global:LASTEXITCODE = 0", (
@@ -768,7 +773,13 @@ def test_a_reinstall_is_told_the_host_may_need_a_restart(tmp_path: Path) -> None
   ConvertTo-Json -InputObject @($ifs) -Compress
 """
     bodies = _last_json(_ok(_extract(_SCRIPT, [], body), tmp_path))
-    assert any("Write-Warning" in b and "restart" in b.lower() for b in bodies), bodies
+    # "the host restarts", and not just "restart": an older block under the same condition tells
+    # the operator to restart the SERVICE, and would satisfy a looser match with this one deleted.
+    assert any("Write-Warning" in b and "the host restarts" in b for b in bodies), bodies
+    assert sum("restart" in b.lower() for b in bodies) > 1, (
+        "CONTROL FAILED: the older restart-the-service block is gone, so the stricter match above "
+        "is no longer shown to tell the two apart"
+    )
     facts = _preflight_facts(tmp_path)
     existed = [a for a in facts["assignments"] if a["lhs"] == "ServiceExisted"]
     installs = [
