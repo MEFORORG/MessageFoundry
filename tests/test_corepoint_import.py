@@ -17,6 +17,10 @@ import pytest
 
 from messagefoundry.checks import run_checks
 from messagefoundry.corepoint_import import (
+    _CONTAINER_KIND_BY_TAG,
+    _STATEMENT_VERBS,
+    _UNDERSTOOD,
+    _VERB_CONNECTIVES,
     Action,
     Control,
     CorepointImportError,
@@ -25,9 +29,12 @@ from messagefoundry.corepoint_import import (
     _corepoint_path,
     _corepoint_segment,
     _count_steps,
+    _hardened_fromstring,
+    _message_handles,
     _operands_from_roles,
     _role_prose,
     _role_verb,
+    _understood_list,
     generate_module,
     import_corepoint,
     parse_any,
@@ -1675,6 +1682,627 @@ def test_a_fully_understood_module_passes_check(tmp_path: Path) -> None:
     summary = import_corepoint(export, tmp_path / "out").to_json()
     assert summary["total_unmapped"] == 0
     assert run_checks(tmp_path / "out", run_lint=False).ok
+
+
+# --- a statement anywhere but on a <Line> (BACKLOG #2632) -----------------------------------------
+#
+# A ``<Block>``, ``<Call>`` or construct whose ``@Data`` is a statement used to render as a label, or
+# as the text of a dead condition, and count nothing, while the handle scan read its ``MsgTreeCopy``
+# as a clone that was made. A send of that clone then rendered as a send of ``msg``. One rule,
+# ``_label_statement``, now answers for both, for every element that is not a ``<Line>``: the render
+# marks the statement as a counted TODO ahead of the element's body and never emits it as live
+# code, and the scan holds no handle for the list. All fixtures are synthetic.
+
+_CLONE_LINE = _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
+_SEND_COPY = _role_send("other-handle", "%OUT", "OB_ACME")
+_SEND_INPUT = _role_send("input-handle", "%ADT", "OB_IN")
+_WRITE_COPY = _write("other-handle", "%OUT", "Y")
+_MERGE_LINE = _role_line(_span("keyword", "MsgTreeMerge") + " " + _span("other-handle", "%NEW"))
+_LABEL_MARKER = "not on a Line, so it may never have run"
+_CONTAINER_TAGS = ("Block", "Call", "Case", "Foreach", "If", "Loop", "Try")
+# One spelling of each statement verb, by the table's own key.
+_VERB_SPELLINGS = {
+    "itemappend": "ItemAppend",
+    "itemclear": "ItemClear",
+    "itemcopy": "ItemCopy",
+    "msgcreate": "MsgCreate",
+    "msglog": "MsgLog",
+    "msgsend": "MsgSend",
+    "msgtreecopy": "MsgTreeCopy",
+}
+
+
+def _container(tag: str, line: str, body: str = "", disabled: bool = False) -> str:
+    """A ``<tag>`` carrying the ``@Data`` of ``line``, a ``<Line .../>`` as :func:`_role_line`
+    builds one, around ``body``."""
+    opening = line.replace("<Line ", f"<{tag} ", 1).removesuffix("/>")
+    return f"{opening}{' Disabled="1"' if disabled else ''}><List>{body}</List></{tag}>"
+
+
+def _labelled(tag: str, data: str, body: str = "") -> str:
+    """A ``<tag>`` whose ``@Data`` is the plain text ``data``."""
+    return _container(tag, _role_line(data), body)
+
+
+@pytest.mark.parametrize("tag", _CONTAINER_TAGS)
+def test_a_clone_where_a_label_belongs_is_marked_and_its_send_is_judged_on_the_marker(
+    tag: str,
+) -> None:
+    """The defect as filed, on each container. The copy is marked and counted, at the handler's own
+    level and ahead of everything in the container's body. It is not emitted as a clone, so the
+    later send of the copy is refused, where it used to send msg."""
+    body = _container(tag, _CLONE_LINE, _WRITE_COPY) + _SEND_COPY
+    lines = _handler_body(_handler_source(body)).splitlines()
+    marker = next(i for i, line in enumerate(lines) if _LABEL_MARKER in line)
+    assert lines[marker].startswith("    # TODO: Corepoint MsgTreeCopy — hand-finish (")
+    assert marker < next(i for i, line in enumerate(lines) if "Corepoint ItemCopy" in line)
+    assert not any("Send(" in line or "_msg = " in line for line in lines)
+    assert not any("set_field(" in line for line in lines)
+    assert any("raise NotImplementedError" in line for line in lines)
+    unmapped = _count_steps(_handler_steps(body), in_loop=False)[1]
+    assert unmapped == ["MsgTreeCopy", "ItemCopy", "MsgSend"]
+
+
+def test_a_blocks_marker_follows_its_label_comment_and_nothing_counts_as_mapped() -> None:
+    body = _container("Block", _CLONE_LINE, _WRITE_COPY) + _SEND_COPY
+    lines = _handler_body(_handler_source(body)).splitlines()
+    label = lines.index("    # Corepoint Block: MsgTreeCopy %ADT/ to %OUT/")
+    assert _LABEL_MARKER in lines[label + 1]
+    assert lines[label + 1].endswith("taken to be msg: MsgTreeCopy %ADT/ to %OUT/)")
+    assert _count_steps(_handler_steps(body), in_loop=False)[0] == 0
+
+
+def test_a_prose_block_label_stays_a_label() -> None:
+    """The control: prose is a label. Nothing is marked, the write maps and the input still sends."""
+    body = _labelled("Block", "Patient identity", _WRITE_INPUT) + _SEND_INPUT
+    src = _handler_body(_handler_source(body))
+    assert "    # Corepoint Block: Patient identity\n" in src
+    assert _LABEL_MARKER not in src and "TODO" not in src
+    assert '    set_field(msg, "MSH-6", "X")\n' in src
+    assert '    sends.append(Send("OB_IN", msg))' in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (2, [], 0)
+
+
+def test_the_same_clone_on_a_line_is_still_read_as_made() -> None:
+    """The control for the scan. The clone is a ``<Line>`` under a prose Block, which closes the
+    gate, so this is the step 1 path too. There the copy still counts, and its send still sends. So
+    the refusals above come from where the statement sits, not from the copy itself."""
+    src = _handler_body(
+        _handler_source(_labelled("Block", "Patient identity", _CLONE_LINE) + _SEND_COPY)
+    )
+    assert '    sends.append(Send("OB_ACME", msg))' in src
+    assert "raise NotImplementedError" not in src and _LABEL_MARKER not in src
+
+
+def test_a_field_write_in_a_block_label_is_marked_and_never_mapped() -> None:
+    """Whether Corepoint runs the label is not known, so the write is a TODO, not a ``set_field``."""
+    body = _container("Block", _WRITE_INPUT) + _SEND_INPUT
+    src = _handler_body(_handler_source(body))
+    assert "    # TODO: Corepoint ItemCopy — hand-finish (not on a Line" in src
+    assert "set_field(" not in src and "Send(" not in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["ItemCopy", "MsgSend"], 0)
+
+
+@pytest.mark.parametrize(
+    ("element", "carried"),
+    [
+        pytest.param(_container("Block", _CLONE_LINE), True, id="block-role-clone"),
+        # The row's own example: no role markup, so the scan could never read what it overwrites.
+        pytest.param(
+            _labelled("Block", "MsgTreeCopy %NEW/ to %ADT/"), True, id="block-flat-copy-over-input"
+        ),
+        pytest.param(_labelled("Block", "itemclear OUT"), True, id="block-flat-lowercase-verb"),
+        pytest.param(
+            _labelled("Block", _span("block", "MsgTreeCopy %NEW/ to %ADT/")),
+            True,
+            id="block-label-span-around-a-statement",
+        ),
+        pytest.param(_container("Block", _MERGE_LINE), True, id="block-keyword-not-in-the-table"),
+        pytest.param(_labelled("If", 'MsgSend %OUT to connection "OB_X"'), True, id="if-flat-send"),
+        pytest.param(_labelled("Call", "MsgLog %ADT"), True, id="call-flat-log"),
+        # A send would be live code, so a Block or a Call never renders one from its ``@Data``.
+        pytest.param(
+            _container("Block", _role_send("input-handle", "%ADT", "OB_LABEL")),
+            True,
+            id="block-send",
+        ),
+        pytest.param(
+            _labelled("Call", 'msgsend %ADT to connection "OB_LABEL"'), True, id="call-send"
+        ),
+        # A ``<List>`` wrapper is flattened and its own ``@Data`` was never rendered at all.
+        pytest.param(_container("Actions", _CLONE_LINE), True, id="actions-wrapper"),
+        pytest.param(_container("List", _CLONE_LINE), True, id="list-wrapper"),
+        pytest.param(
+            _container("List", _CLONE_LINE, disabled=True), True, id="disabled-list-wrapper"
+        ),
+        # An element the import does not model is already marked as that. Its statement is too.
+        pytest.param(_container("Switch", _CLONE_LINE), True, id="unmodelled-tag-clone"),
+        pytest.param(
+            _container("Switch", _role_send("input-handle", "%ADT", "OB_LABEL")),
+            True,
+            id="unmodelled-tag-send",
+        ),
+        pytest.param(_container("If", _MERGE_LINE), False, id="construct-keyword-not-in-the-table"),
+        pytest.param(
+            _container("Switch", _MERGE_LINE), False, id="unmodelled-keyword-not-in-the-table"
+        ),
+        # A keyword span that does not LEAD the label is a styled connective, not a verb.
+        pytest.param(
+            _labelled("Block", "Copy patient " + _span("keyword", "to") + " output"),
+            False,
+            id="block-keyword-connective-in-prose",
+        ),
+        # A leading keyword on a wrapper, which has no verb of its own, is a statement too.
+        pytest.param(_container("List", _MERGE_LINE), True, id="list-wrapper-keyword"),
+        # A limit ADR 0086 records: the verb is read as a Line's is, so it must lead.
+        pytest.param(
+            _labelled("Block", "Step 1: MsgTreeCopy %NEW/ to %OUT/"), False, id="verb-not-leading"
+        ),
+        pytest.param(_labelled("Block", "Patient identity"), False, id="prose"),
+        pytest.param(_labelled("Block", "Message header"), False, id="prose-near-a-verb"),
+        pytest.param(_labelled("If", 'If (%ADT/PID-8 = "M")'), False, id="if-condition"),
+        pytest.param(_labelled("Foreach", "ForEach %ADT/OBX $obx"), False, id="foreach"),
+        pytest.param(_labelled("Loop", "While (x)"), False, id="loop-with-another-verb"),
+        pytest.param(_labelled("Case", "ChooseFrom (x)"), False, id="case"),
+        pytest.param(_labelled("Call", 'ActionListCall "Sub"'), False, id="call"),
+        pytest.param(_container("Block", _CLONE_LINE, disabled=True), False, id="disabled-block"),
+    ],
+)
+def test_the_scan_and_the_render_ask_one_rule(element: str, carried: bool) -> None:
+    """Wherever the render marks a statement, the scan holds nothing, and nowhere else. Each list
+    ends with a send of its one input handle, so the scan holds that handle unless the rule fires."""
+    body = element + _SEND_INPUT
+    src = _handler_body(_handler_source(body))
+    held = _message_handles(_hardened_fromstring(_package(body))[0])[1]
+    assert (_LABEL_MARKER in src) is carried
+    assert (held == frozenset()) is carried
+    assert ('Send("OB_IN", msg)' in src) is not carried
+    assert ("raise NotImplementedError" in src) is carried
+    if carried:
+        assert "Send(" not in src  # no live send at all: not the input's, not the statement's
+
+
+@pytest.mark.parametrize("tag", [*_CONTAINER_TAGS, "Switch", "List"])
+@pytest.mark.parametrize("verb", sorted(_STATEMENT_VERBS))
+def test_every_statement_verb_is_marked_on_every_element_but_a_line(tag: str, verb: str) -> None:
+    """Each verb of the table, in its usual spelling, lower case and upper case, on each container,
+    an unmodelled tag and a list wrapper. On a ``<Line>`` the same text is an ordinary statement."""
+    for spelling in (_VERB_SPELLINGS[verb], verb, verb.upper()):
+        data = f"{spelling} %OUT"
+        src = _handler_body(_handler_source(_labelled(tag, data) + _SEND_INPUT))
+        assert _LABEL_MARKER in src and "Send(" not in src, spelling
+        line = _handler_body(_handler_source(_role_line(data) + _SEND_INPUT))
+        assert _LABEL_MARKER not in line, spelling
+
+
+def test_a_statement_in_a_try_or_a_list_wrapper_is_named_in_its_marker() -> None:
+    """Neither prints its ``@Data`` anywhere else, so the marker carries the statement itself."""
+    for tag in ("Try", "Actions"):
+        src = _handler_body(_handler_source(_container(tag, _CLONE_LINE) + _SEND_COPY))
+        assert src.count("MsgTreeCopy %ADT/ to %OUT/") == 1, tag
+        assert "taken to be msg: MsgTreeCopy %ADT/ to %OUT/)" in src, tag
+
+
+def test_a_send_in_a_block_label_is_never_a_delivery() -> None:
+    """A ``MsgSend`` in a Block's ``@Data`` used to render as a live send of msg. It may never
+    have run, so it is refused: no ``Send``, a raise where the send stood, and its outbound still
+    declared for the hand-finish, as for any refused send."""
+    body = _container("Block", _role_send("input-handle", "%ADT", "OB_LABEL"))
+    src = _handler_source(body)
+    assert "Send(" not in _handler_body(src) and 'outbound("OB_LABEL"' in src
+    assert (
+        "    # TODO: Corepoint MsgSend to OB_LABEL — hand-finish: MsgSend is not on a Line" in src
+    )
+    assert '    raise NotImplementedError("Corepoint import: MsgSend to OB_LABEL: ' in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["MsgSend"], 0)
+    # On a Call it is no call either: not counted as mapped, not labelled as an inlined list.
+    call = _container("Call", _role_send("input-handle", "%ADT", "OB_LABEL"))
+    assert _count_steps(_handler_steps(call), in_loop=False) == (0, ["MsgSend"], 0)
+    assert "called list inlined" not in _handler_source(call)
+    # The control: the same send on a Line under a prose Block is a delivery.
+    line = _labelled("Block", "Section", _role_send("input-handle", "%ADT", "OB_LABEL"))
+    assert 'sends.append(Send("OB_LABEL", msg))' in _handler_source(line)
+
+
+@pytest.mark.parametrize("verb", sorted(_STATEMENT_VERBS - {"msgsend"}))
+def test_a_call_carrying_a_statement_is_a_label_and_not_a_call(verb: str) -> None:
+    """One rule for every element but a Line. A ``<Call>`` whose ``@Data`` is a statement names no
+    list to inline, so it is not counted as a mapped call, whichever statement it is. Its body
+    still renders beneath the label. The control is a Call that names a list. A ``MsgSend`` is
+    left out: it is no label but a refused send, which the tests further down pin."""
+    data = f"{_VERB_SPELLINGS[verb]} %ADT"
+    call = _labelled("Call", data, '<Line Data="ItemClear %ADT/PID-19"/>')
+    src = _handler_body(_handler_source(call))
+    assert f"    # Corepoint Call: {data}\n" in src and "called list inlined" not in src
+    assert '    set_field(msg, "PID-19", "")' in src
+    assert _count_steps(_handler_steps(call), in_loop=False) == (1, [_VERB_SPELLINGS[verb]], 0)
+    named = _labelled("Call", 'ActionListCall "Sub"', '<Line Data="ItemClear %ADT/PID-19"/>')
+    assert "called list inlined" in _handler_source(named)
+    assert _count_steps(_handler_steps(named), in_loop=False) == (2, [], 0)
+
+
+_SIBLING_BRANCHES = {
+    "if-else": ('<If Data="If (x)"><List/></If>', "Else"),
+    "if-elseif": ('<If Data="If (x)"><List/></If>', "ElseIf (y)"),
+    "try-catch": ("<Try><List/></Try>", "Catch"),
+    "case-matching": ('<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M"'),
+}
+# What sits between a construct and the branch marker written after it as a sibling. ``{S}`` is
+# where a wrapper carries a statement; the control is the same text with no statement there.
+_EMPTY_WRAPPERS = {
+    "one-wrapper": "<List{S}/>",
+    "two-wrappers-side-by-side": "<List{S}/><Actions{S}/>",
+    "inner-of-two": "<List><List{S}/></List>",
+    "outer-of-two": "<List{S}><List/></List>",
+    "both-of-two": "<List{S}><List{S}/></List>",
+    "innermost-of-three": "<List><List><List{S}/></List></List>",
+    "middle-of-three": "<List><List{S}><List/></List></List>",
+    "outermost-of-three": "<Actions{S}><List><List/></List></Actions>",
+    "all-of-three": "<List{S}><Actions{S}><List{S}/></Actions></List>",
+}
+_FILLED = '<Line Data="ItemClear %ADT/PID-20"/>'
+# A wrapper holding a statement of its own. On main it already orphans the branch, with or
+# without a statement on the wrapper, and that is out of scope here: it must not get worse.
+_FILLED_WRAPPERS = {
+    "filled-one-wrapper": f"<List{{S}}>{_FILLED}</List>",
+    "filled-inner-of-two": f"<List><List{{S}}>{_FILLED}</List></List>",
+    "filled-outer-of-two": f"<List{{S}}><List>{_FILLED}</List></List>",
+    "filled-beside-the-inner-of-two": f"<List>{_FILLED}<List{{S}}/></List>",
+}
+_WRAPPER_STATEMENT = ' Data="MsgLog %ADT"'
+_ORPHAN = "with no enclosing construct"
+
+
+def _sibling_arm(branch: str) -> str:
+    """A branch ``<Line>`` holding a markup-free write and send, which no handle rule refuses."""
+    return _labelled("Line", branch, _CLEAR + '<Line Data="MsgSend %ADT [OB_FLAT]"/>')
+
+
+def _code(src: str) -> list[str]:
+    """The lines of a rendered handler that are not comments: what runs, and how deep."""
+    return [line for line in src.splitlines() if not line.lstrip().startswith("#")]
+
+
+def _assert_the_markers_change_no_code(template: str, markers: int) -> str:
+    """The rule the whole family below asks: a statement on a wrapper adds its counted marker and
+    changes nothing else. The same code runs at the same indentation, and a branch is an orphan
+    only where it is one with no statement there. Returns the marked handler body."""
+    marked, control = (
+        _handler_body(_handler_source(template.replace("{S}", statement)))
+        for statement in (_WRAPPER_STATEMENT, "")
+    )
+    assert marked.count(_LABEL_MARKER) == markers
+    assert _code(marked) == _code(control)
+    assert marked.count(_ORPHAN) == control.count(_ORPHAN)
+    return marked
+
+
+@pytest.mark.parametrize("between", _EMPTY_WRAPPERS)
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_wrappers_marker_never_orphans_a_sibling_branch(pair: str, between: str) -> None:
+    """A branch marker written after its construct as a sibling is adopted by it, and its body is
+    then dead until someone writes the condition. An orphaned branch renders its body live. A
+    wrapper's marker is no statement position, so the adoption does not see it: at any depth of
+    wrapper, on the inner one or the outer, the branch is adopted exactly as it is with no
+    statement there."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    template = construct + _EMPTY_WRAPPERS[between] + _sibling_arm(branch)
+    src = _assert_the_markers_change_no_code(template, _EMPTY_WRAPPERS[between].count("{S}"))
+    # main adopts this branch, so nothing of it runs at the handler's own level.
+    assert _ORPHAN not in src
+    assert not [
+        line for line in src.splitlines() if line.startswith(("    sends.append", "    set_field"))
+    ]
+    assert '        sends.append(Send("OB_FLAT", msg))' in src
+
+
+@pytest.mark.parametrize("between", _FILLED_WRAPPERS)
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_wrappers_marker_changes_nothing_where_main_already_orphans(
+    pair: str, between: str
+) -> None:
+    """The control for the test above, and the limit it leaves. A wrapper with a statement of its
+    own between a construct and its sibling branch orphans that branch on main, whatever the
+    wrapper's ``@Data``. The marker neither repairs that nor adds to it."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    template = construct + _FILLED_WRAPPERS[between] + _sibling_arm(branch)
+    src = _assert_the_markers_change_no_code(template, 1)
+    assert src.count(_ORPHAN) == 1
+    assert '    sends.append(Send("OB_FLAT", msg))' in src
+
+
+@pytest.mark.parametrize("between", ["<List{S}/>", "<List><List{S}/></List>"])
+@pytest.mark.parametrize(
+    "frame",
+    [
+        # A branch-group wrapper: an ``<If>`` with no ``@Data`` whose children are the branches.
+        pytest.param(
+            '<If><Line Data="If (x)"><List/></Line>{between}</If>{arm}', id="branch-group"
+        ),
+        # A ``<Line>`` carrying a nested list: its body is flattened to the Line's own level, so
+        # a construct at the end of it adopts a branch written after the Line.
+        pytest.param(
+            '<Line Data="ItemClear %ADT/PID-18"><List>'
+            '<If Data="If (x)"><List/></If>{between}</List></Line>{arm}',
+            id="tail-of-a-line-body",
+        ),
+        # The wrapper holds the construct itself, and the branch follows the wrapper.
+        pytest.param(
+            '<List><If Data="If (x)"><List/></If>{between}</List>{arm}',
+            id="wrapper-around-the-construct",
+        ),
+    ],
+)
+def test_a_marker_at_the_end_of_any_flattened_body_never_orphans_a_branch(
+    frame: str, between: str
+) -> None:
+    """A marker reaches the list a branch is adopted in by more routes than a wrapper beside the
+    construct. Each of them leaves the marker last in a body that is flattened to that level."""
+    template = frame.replace("{between}", between).replace("{arm}", _sibling_arm("Else"))
+    src = _assert_the_markers_change_no_code(template, 1)
+    assert _ORPHAN not in src
+    assert '        sends.append(Send("OB_FLAT", msg))' in src
+
+
+def test_a_send_label_keeps_its_body_where_main_put_it() -> None:
+    """main rendered a ``MsgSend`` in a Block's ``@Data`` as a live send and then its body at the
+    Block's own level, so a construct ending that body adopted a branch written after the Block.
+    The send is now refused. The body stays at that level, so the branch is still adopted and
+    its send stays dead."""
+    body = _labelled(
+        "Block", "MsgSend %ADT [OB_LABEL]", '<If Data="If (x)"><List/></If>'
+    ) + _sibling_arm("Else")
+    src = _handler_body(_handler_source(body))
+    assert _LABEL_MARKER in src and _ORPHAN not in src
+    assert 'Send("OB_LABEL"' not in src
+    assert '        sends.append(Send("OB_FLAT", msg))' in src
+    assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
+
+
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_branch_marker_holding_only_a_marked_wrapper_still_opens_its_branch(pair: str) -> None:
+    """The in-body form. A branch marker written in its construct's own list opens a branch when
+    it holds no statement, and what follows it is dead until the condition is written. A wrapper
+    carrying a statement, inside that marker's ``<Line>``, adds a label marker and no statement.
+    So the branch still opens, and the label marker leads it."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    opener = _labelled("Line", branch, "<List{S}/>")
+    arm = _CLEAR + '<Line Data="MsgSend %ADT [OB_FLAT]"/>'
+    template = construct.replace("<List/>", f"<List>{_FILLED}{opener}{arm}</List>")
+    src = _assert_the_markers_change_no_code(template, 1)
+    assert '        sends.append(Send("OB_FLAT", msg))' in src
+    assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
+    assert next(line for line in src.splitlines() if _LABEL_MARKER in line).startswith(
+        " " * 8 + "#"
+    )
+
+
+@pytest.mark.parametrize(
+    ("outer", "label", "plain", "orphans"),
+    [
+        # main reads a ``<Call>`` with no ``@Data`` around a call as a branch-group and drops the
+        # wrapper, so the If inside it adopts the Else written after it.
+        pytest.param(
+            "Call",
+            _labelled("Call", "MsgLog %ADT"),
+            _labelled("Call", 'ActionListCall "Sub"'),
+            0,
+            id="a-call-in-a-bare-call",
+        ),
+        # A bare ``<Block>`` around a call or a send is no branch-group on main. It stays a
+        # label, and the Else after it is an orphan there, statement or no statement.
+        pytest.param(
+            "Block",
+            _labelled("Call", "MsgLog %ADT"),
+            _labelled("Call", 'ActionListCall "Sub"'),
+            1,
+            id="a-call-in-a-bare-block",
+        ),
+        pytest.param(
+            "Block",
+            _labelled("Block", "MsgSend %ADT [OB_LABEL]"),
+            '<Line Data="MsgSend %ADT [OB_LABEL]"/>',
+            1,
+            id="a-send-in-a-bare-block",
+        ),
+    ],
+)
+def test_a_demoted_label_changes_no_shape_around_it(
+    outer: str, label: str, plain: str, orphans: int
+) -> None:
+    """A Call becomes a plain label when its ``@Data`` is a statement, and a send there becomes a
+    refused send. Whether the element around it is a branch-group is still read from the kind it
+    had, so the tree keeps the shape it has with the plain call, or the plain send, in its place.
+    Only the line of that send differs: a raise where the plain one delivers."""
+    construct, branch = _SIBLING_BRANCHES["if-else"]
+    marked, control = (
+        _handler_body(
+            _handler_source(f"<{outer}>{inner}{construct}</{outer}>" + _sibling_arm(branch))
+        )
+        for inner in (label, plain)
+    )
+    assert _LABEL_MARKER in marked and _LABEL_MARKER not in control
+
+    def in_place(src: str, kind: str) -> list[str]:
+        """The code, with a line of that send of ``kind`` cut to its indent and nothing else."""
+        return [
+            line[: len(line) - len(line.lstrip())] + "SEND"
+            if "OB_LABEL" in line and line.lstrip().startswith(kind)
+            else line
+            for line in _code(src)
+        ]
+
+    assert in_place(marked, "raise NotImplementedError(") == in_place(control, "sends.append(")
+    assert marked.count(_ORPHAN) == control.count(_ORPHAN) == orphans
+
+
+def test_demoting_a_handlers_only_visible_send_adds_no_trailing_send() -> None:
+    """A handler with no send the render reaches ends on ``return Send(...)`` for every
+    destination in its tree, and main leaves one kind of send in the tree unrendered: a send in a
+    branch that another branch holds. So when a send off a Line is the handler's only visible
+    send, refusing it must not move the handler to that form. It is still a send, so the handler
+    keeps its ``sends`` list, and delivers nothing. The control is the same list with that send
+    on a Line."""
+    hidden = (
+        '<Block Data="Matching &quot;M&quot;"><Line Data="Matching &quot;M&quot;"/>'
+        '<Line Data="MsgSend %ADT [OB_HIDDEN]"/></Block>'
+    )
+    marked, control = (
+        _handler_body(_handler_source(f"<Case>{hidden}{send}</Case>"))
+        for send in (
+            _labelled("Block", "MsgSend %ADT [OB_LABEL]"),
+            '<Line Data="MsgSend %ADT [OB_LABEL]"/>',
+        )
+    )
+    assert _LABEL_MARKER in marked and "Send(" not in marked
+    assert "    return sends" in marked and "    return sends" in control
+    assert 'Send("OB_HIDDEN"' not in control and 'Send("OB_LABEL", msg)' in control
+
+
+_SEND_OUT = _role_send("other-handle", "%OUT", "OB_R")
+_NO_DESTINATION = "    return None  # TODO: Corepoint export named no destination for this handler"
+
+
+@pytest.mark.parametrize("tag", ["Block", "Call"])
+def test_a_send_off_a_line_is_refused_aloud_and_never_filters_in_silence(tag: str) -> None:
+    """The Lander's second hold on PR 1938. A lone role-marked send of a handle that is not msg,
+    in a Block's or a Call's ``@Data``, with no copy into that handle. main refuses it with a
+    raise, so the message goes to ERROR. Rendered as a label and a comment, it left a handler
+    that returned an empty list: FILTERED, with nobody told. It is a refused send where main put
+    one, with its outbound still declared for the hand-finish, and it counts unmapped once."""
+    body = _container(tag, _SEND_OUT)
+    src = _handler_source(body)
+    lines = _handler_body(src).splitlines()
+    refusals = [i for i, line in enumerate(lines) if line.startswith("    raise ")]
+    assert len(refusals) == 1
+    raised = lines[refusals[0]]
+    assert raised.startswith('    raise NotImplementedError("Corepoint import: MsgSend to OB_R: ')
+    assert _LABEL_MARKER in raised
+    todo = lines[refusals[0] - 1]
+    assert todo.startswith("    # TODO: Corepoint MsgSend to OB_R — hand-finish: ")
+    assert _LABEL_MARKER in todo and todo.endswith('(MsgSend %OUT to connection "OB_R")')
+    assert "Send(" not in _handler_body(src) and 'outbound("OB_R"' in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["MsgSend"], 0)
+
+
+def test_a_catch_never_swallows_the_refusal_of_a_send_off_a_line() -> None:
+    """A refused send in a ``try`` keeps the guard main gives it: every Catch renders as
+    ``except Exception:``, which would catch the refusal and run the Catch body in its place."""
+    body = f'<Try><List>{_container("Block", _SEND_OUT)}<Line Data="Catch"/>{_CLEAR}</List></Try>'
+    src = _handler_body(_handler_source(body))
+    guard = (
+        "    except NotImplementedError:  # a refused MsgSend above — never caught\n        raise\n"
+    )
+    assert "        raise NotImplementedError(" in src and guard in src
+    assert src.index(guard) < src.index("    except Exception:")
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param("MsgSend %OUT", id="no-markup"),
+        pytest.param(
+            _span("keyword", "MsgSend") + " " + _span("other-handle", "%OUT"), id="role-marked"
+        ),
+    ],
+)
+@pytest.mark.parametrize("tag", ["Block", "Call"])
+def test_a_send_off_a_line_naming_no_destination_keeps_mains_loud_ending(
+    tag: str, data: str
+) -> None:
+    """A send that names no destination selects no ``sends`` list on main, and the handler ends on
+    the ``return None`` that says no destination was named. Off a Line it keeps that ending, and
+    never a bare ``return sends``. It is refused as any other send off a Line is."""
+    src = _handler_body(_handler_source(_labelled(tag, data)))
+    assert src.rstrip("\n").endswith("\n" + _NO_DESTINATION)
+    assert "sends" not in src
+    assert (
+        '    raise NotImplementedError("Corepoint import: MsgSend (no destination named): ' in src
+    )
+
+
+@pytest.mark.parametrize("tag", ["Block", "Call"])
+def test_a_send_off_a_line_is_refused_even_where_main_delivered_it(tag: str) -> None:
+    """main sent msg for a send of the input handle in a Block's ``@Data``. It may never have
+    run, so it is no delivery. A refusal is the loud way to say so: nothing is sent, and nothing
+    is filtered in silence either."""
+    for send in (_role_send("input-handle", "%ADT", "OB_R"), _role_line("MsgSend %ADT [OB_R]")):
+        src = _handler_body(_handler_source(_container(tag, send)))
+        assert "Send(" not in src and "    raise NotImplementedError(" in src, send
+        assert src.rstrip("\n").endswith("\n    return sends"), send
+
+
+def test_a_wrappers_marker_stays_where_the_wrapper_sat() -> None:
+    """Source order. A marker is not moved ahead of a construct it follows. Where that construct
+    adopts a branch written after the wrapper, the marker follows the whole chain."""
+    construct, branch = _SIBLING_BRANCHES["if-else"]
+
+    def order(body: str) -> list[str]:
+        lines = _handler_body(_handler_source(body)).splitlines()
+        named = {"    if ": "if", "    elif ": "else", _LABEL_MARKER: "marker", "PID-21": "next"}
+        return [name for line in lines for text, name in named.items() if text in line]
+
+    after = '<Line Data="ItemClear %ADT/PID-21"/>'
+    for nesting in ("one-wrapper", "inner-of-two"):
+        between = _EMPTY_WRAPPERS[nesting].replace("{S}", _WRAPPER_STATEMENT)
+        assert order(construct + between + after) == ["if", "marker", "next"]
+        arm = _sibling_arm(branch)
+        assert order(construct + between + arm + after) == ["if", "else", "marker", "next"]
+
+
+def test_a_hostile_label_statement_cannot_escape_its_marker() -> None:
+    """The statement is untrusted export text. It rides in a comment, flattened and elided."""
+    hostile = "MsgTreeCopy %NEW/ to %ADT/\nimport os  # " + "x" * 5000
+    src = _handler_source(_labelled("Try", hostile) + _SEND_INPUT)
+    compile(src, "generated.py", "exec")
+    assert "\nimport os" not in src
+    marker = next(line for line in src.splitlines() if _LABEL_MARKER in line)
+    assert "MsgTreeCopy %NEW/ to %ADT/ import os" in marker and len(marker) < 400
+
+
+@pytest.mark.parametrize("tag", _CONTAINER_TAGS)
+def test_a_statement_label_keeps_the_whole_list_gate_closed(tag: str) -> None:
+    """The gate admits a ``<Block>`` only with no label, and no construct at all. So a list holding
+    such a container never binds a local: it takes the step 1 path, where the rule above applies.
+    The same list without the container opens the gate, which
+    ``test_an_enclosing_element_with_an_unread_attribute_closes_the_gate`` shows as its control."""
+    body = _CLONE_WRITE_SEND + _container(tag, _CLONE_LINE)
+    root = _hardened_fromstring(_package(body))
+    assert (
+        _understood_list(root[0], {child: parent for parent in root.iter() for child in parent})
+        is None
+    )
+    src = _handler_body(_handler_source(body))
+    assert "_msg = " not in src and "Send(" not in src
+
+
+def test_a_send_of_a_clone_only_a_label_names_raises_when_the_handler_runs(tmp_path: Path) -> None:
+    with pytest.raises(NotImplementedError, match="MsgSend delivers %OUT"):
+        _run_handler(tmp_path, _container("Block", _CLONE_LINE) + _SEND_COPY)
+
+
+def test_a_marked_label_statement_is_counted_and_the_module_passes_check(tmp_path: Path) -> None:
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(_container("Block", _CLONE_LINE) + _SEND_COPY), encoding="utf-8")
+    summary = import_corepoint(export, tmp_path / "out").to_json()
+    assert (summary["total_mapped"], summary["total_unmapped"]) == (0, 2)
+    assert run_checks(tmp_path / "out", run_lint=False).ok
+
+
+def test_the_statement_verb_table_holds_every_verb_the_importer_reads_on_a_line() -> None:
+    """A verb added to the role-parsed step 1 mapping or to the gate's allow-list must join the
+    table too, or its statement off a Line would go back to being a label. The table is kept
+    apart from both, so taking a verb OFF the allow-list, which narrows the gate, cannot shrink
+    it. These are the two tables this test can read: a verb the importer names only in code,
+    as the scan names ``msgtreecopy``, is pinned by name."""
+    assert {verb.lower() for verb in _UNDERSTOOD} | set(_VERB_CONNECTIVES) <= _STATEMENT_VERBS
+    assert "msgtreecopy" in _STATEMENT_VERBS
+    assert set(_VERB_SPELLINGS) == _STATEMENT_VERBS
+
+
+def test_the_container_tags_under_test_are_the_importers_own() -> None:
+    """A container tag the importer gains must gain its cases here too."""
+    assert {tag.lower() for tag in _CONTAINER_TAGS} == set(_CONTAINER_KIND_BY_TAG)
 
 
 def test_generated_xml_module_compiles_and_passes_check(tmp_path: Path) -> None:

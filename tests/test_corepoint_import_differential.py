@@ -20,7 +20,14 @@ hostile handle spellings. Each shape is rendered to XML and imported twice: by t
 by the step 1 importer, vendored byte-for-byte from main at ``bca583f2a`` (blob ``b88e7152``) as
 ``tests/fixtures/corepoint/step1_corepoint_import.py.txt``. A vendored copy, not ``git show
 origin/main``, because once step 2 merges ``origin/main`` IS the head, and the comparison would become
-the head against itself; and because a CI checkout need not hold that ref.
+the head against itself; and because a CI checkout need not hold that ref. The vendored file is never
+edited. The baseline the guard runs is that file plus the amendments in ``_STEP1_AMENDMENTS``, made
+as it loads: the changes the step 1 code path has gained on purpose since that tree. There is one,
+BACKLOG #2632, and ``test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line`` bounds
+what it may change against the file exactly as vendored. The bound is one rule: the amended
+baseline, and the head wherever the gate is closed, are never QUIETER than that file. No refusal
+goes, no marked ending goes, and nothing main counted unmapped goes uncounted (:func:`_quieter`).
+``test_no_raw_list_is_quieter_than_main`` asks the same of lists drawn with no grammar.
 
 **The invariant (the whole-list gate, ADR 0086).** For every shape, EITHER the head's generated
 module and summary counts are step 1's byte for byte (the gate is closed), OR the guard's own
@@ -58,11 +65,13 @@ All fixtures are synthetic. The shapes come from a fixed seed, so a failure is r
 from __future__ import annotations
 
 import hashlib
+import html
 import random
 import re
 import sys
 import types
 import unicodedata
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,18 +95,186 @@ def _step1_bytes() -> bytes:
     return _STEP1_PATH.read_bytes().replace(b"\r\n", b"\n")
 
 
-def _load_step1() -> Any:
-    name = "_mefor_corepoint_import_step1"
+# What the step 1 code path has gained since that tree, as ``(text the vendored file holds exactly
+# once, what replaces it)``. The vendored file itself is never edited: its blob id stays pinned, and
+# the baseline the guard runs is that file with these replacements made when it loads.
+#
+# BACKLOG #2632, the one amendment so far. A statement in the ``@Data`` of an element that is not a
+# ``<Line>`` used to render as a label, as the text of a dead condition, as a live send, or not at
+# all, while the handle scan counted its clone. The step 1 path now marks that statement as a counted
+# TODO, never emits it as a write or a delivery, refuses a send in a Block's or a Call's ``@Data``,
+# and holds no handle for the list. A list the gate declines takes that path, so "renders as step 1" has to mean this
+# path, or the guard would fail on the repair itself. The rule is copied here as text, apart from
+# the head, so a later change to the head's rule turns the guard red until someone amends this copy
+# on purpose.
+_LABEL_RULE = """\
+_STATEMENT_VERBS = frozenset(
+    {"itemappend", "itemclear", "itemcopy", "msgcreate", "msglog", "msgsend", "msgtreecopy"}
+)
+_LABEL_STATEMENT_WHY = (
+    "not on a Line, so it may never have run; nothing is mapped and no role-marked handle here "
+    "is taken to be msg"
+)
+_LABEL_SEND_REFUSAL = (
+    "MsgSend is not on a Line, so it may never have run; nothing is mapped and no role-marked "
+    "handle here is taken to be msg; the import refuses to send msg in its place"
+)
+
+
+@dataclass(frozen=True)
+class LabelMarker(UnmappedAction):
+    pass
+
+
+@dataclass(frozen=True)
+class _Demoted(Control):
+    was: str = ""
+
+
+def _label_statement(elem: Element) -> str:
+    tag = _local(elem.tag).lower()
+    if tag == "line":
+        return ""
+    data = _attr(elem, "Data")
+    roles = parse_roles(data)
+    verb = _statement_verb(roles, _split_verb(strip_markup(data))[0])
+    lowered = verb.lower()
+    kind = _CONTAINER_KIND_BY_TAG.get(tag)
+    if kind is not None:
+        rendered = _statement_kind(tag, verb)
+        if rendered != "send" and rendered == _KIND_BY_VERB.get(lowered):
+            return ""
+    leads = next((token for token in roles if token.role not in _PROSE_ROLES), None)
+    bare = kind == "block" or tag in _LIST_TAGS
+    styled = bare and leads is not None and leads.role == "keyword" and _role_verb(roles)
+    return verb if lowered in _STATEMENT_VERBS or styled else ""
+
+
+def _label_marker(elem: Element) -> list[LabelMarker]:
+    carried = _label_statement(elem)
+    if not carried:
+        return []
+    statement = strip_markup(_attr(elem, "Data"))
+    return [LabelMarker(carried, f"{_LABEL_STATEMENT_WHY}: {statement}")]
+
+
+"""
+_SOURCE_LABEL_DEF = "def _source_label(tag: str, verb: str) -> str:\n"
+_SCAN_SKIP = (
+    "        if not tokens:\n            continue  # markup-free: no handle roles to learn from\n"
+)
+_WRAPPER_FLATTEN = (
+    "            steps.extend(_parse_list(child, subject, held, in_control, depth + 1))\n"
+)
+_SIBLING_PARSE = (
+    "        produced = _parse_statement(child, subject, held, in_control, depth + 1)\n"
+)
+_SIBLING_KEPT = "            continue\n        steps.extend(produced)\n"
+_BARE_MARKER = "and step.kind in _BRANCH_PARENT and not step.body:\n"
+_BRANCH_BODY = "branches.append(replace(marker, body=tuple(steps[start:i])))\n"
+_LAST_BRANCH_BODY = "branches.append(replace(marker, body=tuple(steps[start:])))\n"
+_BRANCH_GROUP = "any(isinstance(s, Control) and s.kind == kind for s in body):\n"
+_SEND_REFUSAL = '        refusal = _send_refusal(role_operands, held) if roles else ""\n'
+_UNKNOWN_ARM = "    if tag.lower() not in _STATEMENT_TAGS:\n"
+_UNKNOWN_RETURN = '        return [Control("unknown", tag, statement or note, body=tuple(body))]\n'
+_BLOCK_RETURN = "return [Control(kind, source, statement or note or tag, body=tuple(body))]\n"
+_CONSTRUCT_RETURN = "    return [Control(kind, source, detail, body=inner, branches=branches)]\n"
+_STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
+    # The rule and its marker, just after ``_statement_kind``, which the rule calls.
+    (_SOURCE_LABEL_DEF, _LABEL_RULE + _SOURCE_LABEL_DEF),
+    # The scan: a list holding such a statement holds no handle at all.
+    (
+        _SCAN_SKIP,
+        "        if _label_statement(elem):\n            return frozenset(), frozenset()\n"
+        + _SCAN_SKIP,
+    ),
+    # The render, a ``<List>`` wrapper: the marker where the wrapper sits, ahead of its
+    # flattened body.
+    (_WRAPPER_FLATTEN, "            steps.extend(_label_marker(child))\n" + _WRAPPER_FLATTEN),
+    # The adoption of a sibling branch never sees a marker, at any depth. Written apart from the
+    # head, which holds the markers back from the list until a statement position follows them.
+    # Here the markers are lifted off the end of the list, main's own adoption runs untouched on
+    # what is left, and they go back after whatever it did.
+    (
+        _SIBLING_PARSE,
+        _SIBLING_PARSE + "        lifted: list[Step] = []\n"
+        "        while steps and isinstance(steps[-1], LabelMarker):\n"
+        "            lifted.insert(0, steps.pop())\n",
+    ),
+    (
+        _SIBLING_KEPT,
+        "            steps.extend(lifted)\n"
+        "            continue\n"
+        "        steps.extend(lifted)\n"
+        "        steps.extend(produced)\n",
+    ),
+    # The render, an unmodelled tag: the statement is named in the marker that tag already has.
+    (_UNKNOWN_ARM, "    marker = _label_marker(elem)\n" + _UNKNOWN_ARM),
+    (
+        _UNKNOWN_RETURN,
+        "        detail = marker[0].detail if marker else statement or note\n"
+        '        return [Control("unknown", tag, detail, body=tuple(body))]\n'
+        # A Call carrying a statement is a plain label, and no call: the label, its marker and
+        # its body beneath. It remembers the kind it had.
+        '    if marker and kind == "call":\n'
+        '        return [_Demoted("block", tag, statement, body=(*marker, *body), was=kind)]\n',
+    ),
+    # A send in a Block's or a Call's ``@Data`` is never a delivery, and never a comment either.
+    # It stays the send main made of it, in main's own send arm, and is always refused. So it
+    # raises where main raised or delivered, its destination stays declared, and the handler
+    # keeps the closing ``return`` main gave it. Written apart from the head, which chooses the
+    # refusal in an ``if`` and an ``else``.
+    (
+        _SEND_REFUSAL,
+        _SEND_REFUSAL + "        if marker:\n            refusal = _LABEL_SEND_REFUSAL\n",
+    ),
+    # The shape of the tree is main's. The branch-group test reads the kind a demoted label had.
+    # And a branch marker holding nothing but label markers still opens its branch, and keeps
+    # them. Written apart from the head, which asks one function for the kind and tests the
+    # marker's body with ``all``.
+    (_BRANCH_GROUP, _BRANCH_GROUP.replace("s.kind", 'getattr(s, "was", s.kind)')),
+    (
+        _BARE_MARKER,
+        _BARE_MARKER.replace(
+            "not step.body", "not [s for s in step.body if not isinstance(s, LabelMarker)]"
+        ),
+    ),
+    (
+        _BRANCH_BODY,
+        _BRANCH_BODY.replace("tuple(steps[start:i])", "(*marker.body, *steps[start:i])"),
+    ),
+    (
+        _LAST_BRANCH_BODY,
+        _LAST_BRANCH_BODY.replace("tuple(steps[start:])", "(*marker.body, *steps[start:])"),
+    ),
+    # The render, a container: the marker ahead of its body, or ahead of the construct.
+    (_BLOCK_RETURN, _BLOCK_RETURN.replace("body=tuple(body)", "body=(*marker, *body)")),
+    (_CONSTRUCT_RETURN, _CONSTRUCT_RETURN.replace("[Control(", "[*marker, Control(")),
+)
+
+
+def _load_step1(name: str, amendments: tuple[tuple[str, str], ...]) -> Any:
     if name in sys.modules:
         return sys.modules[name]
+    source = _step1_bytes().decode("utf-8")
+    for found, replacement in amendments:
+        # Exactly once, so an amendment can neither miss nor land somewhere it was not meant to.
+        assert source.count(found) == 1, f"the vendored step 1 file holds {found!r} other than once"
+        source = source.replace(found, replacement)
     module = types.ModuleType(name)
     # dataclasses resolve string annotations through sys.modules, so register before running it.
     sys.modules[name] = module
-    exec(compile(_step1_bytes().decode("utf-8"), str(_STEP1_PATH), "exec"), module.__dict__)
+    # An amended source is compiled under its own name: a traceback must not quote the vendored
+    # file's lines for code that sits at other lines once amended.
+    filename = f"<{_STEP1_PATH.name} amended>" if amendments else str(_STEP1_PATH)
+    exec(compile(source, filename, "exec"), module.__dict__)
     return module
 
 
-step1: Any = _load_step1()
+#: The baseline: the step 1 code path as it stands, which a gate-declined list must match.
+step1: Any = _load_step1("_mefor_corepoint_import_step1", _STEP1_AMENDMENTS)
+#: The vendored tree exactly as main held it, with no amendment. Only the amendment's own test reads it.
+step1_as_vendored: Any = _load_step1("_mefor_corepoint_import_step1_as_vendored", ())
 
 
 def test_the_step1_fixture_is_mains_step1_importer_byte_for_byte() -> None:
@@ -1008,6 +1185,21 @@ def _live_sends(src: str) -> list[tuple[int, str, str]]:
     ]
 
 
+_RETURNED_SEND = re.compile(r'Send\("([^"]+)", msg\)')
+
+
+def _trailing_sends(src: str) -> list[str]:
+    """Every destination a handler's closing ``return`` delivers to. :func:`_live_sends` reads the
+    ``sends.append`` lines alone, and a handler with no send the render reaches ends on a
+    ``return Send(...)`` for every destination in its tree."""
+    return [
+        dest
+        for line in src.splitlines()
+        if line.startswith("    return ")
+        for dest in _RETURNED_SEND.findall(line)
+    ]
+
+
 def _send_indent(src: str, dest: str, *, live_only: bool = False) -> int | None:
     """The shallowest code line (not a comment) that sends, or refuses to send, to ``dest``. With
     ``live_only``, a live send only: a refusal at any depth fails closed."""
@@ -1025,7 +1217,12 @@ def _send_indent(src: str, dest: str, *, live_only: bool = False) -> int | None:
     return min(found) if found else None
 
 
-def _generate(module: Any, xml: str) -> tuple[str, tuple[object, ...]]:
+#: What :func:`_generate` returns: the module, and ``(mapped, unmapped names, disabled)`` for
+#: each handler.
+_Out = tuple[str, tuple[tuple[int, list[str], int], ...]]
+
+
+def _generate(module: Any, xml: str) -> _Out:
     """The generated module and the summary counts, or ``("", ())`` when the import refuses."""
     try:
         channel = module.parse_package(_package(xml))[0]
@@ -1818,6 +2015,7 @@ def _seed_shapes() -> Iterator[Shape]:
         )
     yield from _round3_shapes()
     yield from _gate_review_shapes()
+    yield from _label_statement_shapes()
     # The Lander's QA of db8873d19e, pre-existing on main: a line between an If and its Else.
     for between in (
         "<Line/>",
@@ -2061,6 +2259,199 @@ def _gate_review_shapes() -> Iterator[Shape]:
         yield Shape(f"gate-review-nested-{depth}", "%ADT", (nested,))
 
 
+#: A construct, and a branch marker a ``<Line>`` after it carries as its sibling.
+_SIBLING_PAIRS = (
+    ("if-else", '<If Data="If (x)"><List/></If>', "Else"),
+    ("if-elseif", '<If Data="If (x)"><List/></If>', "ElseIf (y)"),
+    ("try-catch", "<Try><List/></Try>", "Catch"),
+    ("case-matching", '<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M0"'),
+)
+_FILLED = '<Line Data="ItemClear %ADT/PID-20"/>'
+#: Wrappers between such a pair, nested. ``{S}`` is where one carries a statement. A ``filled``
+#: wrapper holds a statement of its own, which orphans the branch on main already.
+_NESTED_WRAPPERS = {
+    "side-by-side": "<List{S}/><Actions{S}/>",
+    "inner-of-2": "<List><List{S}/></List>",
+    "both-of-2": "<List{S}><List{S}/></List>",
+    "all-of-3": "<List{S}><Actions{S}><List{S}/></Actions></List>",
+    "innermost-of-3": "<List><List><List{S}/></List></List>",
+    "middle-of-3": "<List><List{S}><List/></List></List>",
+    "outermost-of-3": "<Actions{S}><List><List/></List></Actions>",
+    "filled-one": f"<List{{S}}>{_FILLED}</List>",
+    "filled-inner-of-2": f"<List><List{{S}}>{_FILLED}</List></List>",
+    "filled-outer-of-2": f"<List{{S}}><List>{_FILLED}</List></List>",
+    "filled-beside-the-inner-of-2": f"<List>{_FILLED}<List{{S}}/></List>",
+}
+_CONTAINER_TAGS = ("Block", "Call", "Case", "Foreach", "If", "Loop", "Try")
+#: Every tag the #2632 seeds put a statement on: each container, an unmodelled tag, a list wrapper.
+_CARRIER_TAGS = (*_CONTAINER_TAGS, "Switch", "Actions")
+_STATEMENT_VERBS = (
+    "ItemAppend",
+    "ItemClear",
+    "ItemCopy",
+    "MsgCreate",
+    "MsgLog",
+    "MsgSend",
+    "MsgTreeCopy",
+)
+
+
+def _label_statement_shapes() -> Iterator[Shape]:
+    """BACKLOG #2632: a statement in the ``@Data`` of an element that is not a ``<Line>``. Each of
+    the seven container tags, an unmodelled tag and a list wrapper carries one. The random shapes
+    put one on a ``<Block>`` only, and only ever a ``MsgTreeCopy``, so without these seeds a change
+    to the rule for another tag, another verb, or a verb the exporter styled as a keyword, would
+    pass the guard untested."""
+    out = H("%OUT")
+    clone = _leaf_data(Clone(_ADT, out, 1), "%ADT")
+    write = _leaf_data(Write(_ADT, "W3Z"), "%ADT")
+    send = _leaf_data(SendS(_ADT, "OB_LABEL"), "%ADT")
+    # A verb outside the importer's table, styled as a keyword: a statement on a Block alone.
+    merge = _leaf_data(Unread("merge", _NEW, _ADT), "%ADT")
+    assert clone is not None and write is not None and send is not None and merge is not None
+
+    def carrying(tag: str, data: str, body: tuple[Node, ...] = ()) -> Raw:
+        return Raw(f'<{tag} Data="{_esc(data)}"><List>{_render(body, "%ADT")}</List></{tag}>')
+
+    for tag in _CARRIER_TAGS:
+        yield Shape(f"2632-{tag}-clone", "%ADT", (carrying(tag, clone), SendS(out, "OB_OUT")))
+        yield Shape(f"2632-{tag}-write", "%ADT", (carrying(tag, write), SendS(_ADT, "OB_IN")))
+        yield Shape(f"2632-{tag}-send", "%ADT", (carrying(tag, send), SendS(_ADT, "OB_IN")))
+        yield Shape(f"2632-{tag}-keyword", "%ADT", (carrying(tag, merge), SendS(_ADT, "OB_IN")))
+        yield Shape(
+            f"2632-{tag}-clone-over-a-body",
+            "%ADT",
+            (
+                carrying(tag, clone, (Write(out, "W4Z"), SendS(out, "OB_BODY"))),
+                SendS(_ADT, "OB_IN"),
+            ),
+        )
+        for verb in _STATEMENT_VERBS:
+            for spelling in (verb, verb.lower()):
+                yield Shape(
+                    f"2632-{tag}-flat-{spelling}",
+                    "%ADT",
+                    (carrying(tag, f"{spelling} %NEW/ to %ADT/"), SendS(_ADT, "OB_IN")),
+                )
+    # A wrapper holding a statement, between a construct and the branch marker written after it
+    # as a sibling. The adoption must not see the marker: an orphaned branch renders live.
+    arm = _render((Write(_ADT, "W5Z", markup=False), SendS(_ADT, "OB_ARM", markup=False)), "%ADT")
+    for name, construct, branch in _SIBLING_PAIRS:
+        for label, data in (("log", "MsgLog %ADT"), ("clone", clone)):
+            between = Raw(construct + carrying("List", data).xml + _line(branch, arm))
+            yield Shape(f"2632-List-{label}-before-a-sibling-{name}", "%ADT", (between,))
+            # The Lander's hold on PR 1938: the same, with the wrapper nested in others, to a
+            # depth of two and three, and the statement on the inner one, the outer, or each.
+            for nesting, template in _NESTED_WRAPPERS.items():
+                wrappers = template.replace("{S}", f' Data="{_esc(data)}"')
+                nested = Raw(construct + wrappers + _line(branch, arm))
+                yield Shape(
+                    f"2632-List-{label}-{nesting}-before-a-sibling-{name}", "%ADT", (nested,)
+                )
+    # The other routes by which a marker comes last in a list a branch is adopted in: a body
+    # flattened to that level. And a send label over a construct, whose body main left there.
+    if_x, else_arm = _SIBLING_PAIRS[0][1], _line("Else", arm)
+    for nesting, template in (("one", "<List{S}/>"), ("two", _NESTED_WRAPPERS["inner-of-2"])):
+        wrappers = template.replace("{S}", ' Data="MsgLog %ADT"')
+        for route, xml in (
+            ("a-branch-group", f"<If>{_line('If (x)', '')}{wrappers}</If>"),
+            ("a-line-body", _line("ItemClear %ADT/PID-18", if_x + wrappers)),
+            ("a-wrapper-around-the-construct", f"<List>{if_x}{wrappers}</List>"),
+        ):
+            yield Shape(
+                f"2632-List-log-{nesting}-deep-at-the-end-of-{route}",
+                "%ADT",
+                (Raw(xml + else_arm),),
+            )
+    for tag in ("Block", "Call"):
+        over = carrying(tag, "MsgSend %ADT [OB_LABEL]", (Raw(if_x),))
+        yield Shape(f"2632-{tag}-send-over-a-construct", "%ADT", (Raw(over.xml + else_arm),))
+    # A construct carrying a statement still adopts its own sibling branch.
+    carrier = carrying("If", "MsgLog %ADT")
+    yield Shape("2632-If-log-before-its-own-sibling-else", "%ADT", (Raw(carrier.xml + else_arm),))
+    # Code review of the repair: the shape of the tree is decided in two more places.
+    log_wrapper = '<List Data="MsgLog %ADT"/>'
+    for name, construct, branch in _SIBLING_PAIRS:
+        # A branch marker written in the construct's own list, holding nothing but such a wrapper.
+        # It must still open its branch: what follows it is dead until the condition is written.
+        inside = construct.replace(
+            "<List/>", f"<List>{_FILLED}{_line(branch, log_wrapper)}{arm}</List>"
+        )
+        yield Shape(f"2632-List-log-in-a-bare-{name}-marker", "%ADT", (Raw(inside),))
+        # A label demoted from a call, or a send off a Line, inside an element with no
+        # ``@Data``. Whether that element is a branch-group is read from the kind it had on
+        # main.
+        after = _line(branch, arm)
+        for outer, tag, data in (
+            ("Call", "Call", "MsgLog %ADT"),
+            ("Block", "Call", "MsgLog %ADT"),
+            ("Block", "Block", "MsgSend %ADT [OB_LABEL]"),
+        ):
+            group = f'<{outer}><{tag} Data="{_esc(data)}"/>{construct}</{outer}>'
+            yield Shape(
+                f"2632-{tag}-{data[:6]}-in-a-bare-{outer}-before-a-{name}",
+                "%ADT",
+                (Raw(group + after),),
+            )
+    # Code review of the repair, round 2. A send label beside a send the render never reaches:
+    # main does not render a branch held by another branch. Demoting the label takes away the
+    # handler's only visible send, and the handler must not fall back to the closing
+    # ``return Send``, which would deliver the unrendered one for every message.
+    opener = _esc('Matching "M0"')
+    held = _line('Matching "M0"') + _line("MsgSend %ADT [OB_HIDDEN]")
+    hidden = f'<Case><Block Data="{opener}">{held}</Block>'
+    for tag in ("Block", "Call"):
+        label = f'<{tag} Data="MsgSend %ADT [OB_LABEL]"/>'
+        yield Shape(
+            f"2632-{tag}-send-beside-a-send-main-never-renders",
+            "%ADT",
+            (Raw(hidden + label + "</Case>"),),
+        )
+    # The Lander's second hold on PR 1938: a send off a Line that main REFUSES, or ends on the
+    # ``return None`` that says no destination was named. The head must be no quieter. Every
+    # seed above puts the input's own send there, which main delivers, so none of them could
+    # show a refusal that went. ``%OUT`` is never copied into here, so main refuses its send.
+    refused = _leaf_data(SendS(out, "OB_R"), "%ADT")
+    assert refused is not None
+    unnamed = f"{_kw('MsgSend')} {_hs(out, '%ADT')}"
+    catch = _line("Catch") + _render((Write(_ADT, "W6Z", markup=False),), "%ADT")
+    for tag in ("Block", "Call"):
+        alone = carrying(tag, refused)
+        yield Shape(f"2632-{tag}-send-main-refuses", "%ADT", (alone,))
+        yield Shape(
+            f"2632-{tag}-send-main-refuses-beside-a-send", "%ADT", (alone, SendS(_ADT, "OB_IN"))
+        )
+        # A Catch must not swallow the refusal: main re-raises it ahead of every Catch.
+        tried = Raw(f"<Try><List>{alone.xml}{catch}</List></Try>")
+        yield Shape(f"2632-{tag}-send-main-refuses-in-a-try", "%ADT", (tried,))
+        # Where main DELIVERS it, main has no guard of its own to keep. The refusal needs one.
+        delivered = Raw(f"<Try><List>{carrying(tag, send).xml}{catch}</List></Try>")
+        yield Shape(f"2632-{tag}-send-in-a-try-main-delivers", "%ADT", (delivered,))
+        yield Shape(f"2632-{tag}-send-naming-no-destination", "%ADT", (carrying(tag, unnamed),))
+        flat = carrying(tag, "MsgSend %OUT")
+        yield Shape(f"2632-{tag}-flat-send-naming-no-destination", "%ADT", (flat,))
+        # The same send in a construct's body. main leaves a bare TODO there, so the refusal
+        # takes the place of the body's ``pass``, and a ``try`` gains the guard that re-raises it.
+        yield Shape(
+            f"2632-{tag}-flat-send-naming-no-destination-in-an-if",
+            "%ADT",
+            (Raw(f'<If Data="If (x)"><List>{flat.xml}</List></If>'),),
+        )
+        yield Shape(
+            f"2632-{tag}-flat-send-naming-no-destination-in-a-try",
+            "%ADT",
+            (Raw(f"<Try><List>{flat.xml}{catch}</List></Try>"),),
+        )
+    # A keyword span that does not lead a Block's label, and a table verb that does not lead it:
+    # both still read as a label.
+    connective = f"Copy patient {_kw('to')} output"
+    yield Shape(
+        "2632-not-leading-keyword", "%ADT", (carrying("Block", connective), SendS(_ADT, "OB_IN"))
+    )
+    late = "Step 1: MsgTreeCopy %NEW/ to %ADT/"
+    yield Shape("2632-not-leading-verb", "%ADT", (carrying("Block", late), SendS(_ADT, "OB_IN")))
+
+
 # --- the guard ------------------------------------------------------------------------------------
 
 _SEED = 313
@@ -2099,7 +2490,7 @@ def test_open_gate_shapes_are_well_represented() -> None:
     assert len(bound) >= 1000
 
 
-def _generate_text(module: Any, text: str) -> tuple[str, tuple[object, ...]]:
+def _generate_text(module: Any, text: str) -> _Out:
     try:
         channel = module.parse_package(text)[0]
     except module.CorepointImportError:
@@ -2426,6 +2817,526 @@ def test_the_walker_tells_the_gate_apart_on_its_own_seeds() -> None:
     spoiled = [s for s in _round3_shapes() if "write-after-send" not in s.name]
     assert len(spoiled) == 20
     assert not any(_fully_understood(_render(s.nodes, s.inp)) for s in spoiled)
+
+
+# --- the baseline's one amendment (BACKLOG #2632) -------------------------------------------------
+
+_STATEMENT_WORD = re.compile("|".join(_STATEMENT_VERBS), re.IGNORECASE)
+_ANY_TAG = re.compile(r"<[^<>]*>")
+_VOCABULARY_CALL = re.compile(r"^\s*(?:set_field|append_to_field|copy_field)\(.*$", re.MULTILINE)
+
+
+def _may_carry_a_label_statement(xml: str) -> bool:
+    """Whether some element's ``@Data`` could be a statement off a ``<Line>``. Written apart from
+    the importer and WIDER than its rule on purpose: any element but a ``<Line>``, live or not,
+    whose ``@Data`` names one of the seven statement verbs anywhere, or holds a ``keyword`` span."""
+    from messagefoundry._vendor.defusedxml.ElementTree import fromstring
+
+    for elem in fromstring(_package(xml)).iter():
+        if elem.tag.rsplit("}", 1)[-1].lower() == "line":
+            continue
+        for key, data in elem.attrib.items():
+            if key.rsplit("}", 1)[-1].lower() == "data" and (
+                "keyword" in data or _STATEMENT_WORD.search(html.unescape(_ANY_TAG.sub("", data)))
+            ):
+                return True
+    return False
+
+
+def _unmapped_names(out: _Out) -> list[str]:
+    """Every name the summary counts unmapped."""
+    return [name for counts in out[1] for name in counts[1]]
+
+
+def _unmapped(out: _Out) -> int:
+    """How many steps the summary counts unmapped."""
+    return len(_unmapped_names(out))
+
+
+def _handler_lines(src: str) -> list[str]:
+    """The lines of the generated handler, blank ones left out, its closing ``return`` last. The
+    guard wraps every list in one action-list, so a module holds one handler."""
+    return [line for line in src.split("@handler")[-1].splitlines() if line]
+
+
+# The destination a refusal names, as the render writes it: ``to <name>``, or no name at all.
+_REFUSED_TO = re.compile(r'raise NotImplementedError\("Corepoint import: \S+ (?:to ([^:"]+)|\()')
+_TODO = re.compile(r"#\s*TODO: Corepoint (\S+)")
+
+
+def _loud(src: str) -> Counter[tuple[int, str]]:
+    """Every send and every refusal in ``src``, as ``(indent, destination)``. A refusal of a send
+    stands for that send, so the two share a key. One at the handler's own level acts on every
+    message; the same line one level in is dead until someone writes the condition. Keyed by the
+    destination too, so a send that goes cannot hide behind a refusal gained elsewhere. That
+    holds for a send that names a destination. Every refusal naming none shares one key at its
+    indent, so one of those can still hide behind another."""
+    loud: Counter[tuple[int, str]] = Counter((indent, dest) for indent, dest, _ in _live_sends(src))
+    for line in src.splitlines():
+        if _REFUSAL.match(line):
+            named = _REFUSED_TO.search(line)
+            loud[(len(line) - len(line.lstrip()), named.group(1) or "" if named else "")] += 1
+    return loud
+
+
+def _swallowed(lines: Sequence[str]) -> int:
+    """How many ``try`` blocks hold a refusal and open on a handler other than the guard that
+    re-raises it. Every Catch renders as ``except Exception:``, which would catch the refusal and
+    run the Catch body in its place: a delivery, or a silent filter."""
+    count = 0
+    for at, line in enumerate(lines):
+        if line.strip() != "try:":
+            continue
+        indent = len(line) - len(line.lstrip())
+        body: list[str] = []
+        for later in lines[at + 1 :]:
+            if len(later) - len(later.lstrip()) <= indent:
+                count += any(map(_REFUSAL.match, body)) and not later.lstrip().startswith(
+                    "except NotImplementedError:"
+                )
+                break
+            body.append(later)
+    return count
+
+
+def _todos(lines: Sequence[str]) -> Counter[tuple[int, str]]:
+    """Every ``# TODO`` marker, as ``(indent, the word it names)``."""
+    return Counter(
+        (len(line) - len(line.lstrip()), m.group(1))
+        for line in lines
+        if (m := _TODO.search(line)) is not None
+    )
+
+
+def _quieter(was: _Out, now: _Out) -> list[str]:
+    """Every way ``now`` is QUIETER than ``was``, which is main's tree as vendored. It must be
+    none. The rule (ADR 0086 §2(b.4)):
+
+    (b) where main sends or refuses, ``now`` sends or refuses, at the same indent and to the same
+        destination (:func:`_loud`). No ``try`` swallows a refusal main's does not
+        (:func:`_swallowed`), and the handler's closing ``return`` is main's line. A refusal sends
+        the message to ERROR. With a comment in its place the handler returns an empty list or
+        ``None``, and the message is FILTERED with nothing said.
+    (c) what main counted unmapped is still counted, name for name, and every ``# TODO`` main
+        writes is still written, at its indent and naming the same word.
+
+    LOUDER is allowed, and is the whole of what the amendment does: a delivery that becomes a
+    refusal, a mapped step that becomes a counted TODO. Live code it must not add is clause (a),
+    which :func:`_breaches` reads."""
+    if bool(was[0]) != bool(now[0]):
+        return ["(refusal) one of the two refuses the whole list, and the other renders it"]
+    if not was[0]:
+        return []
+    old, new = _handler_lines(was[0]), _handler_lines(now[0])
+    found: list[str] = []
+    lost = _loud(was[0]) - _loud(now[0])
+    if lost:
+        found.append(f"(b) a send or a refusal of main's is gone: {sorted(lost)}")
+    if _swallowed(new) > _swallowed(old):
+        found.append("(b) a Catch swallows a refusal")
+    if new[-1] != old[-1]:
+        found.append(f"(b) the handler ends on {new[-1]!r} where main ends on {old[-1]!r}")
+    uncounted = Counter(_unmapped_names(was)) - Counter(_unmapped_names(now))
+    if uncounted:
+        found.append(f"(c) main counts {sorted(uncounted)} unmapped, and this does not")
+    unwritten = _todos(old) - _todos(new)
+    if unwritten:
+        found.append(f"(c) a TODO main writes is gone: {sorted(unwritten)}")
+    return found
+
+
+# A line that may change where the counts do not: a comment, a refusal, the guard that
+# re-raises a refusal with its bare ``raise``, and the ``pass`` of a body that held no code.
+_QUIET_LINE = re.compile(
+    r"\s*(?:#|raise NotImplementedError\(|except NotImplementedError:|raise$|pass$)"
+)
+
+
+def _breaches(xml: str, was: _Out, now: _Out) -> list[str]:
+    """Every way ``now`` breaks the bound on what BACKLOG #2632 may change, against ``was``, the
+    tree exactly as vendored.
+
+    It changes a list only when an element in it may carry a statement off a ``<Line>``, by a
+    reading written apart from the rule and wider than it. And where it changes a list:
+
+    (a) it adds no live send, inline or in the closing ``return``, and no vocabulary call;
+    (b), (c) it is never quieter than main: see :func:`_quieter`.
+
+    It then counts at least one more step unmapped, with the marker's reason in the module. The
+    exception is a list whose counts stay as they were: a statement under a ``@Disabled``
+    ancestor, one on an unmodelled tag beside no send the scan reads, or a send off a ``<Line>``
+    that main already counted unmapped. There only comment lines and refusals change, with
+    what a refusal brings: the guard that re-raises it ahead of a Catch, and the loss of a
+    ``pass`` its body no longer needs (:data:`_QUIET_LINE`)."""
+    if now == was:
+        return []
+    found: list[str] = []
+    if not _may_carry_a_label_statement(xml):
+        found.append("(rule) no element here may carry a statement off a Line")
+    if Counter(_live_sends(now[0])) - Counter(_live_sends(was[0])):
+        found.append("(a) a live send main does not make")
+    if Counter(_trailing_sends(now[0])) - Counter(_trailing_sends(was[0])):
+        found.append("(a) a closing return that delivers where main's does not")
+    if Counter(_VOCABULARY_CALL.findall(now[0])) - Counter(_VOCABULARY_CALL.findall(was[0])):
+        found.append("(a) a vocabulary call main does not make")
+    found.extend(_quieter(was, now))
+    if _unmapped(now) > _unmapped(was):
+        if step1._LABEL_STATEMENT_WHY not in now[0]:
+            found.append("(reason) one more step is unmapped, and no marker says why")
+        return found
+    was_lines, now_lines = Counter(was[0].splitlines()), Counter(now[0].splitlines())
+    changed = (was_lines - now_lines) + (now_lines - was_lines)
+    if now[1] != was[1]:
+        found.append("(counts) the counts change, and no more is unmapped")
+    if not all(map(_QUIET_LINE.match, changed)):
+        found.append("(code) more than comment lines and refusals change")
+    return found
+
+
+def _bound(name: str, xml: str) -> tuple[bool, list[str]]:
+    """Whether the amended baseline renders the list ``xml`` otherwise than the vendored tree
+    does, and every way it breaks the bound of :func:`_breaches`.
+
+    The head is held to the same bound, against the same vendored tree, wherever the gate is
+    closed. On the battery that is what the head-equals-baseline check already implies. On a list
+    drawn with no grammar nothing else compares the head with main. A fully understood list takes
+    the step 2 path, where a refusal may become a delivery the oracle proves."""
+    was, now = _generate(step1_as_vendored, xml), _generate(step1, xml)
+    broken = [f"{name}: the amended baseline: {b}" for b in _breaches(xml, was, now)]
+    # The head's own output is judged only where it is not the baseline's, which was just judged.
+    if not _fully_understood(xml) and (ahead := _generate(head, xml)) != now:
+        broken += [f"{name}: the head: {b}" for b in _breaches(xml, was, ahead)]
+    return now != was, broken
+
+
+def _amendment_changes(shape: Shape) -> bool:
+    """Whether the amended baseline renders ``shape`` otherwise than the vendored tree does, having
+    checked that the change is one the amendment may make: see :func:`_bound`."""
+    changes, broken = _bound(shape.name, _render(shape.nodes, shape.inp))
+    assert not broken, "\n".join(broken)
+    return changes
+
+
+def _assert_within_the_bound(shapes: Sequence[tuple[str, str]]) -> None:
+    broken: list[str] = []
+    for name, xml in shapes:
+        broken.extend(_bound(name, xml)[1])
+    assert not broken, "\n".join(broken[:20]) + f"\n... {len(broken)} in all"
+
+
+@pytest.mark.parametrize("chunk", range(_CHUNKS))
+def test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line(chunk: int) -> None:
+    """The baseline is main's step 1 tree plus one amendment, so this test bounds what the amendment
+    may change, against the tree exactly as vendored: see :func:`_bound`. Over the battery here,
+    and over the lists drawn with no grammar in ``test_no_raw_list_is_quieter_than_main``."""
+    _assert_within_the_bound(
+        [(shape.name, _render(shape.nodes, shape.inp)) for shape in _SHAPES[chunk::_CHUNKS]]
+    )
+
+
+def test_the_amendment_reaches_every_seed_written_for_it() -> None:
+    """The bound above is not vacuous: the seed that recorded the defect changes, and so does every
+    statement on every carrier tag. Three kinds of seed must NOT change, or the rule is wider than
+    it says: a keyword-styled verb outside the table anywhere but on a ``<Block>`` or a list
+    wrapper, a keyword span that does not lead a Block's label, and a table verb that does not
+    lead it."""
+    assert {tag.lower() for tag in _CONTAINER_TAGS} == set(head._CONTAINER_KIND_BY_TAG)
+    assert {verb.lower() for verb in _STATEMENT_VERBS} == head._STATEMENT_VERBS
+    recorded = next(s for s in _SHAPES if s.name == "d26545d6f-open-1-block-label")
+    assert _amendment_changes(recorded)
+    for shape in _label_statement_shapes():
+        _, tag, kind = shape.name.split("-", 2)
+        expected = tag in ("Block", "Actions") if kind == "keyword" else tag != "not"
+        assert _amendment_changes(shape) is expected, shape.name
+
+
+def _skeleton(module: Any, xml: str) -> tuple[Any, ...] | None:
+    """The SHAPE of the parsed list, or ``None`` where the import refuses: every construct as
+    ``(kind, body, branches)``, every other step as ``"."``. Label markers are left out, and a
+    label demoted from a call counts as the kind it had. So this is the tree as main
+    sees it. Which construct holds which branch, and which branch marker stands alone as an
+    orphan, are both in it."""
+    try:
+        channel = module.parse_package(_package(xml))[0]
+    except module.CorepointImportError:
+        return None
+    marker = getattr(module, "LabelMarker", ())
+
+    def shape(steps: Sequence[Any]) -> tuple[Any, ...]:
+        return tuple(
+            (
+                getattr(step, "demoted_from", "") or getattr(step, "was", "") or step.kind,
+                shape(step.body),
+                shape(step.branches),
+            )
+            if isinstance(step, module.Control)
+            else "."
+            for step in steps
+            if not isinstance(step, marker)
+        )
+
+    return tuple(shape(handler.steps) for handler in channel.handlers)
+
+
+def _adopted(steps: Sequence[Any]) -> int:
+    """How many branches the constructs of a skeleton hold."""
+    return sum(
+        len(step[2]) + _adopted(step[1]) + _adopted(step[2]) for step in steps if step != "."
+    )
+
+
+def _structure_moved(name: str, xml: str) -> tuple[int, list[str]]:
+    """What the amendment, or the head, changes about the shape of the tree, against the file
+    exactly as vendored. It must change nothing. A statement off a ``<Line>`` is marked, and a
+    marker is no statement position. So no branch main adopts is orphaned, at any depth, none it
+    orphans is adopted, and no construct appears or goes. The head is held to that wherever the
+    gate is closed. A fully understood list takes the step 2 path, which builds its own tree.
+
+    Also says how many branches main adopts in the list: where it adopts none, or refuses the
+    list, there is no branch for the amendment to orphan."""
+    was = _skeleton(step1_as_vendored, xml)
+    modules = [("the amended baseline", step1)]
+    if not _fully_understood(xml):
+        modules.append(("the head", head))
+    moved = [
+        f"{name}: {who} parses {now} where main parses {was}"
+        for who, module in modules
+        if (now := _skeleton(module, xml)) != was
+    ]
+    return sum(_adopted(handler) for handler in was or ()), moved
+
+
+_RAW_TAGS = (
+    *("List", "Actions", "Line", "Line", "Line", "Block", "Call"),
+    *("If", "Try", "Case", "Foreach", "Loop", "Switch"),
+)
+_RAW_DATA = (
+    *(None, None, None, "Section", "MsgLog %ADT", "MsgSend %ADT [OB_X]", "ItemClear %ADT/PID-19"),
+    *("MsgTreeCopy %ADT/ to %OUT/", "If (x)", "Else", "ElseIf (y)", "Catch", 'Matching "M"'),
+    *(
+        "ChooseFrom (x)",
+        'ActionListCall "Sub"',
+        "LoopExit",
+        "Try",
+        "Returns",
+        "ForEach %ADT/OBX $o",
+    ),
+)
+#: Role-marked statements, so the keyword half of the rule and the handle scan are in play.
+_RAW_MARKED = tuple(
+    data
+    for data in (
+        _leaf_data(Clone(_ADT, _OUT, 1), "%ADT"),
+        _leaf_data(SendS(_OUT, "OB_R"), "%ADT"),
+        _leaf_data(Unread("merge", _NEW, _ADT), "%ADT"),
+    )
+    if data is not None
+)
+#: One element in ten is switched off, and one in ten carries an operator's comment.
+_RAW_EXTRA = (*[""] * 8, ' Disabled="1"', ' Comment="note"')
+_RAW = 4000
+
+
+def _raw_element(rng: random.Random, depth: int) -> str:
+    """One element of any tag, with any ``@Data``, around up to three more. No grammar: a branch
+    verb on a container, a statement on a wrapper, a wrapper in a branch line. Not every spelling:
+    one casing per tag, and three role-marked statements."""
+    tag, data = rng.choice(_RAW_TAGS), rng.choice((*_RAW_DATA, *_RAW_MARKED))
+    attr = f' Data="{_esc(data)}"' if data is not None else ""
+    attr += rng.choice(_RAW_EXTRA)
+    if depth == 0 or rng.random() < 0.3:
+        return f"<{tag}{attr}/>"
+    children = "".join(_raw_element(rng, depth - 1) for _ in range(rng.randint(0, 3)))
+    if tag not in ("List", "Actions") and rng.random() < 0.6:
+        children = f"<List>{children}</List>"
+    return f"<{tag}{attr}>{children}</{tag}>"
+
+
+def _structure_shapes() -> list[tuple[str, str]]:
+    """Every shape of the battery, and ``_RAW`` lists drawn with no grammar at all. The battery's
+    grammar writes well-formed constructs, so a route nobody thought to seed is not in it. The
+    raw lists are for this test alone: the oracle does not model them."""
+    rng = random.Random(_SEED)
+    raw = ("".join(_raw_element(rng, 3) for _ in range(rng.randint(1, 4))) for _ in range(_RAW))
+    return [
+        *((shape.name, _render(shape.nodes, shape.inp)) for shape in _SHAPES),
+        *((f"raw-{i}", xml) for i, xml in enumerate(raw)),
+    ]
+
+
+_STRUCTURE_SHAPES = _structure_shapes()
+#: The lists drawn with no grammar, which follow the battery in ``_STRUCTURE_SHAPES``.
+_RAW_LISTS = _STRUCTURE_SHAPES[len(_SHAPES) :]
+#: The fewest branches main must adopt over the lists of one chunk of the shape test.
+_ADOPTED_A_CHUNK = 200
+
+
+@pytest.mark.parametrize("chunk", range(_CHUNKS))
+def test_no_branch_main_adopts_is_orphaned(chunk: int) -> None:
+    """The acceptance rule of the repair to PR 1938, and more than it: the amendment changes the
+    shape of no tree. See :func:`_structure_moved`."""
+    moved: list[str] = []
+    adopted = 0
+    for name, xml in _STRUCTURE_SHAPES[chunk::_CHUNKS]:
+        branches, found = _structure_moved(name, xml)
+        adopted += branches
+        moved.extend(found)
+    assert not moved, "\n".join(moved[:20]) + f"\n... {len(moved)} in all"
+    # Equal trees prove nothing where main adopts no branch, or where the import refused.
+    assert adopted >= _ADOPTED_A_CHUNK
+
+
+@pytest.mark.parametrize("chunk", range(_CHUNKS))
+def test_no_raw_list_is_quieter_than_main(chunk: int) -> None:
+    """The bound of :func:`_bound`, over the lists drawn with no grammar. The battery's seeds all
+    put a send main DELIVERS where a label belongs, so a refusal that went was in no shape the
+    bound read (the Lander's second hold on PR 1938). The raw lists draw a role-marked send of
+    ``%OUT`` onto any element, with a copy into it or without."""
+    _assert_within_the_bound(_RAW_LISTS[chunk::_CHUNKS])
+
+
+# The control for the bound's rule (b). The amended baseline, but with a send off a ``<Line>``
+# rendered as a label and its marker, and no refusal: the rule as the Lander held it on PR 1938.
+_SEND_ARM = '    if kind == "send":\n'
+_QUIET_SEND = (
+    '    if marker and kind == "send":\n'
+    '        return [Control("block", tag, statement, body=tuple(marker)), *body]\n'
+)
+#: The fewest raw lists on which that control must turn the bound red.
+_QUIET_RAW_FLOOR = 300
+# Two more controls, each a mutant of the amended baseline: every handler takes the ``sends``
+# list, as the rule the Lander held did for a send off a Line; and a ``try`` never re-raises.
+_INLINE_FORM = "    inline_sends = _has_inline_send(h.steps)\n"
+_GUARDED = "        if _has_refused_send(ctrl.body):\n"
+_MUTANTS = {
+    "every-handler-takes-the-list": (_INLINE_FORM, "    inline_sends = True\n"),
+    "no-try-re-raises": (_GUARDED, "        if False:\n"),
+}
+
+
+def _mutant(name: str) -> Any:
+    return _load_step1(
+        f"_mefor_corepoint_import_step1_{name}", (*_STEP1_AMENDMENTS, _MUTANTS[name])
+    )
+
+
+def _quiet_baseline() -> Any:
+    amendments = (
+        *(pair for pair in _STEP1_AMENDMENTS if pair[0] != _SEND_REFUSAL),
+        (_SEND_ARM, _QUIET_SEND + _SEND_ARM),
+    )
+    return _load_step1("_mefor_corepoint_import_step1_quiet_send", amendments)
+
+
+def test_the_bound_sees_a_refusal_turned_into_a_quiet_filter() -> None:
+    """The bound's rules (b) and (c) can fail. With a send off a Line rendered as a comment, the
+    bound is red on every seed where main refuses that send or delivers it, and on raw lists in
+    number. With the amendment as it stands, the tests above hold it green on the same lists."""
+    quiet = _quiet_baseline()
+
+    def breaches(xml: str) -> list[str]:
+        return _breaches(xml, _generate(step1_as_vendored, xml), _generate(quiet, xml))
+
+    gone = "(b) a send or a refusal of main's is gone"
+    seeds = [
+        s
+        for s in _label_statement_shapes()
+        if "-send-main-refuses" in s.name or s.name in ("2632-Block-send", "2632-Call-send")
+    ]
+    assert len(seeds) == 8
+    for shape in seeds:
+        found = breaches(_render(shape.nodes, shape.inp))
+        assert any(b.startswith(gone) for b in found), shape.name
+    quieter = [name for name, xml in _RAW_LISTS if any(b[:3] == "(b)" for b in breaches(xml))]
+    assert len(quieter) >= _QUIET_RAW_FLOOR
+    # Code review of this bound: a delivery that goes, beside a Try that gains a refusal and
+    # its guard. Counted by indent alone the two cancelled, and the bound stayed green.
+    later = _leaf_data(SendS(_ADT, "OB_B"), "%ADT")
+    assert later is not None
+    masked = (
+        '<Block Data="MsgSend %ADT [OB_A]"/><Try><List><If Data="If (x)"><List>'
+        + _line(later)
+        + '</List></If><Line Data="Catch"/></List></Try>'
+    )
+    assert any(b.startswith(gone) for b in breaches(masked))
+    # Each clause of the rule, on one handler. main refuses this send and names no destination.
+    lone = next(s for s in _label_statement_shapes() if s.name.endswith("-naming-no-destination"))
+    was = _generate(step1_as_vendored, _render(lone.nodes, lone.inp))
+    assert not _quieter(was, was)
+    lines = was[0].splitlines()
+    assert _REFUSAL.match(lines[-2]) and lines[-1].startswith("    return None  # TODO")
+
+    def said(src: list[str], counts: tuple[tuple[int, list[str], int], ...] = was[1]) -> str:
+        return " ".join(_quieter(was, ("\n".join(src) + "\n", counts)))
+
+    assert gone in said([*lines[:-2], lines[-1]])
+    assert gone in said([*lines[:-2], "    " + lines[-2], lines[-1]])
+    assert "(b) the handler ends on" in said([*lines[:-1], "    return sends"])
+    assert "(c) a TODO main writes is gone" in said([*lines[:-3], *lines[-2:]])
+    assert "(c) main counts ['MsgSend'] unmapped" in said(lines, ((0, [], 0),))
+    # A send that goes cannot hide behind a refusal gained at the same indent elsewhere.
+    elsewhere = lines[-2].replace("(no destination named)", "to OB_ELSEWHERE")
+    assert gone in said([*lines[:-2], elsewhere, lines[-1]])
+
+
+@pytest.mark.parametrize(
+    ("mutant", "seed", "breach"),
+    [
+        pytest.param(
+            "every-handler-takes-the-list",
+            "2632-Block-flat-send-naming-no-destination",
+            "(b) the handler ends on",
+            id="ending",
+        ),
+        pytest.param(
+            "no-try-re-raises",
+            "2632-Block-send-in-a-try-main-delivers",
+            "(b) a Catch swallows a refusal",
+            id="guard",
+        ),
+    ],
+)
+def test_the_bound_sees_each_mutant_of_the_ending_and_the_guard(
+    mutant: str, seed: str, breach: str
+) -> None:
+    """The bound's other two (b) checks can fail on generated code, not only on a hand-edited
+    string. Each mutant breaks one of them, and the bound is red on the seed written for it."""
+    shape = next(s for s in _label_statement_shapes() if s.name == seed)
+    xml = _render(shape.nodes, shape.inp)
+    assert not _breaches(xml, _generate(step1_as_vendored, xml), _generate(step1, xml))
+    found = _breaches(xml, _generate(step1_as_vendored, xml), _generate(_mutant(mutant), xml))
+    assert any(b.startswith(breach) for b in found), found
+
+
+def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:
+    """The control for the test above: the reading tells an adopted branch from an orphaned one, on
+    the vendored tree itself. A ``<List>`` holding a statement between an If and its Else orphans
+    the Else on main; an empty one does not."""
+    if_x, arm = _SIBLING_PAIRS[0][1], _line("Else", _line("MsgLog %ADT"))
+    adopted = _skeleton(step1_as_vendored, if_x + "<List/>" + arm)
+    orphaned = _skeleton(step1_as_vendored, if_x + "<List>" + _FILLED + "</List>" + arm)
+    assert adopted == ((("if", (), (("else", (".",), ()),)),),)
+    assert orphaned == ((("if", (), ()), ".", ("else", (".",), ())),)
+    # The raw lists reach what the seeds are written for: branches main adopts, in number, in
+    # lists where the amendment marks a statement.
+    raw = [xml for _, xml in _RAW_LISTS]
+    marked = [xml for xml in raw if step1._LABEL_STATEMENT_WHY in _generate(step1, xml)[0]]
+    assert len(raw) == _RAW and len(marked) >= _RAW // 2
+    assert (
+        sum(_adopted(h) for xml in marked for h in _skeleton(step1_as_vendored, xml) or ()) >= 500
+    )
+    # And every seed with a wrapper between a construct and a sibling branch main adopts is one
+    # the bound sees change.
+    nested = [s for s in _label_statement_shapes() if "-before-a-sibling-" in s.name]
+    held = [
+        s
+        for s in nested
+        if any(_adopted(h) for h in _skeleton(step1_as_vendored, _render(s.nodes, s.inp)) or ())
+    ]
+    filled = sum(name.startswith("filled") for name in _NESTED_WRAPPERS)
+    assert len(nested) == len(_SIBLING_PAIRS) * 2 * (1 + len(_NESTED_WRAPPERS))
+    assert len(held) == len(nested) - len(_SIBLING_PAIRS) * 2 * filled > 0
+    assert all(_amendment_changes(s) for s in held)
 
 
 @pytest.mark.parametrize("chunk", range(_CHUNKS))

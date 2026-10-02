@@ -1079,9 +1079,10 @@ def test_the_tray_probe_passes_the_import_adr_0113_permits() -> None:
     """The negative control: the ADR-PERMITTED import must trip nothing else (BACKLOG #1716).
 
     ADR 0113 §1 allows the tray `messagefoundry.apiclient`, and the tray does not take that import
-    today -- its non-tray engine imports are the stdlib-only `messagefoundry.service_status`,
+    today -- its non-tray engine imports include the stdlib-only `messagefoundry.service_status`,
     `messagefoundry.service`, `messagefoundry.api_tls_source` and `messagefoundry.log_backoff`
-    (measured 2026-09-26, BACKLOG #1844). So nothing else in this file would notice if the
+    (measured 2026-09-26, BACKLOG #1844), and `messagefoundry.childenv` (vault BACKLOG #2801).
+    So nothing else in this file would notice if the
     forbidden set were drawn to red on a legal import, and the guard would fail the first compliant
     change instead of the first violation.
 

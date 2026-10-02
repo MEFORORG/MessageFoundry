@@ -1179,6 +1179,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/redaction.py": frozenset({"hash:hashlib.sha256"}),
+    # Vault BACKLOG #2701: the start-up code inventory asks integrity.record_verdict whether an
+    # installed package's RECORD lists a .pth file or a sitecustomize module with a matching
+    # SHA-256. A tamper-evidence comparison of file bytes: no key, no secret.
+    "messagefoundry/startupcode.py": frozenset({"hash:via messagefoundry.integrity"}),
     "messagefoundry/store/backup_codec.py": frozenset(
         {
             "cipher:.decrypt()",

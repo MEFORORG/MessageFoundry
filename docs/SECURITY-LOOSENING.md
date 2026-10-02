@@ -1234,16 +1234,18 @@ This section is kept rather than deleted, because the claim it used to make is t
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
   line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook
   for their own process and report nothing.
-- **A default start reports `remote_debug_enabled`.** `messagefoundry serve` runs through a
-  console-script launcher, which cannot pass an interpreter option, so the interface stays on. The
-  installed service and the container image start the same way, and neither sets the option or the
-  variable yet.
+- **A start through the console script reports `remote_debug_enabled`.** `messagefoundry serve`
+  runs through a console-script launcher, which cannot pass an interpreter option, so the
+  interface stays on. A developer's own start reports it, and so does each CI leg that starts the
+  engine that way.
+- **The two shipped service launches report neither entry** (vault BACKLOG #2701). The Windows
+  installer and the container image start the interpreter itself, with
+  `-I -X disable-remote-debug`, so the interface is off before any engine code runs.
 - **How to clear it:** start the engine as
-  `python -P -X disable-remote-debug -m messagefoundry serve ...`. Spell the option with hyphens: the
-  interpreter accepts the underscore spelling and ignores it. `-P` keeps the working directory off
-  the import path, which `python -m` would otherwise put first.
-  `PYTHON_DISABLE_REMOTE_DEBUG=1` in the engine's environment also works, but the interpreter
-  ignores it under `-I` or `-E`.
+  `python -I -X disable-remote-debug -m messagefoundry serve ...`. Spell the option with hyphens: the
+  interpreter accepts the underscore spelling and ignores it. `-I` keeps the working directory off
+  the import path, which `python -m` would otherwise put first. It also makes the interpreter
+  ignore `PYTHON_DISABLE_REMOTE_DEBUG=1`, so with `-I` the option is the only form that works.
 - **It is not refused**, at any `enforcement` level. A refusal would stop every start through the
   console script.
 - **Attach debugging goes with it.** `python -m pdb -p <pid>` uses this interface, so it cannot
@@ -1254,6 +1256,95 @@ This section is kept rather than deleted, because the claim it used to make is t
   `python -m pdb -m messagefoundry <command>`, which does not use the interface. That reaches
   the command's own process. Router and Handler bodies that run in a sandbox worker
   (`[sandbox].mode = "subprocess"`) are in a child process, which it does not reach.
+
+### `interpreter_not_isolated`, `startup_code_unexpected` and `startup_directory_writable`: what runs in the interpreter before the engine does
+
+> **OBSERVATIONS, not switches.** No setting declares them. They follow from how the engine's
+> interpreter was started and where it is installed. Vault BACKLOG #2701.
+- **What they are about:** two things put code inside a Python process before its first line
+  runs. The `PYTHON*` environment variables change where the interpreter imports from. And the
+  interpreter runs start-up code: every line of a `.pth` file in a site directory that begins
+  with `import`, and a module named `sitecustomize` found anywhere on the import path. Either
+  would run inside the engine, with the store key, the connection secrets and the messages in
+  flight.
+- **`interpreter_not_isolated`: the interpreter was started without `-I`.** It then reads the
+  `PYTHON*` variables, unless it was started with `-E`, so a `PYTHONPATH` or `PYTHONHOME` left in
+  the service's environment decides what the engine imports. Another product's installer can
+  leave one behind. The entry names the variables that are set.
+- **`python_variables_reach_children`: the engine ignores a variable its children would honour.**
+  The engine ignores the `PYTHON*` variables, and `PYTHONPATH`, `PYTHONHOME`, `PYTHONPLATLIBDIR`,
+  `PYTHONPYCACHEPREFIX` or `PYTHONUSERBASE` is set in its environment. The Python children it
+  starts (the sandbox worker, and each engine shard under `supervise`) are not isolated, and the
+  engine hands them these variables by name. Remove the variable from the service's environment.
+- **`startup_code_unexpected`: a `.pth` import line or a customize module the engine does not
+  know.** The entry names each file. A file is expected in three cases, and in no other:
+  1. An installed package lists it in its `RECORD` with a matching hash. That covers the `.pth`
+     an editable install writes, the one `setuptools` ships, and any other that came with a
+     package.
+  2. It is a `sitecustomize` in the base interpreter's own standard library directory. Some
+     operating-system builds ship one. A virtual environment's own library folder does not count.
+  3. It is `_virtualenv.pth` holding exactly `import _virtualenv`, in an environment whose
+     `pyvenv.cfg` says `virtualenv` or `uv` made it. Those tools write that file into every
+     environment they create; `python -m venv` does not. The module the line imports is not
+     checked.
+
+  What is and is not listed:
+  - A `.pth` file with no `import` line only adds directories to the import path. It is not
+    start-up code and is not listed.
+  - `usercustomize` is listed only where the user site directory is on, which is the only place
+    the interpreter imports it. It is off under `-I` and in a virtual environment.
+  - The search covers the engine's own import path and the absolute `PYTHONPATH` entries the
+    engine hands its Python children. So a `sitecustomize` that only a child would run is listed
+    too, and `supervise` refuses on it before it starts an engine shard.
+- **`startup_directory_writable`: the engine's own account can add a file where start-up code is
+  read from.** That is a site directory, or any directory on the import path, where a
+  `sitecustomize` would be found. Code running as that account could plant start-up code there,
+  and it would run at the next start, ahead of the check that looks for it.
+  `startup_directory_unchecked` says the engine could not tell. Neither is a clean reading. An
+  import-path entry that is an archive is not checked.
+  **The answer is the running process's, not a reading of the permissions.** On Windows the
+  engine opens each directory and lets Windows judge its token. So a write-restricted service
+  token reads as it really is. And an engine started from an elevated session whose token holds
+  the restore privilege switched on reads every directory as writable, whatever the permissions
+  say, because that process could write there. Changing permissions does not clear that one; a
+  service the installer set up does not hold the privilege
+  ([`SERVICE.md`](SERVICE.md#restrict-the-service-token)).
+- **The inventory is detection. The directory's permissions are the prevention.** Start-up code
+  runs before any engine code, so a planted file could change what the inventory reads or skip
+  it. And the list of expected files sits in the directory it describes, so whoever can write the
+  directory can write a matching row. The inventory catches an honest mistake and a careless
+  plant. Install the engine where the service account can read and cannot write.
+- **What is refused:** under `[security].enforcement = "enforce"`, `serve` and `supervise` refuse
+  to start on `startup_code_unexpected`, before they open the store or bind a port. Under `warn`
+  they start and report it. The other entries are never refused, at any level: a developer's own
+  environment is not isolated and is writable by construction.
+- **What a development start reports:** `interpreter_not_isolated` and
+  `startup_directory_writable`, beside `remote_debug_enabled`. It does not refuse: an editable
+  install's `.pth` is recorded by its package, and `python -m venv` writes no `.pth` of its own.
+  **A start under a tool that injects a `sitecustomize` through `PYTHONPATH` does refuse**, unless
+  an installed package records that file. Some debuggers and tracing agents work this way.
+- **What the shipped service launches report:** the Windows installer and the container image
+  start the interpreter with `-I`, so neither reports `interpreter_not_isolated`. The image copies
+  its virtual environment owned by root, and the engine runs as another user, so it does not
+  report `startup_directory_writable`. **On Windows that entry depends on the install.** The
+  installer does not change the permissions of the virtual environment, so the reading follows
+  from each directory's own permissions and from the service token.
+  [`SERVICE.md`](SERVICE.md#the-service-launch) says what to check.
+- **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
+  for the engine's own process. The posture's `interpreter` block carries the whole reading: the
+  flags, each file found with its verdict, and the directories. `supervise` logs one WARNING for
+  each entry at start for the supervisor process. `messagefoundry security show` is a separate
+  process, so it reports none of them, and its scope line says so.
+- **The reading is taken once, at start.** Start-up code runs when the interpreter starts, so a
+  file added later has not run in this process. Restart the engine to read again.
+- **How to clear them:** start the engine as
+  `python -I -X disable-remote-debug -m messagefoundry serve ...`, remove each file the entry names
+  or install it as part of a package, and take the service account's write permission off the
+  directories the entry names.
+- **Not covered**, at least: the import-time code of a third-party package, a file planted and
+  removed between two starts, and a child's user site directory where the engine does not run in
+  a virtual environment. An engine shard reports `interpreter_not_isolated` for itself: the
+  supervisor starts it with `-P`, not `-I`.
 
 ---
 
@@ -1306,6 +1397,7 @@ chapter was not part of the verification above.
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
+| `interpreter_not_isolated` / `python_variables_reach_children` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

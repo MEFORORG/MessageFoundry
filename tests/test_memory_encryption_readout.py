@@ -76,6 +76,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
+        startup=None,
     )
 
 

@@ -608,9 +608,9 @@ if ($configDir) {
     }
 }
 
-# WER suppression is by IMAGE NAME and covers BOTH images the installer names: the launcher, and the
-# interpreter a pip console script starts as a child - which is the process that actually holds the
-# PHI heap. Only images actually present in the registry are reported, so a host that never ran
+# WER suppression is by IMAGE NAME. The installer names the interpreter the service runs, which is
+# the process that holds the PHI heap; an earlier installer also named the console-script launcher.
+# Only images actually present in the registry are reported, so a host that never ran
 # -SuppressCrashDumps gets no line.
 #
 # THE CANDIDATE NAMES ARE NOT PROBED ON DISK. An earlier version took python.exe only when it still
@@ -625,7 +625,10 @@ $werImages = @()
 $werLocalDumps = @()
 if ($appExe) {
     try {
-        $imageNames = @([IO.Path]::GetFileName($appExe), "python.exe") | Select-Object -Unique
+        # The registered program is the interpreter now (vault BACKLOG #2701). The launcher's name
+        # is still a candidate: an install made before that change suppressed dumps for it.
+        $imageNames = @([IO.Path]::GetFileName($appExe), "python.exe", "messagefoundry.exe") |
+            Select-Object -Unique
         $excludedKey = Join-Path $werRoot "ExcludedApplications"
         if (Test-Path $excludedKey) {
             $excludedProps = Get-ItemProperty -Path $excludedKey -ErrorAction Stop
