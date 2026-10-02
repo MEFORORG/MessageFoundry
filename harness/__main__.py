@@ -5,7 +5,8 @@
 ``python -m harness``                 → launch the GUI (Send/Receive/File/Compose/Monitor).
 ``python -m harness --list-scenarios``→ list the built-in scenarios.
 ``python -m harness --scenario NAME`` → run one scenario headless against a running engine
-                                                and exit 0 (pass) / 1 (fail) — for CI.
+                                                and exit 0 (pass) / 1 (fail) / 2 (setup, or
+                                                SKIP: a precondition is missing) — for CI.
 ``python -m harness --coverage``      -> print every registered connector kind, by direction,
                                                 against the scenarios that cover it (no engine
                                                 needed).
@@ -435,6 +436,10 @@ def _run_scenario(
         # Setup, not a verdict on the engine: a sink could not bind (the GUI Receive tab already
         # holds the port, say) or a drop directory could not be made.
         print(f"SETUP {name}: {exc}", file=sys.stderr)
+        return 2
+    if result.skipped:
+        # Not a pass: the scenario's precondition (an external server, an extra) is missing here.
+        print(f"SKIP  {name}: {result.detail}")
         return 2
     print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {result.detail}")
     return 0 if result.ok else 1

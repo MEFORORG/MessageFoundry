@@ -7,7 +7,7 @@ faults, and watch what a running engine actually did with each message.
 ```powershell
 python -m harness                      # launch the GUI
 python -m harness --list-scenarios     # list headless scenarios
-python -m harness --scenario processed # run one scenario in CI (exit 0 pass / 1 fail)
+python -m harness --scenario processed # run one scenario in CI (exit 0 pass / 1 fail / 2 setup or skip)
 python -m harness --coverage           # connector kinds by direction vs the scenarios covering them
 python -m harness --list-profiles      # list headless load profiles
 python -m harness --load smoke         # run a load profile (exit 0 SLOs met / 1 violation / 2 setup)
@@ -83,7 +83,9 @@ python -m harness --coverage                      # which connector kinds the sc
 
 Pass `--engine <url>` for a non-default API address, `--token <t>` for an auth-enabled engine, and
 `--cacert <pem>` to trust the engine's minted certificate. A malformed endpoint, or a sink that cannot bind its port (the GUI
-Receive tab already listening on 2576, say), exits 2 as a setup error; a scenario verdict is 0 or 1.
+Receive tab already listening on 2576, say), exits 2 as a setup error; a scenario verdict is 0 or 1,
+and a scenario whose precondition is missing here (the database family without a server) prints
+`SKIP` and exits 2.
 
 ### Drivers, sinks and endpoints
 
@@ -280,3 +282,40 @@ directory in `harness/endpoints/internal.py`, defaults 2610-2614):
   sink on 2613, and that sink's ACK is the message that re-enters on `LB_Internal_Reply`, whose
   router forwards it to a sink on 2614. The scenario asserts the forwarded copy is that ACK
   (MSA-2 naming the control id sent), not the original.
+
+### Database (DatabasePoll in, Database out)
+
+**This family is unverified without a server database.** The engine's DATABASE connector is
+ODBC-only -- the SQL Server preset over the Microsoft ODBC Driver 18, or an operator-named ODBC
+driver -- through `aioodbc`/`pyodbc` from the `[sqlserver]` extra. There is no SQLite path, and the
+CI install line carries neither the extra nor a server, so on CI and on most machines both
+scenarios report SKIPPED, with the missing piece named. A skip is never a pass (`--scenario` exits
+2 and prints `SKIP`).
+
+The graph is `harness/config/database/`, in its own directory so that serving `harness/config`
+without a database stays clean (measured: without its credentials the graph's two connections fail
+to start, isolated, and the engine reports DEGRADED). A DatabasePoll inbound, `DB-IN_Harness`, reads
+`status = 'NEW'` rows of `dbo.mf_harness_inbox` and marks each `DONE` once it is durably received --
+the poll needs that marker column, or every poll re-reads the same rows. ADT goes to a Database
+outbound, `DB-OUT_Harness`, which writes `dbo.mf_harness_outbox` idempotently on the control id;
+anything else is UNROUTED. The harness driver and sink create both tables. All SQL is
+parameterized and the table names are constants.
+
+Serve it with the server and its credentials in the environment (credentials never sit in source;
+the server must present a certificate this host trusts, as the graph never weakens TLS, and
+`[egress].allowed_db` -- `MEFOR_EGRESS_ALLOWED_DB` -- must list it, or `serve` refuses the dial):
+
+```bash
+export MEFOR_VALUE_HARNESS_DATABASE_SERVER=127.0.0.1 MEFOR_VALUE_HARNESS_DATABASE_PORT=1433
+export MEFOR_VALUE_HARNESS_DATABASE_NAME=... MEFOR_VALUE_HARNESS_DATABASE_USERNAME=...
+export MEFOR_VALUE_HARNESS_DATABASE_PASSWORD=...
+export MEFOR_EGRESS_ALLOWED_DB=127.0.0.1
+python -m messagefoundry serve --config harness/config/database --db ./harness-db.db --env dev
+python -m harness --scenario database_roundtrip --engine URL --token T
+```
+
+`--coverage` counts the `database` inbound and outbound rows as covered because these scenarios
+CLAIM them. That claim is made good only where a server exists; on a run that skipped, nothing
+exercised the connector. `tests/test_harness_database.py` holds the end-to-end test, gated on
+`MEFOR_TEST_SQLSERVER`. No CI step runs it, and wiring it into the existing SQL Server legs alone
+would not verify anything: those present an untrusted certificate, so the test skips there.

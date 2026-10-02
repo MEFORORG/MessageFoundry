@@ -55,9 +55,17 @@ class ScenarioContext:
 
 @dataclass(frozen=True)
 class ScenarioResult:
+    """``skipped`` marks a run whose precondition is missing here (a family that needs an external
+    server, say). A skipped result is never ``ok``: it is reported as SKIPPED, not as a pass."""
+
     scenario: BaseScenario
     ok: bool
     detail: str
+    skipped: bool = False
+
+    def __post_init__(self) -> None:
+        if self.skipped and self.ok:
+            raise ValueError("a skipped scenario result cannot also be ok")
 
 
 class BaseScenario(abc.ABC):
