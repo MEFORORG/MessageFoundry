@@ -26,6 +26,8 @@ import sys
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import httpx
 import pytest
@@ -75,8 +77,11 @@ logging.basicConfig(filename=log, level=logging.WARNING)
 
 from messagefoundry.remotedebug import install_remote_debug_guard, remote_debug_posture
 
-if mode == "guarded":
+if mode in ("guarded", "loud"):
     install_remote_debug_guard()
+if mode == "loud":
+    # Undo the one thing the install does to the interpreter's own report of a refusal.
+    sys.unraisablehook = sys.__unraisablehook__
 posture = remote_debug_posture()
 pathlib.Path(ready).write_text(
     f"{os.getpid()} {posture.interpreter_enabled} {posture.guard_installed}", encoding="utf-8"
@@ -106,6 +111,7 @@ class _Target:
         self.stop = directory / "stop"
         self.final = directory / "final.txt"
         self.marker = directory / "marker.txt"
+        self.stderr = directory / "stderr.txt"
         # In a directory of its own, so the test can tell the file name from the path in the
         # target's log.
         self.script = directory / "directory-that-must-not-be-logged" / "injected_by_the_test.py"
@@ -121,18 +127,20 @@ class _Target:
         env.pop("PYTHON_DISABLE_REMOTE_DEBUG", None)
         # The tree under test, ahead of whatever copy is installed.
         env["PYTHONPATH"] = str(_REPO)
-        self.process = subprocess.Popen(
-            [
-                sys.executable,
-                str(target),
-                mode,
-                str(self.ready),
-                str(self.log),
-                str(self.stop),
-                str(self.final),
-            ],
-            env=env,
-        )
+        with open(self.stderr, "wb") as stderr:
+            self.process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(target),
+                    mode,
+                    str(self.ready),
+                    str(self.log),
+                    str(self.stop),
+                    str(self.final),
+                ],
+                env=env,
+                stderr=stderr,
+            )
 
     def wait_until_ready(self) -> None:
         _wait_for(
@@ -143,6 +151,9 @@ class _Target:
         self.pid = int(pid)
         self.interpreter_enabled = enabled == "True"
         self.guard_installed = guarded == "True"
+
+    def logged_the_refusal(self) -> bool:
+        return self.log.exists() and REMOTE_SCRIPT_EVENT in self.log.read_text("utf-8")
 
     def close(self) -> str:
         """Stop the target and return what it wrote to ``final``."""
@@ -188,9 +199,9 @@ def _inject(target: _Target) -> None:
 def test_an_injected_script_runs_without_the_hook_and_not_with_it(
     start_target: Callable[[str], _Target],
 ) -> None:
-    control, guarded = start_target("unguarded"), start_target("guarded")
-    control.wait_until_ready()
-    guarded.wait_until_ready()
+    control, guarded, loud = (start_target(mode) for mode in ("unguarded", "guarded", "loud"))
+    for target in (control, guarded, loud):
+        target.wait_until_ready()
 
     # CONTROL: no hook. The injected script runs. This is what the engine parent would allow.
     assert control.interpreter_enabled, "the target was started with remote debugging off"
@@ -200,22 +211,27 @@ def test_an_injected_script_runs_without_the_hook_and_not_with_it(
     assert control.close() == "0"
 
     # The same target with the hook installed, and the same injection.
-    assert guarded.interpreter_enabled and guarded.guard_installed
-    _inject(guarded)
-    _wait_for(
-        lambda: guarded.log.exists() and REMOTE_SCRIPT_EVENT in guarded.log.read_text("utf-8"),
-        "the guarded target to log the refusal",
-    )
-    # The hook raised before that line was written, and the target went on running Python until
-    # it was told to stop. A script the interpreter had only put off would have run by now.
-    assert guarded.close() == "1", "the hook did not count exactly one refused script"
-    assert not guarded.marker.exists(), "the injected script ran although the hook raised"
+    for target in (guarded, loud):
+        assert target.interpreter_enabled and target.guard_installed
+        _inject(target)
+        _wait_for(target.logged_the_refusal, "the guarded target to log the refusal")
+        # The hook raised before that line was written, and the target went on running Python
+        # until it was told to stop. A script the interpreter had only put off would have run.
+        assert target.close() == "1", "the hook did not count exactly one refused script"
+        assert not target.marker.exists(), "the injected script ran although the hook raised"
 
     logged = guarded.log.read_text("utf-8")
     assert "WARNING" in logged
     assert guarded.script.name in logged
     # The file name only: the directory is the injecting process's business, not the log's.
-    assert guarded.script.parent.name not in logged
+    directory = guarded.script.parent.name
+    assert directory not in logged
+
+    # The interpreter reports the hook's exception itself, with the full path. The install drops
+    # that report. CONTROL: the "loud" target put the interpreter's own hook back, and there the
+    # path is on standard error, so the check on the guarded target could have failed.
+    assert directory in loud.stderr.read_text("utf-8", errors="replace")
+    assert directory not in guarded.stderr.read_text("utf-8", errors="replace")
 
 
 # --- the hook function -------------------------------------------------------------------------
@@ -227,13 +243,14 @@ def reports(monkeypatch: pytest.MonkeyPatch) -> queue.SimpleQueue[str]:
     test called ``serve``) cannot take what a test here puts on it."""
     private: queue.SimpleQueue[str] = queue.SimpleQueue()
     monkeypatch.setattr(remotedebug, "_reports", private)
+    # The count too: it is module state, and a later test in this process reads it.
+    monkeypatch.setattr(remotedebug, "_refused", 0)
     return private
 
 
 def test_the_hook_refuses_the_script_event_and_queues_the_file_name_only(
-    reports: queue.SimpleQueue[str], monkeypatch: pytest.MonkeyPatch
+    reports: queue.SimpleQueue[str],
 ) -> None:
-    monkeypatch.setattr(remotedebug, "_refused", 0)
     path = os.path.join("some", "directory", "payload.py")
     with pytest.raises(RemoteScriptRefused):
         remotedebug._guard(REMOTE_SCRIPT_EVENT, (path,))
@@ -266,9 +283,8 @@ def test_the_hook_lets_every_other_event_through(reports: queue.SimpleQueue[str]
 
 
 def test_a_flood_of_refusals_is_counted_but_does_not_grow_the_queue(
-    reports: queue.SimpleQueue[str], monkeypatch: pytest.MonkeyPatch
+    reports: queue.SimpleQueue[str],
 ) -> None:
-    monkeypatch.setattr(remotedebug, "_refused", 0)
     attempts = remotedebug._REPORT_BACKLOG + 25
     for _ in range(attempts):
         with pytest.raises(RemoteScriptRefused):
@@ -293,6 +309,37 @@ def test_the_warning_names_the_event_and_escapes_the_file_name(
     assert scrub_log_argument(name) in message and scrub_log_argument(name) != name
 
 
+def test_the_reporter_outlives_a_failing_log_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing restarts the reporter thread, so one failing log call must not end it. Without the
+    guard the first name's error leaves the loop, and this test sees it instead of ``_Stop``."""
+
+    class _Stop(BaseException):
+        pass
+
+    class _Feed:
+        def __init__(self) -> None:
+            self.names = iter(["first", "second"])
+
+        def get(self) -> str:
+            try:
+                return next(self.names)
+            except StopIteration:
+                raise _Stop from None
+
+    written: list[str] = []
+
+    def report(name: str) -> None:
+        if name == "first":
+            raise RuntimeError("the log call failed")
+        written.append(name)
+
+    monkeypatch.setattr(remotedebug, "_reports", _Feed())
+    monkeypatch.setattr(remotedebug, "_report", report)
+    with pytest.raises(_Stop):
+        remotedebug._report_refusals()
+    assert written == ["second"]
+
+
 def test_a_long_file_name_is_cut(reports: queue.SimpleQueue[str]) -> None:
     with pytest.raises(RemoteScriptRefused):
         remotedebug._guard(REMOTE_SCRIPT_EVENT, ("x" * 5000,))
@@ -310,6 +357,8 @@ class _Installs:
         self.reporters = 0
         monkeypatch.setattr(sys, "is_remote_debug_enabled", lambda: enabled)
         monkeypatch.setattr(sys, "addaudithook", self.hooks.append)
+        # Restored afterwards: a successful install wraps it.
+        monkeypatch.setattr(sys, "unraisablehook", sys.unraisablehook)
         monkeypatch.setattr(remotedebug, "_start_reporter", self._start)
 
     def _start(self) -> None:
@@ -320,13 +369,17 @@ def test_install_adds_one_hook_and_a_second_call_adds_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     installs = _Installs(monkeypatch)
-    answers = iter([False, True, True])
+    before = sys.unraisablehook
+    # Not there, then there once added, then there on each later call.
+    answers = iter([False, True, True, True])
     monkeypatch.setattr(remotedebug, "_guard_answers", lambda: next(answers))
     install_remote_debug_guard()
+    wrapped = sys.unraisablehook
     install_remote_debug_guard()
     install_remote_debug_guard()
     assert installs.hooks == [remotedebug._guard]
     assert installs.reporters == 1
+    assert wrapped is not before and sys.unraisablehook is wrapped
 
 
 def test_install_tries_again_while_the_hook_does_not_answer(
@@ -336,10 +389,14 @@ def test_install_tries_again_while_the_hook_does_not_answer(
     interpreter drops a new hook without an error when one already installed objects, so a flag
     set after ``sys.addaudithook`` returned would say "installed" for a hook that is not there."""
     installs = _Installs(monkeypatch)
+    before = sys.unraisablehook
     monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
     install_remote_debug_guard()
     install_remote_debug_guard()
     assert installs.hooks == [remotedebug._guard, remotedebug._guard]
+    # A hook the interpreter dropped gets no reporter thread and no change to the unraisable hook.
+    assert installs.reporters == 0
+    assert sys.unraisablehook is before
 
 
 def test_install_adds_nothing_where_the_interpreter_refuses_injection_already(
@@ -351,6 +408,33 @@ def test_install_adds_nothing_where_the_interpreter_refuses_injection_already(
     monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
     install_remote_debug_guard()
     assert installs.hooks == [] and installs.reporters == 0
+
+
+def test_the_unraisable_wrapper_drops_its_own_refusal_and_passes_the_rest_on() -> None:
+    seen: list[object] = []
+    hook = remotedebug._without_own_refusals(seen.append)
+
+    def unraisable(exc: BaseException) -> sys.UnraisableHookArgs:
+        try:
+            raise exc
+        except BaseException as caught:  # the shape the interpreter hands an unraisable hook
+            return cast(
+                "sys.UnraisableHookArgs",
+                SimpleNamespace(
+                    exc_type=type(caught),
+                    exc_value=caught,
+                    exc_traceback=caught.__traceback__,
+                    err_msg=None,
+                    object=None,
+                ),
+            )
+
+    other = unraisable(ValueError("anything else"))
+    hook(other)
+    hook(unraisable(RuntimeError("a RuntimeError that is not the refusal")))
+    assert len(seen) == 2 and seen[0] is other
+    hook(unraisable(RemoteScriptRefused("refused")))
+    assert len(seen) == 2
 
 
 def test_the_probe_is_answered_by_the_real_hook_and_by_nothing_else() -> None:
@@ -371,6 +455,7 @@ def test_the_real_install_is_seen_by_the_posture_and_is_not_repeated(
     this test process afterwards, which is harmless: it raises on one event nothing here uses."""
     added: list[object] = []
     real = sys.addaudithook
+    monkeypatch.setattr(sys, "unraisablehook", sys.unraisablehook)  # restored afterwards
 
     def counting(hook: object) -> None:
         added.append(hook)
@@ -406,8 +491,10 @@ def test_the_entry_follows_the_reading() -> None:
     # The start-up warning is taken before anything can have been refused, so it carries no count.
     quiet = remote_debug_loosening(RemoteDebugPosture(True, True))
     assert quiet is not None and "It has refused" not in quiet[1]
-    # The wording must not read as "closed": the hook leaves the memory-write capability.
+    # The wording must not read as "closed": the hook leaves the start-up window and the
+    # memory-write capability.
     assert "residual" in guarded[1] and "can still run code" in guarded[1]
+    assert "earlier in start-up still runs" in guarded[1]
 
     unguarded = remote_debug_loosening(_UNGUARDED)
     assert unguarded is not None and unguarded[0] == "remote_debug_unguarded"

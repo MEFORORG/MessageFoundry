@@ -5,8 +5,10 @@ BACKLOG #2700).
 
 **What this is about.** Python 3.14 (PEP 768) lets another process ask a running interpreter to
 execute a script file: ``sys.remote_exec(pid, path)``. The caller needs the right to write the
-target's memory, which a process running as the same account has on a default Windows or Linux
-host. The interface is on unless the interpreter was started with ``-X disable-remote-debug`` or
+target's memory. On Windows a process running as the same account, at the same integrity level,
+has it. On Linux it depends on the kernel's ptrace policy: where Yama ``ptrace_scope`` is 1, as
+Ubuntu ships it, only a parent process or one with ``CAP_SYS_PTRACE`` has it. The interface is
+on unless the interpreter was started with ``-X disable-remote-debug`` or
 ``PYTHON_DISABLE_REMOTE_DEBUG=1``. The engine's children are started with the option
 (``messagefoundry/childenv.py``). The engine itself is started through a console-script launcher,
 which cannot pass an interpreter option, so ``serve`` and ``supervise`` would start with it on.
@@ -18,20 +20,28 @@ event ``cpython.remote_debugger_script``, and it does not run the script when an
 ``tests/test_remote_debug_guard.py`` injects into a real child both ways, because the behaviour is
 the interpreter's and could change under this module.
 
-**What this is not.** The hook closes the interpreter's own injection interface. It does not close
-the capability underneath it: a process that can write this process's memory can run code in it
-some other way, and can remove a hook. So an enabled interface with the hook in place is reported
-as a residual (:func:`remote_debug_loosening`), and turning the interface off at launch is separate
-work. Running untrusted code under a different account is what takes the capability away.
+**What this is not.** The hook closes the interpreter's own injection interface, from the moment
+it is installed. Two things stay open. A script injected earlier in start-up runs: the process
+has to import this module and reach the install call first, and a caller that can restart the
+engine can aim for that window. And the capability underneath is untouched: a process that can
+write this process's memory can run code in it some other way, and can remove a hook. So an
+enabled interface with the hook in place is reported as a residual
+(:func:`remote_debug_loosening`), and turning the interface off at launch is separate work.
+Running untrusted code under a different account is what takes the capability away.
 
 **Why the hook does so little.** The interpreter calls it on the main thread between two bytecodes
 of whatever was running, which is the position a signal handler is in. The engine's log handlers
 take locks that are not reentrant, and the interrupted code may hold one, so a log call made here
 could wait on its own thread forever. The hook therefore only counts, queues the file name on a
 ``queue.SimpleQueue`` (whose ``put`` is documented as reentrant) and raises. A daemon thread
-writes the WARNING, with the script's file name only. The interpreter also reports the hook's
-exception itself, through ``sys.unraisablehook``: by default one line on standard error with the
-script's full path, and a traceback.
+writes the WARNING, with the script's file name only.
+
+**The interpreter's own report of the refusal is dropped.** The interpreter hands the hook's
+exception to ``sys.unraisablehook``, which by default writes four lines to standard error for
+each attempt: the script's full path as the injecting process spelled it, and a traceback. That
+output has no bound and no scrubbing, so :func:`install_remote_debug_guard` wraps the hook to
+drop that one report and pass every other one on. Code that replaces ``sys.unraisablehook``
+afterwards brings the interpreter's lines back.
 
 **Cost.** An audit hook runs on every audited operation in the process, not only this event.
 Measured on one Windows development machine, CPython 3.14.6: about 60 to 90 ns for each audited
@@ -45,11 +55,13 @@ imports nothing, so any package may import it.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import queue
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
 
@@ -133,11 +145,30 @@ def _report(name: str) -> None:
 def _report_refusals() -> None:
     """Write one WARNING for each refused script, off the thread the hook interrupted."""
     while True:
-        _report(_reports.get())
+        name = _reports.get()
+        # never-raise: this is the only reporter, and nothing restarts it. If the log call itself
+        # fails there is no log to say so in. The refusal is already counted, and the posture
+        # reading carries the count.
+        with contextlib.suppress(Exception):
+            _report(name)
 
 
 def _start_reporter() -> None:
     threading.Thread(target=_report_refusals, name="mefor-remote-debug-report", daemon=True).start()
+
+
+def _without_own_refusals(
+    previous: Callable[[sys.UnraisableHookArgs], object],
+) -> Callable[[sys.UnraisableHookArgs], None]:
+    """An unraisable hook that drops the interpreter's report of :class:`RemoteScriptRefused` and
+    hands everything else to ``previous``. The module docstring says why."""
+
+    def hook(unraisable: sys.UnraisableHookArgs) -> None:
+        if isinstance(unraisable.exc_value, RemoteScriptRefused):
+            return
+        previous(unraisable)
+
+    return hook
 
 
 def _guard_answers() -> bool:
@@ -157,7 +188,7 @@ def install_remote_debug_guard() -> None:
 
     The hook may still be missing afterwards: the interpreter drops a new hook without an error
     when one already installed raises on ``sys.addaudithook``. :func:`remote_debug_posture` reports
-    which it is. Nothing in the engine installs another hook.
+    which it is.
     """
     if not sys.is_remote_debug_enabled():
         return
@@ -165,7 +196,10 @@ def install_remote_debug_guard() -> None:
         if _guard_answers():
             return
         sys.addaudithook(_guard)
+        if not _guard_answers():
+            return  # dropped: there is nothing to report for, and nothing to quiet
         _start_reporter()
+        sys.unraisablehook = _without_own_refusals(sys.unraisablehook)
 
 
 def remote_debug_posture() -> RemoteDebugPosture:
@@ -188,11 +222,12 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
         return (
             "remote_debug_unguarded",
             "the interpreter's remote debugging (PEP 768) is enabled in this process and the "
-            "engine's refusal hook is NOT installed. A process running as the same account "
-            "could run Python inside this one with sys.remote_exec, with everything it holds "
-            "(the store key, connection secrets, messages in flight). `serve` and `supervise` "
-            "install the hook at start. Start the interpreter with -X disable-remote-debug to "
-            "turn the interface off",
+            "engine's refusal hook is NOT installed. A process the operating system lets attach "
+            "to this one, which on Windows includes one running as the same account, could run "
+            "Python inside it with sys.remote_exec, with everything it holds (the store key, "
+            "connection secrets, messages in flight). `serve` and `supervise` install the hook "
+            "at start. Start the interpreter with -X disable-remote-debug to turn the interface "
+            "off",
         )
     refused = (
         f" It has refused {posture.refused_scripts} since this process started."
@@ -202,8 +237,9 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
     return (
         "remote_debug_enabled",
         "the interpreter's remote debugging (PEP 768) is enabled in this process. The engine "
-        "refuses a script injected through it, so this is a residual and not an open path."
-        f"{refused} A process that can write into this process's address space can still run "
+        "refuses a script injected through it once its hook is installed, so this is a "
+        f"residual and not an open path.{refused} A script injected earlier in start-up still "
+        "runs, and a process that can write into this process's address space can still run "
         "code in it by other means. Start the interpreter with -X disable-remote-debug to turn "
         "the interface off",
     )

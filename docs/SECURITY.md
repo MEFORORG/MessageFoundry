@@ -4023,28 +4023,24 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
 
 ### Remote debugging of the engine process (PEP 768)
 
-Python 3.14 lets another process run a script inside a running interpreter. The caller must be able
-to write the target's memory, which a process running as the same account can do on a default
-Windows or Linux host. On a first deployment, code running as the service account would be able to
-run Python inside the engine that way, with everything the engine holds.
+Python 3.14 lets another process run a script inside a running interpreter, if the operating
+system lets that process write the target's memory. On a first deployment, code running as the
+service account could be such a process. It would then run Python inside the engine, with
+everything the engine holds.
 
 Two controls answer it, and they differ in strength:
 
-- **The engine's children start with the interface off.** The sandbox worker, the engine shards and
-  the child that loads the config before any shard starts all run with `-X disable-remote-debug`.
-  See the `[sandbox]` table in [CONFIGURATION.md](CONFIGURATION.md) and
-  `messagefoundry/childenv.py`.
+- **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
+  the one place that says which children and how.
 - **The engine process itself refuses the script.** `serve` and `supervise` start through a
   console-script launcher, which cannot pass that option. So each installs an audit hook as its
   first step (`messagefoundry/remotedebug.py`). The interpreter raises an event before it runs an
-  injected script, the hook raises on it, and the interpreter drops the script. The hook logs a
-  WARNING with the script's file name.
+  injected script, the hook raises on it, and the interpreter drops the script.
 
-The hook is the weaker of the two. It closes the interpreter's own interface, not the memory-write
-capability under it, and a script injected before the hook is in place runs. So an engine that
-starts with the interface on reports it: the loosening `remote_debug_enabled`, described in
-[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Neither the installed service nor the container
-image turns the interface off at launch yet, and `serve` does not refuse to start with it on.
+The hook is the weaker of the two, so an engine that starts with the interface on reports it as
+the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported, what
+a default start reports and how to clear it are stated once, in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
 
 ### HIPAA §164.312 alignment
 

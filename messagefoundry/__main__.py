@@ -1704,9 +1704,11 @@ def _forward_spool_dir(settings: ServiceSettings, shard: str | None) -> str:
 
 
 def _serve(args: argparse.Namespace) -> int:
-    # Vault BACKLOG #2700: first, ahead of the imports below and of config, because a script
-    # injected before the hook is in place runs. A no-op where the interpreter was started with
-    # remote debugging disabled, which is every engine shard under `supervise`.
+    # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
+    # because a script injected before the hook is in place runs. It is NOT first in the process:
+    # this module's own imports and argument parsing come before it, and that window stays open.
+    # A no-op where the interpreter was started with remote debugging disabled, which is every
+    # engine shard under `supervise`.
     install_remote_debug_guard()
 
     import uvicorn
