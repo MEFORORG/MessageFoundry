@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
+from harness.load import rigadmin
 from harness.load.metrics import Counters
 from messagefoundry.apiclient import ApiError, EngineClient
 
@@ -499,6 +500,54 @@ async def sample_until_reconciled(
     return last
 
 
+def adopt_rig_session(client: EngineClient, url: str, cacert: str | None) -> None:
+    """Sign ``client`` in as this run's rig Administrator (:mod:`harness.load.rigadmin`).
+
+    The session is the process's one rig session. An engine that refuses it (HTTP 401) is on a store
+    that session is not in, or the session has expired, so the rig signs in again there and the
+    client takes the new one.
+
+    An engine that does not answer raises ``ApiError``, as every other client call does, so a caller
+    that already treats ``ApiError`` as "not reachable yet" needs no second arm. A refused sign-in is
+    not that: it raises :class:`~harness.load.rigadmin.RigSignInRefused`, which no caller swallows.
+    """
+    try:
+        token = rigadmin.session_token(url, cacert=cacert)
+        try:
+            client.set_token(token)
+        except ApiError as exc:
+            if exc.status != 401:
+                raise
+            client.set_token(rigadmin.renew_session(url, token, cacert=cacert))
+    except rigadmin.RigUnreachable as exc:
+        raise ApiError(str(exc)) from exc
+
+    def _step_up() -> bool:
+        # A sensitive route (the reload probe's POST /config/reload) wants a credential proved
+        # within the last few minutes. A fresh sign-in is that proof, and it leaves the session
+        # every other client holds alone, where a re-authentication would rotate it under them.
+        try:
+            client.set_token(rigadmin.renew_session(url, None, cacert=cacert))
+        except (ApiError, rigadmin.RigAdminError):
+            return False
+        return True
+
+    client.set_step_up_handler(_step_up)
+
+
+def rig_client(url: str, *, cacert: str | None, allow_insecure: bool = False) -> EngineClient:
+    """An :class:`EngineClient` for ``url``, signed in as the rig Administrator.
+
+    For a one-off read of an engine this harness spawned. The caller closes it."""
+    client = EngineClient(url, allow_insecure=allow_insecure, cacert=cacert)
+    try:
+        adopt_rig_session(client, url, cacert)
+    except BaseException:
+        client.close()
+        raise
+    return client
+
+
 class EnginePoller:
     """Samples one or more engine APIs off the event loop, aggregates them, and detects post-load
     drain across the whole cluster."""
@@ -506,12 +555,17 @@ class EnginePoller:
     def __init__(
         self,
         engine_urls: str | Sequence[str],
-        token: str | None,
+        token: str | rigadmin.RigSession | None,
         *,
         origin: float,
         allow_insecure: bool = False,
         cacert: str | None = None,
     ) -> None:
+        # `token` is a bearer token for an engine started OUTSIDE this harness (the CLI's --token),
+        # or `rigadmin.RIG_SESSION` for an engine this harness spawned: the poller then signs in as
+        # the run's rig Administrator when it opens, which is after the engine starts. `None` sends
+        # no credential, which an engine with sign-in on refuses.
+        #
         # Accept a single URL (back-compat) or a list. The first URL is the "primary" whose `client`
         # is exposed for one-off preflight reads (served-ports check). `allow_insecure` (default False)
         # is REQUIRED to poll a REMOTE engine over plaintext http (a co-located loopback engine is
@@ -643,12 +697,11 @@ class EnginePoller:
     def _open_sync(self) -> None:
         clients: list[EngineClient] = []
         for url in self._urls:
-            client = EngineClient(
-                url,
-                allow_insecure=self._allow_insecure,
-                cacert=self._cacert or self._cacert_for(url),
-            )
-            if self._token:
+            cacert = self._cacert or self._cacert_for(url)
+            client = EngineClient(url, allow_insecure=self._allow_insecure, cacert=cacert)
+            if isinstance(self._token, rigadmin.RigSession):
+                adopt_rig_session(client, url, cacert)
+            elif self._token:
                 client.set_token(self._token)  # does a /me request to validate
             clients.append(client)
         self._clients = clients
@@ -662,9 +715,10 @@ class EnginePoller:
         if not self._clients:
             return None
         shard_samples: list[_ShardSample] = []
-        for client in self._clients:
+        for client, url in zip(self._clients, self._urls, strict=True):
             shard = self._sample_shard(client)
             if shard is None:
+                self._renew_if_signed_out(client, url)
                 return None  # one shard unreachable → skip the aggregate (keep polling)
             shard_samples.append(shard)
         # Journal mode + synchronous are reported per shard; they share a backend in practice, so take
@@ -726,6 +780,26 @@ class EnginePoller:
             pool_wait_max_max_ms=_max_not_none(s.pool_wait_max_ms for s in shard_samples),
             pool_shards_reporting=sum(1 for s in shard_samples if s.pool_size is not None),
         )
+
+    def _renew_if_signed_out(self, client: EngineClient, url: str) -> None:
+        """After a failed sample, sign a rig poller in again if the engine has ended its session.
+
+        A session has an absolute lifetime, and a soak can outlast it. Without this the poller would
+        read "unreachable" for the rest of the run. One ``/auth/me`` per failed sample is the whole
+        cost, and an engine that is really down answers nothing, so nothing is renewed."""
+        if not isinstance(self._token, rigadmin.RigSession):
+            return
+        try:
+            client.me()
+        except ApiError as exc:
+            if exc.status != 401:
+                return
+        else:
+            return
+        try:
+            adopt_rig_session(client, url, self._cacert or self._cacert_for(url))
+        except (ApiError, rigadmin.RigAdminError):
+            return  # still not reachable, or refused: the next failed sample tries again
 
     @staticmethod
     def _sample_shard(client: EngineClient) -> _ShardSample | None:

@@ -66,6 +66,7 @@ from harness.load.failover_track import FailoverTracker
 from harness.load.ids import SHARDCERT_IDS
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix, load_profile_text
+from harness.load.rigadmin import RIG_SESSION
 from harness.load.sender import PersistentConnection
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context
@@ -839,7 +840,9 @@ class ShardCertNode(EngineNode):
         super().__init__(f"shard-{shard}", api_port, env=env, config_dir=config_dir, cwd=cwd)
         self.shard = shard
 
-    async def start(self) -> None:
+    async def start(self, *, provision: bool = True) -> None:
+        if provision:
+            await self.provision()
         self._proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -1287,7 +1290,7 @@ async def _sample_in_pipeline_peak(
     high-water in ``out[0]``. A dedicated short-lived poller so the SIZING bench can report the
     steady-state backlog peak; the correctness path never starts it (``capture_peak=False``), so its
     drive stays byte-identical."""
-    poller = EnginePoller(urls, None, origin=time.perf_counter())
+    poller = EnginePoller(urls, RIG_SESSION, origin=time.perf_counter())
     await poller.open()
     # De-dup the unified-store gauge: each shard's /stats in_pipeline counts the WHOLE store and the poller
     # SUMS across the N shard URLs, so the aggregate is N× the true fleet backlog (#841). Divide by the
@@ -1320,7 +1323,7 @@ async def _sample_in_pipeline_trace(
     slow-saturation one; a short-lived poller so the correctness/climb path (``sample_in_pipeline=False``)
     adds no concurrent poller during the hold."""
     t0 = origin if origin is not None else time.perf_counter()
-    poller = EnginePoller(urls, None, origin=t0)
+    poller = EnginePoller(urls, RIG_SESSION, origin=t0)
     await poller.open()
     # De-inflate the unified-store in_pipeline: each shard's gauge counts the whole store and the poller
     # sums the N shard URLs (#841). Divide by the distinct-shard count so the recorded trace is a SINGLE
@@ -1453,7 +1456,6 @@ async def run_shardcert(
     escapes = {
         "MEFOR_ALLOW_INSECURE_TLS": "1",
         "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE": "1",
-        "MEFOR_SECURITY_REQUIRE_SIGN_IN": "false",
         "MEFOR_INBOUND_BIND_HOST": "127.0.0.1",
     }
     # ARTIFACT 2: the pool is now RESOLVED (flag > ambient env > PRODUCT default 40) and ASSIGNED, not
@@ -1517,7 +1519,8 @@ async def run_shardcert(
         # at N>=4 simultaneous opens (multishard.py:426 documents the 30s-timeout blowout).
         for i, s in enumerate(ids_list):
             node = ShardCertNode(s, api_ports[i], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
-            await node.start()
+            # One store for the fleet: the first shard provisions the rig Administrator.
+            await node.start(provision=i == 0)
             nodes[s] = node
             if not await _await_health(node.url, timeout=60.0):
                 raise RuntimeError(f"shard {s} did not become healthy\n{node.log_tail()}")
@@ -1623,7 +1626,7 @@ async def run_shardcert(
             restart = ShardCertNode(
                 killed, api_ports[idx], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
             )
-            await restart.start()
+            await restart.start(provision=False)
             nodes[killed] = restart
             if not await _await_health(restart.url, timeout=60.0):
                 raise RuntimeError(f"shard {killed} did not restart\n{restart.log_tail()}")
@@ -1633,7 +1636,7 @@ async def run_shardcert(
         # Aggregate drain over ALL shards (every shard back up): in_pipeline==0 across the fleet, read
         # from /stats — the authoritative drain signal, NOT a poller peak.
         urls = [nodes[s].url for s in ids_list]
-        poller = EnginePoller(urls, None, origin=time.perf_counter())
+        poller = EnginePoller(urls, RIG_SESSION, origin=time.perf_counter())
         await poller.open()
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
         final = poller.final
@@ -2639,12 +2642,12 @@ def _shape_env(
 
 
 def _escapes(inbound_bind_host: str) -> dict[str, str]:
-    """The auth/insecure-TLS test escapes + the inbound bind interface every shard binds (``0.0.0.0`` on
-    a two-box run so the off-box load-gen senders can reach it; loopback co-located)."""
+    """The insecure-TLS test escapes + the inbound bind interface every shard binds (``0.0.0.0`` on
+    a two-box run so the off-box load-gen senders can reach it; loopback co-located). Sign-in is not
+    among them: every shard serves with it on, and ``EngineNode`` provisions the rig Administrator."""
     return {
         "MEFOR_ALLOW_INSECURE_TLS": "1",
         "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE": "1",
-        "MEFOR_SECURITY_REQUIRE_SIGN_IN": "false",
         "MEFOR_INBOUND_BIND_HOST": inbound_bind_host,
     }
 
@@ -2679,7 +2682,8 @@ async def _start_shards(
     the caller's ``finally`` still tears it down."""
     for i, s in enumerate(ids_list):
         node = ShardCertNode(s, api_ports[i], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
-        await node.start()
+        # One store for the fleet: the first shard provisions the rig Administrator.
+        await node.start(provision=i == 0)
         nodes[s] = node
         if not await _await_health(node.url, timeout=60.0):
             raise RuntimeError(f"shard {s} did not become healthy\n{node.log_tail()}")
@@ -3165,7 +3169,7 @@ async def run_shardcert_engine(
             restart = ShardCertNode(
                 killed, api_ports[idx], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
             )
-            await restart.start()
+            await restart.start(provision=False)
             nodes[killed] = restart
             # The restarted shard is a NEW subprocess (new PID) — refresh the correlation map so a
             # post-kill CPU sample attributes to the survivor process, not the reaped pre-kill one.
@@ -3180,7 +3184,7 @@ async def run_shardcert_engine(
         # its self-contained store-truth verdict. A short post-drain grace so the driver's own REMOTE
         # drain poll doesn't race the shard teardown (both read the same store).
         urls = [nodes[s].url for s in ids_list]
-        poller = EnginePoller(urls, None, origin=time.perf_counter())
+        poller = EnginePoller(urls, RIG_SESSION, origin=time.perf_counter())
         await poller.open()
         try:
             drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
@@ -3398,6 +3402,10 @@ async def run_shardcert_driver(
         # any CI workflow -- so it is left visible here rather than half-converted to https, which
         # would fail verification against a cert this box has never seen.
         urls = [f"http://{engine_host}:{p}" for p in api_ports]
+        # NO SESSION ON THIS HOP, KNOWINGLY, and for the reason above. The engine box serves with
+        # sign-in on, and a client refuses to put a credential on a cleartext hop to another box.
+        # So once this rig has its certificate answer, this poller takes RIG_SESSION over https,
+        # and the load box is given the engine box's rig credential (harness.load.rigadmin).
         poller = EnginePoller(urls, None, origin=time.perf_counter(), allow_insecure=allow_insecure)
         await poller.open()
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
@@ -4482,6 +4490,10 @@ async def run_shardcert_drive(
         # off-box, so without it EngineClient fail-closes and poller.open() raises AFTER the children are
         # spawned. (A loopback co-located engine never needs it.) The finally below still tears the
         # children down on any early failure, but threading this is what makes the run succeed.
+        # NO SESSION ON THIS HOP, KNOWINGLY, and for the reason above. The engine box serves with
+        # sign-in on, and a client refuses to put a credential on a cleartext hop to another box.
+        # So once this rig has its certificate answer, this poller takes RIG_SESSION over https,
+        # and the load box is given the engine box's rig credential (harness.load.rigadmin).
         poller = EnginePoller(urls, None, origin=time.perf_counter(), allow_insecure=allow_insecure)
         await poller.open()
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)

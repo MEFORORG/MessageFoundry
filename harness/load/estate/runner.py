@@ -50,6 +50,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.rigadmin import RIG_SESSION
 from harness.load.sink import CorrelationSink
 
 log = logging.getLogger(__name__)
@@ -161,7 +162,7 @@ async def _run_one(
         config_dir=_CONFIG_DIR,
         cwd=cwd,
     )
-    poller = EnginePoller(node.url, token=None, origin=time.perf_counter())
+    poller = EnginePoller(node.url, token=RIG_SESSION, origin=time.perf_counter())
     flags = hub_flags(profile.count, profile.simple_fraction)
     driver = EstateDriver(
         host=sink_host,
@@ -273,9 +274,8 @@ def _node_env(
     inbound_bind_host: str = "127.0.0.1",
 ) -> dict[str, str]:
     env = dict(base)
-    env["MEFOR_SECURITY_REQUIRE_SIGN_IN"] = (
-        "false"  # the poller reads /stats without a bearer token
-    )
+    # No sign-in setting here: the node serves with sign-in on, and `EngineNode` provisions the rig
+    # Administrator the poller signs in as (harness.load.rigadmin).
     env["MEFOR_ESTATE_COUNT"] = str(profile.count)
     env["MEFOR_ESTATE_SIMPLE_FRACTION"] = repr(profile.simple_fraction)
     env["MEFOR_ESTATE_HUB_FANOUT"] = str(profile.hub_fanout)
