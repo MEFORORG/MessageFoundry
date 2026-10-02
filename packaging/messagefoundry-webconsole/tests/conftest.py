@@ -22,6 +22,8 @@ session loop scopes in ``pyproject.toml`` — not here.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import sys
 from collections.abc import AsyncIterator, Iterator
@@ -56,7 +58,11 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[None]:
     ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape this used to set is honoured only at
     ``[security].enforcement = warn`` now (vault BACKLOG #2599). The check itself still runs. POSIX
     checkouts aren't group/world-writable, so the Linux leg keeps running the real readers. The
-    check's own tests live in the engine suite."""
+    check's own tests live in the engine suite.
+
+    One ``pytest`` run can load both conftests. The stand-in records what it replaced
+    (``functools.wraps``), so the engine suite's fixture can still find the real readers when this
+    one ran first."""
     if sys.platform != "win32":
         yield
         return
@@ -66,8 +72,13 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[None]:
     probes = wiring._WinConfigSourceProbes(
         self_sid=_SUITE_SID, read_path=lambda _path: clean, owner_in_admins=lambda _sid: False
     )
+
+    @functools.wraps(inspect.unwrap(wiring._win32_config_source_probes))
+    def clean_readers() -> wiring._WinConfigSourceProbes:
+        return probes
+
     patch = pytest.MonkeyPatch()
-    patch.setattr(wiring, "_win32_config_source_probes", lambda: probes)
+    patch.setattr(wiring, "_win32_config_source_probes", clean_readers)
     try:
         yield
     finally:

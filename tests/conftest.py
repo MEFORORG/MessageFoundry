@@ -15,6 +15,8 @@ asyncio_default_fixture_loop_scope = "session"), which removes the per-test even
 from __future__ import annotations
 
 import atexit
+import functools
+import inspect
 import logging
 import os
 import shutil
@@ -217,17 +219,31 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[
 
     This used to set ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` for the whole session. Vault BACKLOG #2599
     clamped that escape: it is honoured only with ``MEFOR_SECURITY_ENFORCEMENT=warn`` beside it, and
-    setting the dial for a whole session would move every default-posture test to ``warn``. A child
-    process does not inherit these readers. A test that spawns one over a writable config directory
-    sets both variables in the child's environment itself."""
+    setting the dial for a whole session would move every default-posture test to ``warn``.
+
+    A child process does not inherit these readers and runs the real check. A child that loads from
+    ``tmp_path`` passes it: pytest makes that directory with mode ``0o700``, which on Windows is an
+    access list of SYSTEM, Administrators and the owner alone, whatever ``%TEMP%`` grants (measured
+    2026-10-01, Python 3.14). A child that loads from the checkout needs both variables in its own
+    environment, as ``harness.load.failover.EngineNode`` sets them.
+
+    The web console suite's conftest installs the same kind of stand-in, and one ``pytest`` run can
+    load both. So the real readers are found with ``inspect.unwrap``, and each stand-in records what
+    it replaced, or this fixture would capture the other suite's stand-in as "real"."""
     if sys.platform != "win32":
         yield None
         return
     import messagefoundry.config.wiring as wiring
 
-    real = wiring._win32_config_source_probes
+    real = inspect.unwrap(wiring._win32_config_source_probes)
+    probes = _clean_config_source_probes()
+
+    @functools.wraps(real)
+    def clean_readers() -> _WinConfigSourceProbes:
+        return probes
+
     patch = pytest.MonkeyPatch()
-    patch.setattr(wiring, "_win32_config_source_probes", _clean_config_source_probes)
+    patch.setattr(wiring, "_win32_config_source_probes", clean_readers)
     try:
         yield real
     finally:

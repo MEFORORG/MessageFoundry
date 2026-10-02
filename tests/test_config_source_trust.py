@@ -26,6 +26,7 @@ real access list ask for it (``real_config_source_readers``).
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import subprocess
@@ -569,13 +570,17 @@ def test_world_writable_config_dir_warns_with_escape_windows(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real NTFS DACL check needs Windows")
-@pytest.mark.usefixtures("real_config_source_readers", "escape_honoured")
-def test_owner_only_config_dir_loads_windows(tmp_path: Path) -> None:
-    """A freshly-created owner-controlled tmp dir (no broad write ACE) loads cleanly on Windows.
+@pytest.mark.usefixtures("real_config_source_readers")
+def test_owner_only_config_dir_loads_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A freshly-created owner-controlled tmp dir (no broad write ACE) loads cleanly on Windows,
+    through the real readers and with no escape.
 
-    It runs with the escape honoured, as it did while the suite set the escape for every test, so the
-    host's own ``%TEMP%`` access list cannot fail it. ``test_clean_windows_read_loads`` is the test
-    that proves a clean read loads with no escape."""
+    It used to run with the suite-wide escape on, so it could not fail. ``tmp_path`` is a mode
+    ``0o700`` directory, whose access list on Windows names SYSTEM, Administrators and the owner
+    alone, so this does not depend on what the host's ``%TEMP%`` grants."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
     d = tmp_path / "cfg_ok"
     d.mkdir()
     (d / "cfg.py").write_text(
@@ -762,18 +767,68 @@ def test_a_file_only_warn_dial_does_not_unlock_the_escape(tmp_path: Path) -> Non
     assert insecure_config_source_escape_permitted(environ) is False
 
 
+def test_two_spellings_of_the_dial_that_disagree_leave_the_escape_inert() -> None:
+    """The settings loader lowercases variable names, so on POSIX two spellings of the dial can sit
+    in one environment and either may win. If any spelling it would read is not ``warn``, the
+    instance may resolve to ``enforce``, so the escape must stay inert."""
+    lower = SECURITY_ENFORCEMENT_ENV.replace("ENFORCEMENT", "enforcement")
+    assert lower != SECURITY_ENFORCEMENT_ENV
+    environ = {
+        INSECURE_CONFIG_SOURCE_ESCAPE_ENV: "1",
+        SECURITY_ENFORCEMENT_ENV: "warn",
+        lower: "enforce",
+    }
+    # Control: this is a real disagreement to the loader, not a name it ignores.
+    assert load_settings(environ=environ).security.enforcement is SecurityEnforcement.ENFORCE
+    assert insecure_config_source_escape_permitted(environ) is False
+    # The other spelling alone, at warn, is the dial too, and unlocks the escape.
+    assert insecure_config_source_escape_permitted(
+        {INSECURE_CONFIG_SOURCE_ESCAPE_ENV: "1", lower: "warn"}
+    )
+
+
+def _cli_override_sections(source: str) -> set[str]:
+    """The section names a module writes as settings overrides, in the three shapes the code base
+    uses: a dict literal whose value is a dict, ``x["section"]``, and ``x.setdefault("section", ...)``.
+
+    It cannot see a section name held in a variable, and it does not check that the dict reaches
+    ``load_settings(cli=...)``. It over-reports before it under-reports."""
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=True):
+                if (
+                    isinstance(key, ast.Constant)
+                    and isinstance(key.value, str)
+                    and isinstance(value, ast.Dict)
+                ):
+                    found.add(key.value)
+        elif isinstance(node, ast.Subscript):
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                found.add(node.slice.value)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "setdefault"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            found.add(node.args[0].value)
+    return found
+
+
 def test_no_command_line_override_sets_the_dial() -> None:
     """The clamp is sound because nothing outranks the environment for this dial. A command-line
-    override would, so pin that no entry point builds one for ``[security]``."""
-    sources = [
-        (_REPO / "messagefoundry" / name).read_text(encoding="utf-8")
-        for name in ("__main__.py", "checks.py")
-    ]
-    joined = "\n".join(sources)
-    # Control first: the pattern finds the overrides that do exist.
-    assert 'cli.setdefault("store"' in joined
-    assert 'cli.setdefault("security"' not in joined
-    assert 'cli["security"]' not in joined
+    override would, so pin that neither module that builds one writes a ``security`` section."""
+    package = _REPO / "messagefoundry"
+    main = _cli_override_sections((package / "__main__.py").read_text(encoding="utf-8"))
+    checks = _cli_override_sections((package / "checks.py").read_text(encoding="utf-8"))
+    # Controls first, one per module and per shape it uses, so a blind detector fails here.
+    assert "store" in main
+    assert "environments" in checks
+    assert "security" not in main
+    assert "security" not in checks
 
 
 _CHILD_LOAD = (
@@ -805,7 +860,7 @@ def _load_in_a_child(source: Path, env: dict[str, str]) -> subprocess.CompletedP
         text=True,
         env=env,
         cwd=str(_REPO),
-        timeout=120,
+        timeout=30,  # well under the 60s pytest-timeout watchdog, so THIS reports the failure
     )
 
 

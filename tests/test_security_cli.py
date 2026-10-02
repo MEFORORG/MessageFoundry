@@ -168,6 +168,22 @@ def test_show_declares_that_it_cannot_see_a_cli_bind_override(
     assert "--host" in data["loosenings_scope"]
 
 
+def test_show_declares_that_the_config_source_escape_is_read_from_its_own_environment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fifth gap (vault BACKLOG #2599). The escape is an environment variable, so this command
+    reports the shell it runs in, which may not be the service's. With both variables in that shell
+    and an empty file, the list names the escape beside a file that says ``enforce``, and the scope
+    marker is what says why."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    data = _show(tmp_path / "mf.toml", capsys)
+    assert data["values"]["enforcement"] == "enforce"
+    assert "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE" in [row["switch"] for row in data["loosenings"]]
+    assert "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE" in data["loosenings_scope"]
+    assert "environment of THIS command" in data["loosenings_scope"]
+
+
 def test_show_reports_store_and_auth_deviations_from_the_whole_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

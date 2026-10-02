@@ -8338,6 +8338,10 @@ def _security(args: argparse.Namespace) -> int:
     #: GET /security/posture while this command still shows the file's `true`. Both readings are right
     #: for what they describe, and a scope marker that did not say so would send an auditor comparing
     #: the two surfaces looking for a defect in one of them.
+    #:
+    #: Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
+    #: environment variable, and security_loosenings() reads it from the process that calls it. Here
+    #: that is the operator's shell, not the service.
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
@@ -8347,7 +8351,10 @@ def _security(args: argparse.Namespace) -> int:
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
-            "GET /security/posture"
+            "GET /security/posture. One entry is not read from the file at all: "
+            "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE is reported from the environment of THIS command, "
+            "which may not be the service's, so it can appear here beside an `enforce` file, or be "
+            "absent here while the service carries it — GET /security/posture reads the engine's own"
         ),
     }
 

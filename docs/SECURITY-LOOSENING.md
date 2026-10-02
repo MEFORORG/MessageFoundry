@@ -777,6 +777,13 @@ This section is kept rather than deleted, because the claim it used to make is t
 > loads config, and some of those read no settings file: at least the sandbox worker, and the
 > offline commands that load config before any settings. So the dial has to sit where the escape
 > does.
+> **The dial in the environment is the instance's dial, not a switch for this check alone.** A
+> `messagefoundry check` run with both variables judges every posture gate at `warn`. To check a
+> config at `enforce`, lock its directory instead.
+> **"Refused under `enforce`" is about the environment's dial.** It holds for `serve`, `supervise`
+> and every CLI command, whose settings come from that environment. A program that embeds the engine
+> with settings it built itself has a dial this check cannot see; there the escape follows the
+> environment.
 - **What you lose:** the config-source check
   ([ADR 0036](adr/0036-windows-config-source-trust.md)). The engine runs every `*.py` in the config
   directory as its own account, which holds the store credentials and reads PHI. The check refuses

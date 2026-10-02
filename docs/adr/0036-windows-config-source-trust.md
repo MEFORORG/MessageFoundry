@@ -232,9 +232,11 @@ commands. At least `check` and `dryrun` load config before they read any setting
 reads no settings file. So the clamp reads the dial from the environment, where the escape itself
 lives, and every one of those processes decides the same way with nothing handed down by a caller.
 The environment outranks the settings file and no command-line override sets this dial, so an
-instance that resolves to `enforce` can never unlock the escape. The cost is one limit:
-**`warn` set only in the settings file does not unlock it.** That is the strict direction.
-`insecure_config_source_escape_permitted()` in `config/settings.py` is the one place the rule lives.
+instance whose settings come from that environment and resolve to `enforce` cannot unlock the
+escape. The cost is one limit: **`warn` set only in the settings file does not unlock it.** That is
+the strict direction. `insecure_config_source_escape_permitted()` in `config/settings.py` is the one
+place the rule lives, with its other limits: what the dial in the environment does to `check`, and a
+program that embeds the engine with settings it built itself.
 
 **The test suite changed with it.** It used to set the escape for every win32 test. Under the clamp
 that would also need the `warn` dial for the whole session, which would move every default-posture

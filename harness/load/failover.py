@@ -151,7 +151,8 @@ class EngineNode:
         # runner or dev tree leaves writable to BUILTIN\Users, so the engine's config-source check
         # refuses it. The escape is honoured only beside the warn dial above (vault BACKLOG #2599).
         # It used to reach this child by inheritance from the test session, which no longer sets it.
-        # Not set on POSIX, where a checkout passes the check and the refusal path must stay live.
+        # This default is not set on POSIX, where a checkout passes the check. multishard and
+        # shardcert pass the escape in themselves on every platform, and it is honoured there too.
         if sys.platform == "win32":
             self._env.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
         self._config_dir = config_dir
