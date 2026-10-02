@@ -118,6 +118,11 @@ class LabelMarker(UnmappedAction):
     pass
 
 
+@dataclass(frozen=True)
+class _Demoted(Control):
+    was: str = ""
+
+
 def _label_statement(elem: Element) -> str:
     tag = _local(elem.tag).lower()
     if tag == "line":
@@ -157,6 +162,10 @@ _SIBLING_PARSE = (
     "        produced = _parse_statement(child, subject, held, in_control, depth + 1)\n"
 )
 _SIBLING_KEPT = "            continue\n        steps.extend(produced)\n"
+_BARE_MARKER = "and step.kind in _BRANCH_PARENT and not step.body:\n"
+_BRANCH_BODY = "branches.append(replace(marker, body=tuple(steps[start:i])))\n"
+_LAST_BRANCH_BODY = "branches.append(replace(marker, body=tuple(steps[start:])))\n"
+_BRANCH_GROUP = "any(isinstance(s, Control) and s.kind == kind for s in body):\n"
 _UNKNOWN_ARM = "    if tag.lower() not in _STATEMENT_TAGS:\n"
 _UNKNOWN_RETURN = '        return [Control("unknown", tag, statement or note, body=tuple(body))]\n'
 _BLOCK_RETURN = "return [Control(kind, source, statement or note or tag, body=tuple(body))]\n"
@@ -198,11 +207,30 @@ _STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
         '        return [Control("unknown", tag, detail, body=tuple(body))]\n'
         # A send in a Block's or a Call's ``@Data`` is never a live send: a label, its marker,
         # and then its body where a send's body always went. A Call carrying any other
-        # statement is a plain label too, and no call.
+        # statement is a plain label too, and no call. Each remembers the kind it had.
         '    if marker and kind == "send":\n'
-        '        return [Control("block", tag, statement, body=tuple(marker)), *body]\n'
+        '        return [_Demoted("block", tag, statement, body=tuple(marker), was=kind), *body]\n'
         '    if marker and kind == "call":\n'
-        '        kind = "block"\n',
+        '        return [_Demoted("block", tag, statement, body=(*marker, *body), was=kind)]\n',
+    ),
+    # The shape of the tree is main's. The branch-group test reads the kind a demoted label had.
+    # And a branch marker holding nothing but label markers still opens its branch, and keeps
+    # them. Written apart from the head, which asks one function for the kind and tests the
+    # marker's body with ``all``.
+    (_BRANCH_GROUP, _BRANCH_GROUP.replace("s.kind", 'getattr(s, "was", s.kind)')),
+    (
+        _BARE_MARKER,
+        _BARE_MARKER.replace(
+            "not step.body", "not [s for s in step.body if not isinstance(s, LabelMarker)]"
+        ),
+    ),
+    (
+        _BRANCH_BODY,
+        _BRANCH_BODY.replace("tuple(steps[start:i])", "(*marker.body, *steps[start:i])"),
+    ),
+    (
+        _LAST_BRANCH_BODY,
+        _LAST_BRANCH_BODY.replace("tuple(steps[start:])", "(*marker.body, *steps[start:])"),
     ),
     # The render, a container: the marker ahead of its body, or ahead of the construct.
     (_BLOCK_RETURN, _BLOCK_RETURN.replace("body=tuple(body)", "body=(*marker, *body)")),
@@ -2207,8 +2235,10 @@ _FILLED = '<Line Data="ItemClear %ADT/PID-20"/>'
 #: Wrappers between such a pair, nested. ``{S}`` is where one carries a statement. A ``filled``
 #: wrapper holds a statement of its own, which orphans the branch on main already.
 _NESTED_WRAPPERS = {
+    "side-by-side": "<List{S}/><Actions{S}/>",
     "inner-of-2": "<List><List{S}/></List>",
     "both-of-2": "<List{S}><List{S}/></List>",
+    "all-of-3": "<List{S}><Actions{S}><List{S}/></Actions></List>",
     "innermost-of-3": "<List><List><List{S}/></List></List>",
     "middle-of-3": "<List><List{S}><List/></List></List>",
     "outermost-of-3": "<Actions{S}><List><List/></List></Actions>",
@@ -2303,6 +2333,29 @@ def _label_statement_shapes() -> Iterator[Shape]:
     # A construct carrying a statement still adopts its own sibling branch.
     carrier = carrying("If", "MsgLog %ADT")
     yield Shape("2632-If-log-before-its-own-sibling-else", "%ADT", (Raw(carrier.xml + else_arm),))
+    # Code review of the repair: the shape of the tree is decided in two more places.
+    log_wrapper = '<List Data="MsgLog %ADT"/>'
+    for name, construct, branch in _SIBLING_PAIRS:
+        # A branch marker written in the construct's own list, holding nothing but such a wrapper.
+        # It must still open its branch: what follows it is dead until the condition is written.
+        inside = construct.replace(
+            "<List/>", f"<List>{_FILLED}{_line(branch, log_wrapper)}{arm}</List>"
+        )
+        yield Shape(f"2632-List-log-in-a-bare-{name}-marker", "%ADT", (Raw(inside),))
+        # A label demoted from a call or a send, inside an element with no ``@Data``. Whether
+        # that element is a branch-group is read from the kind the label had on main.
+        after = _line(branch, arm)
+        for outer, tag, data in (
+            ("Call", "Call", "MsgLog %ADT"),
+            ("Block", "Call", "MsgLog %ADT"),
+            ("Block", "Block", "MsgSend %ADT [OB_LABEL]"),
+        ):
+            group = f'<{outer}><{tag} Data="{_esc(data)}"/>{construct}</{outer}>'
+            yield Shape(
+                f"2632-{tag}-{data[:6]}-in-a-bare-{outer}-before-a-{name}",
+                "%ADT",
+                (Raw(group + after),),
+            )
     # A keyword span that does not lead a Block's label, and a table verb that does not lead it:
     # both still read as a label.
     connective = f"Copy patient {_kw('to')} output"
@@ -2765,77 +2818,141 @@ def test_the_amendment_reaches_every_seed_written_for_it() -> None:
         assert _amendment_changes(shape) is expected, shape.name
 
 
-_Branches = tuple[Counter[tuple[str, str, str]], Counter[tuple[str, str]]]
-
-
-def _branches(module: Any, xml: str) -> _Branches | None:
-    """Every branch marker in the parsed list, as ``(adopted, orphaned)``, or ``None`` where the
-    import refuses. Adopted: ``(construct kind, branch kind, branch text)`` for each branch a
-    construct holds. Orphaned: ``(kind, text)`` for each marker standing as a step of its own,
-    which the render lifts to that level with its body live."""
+def _skeleton(module: Any, xml: str) -> tuple[Any, ...] | None:
+    """The SHAPE of the parsed list, or ``None`` where the import refuses: every construct as
+    ``(kind, body, branches)``, every other step as ``"."``. Label markers are left out, and a
+    label demoted from a send or a call counts as the kind it had. So this is the tree as main
+    sees it. Which construct holds which branch, and which branch marker stands alone as an
+    orphan, are both in it."""
     try:
         channel = module.parse_package(_package(xml))[0]
     except module.CorepointImportError:
         return None
-    adopted: Counter[tuple[str, str, str]] = Counter()
-    orphaned: Counter[tuple[str, str]] = Counter()
+    marker = getattr(module, "LabelMarker", ())
 
-    def walk(steps: Sequence[Any]) -> None:
-        for step in steps:
-            if not isinstance(step, module.Control):
-                continue
-            if step.kind in module._BRANCH_PARENT:
-                orphaned[step.kind, step.detail] += 1
-            hold(step)
+    def shape(steps: Sequence[Any]) -> tuple[Any, ...]:
+        return tuple(
+            (
+                getattr(step, "demoted_from", "") or getattr(step, "was", "") or step.kind,
+                shape(step.body),
+                shape(step.branches),
+            )
+            if isinstance(step, module.Control)
+            else "."
+            for step in steps
+            if not isinstance(step, marker)
+        )
 
-    def hold(construct: Any) -> None:
-        walk(construct.body)
-        for branch in construct.branches:
-            adopted[construct.kind, branch.kind, branch.detail] += 1
-            hold(branch)
-
-    for handler in channel.handlers:
-        walk(handler.steps)
-    return adopted, orphaned
+    return tuple(shape(handler.steps) for handler in channel.handlers)
 
 
-def _branches_moved(shape: Shape) -> list[str]:
-    """What the amendment, or the head, changes about which construct holds which branch, against
-    the tree exactly as vendored. It must change nothing: a statement off a ``<Line>`` is marked,
-    and a marker is no statement position. So no branch main adopts is orphaned, at any depth of
-    wrapper, and none it orphans is adopted. A gate-open list holds no construct at all."""
-    xml = _render(shape.nodes, shape.inp)
-    was = _branches(step1_as_vendored, xml)
+def _adopted(steps: Sequence[Any]) -> int:
+    """How many branches the constructs of a skeleton hold."""
+    return sum(
+        len(step[2]) + _adopted(step[1]) + _adopted(step[2]) for step in steps if step != "."
+    )
+
+
+def _structure_moved(name: str, xml: str) -> list[str]:
+    """What the amendment, or the head, changes about the shape of the tree, against the file
+    exactly as vendored. It must change nothing. A statement off a ``<Line>`` is marked, and a
+    marker is no statement position. So no branch main adopts is orphaned, at any depth, none it
+    orphans is adopted, and no construct appears or goes. The head is held to that wherever the
+    gate is closed. A fully understood list takes the step 2 path, which builds its own tree."""
+    was = _skeleton(step1_as_vendored, xml)
+    modules = [("the amended baseline", step1)]
+    if not _fully_understood(xml):
+        modules.append(("the head", head))
     return [
-        f"{shape.name}: {name} holds {now} where main holds {was}"
-        for name, module in (("the amended baseline", step1), ("the head", head))
-        if (now := _branches(module, xml)) != was
+        f"{name}: {who} parses {now} where main parses {was}"
+        for who, module in modules
+        if (now := _skeleton(module, xml)) != was
     ]
+
+
+_RAW_TAGS = (
+    *("List", "Actions", "Line", "Line", "Line", "Block", "Call"),
+    *("If", "Try", "Case", "Foreach", "Loop", "Switch"),
+)
+_RAW_DATA = (
+    *(None, None, None, "Section", "MsgLog %ADT", "MsgSend %ADT [OB_X]", "ItemClear %ADT/PID-19"),
+    *("MsgTreeCopy %ADT/ to %OUT/", "If (x)", "Else", "ElseIf (y)", "Catch", 'Matching "M"'),
+    *(
+        "ChooseFrom (x)",
+        'ActionListCall "Sub"',
+        "LoopExit",
+        "Try",
+        "Returns",
+        "ForEach %ADT/OBX $o",
+    ),
+)
+_RAW = 4000
+
+
+def _raw_element(rng: random.Random, depth: int) -> str:
+    """One element of any tag, with any ``@Data``, around up to three more. No grammar: a branch
+    verb on a container, a statement on a wrapper, a wrapper in a branch line."""
+    tag, data = rng.choice(_RAW_TAGS), rng.choice(_RAW_DATA)
+    attr = f' Data="{_esc(data)}"' if data is not None else ""
+    if depth == 0 or rng.random() < 0.3:
+        return f"<{tag}{attr}/>"
+    children = "".join(_raw_element(rng, depth - 1) for _ in range(rng.randint(0, 3)))
+    if tag not in ("List", "Actions") and rng.random() < 0.6:
+        children = f"<List>{children}</List>"
+    return f"<{tag}{attr}>{children}</{tag}>"
+
+
+def _structure_shapes() -> list[tuple[str, str]]:
+    """Every shape of the battery, and ``_RAW`` lists drawn with no grammar at all. The battery's
+    grammar writes well-formed constructs, so a route nobody thought to seed is not in it. The
+    raw lists are for this test alone: the oracle does not model them."""
+    rng = random.Random(_SEED)
+    raw = ("".join(_raw_element(rng, 3) for _ in range(rng.randint(1, 4))) for _ in range(_RAW))
+    return [
+        *((shape.name, _render(shape.nodes, shape.inp)) for shape in _SHAPES),
+        *((f"raw-{i}", xml) for i, xml in enumerate(raw)),
+    ]
+
+
+_STRUCTURE_SHAPES = _structure_shapes()
 
 
 @pytest.mark.parametrize("chunk", range(_CHUNKS))
 def test_no_branch_main_adopts_is_orphaned(chunk: int) -> None:
-    """The acceptance rule of the repair to PR 1938, over the whole battery and not only where
-    the rendered text shows it: see :func:`_branches_moved`."""
-    moved = [line for shape in _SHAPES[chunk::_CHUNKS] for line in _branches_moved(shape)]
+    """The acceptance rule of the repair to PR 1938, and more than it: the amendment changes the
+    shape of no tree. See :func:`_structure_moved`."""
+    moved = [
+        line
+        for name, xml in _STRUCTURE_SHAPES[chunk::_CHUNKS]
+        for line in _structure_moved(name, xml)
+    ]
     assert not moved, "\n".join(moved[:20]) + f"\n... {len(moved)} in all"
 
 
-def test_the_branch_check_sees_an_orphan_and_an_adoption() -> None:
+def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:
     """The control for the test above: the reading tells an adopted branch from an orphaned one, on
     the vendored tree itself. A ``<List>`` holding a statement between an If and its Else orphans
     the Else on main; an empty one does not."""
     if_x, arm = _SIBLING_PAIRS[0][1], _line("Else", _line("MsgLog %ADT"))
-    adopted = _branches(step1_as_vendored, if_x + "<List/>" + arm)
-    orphaned = _branches(step1_as_vendored, if_x + "<List>" + _FILLED + "</List>" + arm)
-    assert adopted == (Counter({("if", "else", ""): 1}), Counter())
-    assert orphaned == (Counter(), Counter({("else", ""): 1}))
-    # And every nested seed that main adopts is one the bound sees change.
+    adopted = _skeleton(step1_as_vendored, if_x + "<List/>" + arm)
+    orphaned = _skeleton(step1_as_vendored, if_x + "<List>" + _FILLED + "</List>" + arm)
+    assert adopted == ((("if", (), (("else", (".",), ()),)),),)
+    assert orphaned == ((("if", (), ()), ".", ("else", (".",), ())),)
+    # The raw lists reach what the seeds are written for: branches main adopts, in number, in
+    # lists where the amendment marks a statement.
+    raw = [xml for name, xml in _STRUCTURE_SHAPES if name.startswith("raw-")]
+    marked = [xml for xml in raw if step1._LABEL_STATEMENT_WHY in _generate(step1, xml)[0]]
+    assert len(raw) == _RAW and len(marked) >= _RAW // 2
+    assert (
+        sum(_adopted(h) for xml in marked for h in _skeleton(step1_as_vendored, xml) or ()) >= 500
+    )
+    # And every seed with a wrapper between a construct and a sibling branch main adopts is one
+    # the bound sees change.
     nested = [s for s in _label_statement_shapes() if "-before-a-sibling-" in s.name]
     held = [
         s
         for s in nested
-        if (found := _branches(step1_as_vendored, _render(s.nodes, s.inp))) and found[0]
+        if any(_adopted(h) for h in _skeleton(step1_as_vendored, _render(s.nodes, s.inp)) or ())
     ]
     filled = sum(name.startswith("filled") for name in _NESTED_WRAPPERS)
     assert len(nested) == len(_SIBLING_PAIRS) * 2 * (1 + len(_NESTED_WRAPPERS))
