@@ -1217,7 +1217,12 @@ def _send_indent(src: str, dest: str, *, live_only: bool = False) -> int | None:
     return min(found) if found else None
 
 
-def _generate(module: Any, xml: str) -> tuple[str, tuple[object, ...]]:
+#: What :func:`_generate` returns: the module, and ``(mapped, unmapped names, disabled)`` for
+#: each handler.
+_Out = tuple[str, tuple[tuple[int, list[str], int], ...]]
+
+
+def _generate(module: Any, xml: str) -> _Out:
     """The generated module and the summary counts, or ``("", ())`` when the import refuses."""
     try:
         channel = module.parse_package(_package(xml))[0]
@@ -2373,8 +2378,9 @@ def _label_statement_shapes() -> Iterator[Shape]:
             "<List/>", f"<List>{_FILLED}{_line(branch, log_wrapper)}{arm}</List>"
         )
         yield Shape(f"2632-List-log-in-a-bare-{name}-marker", "%ADT", (Raw(inside),))
-        # A label demoted from a call or a send, inside an element with no ``@Data``. Whether
-        # that element is a branch-group is read from the kind the label had on main.
+        # A label demoted from a call, or a send off a Line, inside an element with no
+        # ``@Data``. Whether that element is a branch-group is read from the kind it had on
+        # main.
         after = _line(branch, arm)
         for outer, tag, data in (
             ("Call", "Call", "MsgLog %ADT"),
@@ -2472,7 +2478,7 @@ def test_open_gate_shapes_are_well_represented() -> None:
     assert len(bound) >= 1000
 
 
-def _generate_text(module: Any, text: str) -> tuple[str, tuple[object, ...]]:
+def _generate_text(module: Any, text: str) -> _Out:
     try:
         channel = module.parse_package(text)[0]
     except module.CorepointImportError:
@@ -2825,49 +2831,41 @@ def _may_carry_a_label_statement(xml: str) -> bool:
     return False
 
 
-#: What :func:`_generate` returns: the module, and ``(mapped, unmapped names, disabled)`` a handler.
-_Out = tuple[str, tuple[object, ...]]
-
-
-def _unmapped_names(out: _Out) -> list[list[str]]:
-    """The names the summary counts unmapped, one list for each handler."""
-    names: list[list[str]] = []
-    for counts in out[1]:
-        assert isinstance(counts, tuple) and isinstance(counts[1], list)
-        names.append(counts[1])
-    return names
+def _unmapped_names(out: _Out) -> list[str]:
+    """Every name the summary counts unmapped."""
+    return [name for counts in out[1] for name in counts[1]]
 
 
 def _unmapped(out: _Out) -> int:
-    """How many steps the summary counts unmapped, over every handler."""
-    return sum(len(names) for names in _unmapped_names(out))
+    """How many steps the summary counts unmapped."""
+    return len(_unmapped_names(out))
 
 
-def _handlers(src: str) -> list[list[str]]:
-    """The lines of each generated handler, blank ones left out: its decorator first, and its
-    closing ``return`` last."""
-    lines = src.splitlines()
-    starts = [i for i, line in enumerate(lines) if line.startswith("@handler(")]
-    return [
-        [line for line in lines[start:end] if line]
-        for start, end in zip(starts, [*starts[1:], len(lines)], strict=True)
-    ]
+def _handler_lines(src: str) -> list[str]:
+    """The lines of the generated handler, blank ones left out, its closing ``return`` last. The
+    guard wraps every list in one action-list, so a module holds one handler."""
+    return [line for line in src.split("@handler")[-1].splitlines() if line]
 
 
-def _refusals(lines: Sequence[str]) -> Counter[int]:
-    """The refusals among ``lines``, counted by indent. A raise at the handler's own level stops
-    every message; the same raise one level in is dead until someone writes the condition."""
-    return Counter(len(m.group(1)) for m in map(_REFUSAL.match, lines) if m is not None)
+# A LOUD line: a live send, a refusal, or the guard that re-raises a refusal ahead of a Catch.
+_LOUD = re.compile(
+    r"^(\s*)(?:sends\.append\(Send\(|raise NotImplementedError\(|except NotImplementedError:)"
+)
+
+
+def _loud(lines: Sequence[str]) -> Counter[int]:
+    """The loud lines among ``lines``, counted by indent. One at the handler's own level acts on
+    every message. The same line one level in is dead until someone writes the condition."""
+    return Counter(len(m.group(1)) for m in map(_LOUD.match, lines) if m is not None)
 
 
 def _quieter(was: _Out, now: _Out) -> list[str]:
     """Every way ``now`` is QUIETER than ``was``, which is main's tree as vendored. It must be
-    none. The rule (ADR 0086 §2(b.4)), over every handler of the list:
+    none. The rule (ADR 0086 §2(b.4)):
 
-    (b) ``now`` refuses at least where main refuses. No ``raise NotImplementedError`` goes, at any
-        indent, and a closing ``return`` that carries a marker (the ``return None`` that says no
-        destination was named, or that the list is ``@Disabled``) is main's line still. A
-        refusal sends the message to ERROR. Without it the handler returns an empty list or
+    (b) where main sends or refuses, ``now`` sends or refuses. No loud line goes, at any indent
+        (:func:`_loud`), and the handler's closing ``return`` is main's line. A refusal sends the
+        message to ERROR. With a comment in its place the handler returns an empty list or
         ``None``, and the message is FILTERED with nothing said.
     (c) what main counted unmapped is still counted, name for name, and the handler holds at
         least as many ``# TODO`` lines.
@@ -2877,30 +2875,26 @@ def _quieter(was: _Out, now: _Out) -> list[str]:
     which :func:`_breaches` reads."""
     if bool(was[0]) != bool(now[0]):
         return ["(refusal) one of the two refuses the whole list, and the other renders it"]
-    was_handlers, now_handlers = _handlers(was[0]), _handlers(now[0])
-    was_names, now_names = _unmapped_names(was), _unmapped_names(now)
-    if not len(was_handlers) == len(now_handlers) == len(was_names) == len(now_names):
-        return [f"(handlers) {len(now_handlers)} handlers where main has {len(was_handlers)}"]
+    if not was[0]:
+        return []
+    old, new = _handler_lines(was[0]), _handler_lines(now[0])
     found: list[str] = []
-    for old, new, old_names, new_names in zip(
-        was_handlers, now_handlers, was_names, now_names, strict=True
-    ):
-        lost = _refusals(old) - _refusals(new)
-        if lost:
-            found.append(f"(b) a refusal main raises is gone, at indent {sorted(lost)}")
-        if "#" in old[-1] and new[-1] != old[-1]:
-            found.append(f"(b) the handler ends on {new[-1]!r} where main ends on {old[-1]!r}")
-        uncounted = Counter(old_names) - Counter(new_names)
-        if uncounted:
-            found.append(f"(c) main counts {sorted(uncounted)} unmapped, and this does not")
-        if sum("# TODO" in line for line in new) < sum("# TODO" in line for line in old):
-            found.append("(c) a TODO line main writes is gone")
+    lost = _loud(old) - _loud(new)
+    if lost:
+        found.append(f"(b) a send or a refusal of main's is gone, at indent {sorted(lost)}")
+    if new[-1] != old[-1]:
+        found.append(f"(b) the handler ends on {new[-1]!r} where main ends on {old[-1]!r}")
+    uncounted = Counter(_unmapped_names(was)) - Counter(_unmapped_names(now))
+    if uncounted:
+        found.append(f"(c) main counts {sorted(uncounted)} unmapped, and this does not")
+    if sum("# TODO" in line for line in new) < sum("# TODO" in line for line in old):
+        found.append("(c) a TODO line main writes is gone")
     return found
 
 
-def _breaches(xml: str, was: _Out, now: _Out, why: str) -> list[str]:
+def _breaches(xml: str, was: _Out, now: _Out) -> list[str]:
     """Every way ``now`` breaks the bound on what BACKLOG #2632 may change, against ``was``, the
-    tree exactly as vendored. ``why`` is the reason a marker gives.
+    tree exactly as vendored.
 
     It changes a list only when an element in it may carry a statement off a ``<Line>``, by a
     reading written apart from the rule and wider than it. And where it changes a list:
@@ -2925,7 +2919,7 @@ def _breaches(xml: str, was: _Out, now: _Out, why: str) -> list[str]:
         found.append("(a) a vocabulary call main does not make")
     found.extend(_quieter(was, now))
     if _unmapped(now) > _unmapped(was):
-        if why not in now[0]:
+        if step1._LABEL_STATEMENT_WHY not in now[0]:
             found.append("(reason) one more step is unmapped, and no marker says why")
         return found
     was_lines, now_lines = Counter(was[0].splitlines()), Counter(now[0].splitlines())
@@ -2946,11 +2940,10 @@ def _bound(name: str, xml: str) -> tuple[bool, list[str]]:
     drawn with no grammar nothing else compares the head with main. A fully understood list takes
     the step 2 path, where a refusal may become a delivery the oracle proves."""
     was, now = _generate(step1_as_vendored, xml), _generate(step1, xml)
-    why = step1._LABEL_STATEMENT_WHY
-    broken = [f"{name}: the amended baseline: {b}" for b in _breaches(xml, was, now, why)]
-    if not _fully_understood(xml):
-        ahead = _generate(head, xml)
-        broken += [f"{name}: the head: {b}" for b in _breaches(xml, was, ahead, why)]
+    broken = [f"{name}: the amended baseline: {b}" for b in _breaches(xml, was, now)]
+    # The head's own output is judged only where it is not the baseline's, which was just judged.
+    if not _fully_understood(xml) and (ahead := _generate(head, xml)) != now:
+        broken += [f"{name}: the head: {b}" for b in _breaches(xml, was, ahead)]
     return now != was, broken
 
 
@@ -3147,6 +3140,8 @@ _QUIET_SEND = (
     '    if marker and kind == "send":\n'
     '        return [Control("block", tag, statement, body=tuple(marker)), *body]\n'
 )
+#: The fewest raw lists on which that control must turn the bound red.
+_QUIET_RAW_FLOOR = 300
 
 
 def _quiet_baseline() -> Any:
@@ -3159,27 +3154,25 @@ def _quiet_baseline() -> Any:
 
 def test_the_bound_sees_a_refusal_turned_into_a_quiet_filter() -> None:
     """The bound's rules (b) and (c) can fail. With a send off a Line rendered as a comment, the
-    bound is red on every seed where main refuses that send, and on raw lists in number. With
-    the amendment as it stands, the tests above hold it green on the same lists."""
+    bound is red on every seed where main refuses that send or delivers it, and on raw lists in
+    number. With the amendment as it stands, the tests above hold it green on the same lists."""
     quiet = _quiet_baseline()
-    why = step1._LABEL_STATEMENT_WHY
 
     def breaches(xml: str) -> list[str]:
-        return _breaches(xml, _generate(step1_as_vendored, xml), _generate(quiet, xml), why)
+        return _breaches(xml, _generate(step1_as_vendored, xml), _generate(quiet, xml))
 
-    # Not the seeds with a second send beside the first. The scan holds no handle for such a
-    # list, so that send is refused in its turn, and the handler raises as often as main's does.
+    gone = "(b) a send or a refusal of main's is gone"
     seeds = [
         s
         for s in _label_statement_shapes()
-        if "-send-main-refuses" in s.name and "-beside-a-send" not in s.name
+        if "-send-main-refuses" in s.name or s.name in ("2632-Block-send", "2632-Call-send")
     ]
-    assert len(seeds) == 4
+    assert len(seeds) == 8
     for shape in seeds:
         found = breaches(_render(shape.nodes, shape.inp))
-        assert any(b.startswith("(b) a refusal main raises is gone") for b in found), shape.name
+        assert any(b.startswith(gone) for b in found), shape.name
     quieter = [name for name, xml in _RAW_LISTS if any(b[:3] == "(b)" for b in breaches(xml))]
-    assert len(quieter) >= 100
+    assert len(quieter) >= _QUIET_RAW_FLOOR
     # Each clause of the rule, on one handler. main refuses this send and names no destination.
     lone = next(s for s in _label_statement_shapes() if s.name.endswith("-naming-no-destination"))
     was = _generate(step1_as_vendored, _render(lone.nodes, lone.inp))
@@ -3187,11 +3180,11 @@ def test_the_bound_sees_a_refusal_turned_into_a_quiet_filter() -> None:
     lines = was[0].splitlines()
     assert _REFUSAL.match(lines[-2]) and lines[-1].startswith("    return None  # TODO")
 
-    def said(src: list[str], counts: tuple[object, ...] = was[1]) -> str:
+    def said(src: list[str], counts: tuple[tuple[int, list[str], int], ...] = was[1]) -> str:
         return " ".join(_quieter(was, ("\n".join(src) + "\n", counts)))
 
-    assert "(b) a refusal main raises is gone" in said([*lines[:-2], lines[-1]])
-    assert "(b) a refusal main raises is gone" in said([*lines[:-2], "    " + lines[-2], lines[-1]])
+    assert gone in said([*lines[:-2], lines[-1]])
+    assert gone in said([*lines[:-2], "    " + lines[-2], lines[-1]])
     assert "(b) the handler ends on" in said([*lines[:-1], "    return sends"])
     assert "(c) a TODO line main writes is gone" in said([*lines[:-3], *lines[-2:]])
     assert "(c) main counts ['MsgSend'] unmapped" in said(lines, ((0, [], 0),))
@@ -3208,7 +3201,7 @@ def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:
     assert orphaned == ((("if", (), ()), ".", ("else", (".",), ())),)
     # The raw lists reach what the seeds are written for: branches main adopts, in number, in
     # lists where the amendment marks a statement.
-    raw = [xml for name, xml in _STRUCTURE_SHAPES if name.startswith("raw-")]
+    raw = [xml for _, xml in _RAW_LISTS]
     marked = [xml for xml in raw if step1._LABEL_STATEMENT_WHY in _generate(step1, xml)[0]]
     assert len(raw) == _RAW and len(marked) >= _RAW // 2
     assert (
