@@ -573,7 +573,8 @@ the rule copied as text, so a later change to the head's rule turns the guard re
 amended on purpose. Two more tests run the battery against the file exactly as vendored. They check
 that the amendment changes only lists that may carry a statement off a `<Line>`, by a wider reading
 written apart from the rule. Where it changes a list it must only narrow: no new live send, no new
-vocabulary call, and one more unmapped step, or else only comment lines and refusals change. A
+vocabulary call, and one more unmapped step, or else only comment lines and refusals change,
+with the guard a refusal brings to a `try` and the `pass` it takes from an empty body. A
 live send is read inline and in the handler's closing `return`. *Corrected 2026-10-02 (code review
 of the repair, round 2):* the bound read the inline form alone, so it could not see a closing
 `return Send(...)` that the amendment added.
@@ -587,8 +588,10 @@ and naming the same word. Depth stands in for "runs": a line one level in sits u
 placeholder, or in a `try`. The shape test is what keeps a line from moving between those two.
 *Corrected 2026-10-02 (code review of this repair):* the first cut counted lines by depth
 alone, so a send that went could hide behind a refusal gained elsewhere at the same depth.
-At least one limit remains: the unmapped names are compared as a set of counts, so a name main
-counted can go unseen where the amendment adds a marker of the same name.
+At least two limits remain. Every refusal that names no destination shares one key at its
+depth, so one of those can still hide behind another. And the unmapped names are compared as
+counts by name, so a name main counted can go unseen where the amendment adds a marker of the
+same name.
 
 It holds the head to the same bound, against the same vendored file, wherever the
 gate is closed. And `test_no_raw_list_is_quieter_than_main` runs it over the 4,000 lists drawn
@@ -653,17 +656,17 @@ of this battery, not proofs about the change.
 The two rows about a send label were measured before the second repair, when a send off a
 `<Line>` was a label. It is a refused send now, so neither mutation exists as written.
 
-Measured 2026-10-02 at the second repair. The battery holds 8,095 shapes. Twelve are new seeds,
+Measured 2026-10-02 at the second repair. The battery holds 8,099 shapes. Sixteen are new seeds,
 on a `<Block>` and on a `<Call>`: a send off a `<Line>` that main refuses, alone, beside another
-send and in a `Try` with a Catch; a send naming no destination, with role markup and without;
-and a send main delivers, in a `Try` with a Catch. The amendment changes 773 battery shapes and
-2,929 of the 4,000 raw lists. "Put back" restores the
+send and in a `Try` with a Catch; a send naming no destination, with role markup and without,
+and inside an `If` and a `Try`; and a send main delivers, in a `Try` with a Catch. The amendment
+changes 777 battery shapes and 2,929 of the 4,000 raw lists. "Put back" restores the
 earlier rule, a send off a `<Line>` rendered as a label and a marker, in the head and in the
 baseline copy alike.
 
-| | Battery, of 8,095 | Raw lists, of 4,000 |
+| | Battery, of 8,099 | Raw lists, of 4,000 |
 |---|---|---|
-| The bound is red, with the earlier rule put back | 22 | 429 |
+| The bound is red, with the earlier rule put back | 26 | 429 |
 | The same, counting refusals alone and not sends | 8 | 128 |
 | The bound is red, with the repair in place | 0 | 0 |
 
@@ -671,7 +674,7 @@ The second row is the first cut of this check, which counted only the refusals, 
 seeds it then had. All 8 of its battery shapes are new seeds. So a lost refusal could not show on
 the 8,083 older shapes by any check, and it showed on the raw lists once the bound read them.
 Counting sends too adds ten older seeds, where main delivers the send and the earlier rule left
-a comment. Of the 22, twelve are new seeds and ten are older. This is still a sample. It shows
+a comment. Of the 26, sixteen are new seeds and ten are older. This is still a sample. It shows
 no quieter list among those it draws, not that none exists.
 
 The measurement below is older. It was taken the same day at `880f431d94`, before the repair, and
@@ -797,7 +800,8 @@ omitting it would claim it vanished.
   whose `@Data` is a statement (§2(b.4)) SHALL emit a counted TODO naming it, SHALL emit no
   write and no delivery for it, and its list SHALL hold no handle as `msg`; a prose label SHALL
   stay a comment. A `MsgSend` in a Block's or a Call's `@Data` SHALL be a refused send, which
-  raises. The marker SHALL NOT
+  raises, wherever main renders that send (the last limit of §2(b.4) says where it does not).
+  The marker SHALL NOT
   change the shape of the tree: which construct holds which branch. The head SHALL be no quieter
   than main on any list: no refusal, marked ending, unmapped count or TODO main has SHALL go.
   → `::test_a_clone_where_a_label_belongs_is_marked_and_its_send_is_judged_on_the_marker`,

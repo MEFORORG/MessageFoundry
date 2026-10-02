@@ -1002,9 +1002,10 @@ _LABEL_STATEMENT_WHY = (
 )
 # Why a ``MsgSend`` in a Block's or a Call's ``@Data`` is refused, whatever it names. It is the
 # one statement off a ``<Line>`` that is not marked with a comment alone. main renders it where it
-# sits: as a delivery, or as a refusal that raises. A comment in its place would turn that refusal
-# into a handler that returns nothing, so the message would be FILTERED where main sent it to ERROR.
-# The head must never be quieter than main (ADR 0086 §2(b.4)), so it raises here on every list.
+# sits: as a delivery, as a refusal that raises, or as a bare TODO when it names no destination and
+# is not refused. A comment in place of the refusal would leave a handler that returns nothing, so
+# the message would be FILTERED where main sent it to ERROR. The head must never be quieter than
+# main (ADR 0086 §2(b.4)), so it raises here wherever main renders the send at all.
 _LABEL_SEND_REFUSAL = (
     f"MsgSend is {_LABEL_STATEMENT_WHY}; the import refuses to send msg in its place"
 )
@@ -1706,8 +1707,9 @@ def _parse_statement(
             # destination stays declared, it selects the handler's closing ``return`` as main's
             # send does, a ``try`` around it re-raises, and it counts unmapped once. The refusal
             # stands in for the marker, so the statement is not counted a second time beside it.
-            # The test is the element, not the marker: a send off a ``<Line>`` must be refused
-            # even if a later verb table left :func:`_label_statement` not naming it.
+            # The test is the element, not the marker: this send must be refused even if a
+            # later verb table left :func:`_label_statement` not naming it. That protects the
+            # send alone. The scan asks that rule, so the list's handles still depend on it.
             refusal = _LABEL_SEND_REFUSAL
         else:
             refusal = _send_refusal(role_operands, held) if roles else ""
