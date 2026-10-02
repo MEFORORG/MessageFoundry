@@ -27,7 +27,12 @@ Four derived axes, and the hand-kept parts the doc discloses:
    in ``harness/`` that starts a server and builds an ``MLLPDecoder`` must be named in the harness row,
    and must bound each decoder at the engine's ``DEFAULT_MAX_FRAME_BYTES``. Every code unit there that
    builds a ``QFileSystemWatcher`` reads files another party writes, so it must be named in the same
-   row, must cap its reads at ``DEFAULT_MAX_MESSAGE_BYTES``, and must not read a file whole.
+   row, must cap its reads at ``DEFAULT_MAX_MESSAGE_BYTES``, and must not read a file whole. Every
+   module in ``harness/sinks/`` the harness discovers as a sink (public, sets ``KIND``) must be named in
+   the harness sink row, must bound at an engine cap constant (itself, or through a sink module or a
+   ``_``-prefixed harness helper it imports), and must not read a file whole. The reconcile loader
+   (:data:`HARNESS_FILE_LOADERS`) is hand-kept: it must read only through the capped reader, at a
+   default pinned to its constant.
 4. **Downloads.** An AST walk over ``messagefoundry/`` and ``messagefoundry_webconsole/`` finds every
    code site that writes a ``Content-Disposition`` header (``str`` or ``bytes``) or builds a
    ``FileResponse``, and names its file and enclosing function. That set must equal
@@ -54,7 +59,12 @@ from pathlib import Path
 
 import pytest
 
+import harness.sinks.email as email_sink
 import messagefoundry.transports  # noqa: F401 - import runs every register_source(...)
+from harness.drivers import _database as harness_database
+from harness.reconcile import compare
+from harness.sinks import dimse as dimse_sink
+from harness.sinks.file import FileSink
 from messagefoundry.api import app as api_app
 from messagefoundry.api.models import AiChatRequest, EditResendRequest, MessageExportRequest
 from messagefoundry.api.validation import MAX_EXPORT_IDS
@@ -213,6 +223,91 @@ def _imports_and_uses(path: Path, unit: str, module: str, cap_name: str) -> bool
     )
     node = next(n for n in tree.body if getattr(n, "name", None) == unit)
     return imported and any(isinstance(n, ast.Name) and n.id == cap_name for n in ast.walk(node))
+
+
+#: The harness's scenario sinks; each is an upload row since the 2026-10-02 owner ruling (vault
+#: BACKLOG #1130) put ``harness/`` inside the ASVS assessed scope.
+_SINKS = _HARNESS / "sinks"
+#: The engine cap constants a sink may bound at. Each is imported from a ``messagefoundry`` leaf.
+_SINK_CAPS = frozenset(
+    {"DEFAULT_MAX_MESSAGE_BYTES", "DEFAULT_MAX_FRAME_BYTES", "DEFAULT_MAX_INTERCHANGE_BYTES"}
+)
+
+#: Hand-kept harness units that read files another system produced, though an operator names them ->
+#: the function that reads them. No code marker tells such a loader from an operator's own input.
+HARNESS_FILE_LOADERS: dict[str, str] = {"harness/reconcile/compare.py": "load_messages"}
+
+
+def harness_sinks(src: Path, root: Path) -> list[str]:
+    """Repo-relative path of every module in ``src`` the harness discovers as a sink: public (no
+    leading ``_``, as ``harness._discover`` skips) and setting ``KIND`` at top level."""
+    found: list[str] = []
+    for path in sorted(src.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, ast.AnnAssign)
+                else []
+            )
+            if any(isinstance(t, ast.Name) and t.id == "KIND" for t in targets):
+                found.append(path.relative_to(root).as_posix())
+                break
+    return found
+
+
+def _cap_hops(path: Path, root: Path, sinks_dir: Path) -> list[Path]:
+    """The files of the harness modules ``path`` imports from at top level that may carry its cap:
+    a sink module (``remotefile`` reuses ``file``'s scan) or a ``_``-prefixed helper (``_http``,
+    ``_sftp_server``, ``drivers._database``). An import resolves only to ``<module>.py`` or
+    ``<module>/<name>.py``, never to a package ``__init__``: every sink imports ``harness.sinks``, so a
+    cap there would pass every sink at once. The ``viainit`` self-test pins that."""
+    hops: list[Path] = []
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if not (isinstance(node, ast.ImportFrom) and node.module):
+            continue
+        parts = node.module.split(".")
+        if parts[0] != "harness":
+            continue
+        base = root.joinpath(*parts)
+        for cand in [base.with_suffix(".py"), *(base / f"{a.name}.py" for a in node.names)]:
+            if cand.is_file() and (cand.name.startswith("_") or cand.parent == sinks_dir):
+                hops.append(cand)
+    return hops
+
+
+def _caps_used(path: Path) -> set[str]:
+    """The :data:`_SINK_CAPS` that ``path`` imports from ``messagefoundry`` at top level and names."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported = {
+        a.asname or a.name
+        for n in tree.body
+        if isinstance(n, ast.ImportFrom) and (n.module or "").startswith("messagefoundry.")
+        for a in n.names
+        if a.name in _SINK_CAPS
+    }
+    return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id in imported}
+
+
+def unbounded_sinks(sinks: Iterable[str], root: Path, sinks_dir: Path) -> list[str]:
+    """Sinks that bound at none of :data:`_SINK_CAPS`, themselves or through one hop, or that read a
+    file whole (``read_text``, ``read_bytes``, or a ``.read()`` method call with no size) in their own
+    module. A bare ``read()`` is not a file: the stream sinks name their ``recv_chunks`` reader so."""
+    bad: list[str] = []
+    for rel in sinks:
+        path = root / rel
+        if not any(_caps_used(f) for f in [path, *_cap_hops(path, root, sinks_dir)]):
+            bad.append(f"{rel} (bounds at none of {sorted(_SINK_CAPS)})")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for call in (c for c in ast.walk(tree) if isinstance(c, ast.Call)):
+            name = _call_name(call)
+            sizeless = not call.args and not call.keywords and isinstance(call.func, ast.Attribute)
+            if name in _WHOLE_FILE_READS or (name == "read" and sizeless):
+                bad.append(f"{rel}:{call.lineno} (reads a file whole: {name})")
+    return bad
 
 
 _WATCHER_CALLS = frozenset({"QFileSystemWatcher"})
@@ -441,6 +536,8 @@ def test_no_upload_row_or_source_exclusion_names_a_surface_the_code_lacks() -> N
         | set(IDE_PICK_LISTS)
         | {key.split("::")[0] for key in harness_receivers(_HARNESS, _ROOT)}
         | {key.split("::")[0] for key in harness_file_watchers(_HARNESS, _ROOT)}
+        | set(harness_sinks(_SINKS, _ROOT))
+        | set(HARNESS_FILE_LOADERS)
     )
     stale = stale_keys(set(_UPLOAD_ROWS), allowed) | stale_keys(_EXCLUDED_SOURCES, _SOURCE_VALUES)
     assert not stale, f"5.1.1 rows or exclusions naming nothing the code registers: {sorted(stale)}"
@@ -514,9 +611,8 @@ def test_every_harness_receiver_is_named_in_the_harness_row_and_bounded() -> Non
         if token.startswith("harness/")
     }
     watcher_files = {key.split("::")[0] for key in harness_file_watchers(_HARNESS, _ROOT)}
-    assert named == files | watcher_files, (
-        f"harness row differs from the code: {sorted(named ^ (files | watcher_files))}"
-    )
+    surfaces = files | watcher_files | set(harness_sinks(_SINKS, _ROOT)) | set(HARNESS_FILE_LOADERS)
+    assert named == surfaces, f"harness rows differ from the code: {sorted(named ^ surfaces)}"
     bad = unbounded_decoders(receivers, _ROOT)
     assert not bad, bad
     row = next((r for key, r in _UPLOAD_ROWS.items() if key in files), None)
@@ -537,6 +633,67 @@ def test_every_harness_file_watcher_is_named_in_the_harness_row_and_capped() -> 
     for key in watchers:
         assert f"`{key.split('::')[0]}`" in first_cell, f"{key} is not named in the harness row"
     assert has_figure(row, f"DEFAULT_MAX_MESSAGE_BYTES` = {_size(DEFAULT_MAX_MESSAGE_BYTES)}")
+
+
+def test_every_harness_sink_is_named_in_the_sink_row_and_bounded() -> None:
+    """``harness/sinks/`` was not seen by the two tests above: its sinks start their own loopback
+    servers and build no ``MLLPDecoder`` and no ``QFileSystemWatcher``. A new sink module fails here
+    until the sink row names it, and until it bounds at an engine cap constant."""
+    sinks = harness_sinks(_SINKS, _ROOT)
+    assert len(sinks) >= 12, f"instrument found too few sinks in harness/sinks/: {sinks}"
+    bad = unbounded_sinks(sinks, _ROOT, _SINKS)
+    assert not bad, bad
+    row = next((r for key, r in _UPLOAD_ROWS.items() if key in sinks), None)
+    assert row is not None, "no upload row is KEYED by a harness sink path"
+    first_cell = row.split("|")[1]
+    for rel in sinks:
+        assert f"`{rel}`" in first_cell, f"{rel} is not named in the harness sink row"
+    assert dimse_sink.DimseSink().max_object_bytes == DEFAULT_MAX_MESSAGE_BYTES
+    assert FileSink(_ROOT).max_file_bytes == DEFAULT_MAX_MESSAGE_BYTES
+    assert harness_database.MAX_OUTBOX_PAYLOAD_CHARS == DEFAULT_MAX_MESSAGE_BYTES
+    assert email_sink.MAX_DATA_BYTES == 2 * DEFAULT_MAX_MESSAGE_BYTES
+    for needle in (
+        f"DEFAULT_MAX_MESSAGE_BYTES` = {_size(DEFAULT_MAX_MESSAGE_BYTES)}",
+        f"DEFAULT_MAX_INTERCHANGE_BYTES` = {_size(DEFAULT_MAX_INTERCHANGE_BYTES)}",
+        f"DEFAULT_MAX_INFLATED_BYTES` = {_size(DEFAULT_MAX_INFLATED_BYTES)}",
+        f"MAX_LINE_BYTES` = {email_sink.MAX_LINE_BYTES:,}",
+        f"MAX_DATA_BYTES` = {_size(email_sink.MAX_DATA_BYTES)}",
+        f"MAX_OUTBOX_PAYLOAD_CHARS` = {harness_database.MAX_OUTBOX_PAYLOAD_CHARS:,}",
+        f"default {_size(DEFAULT_MAX_MESSAGE_BYTES)}",
+    ):
+        assert has_figure(row, needle), f"harness sink row lost or changed `{needle}`"
+
+
+def test_every_harness_file_loader_keys_a_row_and_is_capped() -> None:
+    """A loader reads a capture or an export, many messages to a file, so its cap is a file bound
+    rather than the per-message cap. It must default to that bound and never read a file whole."""
+    assert compare.DEFAULT_MAX_LOAD_FILE_BYTES == 64 * DEFAULT_MAX_MESSAGE_BYTES
+    assert (
+        _sig_default(compare.load_messages, "max_file_bytes") == compare.DEFAULT_MAX_LOAD_FILE_BYTES
+    )
+    trees = {
+        rel: ast.parse((_ROOT / rel).read_text(encoding="utf-8")) for rel in HARNESS_FILE_LOADERS
+    }
+    calls = [
+        (rel, c) for rel, tree in trees.items() for c in ast.walk(tree) if isinstance(c, ast.Call)
+    ]
+    assert len(calls) >= 1, "instrument found no calls at all in the loaders"
+    whole = [
+        f"{rel}:{c.lineno}"
+        for rel, c in calls
+        if _call_name(c) in _WHOLE_FILE_READS
+        or (_call_name(c) == "read" and not c.args and isinstance(c.func, ast.Attribute))
+    ]
+    assert not whole, f"a loader reads a file whole: {whole}"
+    for rel, unit in HARNESS_FILE_LOADERS.items():
+        names = {getattr(n, "name", None) for n in trees[rel].body}
+        assert unit in names, f"{rel}::{unit} is gone"
+        assert "read_capped" in {_call_name(c) for r, c in calls if r == rel}
+        assert rel in _UPLOAD_ROWS, f"{rel} has no 5.1.1 upload row keyed by it"
+        assert has_figure(
+            _UPLOAD_ROWS[rel],
+            f"DEFAULT_MAX_LOAD_FILE_BYTES` = {_size(compare.DEFAULT_MAX_LOAD_FILE_BYTES)}",
+        )
 
 
 # --- axis 2: upload routes ------------------------------------------------------------------------
@@ -757,6 +914,10 @@ QUOTED_CONSTANTS: dict[str, int] = {
     "_MAX_CONFIG_BYTES": dr_backup._MAX_CONFIG_BYTES,
     "MAX_FIXTURE_FILE_BYTES": dryrun.MAX_FIXTURE_FILE_BYTES,
     "MAX_SAMPLE_FILE_BYTES": ts_sample_cap(_IDE_SAMPLE_CAP),
+    "MAX_LINE_BYTES": email_sink.MAX_LINE_BYTES,
+    "MAX_DATA_BYTES": email_sink.MAX_DATA_BYTES,
+    "MAX_OUTBOX_PAYLOAD_CHARS": harness_database.MAX_OUTBOX_PAYLOAD_CHARS,
+    "DEFAULT_MAX_LOAD_FILE_BYTES": compare.DEFAULT_MAX_LOAD_FILE_BYTES,
 }
 
 _QUOTED = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)` = (\d+(?:,\d{3})*(?: [KMG]iB)?)")
@@ -995,4 +1156,57 @@ def test_self_test_a_harness_file_watcher_is_found_and_an_uncapped_one_flagged(
         "harness/fw.py::Whole (does not cap at DEFAULT_MAX_MESSAGE_BYTES)",
         "harness/fw.py::Whole:12 (reads a file whole: read_text)",
         "harness/fw.py::BareRead:19 (reads a file whole: read)",
+    ]
+
+
+def test_self_test_a_harness_sink_is_found_and_an_unbounded_one_flagged(tmp_path: Path) -> None:
+    sinks_dir = tmp_path / "harness" / "sinks"
+    sinks_dir.mkdir(parents=True)
+    (sinks_dir / "__init__.py").write_text(
+        "from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES\n"
+        "CAP = DEFAULT_MAX_MESSAGE_BYTES\n",
+        encoding="utf-8",
+    )
+    (sinks_dir / "_helper.py").write_text(
+        "from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES\n"
+        "def cap():\n    return DEFAULT_MAX_MESSAGE_BYTES\n",
+        encoding="utf-8",
+    )
+    (sinks_dir / "capped.py").write_text(
+        "from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES\n"
+        "KIND = 'capped'\nLIMIT = DEFAULT_MAX_MESSAGE_BYTES\n",
+        encoding="utf-8",
+    )
+    (sinks_dir / "viahelper.py").write_text(
+        "from harness.sinks._helper import cap\nKIND: str = 'viahelper'\n", encoding="utf-8"
+    )
+    (sinks_dir / "viainit.py").write_text(
+        "from harness.sinks import CAP\nKIND = 'viainit'\n", encoding="utf-8"
+    )
+    (sinks_dir / "importonly.py").write_text(
+        "from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES\nKIND = 'importonly'\n",
+        encoding="utf-8",
+    )
+    (sinks_dir / "whole.py").write_text(
+        "from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES\n"
+        "KIND = 'whole'\n"
+        "def scan(p):\n    DEFAULT_MAX_MESSAGE_BYTES\n    return p.read_bytes()\n"
+        "def pull(read, fh):\n    read()\n    return fh.read()\n",
+        encoding="utf-8",
+    )
+    (sinks_dir / "notasink.py").write_text("X = 1\n", encoding="utf-8")
+    (sinks_dir / "_private.py").write_text("KIND = 'hidden'\n", encoding="utf-8")
+    sinks = harness_sinks(sinks_dir, tmp_path)
+    assert sinks == [
+        "harness/sinks/capped.py",
+        "harness/sinks/importonly.py",
+        "harness/sinks/viahelper.py",
+        "harness/sinks/viainit.py",
+        "harness/sinks/whole.py",
+    ]
+    assert unbounded_sinks(sinks, tmp_path, sinks_dir) == [
+        f"harness/sinks/importonly.py (bounds at none of {sorted(_SINK_CAPS)})",
+        f"harness/sinks/viainit.py (bounds at none of {sorted(_SINK_CAPS)})",
+        "harness/sinks/whole.py:5 (reads a file whole: read_bytes)",
+        "harness/sinks/whole.py:8 (reads a file whole: read)",
     ]
