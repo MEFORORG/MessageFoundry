@@ -5,8 +5,9 @@ a directory the engine writes to.
 
 The engine's File **inbound** polls a directory for ``*.hl7`` and the File **outbound** writes
 them; this mirrors both ends so the harness can exercise the file connector without MLLP. Dropping
-writes atomically (a hidden ``.part`` temp then ``os.replace``) so the engine never reads a
-half-written file — the same guarantee the engine's own File destination gives. Watching is
+goes through :func:`harness.drivers.file.drop_atomic` (a hidden ``.part`` temp hard-linked onto the
+first free name) so the engine never reads a half-written file — the same guarantee the engine's
+own File destination gives. Watching is
 event-driven (:class:`QFileSystemWatcher`) with a periodic rescan as a safety net for missed
 notifications; it reports only files that appear *while watching* (like the MLLP receiver shows
 only live arrivals).
