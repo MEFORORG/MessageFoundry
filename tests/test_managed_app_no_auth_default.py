@@ -14,6 +14,8 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from messagefoundry.api import create_managed_app
 from messagefoundry.auth import Role
@@ -55,11 +57,14 @@ async def test_only_the_opt_in_opens_an_app_with_no_enabled_auth(
         allow_no_auth=allow_no_auth,
     )
     async with app.router.lifespan_context(app), _client(app) as c:
-        assert (await c.get(_ALWAYS_ANSWERS)).status_code == 200, "control: the app is serving"
+        health = await c.get(_ALWAYS_ANSWERS)
         answer = await c.get(_PROTECTED)
+    assert health.status_code == 200, "control: the app is serving"
     assert answer.status_code == status
     if status == 503:
         assert answer.json()["detail"] == "authentication is not configured"
+    # The same flag feeds ``optional_identity``: the build version goes only to an identified caller.
+    assert (health.json()["version"] is not None) is allow_no_auth
 
 
 async def test_a_caller_that_passes_nothing_is_refused(tmp_path: Path) -> None:
@@ -67,6 +72,24 @@ async def test_a_caller_that_passes_nothing_is_refused(tmp_path: Path) -> None:
     app = create_managed_app(db_path=tmp_path / "default.db", poll_interval=0.05)
     async with app.router.lifespan_context(app), _client(app) as c:
         assert (await c.get(_PROTECTED)).status_code == 503
+
+
+def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
+    """``authorize_ws`` reads the same flag, so the socket is refused by default and opens on the
+    opt-in. The sync client drives the lifespan, as the other WebSocket tests do."""
+    refused = create_managed_app(db_path=tmp_path / "ws-deny.db", poll_interval=0.05)
+    with (
+        TestClient(refused) as tc,
+        pytest.raises(WebSocketDisconnect),
+        tc.websocket_connect("/ws/stats") as ws,
+    ):
+        ws.receive_json()
+
+    opened = create_managed_app(
+        db_path=tmp_path / "ws-open.db", poll_interval=0.05, allow_no_auth=True
+    )
+    with TestClient(opened) as tc, tc.websocket_connect("/ws/stats") as ws:
+        assert "outbox_by_status" in ws.receive_json(), "control: the opt-in opens the socket"
 
 
 async def test_enabled_auth_settings_refuse_an_anonymous_call_and_answer_a_signed_in_one(

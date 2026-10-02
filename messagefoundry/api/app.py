@@ -7714,6 +7714,14 @@ def create_managed_app(
             raise ValueError("create_managed_app requires either store_settings or db_path")
         store_settings = sqlite_settings(db_path, synchronous=synchronous)
     resolved = store_settings
+    # create_app can ignore the opt-in beside an enabled service, because it is handed the service
+    # already attached. Here the service attaches in the lifespan, so an app that never ran it
+    # would answer as the system identity. The combination is refused instead.
+    if allow_no_auth and auth_settings is not None and auth_settings.enabled:
+        raise ValueError(
+            "create_managed_app: allow_no_auth=True was passed beside enabled auth_settings; "
+            "pass the opt-in only when sign-in is off"
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -8365,14 +8373,8 @@ def create_managed_app(
                 # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
                 await notifier.aclose()
 
-    # Unset or disabled auth_settings no longer select the open mode: only the caller's opt-in does
-    # (vault BACKLOG #2611). Beside ENABLED auth_settings the opt-in is refused, because the service
-    # attaches in the lifespan and an app that never ran it would answer as the system identity.
-    if allow_no_auth and auth_settings is not None and auth_settings.enabled:
-        raise ValueError(
-            "create_managed_app: allow_no_auth=True was passed beside enabled auth_settings; "
-            "pass the opt-in only when sign-in is off"
-        )
+    # Unset or disabled auth_settings no longer select the open mode: only the caller's opt-in,
+    # checked at the top, does (vault BACKLOG #2611).
     return create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test
