@@ -1331,14 +1331,14 @@ issuer. The engine applies a replaced file only when both of these hold:
 
 1. The file passes the rules a start applies: every CRL parses, has a `nextUpdate`, is not a delta CRL
    and has not expired, and the file carries no certificate the hop does not already trust.
-2. For each CRL the hop holds, the file carries the same CRL, or a CRL from the same issuer that was
-   issued later, is already in effect, runs at least as long, and has the same scope, signing key
-   and critical extensions.
+2. For each CRL the hop holds, the file carries the same CRL or a newer one from the same issuer.
+   The newer CRL was issued later, is already in effect and runs at least as long. It also has the
+   same scope, signing key and critical extensions.
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
 what to do. A file failing rule 1 would also stop the engine starting, so fix the file. A file failing
-only rule 2, such as a rollback to an older CRL, one that drops an issuer or one signed under a new
-key, needs a restart to apply. **A CRL that is not in effect yet is the exception: wait.** The engine
+only rule 2 needs a restart to apply. Examples are a rollback to an older CRL, a file that drops an
+issuer, and a CRL signed under a new key. **A CRL that is not in effect yet is the exception: wait.** The engine
 applies it once it takes effect, and a restart before then would make the hop refuse every peer.
 A reload changes what the next full TLS handshake checks. An established connection, or a session
 resumed from an earlier handshake, is not checked again, so a newly revoked partner that stays
