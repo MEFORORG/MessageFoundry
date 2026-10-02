@@ -14,9 +14,13 @@ the module the way ``python -m`` would.
   build, wherever another copy sits on the path. Path order alone cannot promise that: an inherited
   ``PYTHONPATH`` entry is searched ahead of anything this file could add.
 * **It puts the package's parent directory on ``sys.path``, after the standard library and ahead
-  of site-packages**, unless it is on the path already, which is the installed case. That is for
-  the packages that ship beside this one in a checkout. After the standard library, so nothing in
-  that directory can stand in for a standard-library module.
+  of the site-packages directories that follow it**, unless it is on the path already, which is
+  the installed case. That is for the packages that ship beside this one in a checkout. After the
+  standard library, so nothing in that directory can stand in for a standard-library module. That
+  holds when an inherited ``PYTHONPATH`` names a site-packages directory, which then sits ahead of
+  the standard library: the search for a site-packages directory starts after the standard
+  library's last entry. A standard-library entry is one inside the base prefix and outside every
+  site-packages directory.
 
 Stdlib only.
 """
@@ -49,16 +53,43 @@ def _load_this_build(package_dir: str) -> None:
     spec.loader.exec_module(module)
 
 
+def _inside(path: str, parent: str) -> bool:
+    path, parent = (os.path.normcase(os.path.abspath(p)) for p in (path, parent))
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:  # Windows: different drives
+        return False
+
+
 def _place_package_root() -> None:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if any(entry and _same(entry, root) for entry in sys.path):
         return
     site_dirs = [entry for entry in (*site.getsitepackages(), site.getusersitepackages()) if entry]
+    bases = (sys.base_prefix, sys.base_exec_prefix)
+    # On Windows without a virtual environment the base prefix is itself a site directory, and
+    # the whole standard library sits inside it, so it cannot rule an entry out.
+    nested_sites = [s for s in site_dirs if not any(_same(s, base) for base in bases)]
+
+    def standard_library(entry: str) -> bool:
+        return (
+            any(_inside(entry, base) for base in bases)
+            and not any(_same(entry, s) for s in site_dirs)
+            and not any(_inside(entry, s) for s in nested_sites)
+        )
+
+    # A PYTHONPATH entry comes ahead of the standard library, and it may name a site-packages
+    # directory, so the first site directory on the path can be ahead of the standard library.
+    # Search for one only after the standard library's last entry (vault BACKLOG #2800).
+    last_stdlib = max(
+        (index for index, entry in enumerate(sys.path) if entry and standard_library(entry)),
+        default=-1,
+    )
     first_site = next(
         (
             index
             for index, entry in enumerate(sys.path)
-            if entry and any(_same(entry, site_dir) for site_dir in site_dirs)
+            if index > last_stdlib and entry and any(_same(entry, s) for s in site_dirs)
         ),
         len(sys.path),
     )
