@@ -2146,12 +2146,13 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The policy is applied** — `tests/test_field_authz_enforcement_sites.py` hits the redaction
   surfaces over HTTP as a caller lacking `messages:view_summary` (a Viewer, plus a `custom:` role
   holding `view_raw` **without** `view_summary` for the detail route, and one holding
-  `monitoring:diagnose` without it for the alert list). Since vault BACKLOG #1187, minting refuses
-  a custom role holding `view_raw` without `view_summary`, and decoding drops `view_raw` from a
-  stored one. The test lifts that one rule to reach the route tier; `tests/_role_pairing.py` says
-  how. It asserts every gated property comes back `null`. A companion assertion checks that an
-  administrator sees all fifteen. Both are matched **per model, not per property name**, so the
-  negative cannot pass vacuously. That distinction is load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on
+  `monitoring:diagnose` without it for the alert list). That `view_raw` role is one minting now
+  refuses (see [Custom roles](#custom-roles-adr-0045)), so this test lifts the pairing rule alone
+  to reach the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated
+  property comes back `null`. A companion assertion checks that an administrator sees all
+  fifteen, matched **per model, not per property name**, so the negative cannot pass vacuously.
+  That distinction is load-bearing: keyed on names, `last_error` looked covered by
+  `DeadLetterRow.last_error` on
   `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
   outbox row carries a non-null `last_error` is the dead-lettered one and its detail route was not in
   the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.

@@ -25,6 +25,7 @@ from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_ID_PREFIX,
     CustomRoleError,
     decode_custom_role_permissions,
+    raw_body_without_summary,
     validate_custom_role_permissions,
 )
 from messagefoundry.auth.service import AuthService
@@ -32,6 +33,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._role_pairing import bypass_view_raw_pairing_rule
 
 PW = "a-strong-test-passphrase"
 
@@ -152,29 +154,27 @@ def test_no_builtin_role_has_the_refused_shape() -> None:
 
 
 def test_the_predicate_answers_an_iterator_correctly() -> None:
-    from messagefoundry.auth.permissions import raw_body_without_summary
-
+    # ORDER MATTERS: view_summary first. Two `in` tests on an iterator consume it on the way to
+    # view_raw, so the second test misses it; the reverse order would hide that defect.
     pair = [Permission.MESSAGES_VIEW_SUMMARY, Permission.MESSAGES_VIEW_RAW]
     assert not raw_body_without_summary(iter(pair))
     assert raw_body_without_summary(iter([Permission.MESSAGES_VIEW_RAW]))
 
 
 def test_the_test_bypass_lifts_only_the_pairing_rule(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests._role_pairing import bypass_view_raw_pairing_rule
-
     bypass_view_raw_pairing_rule(monkeypatch)
     # Lifted: the pairing rule, at both mint and decode.
     assert validate_custom_role_permissions(["messages:view_raw"]) == [Permission.MESSAGES_VIEW_RAW]
     assert decode_custom_role_permissions(json.dumps(["messages:view_raw"])) == frozenset(
         {Permission.MESSAGES_VIEW_RAW}
     )
-    # Kept: every other rule.
-    with pytest.raises(CustomRoleError):
+    # Kept: at least these other rules, each arm able to fail on its own rule.
+    with pytest.raises(CustomRoleError, match="at least one permission"):
         validate_custom_role_permissions([])
-    with pytest.raises(CustomRoleError):
+    with pytest.raises(CustomRoleError, match="not assignable"):
         validate_custom_role_permissions(["messages:view_raw", "users:manage"])
-    with pytest.raises(CustomRoleError):
-        validate_custom_role_permissions(["not:a:real:perm"])
+    with pytest.raises(CustomRoleError, match="unknown permission"):
+        validate_custom_role_permissions(["messages:view_raw", "not:a:real:perm"])
     assert decode_custom_role_permissions(
         json.dumps(["messages:view_raw", "users:manage", "bogus:perm"])
     ) == frozenset({Permission.MESSAGES_VIEW_RAW})

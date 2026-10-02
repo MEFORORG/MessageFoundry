@@ -5,8 +5,9 @@
 Minting refuses a custom role holding ``messages:view_raw`` without ``messages:view_summary``, and
 decoding drops ``view_raw`` from a stored one (vault BACKLOG #1187). Both decisions go through one
 predicate, :func:`messagefoundry.auth.permissions.raw_body_without_summary`, so patching it to answer
-``False`` lifts exactly that rule: the validator's other rules (unknown names, an empty set, the
-forbidden escalation permissions) and the decoder's defences all still run. No route gate calls the
+``False`` lifts exactly that rule: at least the validator's other rules (unknown names, an empty
+set, the forbidden escalation permissions) and the decoder's drops still run, and
+tests/test_custom_roles.py pins those. No route gate calls the
 predicate, so the routes' own checks stay live, which is what these tests exist to prove. This module is
 the one place that states the bypass; the tests using it point here. Test-only.
 """
@@ -21,7 +22,4 @@ from messagefoundry.auth import permissions
 def bypass_view_raw_pairing_rule(monkeypatch: pytest.MonkeyPatch) -> None:
     """Let a custom role hold ``messages:view_raw`` without ``messages:view_summary``."""
 
-    def never(perms: object) -> bool:  # the real predicate's parameter name, so keywords work
-        return False
-
-    monkeypatch.setattr(permissions, "raw_body_without_summary", never)
+    monkeypatch.setattr(permissions, "raw_body_without_summary", lambda perms: False)

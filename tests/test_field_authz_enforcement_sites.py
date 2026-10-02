@@ -370,9 +370,10 @@ async def test_the_seed_actually_carries_every_gated_model_property_pair(seeded:
 async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identity(
     seeded: _Seed,
 ) -> None:
-    """A ``view_raw``-only identity (see ``tests/_role_pairing.py``) gets the open and the body, but
-    no gated property, on both seeded rows. The ERROR row carries ``error`` as well as summary and
-    metadata, so every withholding assertion has a value to withhold."""
+    """A ``view_raw``-only identity (see ``tests/_role_pairing.py``) opens both seeded rows and reads
+    the PROCESSED row's body, but gets no top-level gated property on either row. The administrator
+    arm shows each of those properties is set on the row, so no withholding assertion is vacuous.
+    Nested properties are the surfaces test's job."""
     async with _client(seeded.engine, seeded.service) as client:
         headers = await _login(client, "rawonly")
         response = await client.get(f"/messages/{seeded.message_id}", headers=headers)
@@ -384,6 +385,14 @@ async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identi
         detail = errored.json()
         assert detail["error"] is None
         assert detail["summary"] is None and detail["metadata"] is None
+        # Positive control, per row: the administrator gets each property (masked, not null).
+        boss = await _login(client, "boss")
+        for mid, props in (
+            (seeded.message_id, ("summary", "metadata")),
+            (seeded.error_message_id, ("summary", "metadata", "error")),
+        ):
+            seen = (await client.get(f"/messages/{mid}", headers=boss)).json()
+            assert all(seen[p] is not None for p in props), (mid, seen)
         # The body is its own fetch since BACKLOG #2345, on the same messages:view_raw gate.
         raw = await client.get(f"/messages/{seeded.message_id}/raw", headers=headers)
         assert raw.status_code == 200, raw.text

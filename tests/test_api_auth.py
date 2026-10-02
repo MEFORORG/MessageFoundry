@@ -594,7 +594,8 @@ async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) 
         # PUT control: the same edit keeping view_summary is accepted.
         kept = await c.put(role_url, headers=h, json={"display_name": "R", "permissions": both})
         assert kept.status_code == 200, kept.text
-        # The refused edit drops view_summary only.
+        # The refused edit drops view_summary and also renames; the 400's detail ties it to the
+        # pairing rule, and the listing below shows the rename did not land either.
         edited = await c.put(
             role_url,
             headers=h,
