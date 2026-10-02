@@ -176,14 +176,9 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         False,
         0,
     ),
-    # auth-off + non-loopback is a HARD refuse regardless of the insecure escape.
-    (
-        "authoff-nonloopback-refuses",
-        'security.require_sign_in = false\nsecurity.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n',
-        "dev",
-        True,
-        2,
-    ),
+    # The auth-off row that sat here went with [security].require_sign_in (vault BACKLOG #2719). No
+    # [security] key turns sign-in off now, so a row setting it would exit 2 at the LOAD, not at the
+    # gate it claims to measure. tests/test_cli.py drives the arm itself.
     # cleartext off-loopback bind: refuse by default; the config-twin of --allow-insecure-bind
     # (require_encryption_for_remote=false) allows it on non-prod-PHI but the prod-PHI CLAMP still refuses.
     (

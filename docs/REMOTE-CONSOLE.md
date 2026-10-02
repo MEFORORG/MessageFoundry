@@ -183,14 +183,13 @@ carries the recommended hardening for an exposed console (client-certificate dev
 
 ### Authentication at exposure
 
-Auth is on by default. Remote users sign in with a local account, or a directory account through
+Auth is always on. Remote users sign in with a local account, or a directory account through
 Windows SSO or OIDC. The directory password sign-in is retired (BACKLOG #1137). A directory
 account is not exempt from the engine's second factor
 ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)). Note:
 
-- With `[security].require_sign_in = false`, an exposed instance is **hard-refused** — an off-loopback
-  bind, or a loopback bind behind a declared TLS terminator (a bare loopback bind with no declared
-  terminator is the only no-auth posture).
+- `serve` refuses to start with sign-in off, on every bind, loopback included. No setting turns it
+  off (vault BACKLOG #2719).
 - `[security].require_mfa` is **on by default**, and MFA is an access gate: an enrolled-pending session
   gets `403` + `X-MFA-Required: 1` on every authorized route. **Leave it on** — that default, not the
   startup gate below, is the control.
