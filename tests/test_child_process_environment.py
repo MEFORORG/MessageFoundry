@@ -369,9 +369,10 @@ _BUILDERS_OF_A_PYTHON_CHILD = (childenv.worker_environment, childenv.engine_envi
     ["", ".", os.pathsep + _OPERATOR_PATH, _OPERATOR_PATH + os.pathsep, "relative-directory"],
 )
 def test_an_entry_that_names_the_working_directory_does_not_reach_the_child(inherited: str) -> None:
-    """An empty or relative ``PYTHONPATH`` entry is the working directory by another name, so
-    carrying it across would undo ``-P``. An absolute entry crosses, and nothing is added: the
-    child is told where the package is by its bootstrap, never through ``PYTHONPATH``."""
+    """An empty or relative ``PYTHONPATH`` entry resolves against the working directory, which the
+    child's script start keeps off its path, so it must not cross. An absolute entry crosses, and
+    nothing is added: the child is told where the package is by its bootstrap, never through
+    ``PYTHONPATH``."""
     expected = [_OPERATOR_PATH] if _OPERATOR_PATH in inherited else []
     for build in _BUILDERS_OF_A_PYTHON_CHILD:
         crossed = build({"PYTHONPATH": inherited}).get("PYTHONPATH", "")

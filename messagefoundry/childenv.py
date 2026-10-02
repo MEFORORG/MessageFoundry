@@ -19,8 +19,10 @@ process start whose environment does not come from one of them.
   (:data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`). **A secret kept under any other name still reaches
   the hook**: a ``[secrets].provider = "env"`` reference may name any variable, a library may read
   one this module does not know, and neither can be listed here.
-* :func:`engine_environment` is the **whole** environment, for a child that is itself a full engine
-  (an engine shard). It opens the store and builds connections, so it needs the secrets.
+* :func:`engine_environment` is the **whole** environment, for a Python child started through the
+  bootstrap that runs the engine's own trusted code: an engine shard, which opens the store and
+  builds connections and so needs the secrets, and other such children, the tray's relaunch among
+  them.
 
 **THIS IS NOT AN ISOLATION BOUNDARY BY ITSELF.** A child that runs as the same operating-system
 account as the engine can still read the engine process, and the files that account can read. What
@@ -53,8 +55,11 @@ __all__ = [
 #: other names as well; :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX` holds the secret ones known here.
 ENGINE_ENV_PREFIX: Final = "MEFOR_"
 
-#: The interpreter options every Python child is started with. ``-P`` keeps the working directory
-#: off the child's import path, so a file there cannot stand in for a module the child imports.
+#: The interpreter options every Python child is started with. Each child starts a script,
+#: :data:`_BOOTSTRAP`, and a script start puts the script's own directory first on the import path
+#: and never the working directory. ``-P`` drops that directory, which is this package's own, so
+#: a module in it cannot stand in for a top-level module the child imports. (For ``-m`` and ``-c``
+#: starts, ``-P`` drops the working directory instead; no child here starts that way.)
 #: ``-X disable-remote-debug`` starts the child with the interpreter's remote debugging disabled.
 #: The option is spelled with hyphens; the interpreter accepts and ignores other spellings, which is
 #: why ``tests/test_child_process_environment.py`` reads the result off a real child.
@@ -197,9 +202,11 @@ def python_child_argv(module: str, *, executable: str | None = None) -> list[str
     """The command line that runs ``module`` in a child interpreter, as ``python -m`` would.
 
     Two differences from ``python -m``. The child starts with :data:`CHILD_INTERPRETER_FLAGS`.
-    And it starts through :data:`_BOOTSTRAP`, which hands it the package location that ``-P``
-    takes away. Pass the result of :func:`worker_environment` or :func:`engine_environment` as its
-    ``env``: they keep a ``PYTHONPATH`` entry from putting the working directory back.
+    And it starts through :data:`_BOOTSTRAP`, which hands it the package location. A script start
+    does not search the working directory, which is where ``python -m`` found the package in a
+    source checkout that is not installed. Pass the result of :func:`worker_environment` or
+    :func:`engine_environment` as its ``env``: they keep a ``PYTHONPATH`` entry from putting the
+    working directory on the child's import path.
     """
     return [executable or sys.executable, *CHILD_INTERPRETER_FLAGS, _BOOTSTRAP, module]
 
@@ -207,8 +214,8 @@ def python_child_argv(module: str, *, executable: str | None = None) -> list[str
 def _without_working_directory_entries(env: dict[str, str]) -> dict[str, str]:
     """Keep only the absolute entries of an inherited ``PYTHONPATH``.
 
-    An empty or relative entry names the working directory, which is what ``-P`` takes off the
-    child's import path.
+    An empty or relative entry is resolved against the working directory, which the child's script
+    start otherwise keeps off its import path.
     """
     inherited = env.pop("PYTHONPATH", "")
     entries = [entry for entry in inherited.split(os.pathsep) if os.path.isabs(entry)]
@@ -254,5 +261,10 @@ def hook_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]
 
 
 def engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment for a Python child that is itself a full engine: all of it."""
+    """The environment for a Python child started through the bootstrap that runs the engine's own
+    trusted code: all of it, less any ``PYTHONPATH`` entry that names the working directory.
+
+    An engine shard is one such child, and it needs the secrets. The tray's branded relaunch is
+    another. A child that runs code the engine does not fully trust takes
+    :func:`worker_environment` instead."""
     return _without_working_directory_entries(dict(_source(environ)))

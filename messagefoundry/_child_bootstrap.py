@@ -3,16 +3,15 @@
 """Start one ``messagefoundry`` module in a child process, from the build this file belongs to.
 
 Run as a script, never imported by the engine: ``python <flags> <this file> <module> [args...]``,
-which is what :func:`messagefoundry.childenv.python_child_argv` builds (vault BACKLOG #2587). The
-flags include ``-P``, which keeps the working directory off the child's import path. An engine run
-from a source checkout that is not installed found its own package exactly there, so the child has
-to be told where the package is. This file knows: it sits inside it. It does two things, then runs
-the module the way ``python -m`` would.
+which is what :func:`messagefoundry.childenv.python_child_argv` builds (vault BACKLOG #2587). A
+script start puts the script's own directory first on the import path, never the working directory,
+and the flags include ``-P``, which drops the script's directory. So the child starts with neither
+on its path. (For ``-m`` and ``-c`` starts, ``-P`` drops the working directory instead; the child
+does not start that way.) An engine run from a source checkout that is not installed found its own
+package in the working directory, so the child has to be told where the package is. This file
+knows: it sits inside it. It does two things, in this order, then runs the module the way
+``python -m`` would.
 
-* **It loads this build's ``messagefoundry`` package by its location, before anything can import
-  it by name.** Every later ``import messagefoundry...`` in the child then resolves inside this
-  build, wherever another copy sits on the path. Path order alone cannot promise that: an inherited
-  ``PYTHONPATH`` entry is searched ahead of anything this file could add.
 * **It puts the package's parent directory on ``sys.path``, after the standard library and ahead
   of the site-packages directories that follow it**, unless it is on the path already, which is
   the installed case. That is for the packages that ship beside this one in a checkout. After the
@@ -21,6 +20,10 @@ the module the way ``python -m`` would.
   the standard library: the search for a site-packages directory starts after the standard
   library's last entry. A standard-library entry is one inside the base prefix and outside every
   site-packages directory.
+* **It loads this build's ``messagefoundry`` package by its location, before anything can import
+  it by name.** Every later ``import messagefoundry...`` in the child then resolves inside this
+  build, wherever another copy sits on the path. Path order alone cannot promise that: an inherited
+  ``PYTHONPATH`` entry is searched ahead of anything this file could add.
 
 Stdlib only.
 """
