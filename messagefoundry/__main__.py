@@ -1890,6 +1890,20 @@ def _serve(args: argparse.Namespace) -> int:
     # reflects a true property (the DEBUG-logging refusal below; the AI data-scope ceiling).
     enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
 
+    # Vault BACKLOG #2701: what ran in this interpreter before the engine did. A .pth import line
+    # or a sitecustomize module that no installed package records refuses the start under enforce,
+    # and is reported under warn. The launch flags and a writable site directory are only ever
+    # reported, in the loosening list below. Read once and kept: GET /security/posture reports this
+    # same reading. The check is detection: start-up code runs before it and could defeat it
+    # (messagefoundry/startupcode.py says what it does not cover).
+    from messagefoundry.startupcode import startup_posture, startup_refusal
+
+    startup = startup_posture()
+    startup_refused = startup_refusal(startup)
+    if startup_refused is not None and enforcing:
+        print(f"error: refusing to start: {startup_refused}.", file=sys.stderr)
+        return 2
+
     # ADR 0118: [security].require_encryption_for_remote=false is the config-file twin of
     # --allow-insecure-bind (accept off-machine access on the API's self-signed placeholder, and on a
     # cleartext inbound listener; BACKLOG #1672). It rides the SAME exposed-bind gate + the SAME
@@ -2407,8 +2421,9 @@ def _serve(args: argparse.Namespace) -> int:
     # GET /security/posture. None here is "not yet observed", never "observed and clean". The same
     # holds for the #1905 audit-chain keying observation: the store logs its own WARNING when it opens
     # onto a keyless chain, and GET /security/posture reports it off the live store.
-    # The remote-debugging reading (vault BACKLOG #2700) is the one observation that IS complete
-    # here: it is a fact about this process, and this is the process.
+    # The remote-debugging reading (vault BACKLOG #2700) and the start-up reading (vault BACKLOG
+    # #2701) are the observations that ARE complete here: each is a fact about this process, and
+    # this is the process.
     _loosenings = security_loosenings(
         settings.security,
         settings.store,
@@ -2426,6 +2441,7 @@ def _serve(args: argparse.Namespace) -> int:
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
+        startup=startup,
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -4442,6 +4458,27 @@ def _supervise(args: argparse.Namespace) -> int:
     # below: every shard would refuse, and the supervisor would only restart them.
     if _protocol_floor_or_refusal("start the fleet") is None:
         return 2
+
+    # Vault BACKLOG #2701: the start-up code check each shard's `serve` makes, for the same reason
+    # as the gates around it, and because the supervisor's own interpreter ran that code too. The
+    # supervisor builds no loosening list, so its own reading is logged here, like the
+    # remote-debugging one above. Each shard reports its own through `serve`.
+    from messagefoundry.config.ai_policy import SecurityEnforcement
+    from messagefoundry.startupcode import startup_loosenings, startup_posture, startup_refusal
+
+    startup = startup_posture()
+    startup_refused = startup_refusal(startup)
+    if startup_refused is not None and settings.security.enforcement is SecurityEnforcement.ENFORCE:
+        print(
+            f"error: {startup_refused}. Every shard would refuse to start; refusing to start the "
+            "fleet.",
+            file=sys.stderr,
+        )
+        return 2
+    for startup_entry in startup_loosenings(startup):
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *startup_entry
+        )
 
     # BACKLOG #1916: the at-rest gate each shard's `serve` applies, checked once here and BEFORE the
     # renewal below. Renewing first and then refusing to audit it would replace the pair with no
@@ -8481,8 +8518,8 @@ def _security(args: argparse.Namespace) -> int:
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
         # posture. GET /security/posture is the complete surface; `messagefoundry check` adds the
         # connection-scoped entries but opens no store either. The remote-debugging reading (vault
-        # BACKLOG #2700) is a fact about the ENGINE process, and this command is another process, so
-        # it passes None for that too.
+        # BACKLOG #2700) and the start-up reading (vault BACKLOG #2701) are facts about the ENGINE
+        # process, and this command is another process, so it passes None for those too.
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
@@ -8502,6 +8539,7 @@ def _security(args: argparse.Namespace) -> int:
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
+                startup=None,
             )
         ]
 
@@ -8530,8 +8568,9 @@ def _security(args: argparse.Namespace) -> int:
             "tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
-            "GET /security/posture reports both). Nor is the engine process's remote-debugging "
-            "reading: this command is a separate process (GET /security/posture reports it). "
+            "GET /security/posture reports both). Nor are the engine process's remote-debugging "
+            "reading and its start-up reading (launch flags, start-up code, writable site "
+            "directories): this command is a separate process (GET /security/posture reports them). "
             "These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
             "GET /security/posture. One entry is not read from the file at all: "

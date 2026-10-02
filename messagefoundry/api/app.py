@@ -146,6 +146,7 @@ from messagefoundry.api.models import (
     GraphResponse,
     Health,
     IntegrityResult,
+    InterpreterView,
     LogInfo,
     LogLevelInfo,
     LogLevelUpdate,
@@ -182,6 +183,7 @@ from messagefoundry.api.models import (
     SecurityLoosening,
     SecurityPosture,
     ServiceStatusInfo,
+    StartupCodeItemView,
     StaticCredentialHopView,
     StatsResetRequest,
     StatsResetResult,
@@ -363,6 +365,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import remote_debug_posture
 from messagefoundry.service_status import query_service_state
+from messagefoundry.startupcode import startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
 from messagefoundry.store.content_search import (
@@ -2252,6 +2255,13 @@ def create_app(
         # the registry then reports nothing for it and `store_privilege` below renders the explicit
         # `not_probed` status, so silence never reads as a clean observation.
         store_privilege = getattr(request.app.state, "store_privilege", None)
+        # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
+        # once here, so the loosening list and the `interpreter` block below report one reading.
+        # An app built without `serve` never installed the remote-debugging hook, and the reading
+        # then says so. The start-up reading is the one `serve` took as it started; an app built
+        # without `serve` takes it now, off the event loop because it reads files.
+        remote_debug = remote_debug_posture()
+        startup = await asyncio.to_thread(startup_posture)
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
             for name, risk in security_loosenings(
@@ -2271,11 +2281,32 @@ def create_app(
                 store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
                 audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
-                # Vault BACKLOG #2700: read off THIS process, which is the engine. An app built
-                # without `serve` never installed the hook, and the reading then says so.
-                remote_debug=remote_debug_posture(),
+                remote_debug=remote_debug,
+                startup=startup,
             )
         ]
+        interpreter_view = InterpreterView(
+            isolated=startup.launch.isolated,
+            safe_path=startup.launch.safe_path,
+            ignore_environment=startup.launch.ignore_environment,
+            no_user_site=startup.launch.no_user_site,
+            remote_debug_enabled=remote_debug.interpreter_enabled,
+            remote_debug_guard_installed=remote_debug.guard_installed,
+            code_path_variables=list(startup.launch.code_path_variables),
+            startup_code=[
+                StartupCodeItemView(
+                    kind=item.kind,
+                    path=item.path,
+                    verdict=item.verdict,
+                    owner=item.owner,
+                    expected=item.expected,
+                )
+                for item in startup.items
+            ],
+            site_dirs=list(startup.site_dirs),
+            writable_site_dirs=list(startup.writable_site_dirs),
+            unchecked_site_dirs=list(startup.unchecked_site_dirs),
+        )
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
         # read live off the running graph, like the loosenings above; the settings half from the resolved
         # service configuration `serve` stashed (`cred_settings`, read above with `security`, so the
@@ -2366,6 +2397,7 @@ def create_app(
             store_privilege=store_privilege_view,
             static_credential_hops=static_hops,
             static_credential_hops_scope=static_hops_scope,
+            interpreter=interpreter_view,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
             kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?

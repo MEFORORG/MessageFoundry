@@ -82,9 +82,19 @@ RUN apt-get update \
 # the SQLite store lives there, and WAL writes -wal/-shm SIBLING files next to the DB, so it must be a
 # writable DIRECTORY (a single writable file mount is not enough). /config is the read-only config-repo
 # mount. Everything else stays read-only; /tmp is provided as a tmpfs at run time.
+#
+# THESE TWO PATHS ARE ALL THE RUNTIME UID OWNS (vault BACKLOG #2701). /var/lib/mefor because the
+# engine writes it. /config because the config-source guard refuses a config dir owned by another
+# uid. The venv is NOT in that list: the final stages copy it root-owned, so the engine's own
+# account cannot add a .pth file or a sitecustomize module to site-packages even where the root
+# file system is left writable (a plain `docker run` with no --read-only).
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin mefor \
  && mkdir -p /var/lib/mefor /config \
  && chown -R 10001:10001 /var/lib/mefor /config
+# PYTHONUNBUFFERED and PYTHONDONTWRITEBYTECODE are for the Python CHILDREN the engine starts (an
+# engine shard under `supervise`, the sandbox worker). The engine itself is started in isolated
+# mode by the ENTRYPOINT below, which ignores every PYTHON* variable, so it gets the same two
+# behaviours from -u and -B there.
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -126,9 +136,23 @@ EXPOSE 8443 8765 2575
 # override this HEALTHCHECK rather than have the image infer a plaintext hop from a TLS failure.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS -k "https://127.0.0.1:${MEFOR_API_PORT:-8765}/health" || exit 1
-# tini reaps + forwards signals; `messagefoundry` is the engine CLI. Default prints serve usage; real
-# deployments override the command, e.g.:  serve --config /config --env prod
-ENTRYPOINT ["tini", "--", "messagefoundry"]
+# tini reaps + forwards signals; the rest is the engine CLI, run as `python -m messagefoundry` so the
+# interpreter options reach the interpreter (the `messagefoundry` console script cannot pass one).
+# Default prints serve usage; real deployments override the command, e.g.:
+#     serve --config /config --env prod
+#
+# THE OPTIONS (vault BACKLOG #2701, #2700), kept in step with the Windows installer by
+# tests/test_isolated_launch.py:
+#   -I                       isolated mode: the interpreter ignores every PYTHON* variable (PYTHONPATH,
+#                            PYTHONHOME), and keeps the working directory and the user site off the
+#                            import path. WORKDIR is the writable store volume, so without it `-m`
+#                            would search that directory first.
+#   -X disable-remote-debug  the interpreter's remote debugging (PEP 768) is off. Hyphens: the
+#                            underscore spelling is accepted and ignored.
+#   -u -B                    unbuffered output and no bytecode files, which the two PYTHON* variables
+#                            above no longer give the engine itself.
+# The interpreter is named by its full path, so a PATH set at run time cannot choose another.
+ENTRYPOINT ["tini", "--", "/opt/venv/bin/python", "-I", "-X", "disable-remote-debug", "-u", "-B", "-m", "messagefoundry"]
 CMD ["serve", "--help"]
 
 # ---- runtime-sqlserver: the default runtime + the OS-level Microsoft ODBC Driver 18 -------------
@@ -152,9 +176,13 @@ RUN apt-get update \
  && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 unixodbc \
  && apt-get purge -y gnupg && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=builder-sqlserver --chown=10001:10001 /opt/venv /opt/venv
+# Root-owned, like the slim stage below: see the note at the useradd step.
+COPY --from=builder-sqlserver --chown=0:0 /opt/venv /opt/venv
 USER 10001
 
 # ---- runtime (slim default) — LAST stage, so a bare `docker build` produces the slim image -------
 FROM runtime-base AS runtime
-COPY --from=builder --chown=10001:10001 /opt/venv /opt/venv
+# ROOT-OWNED (vault BACKLOG #2701). The engine runs as uid 10001 and only reads the venv. Owned by
+# that uid, site-packages was a directory the engine's own account could write, and code planted
+# there runs at every interpreter start. The files stay world-readable, as pip wrote them.
+COPY --from=builder --chown=0:0 /opt/venv /opt/venv

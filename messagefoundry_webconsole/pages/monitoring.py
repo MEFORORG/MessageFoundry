@@ -79,6 +79,39 @@ def _fips(value: bool | None) -> str:
     return "reported active" if value else "reported inactive"
 
 
+def _interpreter_rows(interpreter: object) -> list[list[object]]:
+    """The status rows for how the engine process was started (vault BACKLOG #2701, #2700).
+
+    ``interpreter`` is the posture's ``InterpreterView``, or None when the posture was built
+    without the reading. None renders as a dash in every row, never as a hardened launch. Counts
+    only: the file names are in ``GET /security/posture`` and in the loosening list below."""
+    isolated, remote, startup = (
+        "Interpreter: isolated mode (-I)",
+        "Interpreter: remote debugging (PEP 768)",
+        "Interpreter: start-up code",
+    )
+    if interpreter is None:
+        return [[label, _opt(None)] for label in (isolated, remote, startup)]
+    startup_code = getattr(interpreter, "startup_code", [])
+    unexpected = sum(1 for item in startup_code if not item.expected)
+    writable = len(getattr(interpreter, "writable_site_dirs", []))
+    if not getattr(interpreter, "remote_debug_enabled", True):
+        remote_state = "off"
+    elif getattr(interpreter, "remote_debug_guard_installed", False):
+        remote_state = "on, injected scripts refused"
+    else:
+        remote_state = "ON, NOT GUARDED"
+    return [
+        [isolated, _yn(getattr(interpreter, "isolated", None))],
+        [remote, remote_state],
+        [
+            startup,
+            f"{len(startup_code)} found, {unexpected} not expected; "
+            f"{writable} site directories writable by the engine",
+        ],
+    ]
+
+
 def _memenc(value: bool | None) -> str:
     """Render one leg of the platform memory-encryption read-out (ADR 0152 Phase 1).
 
@@ -513,6 +546,9 @@ def status(
             # inherited from OpenSSL's default (inherited until Python 3.15). getattr-with-default is
             # defensive, not cross-seam compat (one supported seam, #279), so a None renders as a dash.
             ["TLS key-exchange groups (reported)", _opt(getattr(posture, "kex_groups", None))],
+            # How this engine process was started (vault BACKLOG #2701, #2700). A reading of the
+            # process that answered, like the rows above; an engine shard reports its own.
+            *_interpreter_rows(getattr(posture, "interpreter", None)),
             # Platform memory-encryption read-out (report-only, ADR 0152 Phase 1 / ASVS 11.7.1).
             # Wording is a security property here: every label says "self-reported", and capability
             # ("this silicon can") is a SEPARATE row from activation ("this guest is"), because a

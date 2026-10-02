@@ -566,6 +566,7 @@ def _names(remote_debug: RemoteDebugPosture | None) -> list[str]:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=remote_debug,
+            startup=None,
         )
     ]
 
@@ -591,7 +592,10 @@ async def _route_names(engine: Engine) -> list[str]:
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         resp = await client.get("/security/posture")
     assert resp.status_code == 200
-    return [entry["switch"] for entry in resp.json()["loosenings"]]
+    # This module's entries only. The route also reports this process's launch flags and start-up
+    # code (vault BACKLOG #2701), which follow how pytest was started; those have their own tests.
+    names = [entry["switch"] for entry in resp.json()["loosenings"]]
+    return [name for name in names if name.startswith("remote_debug_")]
 
 
 @pytest.mark.parametrize(
