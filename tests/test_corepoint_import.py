@@ -1901,42 +1901,176 @@ def test_a_send_in_a_block_label_is_never_a_delivery() -> None:
     assert 'sends.append(Send("OB_LABEL", msg))' in _handler_source(line)
 
 
+@pytest.mark.parametrize("verb", sorted(_STATEMENT_VERBS))
+def test_a_call_carrying_a_statement_is_a_label_and_not_a_call(verb: str) -> None:
+    """One rule for every element but a Line. A ``<Call>`` whose ``@Data`` is a statement names no
+    list to inline, so it is not counted as a mapped call, whichever statement it is. Its body
+    still renders beneath the label. The control is a Call that names a list."""
+    data = f"{_VERB_SPELLINGS[verb]} %ADT"
+    call = _labelled("Call", data, '<Line Data="ItemClear %ADT/PID-19"/>')
+    src = _handler_body(_handler_source(call))
+    assert f"    # Corepoint Call: {data}\n" in src and "called list inlined" not in src
+    assert '    set_field(msg, "PID-19", "")' in src
+    assert _count_steps(_handler_steps(call), in_loop=False) == (1, [_VERB_SPELLINGS[verb]], 0)
+    named = _labelled("Call", 'ActionListCall "Sub"', '<Line Data="ItemClear %ADT/PID-19"/>')
+    assert "called list inlined" in _handler_source(named)
+    assert _count_steps(_handler_steps(named), in_loop=False) == (2, [], 0)
+
+
+_SIBLING_BRANCHES = {
+    "if-else": ('<If Data="If (x)"><List/></If>', "Else"),
+    "if-elseif": ('<If Data="If (x)"><List/></If>', "ElseIf (y)"),
+    "try-catch": ("<Try><List/></Try>", "Catch"),
+    "case-matching": ('<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M"'),
+}
+# What sits between a construct and the branch marker written after it as a sibling. ``{S}`` is
+# where a wrapper carries a statement; the control is the same text with no statement there.
+_EMPTY_WRAPPERS = {
+    "one-wrapper": "<List{S}/>",
+    "two-wrappers-side-by-side": "<List{S}/><Actions{S}/>",
+    "inner-of-two": "<List><List{S}/></List>",
+    "outer-of-two": "<List{S}><List/></List>",
+    "both-of-two": "<List{S}><List{S}/></List>",
+    "innermost-of-three": "<List><List><List{S}/></List></List>",
+    "middle-of-three": "<List><List{S}><List/></List></List>",
+    "outermost-of-three": "<Actions{S}><List><List/></List></Actions>",
+    "all-of-three": "<List{S}><Actions{S}><List{S}/></Actions></List>",
+}
+_FILLED = '<Line Data="ItemClear %ADT/PID-20"/>'
+# A wrapper holding a statement of its own. On main it already orphans the branch, with or
+# without a statement on the wrapper, and that is out of scope here: it must not get worse.
+_FILLED_WRAPPERS = {
+    "filled-one-wrapper": f"<List{{S}}>{_FILLED}</List>",
+    "filled-inner-of-two": f"<List><List{{S}}>{_FILLED}</List></List>",
+    "filled-outer-of-two": f"<List{{S}}><List>{_FILLED}</List></List>",
+    "filled-beside-the-inner-of-two": f"<List>{_FILLED}<List{{S}}/></List>",
+}
+_WRAPPER_STATEMENT = ' Data="MsgLog %ADT"'
+_ORPHAN = "with no enclosing construct"
+
+
+def _sibling_arm(branch: str) -> str:
+    """A branch ``<Line>`` holding a markup-free write and send, which no handle rule refuses."""
+    return _labelled("Line", branch, _CLEAR + '<Line Data="MsgSend %ADT [OB_FLAT]"/>')
+
+
+def _code(src: str) -> list[str]:
+    """The lines of a rendered handler that are not comments: what runs, and how deep."""
+    return [line for line in src.splitlines() if not line.lstrip().startswith("#")]
+
+
+def _assert_the_markers_change_no_code(template: str, markers: int) -> str:
+    """The rule the whole family below asks: a statement on a wrapper adds its counted marker and
+    changes nothing else. The same code runs at the same indentation, and a branch is an orphan
+    only where it is one with no statement there. Returns the marked handler body."""
+    marked, control = (
+        _handler_body(_handler_source(template.replace("{S}", statement)))
+        for statement in (_WRAPPER_STATEMENT, "")
+    )
+    assert marked.count(_LABEL_MARKER) == markers
+    assert _code(marked) == _code(control)
+    assert marked.count(_ORPHAN) == control.count(_ORPHAN)
+    return marked
+
+
+@pytest.mark.parametrize("between", _EMPTY_WRAPPERS)
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_wrappers_marker_never_orphans_a_sibling_branch(pair: str, between: str) -> None:
+    """A branch marker written after its construct as a sibling is adopted by it, and its body is
+    then dead until someone writes the condition. An orphaned branch renders its body live. A
+    wrapper's marker is no statement position, so the adoption does not see it: at any depth of
+    wrapper, on the inner one or the outer, the branch is adopted exactly as it is with no
+    statement there."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    template = construct + _EMPTY_WRAPPERS[between] + _sibling_arm(branch)
+    src = _assert_the_markers_change_no_code(template, _EMPTY_WRAPPERS[between].count("{S}"))
+    # main adopts this branch, so nothing of it runs at the handler's own level.
+    assert _ORPHAN not in src
+    assert not [
+        line for line in src.splitlines() if line.startswith(("    sends.append", "    set_field"))
+    ]
+    assert '        sends.append(Send("OB_FLAT", msg))' in src
+
+
+@pytest.mark.parametrize("between", _FILLED_WRAPPERS)
+@pytest.mark.parametrize("pair", _SIBLING_BRANCHES)
+def test_a_wrappers_marker_changes_nothing_where_main_already_orphans(
+    pair: str, between: str
+) -> None:
+    """The control for the test above, and the limit it leaves. A wrapper with a statement of its
+    own between a construct and its sibling branch orphans that branch on main, whatever the
+    wrapper's ``@Data``. The marker neither repairs that nor adds to it."""
+    construct, branch = _SIBLING_BRANCHES[pair]
+    template = construct + _FILLED_WRAPPERS[between] + _sibling_arm(branch)
+    src = _assert_the_markers_change_no_code(template, 1)
+    assert src.count(_ORPHAN) == 1
+    assert '    sends.append(Send("OB_FLAT", msg))' in src
+
+
+@pytest.mark.parametrize("between", ["<List{S}/>", "<List><List{S}/></List>"])
 @pytest.mark.parametrize(
-    ("construct", "branch"),
+    "frame",
     [
-        pytest.param('<If Data="If (x)"><List/></If>', "Else", id="if-else"),
-        pytest.param('<If Data="If (x)"><List/></If>', "ElseIf (y)", id="if-elseif"),
-        pytest.param("<Try><List/></Try>", "Catch", id="try-catch"),
+        # A branch-group wrapper: an ``<If>`` with no ``@Data`` whose children are the branches.
         pytest.param(
-            '<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M"', id="case-matching"
+            '<If><Line Data="If (x)"><List/></Line>{between}</If>{arm}', id="branch-group"
+        ),
+        # A ``<Line>`` carrying a nested list: its body is flattened to the Line's own level, so
+        # a construct at the end of it adopts a branch written after the Line.
+        pytest.param(
+            '<Line Data="ItemClear %ADT/PID-18"><List>'
+            '<If Data="If (x)"><List/></If>{between}</List></Line>{arm}',
+            id="tail-of-a-line-body",
+        ),
+        # The wrapper holds the construct itself, and the branch follows the wrapper.
+        pytest.param(
+            '<List><If Data="If (x)"><List/></If>{between}</List>{arm}',
+            id="wrapper-around-the-construct",
         ),
     ],
 )
-def test_a_wrappers_marker_never_orphans_a_sibling_branch(construct: str, branch: str) -> None:
-    """A branch marker written after its construct as a sibling is adopted by it, and its body is
-    then dead until someone writes the condition. A step between the two would orphan the branch,
-    and an orphan's body renders live. So a wrapper's marker goes ahead of the construct. The
-    control is the same list with no statement on the wrapper: it must render the same code."""
-    arm = (
-        f'<Line Data="{branch.replace(chr(34), "&quot;")}"><List>'
-        '<Line Data="ItemClear %ADT/PID-19"/><Line Data="MsgSend %ADT [OB_FLAT]"/>'
-        "</List></Line>"
-    )
+def test_a_marker_at_the_end_of_any_flattened_body_never_orphans_a_branch(
+    frame: str, between: str
+) -> None:
+    """A marker reaches the list a branch is adopted in by more routes than a wrapper beside the
+    construct. Each of them leaves the marker last in a body that is flattened to that level."""
+    template = frame.replace("{between}", between).replace("{arm}", _sibling_arm("Else"))
+    src = _assert_the_markers_change_no_code(template, 1)
+    assert _ORPHAN not in src
+    assert '        sends.append(Send("OB_FLAT", msg))' in src
 
-    def code(wrapper: str) -> list[str]:
-        lines = _handler_body(_handler_source(construct + wrapper + arm)).splitlines()
-        return [line for line in lines if not line.lstrip().startswith("#")]
 
-    marked = _handler_body(_handler_source(construct + _labelled("List", "MsgLog %ADT") + arm))
-    assert _LABEL_MARKER in marked
-    assert code(_labelled("List", "MsgLog %ADT")) == code("<List/>")
-    # Nothing of the branch runs at the handler's own level: its write and its send stay nested.
-    assert not [
-        line
-        for line in marked.splitlines()
-        if line.startswith(("    sends.append", "    set_field"))
-    ]
-    assert '        sends.append(Send("OB_FLAT", msg))' in marked
+def test_a_send_label_keeps_its_body_where_main_put_it() -> None:
+    """main rendered a ``MsgSend`` in a Block's ``@Data`` as a live send and then its body at the
+    Block's own level, so a construct ending that body adopted a branch written after the Block.
+    The send is now a marker under the label. The body stays at that level, so the branch is
+    still adopted and its send stays dead."""
+    body = _labelled(
+        "Block", "MsgSend %ADT [OB_LABEL]", '<If Data="If (x)"><List/></If>'
+    ) + _sibling_arm("Else")
+    src = _handler_body(_handler_source(body))
+    assert _LABEL_MARKER in src and _ORPHAN not in src
+    assert 'Send("OB_LABEL"' not in src
+    assert '        sends.append(Send("OB_FLAT", msg))' in src
+    assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
+
+
+def test_a_wrappers_marker_stays_where_the_wrapper_sat() -> None:
+    """Source order. A marker is not moved ahead of a construct it follows. Where that construct
+    adopts a branch written after the wrapper, the marker follows the whole chain."""
+    construct, branch = _SIBLING_BRANCHES["if-else"]
+
+    def order(body: str) -> list[str]:
+        lines = _handler_body(_handler_source(body)).splitlines()
+        named = {"    if ": "if", "    elif ": "else", _LABEL_MARKER: "marker", "PID-21": "next"}
+        return [name for line in lines for text, name in named.items() if text in line]
+
+    after = '<Line Data="ItemClear %ADT/PID-21"/>'
+    for nesting in ("one-wrapper", "inner-of-two"):
+        between = _EMPTY_WRAPPERS[nesting].replace("{S}", _WRAPPER_STATEMENT)
+        assert order(construct + between + after) == ["if", "marker", "next"]
+        arm = _sibling_arm(branch)
+        assert order(construct + between + arm + after) == ["if", "else", "marker", "next"]
 
 
 def test_a_hostile_label_statement_cannot_escape_its_marker() -> None:

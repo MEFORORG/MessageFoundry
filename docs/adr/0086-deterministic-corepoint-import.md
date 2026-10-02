@@ -442,9 +442,12 @@ itself, and either:
 
 A container renders a control verb itself: its own construct, a call, an exit, a `LoopExit`. A
 `MsgSend` is the exception, because it would deliver a message. So in a Block's or a Call's `@Data`
-it is a statement too, and the element then renders as a plain label: a Call that names no list is
-not counted as a call. A `LoopExit` there still renders its `break`, which only ever sits in a loop
-that is itself a dead placeholder.
+it is a statement too, and the element then renders as a plain label. Its body stays at the
+element's own level, where a send's body always went. A `<Call>` carrying any statement renders as
+a plain label too: it names no list, so it is not counted as a call. *Corrected 2026-10-02 (the
+Lander's hold on PR 1938):* at first only a `MsgSend` did that, and a `<Call Data="MsgLog …">`
+still counted as a mapped call. A `LoopExit` there still renders its `break`, which only ever sits
+in a loop that is itself a dead placeholder.
 
 Whether Corepoint runs such a statement is not known. So:
 
@@ -452,11 +455,23 @@ Whether Corepoint runs such a statement is not known. So:
   a Block's or a Call's label comment, before a construct's placeholder, and before a list wrapper's
   flattened statements. An unmodelled element is one counted marker already, so the statement is
   named in that marker and not counted twice.
-- A wrapper's marker never sits between a construct and a branch marker written after it as a
-  sibling. It goes ahead of that construct. Between the two it would orphan the branch, and an
-  orphaned branch renders its body live. *Corrected 2026-10-02 (code review, round 2):* the first
-  cut put the marker where the wrapper sat, and an `Else` after such a wrapper ran for every
-  message.
+- A marker never changes which construct adopts a branch. A branch marker written after its
+  construct as a sibling is adopted by it, and its body is then dead until someone writes the
+  condition. An orphaned branch renders its body live. So the marker is its own step type,
+  `LabelMarker`, which stands for no statement position of the export. `_parse_list` holds a
+  marker back from its list until a statement position follows it, so the one adoption rule,
+  `_adopt_branch`, never finds a marker as the step before a branch. The branch is adopted
+  exactly as it is with every marker taken out, and the marker follows the whole chain. Among
+  the steps that are not adopted, every marker stays where its element sat, in source order.
+  That holds at any depth of wrapper, and wherever a flattened body leaves a marker last: a
+  wrapper nested in another, a branch-group `<If>`, a `<Line>` carrying a list.
+  *Corrected 2026-10-02, twice.* The first cut let the adoption see the marker as a step, and an
+  `Else` after such a wrapper ran for every message (code review, round 2). The second moved a
+  wrapper's marker ahead of the step before it, by looking one step back in one call. A wrapper
+  nested in another starts a new call, so its marker orphaned the branch again. With no branch to
+  follow, the marker was still moved ahead of an `If` it came after (the Lander's hold on PR
+  1938). Moving one marker was the wrong mechanism. The rule now covers every marker, in the one
+  place that builds the list a branch is adopted in.
 - Nothing is mapped for it, and it is never emitted as a write or a delivery.
 - The scan holds no handle for the whole list. Every role-parsed send in it raises, and no
   role-parsed field write maps onto `msg`. So a clone or a send counts only on a `<Line>`.
@@ -478,8 +493,8 @@ At least these limits remain:
 - The rule is blunt on purpose. Any table verb off a `<Line>`, a `MsgLog` included, leaves the
   whole list holding no handle, so its role-parsed sends raise until someone finishes them.
 - A `<Block>` label that merely leads with a word the exporter styled as a `keyword` is read as a
-  statement. How often a real label does that was not measured: the validated export is not in
-  this repository.
+  statement. So is the `@Data` of a list wrapper that leads with one. How often a real label does
+  that was not measured: the validated export is not in this repository.
 - The marker and the statement share one 200-character comment, so a statement longer than about
   90 characters is cut. Under a `@Disabled` ancestor the preview shows only the verb.
 - A statement with no role markup names no handle the scan can read. So a markup-free write still
@@ -487,8 +502,11 @@ At least these limits remain:
   The same holds for a markup-free `MsgTreeCopy` on a `<Line>`.
 - The refusal at a send, and the reason on a declined write, still name the two older causes: no
   single input handle, or an overwritten input. The marker carries the true one.
-- A construct or a `<Call>` carrying a statement counts twice: once as the element, as before, and
-  once unmapped for the statement.
+- A construct carrying a statement counts twice: once as the construct, as before, and once
+  unmapped for the statement. A `<Call>` carrying one counts once, for the statement.
+- A wrapper that holds a statement of its own, between a construct and its sibling branch, orphans
+  that branch. main does the same whatever the wrapper's `@Data`, and this amendment leaves it as
+  it found it. `test_a_wrappers_marker_changes_nothing_where_main_already_orphans` pins that.
 
 The differential guard compares a gate-declined list with step 1. That step 1 path now carries this
 rule. So the guard runs the vendored step 1 file with one amendment made as it loads. The file
@@ -500,16 +518,46 @@ written apart from the rule. Where it changes a list it must only narrow: no new
 vocabulary call, and one more unmapped step, or else only comment lines change.
 
 That bound is what catches a rule that is wrong in the head and in its copy alike, where the
-head-equals-baseline check is blind. It did not catch the wrapper defect above at first, because no
-seed put a wrapper between a construct and a sibling branch. Eight seeds now do. With the first
-cut's placement put back into the baseline copy, the bound fails on all eight.
+head-equals-baseline check is blind. It missed the wrapper defect twice, each time for want of a
+seed. At first no seed put a wrapper between a construct and a sibling branch. Eight seeds then
+did, each with one wrapper, and the bound stayed green on a wrapper nested in another. The seeds
+now also nest the wrapper to a depth of two and three, with the statement on the inner wrapper,
+the outer, or each, with and without a statement inside, for each of the four branch kinds. They
+end a branch-group, a `<Line>`'s list and a wrapper around the construct with such a wrapper, and
+they put a send label over a construct.
 
-Measured 2026-10-02. The battery now holds 7,968 shapes, 512 of them fixed seeds. The 181 new seeds
-put a statement on each of the seven container tags, an unmodelled tag and a list wrapper: a clone,
-a write, a send, a styled verb outside the table, and each of the seven verbs with no markup in two
-casings. The amendment changes 646 shapes, marks a live statement in 623 and drops a live send in
-513. The head equals the amended baseline on every shape. Each mutation arm of the head fails the
-guard, counted in shapes:
+A second test states the rule itself. `test_no_branch_main_adopts_is_orphaned` parses every shape
+with the vendored file as it is, with the amended baseline and with the head. All three must hold
+the same branches adopted and the same branches orphaned. The bound sees an orphan only through a
+live send or a vocabulary call in its body; this test needs neither.
+
+Measured 2026-10-02 at the repaired head. The battery holds 8,041 shapes, 585 of them fixed seeds,
+and the amendment changes 719. The repair added 73 seeds. Each row puts part of the repair back and
+counts the shapes that fail. "Head alone" changes the head only, which the head-equals-baseline
+check sees. "Both" changes the head and the baseline copy alike, which that check cannot see.
+
+| What is put back | Head alone | Both: the bound | Both: the branch test |
+|---|---|---|---|
+| the whole repair, so the rule at `880f431d94` | 79 | 37 | 37 |
+| the adoption sees a marker as a step | 54 | 54 | 54 |
+| the same, and a wrapper moves its marker one step back (round 2) | 62 | 35 | 35 |
+| a send label nests its body | 2 | 2 | 2 |
+| a `<Call>` carrying a statement stays a call | 15 | 0 | 0 |
+
+Every shape in the two "Both" columns is one of the 73 new seeds, but for eight in the second row,
+which are the seeds round 2 added. The last row is not a fail-open. It counts a label as a mapped
+call, so only the head-equals-baseline check and a unit test see it. With the repair in place
+every count is zero.
+
+The measurement below is older. It was taken the same day at `880f431d94`, before the repair, and
+was not run again. The battery then held 7,968 shapes, 512 of them fixed seeds. The 181 seeds new
+at that head put a statement on each of the seven container tags, an unmodelled tag and a list
+wrapper: a clone, a write, a send, a styled verb outside the table, and each of the seven verbs
+with no markup in two casings. The amendment changed 646 shapes, marked a live statement in 623
+and dropped a live send in 513. The head equalled the amended baseline on every shape. Each
+mutation arm of the head failed the guard, counted in shapes. The row "a wrapper's marker sits
+where the wrapper sat" was the first cut put back, where the adoption saw the marker. The marker
+does sit there now, and the adoption never sees it.
 
 | Mutation of the head | Shapes failing |
 |---|---|
@@ -623,9 +671,12 @@ omitting it would claim it vanished.
 - **AC-6g (a statement off a `<Line>`, amendment 2026-10-02)** — an element other than a `<Line>`
   whose `@Data` is a statement (§2(b.4)) SHALL emit a counted TODO naming it, SHALL emit no live
   code for it, and its list SHALL hold no handle as `msg`; a prose label SHALL stay a comment.
+  The marker SHALL NOT change which construct adopts a branch.
   → `::test_a_clone_where_a_label_belongs_is_marked_and_its_send_is_judged_on_the_marker`,
   `::test_a_send_in_a_block_label_is_never_a_delivery`,
-  `::test_a_prose_block_label_stays_a_label`, `::test_the_scan_and_the_render_ask_one_rule`
+  `::test_a_prose_block_label_stays_a_label`, `::test_the_scan_and_the_render_ask_one_rule`,
+  `::test_a_wrappers_marker_never_orphans_a_sibling_branch`,
+  `::test_a_marker_at_the_end_of_any_flattened_body_never_orphans_a_branch`
 
 ## 4. Consequences
 

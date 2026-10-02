@@ -176,6 +176,15 @@ class UnmappedAction:
 
 
 @dataclass(frozen=True)
+class LabelMarker(UnmappedAction):
+    """The counted TODO for a statement written in the ``@Data`` of an element that is not a
+    ``<Line>`` (:func:`_label_marker`, BACKLOG #2632).
+
+    It renders and counts as any :class:`UnmappedAction`. It is its own type so that
+    :func:`_parse_list` can tell it from a statement position, which it is not."""
+
+
+@dataclass(frozen=True)
 class Control:
     """A non-leaf element of the ``<Package>`` control-flow tree — a construct with a nested body.
 
@@ -973,8 +982,9 @@ _STATEMENT_VERBS = frozenset(
     {"itemappend", "itemclear", "itemcopy", "msgcreate", "msglog", "msgsend", "msgtreecopy"}
 )
 # What the marker says for such a statement (:func:`_label_marker`), ahead of the statement itself.
-# Kept short: the two share one 200-character comment. A markup-free statement names no handle
-# the scan can read, so it is left as step 1 renders it.
+# Kept short: the two share one 200-character comment. It says "role-marked" because the scan
+# reads handles from role markup alone: a markup-free write or send on a ``<Line>`` of such a list
+# names no handle the scan can read, and still renders as it does in any other list.
 _LABEL_STATEMENT_WHY = (
     "not on a Line, so it may never have run; nothing is mapped and no role-marked handle here "
     "is taken to be msg"
@@ -982,8 +992,6 @@ _LABEL_STATEMENT_WHY = (
 
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
 _BRANCH_PARENT = {"elif": "if", "else": "if", "except": "try", "match": "case"}
-# The kinds that may still adopt a branch marker written after them as a sibling.
-_ADOPTING_KINDS = frozenset(_BRANCH_PARENT.values())
 
 # Kinds whose body is emitted INSIDE a Python block — under a dead placeholder condition, or in a loop
 # that rewrites the same occurrence each pass. A statement anywhere beneath one of these is not
@@ -1469,48 +1477,72 @@ def _parse_list(
 ) -> list[Step]:
     """Parse the statement children of a ``<List>``/``<Actions>`` into ordered steps.
 
-    A branch marker that follows a compatible construct as a *sibling* is adopted by it; the more
-    common in-body form is handled by :func:`_split_branches` when the construct is built."""
+    A branch marker that follows a compatible construct as a *sibling* is adopted by it
+    (:func:`_adopt_branch`); the more common in-body form is handled by :func:`_split_branches`
+    when the construct is built."""
     if depth > _MAX_NESTING:
         raise CorepointImportError(
             f"export nests statements more than {_MAX_NESTING} levels deep — refusing to parse"
         )
     steps: list[Step] = []
+    # Label markers written after the last statement position. They wait here, outside ``steps``,
+    # until the next one arrives. So ``steps[-1]`` is always a statement position, and a marker
+    # never comes between a construct and a branch written after it: not from a wrapper beside
+    # the construct, not from one nested in another, not at the end of a body flattened to this
+    # level. Seen as a step, a marker would orphan the branch, and an orphan's body renders live
+    # (BACKLOG #2632). It keeps its place in source order among the steps that are not adopted.
+    waiting: list[Step] = []
     for child in container:
         tag = _local(child.tag).lower()
+        produced: list[Step]
         if tag in _LIST_TAGS:
             # A doubly-wrapped list: flatten rather than lose the statements. A statement the rule
-            # finds in the wrapper's own ``@Data`` is marked (:func:`_label_marker`). The marker
-            # goes AHEAD of a construct that may still adopt a sibling branch marker after this
-            # wrapper: between the two it would orphan the branch, and an orphan's body renders
-            # live at this level.
-            adopting = (
-                bool(steps) and isinstance(steps[-1], Control) and steps[-1].kind in _ADOPTING_KINDS
-            )
-            at = len(steps) - 1 if adopting else len(steps)
-            steps[at:at] = _label_marker(child)
-            steps.extend(_parse_list(child, subject, held, in_control, depth + 1))
-            continue
-        # EVERY other child is a statement position and goes through _parse_statement — including a tag
-        # this layer does not model, which comes back as an "unknown" marker plus its parsed subtree.
-        # Skipping unmodelled tags here (as an earlier cut did, citing the <Connection>/<Codeset>/
-        # <DataPoint> package subtrees) dropped whole subtrees silently: those subtrees are children of
-        # <Package>, NEVER of a <List>, so the tolerance was applied exactly where statements live and a
-        # <Switch> — or a <Lines> typo — vanished with its body. Untrusted input is still never a crash.
-        produced = _parse_statement(child, subject, held, in_control, depth + 1)
-        if (
-            len(produced) == 1
-            and isinstance(produced[0], Control)
-            and produced[0].kind in _BRANCH_PARENT
-            and steps
-            and isinstance(steps[-1], Control)
-            and steps[-1].kind == _BRANCH_PARENT[produced[0].kind]
-        ):
-            previous = steps[-1]
-            steps[-1] = replace(previous, branches=(*previous.branches, produced[0]))
-            continue
-        steps.extend(produced)
-    return steps
+            # finds in the wrapper's own ``@Data`` is marked where the wrapper sits, ahead of the
+            # statements it holds (:func:`_label_marker`).
+            produced = [
+                *_label_marker(child),
+                *_parse_list(child, subject, held, in_control, depth + 1),
+            ]
+        else:
+            # EVERY other child is a statement position and goes through _parse_statement — including
+            # a tag this layer does not model, which comes back as an "unknown" marker plus its parsed
+            # subtree. Skipping unmodelled tags here (as an earlier cut did, citing the <Connection>/
+            # <Codeset>/<DataPoint> package subtrees) dropped whole subtrees silently: those subtrees
+            # are children of <Package>, NEVER of a <List>, so the tolerance was applied exactly where
+            # statements live and a <Switch> — or a <Lines> typo — vanished with its body. Untrusted
+            # input is still never a crash.
+            produced = _parse_statement(child, subject, held, in_control, depth + 1)
+            if _adopt_branch(steps, produced):
+                continue
+        for step in produced:
+            if isinstance(step, LabelMarker):
+                waiting.append(step)
+            else:
+                steps.extend(waiting)
+                waiting.clear()
+                steps.append(step)
+    return [*steps, *waiting]
+
+
+def _adopt_branch(steps: list[Step], produced: list[Step]) -> bool:
+    """Attach ``produced`` to the construct written before it, when ``produced`` is one branch
+    marker that construct continues. Says whether it did. THE one adoption rule.
+
+    It reads ``steps[-1]`` alone. :func:`_parse_list` keeps every :class:`LabelMarker` out of
+    that position, so a marker never changes which branch is adopted: the answer is the one this
+    list gives with every marker taken out of it."""
+    if len(produced) != 1 or not steps:
+        return False
+    branch, previous = produced[0], steps[-1]
+    if not (
+        isinstance(branch, Control)
+        and branch.kind in _BRANCH_PARENT
+        and isinstance(previous, Control)
+        and previous.kind == _BRANCH_PARENT[branch.kind]
+    ):
+        return False
+    steps[-1] = replace(previous, branches=(*previous.branches, branch))
+    return True
 
 
 def _container_steps(
@@ -1568,8 +1600,8 @@ def _parse_statement(
         label = statement or note or tag
         return [Control("disabled", source, label, body=tuple(body))]
 
-    # A statement written anywhere but on a ``<Line>`` is marked and counted, ahead of the element's
-    # body, and never emitted as live code: whether Corepoint runs it there is not known.
+    # A statement written anywhere but on a ``<Line>`` is marked and counted, and never emitted as
+    # live code: whether Corepoint runs it there is not known.
     marker = _label_marker(elem)
 
     if tag.lower() not in _STATEMENT_TAGS:
@@ -1583,10 +1615,15 @@ def _parse_statement(
         return [Control("unknown", tag, detail, body=tuple(body))]
 
     if marker and kind == "send":
-        # A ``MsgSend`` in a Block's or a Call's ``@Data``: the marker stands for it, and the
-        # element renders as a label. A send that may never have run is not a delivery, and a
-        # Call that names no list is not a call, so neither counts as mapped.
-        kind, source = "block", tag
+        # A ``MsgSend`` in a Block's or a Call's ``@Data``: the marker stands for it, under the
+        # element's label. A send that may never have run is not a delivery, so it does not count
+        # as mapped. Its body stays at the element's own level, where a send's body always went:
+        # a construct ending that body may adopt a branch written after the element.
+        return [Control("block", tag, statement, body=tuple(marker)), *body]
+    if marker and kind == "call":
+        # A ``<Call>`` whose ``@Data`` is a statement names no list, so it is not a call and does
+        # not count as one. It renders as the plain label it is, like every other such element.
+        kind = "block"
 
     if not data and any(isinstance(s, Control) and s.kind == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
@@ -1708,7 +1745,7 @@ def _label_statement(elem: Element) -> str:
     return verb if lowered in _STATEMENT_VERBS or styled else ""
 
 
-def _label_marker(elem: Element) -> list[UnmappedAction]:
+def _label_marker(elem: Element) -> list[LabelMarker]:
     """The counted TODO for a statement :func:`_label_statement` finds on ``elem``, or ``[]``.
 
     The statement rides in the marker, after the reason, because a ``<Try>`` and a ``<List>`` wrapper
@@ -1719,7 +1756,7 @@ def _label_marker(elem: Element) -> list[UnmappedAction]:
     if not carried:
         return []
     statement = strip_markup(_attr(elem, "Data"))
-    return [UnmappedAction(carried, f"{_LABEL_STATEMENT_WHY}: {statement}")]
+    return [LabelMarker(carried, f"{_LABEL_STATEMENT_WHY}: {statement}")]
 
 
 def _source_label(tag: str, verb: str) -> str:
@@ -2906,9 +2943,10 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
     commented-out pseudo-source under a ``@Disabled`` element or action-list (*disabled*). Nothing is
     ever silently dropped.
 
-    One element counts twice, on purpose: a construct or a ``<Call>`` whose ``@Data`` is a statement
-    (:func:`_label_marker`). The element is counted as it always was, and the statement it carried
-    is counted unmapped beside it, because the two are rendered apart.
+    One element counts twice, on purpose: a construct whose ``@Data`` is a statement
+    (:func:`_label_marker`). The construct is counted as it always was, and the statement it carried
+    is counted unmapped beside it, because the two are rendered apart. A ``<Call>`` carrying one
+    is a plain label and is not counted as a call, so only its statement counts.
 
     The names go through :func:`_comment_text` because the CLI prints them: the import summary is the
     count-and-log record a migrator trusts, and a JSON export naming a class
