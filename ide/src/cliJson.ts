@@ -15,24 +15,25 @@
 // Either text stays out of the message. It is not logged either: the extension's output channels are
 // pasted into bug reports (see engineLog.ts), so they are no safer than a toast.
 //
-// The CLI's own `{"error": "..."}` body is different, and passes through. Every path that composes it
-// in the three commands that run author code was traced at engine 5afcd55242 (vault BACKLOG #1187):
-//   * `dryrun`: (1) a `WiringError` from `load_config`; (2) a missing path, an empty directory, an
-//     unreadable or over-cap fixture from `read_messages` (paths, sizes, `strerror`); (3) a
-//     `ValueError`/`KeyError` from the per-message loop: `select_inbound`'s no-inbound,
-//     unknown-inbound or ambiguous-inbound refusal, or `decode_body`'s refusal to text-decode a
-//     binary inbound (connection names and content types). Everything that
-//     processes a message (decode, the HL7 parse, strict validation, the Router and Handlers) is
-//     caught inside `dry_run` into that message's own `error` field, which `safe_error` gates, and
-//     never reaches this body; tests/test_cli.py `test_dryrun_redacts_a_raised_exception_by_default`
-//     pins that a raise quoting PID values leaves stdout without them.
-//   * `graph`: a `WiringError` from `load_config` only.
-//   * `validate`: never prints `{"error"}`; its failures are the diagnostics list, which is a result.
-// So no path carries message content: none has read a message when it composes the text. The one
-// unvetted part is `WiringError`'s "error loading config module <file>: <exception>", which quotes what
-// a config module raised at import. That is the author's own code, run before any sample is read, the
-// same class as an author's print(). The other commands that use runJson (codeset, connection, alert,
-// security, cert, lens, generate --list, ai-policy) handle configuration, not messages.
+// The CLI's own `{"error": "..."}` body is different, and passes through. The paths that compose it in
+// `dryrun`, `validate` and `graph` were traced on this branch (vault BACKLOG #1187, 2026-10-01). At
+// least these exist, and each is built from configuration and path facts, from class-only text, or
+// from `safe_exc`-scrubbed text:
+//   * `dryrun` and `graph`: a `WiringError` from `load_config`, before any message is read.
+//   * `dryrun`: `read_messages`' refusals (paths, sizes, `strerror`), before any message is read.
+//   * `dryrun`, plain and `--trace json` alike: a `ValueError`/`KeyError` that stops the per-message
+//     loop. `select_inbound`'s refusals keep their text (connection names). Anything else is
+//     reported by class only, since it can come from reading a message: `_dryrun_loop_error` in
+//     `__main__.py`, pinned by tests/test_cli.py. The loop's ordinary failures (decode, the HL7
+//     parse, strict validation, the Router and Handlers) never reach it: `dry_run` catches them into
+//     the message's own `safe_error`-gated `error` field.
+//   * any command: the dispatch-level catch in `cli_common.run_cli` (BACKLOG #1863) prints an
+//     uncaught exception as `safe_exc` text. That scrubber is not de-identification (it can miss a
+//     lone identifier), so it is the weakest of these.
+// The one unvetted fact-path text is `WiringError`'s "error loading config module <file>:
+// <exception>", which quotes what a config module raised at import: the author's own code, run
+// before any sample is read. Every command that imports config modules can print it, `connection
+// upsert` and `remove` included.
 import { looksLikeUnknownArgument } from "./stepsModel";
 
 export interface CliResult {

@@ -4597,6 +4597,28 @@ def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
     return contextlib.redirect_stdout(sys.stderr)
 
 
+def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
+    """The text ``dryrun`` reports for an error that stopped its per-message loop.
+
+    The loop runs after the fixtures are read, so its error may come from processing a message.
+    The inbound-selection refusals are composed from connection names and keep their text: an
+    operator needs it to choose ``--inbound``. Anything else is reported by class only, because
+    ``str()`` of a ``ValueError`` or ``KeyError`` raised while reading a message can quote a field
+    value, and the IDE shows this text as written (vault BACKLOG #1187)."""
+    from messagefoundry.pipeline.dryrun import (
+        AmbiguousInboundError,
+        NoInboundError,
+        UnknownInboundError,
+    )
+
+    if isinstance(exc, (AmbiguousInboundError, NoInboundError, UnknownInboundError)):
+        return str(exc)
+    return (
+        f"dry-run stopped on an unexpected {type(exc).__name__} while processing a message; its "
+        "text is withheld because it can quote message data"
+    )
+
+
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
@@ -4646,7 +4668,7 @@ def _dryrun(args: argparse.Namespace) -> int:
                     )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
-            return _emit_error(str(exc), as_json=args.json)
+            return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
         _print_json(traced, compact=args.json)
         return 0
 
@@ -4704,7 +4726,7 @@ def _dryrun(args: argparse.Namespace) -> int:
                 }
             )
     except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
-        return _emit_error(str(exc), as_json=args.json)
+        return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
     _print_json(out, compact=args.json)
     return 0
 

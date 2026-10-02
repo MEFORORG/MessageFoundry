@@ -324,6 +324,43 @@ def test_dryrun_sends_a_handlers_print_to_stderr(
     assert isinstance(results, list) and len(results) == 1
 
 
+@pytest.mark.parametrize(
+    ("trace", "target"),
+    [
+        ([], "messagefoundry.pipeline.dryrun.dry_run"),
+        (["--trace", "json"], "messagefoundry.pipeline.dryrun_trace.trace_dry_run"),
+    ],
+)
+def test_dryrun_loop_error_withholds_text_except_inbound_selection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    trace: list[str],
+    target: str,
+) -> None:
+    """vault BACKLOG #1187: the IDE shows a ``{"error": ...}`` body as written, so an error that stops
+    the per-message loop is reported by class only. The inbound-selection refusal is the control: it
+    is composed from connection names and keeps its text."""
+    from messagefoundry.pipeline.dryrun import UnknownInboundError
+
+    cfg, _messages, message = _phi_raiser(tmp_path)
+
+    def raises(exc: Exception) -> Callable[..., object]:
+        def _run(*_a: object, **_k: object) -> object:
+            raise exc
+
+        return _run
+
+    monkeypatch.setattr(target, raises(KeyError("DOE^JANE^Q")))
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace]) != 0
+    body = json.loads(capsys.readouterr().out)
+    assert "DOE" not in body["error"] and "KeyError" in body["error"], body
+
+    monkeypatch.setattr(target, raises(UnknownInboundError("no such inbound connection: 'IB_X'")))
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace]) != 0
+    assert json.loads(capsys.readouterr().out) == {"error": "no such inbound connection: 'IB_X'"}
+
+
 # --- BACKLOG #1692: dryrun prints a Handler's declared metadata writes ----------------------------
 #
 # A SetMeta key and value are both message-derived in the general case, so this fixture builds each
