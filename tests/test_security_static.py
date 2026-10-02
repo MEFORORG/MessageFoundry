@@ -1098,7 +1098,13 @@ _LXML_PARSE_CALLS = frozenset(
 )
 #: Methods of a parsed lxml tree that transform it or pull further documents into it. The receiver
 #: is whatever ``harden.py`` returned, which no static walk can type, so these match on any receiver.
+#: NOT COVERED, at least: a tree's own ``parse`` and a parser's ``feed``, which also read a new
+#: document. Either name on any receiver would match ``ast.parse`` and every other parser in the
+#: tree, so the walk does not look for them.
 _LXML_TREE_METHODS = frozenset({"xslt", "xinclude"})
+#: lxml's own modules. A read of one off an lxml binding is a hop to that module, and the name read
+#: off the hop is the one reported.
+_LXML_SUBMODULES = frozenset({"etree", "html", "objectify"})
 #: What the walk reports for an lxml star import and for a ``getattr`` on an lxml binding. Neither
 #: names an entry point, and either one reaches every entry point.
 _LXML_STAR_IMPORT = "import *"
@@ -1230,24 +1236,37 @@ def _lxml_reads(source: str) -> set[str]:
 
     A binding is any of:
 
-    * the name ``etree``, which is what every consumer in this tree calls the module;
+    * the name ``etree``, which is what every consumer in this tree calls the module, unless the
+      file imports something that is not lxml under that name;
     * a name an ``import lxml...`` or a ``from lxml... import`` binds, under any alias;
-    * what a :data:`_LXML_LOADERS` call returns: called in place, assigned to a name or to an
-      attribute such as ``self._lx``, bound by ``:=``, or returned by a function or a lambda
-      defined in the file;
+    * what a :data:`_LXML_LOADERS` call returns: called in place, awaited, picked by ``or`` or by
+      a conditional expression, bound by ``:=``, assigned to a name, given as a parameter's
+      default, or returned by a function or a lambda defined in the file;
     * a name assigned from another binding.
 
-    A read counts whether or not it is called. Three more shapes are reported under their own
-    names: a :data:`_LXML_TREE_METHODS` call on any receiver, ``getattr`` on a binding, and a star
-    import from an lxml module.
+    Three kinds of name match as an attribute of ANY receiver, because no static walk can type the
+    receiver: an attribute a binding was assigned to (``self._lx = load_lxml()`` makes ``c._lx``
+    lxml too), a name bound in a class body, and a decorated function that returns a binding, which
+    is how a property looks. A function that returns a binding counts as a loader when it is called
+    on any receiver, for the same reason.
 
-    The walk reads one file and ignores scope, so a name bound to lxml anywhere in the file counts
-    everywhere in it. It does not follow a binding passed as an argument, unpacked from a tuple,
+    The name reported is the first one read off the binding. A hop through
+    :data:`_LXML_SUBMODULES` is not a read (``lxml.etree.parse`` reports ``parse``), and neither is
+    anything further down the chain (``etree.XPathError.__name__`` reports ``XPathError``). A read
+    counts whether or not it is called. Three more shapes are reported under their own names: a
+    :data:`_LXML_TREE_METHODS` call on any receiver, ``getattr`` on a binding, and a star import
+    from an lxml module.
+
+    THIS ERRS TOWARDS ACCUSING, AND IT STILL MISSES THINGS. It reads one file and ignores scope, so
+    a name bound to lxml anywhere in the file counts everywhere in it, and a method that shares its
+    name with a loader counts as one. It does not follow, at least, a binding passed as an argument,
+    returned through a call that wraps it (``cast(Any, load_lxml())``), unpacked from a tuple,
     bound by ``with`` or ``for``, stored in a container, or imported from another first-party
     module. Only the bare name ``etree`` survives those.
     """
     nodes = list(ast.walk(ast.parse(source)))
-    bindings = {"etree"}
+    bindings: set[str] = set()
+    on_any_receiver: set[str] = set()
     loaders = set(_LXML_LOADERS)
     found: set[str] = set()
 
@@ -1257,72 +1276,110 @@ def _lxml_reads(source: str) -> set[str]:
         return _dotted(node) in loaders
 
     def is_lxml(node: ast.AST) -> bool:
-        if isinstance(node, ast.NamedExpr):
+        if isinstance(node, (ast.NamedExpr, ast.Await)):
             return is_lxml(node.value)
+        if isinstance(node, ast.IfExp):
+            return is_lxml(node.body) or is_lxml(node.orelse)
+        if isinstance(node, ast.BoolOp):
+            return any(is_lxml(value) for value in node.values)
         if isinstance(node, ast.Call):
             return is_loader(node.func)
         if _dotted(node) in bindings:
             return True
-        return isinstance(node, ast.Attribute) and is_lxml(node.value)
+        if not isinstance(node, ast.Attribute):
+            return False
+        if node.attr in on_any_receiver:
+            return True
+        return node.attr in _LXML_SUBMODULES and is_lxml(node.value)
 
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
     returned: list[ast.expr] = []
     assigned: list[tuple[list[ast.expr], ast.expr]] = []
+    class_level: set[int] = set()
+    etree_is_foreign = False
     for node in nodes:
         if isinstance(node, ast.Import):
-            bindings |= {
-                alias.asname or "lxml"
-                for alias in node.names
-                if alias.name == "lxml" or alias.name.startswith("lxml.")
-            }
+            for alias in node.names:
+                if alias.name == "lxml" or alias.name.startswith("lxml."):
+                    bindings.add(alias.asname or "lxml")
+                elif (alias.asname or alias.name) == "etree":
+                    etree_is_foreign = True
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             from_lxml = not node.level and (module == "lxml" or module.startswith("lxml."))
             for alias in node.names:
+                local = alias.asname or alias.name
                 if not from_lxml:
                     if alias.name in _LXML_LOADERS:
-                        loaders.add(alias.asname or alias.name)
+                        loaders.add(local)
+                    etree_is_foreign = etree_is_foreign or local == "etree"
                 elif alias.name == "*":
                     found.add(_LXML_STAR_IMPORT)
                 else:
-                    found.add(alias.name)
-                    bindings.add(alias.asname or alias.name)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            functions.append(node)
+                    bindings.add(local)
+                    if not (module == "lxml" and alias.name in _LXML_SUBMODULES):
+                        found.add(alias.name)
         elif isinstance(node, ast.Return) and node.value is not None:
             returned.append(node.value)
         elif isinstance(node, ast.Assign):
             assigned.append((node.targets, node.value))
         elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
             assigned.append(([node.target], node.value))
+        elif isinstance(node, ast.ClassDef):
+            class_level |= {id(target) for stmt in node.body for target in _assigned_names(stmt)}
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if not isinstance(node, ast.Lambda):
+                functions.append(node)
+            # A parameter's default binds its name, exactly as an assignment would.
+            spec = node.args
+            positional = [*spec.posonlyargs, *spec.args]
+            defaults: list[tuple[ast.arg, ast.expr | None]] = [
+                *zip(
+                    positional[len(positional) - len(spec.defaults) :], spec.defaults, strict=True
+                ),
+                *zip(spec.kwonlyargs, spec.kw_defaults, strict=True),
+            ]
+            for arg, default in defaults:
+                if default is not None:
+                    assigned.append(([ast.Name(id=arg.arg, ctx=ast.Store())], default))
+    if not etree_is_foreign:
+        bindings.add("etree")
 
     # To a fixed point, because `E = etree` can sit above the line that binds `etree`.
     grew = True
     while grew:
-        before = len(bindings) + len(loaders)
+        before = len(bindings) + len(on_any_receiver) + len(loaders)
         # Almost no file returns an lxml binding, so the per-function walk is paid only where one does.
         if any(is_lxml(value) for value in returned):
-            loaders |= {
-                function.name
-                for function in functions
+            for function in functions:
                 if any(
                     isinstance(inner, ast.Return)
                     and inner.value is not None
                     and is_lxml(inner.value)
                     for inner in ast.walk(function)
-                )
-            }
+                ):
+                    loaders.add(function.name)
+                    if function.decorator_list:
+                        on_any_receiver.add(function.name)
         for targets, value in assigned:
-            names = {name for target in targets if (name := _dotted(target)) is not None}
             if is_lxml(value):
-                bindings |= names
+                for target in targets:
+                    if (name := _dotted(target)) is None:
+                        continue
+                    bindings.add(name)
+                    # `xml.etree` is the stdlib's, so `etree` never matches on a bare receiver.
+                    if isinstance(target, ast.Attribute) and target.attr != "etree":
+                        on_any_receiver.add(target.attr)
+                    elif id(target) in class_level and name != "etree":
+                        on_any_receiver.add(name)
             elif is_loader(value) or (isinstance(value, ast.Lambda) and is_lxml(value.body)):
-                loaders |= names
-        grew = len(bindings) + len(loaders) > before
+                loaders |= {name for target in targets if (name := _dotted(target)) is not None}
+        grew = len(bindings) + len(on_any_receiver) + len(loaders) > before
 
     for node in nodes:
         if isinstance(node, ast.Attribute):
-            if is_lxml(node.value):
+            # A hop to a submodule, or to another binding, is not itself a read.
+            if is_lxml(node.value) and not is_lxml(node):
                 found.add(node.attr)
         elif isinstance(node, ast.Call):
             func = node.func
@@ -1331,6 +1388,15 @@ def _lxml_reads(source: str) -> set[str]:
             elif _dotted(func) == "getattr" and node.args and is_lxml(node.args[0]):
                 found.add(_LXML_GETATTR)
     return found
+
+
+def _assigned_names(stmt: ast.stmt) -> list[ast.expr]:
+    """The targets of an assignment statement, or nothing for any other statement."""
+    if isinstance(stmt, ast.Assign):
+        return stmt.targets
+    if isinstance(stmt, ast.AnnAssign):
+        return [stmt.target]
+    return []
 
 
 def _lxml_parse_call_sites(source: str) -> set[str]:
@@ -1354,6 +1420,7 @@ def test_lxml_parsing_really_is_hardened_in_exactly_one_place() -> None:
         if (found := _lxml_reads(path.read_text(encoding="utf-8")))
         and (rel := path.relative_to(_REPO).as_posix()) != _LXML_PARSE_HOME
     }
+    assert reads, "no file outside harden.py reads anything off lxml; the walk has gone blind"
     offenders = sorted(
         f"{rel}: {sorted(found & _LXML_REPORTED)}"
         for rel, found in reads.items()
@@ -1382,7 +1449,6 @@ def test_lxml_parsing_really_is_hardened_in_exactly_one_place() -> None:
     assert {"XMLParser", "fromstring"} <= _lxml_parse_call_sites(home)
     source, expected = _LXML_PLANTED_BASELINE
     assert _lxml_parse_call_sites(source) == expected
-    assert _lxml_reads("etree = load_lxml()\nroot = etree.Element('probe')\n") == {"Element"}
     assert not _LXML_NON_PARSING_READS & _LXML_REPORTED
 
 
@@ -1421,6 +1487,45 @@ _LXML_PLANTED_SHAPES: tuple[tuple[str, set[str]], ...] = (
         "        return self._lx.fromstring(body)\n",
         {"fromstring"},
     ),
+    # The same attribute read through another receiver, and one bound in the class body.
+    (
+        "class C:\n"
+        "    def __init__(self):\n"
+        "        self._lx = load_lxml()\n\n\n"
+        "def go(c, body):\n"
+        "    return c._lx.fromstring(body)\n",
+        {"fromstring"},
+    ),
+    (
+        "class C:\n"
+        "    _lx = load_lxml()\n"
+        "    def go(self, body):\n"
+        "        return self._lx.fromstring(body)\n",
+        {"fromstring"},
+    ),
+    # A property: a decorated function that returns the module, read and never called.
+    (
+        "class C:\n"
+        "    @cached_property\n"
+        "    def lx(self):\n"
+        "        return load_lxml()\n"
+        "    def go(self, body):\n"
+        "        return self.lx.fromstring(body)\n",
+        {"fromstring"},
+    ),
+    # The loader's result reached through a conditional, an `or`, a default and an await.
+    ("lx = load_lxml() if enabled else None\nr = lx.fromstring(body)\n", {"fromstring"}),
+    ("lx = cached or load_lxml()\nr = lx.fromstring(body)\n", {"fromstring"}),
+    ("def go(body, lx=load_lxml()):\n    return lx.fromstring(body)\n", {"fromstring"}),
+    ("def go(body, *, lx=load_lxml()):\n    return lx.fromstring(body)\n", {"fromstring"}),
+    (
+        "async def aload():\n"
+        "    return load_lxml()\n\n\n"
+        "async def go(body):\n"
+        "    lx = await aload()\n"
+        "    return lx.fromstring(body)\n",
+        {"fromstring"},
+    ),
     # A second-order alias, written above the line that binds the name it copies.
     ("def go(body):\n    return E.fromstring(body)\n\n\nE = etree\n", {"fromstring"}),
     # The entry point imported by name, so no attribute access is left to match.
@@ -1446,12 +1551,35 @@ _LXML_PLANTED_CLEAN = (
     "from xml.sax import make_parser\np = make_parser()\n",
     "from messagefoundry.parsing.xml import harden\nroot = harden.parse_xml(body)\n",
     "value = getattr(settings, name)\n",
+    # The stdlib's ElementTree under the name every lxml consumer uses. The import allow-list
+    # above is what holds a stdlib parser, so this walk must not call it lxml.
+    "import xml.etree.ElementTree as etree\nroot = etree.fromstring(body)\n",
+    "import xml.etree.ElementTree\nroot = xml.etree.ElementTree.fromstring(body)\n",
+)
+
+#: What the allow-list sees: every name read off a binding, parse entry point or not. One name
+#: per chain, and a hop through an lxml module is not a read.
+_LXML_PLANTED_READS: tuple[tuple[str, set[str]], ...] = (
+    ("etree = load_lxml()\nroot = etree.Element('probe')\n", {"Element"}),
+    ("etree = load_lxml()\nname = etree.XPathError.__name__\n", {"XPathError"}),
+    ("import lxml.etree\nout = lxml.etree.tostring(root)\n", {"tostring"}),
+    ("from lxml import etree\nout = etree.tostring(root)\n", {"tostring"}),
+    ("from lxml.etree import tostring\nout = tostring(root)\n", {"tostring"}),
+    (
+        "etree = load_lxml()\nserialise = etree.tostring\nout = serialise.__call__(root)\n",
+        {"tostring"},
+    ),
 )
 
 
 @pytest.mark.parametrize(("source", "expected"), [_LXML_PLANTED_BASELINE, *_LXML_PLANTED_SHAPES])
 def test_the_lxml_guard_sees_every_planted_shape(source: str, expected: set[str]) -> None:
     assert _lxml_parse_call_sites(source) == expected, source
+
+
+@pytest.mark.parametrize(("source", "expected"), _LXML_PLANTED_READS)
+def test_the_lxml_walk_reports_one_read_per_chain(source: str, expected: set[str]) -> None:
+    assert _lxml_reads(source) == expected, source
 
 
 @pytest.mark.parametrize("source", _LXML_PLANTED_CLEAN)
@@ -1474,6 +1602,7 @@ def test_every_lxml_entry_point_name_exists_in_lxml() -> None:
     etree = pytest.importorskip("lxml.etree")
     lxml_html = pytest.importorskip("lxml.html")
     objectify = pytest.importorskip("lxml.objectify")
+    assert len(_LXML_PARSE_CALLS) >= 8
     missing = sorted(
         name
         for name in _LXML_PARSE_CALLS
