@@ -264,9 +264,11 @@ pure-Python equivalent:
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`
-- Start-up code check: `startupcode.py`, which on Windows opens each of the interpreter's site
-  directories with `kernel32`'s `CreateFileW`, asking only for the right to add a file. Windows
-  runs its own access check against the engine's token, so the engine learns whether its account
+- Start-up code check: `startupcode.py`, which on Windows opens each directory the interpreter
+  reads start-up code from with `kernel32`'s `CreateFileW`, asking only for the right to add a
+  file or a folder. Those are the site directories and every directory on the import path, the
+  engine's own and the absolute `PYTHONPATH` entries it hands its Python children. Windows runs
+  its own access check against the engine's token, so the engine learns whether its account
   could plant start-up code there. Nothing is created or changed. POSIX needs no `ctypes` for
   this; it asks `os.access` (vault BACKLOG #2701)
 - Alternate file credentials: `transports/wincred.py`, covered in section 6

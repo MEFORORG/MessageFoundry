@@ -4446,11 +4446,12 @@ def _supervise(args: argparse.Namespace) -> int:
     if _protocol_floor_or_refusal("start the fleet") is None:
         return 2
 
-    # Vault BACKLOG #2701: the start-up code check each shard's `serve` makes, for the same reason
-    # as the gates around it, and because the supervisor's own interpreter ran that code too. The
-    # supervisor builds no loosening list, so its own reading is logged here, like the
-    # remote-debugging one above. Each shard reports its own through `serve`. The reading also
-    # searches the import path the shards inherit, so a module only they would run refuses here.
+    # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
+    # reason as the gates around it, and because the supervisor's own interpreter ran that code
+    # too. The supervisor builds no loosening list, so its own reading is logged here, like the
+    # remote-debugging one above. Each engine shard reports its own through `serve`. The reading
+    # also searches the import path the engine shards inherit, so a module only they would run
+    # refuses here.
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.startupcode import startup_loosenings, startup_posture, startup_refusal
 
@@ -4459,8 +4460,8 @@ def _supervise(args: argparse.Namespace) -> int:
     startup_refused = startup_refusal(startup)
     if startup_refused is not None and enforcing:
         print(
-            f"error: {startup_refused}. Every shard would refuse to start; refusing to start the "
-            "fleet.",
+            f"error: {startup_refused}. An engine shard would refuse to start on it, or run it; "
+            "refusing to start the fleet.",
             file=sys.stderr,
         )
         return 2

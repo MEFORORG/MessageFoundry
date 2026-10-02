@@ -14,6 +14,7 @@ planted. The launch reading is taken off real child interpreters, with and witho
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import json
 import locale
@@ -83,6 +84,11 @@ def site_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("PYTHONPATH", raising=False)
     monkeypatch.setattr(site_module, "ENABLE_USER_SITE", False)
     return site
+
+
+def _customize(site: Path) -> list[StartupCodeItem]:
+    """The customize modules found on the search path as it stands now."""
+    return startupcode._customize_items([site], startupcode._search_path())
 
 
 def _pth_verdicts(site: Path) -> dict[str, str]:
@@ -197,7 +203,7 @@ def test_a_sitecustomize_on_the_import_path_is_found_and_not_run(
         f"open({str(ran)!r}, 'w').close()\n", encoding="utf-8"
     )
     monkeypatch.setattr(sys, "path", [str(site_dir), str(elsewhere)])
-    items = startupcode._customize_items([site_dir])
+    items = _customize(site_dir)
     assert [(i.kind, Path(i.path).parent.name, i.verdict) for i in items] == [
         ("sitecustomize", "on-pythonpath", "unrecorded")
     ]
@@ -212,7 +218,7 @@ def test_every_entry_is_searched_not_only_the_first_that_answers(
         directory.mkdir()
         (directory / "sitecustomize.py").write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(first), str(second)])
-    found = [Path(i.path).parent.name for i in startupcode._customize_items([site_dir])]
+    found = [Path(i.path).parent.name for i in _customize(site_dir)]
     assert found == ["first", "second"]
 
 
@@ -223,10 +229,10 @@ def test_usercustomize_counts_only_where_the_user_site_is_on(
     ``-I`` and in a virtual environment, and a file that cannot run there must not refuse a
     start."""
     (site_dir / "usercustomize.py").write_text("x = 1\n", encoding="utf-8")
-    assert startupcode._customize_items([site_dir]) == []
+    assert _customize(site_dir) == []
     # CONTROL: with the user site on, the same file is listed.
     monkeypatch.setattr(site_module, "ENABLE_USER_SITE", True)
-    assert [i.kind for i in startupcode._customize_items([site_dir])] == ["usercustomize"]
+    assert [i.kind for i in _customize(site_dir)] == ["usercustomize"]
 
 
 def test_the_path_the_children_inherit_is_searched_too(
@@ -237,9 +243,9 @@ def test_the_path_the_children_inherit_is_searched_too(
     inherited = tmp_path / "inherited"
     inherited.mkdir()
     (inherited / "sitecustomize.py").write_text("x = 1\n", encoding="utf-8")
-    assert startupcode._customize_items([site_dir]) == []  # CONTROL: not on sys.path
+    assert _customize(site_dir) == []  # CONTROL: not on sys.path
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["relative/entry", str(inherited)]))
-    found = [Path(i.path).parent.name for i in startupcode._customize_items([site_dir])]
+    found = [Path(i.path).parent.name for i in _customize(site_dir)]
     assert found == ["inherited"]
     # The directory joins the ones checked for write access.
     assert str(inherited) in read_startup_posture().startup_dirs
@@ -252,7 +258,7 @@ def test_a_namespace_package_named_sitecustomize_runs_nothing_and_is_not_listed(
     (tmp_path / "pkg" / "sitecustomize").mkdir(parents=True)
     (tmp_path / "pkg" / "sitecustomize" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(tmp_path / "ns"), str(tmp_path / "pkg")])
-    found = [Path(i.path).parent.parent.name for i in startupcode._customize_items([site_dir])]
+    found = [Path(i.path).parent.parent.name for i in _customize(site_dir)]
     # CONTROL: the package with an __init__ IS listed.
     assert found == ["pkg"]
 
@@ -267,18 +273,18 @@ def test_a_sitecustomize_in_the_interpreters_own_library_is_expected(
     monkeypatch.setattr(
         startupcode, "_interpreter_dirs", lambda: frozenset({startupcode._norm(str(stdlib))})
     )
-    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["interpreter"]
+    assert [i.verdict for i in _customize(site_dir)] == ["interpreter"]
     # CONTROL: the same file where the interpreter's library is not.
     monkeypatch.setattr(startupcode, "_interpreter_dirs", lambda: frozenset())
-    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["unrecorded"]
+    assert [i.verdict for i in _customize(site_dir)] == ["unrecorded"]
 
 
 def test_a_sitecustomize_a_package_records_is_expected(site_dir: Path) -> None:
     module = site_dir / "sitecustomize.py"
     module.write_text("x = 1\n", encoding="utf-8")
-    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["unrecorded"]
+    assert [i.verdict for i in _customize(site_dir)] == ["unrecorded"]
     _install_dist(site_dir, "hooks", [module])
-    items = startupcode._customize_items([site_dir])
+    items = _customize(site_dir)
     assert [(i.verdict, i.owner) for i in items] == [("recorded", "hooks")]
 
 
@@ -294,9 +300,9 @@ def test_a_sitecustomize_a_package_ships_in_a_directory_of_its_own_is_expected(
     module.write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(site_dir), str(bootstrap)])
     # CONTROL: nothing records it yet.
-    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["unrecorded"]
+    assert [i.verdict for i in _customize(site_dir)] == ["unrecorded"]
     _install_dist(site_dir, "agent", [module])
-    items = startupcode._customize_items([site_dir])
+    items = _customize(site_dir)
     assert [(i.verdict, i.owner) for i in items] == [("recorded", "agent")]
 
 
@@ -343,16 +349,26 @@ def test_a_directory_this_process_may_not_add_files_to_reads_as_not_writable(
     tmp_path: Path,
 ) -> None:
     """The Windows check asks the system's own access check, so the control is a real ACL: deny
-    Everyone the right to add a file, then take the entry away again."""
+    Everyone the rights, then take the entry away again. A customize module may be a package, so
+    the right to add a folder counts as well as the right to add a file."""
     if shutil.which("icacls") is None:
         pytest.skip("SKIP (nothing run): icacls not on PATH")
     locked = tmp_path / "locked"
     locked.mkdir()
+
+    def deny(rights: str) -> None:
+        subprocess.run(["icacls", str(locked), "/remove:d", "*S-1-1-0"], capture_output=True)
+        subprocess.run(
+            ["icacls", str(locked), "/deny", f"*S-1-1-0:({rights})"],
+            check=True,
+            capture_output=True,
+        )
+
     assert startupcode._can_add_files(locked) is True  # CONTROL: writable before the entry
-    subprocess.run(
-        ["icacls", str(locked), "/deny", "*S-1-1-0:(WD)"], check=True, capture_output=True
-    )
     try:
+        deny("WD")  # add a file is refused, add a folder is not
+        assert startupcode._can_add_files(locked) is True
+        deny("WD,AD")
         assert startupcode._can_add_files(locked) is False
     finally:
         subprocess.run(["icacls", str(locked), "/remove:d", "*S-1-1-0"], capture_output=True)
@@ -438,10 +454,25 @@ def test_the_hardened_launch_reports_nothing() -> None:
         (
             StartupPosture(
                 launch=InterpreterLaunch(
-                    True, True, True, True, code_path_variables=("PYTHONPATH",)
+                    True,
+                    True,
+                    True,
+                    True,
+                    code_path_variables=("PYTHONPATH",),
+                    reaching_children=("PYTHONPATH",),
                 )
             ),
             ["python_variables_reach_children"],
+        ),
+        # A variable that is set and reaches no child, such as a PYTHONPATH with no absolute
+        # entry, is not reported for the children.
+        (
+            StartupPosture(
+                launch=InterpreterLaunch(
+                    True, True, True, True, code_path_variables=("PYTHONPATH",)
+                )
+            ),
+            [],
         ),
     ],
 )
@@ -456,11 +487,48 @@ def test_a_variable_the_engine_honours_is_named_in_the_not_isolated_entry() -> N
     assert "It reads the PYTHON* environment variables" in risk
     # CONTROL: under -E the same variable is not honoured, and the entry does not claim it is.
     # The children still receive it, so that entry is there as well.
-    ignored = InterpreterLaunch(False, False, True, False, code_path_variables=("PYTHONPATH",))
+    ignored = InterpreterLaunch(
+        False,
+        False,
+        True,
+        False,
+        code_path_variables=("PYTHONPATH",),
+        reaching_children=("PYTHONPATH",),
+    )
     entries = dict(startup_loosenings(StartupPosture(launch=ignored)))
     assert list(entries) == ["interpreter_not_isolated", "python_variables_reach_children"]
     assert "is set in its environment now" not in entries["interpreter_not_isolated"]
     assert "It reads the PYTHON*" not in entries["interpreter_not_isolated"]
+
+
+def test_the_launch_reading_names_a_variable_only_when_it_holds_something(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A variable set to nothing changes nothing. And the child builders drop a ``PYTHONPATH``
+    entry that is not absolute, so a variable holding only those reaches no child."""
+    for name in startupcode._CODE_PATH_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+    def reading() -> tuple[tuple[str, ...], tuple[str, ...]]:
+        launch = startupcode._interpreter_launch()
+        return launch.code_path_variables, launch.reaching_children
+
+    monkeypatch.setenv("PYTHONPATH", "")
+    assert reading() == ((), ())
+    monkeypatch.setenv("PYTHONPATH", "relative/entry")
+    assert reading() == (("PYTHONPATH",), ())
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    assert reading() == (("PYTHONPATH",), ("PYTHONPATH",))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path))
+    assert reading()[1] == ("PYTHONHOME", "PYTHONPATH")
+
+
+def test_an_import_path_entry_that_is_not_text_does_not_stop_the_reading(
+    site_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The import system skips such an entry. The reading runs at every start, so it must too."""
+    monkeypatch.setattr(sys, "path", [str(site_dir), os.fsencode(str(site_dir)), None])
+    assert read_startup_posture().startup_dirs == (str(site_dir),)
 
 
 def test_a_file_name_cannot_break_the_log_line() -> None:
@@ -584,3 +652,81 @@ def test_serve_reports_unexpected_start_up_code_under_warn(
     assert "refusing to start: start-up code" not in captured.err
     # serve installs its own stdout handler, so the loosening line is read from stdout.
     assert "startup_code_unexpected (start-up code the engine does not know" in captured.out
+
+
+# --- supervise makes the same check before it starts an engine shard ------------------------------
+
+
+def _supervise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, posture: StartupPosture, *, warn: bool
+) -> tuple[int, list[str]]:
+    """``_supervise`` with the fleet stubbed out: its return code and the configs it would have
+    spawned. No store key is set, so a run that gets past the start-up gate stops at the at-rest
+    gate. Logging setup is stubbed, so the root handlers are not left bound to this test's
+    capture buffer."""
+    from messagefoundry import __main__ as cli
+
+    spawned: list[str] = []
+
+    async def fake_supervise(config: str, **kwargs: object) -> int:
+        spawned.append(config)
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    if warn:
+        monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    else:
+        monkeypatch.delenv("MEFOR_SECURITY_ENFORCEMENT", raising=False)
+    monkeypatch.setattr(startupcode, "startup_posture", lambda: posture)
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
+    monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: None)
+    args = argparse.Namespace(
+        config=str(_SAMPLES_CONFIG),
+        db=str(tmp_path / "mefor.db"),
+        base_port=8765,
+        env="dev",
+        service_config=None,
+        project_root=str(tmp_path),
+    )
+    return cli._supervise(args), spawned
+
+
+def test_supervise_refuses_unexpected_start_up_code_before_it_starts_an_engine_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    planted = StartupPosture(launch=_HARDENED, items=(_PLANTED,))
+    rc, spawned = _supervise(tmp_path, monkeypatch, planted, warn=False)
+    err = capsys.readouterr().err
+    assert rc == 2 and not spawned
+    assert "start-up code the engine does not know" in err
+    assert "refusing to start the fleet" in err
+    # This gate, and not the at-rest gate after it, is what stopped the start.
+    assert "store key" not in err
+
+
+def test_supervise_does_not_refuse_known_start_up_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: the same start with only expected start-up code gets past this gate, and
+    stops at the next one."""
+    known = StartupPosture(launch=_HARDENED, items=(_KNOWN,))
+    rc, spawned = _supervise(tmp_path, monkeypatch, known, warn=False)
+    err = capsys.readouterr().err
+    assert "start-up code the engine does not know" not in err
+    assert rc == 2 and "store key" in err and not spawned
+
+
+def test_supervise_reports_unexpected_start_up_code_under_warn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    planted = StartupPosture(launch=_PLAIN, items=(_PLANTED,))
+    with caplog.at_level("WARNING", logger="messagefoundry.__main__"):
+        _supervise(tmp_path, monkeypatch, planted, warn=True)
+    assert "start-up code the engine does not know" not in capsys.readouterr().err
+    logged = [record.getMessage() for record in caplog.records]
+    assert any(line.startswith("[security] startup_code_unexpected:") for line in logged), logged
+    assert any(line.startswith("[security] interpreter_not_isolated:") for line in logged), logged

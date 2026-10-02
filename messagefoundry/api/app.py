@@ -2258,10 +2258,10 @@ def create_app(
         # once here, so the loosening list and the `interpreter` block below report one reading.
         # An app built without `serve` never installed the remote-debugging hook, and the reading
         # then says so. The start-up reading is the one `serve` took as it started, kept for the
-        # life of the process, so this call reads no file. An app built without `serve` takes it
-        # here, once.
+        # life of the process. An app built without `serve` takes it here, once, and that first
+        # reading reads files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
-        startup = startup_posture()
+        startup = await asyncio.to_thread(startup_posture)
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
             for name, risk in security_loosenings(

@@ -1274,7 +1274,7 @@ This section is kept rather than deleted, because the claim it used to make is t
     the interpreter imports it. It is off under `-I` and in a virtual environment.
   - The search covers the engine's own import path and the absolute `PYTHONPATH` entries the
     engine hands its Python children. So a `sitecustomize` that only a child would run is listed
-    too, and `supervise` refuses on it before it starts a shard.
+    too, and `supervise` refuses on it before it starts an engine shard.
 - **`startup_directory_writable`: the engine's own account can add a file where start-up code is
   read from.** That is a site directory, or any directory on the import path, where a
   `sitecustomize` would be found. Code running as that account could plant start-up code there,

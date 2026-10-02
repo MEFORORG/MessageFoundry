@@ -164,8 +164,12 @@ class InterpreterLaunch:
     ignore_environment: bool
     #: ``sys.flags.no_user_site``: the user's own site directory is off. ``-I`` and ``-s``.
     no_user_site: bool
-    #: The names from :data:`_CODE_PATH_VARIABLES` that are set. Names only, never values.
+    #: The names from :data:`_CODE_PATH_VARIABLES` that are set to something. Names only, never
+    #: values.
     code_path_variables: tuple[str, ...] = ()
+    #: The ones among them a Python child of the engine is handed with something in it. That
+    #: leaves out a ``PYTHONPATH`` with no absolute entry, which the child builders drop.
+    reaching_children: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,27 +213,42 @@ def _norm(path: str) -> str:
 
 
 def _unique(paths: list[str]) -> list[str]:
-    """``paths`` made absolute, in order, without repeats."""
+    """``paths`` made absolute, in order, without repeats. A relative path that cannot be made
+    absolute, because the working directory is gone, is left out: nothing can be found in it."""
     seen: set[str] = set()
     out: list[str] = []
     for path in paths:
-        key = _norm(path)
+        try:
+            absolute = os.path.abspath(path)
+        except OSError:
+            continue
+        key = os.path.normcase(absolute)
         if key not in seen:
             seen.add(key)
-            out.append(os.path.abspath(path))
+            out.append(absolute)
     return out
+
+
+def _inherited_pythonpath() -> list[str]:
+    """The ``PYTHONPATH`` entries the engine hands a Python child: the absolute ones.
+    ``messagefoundry/childenv.py`` drops the rest."""
+    entries = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    return [entry for entry in entries if os.path.isabs(entry)]
 
 
 def _interpreter_launch() -> InterpreterLaunch:
     """The launch flags of THIS process. It says nothing about any other process."""
     flags = sys.flags
-    present = {name.upper() for name in os.environ} if sys.platform == "win32" else set(os.environ)
+    present = tuple(name for name in _CODE_PATH_VARIABLES if os.environ.get(name))
     return InterpreterLaunch(
         isolated=bool(flags.isolated),
         safe_path=bool(flags.safe_path),
         ignore_environment=bool(flags.ignore_environment),
         no_user_site=bool(flags.no_user_site),
-        code_path_variables=tuple(name for name in _CODE_PATH_VARIABLES if name in present),
+        code_path_variables=present,
+        reaching_children=tuple(
+            name for name in present if name != "PYTHONPATH" or _inherited_pythonpath()
+        ),
     )
 
 
@@ -245,12 +264,10 @@ def _site_dirs() -> list[Path]:
 def _search_path() -> list[str]:
     """The import path a customize module is looked for on: this process's, then the absolute
     ``PYTHONPATH`` entries the engine hands its Python children. A process that reads the
-    variable has them on its own path already."""
-    inherited = os.environ.get("PYTHONPATH", "").split(os.pathsep)
-    return _unique(
-        [entry or os.getcwd() for entry in sys.path]
-        + [entry for entry in inherited if os.path.isabs(entry)]
-    )
+    variable has them on its own path already. An entry that is not text is left out, as the
+    import system leaves it out."""
+    own = [entry or os.curdir for entry in sys.path if isinstance(entry, str)]
+    return _unique(own + _inherited_pythonpath())
 
 
 def _is_hidden(path: Path) -> bool:
@@ -355,8 +372,8 @@ def _customize_modules() -> tuple[Kind, ...]:
     return ("sitecustomize", "usercustomize") if site.ENABLE_USER_SITE else ("sitecustomize",)
 
 
-def _customize_items(site_dirs: list[Path]) -> list[StartupCodeItem]:
-    """Each customize module findable on the search path (:func:`_search_path`).
+def _customize_items(site_dirs: list[Path], search: list[str]) -> list[StartupCodeItem]:
+    """Each customize module findable on ``search`` (:func:`_search_path`).
 
     Every entry is searched, not only the first that answers: a module on a later entry runs the
     day the earlier one is removed. Nothing is imported. A module found on an entry that was added
@@ -368,7 +385,7 @@ def _customize_items(site_dirs: list[Path]) -> list[StartupCodeItem]:
     interpreter_dirs = _interpreter_dirs()
     names = _customize_modules()
     items: list[StartupCodeItem] = []
-    for root in _search_path():
+    for root in search:
         for name in names:
             try:
                 spec = importlib.machinery.PathFinder.find_spec(name, [root])
@@ -386,8 +403,9 @@ def _customize_items(site_dirs: list[Path]) -> list[StartupCodeItem]:
     return items
 
 
-#: ``FILE_ADD_FILE``: the right to create a file in a directory.
-_FILE_ADD_FILE: Final = 0x0002
+#: ``FILE_ADD_FILE`` and ``FILE_ADD_SUBDIRECTORY``: the rights to create a file and a folder in a
+#: directory. A customize module may be a package, so either one is enough to plant it.
+_ADD_RIGHTS: Final = (0x0002, 0x0004)
 _FILE_SHARE_ALL: Final = 0x0007
 _OPEN_EXISTING: Final = 3
 #: Needed to open a directory at all.
@@ -396,13 +414,17 @@ _ERROR_ACCESS_DENIED: Final = 5
 
 
 def _can_add_files(directory: Path) -> bool | None:
-    """Whether this process may create a file in ``directory``. None when that cannot be told.
+    """Whether this process may create a file or a folder in ``directory``. None when that cannot
+    be told.
 
-    Nothing is created. On Windows the directory is opened asking for the add-file right, which
-    makes the system run its own access check against this process's token, a write-restricted
-    service token included. ``os.access`` cannot answer there: it reads the read-only attribute
-    and no permission. Elsewhere ``os.access`` asks the kernel, with the effective ids where the
-    platform supports that, and a read-only file system answers no."""
+    Nothing is created. On Windows the directory is opened asking for each add right in turn,
+    which makes the system run its own access check against this process's token, a
+    write-restricted service token included. ``os.access`` cannot answer there: it reads the
+    read-only attribute and no permission. Elsewhere ``os.access`` asks the kernel, with the
+    effective ids where the platform supports that, and a read-only file system answers no.
+
+    It does not ask whether an EXISTING file in the directory can be rewritten. A start-up file
+    the account owns inside a directory it cannot add to is not seen here."""
     if sys.platform != "win32":
         try:
             effective = os.access in os.supports_effective_ids
@@ -424,21 +446,26 @@ def _can_add_files(directory: Path) -> bool | None:
         ctypes.c_void_p,
     ]
     create_file.restype = ctypes.c_void_p
-    handle = create_file(
-        str(directory),
-        _FILE_ADD_FILE,
-        _FILE_SHARE_ALL,
-        None,
-        _OPEN_EXISTING,
-        _FILE_FLAG_BACKUP_SEMANTICS,
-        None,
-    )
-    invalid = ctypes.c_void_p(-1).value
-    if handle is None or handle == invalid:
-        return False if ctypes.get_last_error() == _ERROR_ACCESS_DENIED else None
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle(handle)
-    return True
+    invalid = ctypes.c_void_p(-1).value
+    every_right_denied = True
+    for right in _ADD_RIGHTS:
+        handle = create_file(
+            str(directory),
+            right,
+            _FILE_SHARE_ALL,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        if handle is not None and handle != invalid:
+            kernel32.CloseHandle(handle)
+            return True
+        if ctypes.get_last_error() != _ERROR_ACCESS_DENIED:
+            every_right_denied = False
+    # Not writable only when the system refused each right. Any other failure settles nothing.
+    return False if every_right_denied else None
 
 
 def read_startup_posture() -> StartupPosture:
@@ -451,13 +478,12 @@ def read_startup_posture() -> StartupPosture:
     if sys.flags.no_site:
         return StartupPosture(launch=launch)
     site_dirs = _site_dirs()
+    search = _search_path()
     items = [item for directory in site_dirs for item in _pth_items(directory)]
-    items.extend(_customize_items(site_dirs))
+    items.extend(_customize_items(site_dirs, search))
     # An import-path entry that is an archive, or that does not exist, holds no file to plant.
     startup_dirs = [
-        path
-        for path in _unique([*(str(d) for d in site_dirs), *_search_path()])
-        if os.path.isdir(path)
+        path for path in _unique([*(str(d) for d in site_dirs), *search]) if os.path.isdir(path)
     ]
     writable: list[str] = []
     unchecked: list[str] = []
@@ -557,11 +583,12 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
                 f"`python {' '.join(ISOLATED_LAUNCH_OPTIONS)} -m messagefoundry serve ...`",
             )
         )
-    if launch.ignore_environment and variables:
+    if launch.ignore_environment and launch.reaching_children:
         out.append(
             (
                 "python_variables_reach_children",
-                f"{variables} is set in the engine's environment. The engine ignores it, but the "
+                f"{', '.join(launch.reaching_children)} is set in the engine's environment. The "
+                "engine ignores it, but the "
                 "Python children it starts (the sandbox worker, and each engine shard under "
                 "`supervise`) are not isolated and would import from where it points. Remove it "
                 "from the service's environment",
