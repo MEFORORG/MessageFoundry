@@ -198,7 +198,7 @@ GUARD_SUB = "S-1-guard"
 
 
 async def _guarded_session(
-    store: Any, token: str, pair: tuple[str, str] | None, *, user: str = GUARD_USER
+    store: Any, token: str, pair: tuple[str | None, str | None] | None, *, user: str = GUARD_USER
 ) -> bool:
     """One ``create_session`` for the guard contract. ``pair`` of ``None`` passes NO guard at all,
     which is the control arm, not a guard that matches nothing."""
@@ -257,3 +257,76 @@ async def _assert_session_binding_guard_contract(store: Any) -> None:
     # 5. CONTROL for step 3. With no guard requested the SAME unbound account still takes a session,
     #    so the refusals above came from the guard and not from anything else about the row.
     assert await _guarded_session(store, "g-unguarded", None) is True
+
+
+#: A second account for the bind's sweep, so "every session of THAT account" has a control.
+GUARD_BYSTANDER = "fed-guard-bystander"
+#: The pair a Windows SSO mint requires: an unbound row.
+UNBOUND: tuple[None, None] = (None, None)
+
+
+async def _live(store: Any, token: str) -> bool:
+    session = await store.get_session(token)
+    return session is not None and session.revoked_at is None
+
+
+async def _assert_bind_sweeps_and_unbound_guard_contract(store: Any) -> None:
+    """``set_user_federated_subject`` and ``create_session(require_federated_subject=(None, None))``
+    on this backend (vault BACKLOG #2609).
+
+    Two decisions. A bind ends every live session of the account it binds, in its own transaction,
+    and reports the count. And a session insert that requires an unbound row is refused once the row
+    is bound. As in the contract above, what is checked is the decision, sequentially: the
+    interleaving is a backend lock property.
+    """
+    for user in (GUARD_USER + "-2", GUARD_BYSTANDER):
+        await store.create_user(
+            user_id=user, username=user, auth_provider="ad", now=1.0, password_generated=False
+        )
+    account = GUARD_USER + "-2"
+
+    # 1. Unbound: the guarded insert is written. CONTROL for step 4.
+    assert await _guarded_session(store, "b-unbound", UNBOUND, user=account) is True
+    assert await _guarded_session(store, "b-plain", None, user=account) is True
+    assert await _guarded_session(store, "b-bystander", None, user=GUARD_BYSTANDER) is True
+
+    # 2. A write that changes nothing revokes nothing and answers None. The user is unknown.
+    assert (
+        await store.set_user_federated_subject("fed-guard-nobody-2", ISSUER, "S-1-none", now=2.0)
+        is None
+    )
+    assert await _live(store, "b-unbound") and await _live(store, "b-plain")
+
+    # 3. THE BIND. Both of the account's sessions end, the count says two, and the other account's
+    #    session is untouched.
+    swept = await store.set_user_federated_subject(
+        account, ISSUER, "S-1-guard-2", now=3.0, expect_unbound=True
+    )
+    assert swept == 2, swept
+    assert not await _live(store, "b-unbound") and not await _live(store, "b-plain")
+    assert await _live(store, "b-bystander"), "the sweep reached another account"
+
+    # 4. THE CASE THE GUARD EXISTS FOR. The row is bound, so an insert that requires it unbound is
+    #    refused and writes nothing.
+    assert await _guarded_session(store, "b-after-bind", UNBOUND, user=account) is False
+
+    # 5. A conditional write on a row that is already bound writes nothing, so it revokes nothing:
+    #    the session minted under the binding stays live, and the answer is None and not 0.
+    assert await _guarded_session(store, "b-bound", (ISSUER, "S-1-guard-2"), user=account) is True
+    again = await store.set_user_federated_subject(
+        account, ISSUER, "S-1-other", now=4.0, expect_unbound=True
+    )
+    assert again is None, again
+    assert await _live(store, "b-bound")
+
+    # 6. A bind that finds no session still wrote: it answers 0, which is not None.
+    await store.create_user(
+        user_id="fed-guard-quiet",
+        username="fed-guard-quiet",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+    )
+    assert (
+        await store.set_user_federated_subject("fed-guard-quiet", ISSUER, "S-1-quiet", now=5.0) == 0
+    )

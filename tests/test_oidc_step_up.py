@@ -50,6 +50,15 @@ from tests.test_auth_oidc_service import (
 )
 
 ORIGIN = "https://ops.example"
+#: A second directory account, with no federated binding, so Windows SSO still signs it in.
+UNBOUND_PRINCIPAL = AdPrincipal(
+    username="asmith",
+    display_name="A Smith",
+    email="a@corp.example",
+    dn="CN=asmith,DC=corp,DC=example",
+    groups=PRINCIPAL.groups,
+    directory_object_id="guid-asmith",
+)
 NEXT = "/ui/config/reload"
 
 
@@ -132,12 +141,15 @@ async def _mechanism(store: MessageStore, token: str) -> str | None:
 async def test_a_federated_session_is_minted_as_oidc_and_a_kerberos_one_as_kerberos(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ADR 0184 item (iv): one hybrid account, two mechanisms, and the SESSION says which ran."""
+    """ADR 0184 item (iv): two mechanisms, and the SESSION says which ran.
+
+    Two directory accounts, because one account no longer holds both: a bound account is refused
+    Windows SSO, and the bind ends the sessions it held (vault BACKLOG #2609)."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
         federated = await _oidc_session(service, monkeypatch, rsa_key)
-        kerberos = await service._complete_ad_login(PRINCIPAL, None, mfa_verified=False)
+        kerberos = await service._complete_ad_login(UNBOUND_PRINCIPAL, None, mfa_verified=False)
         assert kerberos.ok and kerberos.token is not None
         assert await _mechanism(store, federated) == SessionMechanism.OIDC.value
         assert await _mechanism(store, kerberos.token) == SessionMechanism.KERBEROS.value
@@ -184,12 +196,13 @@ async def test_an_oidc_session_cannot_step_up_with_a_password(
 async def test_a_kerberos_session_of_the_same_account_keeps_the_password_leg(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
-    """The inverse: the refusal keys on the SESSION, so the same account signed in by Kerberos still
-    re-binds (ADR 0142 Amendment B: "those sessions keep their existing step-up")."""
+    """The inverse: the refusal keys on the SESSION, so a Kerberos session still re-binds (ADR 0142
+    Amendment B: "those sessions keep their existing step-up"). The account has no binding, because
+    a bound account holds no Kerberos session (vault BACKLOG #2609)."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _CountingLdap()
-        service = await _service(store, rsa_key, ldap=ldap)
+        service = await _service(store, rsa_key, ldap=ldap, bind=None)
         login = await service._complete_ad_login(PRINCIPAL, None, mfa_verified=False)
         assert login.ok and login.token is not None and login.identity is not None
 
@@ -229,7 +242,8 @@ async def test_the_step_up_request_sends_max_age_zero_and_prompt_login(
 async def test_a_non_oidc_session_cannot_start_the_idp_leg(rsa_key: rsa.RSAPrivateKey) -> None:
     store = await MessageStore.open(":memory:")
     try:
-        service = await _service(store, rsa_key)
+        # An account with no binding: a bound one holds no Kerberos session (vault BACKLOG #2609).
+        service = await _service(store, rsa_key, bind=None)
         login = await service._complete_ad_login(PRINCIPAL, None, mfa_verified=False)
         assert login.token is not None
         with pytest.raises(oidc.FlowError):

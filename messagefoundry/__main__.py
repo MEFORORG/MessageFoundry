@@ -684,7 +684,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "protect-key",
         help="DPAPI-protect the store key to a file for [store].encryption_key_file (Windows-only)",
     )
-    protect_key.add_argument("--out", required=True, help="path to write the protected key file")
+    protect_key.add_argument(
+        "--out",
+        required=True,
+        help="path to write the protected key file (must not exist; a file is never replaced)",
+    )
     protect_key.add_argument(
         "--generate",
         action="store_true",
@@ -2038,6 +2042,10 @@ def _serve(args: argparse.Namespace) -> int:
             "encryption protects them). Configure MEFOR_STORE_ENCRYPTION_KEY to encrypt them.",
             file=sys.stderr,
         )
+
+    # The store key file is checked BEFORE it is used (vault BACKLOG #2601).
+    if not _store_key_file_gate(settings, enforcing=enforcing):
+        return 2
 
     # PHI-at-rest invariant (#186b, ASVS 13.2.4): at-rest encryption is effective-by-default on ANY
     # instance, not only a production one — the keyless gate ABOVE already fails
@@ -4092,24 +4100,36 @@ def _serve(args: argparse.Namespace) -> int:
         ensure_api_tls_material,
         generated_state_dir,
     )
+    from messagefoundry.restricted_file import RestrictedFileError
 
     # A renewal or recovery of the generated pair is reported here and audited by the lifespan once
     # the store is open, which is after this point (ADR 0172 decision 6: never silent).
     _replaced: list[GeneratedPairReplaced] = []
-    _material = ensure_api_tls_material(
-        settings.api,
-        state_dir=generated_state_dir(settings.store.path),
-        replacements=_replaced,
-        # An engine shard never renews: `supervise` renews before it spawns the whole fleet, so a
-        # lone restarted shard cannot leave its siblings serving a different certificate (#1276).
-        renew=args.shard is None,
-    )
+    _state_dir = generated_state_dir(settings.store.path)
+    try:
+        _material = ensure_api_tls_material(
+            settings.api,
+            state_dir=_state_dir,
+            replacements=_replaced,
+            # An engine shard never renews: `supervise` renews before it spawns the whole fleet, so
+            # a lone restarted shard cannot leave its siblings serving a different certificate
+            # (#1276).
+            renew=args.shard is None,
+        )
+    except RestrictedFileError as exc:
+        # The TLS key could not be created restricted, and no usable pair exists to fall back on
+        # (vault BACKLOG #2601). A clean refusal, as protect-key and the cert commands give.
+        print(f"error: {exc}; refusing to start.", file=sys.stderr)
+        return 2
     # Minted HERE, before the app is built, so the expiry monitor below watches the certificate this
     # listener actually presents. [api].tls_cert_file is the PRE-mint config value and is empty
     # exactly when the engine minted, so handing the monitor that value left the generated pair
     # unwatched (BACKLOG #1276). None only behind a declared upstream terminator: the engine then
     # serves no certificate of its own, so it has none to watch.
     _served_api_cert = _material[0] if _material is not None else None
+    # The key the engine minted is checked before it is served (vault BACKLOG #2601).
+    if not _generated_tls_key_gate(settings, _state_dir, enforcing=enforcing):
+        return 2
 
     app = create_managed_app(
         store_settings=settings.store,
@@ -4305,8 +4325,10 @@ def _protocol_floor_or_refusal(refusing_to: str) -> tuple[Any, Any] | None:
         return None
 
 
-def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> None:
+def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> Path:
     """Renew the shared generated API pair, if due, before any engine shard starts (#1276).
+
+    Returns the state dir the pair lives in, which is where each shard will look for it.
 
     Every shard serves this one pair from the state dir beside its store, and a shard never renews
     it (``serve --shard`` passes ``renew=False``), so this is the fleet's only renewal: all shards
@@ -4337,12 +4359,11 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> N
     if root is not None and not store_path.is_absolute():
         store_path = root / store_path
 
+    state_dir = generated_state_dir(str(store_path))
     replaced: list[GeneratedPairReplaced] = []
-    ensure_api_tls_material(
-        settings.api, state_dir=generated_state_dir(str(store_path)), replacements=replaced
-    )
+    ensure_api_tls_material(settings.api, state_dir=state_dir, replacements=replaced)
     if not replaced:
-        return
+        return state_dir
     posture = (
         hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
         if settings.ai is not None
@@ -4366,6 +4387,7 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> N
             await store.close()
 
     run_guarded(_audit())
+    return state_dir
 
 
 def _supervise(args: argparse.Namespace) -> int:
@@ -4445,12 +4467,25 @@ def _supervise(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # Vault BACKLOG #2601: the two key-file checks each shard's `serve` makes, for the same reason
+    # as the gates above: every shard would refuse, and the supervisor would only restart them. The
+    # store key file is checked before the renewal below can open the store and read it.
+    from messagefoundry.config.ai_policy import SecurityEnforcement
+    from messagefoundry.restricted_file import RestrictedFileError
     from messagefoundry.store.base import KeylessAuditChainRefused
 
+    enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
+    if not _store_key_file_gate(settings, enforcing=enforcing):
+        return 2
     try:
-        _renew_api_tls_before_spawning(settings, db_base)
+        state_dir = _renew_api_tls_before_spawning(settings, db_base)
     except KeylessAuditChainRefused as exc:  # #1916: a named key the provider did not resolve
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except RestrictedFileError as exc:  # the TLS key could not be created restricted
+        print(f"error: {exc}; refusing to start the fleet.", file=sys.stderr)
+        return 2
+    if not _generated_tls_key_gate(settings, state_dir, enforcing=enforcing):
         return 2
 
     return run_guarded(
@@ -5050,36 +5085,17 @@ def _cert_fail(message: str, *, as_json: bool, code: int = 2) -> int:
 
 
 def _write_private_key(path: Path, pem: bytes) -> None:
-    """Write a private-key PEM with ``O_EXCL`` (refuse to overwrite) + ``0o600``, then tighten the
-    Windows DACL via ``_secure_file`` — the write-then-secure sequence ``protect-key`` uses. Raises
-    ``FileExistsError`` when ``path`` already exists (never clobber a key) or ``OSError`` on write
-    failure. The PEM bytes are secret — never logged or surfaced in an exception."""
-    import os
+    """Write a private-key PEM to a NEW file that is restricted from the moment it exists.
 
-    from messagefoundry.store.store import _secure_file
+    The create is exclusive and carries the restriction itself (``restricted_file``): mode ``0o600``
+    on POSIX, and on Windows an access list attached in the creating call. It is the same helper
+    ``protect-key`` uses, and it fails closed (vault BACKLOG #2601). Raises ``FileExistsError`` when
+    ``path`` already exists (never clobber a key), ``RestrictedFileError`` when the file cannot be
+    created restricted, or ``OSError`` on write failure; in the last two cases nothing is left at
+    ``path``. The PEM bytes are secret — never logged or surfaced in an exception."""
+    from messagefoundry.restricted_file import write_restricted_file
 
-    # The exclusive create sits OUTSIDE the cleanup guard on purpose: a pre-existing key raises
-    # FileExistsError HERE, and that file is the operator's real key — unlinking it is precisely the
-    # clobber the O_EXCL refusal exists to prevent.
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    placed = False
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(pem)
-        # Inside the guard for breadth, not because it raises today: _secure_file is best-effort and
-        # non-fatal by contract (it logs a failed restriction rather than raising, so the engine can
-        # still start). Were that ever to change, the key it could not lock down must not be the one
-        # thing left behind.
-        _secure_file(path)
-        placed = True
-    finally:
-        # A write that dies partway (a full volume) would otherwise leave a TRUNCATED key that
-        # nothing removes, and the O_EXCL refusal above then fires on it forever: the caller cannot
-        # re-mint, and all it gets is a FileExistsError naming no cause. `finally`, not `except`, so
-        # nothing is caught or relabelled. It runs after the `with` closed the handle, which Windows
-        # requires before an unlink.
-        if not placed:
-            path.unlink(missing_ok=True)
+    write_restricted_file(path, pem)
 
 
 def _cert(args: argparse.Namespace) -> int:
@@ -5098,7 +5114,7 @@ def _cert_import(args: argparse.Namespace) -> int:
     which only an unencrypted bundle with no MAC can use, BACKLOG #1352); it is never a CLI arg and
     never echoed. A bad password / malformed bundle is
     reported with a scrubbed message so the passphrase can never leak. cert.pem + ca-chain.pem are
-    public; key.pem is written ``O_EXCL`` + ``0o600`` + ``_secure_file`` and refuses to overwrite."""
+    public; key.pem is written by :func:`_write_private_key`, which refuses to overwrite."""
     import os
 
     from messagefoundry import pki
@@ -5367,9 +5383,9 @@ def _cert_inventory(args: argparse.Namespace) -> int:
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key for NON-PROD TLS bring-up.
 
-    Writes cert.pem + key.pem to ``--out-dir``; key.pem is written ``O_EXCL`` + ``0o600`` +
-    ``_secure_file`` and refuses to overwrite. Prints a clear DEV/non-prod note (a self-signed cert has
-    no chain of trust)."""
+    Writes cert.pem + key.pem to ``--out-dir``; key.pem is written by :func:`_write_private_key`,
+    which refuses to overwrite. Prints a clear DEV/non-prod note (a self-signed cert has no chain of
+    trust)."""
     from messagefoundry import pki
 
     if args.days <= 0:
@@ -5425,9 +5441,15 @@ def _protect_key(args: argparse.Namespace) -> int:
 
     Source: ``--generate`` mints a fresh key (also printed once to stderr so it can be backed up
     offline — the machine-bound file is unrecoverable if the host is lost); otherwise the key is read
-    from ``MEFOR_STORE_ENCRYPTION_KEY``. The file is written with a tight DACL — the minting owner plus
-    READ for the engine's service principal (SYSTEM by default, or ``--grant-account``) — atop DPAPI, so
-    the service account (not just the minting admin) can read the key at startup.
+    from ``MEFOR_STORE_ENCRYPTION_KEY``. The file is CREATED with a tight DACL, in the call that creates
+    it: SYSTEM (a LocalSystem service), Administrators and the minting owner, plus READ for
+    ``--grant-account`` (a virtual / gMSA service account). So the service account, not just the
+    minting admin, can read the key at startup, and the file never exists with the directory's
+    inherited access (vault BACKLOG #2601).
+
+    Fails closed: if the file cannot be created that way, or ``--out`` already exists, the command
+    exits non-zero, writes no file and prints no success line. A generated key is printed only once
+    the file that holds it exists.
     """
     import base64
     import os
@@ -5435,15 +5457,9 @@ def _protect_key(args: argparse.Namespace) -> int:
 
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable, protect_key_to_file
     from messagefoundry.store.crypto import generate_key
-    from messagefoundry.store.store import _secure_file
 
     if args.generate:
         key_b64 = generate_key()
-        print(
-            "Generated a new store key. BACK IT UP OFFLINE — the protected file is bound to this "
-            f"machine and cannot be recovered if the host is lost:\n  {key_b64}",
-            file=sys.stderr,
-        )
     else:
         key_b64 = os.environ.get("MEFOR_STORE_ENCRYPTION_KEY", "").strip()
         if not key_b64:
@@ -5466,8 +5482,13 @@ def _protect_key(args: argparse.Namespace) -> int:
         return 2
 
     out = Path(args.out)
+    # Machine-scope DPAPI lets any host principal decrypt, so the file's access list is the control.
+    # The restricted create always names SYSTEM and Administrators; --grant-account adds read for a
+    # virtual / gMSA service account, without which the service would fail closed at startup
+    # (DpapiError).
+    grants = [args.grant_account] if args.grant_account else []
     try:
-        protect_key_to_file(key_b64, out, machine_scope=not args.user)
+        protect_key_to_file(key_b64, out, machine_scope=not args.user, read_grants=grants)
     except DpapiUnavailable as exc:
         print(
             f"error: {exc}. protect-key is Windows-only; on other platforms keep the key in "
@@ -5475,25 +5496,37 @@ def _protect_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    except FileExistsError:
+        print(
+            f"error: refusing to overwrite an existing file: {out}. No key file was written. "
+            "Choose a new --out path, or remove that file first if no store still needs its key.",
+            file=sys.stderr,
+        )
+        return 2
+    except OSError as exc:
+        # The file could not be created restricted, or the write failed. Either way the helper
+        # removed what it created, so there is nothing to print a success line about.
+        print(f"error: cannot write {out}: {exc}. No key file was written.", file=sys.stderr)
+        return 2
     except DpapiError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    # Lock the key file down, but keep it readable by the engine's service principal: SYSTEM by default
-    # (a LocalSystem service) plus an explicit --grant-account for a virtual / gMSA account. Machine-scope
-    # DPAPI already lets any host principal decrypt; without these read grants the owner-only DACL would
-    # lock the file to the minting admin and the service would fail closed at startup (DpapiError). The
-    # generic _secure_file (store DB/WAL) passes no grants and stays owner-only.
-    grants = ["*S-1-5-18"]  # NT AUTHORITY\SYSTEM — well-known SID, robust on non-English Windows
-    if args.grant_account:
-        grants.append(args.grant_account)
-    _secure_file(out, extra_read_grants=grants)
-    granted = "SYSTEM" + (f" + {args.grant_account!r}" if args.grant_account else "")
+    if args.generate:
+        print(
+            "Generated a new store key. BACK IT UP OFFLINE — the protected file is bound to this "
+            f"machine and cannot be recovered if the host is lost:\n  {key_b64}",
+            file=sys.stderr,
+        )
+    granted = f", and {args.grant_account!r} may read it" if args.grant_account else ""
     print(
-        f"Wrote DPAPI-protected key to {out} (read-granted to {granted}).\n"
+        f"Wrote DPAPI-protected key to {out} (restricted to SYSTEM, Administrators and this "
+        f"account{granted}).\n"
         f"Next: set [store].encryption_key_file = {str(out)!r} and unset MEFOR_STORE_ENCRYPTION_KEY. "
         "Leave [store].key_provider at 'auto' or set it to 'dpapi'; 'env' ignores the file. "
-        "If the engine runs as a virtual / gMSA account (not LocalSystem), re-run with "
-        "--grant-account '<that account>' so the service can read the key at startup."
+        "If the engine runs as a virtual / gMSA account (not LocalSystem), the file must be "
+        "created with --grant-account '<that account>' so the service can read the key at "
+        "startup. protect-key does not replace a file, so to add the grant, delete this file and "
+        "run protect-key again with the SAME key in MEFOR_STORE_ENCRYPTION_KEY, not --generate."
     )
     return 0
 
@@ -6006,6 +6039,78 @@ def _refuse_an_unauditable_write(store: Store) -> None:
         raise _UnauditableWrite(
             f"refusing to write anything: this command's audit row would be refused ({refusal})"
         )
+
+
+def _key_file_access_gate(path: str, *, what: str, remedy: str, enforcing: bool) -> bool:
+    """May ``serve`` use the key file at ``path``? ``False`` means refuse the start.
+
+    A broad group must not be able to read or change the file
+    (``restricted_file.broad_access_problem``, which also reports a file whose access could not be
+    read). Under ``[security].enforcement = enforce``
+    a problem is an error and the answer is ``False``; under ``warn`` it is a warning and the start
+    goes on. ``what`` names the file for the operator and ``remedy`` says what to do about it."""
+    from messagefoundry.restricted_file import broad_access_problem
+
+    problem = broad_access_problem(Path(path))
+    if problem is None:
+        return True
+    if enforcing:
+        print(
+            f"error: {what} is not restricted: {problem}. {remedy}; refusing to start.",
+            file=sys.stderr,
+        )
+        return False
+    print(f"warning: {what} is not restricted: {problem}. {remedy}.", file=sys.stderr)
+    return True
+
+
+def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
+    """:func:`_key_file_access_gate` for the DPAPI store key file, when the provider loads one.
+
+    Machine-scope DPAPI lets any account on the host unprotect the blob, so the file's access list
+    is what keeps the key from the others. ``protect-key`` creates the file restricted; this
+    catches one that was moved, copied or re-granted since. A file that is absent is left to the
+    key provider, which fails closed on it at store open and says why."""
+    from messagefoundry.secrets_dpapi import dpapi_available
+    from messagefoundry.store.keyprovider import provider_key_file
+
+    key_file = provider_key_file(settings.store)
+    # Off Windows the file cannot be used at all: the key provider refuses it at store open and says
+    # so, which is the fault the operator needs to hear about.
+    if key_file is None or not dpapi_available() or not Path(key_file).exists():
+        return True
+    return _key_file_access_gate(
+        key_file,
+        what="the store key file named by [store].encryption_key_file",
+        remedy=(
+            "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
+            "the key again with `messagefoundry protect-key` to a new path"
+        ),
+        enforcing=enforcing,
+    )
+
+
+def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enforcing: bool) -> bool:
+    """:func:`_key_file_access_gate` for the TLS private key the engine minted into ``state_dir``.
+
+    The key is created restricted, so this catches a pair that was copied into a broader directory
+    or re-granted since. Only the generated pair, as the plan names it: an operator's own
+    ``[api].tls_key_file`` is not judged here."""
+    from messagefoundry.api.tls import plan_api_tls_material
+
+    plan = plan_api_tls_material(settings.api, state_dir=state_dir)
+    if plan.source != "generated" or plan.key_file is None:
+        return True
+    return _key_file_access_gate(
+        plan.key_file,
+        what=f"the generated TLS private key {plan.key_file}",
+        remedy=(
+            "Restrict it to the account the engine runs as, or delete it and its certificate so "
+            "the next start mints a new pair. If the volume itself widens the file on every "
+            "mount, set [api].tls_cert_file to a certificate of your own"
+        ),
+        enforcing=enforcing,
+    )
 
 
 def _store_key_configured(settings: ServiceSettings) -> bool:
@@ -8412,6 +8517,10 @@ def _security(args: argparse.Namespace) -> int:
     #: GET /security/posture while this command still shows the file's `true`. Both readings are right
     #: for what they describe, and a scope marker that did not say so would send an auditor comparing
     #: the two surfaces looking for a defect in one of them.
+    #:
+    #: Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
+    #: environment variable, and security_loosenings() reads it from the process that calls it. Here
+    #: that is the operator's shell, not the service.
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
@@ -8425,7 +8534,10 @@ def _security(args: argparse.Namespace) -> int:
             "reading: this command is a separate process (GET /security/posture reports it). "
             "These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
-            "GET /security/posture"
+            "GET /security/posture. One entry is not read from the file at all: "
+            "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE is reported from the environment of THIS command, "
+            "which may not be the service's, so it can appear here beside an `enforce` file, or be "
+            "absent here while the service carries it — GET /security/posture reads the engine's own"
         ),
     }
 

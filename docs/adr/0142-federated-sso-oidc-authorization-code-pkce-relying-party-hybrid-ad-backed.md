@@ -523,3 +523,51 @@ B.1 left the verification of what comes back to the build. These are its criteri
   leg's path: stamp `reauth_at` and the client address on the old hash, rotate the session (ASVS 7.2.4)
   carrying `mfa_verified_at` and `auth_mechanism` forward, and only then mint any single-use action
   grant against the new hash.
+
+## Amendment C (2026-10-01) — a bound account signs in through the IdP only, and a bind ends its sessions (vault BACKLOG #2609)
+
+> Decided 2026-10-01 after an adversarial review the owner asked for and said to follow. It came from
+> the architecture review the owner approved the same day. This amendment does not change the status
+> line at the top of this ADR.
+
+An administrator binds an account to put it behind the identity provider's own sign-in. Windows SSO
+mints at the minimum, one factor and nothing asserted. So a bound account that Windows SSO still
+admitted kept a sign-in that never met the identity provider. Two things changed.
+
+- **Windows SSO refuses a bound account.** `_directory_login_refusal` refuses the row at both of its
+  call sites, audited as `auth.login_failed` with `reason=federated_sign_in_required`. The Windows
+  SSO session insert also requires an unbound row, so a bind that lands during a sign-in, or a
+  sign-in inside a rebind's clear-then-set gap, leaves no session. An account with no binding is
+  unchanged.
+- **Every bind ends every live session of the account**, in the same transaction that writes the
+  pair. A first bind used to revoke nothing. The session doing the bind is never one of the
+  account's own, because both routes refuse a caller binding its own account.
+
+**This narrows three things above. It does not leave them true as written.**
+
+- **AC-8 is narrowed.** For a bound account the system no longer serves a Kerberos login while the
+  IdP is unreachable. AC-8 still holds for local accounts and for directory accounts with no
+  binding. Its test, `test_unreachable_idp_does_not_affect_local_or_ad_login`, used a bound account
+  for the directory leg and now uses an unbound one.
+- **The Context sentence is narrowed.** Federation "must not make a reachable IdP a precondition for
+  operating the engine" no longer holds for a site whose every enabled Administrator is bound. Such a
+  site keeps one local, unbound Administrator.
+  [SECURITY.md](../SECURITY.md#federated-sign-in-oidc-browser-only--adr-0142) is the source of record
+  for that rule and for why `provision-admin` does not replace it.
+- **AC-13's last sentence is narrowed.** "A session minted by Kerberos on the same account SHALL keep
+  the password re-bind" cannot occur on a bound account, which holds no Kerberos session. It still
+  describes an account with no binding. Amendment B's "A hybrid account can also log in by AD
+  password or Kerberos" is narrowed the same way.
+
+**Two limits, stated and not closed here.** On the SQL Server store, a session whose token is
+rotated in the instant the bind's sweep runs can be missed, and it then lasts until it expires;
+an unbind and an administrator's revoke of a user's sessions run the same sweep. And on the SQL
+Server and Postgres stores a bind locks the account's row and then its sessions, while deleting
+a user locks them in the other order, so the two can deadlock against one account. The worst
+outcome is one administrator request failing and being retried: no bound account keeps its
+sessions and no user is left half deleted.
+[SECURITY.md](../SECURITY.md#federated-sign-in-oidc-browser-only--adr-0142) is the source of
+record for both.
+
+**Not decided here.** An account with no binding still enrols its first engine factor on proof of the
+directory credential alone. Closing that needs its own decision.

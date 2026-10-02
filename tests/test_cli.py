@@ -1602,33 +1602,32 @@ def test_serve_exposed_with_approvals_on_no_warn(
 
 
 def _stub_protect_key(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Stub out real DPAPI + the icacls call; capture the read-grants protect-key passes through."""
+    """Stub out real DPAPI and the restricted create; capture the read-grants protect-key asks for."""
     import messagefoundry.secrets_dpapi as dpapi_mod
-    import messagefoundry.store.store as store_mod
 
-    monkeypatch.setattr(dpapi_mod, "protect_key_to_file", lambda *a, **k: None)
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        store_mod,
-        "_secure_file",
-        lambda path, *, extra_read_grants=None: captured.update(grants=extra_read_grants),
+        dpapi_mod,
+        "protect_key_to_file",
+        lambda *a, read_grants=(), **k: captured.update(grants=list(read_grants)),
     )
     return captured
 
 
-def test_protect_key_grants_system_by_default(
+def test_protect_key_asks_for_no_extra_grant_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # SYSTEM is always read-granted so a LocalSystem service can read the key at startup (BACKLOG #44).
+    # SYSTEM can always read the key (BACKLOG #44), because the restricted create itself always names
+    # SYSTEM and Administrators; tests/test_restricted_file.py pins that. So protect-key adds nothing.
     captured = _stub_protect_key(monkeypatch)
     assert main(["protect-key", "--out", str(tmp_path / "k.dpapi"), "--generate"]) == 0
-    assert captured["grants"] == ["*S-1-5-18"]
+    assert captured["grants"] == []
 
 
 def test_protect_key_grants_named_service_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # --grant-account adds the virtual / gMSA principal alongside SYSTEM.
+    # --grant-account adds read for the virtual / gMSA principal the service runs as.
     captured = _stub_protect_key(monkeypatch)
     rc = main(
         [
@@ -1641,7 +1640,7 @@ def test_protect_key_grants_named_service_account(
         ]
     )
     assert rc == 0
-    assert captured["grants"] == ["*S-1-5-18", "NT SERVICE\\MessageFoundry"]
+    assert captured["grants"] == ["NT SERVICE\\MessageFoundry"]
 
 
 # --- protect-key exit-2 branches (off-Windows + key-validation) ----------------------------------

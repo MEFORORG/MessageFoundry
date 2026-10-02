@@ -1448,6 +1448,10 @@ _SET_FEDERATED_IF_UNBOUND_SQL: Final = (
     "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
     " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
 )
+#: The session sweep a bind and an unbind each run inside their own transaction.
+_REVOKE_USER_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+)
 
 
 @dataclass(frozen=True)
@@ -3157,7 +3161,7 @@ def forget_store_salt(path: Path) -> bool:
     return removed
 
 
-def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
+def _secure_file(path: Path) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
@@ -3166,10 +3170,12 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
     an owner-only DACL via ``icacls`` (inheritance disabled) instead. A skipped or failed
     restriction is **logged** (STORE-2) so it isn't silently world-readable.
 
-    ``extra_read_grants`` (Windows only) names additional principals — a name like
-    ``NT SERVICE\\MessageFoundry`` or a SID like ``*S-1-5-18`` — to grant **read** on the file. The
-    DPAPI key file needs this so the engine's *service account* (not just the admin who minted it) can
-    read the key at startup; the generic store DB/WAL files pass nothing and stay owner-only.
+    **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
+    exists, and only logs when it cannot, so a key written and then passed here would sit under the
+    directory's inherited access until the call lands, and for good if the call fails. A key file is
+    created through ``messagefoundry.restricted_file.write_restricted_file``, which restricts it in
+    the creating call and raises when it cannot. That is why this takes no extra read grants: the
+    one caller that needed them was the DPAPI key file.
     """
     try:
         if os.name == "nt":
@@ -3181,16 +3187,15 @@ def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) 
                     path,
                 )
                 return
-            # icacls is pinned to its absolute System32 path and invoked without a shell; an
-            # extra-grant principal (if any) is a single argv token, never a shell word, so it can't
-            # inject a flag (low-27/STORE-5). The pin is what makes "fixed system tool" true:
+            # icacls is pinned to its absolute System32 path and invoked without a shell; the
+            # principal is a single argv token, never a shell word, so it can't inject a flag
+            # (low-27/STORE-5). The pin is what makes "fixed system tool" true:
             # CreateProcess resolves an unqualified name through a search path that reaches the
             # caller's working directory, and because this call only logs on a non-zero exit, a
             # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
             # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
-            grants = [f"{user}:F", *(f"{p}:R" for p in extra_read_grants or ())]
             result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", *grants],
+                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -3246,7 +3251,7 @@ def _grant_read(path: Path, principal: str) -> None:
         )
 
 
-async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
+async def _secure_file_async(path: Path) -> None:
     """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
     On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
@@ -3258,15 +3263,15 @@ async def _secure_file_async(path: Path, *, extra_read_grants: Sequence[str] | N
     dispatched off the loop.
 
     The synchronous :func:`_secure_file` stays the callable for every caller that is NOT on a loop —
-    the CLI key/cert writers and the ``config/*_edit.py`` writers
+    the ``config/*_edit.py`` writers
     (whose one async caller already wraps the whole write in ``to_thread``). It is deliberately left
     unrenamed and unmoved: ``tests/test_phi_at_rest_inventory.py`` asserts that token lives in this
-    module and in no other ``store/`` backend, and ``tests/test_cli.py`` patches it by that name.
+    module and in no other ``store/`` backend, and several tests patch it by that name.
 
     ``_secure_file`` is resolved through the module global when the call is made, so a test that
     patches the name is honoured through this wrapper too.
     """
-    await asyncio.to_thread(_secure_file, path, extra_read_grants=extra_read_grants)
+    await asyncio.to_thread(_secure_file, path)
 
 
 # --- the store trio in a HARDENED data directory (ADR 0183 Wave 0b, ADR 0163 consequences 1-2) ------
@@ -11892,9 +11897,11 @@ class MessageStore:
         *,
         now: float | None = None,
         expect_unbound: bool = False,
-    ) -> bool:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Written only by the
-        administrative bind since BACKLOG #1143; see :meth:`AuthStore.set_user_federated_subject`."""
+    ) -> int | None:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015) and revoke the
+        account's live sessions in the same transaction (vault BACKLOG #2609). Written only by
+        the administrative bind since BACKLOG #1143; see
+        :meth:`AuthStore.set_user_federated_subject`."""
         now = time.time() if now is None else now
         # ux_users_federated_subject refusing this UPDATE is EXPECTED (the #1256 race loser), and the
         # unwind rolls it back (BACKLOG #1801).
@@ -11905,8 +11912,13 @@ class MessageStore:
                 )
             else:
                 cur = await self._db.execute(_SET_FEDERATED_SQL, (issuer, subject, now, user_id))
+            if int(cur.rowcount) <= 0:
+                # Nothing written, so nothing is revoked. The commit ends the empty transaction.
+                await self._commit()
+                return None
+            revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
-            return int(cur.rowcount) > 0
+            return int(revoked.rowcount)
 
     async def clear_user_federated_subject(
         self,
@@ -11953,10 +11965,7 @@ class MessageStore:
                 "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
                 (now, user_id),
             )
-            revoked = await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
-                (now, user_id),
-            )
+            revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return FederatedUnbind(
                 username=row["username"],
@@ -12039,7 +12048,7 @@ class MessageStore:
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-        require_federated_subject: tuple[str, str] | None = None,
+        require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -12168,7 +12177,7 @@ class MessageStore:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
         caller's current session — "sign out everywhere else"). Returns the number revoked."""
         now = time.time() if now is None else now
-        sql = "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+        sql = _REVOKE_USER_SESSIONS_SQL
         params: list[object] = [now, user_id]
         if except_token_hash is not None:
             sql += " AND token_hash != ?"

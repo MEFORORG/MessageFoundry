@@ -180,7 +180,7 @@ async def test_bind_refuses_without_a_grant_bound_to_this_action(
             headers=_auth(tok),
         )
         assert ok.status_code == 200, ok.text
-        assert ok.json()["detail"] == "federated identity bound"
+        assert ok.json()["detail"] == "federated identity bound; revoked 0 session(s)"
 
 
 async def test_unbind_refuses_without_a_grant_bound_to_this_action(
@@ -241,11 +241,19 @@ async def test_bind_rebind_and_unbind_each_leave_an_audit_row_naming_the_actor(
             "username": "jdoe",
             "issuer": ISSUER,
             "subject": "S-1-a",
+            "sessions_revoked": 1,
         }
-        live = await engine.store.get_session("t-jdoe")
-        assert live is not None and live.revoked_at is None, "a first bind revoked a session"
+        assert r.json()["detail"] == "federated identity bound; revoked 1 session(s)"
+        ended = await engine.store.get_session("t-jdoe")
+        assert ended is not None and ended.revoked_at is not None, (
+            "a first bind left a session live (vault BACKLOG #2609)"
+        )
 
-        # REBIND: the old identity's sessions end with its binding.
+        # REBIND: the old identity's sessions end with its binding. A new session, minted under
+        # the first binding, because the first bind ended the earlier one.
+        await engine.store.create_session(
+            token_hash="t-jdoe-2", user_id=target, expires_at=9e9, now=1.0
+        )
         _r, tok = await _reauth(c, tok, purpose=ACTION)
         r = await c.put(
             f"/users/{target}/federated-identity",
@@ -265,7 +273,7 @@ async def test_bind_rebind_and_unbind_each_leave_an_audit_row_naming_the_actor(
             "previous_subject": "S-1-a",
             "sessions_revoked": 1,
         }
-        gone = await engine.store.get_session("t-jdoe")
+        gone = await engine.store.get_session("t-jdoe-2")
         assert gone is not None and gone.revoked_at is not None
 
         # UNBIND, through the route, reusing BACKLOG #1474's service method.

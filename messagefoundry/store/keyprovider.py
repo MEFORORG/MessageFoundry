@@ -74,6 +74,10 @@ class EnvKeyProvider:
     def __init__(self, settings: StoreSettings) -> None:
         self._settings = settings
 
+    def key_file(self) -> None:
+        """This provider loads no key file."""
+        return None
+
     def active_key(self) -> str | None:
         return self._settings.encryption_key or None
 
@@ -89,12 +93,17 @@ class DpapiKeyProvider:
     def __init__(self, settings: StoreSettings) -> None:
         self._settings = settings
 
+    def key_file(self) -> str | None:
+        """The key file this provider loads the active key from, or ``None`` when it loads none."""
+        return self._settings.encryption_key_file or None
+
     def active_key(self) -> str | None:
-        if not self._settings.encryption_key_file:
+        key_file = self.key_file()
+        if key_file is None:
             return None
         from messagefoundry.secrets_dpapi import load_protected_key
 
-        return load_protected_key(self._settings.encryption_key_file)
+        return load_protected_key(key_file)
 
     def retired_keys(self) -> Sequence[str]:
         return _split_retired(self._settings.encryption_keys_retired)
@@ -110,21 +119,34 @@ class AutoKeyProvider:
     def __init__(self, settings: StoreSettings) -> None:
         self._settings = settings
 
+    def key_file(self) -> str | None:
+        """The key file this provider loads the active key from, or ``None`` when it loads none:
+        the environment key wins, so the file is loaded only when that key is unset."""
+        if self._settings.encryption_key:
+            return None
+        return self._settings.encryption_key_file or None
+
     def active_key(self) -> str | None:
         if self._settings.encryption_key:
             return self._settings.encryption_key
-        if self._settings.encryption_key_file:
-            from messagefoundry.secrets_dpapi import load_protected_key
+        key_file = self.key_file()
+        if key_file is None:
+            return None
+        from messagefoundry.secrets_dpapi import load_protected_key
 
-            return load_protected_key(self._settings.encryption_key_file)
-        return None
+        return load_protected_key(key_file)
 
     def retired_keys(self) -> Sequence[str]:
         return _split_retired(self._settings.encryption_keys_retired)
 
 
-#: Built-in providers — fully reproduce today's behavior, no external dependency.
-_BUILTIN_PROVIDERS = ("auto", "env", "dpapi")
+#: Built-in providers — fully reproduce today's behavior, no external dependency. The ONE dispatch
+#: from a ``[store].key_provider`` name to its class: :func:`resolve_key_provider` builds from it and
+#: :func:`provider_key_file` asks it which file is loaded, so the two cannot name different providers.
+_BUILTIN_PROVIDER_CLASSES: dict[
+    str, type[AutoKeyProvider] | type[EnvKeyProvider] | type[DpapiKeyProvider]
+] = {"auto": AutoKeyProvider, "env": EnvKeyProvider, "dpapi": DpapiKeyProvider}
+_BUILTIN_PROVIDERS = tuple(_BUILTIN_PROVIDER_CLASSES)
 
 #: External provider name → optional ``pyproject`` extra that carries its SDK. Each envelope-decrypts
 #: a wrapped DEK inside an isolated security module (ADR 0019 §3). Each lives in its own module, loaded
@@ -169,6 +191,17 @@ def provider_reads_a_configured_key(settings: StoreSettings) -> bool:
     if pinned is not None:
         return bool(getattr(settings, pinned[0]))
     return bool(settings.encryption_key or settings.encryption_key_file)
+
+
+def provider_key_file(settings: StoreSettings) -> str | None:
+    """The key file ``[store].key_provider`` loads the active key from, or ``None``.
+
+    Asked of the built-in provider itself (its ``key_file``), which is what its ``active_key``
+    loads. An external provider loads no local file, and is not built here: building one may need
+    its backend. ``serve`` checks the access of the file this names before it is used (vault
+    BACKLOG #2601)."""
+    builtin = _BUILTIN_PROVIDER_CLASSES.get(settings.key_provider)
+    return None if builtin is None else builtin(settings).key_file()
 
 
 def unread_key_refusal(settings: StoreSettings) -> str | None:
@@ -228,12 +261,9 @@ def resolve_key_provider(settings: StoreSettings) -> KeyProvider:
     lazy optional extras (:func:`_load_external_provider`). An unknown name **fails closed** with
     :class:`KeyProviderError` rather than silently falling back to the identity cipher."""
     name = settings.key_provider
-    if name == "auto":
-        return AutoKeyProvider(settings)
-    if name == "env":
-        return EnvKeyProvider(settings)
-    if name == "dpapi":
-        return DpapiKeyProvider(settings)
+    builtin = _BUILTIN_PROVIDER_CLASSES.get(name)
+    if builtin is not None:
+        return builtin(settings)
     if name in _EXTERNAL_PROVIDERS:
         return _load_external_provider(name, settings)
     raise KeyProviderError(

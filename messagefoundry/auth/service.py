@@ -473,6 +473,12 @@ _SPENT_REFUNDABLE_GRANT: ContextVar[tuple[int, tuple[str, str], float] | None] =
 #: bound to no account (ADR 0184 AC-4). Named because the browser layer maps it to a login-page code.
 FEDERATED_SUBJECT_NOT_BOUND = "federated_subject_not_bound"
 
+#: The closed-set reason a Windows SSO sign-in is refused with when the account it resolves to holds
+#: a federated binding (vault BACKLOG #2609). That account signs in through its identity provider.
+#: Written on the ``auth.login_failed`` audit row. Deliberately absent from the browser layer's code
+#: map, and the Windows SSO routes read no reason at all, so a caller sees the generic failure.
+FEDERATED_SIGN_IN_REQUIRED = "federated_sign_in_required"
+
 #: The closed-set reason :meth:`AuthService.bind_federated_subject` refuses an account with when the
 #: account carries no ``directory_object_id`` (BACKLOG #1143 slice C, ADR 0184 AC-5). Written into the
 #: ``auth.federated_bind_refused`` audit row and carried on :class:`DirectoryObjectIdMissing`. Also the
@@ -916,12 +922,14 @@ class _DirectoryLoginRefused(Exception):
         self.reason = reason
 
 
-class _FederatedBindingWithdrawn(Exception):
-    """An admin unbound the account's federated identity while this login was still in flight.
+class _BindingChangedMidLogin(Exception):
+    """An admin changed the account's federated binding while this login was still in flight.
+
+    Two directions, one signal. A federated login whose account was UNBOUND under it (BACKLOG
+    #1474), and a Windows SSO login whose account was BOUND under it (vault BACKLOG #2609).
 
     Raised by :meth:`AuthService._issue_session` when the store refuses the conditional insert, and
-    caught by :meth:`AuthService._complete_ad_login`, which renders it as an audited refusal
-    (BACKLOG #1474).
+    caught by :meth:`AuthService._complete_ad_login`, which renders it as an audited refusal.
 
     **Signalled by raising because the alternative loses the race it exists to close.** The store
     refuses inside the same transaction that re-reads the binding, so there is no point at which the
@@ -1060,8 +1068,9 @@ class DirectoryObjectIdMissing(ValueError):
 class FederatedBinding:
     """What :meth:`AuthService.bind_federated_subject` wrote (BACKLOG #1143).
 
-    ``previous_*`` are ``None`` for a first bind. ``sessions_revoked`` is non-zero only on a rebind,
-    where the prior identity's sessions end in the same transaction that clears its binding.
+    ``previous_*`` are ``None`` for a first bind. ``sessions_revoked`` counts every session the bind
+    ended: the ones a rebind's clear swept, plus the ones the write's own transaction swept. Every
+    bind ends every session of the account, a first bind included (vault BACKLOG #2609).
     """
 
     issuer: str
@@ -1227,24 +1236,44 @@ _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
 }
 
 
+#: The pair a session insert requires of a row that must hold NO federated binding (vault BACKLOG
+#: #2609). Passed as ``require_federated_subject`` by the Windows SSO mint.
+_UNBOUND: Final[tuple[None, None]] = (None, None)
+
+
+def _holds_federated_binding(user: UserRecord) -> bool:
+    """Whether ``user`` carries a federated binding. Either half of the pair counts as one, matching
+    the unbind's own predicate, so a row holding half a pair is never read as unbound."""
+    return user.oidc_issuer is not None or user.oidc_subject is not None
+
+
 def _holds_unkeyed_federated_binding(user: UserRecord) -> bool:
     """Whether ``user`` carries a federated binding but no ``directory_object_id`` (BACKLOG #2027).
 
-    Either half of the pair counts as a binding, matching the unbind's own predicate. Such a row's
-    only directory key is its username, and ADR 0184 AC-5 forbids re-resolving a bound row by that,
-    so the engine has no key it may ask the directory with.
+    Such a row's only directory key is its username, and ADR 0184 AC-5 forbids re-resolving a bound
+    row by that, so the engine has no key it may ask the directory with.
     """
-    has_binding = user.oidc_issuer is not None or user.oidc_subject is not None
-    return has_binding and not user.directory_object_id
+    return _holds_federated_binding(user) and not user.directory_object_id
 
 
-def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
+def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -> str | None:
     """The closed-set reason a directory login must refuse ``user``'s mirror row, or ``None``.
 
     BACKLOG #1637 (``disabled``) and #1638 (``locked``). Both states used to be invisible to a
     directory sign-in: ``_complete_ad_login`` checked provider and directory id and neither of these,
     so an engine-disabled mirror row completed Kerberos or OIDC login with an ``auth.login_success``
     row and a live session, and a lock set by five wrong TOTP codes was cleared by one re-login.
+
+    **A ROW THAT HOLDS A FEDERATED BINDING SIGNS IN THROUGH ITS IDENTITY PROVIDER ONLY** (vault
+    BACKLOG #2609). ``federated`` says whether the login asking is the federated one. An
+    administrator binds an account to put it behind the identity provider's own sign-in, and a
+    Windows SSO ticket asserts nothing about factor strength. So a bound row that Windows SSO still
+    admitted would keep a sign-in that never meets the identity provider. The keyword is required,
+    so every caller states which pathway it is.
+
+    THE COST: the binding decides, not ``oidc_enabled``, so a settings change does not reopen
+    Windows SSO for a bound account. ``docs/SECURITY.md``, *Federated sign-in*, states what that
+    costs a site and is the source of record for it.
 
     The slugs are literals from a closed set, never directory- or IdP-supplied text, because they are
     stored on the audit row and read by the browser layer.
@@ -1257,6 +1286,9 @@ def _directory_login_refusal(user: UserRecord, now: float) -> str | None:
         return "locked"
     if user.second_step_locked_until is not None and now < user.second_step_locked_until:
         return "locked"
+    # Last, so a disabled or locked row keeps the reason an operator already acts on.
+    if not federated and _holds_federated_binding(user):
+        return FEDERATED_SIGN_IN_REQUIRED
     return None
 
 
@@ -3611,8 +3643,10 @@ class AuthService:
         """Whether this session's step-up goes back to the IdP rather than to a password.
 
         True exactly when the session was minted by the federated login (``sessions.auth_mechanism``,
-        ADR 0184 item (iv)). The SESSION decides, not the account: a hybrid directory account can also
-        sign in by Kerberos, and that session keeps its existing step-up. PUBLIC because the web
+        ADR 0184 item (iv)). The SESSION decides, not the account, so a Kerberos session keeps its
+        existing step-up. (A bind ends the account's sessions and Windows SSO refuses it
+        afterwards, vault BACKLOG #2609; ``docs/SECURITY.md``, *Federated sign-in*, is the source
+        of record for that rule.) PUBLIC because the web
         console's ``/ui/reauth`` asks it to choose which page to render. :meth:`reauth` asks it too,
         so a caller that forgot to would still never verify a password for an OIDC session.
         """
@@ -3988,8 +4022,9 @@ class AuthService:
         supersedes_hash: str | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
-        # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller stays
-        # byte-identical -- no extra store read, no changed audit row. The federated caller has
+        # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller's audit row is
+        # unchanged. (Its session insert is guarded since vault BACKLOG #2609, which is one read
+        # inside that insert's transaction.) The federated caller has
         # already SELECTED the account by that pair and re-resolved ``principal`` from the selected
         # row (ADR 0184), so the name read below finds that row unless the directory renamed it.
         federated = federated_subject is not None or mech == "oidc"
@@ -4100,12 +4135,19 @@ class AuthService:
         # meeting a stale disabled row is a ``directory_identity_conflict`` and not a ``disabled``
         # login: the new holder's account is neither disabled nor locked, and telling them otherwise
         # would misdirect the operator reading the audit row.
+        #
+        # vault BACKLOG #2609: the same helper refuses a row that holds a federated binding when the
+        # login asking is not the federated one, so Windows SSO never signs a bound account in. Both
+        # arms pass ``federated``, and the paragraph above about which arm closes it holds for this
+        # refusal too.
         if existing is not None:
-            refusal = _directory_login_refusal(existing, time.time())
+            refusal = _directory_login_refusal(existing, time.time(), federated=federated)
             if refusal is not None:
                 return await self._refuse_directory_row(principal.username, refusal, client=client)
         try:
-            user = await self._upsert_ad_user(principal, by_name=existing, client=client)
+            user = await self._upsert_ad_user(
+                principal, by_name=existing, federated=federated, client=client
+            )
         except _DirectoryLoginRefused as exc:
             # The resolver refused before it wrote anything. Rendered here rather than there so the
             # audit row carries the caller's ``client`` and every directory refusal in this method
@@ -4214,10 +4256,29 @@ class AuthService:
                 # revokes what is live at that instant, and without the guard this login's own
                 # INSERT lands just after it. The Kerberos and password legs pass nothing here, so
                 # they take no extra read and no extra statement.
-                require_federated_subject=federated_subject,
+                #
+                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so the
+                # sentence above holds for the password leg only. The refusal further up read
+                # the row before this mint, and a bind can commit between the two: its sweep
+                # runs in the bind's own transaction and cannot see a session inserted after
+                # it. So the insert itself requires an unbound row, under the lock the bind
+                # takes. That also covers a rebind's gap, where the row is unbound between the
+                # clear and the write.
+                require_federated_subject=federated_subject if federated else _UNBOUND,
                 supersedes_hash=supersedes_hash,
             )
-        except _FederatedBindingWithdrawn:
+        except _BindingChangedMidLogin:
+            if not federated:
+                # A bind landed between the refusal check and the insert, so no session was
+                # minted. The caller gets the answer the check gives. NOT THE SAME AS THAT
+                # CHECK IN ONE WAY: the role, scope and profile sync above already ran, so a
+                # directory role change in this window is applied and audited, and it ends
+                # the account's other sessions as that sync always does. The reason is
+                # also written for a row deleted in the same window, which the guard
+                # refuses too; that row has no binding to look for.
+                return await self._refuse_directory_row(
+                    principal.username, FEDERATED_SIGN_IN_REQUIRED, client=client
+                )
             await self._directory_reject_audit(
                 principal.username, "oidc", "federated_subject_unbound"
             )
@@ -4337,6 +4398,7 @@ class AuthService:
         principal: AdPrincipal,
         *,
         by_name: UserRecord | None,
+        federated: bool,
         client: str | None = None,
     ) -> UserRecord:
         """Resolve the mirror row for a directory principal, creating it on first sight.
@@ -4383,8 +4445,10 @@ class AuthService:
         spellings of the bug were the same mistake: reading a recyclable label as an identity.
 
         Raises :class:`_DirectoryLoginRefused` when the resolved row is engine-disabled or locked
-        (BACKLOG #1637 / #1638), before any write. See the gate below the id-keyed lookup for why the
-        condition is signalled from here rather than checked on the returned record.
+        (BACKLOG #1637 / #1638), or holds a federated binding while the login is not the federated
+        one (vault BACKLOG #2609, which is what ``federated`` is for), before any write. See the gate
+        below the id-keyed lookup for why the condition is signalled from here rather than checked
+        on the returned record.
         """
         if by_name is not None and by_name.directory_object_id != principal.directory_object_id:
             # Defensive, and deliberately a RAISE rather than a silent re-read. The caller's check is
@@ -4411,7 +4475,7 @@ class AuthService:
         # rename refresh, the profile write and the caller's role resync have all already run against
         # a row that must not be signing in.
         if existing is not None:
-            refusal = _directory_login_refusal(existing, time.time())
+            refusal = _directory_login_refusal(existing, time.time(), federated=federated)
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
@@ -5436,11 +5500,11 @@ class AuthService:
         seed_reauth: bool,
         mechanism: SessionMechanism,
         max_expires_at: float | None = None,
-        require_federated_subject: tuple[str, str] | None = None,
+        require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
     ) -> str:
         """Mint a session token and persist the row. Callers passing
-        ``require_federated_subject`` must handle :class:`_FederatedBindingWithdrawn`.
+        ``require_federated_subject`` must handle :class:`_BindingChangedMidLogin`.
 
         ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
         7.2.4, login side). It is ended after the new
@@ -5478,10 +5542,10 @@ class AuthService:
             auth_mechanism=mechanism.value,
         )
         if not issued:
-            # Only reachable with a guard requested: an unbind revoked this account's sessions while
-            # this login was in flight, so issuing now would hand back a token the revocation could
-            # never have seen. Nothing was written, so there is nothing to undo.
-            raise _FederatedBindingWithdrawn()
+            # Only reachable with a guard requested: an unbind or a bind revoked this account's
+            # sessions while this login was in flight, so issuing now would hand back a token the
+            # revocation could never have seen. Nothing was written, so there is nothing to undo.
+            raise _BindingChangedMidLogin()
         if mfa_verified:
             # No second factor pending (MFA is not required for this user, or the federated IdP
             # asserted one): mark the session's 2nd factor satisfied at issuance so the step-up gate
@@ -8743,11 +8807,23 @@ class AuthService:
 
         **EVERY BIND CLEARS FIRST, THEN BINDS.** The clear is the unbind's own transaction, so the prior
         pair and every live session of the account go together and the audit row names the pair that
-        transaction cleared. On an unbound account the clear writes nothing and revokes nothing, so a
-        first bind revokes no session: it adds a way in and withdraws none. On a rebind the account is
-        unbound between the two writes, and a federated login in that gap is refused rather than
-        admitted. If the bind is then refused because another account took the pair in the gap, the
-        account is left unbound, and the error says so.
+        transaction cleared. On an unbound account the clear writes nothing and revokes nothing. On a
+        rebind the account is unbound between the two writes, and a federated login in that gap is
+        refused rather than admitted. If the bind is then refused because another account took the
+        pair in the gap, the account is left unbound, and the error says so.
+
+        **EVERY BIND THEN ENDS THE ACCOUNT'S SESSIONS, A FIRST BIND INCLUDED** (vault BACKLOG #2609).
+        A bind adds the federated way in and withdraws Windows SSO, which
+        ``_directory_login_refusal`` refuses for a bound row. So a session minted before the bind
+        is one the account could no longer get, and it must not outlive the bind. This docstring
+        used to say a first bind "adds a way in and withdraws none" and revoked nothing.
+
+        The sweep is the write's own transaction (``Store.set_user_federated_subject``), so there
+        is no moment at which the pair is written and the earlier sessions are live. A Windows SSO
+        sign-in that read the row unbound either inserts its session before that transaction,
+        which ends it, or after, and then its guarded insert in :meth:`_complete_ad_login` finds
+        the row bound and is refused. The account's own session never performs the bind: both
+        routes refuse a caller binding its own account.
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).
@@ -8814,7 +8890,7 @@ class AuthService:
             )
         # ALWAYS THROUGH THE CLEAR, and the transaction's own answer decides bind versus rebind -- not
         # the `user` read above. The clear writes nothing and revokes nothing on an unbound account,
-        # so a first bind costs one statement. Deciding from the earlier read would let a binding
+        # so on a first bind it costs one statement. Deciding from the earlier read would let a binding
         # another administrator wrote in between be overwritten with its sessions left live. The
         # clear compares the CALLER's pair, not that read's: the read is this request's, and the
         # decision to replace a binding was made on whatever the caller's page showed (#2026).
@@ -8833,7 +8909,7 @@ class AuthService:
             # this write are two transactions, so a second bind of this account can land between
             # them; an unconditional write would overwrite it with no audit row and leave the
             # sessions it admitted live.
-            written = await self._store.set_user_federated_subject(
+            swept = await self._store.set_user_federated_subject(
                 user_id, issuer, subject, expect_unbound=True
             )
         except Exception as exc:
@@ -8853,7 +8929,7 @@ class AuthService:
                     else ""
                 )
             ) from exc
-        if not written:
+        if swept is None:
             if not rebind:
                 # Nothing was written: the caller saw the account unbound and another bind landed
                 # first. That is the changed-pair refusal, with its code (BACKLOG #2026).
@@ -8865,19 +8941,19 @@ class AuthService:
                 "another request bound this account while this one ran; read it and retry"
                 "; this request removed its previous binding first"
             )
+        # The write swept in its own transaction. On a rebind the clear already swept, so this
+        # adds only what was minted in the gap between the clear and the write.
+        revoked += swept
         detail: dict[str, object] = {
             "user_id": user_id,
             "username": user.username,
             "issuer": issuer,
             "subject": subject,
+            "sessions_revoked": revoked,
         }
         if rebind:
             detail.update(
-                {
-                    "previous_issuer": previous_issuer,
-                    "previous_subject": previous_subject,
-                    "sessions_revoked": revoked,
-                }
+                {"previous_issuer": previous_issuer, "previous_subject": previous_subject}
             )
         await self._audit(
             "auth.federated_subject_rebound" if rebind else "auth.federated_subject_bound",
@@ -8893,7 +8969,7 @@ class AuthService:
             FEDERATED_IDENTITY_BOUND,
             username=user.username,
             email=user.notify_email,
-            detail={"issuer": issuer},
+            detail={"issuer": issuer, "sessions_revoked": revoked},
         )
         return FederatedBinding(
             issuer=issuer,

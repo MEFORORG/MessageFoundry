@@ -55,12 +55,9 @@ def test_edit_transform_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(reg.handlers) == 2  # loads with the edit transform branch active
 
 
-def test_gen_toml_reload_graph_loads_and_grows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A temp dir is world-writable; the Windows config-source trust guard would refuse it, so allow
-    # the dev escape for the test (POSIX runners are unaffected).
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
+def test_gen_toml_reload_graph_loads_and_grows(tmp_path: Path) -> None:
+    # No escape is set here. On win32 the suite's config-source gate reads a clean access list
+    # (tests/conftest.py), and a POSIX temp dir passes the real check.
     from harness.config.connscale.gen_toml import write_config_dir
 
     cfg = tmp_path / "reload"

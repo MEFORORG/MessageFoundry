@@ -70,6 +70,7 @@ from messagefoundry.pipeline.cert_expiry import (
     certs_from_registry,
 )
 from messagefoundry.pki import IssuerIndex, canonical_dn
+from messagefoundry.restricted_file import write_restricted_file
 from tests._admin_account import create_local_user_chosen
 from tests._approved_key_wrap import approved_pkcs8_pem
 
@@ -3955,12 +3956,17 @@ def _plant_generated_pair(
         .sign(signer, hashes.SHA256())
     )
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
+    # Restricted, as the engine creates its own key (vault BACKLOG #2601). `serve` and `supervise`
+    # refuse a generated key a broad account can read, and a plain write is group- and
+    # world-readable on POSIX, so a planted pair must not differ from a minted one on that axis.
+    key_path.unlink(missing_ok=True)
+    write_restricted_file(
+        key_path,
         key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
-        )
+        ),
     )
     return cert_path, key_path
 
