@@ -65,6 +65,7 @@ catalog, and **[../CHANGELOG.md](../CHANGELOG.md)**, which is authoritative for 
 | [testing/VERIFY.md](testing/VERIFY.md) | On-box acceptance check: is this machine set up correctly? |
 | [SUPPORT-POLICY.md](SUPPORT-POLICY.md) | What is supported, and the clock on re-pinning security releases. |
 | [ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md) | Exact paths, processes and ports to exclude or open (Windows/NSSM). |
+| [EXPOSURE-SURFACE.md](EXPOSURE-SURFACE.md) | What the engine exposes, as a map for a security team scoping it: listeners, outbound hops, startup guards, and what `verify` does not check. |
 | [SERVICE.md](SERVICE.md) | Running the engine as a long-lived service. |
 | [CLUSTERING.md](CLUSTERING.md) | Active/passive HA for the engine itself. |
 | [CLOUD-DEPLOYMENT.md](CLOUD-DEPLOYMENT.md) | Multi-node HA on Kubernetes or cloud, with managed Postgres. |
