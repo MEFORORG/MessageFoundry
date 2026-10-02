@@ -8,6 +8,7 @@ faults, and watch what a running engine actually did with each message.
 python -m harness                      # launch the GUI
 python -m harness --list-scenarios     # list headless scenarios
 python -m harness --scenario processed # run one scenario in CI (exit 0 pass / 1 fail)
+python -m harness --coverage           # connector kinds by direction vs the scenarios covering them
 python -m harness --list-profiles      # list headless load profiles
 python -m harness --load smoke         # run a load profile (exit 0 SLOs met / 1 violation / 2 setup)
 ```
@@ -65,19 +66,62 @@ draining). Then replay it from there.
 
 ## Headless scenarios (CI)
 
-The scenario runner generates traffic, sends it, and asserts the engine's resulting disposition
-(or dead-lettering) over the API — Qt-free, so it runs on a display-less runner. Built-in
-scenarios target `harness/config`; serve it, then:
+The scenario runner injects traffic, then asserts what the engine did with it -- Qt-free, so it
+runs on a display-less runner. Built-in scenarios target `harness/config`; serve it, then:
 
 ```powershell
-python -m harness --scenario processed   # ADT^A05 → file → PROCESSED
-python -m harness --scenario filtered     # ADT^A02 → FILTERED
-python -m harness --scenario unrouted      # ORU → UNROUTED
-python -m harness --scenario error         # ADT^A03 → ERROR
-python -m harness --scenario dead_letter   # ADT^A01 echo with nothing on 2576
+python -m harness --list-scenarios
+python -m harness --scenario processed            # ADT^A05 -> file -> PROCESSED
+python -m harness --scenario filtered             # ADT^A02 -> FILTERED
+python -m harness --scenario unrouted             # ORU -> UNROUTED
+python -m harness --scenario error                # ADT^A03 -> ERROR
+python -m harness --scenario dead_letter          # ADT^A01 echo with nothing on 2576
+python -m harness --scenario mllp_echo_delivered  # the echo copy arrives at a harness MLLP sink
+python -m harness --scenario file_roundtrip       # file in -> PROCESSED -> file out
+python -m harness --coverage                      # which connector kinds the scenarios cover
 ```
 
-Pass `--engine <url>` for a non-default API address and `--token <t>` for an auth-enabled engine.
+Pass `--engine <url>` for a non-default API address, `--token <t>` for an auth-enabled engine, and
+`--cacert <pem>` to trust the engine's minted certificate. A malformed endpoint, or a sink that cannot bind its port (the GUI
+Receive tab already listening on 2576, say), exits 2 as a setup error; a scenario verdict is 0 or 1.
+
+### Drivers, sinks and endpoints
+
+A scenario is three parts, each one module per transport family and each discovered rather than
+listed, so a new family is a new file and never an edit to a shared table:
+
+- **Driver** (`harness/drivers/<family>.py`) -- injects payloads into one kind of engine
+  *inbound* (MLLP, File, ...). It reports a failed send instead of raising.
+- **Sink** (`harness/sinks/<family>.py`) -- stands up the peer an engine *outbound* delivers to
+  and records what arrived, byte for byte. Every sink binds loopback, records in memory, and never
+  logs a payload.
+- **Endpoints** (`harness/endpoints/<family>.py`) -- the ports and directories a graph under
+  `harness/config/` binds. The graph reads each one through the engine's own `env("harness_<key>",
+  default=...)` and imports nothing from the harness; the harness resolves the same name as
+  `--endpoint KEY=VALUE`, then the `MEFOR_VALUE_HARNESS_<KEY>` environment variable, then the
+  documented default (`mllp_in` is 2575, `file_in` is `./harness_io/in`, and so on). A test holds
+  every graph default equal to its endpoint default. The engine applies `MEFOR_VALUE_*` only with an
+  environment active, so serve with `--env dev` when you move an endpoint. The tests serve the real
+  graph with every port ephemeral and every directory temporary. Relative directories resolve
+  against each process's own working directory, so run the engine and the harness from the same
+  directory, or pass absolute paths to both.
+- Every sink binds 127.0.0.1 only. The `host` endpoint is what drivers and engine outbounds DIAL.
+
+Scenarios live in `harness/scenarios/<family>.py`, each module exporting a `SCENARIOS` tuple; a
+name claimed twice is an error. A scenario declares the (connector kind, direction) pairs it
+covers: it covers an inbound kind by injecting through it, and an outbound kind only by asserting
+what a sink of that kind received -- a disposition alone does not say what left the engine. Every
+run sends fresh `uuid4` control ids, so a long-lived store cannot satisfy it with a previous run's
+rows.
+
+### Connector coverage
+
+`python -m harness --coverage` prints every connector kind the engine registers, by direction,
+against the scenarios that cover it. It reads the engine's live connector registries, not a list
+kept here, and flags a scenario that claims a kind the engine does not register. It needs no
+running engine. `harness/coverage.py` is the one harness module allowed to import
+`messagefoundry.transports` (read-only; `_CLIENT_ALLOWED` in `tests/test_dependency_boundaries.py`
+names it), because the registries have no public listing.
 
 ## Load testing (headless)
 
