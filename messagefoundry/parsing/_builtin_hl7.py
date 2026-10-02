@@ -1140,10 +1140,13 @@ class _LeafRewrite:
         self._codes = codes
         self._s_esc = s_esc
         self._t_esc = t_esc
-        self._danger = re.compile("[" + re.escape("".join(codes)) + "]")
+
+    def _holds_code(self, text: str) -> bool:
+        # At most five characters, each a C-level substring scan; no pattern is built from config.
+        return any(char in text for char in self._codes)
 
     def __call__(self, text: str) -> str:
-        if self._danger.search(text) is None:
+        if not self._holds_code(text):
             return text.translate(self._table)
         structure, codes, s_esc, t_esc = self._structure, self._codes, self._s_esc, self._t_esc
         out: list[str] = []
@@ -1171,7 +1174,7 @@ class _LeafRewrite:
 
     def _sequence(self, run: list[str]) -> str:
         text = "".join(run)
-        if self._danger.search(text) is not None:
+        if self._holds_code(text):
             raise DelimiterRewriteRefused(
                 "an escape sequence holds a target delimiter, which the target set cannot carry"
             )
