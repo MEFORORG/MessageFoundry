@@ -7,7 +7,7 @@ faults, and watch what a running engine actually did with each message.
 ```powershell
 python -m harness                      # launch the GUI
 python -m harness --list-scenarios     # list headless scenarios
-python -m harness --scenario processed # run one scenario in CI (exit 0 pass / 1 fail)
+python -m harness --scenario processed # run one scenario in CI (exit 0 pass / 1 fail / 2 setup or skip)
 python -m harness --coverage           # connector kinds by direction vs the scenarios covering them
 python -m harness --list-profiles      # list headless load profiles
 python -m harness --load smoke         # run a load profile (exit 0 SLOs met / 1 violation / 2 setup)
@@ -83,7 +83,9 @@ python -m harness --coverage                      # which connector kinds the sc
 
 Pass `--engine <url>` for a non-default API address, `--token <t>` for an auth-enabled engine, and
 `--cacert <pem>` to trust the engine's minted certificate. A malformed endpoint, or a sink that cannot bind its port (the GUI
-Receive tab already listening on 2576, say), exits 2 as a setup error; a scenario verdict is 0 or 1.
+Receive tab already listening on 2576, say), exits 2 as a setup error; a scenario verdict is 0 or 1,
+and a scenario whose precondition is missing here (the database family without a server) prints
+`SKIP` and exits 2.
 
 ### Drivers, sinks and endpoints
 
@@ -122,7 +124,23 @@ against the scenarios that cover it. It reads the engine's live connector regist
 kept here, and flags a scenario that claims a kind the engine does not register. It needs no
 running engine. `harness/coverage.py` is the one harness module allowed to import
 `messagefoundry.transports` (read-only; `_CLIENT_ALLOWED` in `tests/test_dependency_boundaries.py`
-names it), because the registries have no public listing.
+names it); its module docstring says what it may read.
+
+It is also a gate. Every registered (kind, direction) pair must have a scenario or an entry, with a
+reason, in `EXEMPT` in `harness/coverage.py`; `--coverage` prints a `GAP:` line and exits 1 when
+one does not, and `tests/test_harness_coverage_gate.py` runs the same check in CI. A stale
+exemption (its pair gained a scenario or is no longer registered) and a claim on a kind the engine
+does not register are gaps too. The one exemption today is the Direct outbound, which needs S/MIME
+keys and certificates on disk and is proven in its own family test instead.
+
+A claim counts as coverage. A few families claim kinds their scenarios run only where the
+dependency exists, and none of them passes without it: the database family needs a SQL Server
+(`MEFOR_TEST_SQLSERVER`) and prints `SKIP` (exit 2) without one; DIMSE needs the `[dicom]` extra
+and fails with "cannot run" without it; remote file needs the `[sftp]` extra and a password and
+exits 2 (`SETUP`) without them, and runs over SFTP only (FTP and FTPS are not exercised). In the
+test suite each is reported as a skip. The gate counts what a scenario CLAIMS, so a claimed pair
+is covered even on a runner where its scenario skips -- and the Direct outbound, exempt here,
+does run end to end in `tests/test_harness_email.py`.
 
 ## Load testing (headless)
 
@@ -141,6 +159,9 @@ $env:MEFOR_LOAD_FANOUT=20; $env:MEFOR_LOAD_TRANSFORM="edit"; $env:MEFOR_LOAD_SIN
 python -m messagefoundry serve --config harness/config/load --db ./load.db   # swap --db for backends
 python -m harness --load fanout-baseline --engine URL --token T --report-json out/load/run.json
 ```
+
+The engine serves with sign-in on, and `--token` is a session for it. `python -m harness.load.rigadmin`
+provisions an Administrator for the run and signs in for you; the guide below shows the three steps.
 
 Full guide — profile schema, the env knobs, reading the report/SLOs, exit codes, baseline
 comparison, and the backend-comparison recipe — is in [docs/LOAD-TESTING.md](../docs/LOAD-TESTING.md).
@@ -280,3 +301,108 @@ directory in `harness/endpoints/internal.py`, defaults 2610-2614):
   sink on 2613, and that sink's ACK is the message that re-enters on `LB_Internal_Reply`, whose
   router forwards it to a sink on 2614. The scenario asserts the forwarded copy is that ACK
   (MSA-2 naming the control id sent), not the original.
+
+### Database (DatabasePoll in, Database out)
+
+**This family is unverified without a server database.** The engine's DATABASE connector is
+ODBC-only -- the SQL Server preset over the Microsoft ODBC Driver 18, or an operator-named ODBC
+driver -- through `aioodbc`/`pyodbc` from the `[sqlserver]` extra. There is no SQLite path, and the
+CI install line carries neither the extra nor a server, so on CI and on most machines both
+scenarios report SKIPPED, with the missing piece named. A skip is never a pass (`--scenario` exits
+2 and prints `SKIP`).
+
+The graph is `harness/config/database/`, in its own directory so that serving `harness/config`
+without a database stays clean (measured: without its credentials the graph's two connections fail
+to start, isolated, and the engine reports DEGRADED). A DatabasePoll inbound, `DB-IN_Harness`, reads
+`status = 'NEW'` rows of `dbo.mf_harness_inbox` and marks each `DONE` once it is durably received --
+the poll needs that marker column, or every poll re-reads the same rows. ADT goes to a Database
+outbound, `DB-OUT_Harness`, which writes `dbo.mf_harness_outbox` idempotently on the control id;
+anything else is UNROUTED. The harness driver and sink create both tables. All SQL is
+parameterized and the table names are constants.
+
+Serve it with the server and its credentials in the environment (credentials never sit in source;
+the server must present a certificate this host trusts, as the graph never weakens TLS, and
+`[egress].allowed_db` -- `MEFOR_EGRESS_ALLOWED_DB` -- must list it, or `serve` refuses the dial):
+
+```bash
+export MEFOR_VALUE_HARNESS_DATABASE_SERVER=127.0.0.1 MEFOR_VALUE_HARNESS_DATABASE_PORT=1433
+export MEFOR_VALUE_HARNESS_DATABASE_NAME=... MEFOR_VALUE_HARNESS_DATABASE_USERNAME=...
+export MEFOR_VALUE_HARNESS_DATABASE_PASSWORD=...
+export MEFOR_EGRESS_ALLOWED_DB=127.0.0.1
+python -m messagefoundry serve --config harness/config/database --db ./harness-db.db --env dev
+python -m harness --scenario database_roundtrip --engine URL --token T
+```
+
+`--coverage` counts the `database` inbound and outbound rows as covered because these scenarios
+CLAIM them. That claim is made good only where a server exists; on a run that skipped, nothing
+exercised the connector. `tests/test_harness_database.py` holds the end-to-end test, gated on
+`MEFOR_TEST_SQLSERVER`. No CI step runs it, and wiring it into the existing SQL Server legs alone
+would not verify anything: those present an untrusted certificate, so the test skips there.
+
+### DICOM DIMSE (C-STORE SCP inbound, SCU outbound)
+
+`harness/config/dimse.py` forwards every object its C-STORE SCP inbound receives, unchanged, to a
+C-STORE SCU outbound whose peer is the harness DIMSE sink; the endpoints are `dimse_in` and
+`dimse_out` (`harness/endpoints/dimse.py`), and the AE titles are in the graph's docstring. The
+driver (`harness/drivers/dimse.py`) C-STOREs synthetic Basic Text SR objects with a fresh
+SOPInstanceUID each; the sink (`harness/sinks/dimse.py`) records every C-STORE and answers Success
+or a configured failure status. Serving `harness/config` now also binds that SCP, which needs the
+`[dicom]` extra; without it that one inbound fails to start, harness discovery still works, and a
+DIMSE scenario reports the missing extra rather than passing.
+
+The engine records a DICOM object with no control id, so these scenarios match rows differently from
+the HL7 ones: they snapshot the inbound's rows before sending, then read the bodies of rows that
+arrived after it through the audited raw-body route (`surface="harness"`) and match them by
+SOPInstanceUID. That needs a token with `messages:view_raw` as well as `messages:read`.
+`harness/scenarios/dimse.py` lists the scenarios: delivered, retried-then-dead-lettered, and
+refused-then-dead-lettered, each also counting the C-STOREs that reached the sink.
+
+### Email and Direct (SMTP outbound)
+
+`harness/config/email.py` takes MLLP on `email_in` (2660) and mails each ADT message to the
+loopback SMTP sink on `email_smtp` (2661): ADT^A31 goes to a recipient the
+`email_rejected_recipient` scenario makes the sink refuse with 550 at RCPT (dead-lettered, every
+attempt refused), and every other ADT trigger goes to `clinic@harness.invalid` (`email_delivered`).
+The hop is cleartext and declared so with `cleartext_accepted`; the graph's docstring says what
+that declaration does and does not cover, and which egress allowlist entry it needs. The sink
+(`harness/sinks/email.py`) is a minimal RFC 5321 server with no
+dependency: EHLO/HELO, MAIL, RCPT, DATA with dot-unstuffing, RSET, NOOP, QUIT, and STARTTLS when
+handed a server-side TLS context. It records the envelope and the message as submitted.
+
+`harness/config/direct/` is the Direct (S/MIME over STARTTLS) graph. A Direct outbound loads its
+keys and certificates when it is built, so that graph is served on its own with trust material
+minted for the run (its docstring names the five `MEFOR_VALUE_DIRECT_*` values), and
+`tests/test_harness_email.py` is where it runs: the sink receives an enveloped-data message over
+STARTTLS that decrypts with the partner's key and carries the sender's signature. It is not a
+registered scenario: a scenario runs against an engine that is already serving, and this one
+needs certificates minted before that engine starts, plus a sink TLS context matching them. So
+`--coverage` does not count the Direct outbound.
+
+### Remote file (SFTP)
+
+`remotefile_poll_in` and `remotefile_write_out` exercise the engine's REMOTEFILE connector over
+SFTP, in both directions, against a real in-process SSH server (`harness/sinks/_sftp_server.py`,
+paramiko's server classes, so they need the `[sftp]` extra). The server is the remotefile sink: it
+binds 127.0.0.1 on `remotefile_sftp` (default 2670) and serves a temporary directory holding
+`/inbox`, which the engine's inbound polls and the remotefile driver uploads into over SFTP, and
+`/outbox`, which the engine's outbound writes. `remotefile_write_out` checks each written file
+equals the upload byte for byte and sits directly in `/outbox`.
+
+Host-key verification stays on. Each run mints a throwaway host key and pins it into the
+`remotefile_known_hosts` file, which the engine and the driver both verify against; the rule about
+the insecure escape, and the one known cause of a refused pin, are in
+[`sinks/_sftp_server.py`](sinks/_sftp_server.py). The one password comes from
+`MEFOR_VALUE_REMOTEFILE_HARNESS_PASSWORD`, set for both the engine and the harness. The graph reads
+it without a default, so it lives in its own subdirectory and `serve --config harness/config` does
+not load it:
+
+```powershell
+$env:MEFOR_VALUE_REMOTEFILE_HARNESS_PASSWORD = "<any throwaway value>"
+python -m messagefoundry serve --config harness/config/remotefile --env dev
+python -m harness --scenario remotefile_write_out --engine URL --token T
+```
+
+With no scenario running there is no server, and the inbound logs one failed poll per second and
+retries. A missing extra or password is a SETUP error (exit 2), never a pass. FTP and FTPS are not
+covered: there is no stdlib FTP server, and the reputable in-process one (pyftpdlib) is not a
+dependency here.

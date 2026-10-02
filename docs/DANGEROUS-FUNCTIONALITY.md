@@ -49,7 +49,7 @@ on its own.
 |---|---|---|---|
 | 1 | Executing your Python | Routers and Handlers | In-process, no isolation |
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
-| 3 | Loading a provider module by name | Two provider seams | Off unless you name an external provider |
+| 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise` |
 | 4 | Starting processes | 11 modules | Varies, see below |
 | 5 | Calling native libraries | 18 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
@@ -141,6 +141,33 @@ that is the repository's own scanner. From an installed wheel, the walk continue
 folder, so a file planted at that path in any parent folder would run. It serves the
 de-identification leak check only, and is not on the message path.
 
+`_child_bootstrap.py` loads the engine package by path, then runs a module by name.
+`python_child_argv` in `childenv.py` builds a command line that starts a Python child through it.
+At least three kinds of child start this way. They are the sandbox worker, each engine shard, and
+the child that loads the config before any shard starts. The tray starts its own Python child with
+`-m` and does not use the script. The script does three things:
+
+1. It puts the folder above the package on the import path, ahead of site-packages, the folder
+   that holds installed packages. Usually that is after the standard library. It skips this step
+   when that folder is on the path already. The step serves the packages that ship beside the
+   engine in a checkout.
+2. It loads the `messagefoundry` package by file location, from the folder the script sits in.
+3. It runs the module named on its command line, much as `python -m` would.
+
+**What holds it.** Both folders come from where the script sits, never from a setting. Each caller
+passes a module name fixed in the code, and nothing from a message reaches the command line. The
+arguments after the module name are another matter. An engine shard's command line carries at least
+the config path and the shard name. An author sets that name in `connections.toml` or in
+`inbound(shard=...)`. Each child starts from an argument list with no shell (section 4). The engine
+starts the script and never imports it.
+
+One edge is worth knowing. In a checkout that is not installed, the folder above the package is the
+checkout's root, and step 1 puts it ahead of site-packages. A file or folder at that root named like
+a module outside the standard library would then load first, inside each of these children. If
+`PYTHONPATH` names a site-packages folder, step 1 can put the root ahead of the standard library
+too. In the usual installed engine, editable installs included, that folder is already on the path,
+so the script skips step 1.
+
 ---
 
 ## 4. The engine starts processes
@@ -190,8 +217,8 @@ Two argument-list starts are not pinned that way:
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
-environment for the sandbox worker, the disaster-recovery hook and the engine shards. Its
-docstring says what each one gets, and why that is not an isolation boundary by itself. The other
+environment for the sandbox worker, the disaster-recovery hook, the engine shards and the child
+that loads the config before any shard starts. Its docstring says what each one gets, and why that is not an isolation boundary by itself. The other
 starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
 that module.

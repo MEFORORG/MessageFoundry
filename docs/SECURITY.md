@@ -2045,8 +2045,13 @@ sign-in mints one session, so the AD role-resync and revocation side effect fire
 never per navigation. The directory bind **as the user** survives only as the step-up re-bind at
 `POST /ui/reauth` and `POST /me/reauth`, where it re-proves a session **Kerberos** minted, or a session
 row written before `sessions.auth_mechanism` existed. An OIDC session never reaches it: it steps up at the IdP instead (`POST /ui/reauth/oidc`; see
-[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)). MFA is
-**not** delegated: the engine's own second factor binds a directory account like any other
+[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)). A directory account's second
+factor follows the rule in [Multi-factor authentication](#multi-factor-authentication-totp-wp-14).
+It shares the local account's rule, with at least two differences. First, while `[security].require_mfa` is
+on, a directory session that proved no factor at sign-in owes an engine factor under either
+`require_mfa_scope` value. That includes at least every Kerberos session and an OIDC session minted
+while `[auth].oidc_require_mfa_claim` is off. Second, an OIDC sign-in meets its factor at mint on the
+identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` is on, the default
 (BACKLOG #1144).
 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the

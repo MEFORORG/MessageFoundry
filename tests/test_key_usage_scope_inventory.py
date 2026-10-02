@@ -120,6 +120,10 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "DAST scan-target credential": "a throwaway CSPRNG password for two ephemeral scan identities, "
     "stored only as an argon2id hash in a temp-directory store the scan destroys; a credential is "
     "not a key and it protects nothing",
+    "Rig Administrator credential": "a CSPRNG password for the one Administrator a CI leg or load "
+    "rig provisions (vault BACKLOG #2719), held in memory and process environments and persisted "
+    "only as an argon2id hash in the rig's store; a credential is not a key, and it encrypts, signs "
+    "and unlocks nothing",
     "MFA recovery codes": "single-use fallback credentials stored only as argon2id hashes; a code "
     "is a credential the user types, not a key, and it encrypts, signs and unlocks nothing",
     "CSP nonces": "single-use per-render CSPRNG values that let one page's own scripts run under its "
