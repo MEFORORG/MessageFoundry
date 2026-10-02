@@ -100,7 +100,8 @@ listed, so a new family is a new file and never an edit to a shared table:
   default=...)` and imports nothing from the harness; the harness resolves the same name as
   `--endpoint KEY=VALUE`, then the `MEFOR_VALUE_HARNESS_<KEY>` environment variable, then the
   documented default (`mllp_in` is 2575, `file_in` is `./harness_io/in`, and so on). A test holds
-  every graph default equal to its endpoint default. The engine applies `MEFOR_VALUE_*` only with an
+  every graph default equal to its endpoint default (or, where a graph casts a port into a URL, to
+  that cast of it). The engine applies `MEFOR_VALUE_*` only with an
   environment active, so serve with `--env dev` when you move an endpoint. The tests serve the real
   graph with every port ephemeral and every directory temporary. Relative directories resolve
   against each process's own working directory, so run the engine and the harness from the same
@@ -229,3 +230,34 @@ open each new row's body once through the audited `GET /messages/{id}/raw` (surf
 and match this run's fresh ISA13 values. On an auth-enabled engine that read needs a token with
 `messages:view_raw`, which the TCP and MLLP scenarios do not. A burst of other traffic large
 enough to push this run's rows off that page reads as "not found", never as a pass.
+
+### HTTP: the Http inbound, and the REST, SOAP, FHIR and DICOMweb outbounds
+
+`harness/config/http.py` takes HL7 v2 over `POST` on `http_in` (2590) and a DICOM Part-10 object on
+`http_dicom_in` (2591). ADT goes out as JSON to the REST outbound, ORM as a SOAP 1.1 envelope, ORU
+as a FHIR Patient create, and the DICOM object as a STOW-RS `multipart/related` store. Each
+outbound posts to a harness HTTP sink on loopback (`http_rest` 2592, `http_soap` 2593, `http_fhir`
+2594, `http_dicomweb` 2595), which records the method, path, headers and body, and answers a status
+the scenario chooses.
+
+These outbounds sit behind `[egress].allowed_http`. `serve` turns
+`[security].block_unlisted_outbound` on unless you set it, and then an empty list refuses all four,
+so allow loopback first: `[egress] allowed_http = ["127.0.0.1"]`, or
+`MEFOR_EGRESS_ALLOWED_HTTP=127.0.0.1`. The same rule applies to every other transport the directory
+serves; the coverage graph's MLLP and File outbounds need `allowed_mllp` and `allowed_file_dirs`.
+The tests serve the graph with `allowed_http` set, and check that an empty or wrong list makes the
+delivery scenarios fail.
+
+```powershell
+python -m harness --scenario http_rest_delivered          # also soap / fhir / dicomweb
+python -m harness --scenario http_fhir_retry_dead_letter  # sink answers 503: retried, then dead-lettered
+python -m harness --scenario http_rest_rejected_dead_letter  # sink answers 400: one attempt only
+```
+
+A delivery scenario checks that each message reached `PROCESSED` (by control id; a DICOM object
+has none, so by the `message_id` in the inbound's `202` receipt), then checks every request the
+sink saw: the destination's method, path and `Content-Type`, and this run's control id in the body.
+The DICOMweb scenario also requires the stored part to equal the object it sent, byte for byte, and
+is registered only where the `[dicom]` extra is installed. The sink redacts the values of common
+credential headers and never logs a body. An outbound URL is always loopback: a sink binds nothing
+else, so moving `host` moves only where a driver dials.

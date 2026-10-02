@@ -40,6 +40,7 @@ from harness.sinks import Record, Sink
 from harness.sinks.file import FileSink
 from harness.sinks.mllp import MLLPSink
 from messagefoundry.apiclient import EngineClient
+from messagefoundry.config.wiring import EnvRef, load_config
 from messagefoundry.parsing.message import Message
 from tests._harness_engine import ephemeral_overrides, serve_harness_config
 
@@ -490,18 +491,16 @@ def test_every_registered_scenario_names_real_drivers_sinks_and_endpoints() -> N
             assert scenario.sink_endpoint in declared, name
 
 
-def _graph_env_refs() -> dict[str, object]:
+def _graph_env_refs() -> dict[str, EnvRef]:
     """Every ``env("harness_<key>", default=...)`` the served harness/config graphs make, by key."""
-    from messagefoundry.config.wiring import EnvRef, load_config
-
     registry = load_config(str(Path(__file__).resolve().parents[1] / "harness" / "config"))
-    found: dict[str, object] = {}
+    found: dict[str, EnvRef] = {}
     specs = [c.spec for c in registry.inbound.values()]
     specs += [c.spec for c in registry.outbound.values()]
     for spec in specs:
         for value in spec.settings.values():
             if isinstance(value, EnvRef) and value.key.startswith("harness_"):
-                found[value.key.removeprefix("harness_")] = value.default
+                found[value.key.removeprefix("harness_")] = value
     return found
 
 
@@ -511,11 +510,19 @@ def test_each_graph_default_equals_its_endpoint_default() -> None:
     refs = _graph_env_refs()
     declared = endpoints.registry()
     assert refs, "the walk found no harness env() reference -- it is not looking at the graph"
-    for key, default in refs.items():
+    for key, ref in refs.items():
         assert key in declared, (
             f"graph reads harness_{key}, which harness/endpoints does not declare"
         )
-        assert str(default) == declared[key].default, key
+        # The engine casts an environment value but never a default, so a graph that casts a
+        # declared PORT into a whole URL (harness/config/http.py) carries that cast of the declared
+        # default instead: the value it would read if the variable held the declared default.
+        cast = ref.cast
+        assert str(ref.default) == declared[key].default or (
+            cast is not None
+            and type(cast(declared[key].default)) is type(ref.default)
+            and cast(declared[key].default) == ref.default
+        ), key
     unread = sorted(set(declared) - set(refs))
     assert not unread, f"declared endpoints no graph reads: {unread}"
 

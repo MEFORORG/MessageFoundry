@@ -30,6 +30,7 @@ from harness import endpoints as harness_endpoints
 from harness.endpoints import PATH, PORT, Endpoints
 from messagefoundry.api import create_managed_app
 from messagefoundry.config.environments import load_environment_values
+from messagefoundry.config.settings import EgressSettings, load_settings
 
 REPO = Path(__file__).resolve().parents[1]
 HARNESS_CONFIG = REPO / "harness" / "config"
@@ -72,11 +73,34 @@ def _environment(values: Mapping[str, str]) -> Iterator[None]:
                 os.environ[key] = old
 
 
+#: The ``[egress]`` section the served graphs run under. ``allowed_http`` names the loopback host, so
+#: the HTTP-family outbounds of ``harness/config/http.py`` pass the REAL ``[egress].allowed_http``
+#: gate rather than an unset one (an unset list is permissive). No other family's outbound reads it.
+HARNESS_EGRESS_TOML = '[egress]\nallowed_http = ["127.0.0.1"]\n'
+
+
+def harness_egress(
+    tmp_path: Path,
+    toml: str = HARNESS_EGRESS_TOML,
+    environ: Mapping[str, str] | None = None,
+) -> EgressSettings:
+    """``[egress]`` as the settings loader ``serve`` uses resolves it from a settings file holding
+    ``toml``, plus ``environ`` (empty by default, so a developer's own ``MEFOR_*`` cannot leak in)."""
+    path = tmp_path / "harness-settings.toml"
+    path.write_text(toml, encoding="utf-8")
+    return load_settings(config_path=path, environ=environ or {}).egress
+
+
 @contextmanager
 def serve_harness_config(
-    tmp_path: Path, overrides: Mapping[str, str], *, config_dir: Path = HARNESS_CONFIG
+    tmp_path: Path,
+    overrides: Mapping[str, str],
+    *,
+    config_dir: Path = HARNESS_CONFIG,
+    egress: EgressSettings | None = None,
 ) -> Iterator[tuple[str, Endpoints]]:
-    """Serve ``config_dir`` with ``overrides`` applied; yield the API URL and the endpoints."""
+    """Serve ``config_dir`` with ``overrides`` applied; yield the API URL and the endpoints.
+    ``egress`` defaults to :func:`harness_egress`."""
     registry = harness_endpoints.registry()
     env = {registry[key].env: value for key, value in overrides.items()}
     with _environment(env):
@@ -92,6 +116,7 @@ def serve_harness_config(
             poll_interval=0.05,
             env_values=values,
             allow_no_auth=True,  # the harness reads the API with no session
+            egress_settings=harness_egress(tmp_path) if egress is None else egress,
         )
         api_port = free_port()
         uv = uvicorn.Server(
