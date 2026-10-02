@@ -4087,10 +4087,10 @@ Three controls answer it, and they differ in strength:
   longer the console-script launcher, which cannot pass an option
   ([the next section](#isolated-mode-and-start-up-code-of-the-engines-interpreter)).
 - **The engine process refuses the script where the interface is still on.** A start through the
-  console script, such as a developer's `messagefoundry serve`, leaves it on. So `serve` and
-  `supervise` each install an audit hook as their first step (`messagefoundry/remotedebug.py`).
-  The interpreter raises an event before it runs an injected script, the hook raises on it, and
-  the interpreter drops the script.
+  console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
+  installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
+  interpreter raises an event before it runs an injected script, the hook raises on it, and the
+  interpreter drops the script.
 
 The hook is the weakest of the three, so an engine that starts with the interface on reports it
 as the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported,

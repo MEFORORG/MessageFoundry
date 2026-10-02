@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The engine process refuses a script injected through the interpreter's remote debugging, and
-reports the interpreter setting (vault BACKLOG #2700).
+reports the interpreter setting (vault BACKLOG #2700, #2742).
 
 Python 3.14 lets another process run a script inside a running interpreter (PEP 768,
 ``sys.remote_exec``). ``messagefoundry/remotedebug.py`` installs an audit hook that raises on the
@@ -18,9 +18,12 @@ Every other arm has a control too, named in its test.
 from __future__ import annotations
 
 import ast
+import io
+import json
 import logging
 import os
 import queue
+import socket
 import subprocess
 import sys
 import time
@@ -45,6 +48,8 @@ from messagefoundry.config.settings import (
     security_loosenings,
 )
 from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.logging_guard import active_guard
+from messagefoundry.logging_setup import LogFile, SyslogForward, configure_logging
 from messagefoundry.pipeline import Engine
 from messagefoundry.remotedebug import (
     REMOTE_SCRIPT_EVENT,
@@ -98,6 +103,15 @@ pathlib.Path(final).write_text(str(remote_debug_posture().refused_scripts), enco
 """
 
 
+def _child_env() -> dict[str, str]:
+    """The environment for a child interpreter that must accept injected scripts and must import
+    the tree under test, ahead of whatever copy is installed."""
+    env = dict(os.environ)
+    env.pop("PYTHON_DISABLE_REMOTE_DEBUG", None)
+    env["PYTHONPATH"] = str(_REPO)
+    return env
+
+
 def _wait_for(condition: Callable[[], object], what: str) -> None:
     deadline = time.monotonic() + _WAIT
     while not condition():
@@ -127,11 +141,6 @@ class _Target:
         )
         target = directory / "target.py"
         target.write_text(_TARGET, encoding="utf-8")
-        env = dict(os.environ)
-        # The target must accept injected scripts, or neither arm measures anything.
-        env.pop("PYTHON_DISABLE_REMOTE_DEBUG", None)
-        # The tree under test, ahead of whatever copy is installed.
-        env["PYTHONPATH"] = str(_REPO)
         with open(self.stderr, "wb") as stderr:
             self.process = subprocess.Popen(
                 [
@@ -143,7 +152,8 @@ class _Target:
                     str(self.stop),
                     str(self.final),
                 ],
-                env=env,
+                # The target must accept injected scripts, or neither arm measures anything.
+                env=_child_env(),
                 stderr=stderr,
             )
 
@@ -245,8 +255,8 @@ def test_an_injected_script_runs_without_the_hook_and_not_with_it(
 
 @pytest.fixture
 def reports(monkeypatch: pytest.MonkeyPatch) -> queue.SimpleQueue[str]:
-    """A private report queue, so a reporter thread already running in this process (an earlier
-    test called ``serve``) cannot take what a test here puts on it."""
+    """A private report queue, so the reporter thread already running in this process (the suite
+    imports the command line, which installs the guard) cannot take what a test here puts on it."""
     private: queue.SimpleQueue[str] = queue.SimpleQueue()
     monkeypatch.setattr(remotedebug, "_reports", private)
     # The count too: it is module state, and a later test in this process reads it.
@@ -352,6 +362,165 @@ def test_a_long_file_name_is_cut(reports: queue.SimpleQueue[str]) -> None:
     assert len(reports.get_nowait()) == remotedebug._FILE_NAME_LIMIT
 
 
+@pytest.mark.parametrize(
+    "character",
+    [
+        pytest.param("\U0001f600", id="ten-characters-as-an-ascii-escape"),
+        pytest.param("\x01", id="four-characters-as-a-control-escape"),
+        pytest.param("\\", id="two-characters-as-a-doubled-backslash"),
+    ],
+)
+def test_the_logged_name_is_bounded_and_can_be_read_back(
+    caplog: pytest.LogCaptureFixture, character: str
+) -> None:
+    """The hook keeps a fixed number of characters, and each is logged whole. A second cut made
+    after escaping would let the injecting process choose how little of the name survives."""
+    name = character * remotedebug._FILE_NAME_LIMIT
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.remotedebug"):
+        remotedebug._report(name)
+    message = caplog.records[-1].getMessage()
+    logged = message.split("script file name ")[1].removesuffix("). Nothing in it ran.")
+    assert logged.encode("ascii").decode("unicode_escape") == name
+    assert len(logged) <= 10 * remotedebug._FILE_NAME_LIMIT
+
+
+# --- the refusal line and the log sinks (vault BACKLOG #2742) -----------------------------------
+
+#: File names the injecting process could choose, and how the log must spell each. Written as
+#: escapes so this file stays ASCII. The last one is the control: a plain name is logged as it is.
+_NAMES = [
+    pytest.param("pay\udcffload.py", r"pay\udcffload.py", id="lone-low-surrogate"),
+    pytest.param("pay\ud83dload.py", r"pay\ud83dload.py", id="lone-high-surrogate"),
+    pytest.param("pay\u4e2dload.py", r"pay\u4e2dload.py", id="outside-cp1252"),
+    pytest.param("pay\U0001f600load.py", r"pay\U0001f600load.py", id="astral"),
+    pytest.param("pay\xe9load.py", r"pay\xe9load.py", id="latin-1"),
+    # Six plain characters that read like an escape. The backslash is doubled, so this name is
+    # not logged the same as the lone surrogate in the first arm.
+    pytest.param("pay\\udcffload.py", r"pay\\udcffload.py", id="literal-backslash"),
+    pytest.param("payload.py", "payload.py", id="plain-ascii"),
+]
+
+
+@pytest.mark.parametrize(("name", "spelled"), _NAMES)
+def test_the_warning_is_ascii_whatever_the_file_name(
+    caplog: pytest.LogCaptureFixture, name: str, spelled: str
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.remotedebug"):
+        remotedebug._report(name)
+    message = caplog.records[-1].getMessage()
+    assert message.isascii()
+    assert f"script file name {spelled})" in message
+
+
+class _Sinks:
+    """The three sinks ``configure_logging`` builds, each one readable by the test.
+
+    Standard output is a strict cp1252 stream: the encoding a redirected stdout has on a stock
+    Windows install, with none of the leniency ``main()`` adds. The forwarder sends UDP to a
+    socket this object holds."""
+
+    def __init__(self, directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.log = directory / "engine.log"
+        self._stdout = io.BytesIO()
+        # Held here: dropping the wrapper would close the buffer under it.
+        self._stream = io.TextIOWrapper(
+            self._stdout, encoding="cp1252", errors="strict", write_through=True
+        )
+        monkeypatch.setattr(sys, "stdout", self._stream)
+        self.collector = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.collector.bind(("127.0.0.1", 0))
+        self.collector.settimeout(0.2)
+        configure_logging(
+            "INFO",
+            log_file=LogFile(path=str(self.log)),
+            forward=SyslogForward(host="127.0.0.1", port=self.collector.getsockname()[1]),
+            # Nothing here is an engine, and the control arm fails every sink on purpose.
+            stop_on_write_failure=False,
+        )
+
+    def on_stdout(self) -> str:
+        return self._stdout.getvalue().decode("cp1252")
+
+    def in_file(self) -> str:
+        return self.log.read_text("utf-8")
+
+    def rolled_aside(self) -> list[str]:
+        return sorted(p.name for p in self.log.parent.iterdir() if ".broken-" in p.name)
+
+    def states(self) -> dict[str, str]:
+        guard = active_guard()
+        assert guard is not None
+        return {status.sink: status.state for status in guard.status()}
+
+    def forwarded(self, until: str) -> str:
+        """Every datagram the collector receives, up to the one that holds ``until``."""
+        received = ""
+        deadline = time.monotonic() + _WAIT
+        while until not in received and time.monotonic() < deadline:
+            try:
+                received += self.collector.recvfrom(65535)[0].decode("utf-8")
+            except TimeoutError:
+                continue
+        return received
+
+
+@pytest.fixture
+def build_sinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[], _Sinks]]:
+    """Build the sinks from the test body, not from fixture set-up. pytest puts its own stdout
+    back between the two, and the stdout sink moves to whatever ``sys.stdout`` is when a write
+    fails, so sinks built in set-up would be rescued by pytest's lenient stream."""
+    built: list[_Sinks] = []
+
+    def build() -> _Sinks:
+        built.append(_Sinks(tmp_path, monkeypatch))
+        return built[-1]
+
+    yield build
+    for one in built:
+        one.collector.close()
+
+
+@pytest.mark.parametrize(("name", "spelled"), _NAMES)
+def test_the_refusal_line_reaches_every_sink_whatever_the_file_name(
+    build_sinks: Callable[[], _Sinks], name: str, spelled: str
+) -> None:
+    """The injecting process chooses the name, and it must not be able to keep the refusal out
+    of a log. The control for these arms is the test below, on the same sinks."""
+    sinks = build_sinks()
+    remotedebug._report(name)
+    wanted = f"script file name {spelled})"
+    assert REMOTE_SCRIPT_EVENT in sinks.in_file() and wanted in sinks.in_file()
+    assert wanted in sinks.on_stdout()
+    # The forwarder renders JSON, so a backslash in the name arrives doubled.
+    assert json.dumps(wanted)[1:-1] in sinks.forwarded(REMOTE_SCRIPT_EVENT)
+    assert sinks.rolled_aside() == []
+    assert sinks.states() == {"stdout": "healthy", "file": "healthy"}
+
+
+def test_without_the_escape_a_lone_surrogate_keeps_the_line_out_of_every_sink(
+    build_sinks: Callable[[], _Sinks], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CONTROL for the test above: the same sinks and the same name, with the name passed as it
+    came. The line reaches none of them and the log file is rolled aside, so every assertion
+    above could have failed.
+
+    This arm depends on the sinks themselves failing on a lone surrogate, which they do for any
+    logger's line. If a later change makes the sinks take any string, this arm goes red: delete
+    it then, and the escape is no longer what protects the line."""
+    sinks = build_sinks()
+    monkeypatch.setattr(remotedebug, "_ascii", lambda name: name)
+    remotedebug._report("pay\udcffload.py")
+    assert REMOTE_SCRIPT_EVENT not in sinks.in_file()
+    assert REMOTE_SCRIPT_EVENT not in sinks.on_stdout()
+    assert len(sinks.rolled_aside()) == 1
+    assert sinks.states() == {"stdout": "unwritable", "file": "unwritable"}
+    # The forwarder sends in order. A later line that arrives with no refusal line ahead of it
+    # shows the refusal line was not sent, without waiting out a timeout to prove an absence.
+    logging.getLogger("tests.remote_debug_guard").warning("a later line")
+    forwarded = sinks.forwarded("a later line")
+    assert "a later line" in forwarded and REMOTE_SCRIPT_EVENT not in forwarded
+
+
 # --- installing --------------------------------------------------------------------------------
 
 
@@ -366,6 +535,8 @@ class _Installs:
         # Restored afterwards: a successful install wraps it.
         monkeypatch.setattr(sys, "unraisablehook", sys.unraisablehook)
         monkeypatch.setattr(remotedebug, "_start_reporter", self._start)
+        # This process started its reporter when the suite imported the command line.
+        monkeypatch.setattr(remotedebug, "_reporter_started", False)
 
     def _start(self) -> None:
         self.reporters += 1
@@ -403,6 +574,49 @@ def test_install_tries_again_while_the_hook_does_not_answer(
     # A hook the interpreter dropped gets no reporter thread, and the unraisable hook is put back.
     assert installs.reporters == 0
     assert sys.unraisablehook is before
+
+
+def test_install_does_not_raise_when_a_hook_objects_with_any_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented contract is that the interpreter swallows a RuntimeError from a hook that
+    objects to a new one, and passes on anything else. The command line installs at import, so
+    that must not get out. A stand-in raises here, because CPython 3.14.6 was measured to
+    swallow a ValueError as well."""
+    installs = _Installs(monkeypatch)
+    before = sys.unraisablehook
+
+    def objecting(hook: object) -> None:
+        raise ValueError("an audit hook already installed refused this one")
+
+    monkeypatch.setattr(sys, "addaudithook", objecting)
+    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: False)
+    install_remote_debug_guard()  # returns
+    assert installs.reporters == 0 and sys.unraisablehook is before
+
+
+def test_a_reporter_that_cannot_start_is_tried_again_by_the_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hook refuses with or without its reporter, so a thread the interpreter could not
+    start must not fail the install, and must not be given up on."""
+    installs = _Installs(monkeypatch)
+    attempts: list[int] = []
+
+    def start() -> None:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(remotedebug, "_start_reporter", start)
+    answers = iter([False, True, True, True])
+    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: next(answers))
+    install_remote_debug_guard()  # the hook is in, and the failed start did not get out
+    assert installs.hooks == [remotedebug._guard] and len(attempts) == 1
+    install_remote_debug_guard()  # the hook answers, and the reporter is tried again
+    assert len(attempts) == 2
+    install_remote_debug_guard()  # started now, so nothing more
+    assert installs.hooks == [remotedebug._guard] and len(attempts) == 2
 
 
 def test_the_unraisable_hook_is_wrapped_before_the_audit_hook_is_added(
@@ -496,23 +710,17 @@ def test_the_probe_is_answered_by_the_real_hook_and_by_nothing_else() -> None:
 def test_the_real_install_is_seen_by_the_posture_and_is_not_repeated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Against the real interpreter, with no stand-in for ``sys.addaudithook``. The hook stays in
-    this test process afterwards, which is harmless: it raises on one event nothing here uses."""
+    """Against the real interpreter, with no stand-in for the posture. Importing the command
+    line installs the hook, and it stays in this test process, which is harmless: it raises on
+    one event nothing here uses. So this reads the posture and shows that another call adds
+    nothing. The install itself is measured in a fresh interpreter, further down."""
+    import messagefoundry.__main__  # noqa: F401  (installs the guard, if nothing has yet)
+
     added: list[object] = []
-    real = sys.addaudithook
-    monkeypatch.setattr(sys, "unraisablehook", sys.unraisablehook)  # restored afterwards
-
-    def counting(hook: object) -> None:
-        added.append(hook)
-        real(hook)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(sys, "addaudithook", counting)
-    install_remote_debug_guard()
-    first = len(added)
-    assert first <= 1  # 0 when an earlier test in this process ran `serve`
+    monkeypatch.setattr(sys, "addaudithook", added.append)
     assert remote_debug_posture().guard_installed
     install_remote_debug_guard()
-    assert len(added) == first
+    assert added == []
     # Other audited operations still work with the hook in place.
     sys.audit("messagefoundry.tests.some_other_event", 1)
     assert Path(__file__).read_bytes()
@@ -623,7 +831,162 @@ async def test_the_posture_route_reads_the_live_process_when_nothing_is_pinned(
     assert await _route_names(engine) == ([] if entry is None else [entry[0]])
 
 
-# --- serve and supervise install it before anything else ---------------------------------------
+# --- the command line installs it before anything else (vault BACKLOG #2742) --------------------
+
+# Run in a fresh interpreter, because this process imported the command line long ago. It records
+# which engine modules were loaded at the moment the guard's hook was added.
+_INSTALL_PROBE = """\
+import json
+import sys
+
+from messagefoundry.remotedebug import remote_debug_posture
+
+out, mode = sys.argv[1:3]
+real = sys.addaudithook
+loaded_at_install = []
+
+
+def recording(hook):
+    loaded_at_install.append(sorted(m for m in sys.modules if m.startswith("messagefoundry")))
+    real(hook)
+
+
+sys.addaudithook = recording
+if mode == "objecting":
+
+    def objects(event, args):
+        if event == "sys.addaudithook":
+            raise ValueError("this hook refuses every new one")
+
+    real(objects)
+before = remote_debug_posture().guard_installed
+try:
+    if mode in ("import", "objecting"):
+        import messagefoundry.__main__
+    elif mode == "run":
+        import runpy
+
+        sys.argv = ["messagefoundry", "--version"]
+        runpy.run_module("messagefoundry", run_name="__main__")
+except SystemExit:
+    pass
+finally:
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "enabled": sys.is_remote_debug_enabled(),
+                "before": before,
+                "after": remote_debug_posture().guard_installed,
+                "loaded_at_install": loaded_at_install,
+            },
+            fh,
+        )
+"""
+
+#: What the guard itself needs. Anything more at the moment of the install is an import that ran
+#: ahead of it, and a longer window for a script injected at start-up.
+_GUARD_NEEDS = {"messagefoundry", "messagefoundry.controlchars", "messagefoundry.remotedebug"}
+
+
+def _install_probe(tmp_path: Path, mode: str) -> dict[str, object]:
+    script = tmp_path / "install_probe.py"
+    script.write_text(_INSTALL_PROBE, encoding="utf-8")
+    out = tmp_path / f"{mode}.json"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), str(out), mode],
+            env=_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=50,  # under the suite's per-test watchdog, so a hung probe is reported here
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the install probe did not finish: {exc.stderr!r}")
+    assert proc.returncode == 0 and out.exists(), proc.stderr[-2000:]
+    reading: dict[str, object] = json.loads(out.read_text(encoding="utf-8"))
+    if reading["enabled"] is not True:
+        # An interpreter built without the interface. Nothing was measured, in either direction.
+        pytest.skip("the child interpreter does not accept injected scripts")
+    return reading
+
+
+@pytest.mark.parametrize(
+    ("mode", "own_module"),
+    [
+        # The console-script launcher imports `main` from the module.
+        pytest.param("import", {"messagefoundry.__main__"}, id="imported"),
+        # `python -m messagefoundry --version`: a command that is not `serve`.
+        pytest.param("run", set(), id="run-as-a-module"),
+    ],
+)
+def test_the_command_line_installs_the_guard_ahead_of_its_other_imports(
+    tmp_path: Path, mode: str, own_module: set[str]
+) -> None:
+    reading = _install_probe(tmp_path, mode)
+    assert reading["before"] is False and reading["after"] is True
+    # Added once, and with nothing of the engine loaded but what the guard itself imports.
+    assert reading["loaded_at_install"] == [sorted(_GUARD_NEEDS | own_module)]
+
+
+def test_the_command_line_still_imports_when_another_hook_refuses_the_guard(
+    tmp_path: Path,
+) -> None:
+    """Against a real interpreter: a hook installed earlier raises a ValueError on every new
+    hook. The probe exits non-zero if the import raises, and the reading must say the guard is
+    not there. On CPython 3.14.6 the interpreter swallows that ValueError itself, so this arm
+    does not show that the install contains it. The stand-in test further up does."""
+    reading = _install_probe(tmp_path, "objecting")
+    assert reading["before"] is False and reading["after"] is False
+    assert len(cast("list[object]", reading["loaded_at_install"])) == 1  # tried, once
+
+
+def test_the_probe_alone_installs_nothing(tmp_path: Path) -> None:
+    """CONTROL for the test above: the same probe, which imports the guard's own module, without
+    the command line. The guard is not there, so the True above came from importing the
+    command-line module and from nowhere else."""
+    reading = _install_probe(tmp_path, "library")
+    assert reading["before"] is False and reading["after"] is False
+    assert reading["loaded_at_install"] == []
+
+
+def _ahead_of_the_install(source: str) -> list[str]:
+    """One entry for each module-level statement of ``source`` that stands ahead of the bare
+    ``install_remote_debug_guard()`` call."""
+    ahead: list[str] = []
+    for node in parse_source(source).body:
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and callee_name(node.value, bare_only=True) == "install_remote_debug_guard"
+        ):
+            return ahead
+        if isinstance(node, ast.ImportFrom):
+            ahead.append(f"from {node.module}")
+        elif isinstance(node, ast.Import):
+            ahead.extend(f"import {alias.name}" for alias in node.names)
+        elif ast.get_docstring(ast.Module(body=[node], type_ignores=[])) is not None:
+            ahead.append("docstring")
+        else:
+            ahead.append(type(node).__name__)
+    raise AssertionError("no module-level call to install_remote_debug_guard()")
+
+
+def test_nothing_but_the_guard_import_stands_ahead_of_the_install() -> None:
+    """The child probe above counts engine modules only. Any other import placed above the call
+    would lengthen the start-up window unseen, so the source is read as well."""
+    source = (_REPO / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    guard_only = ["docstring", "from __future__", "from messagefoundry.remotedebug"]
+    assert _ahead_of_the_install(source) == guard_only
+    # CONTROL: an import placed above the call is seen, so the check above could have failed.
+    late = (
+        '"""Doc."""\nfrom __future__ import annotations\nimport argparse\n'
+        "from messagefoundry.remotedebug import install_remote_debug_guard\n"
+        "install_remote_debug_guard()\nimport json\n"
+    )
+    assert _ahead_of_the_install(late) == [*guard_only[:2], "import argparse", guard_only[2]]
+
+
+# --- serve and supervise still make the call first ----------------------------------------------
 
 
 def _first_statement_installs_the_guard(source: str, function: str) -> bool:
@@ -642,7 +1005,8 @@ def _first_statement_installs_the_guard(source: str, function: str) -> bool:
 
 @pytest.mark.parametrize("function", ["_serve", "_supervise"])
 def test_serve_and_supervise_install_the_guard_first(function: str) -> None:
-    """Before the imports and before config: a script injected ahead of the hook runs."""
+    """Before the imports and before config. The command line has installed it by then, so this
+    call normally adds nothing. It predates the install at import and is still in place."""
     source = (_REPO / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
     assert _first_statement_installs_the_guard(source, function)
 

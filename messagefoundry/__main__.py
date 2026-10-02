@@ -21,27 +21,44 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 
 from __future__ import annotations
 
+from messagefoundry.remotedebug import (
+    install_remote_debug_guard,
+    remote_debug_loosening,
+    remote_debug_posture,
+)
+
+# Vault BACKLOG #2742: the hook that refuses an injected script goes in HERE, at import, ahead of
+# every other import and of argument parsing, so every subcommand has it. Put nothing above this
+# call: a script injected before it runs. `messagefoundry/remotedebug.py` says what the hook does
+# and what stays open. Anything that imports this module gets the hook too, for the life of its
+# process: the test suite does, and so does `api/tls.py` inside an engine that already has it.
+#
+# `_serve` and `_supervise` still make the same call first. Their comments describe the window
+# as it was before this call existed; with this one in place theirs normally adds nothing.
+install_remote_debug_guard()
+
 # PEP 810 (BACKLOG #2514; inert on 3.14, see tests/test_startup_import_budget.py). Only commands that
 # open a store or read a service TOML use these. The rest below runs on every command or is the
 # logging chain, so it stays eager. The heavy import is deferred in config/__init__.py.
 __lazy_modules__ = ["sqlite3", "tomllib"]
 
-import argparse
-import contextlib
-import functools
-import json
-import logging
-import sqlite3  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
-import sys
-import tomllib  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
-from collections.abc import Mapping, Sequence
-from pathlib import (
+# E402 on each import below: they follow the install call above on purpose.
+import argparse  # noqa: E402
+import contextlib  # noqa: E402
+import functools  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import sqlite3  # noqa: E402  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
+import sys  # noqa: E402
+import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
+from collections.abc import Mapping, Sequence  # noqa: E402
+from pathlib import (  # noqa: E402
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast  # noqa: E402
 
-from messagefoundry import __version__
-from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR 0201 slice 1)
+from messagefoundry import __version__  # noqa: E402
+from messagefoundry.cli_common import (  # noqa: E402  # the shared CLI shell and helpers (ADR 0201 slice 1)
     Dispatch,
     HelpFormatter,
     _emit_error,
@@ -53,21 +70,19 @@ from messagefoundry.cli_common import (  # the shared CLI shell and helpers (ADR
     first_command,
     run_cli,
 )
-from messagefoundry.cli_surface import CLI_TIERS, TOOLKIT_COMMAND  # pure data, stdlib-only imports
-from messagefoundry.console_streams import harden_console_streams
-from messagefoundry.logging_setup import (
+from messagefoundry.cli_surface import (  # noqa: E402  # pure data, stdlib-only imports
+    CLI_TIERS,
+    TOOLKIT_COMMAND,
+)
+from messagefoundry.console_streams import harden_console_streams  # noqa: E402
+from messagefoundry.logging_setup import (  # noqa: E402
     LOG_LEVELS,
     LogFile,
     SyslogForward,
     configure_logging,
     query_sntp_offset,
 )
-from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.remotedebug import (
-    install_remote_debug_guard,
-    remote_debug_loosening,
-    remote_debug_posture,
-)
+from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
 
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
