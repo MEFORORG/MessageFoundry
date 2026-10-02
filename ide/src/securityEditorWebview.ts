@@ -56,7 +56,7 @@ export const FIELDS: Field[] = [
     desc: "Require an engine second factor (TOTP or a passkey) at sign-in. Every account by default; require_mfa_scope can free a local account without the Administrator role.",
     insecure: false, risk: "an account with no second factor enrolled is single-factor, so a Kerberos session enters on a ticket that asserts no strength. An enrolled account owes its factor only while it keeps one, and its holder may remove the last. An OIDC sign-in needs an amr/acr claim checked while [auth].oidc_require_mfa_claim is on, and that claim stands in for the enrolled factor" },
   { key: "allow_single_factor_admin_when_exposed", label: "Allow single-factor admin when exposed", type: "bool", group: "Sign-in & identity",
-    desc: "Audited ack (ADR 0140): an EXPOSED instance under enforcement = enforce may start with Require MFA off, on an audited warning instead of the refusal.",
+    desc: "Audited ack (ADR 0140): lifts the start refusal that an exposed instance with Require MFA off meets under strict enforcement.",
     insecure: true, risk: "an EXPOSED instance under enforcement = enforce may start with [security].require_mfa off, on an audited warning instead of the refusal. Every account with no second factor enrolled is then single-factor over the network, unless an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on" },
   { key: "sign_out_after_idle_minutes", label: "Sign out after idle (min)", type: "int", group: "Sign-in & identity",
     desc: "Session idle timeout, in minutes." },

@@ -6784,6 +6784,14 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     return out
 
 
+#: The one sign-in that proves a second factor without an enrolled one, worded once for the
+#: ``require_mfa``-off texts here and in ``__main__._serve``. ``_check_mfa_gate`` checks the amr/acr
+#: claim, and the OIDC mint stamps the session verified, only while this setting is on.
+OIDC_MFA_CLAIM_EXCEPTION = (
+    "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
+)
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -7041,8 +7049,7 @@ def security_loosenings(
                 "an EXPOSED instance under enforcement = enforce may start with "
                 "[security].require_mfa off, on an audited warning instead of the refusal. Every "
                 "account with no second factor enrolled is then single-factor over the network, "
-                "unless an OIDC sign-in carries an amr/acr claim checked while "
-                "[auth].oidc_require_mfa_claim is on",
+                f"unless {OIDC_MFA_CLAIM_EXCEPTION}",
             )
         )
     if not sec.encrypt_stored_data:

@@ -11,6 +11,7 @@ AC-5 (the read-only posture view) is in ``tests/test_api_security_posture.py``.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -427,6 +428,33 @@ def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
         "enrolled is then single-factor over the network, unless an OIDC sign-in carries an "
         "amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
     )
+
+
+@pytest.mark.parametrize(
+    ("switch", "sec"),
+    [
+        ("require_mfa", SecuritySettings(require_mfa=False)),
+        (
+            "allow_single_factor_admin_when_exposed",
+            SecuritySettings(allow_single_factor_admin_when_exposed=True),
+        ),
+    ],
+)
+def test_ide_security_editor_risk_mirrors_the_mfa_advisories(
+    switch: str, sec: SecuritySettings
+) -> None:
+    """Vault BACKLOG #1133. RED when the IDE Security Settings page drifts from the engine's text.
+
+    ``ide/src/securityEditorWebview.ts`` says its ``risk`` strings are kept in step with
+    ``security_loosenings()``, and nothing checked it: the page still said "the Administrator role is
+    single-factor" after the engine text was corrected. TypeScript cannot import the Python, so this
+    reads the source. Scoped to the two MFA switches; other risks there are shorter on purpose."""
+    source = (
+        Path(__file__).resolve().parent.parent / "ide" / "src" / "securityEditorWebview.ts"
+    ).read_text(encoding="utf-8")
+    match = re.search(rf'key: "{switch}",.*?risk: "([^"]*)"', source, re.DOTALL)
+    assert match is not None, f"no risk string for {switch} in securityEditorWebview.ts"
+    assert match.group(1) == dict(_loosenings(sec))[switch]
 
 
 def test_loosening_warns_and_prod_phi_refuses(
