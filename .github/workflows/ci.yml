@@ -3764,9 +3764,9 @@ jobs:
       # RIGS SIGN IN (vault BACKLOG #2719). The service runs with sign-in on, as shipped, so this
       # smoke provisions one Administrator before the first start and reads /messages and the
       # security posture as that account (harness/load/rigadmin.py). The password is drawn here,
-      # masked before anything can echo it, and handed as a step output to the steps that use it
-      # (the install, the /messages read and the launch read) and to no other. Hex
-      # cannot spell a word on the engine's password deny-list.
+      # masked before anything can echo it, and handed as a step output to the steps that sign in:
+      # at least the install, the /messages read and the launch read. Hex cannot spell a word on
+      # the engine's password deny-list.
       - name: Draw the rig Administrator's password for this run
         id: rig
         run: |
@@ -4104,7 +4104,9 @@ jobs:
           # Windows pipe is cp1252, and Python stops on the first character that code page lacks.
           PYTHONUTF8: "1"
         run: |
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          # Read that output as UTF-8 too. The readings below are ASCII either way, so a shell
+          # with no console to set is said and not fatal.
+          try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { "console output encoding left as it was" }
           $options = "-I -X disable-remote-debug"
           $module = " -m messagefoundry "
           $command = "serve "
@@ -4155,7 +4157,7 @@ jobs:
           # --- 3. the engine's own report ----------------------------------------------------------
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
           $answer = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert /security/posture
-          if ($LASTEXITCODE -eq 4) { throw "the rig could not sign in to the service, or the service answered /security/posture with no session" }
+          if ($LASTEXITCODE -eq 4) { throw "rigadmin exit 4 on /security/posture: the service did not answer, refused the sign-in, or answered with no session. Its own line above says which" }
           if ($LASTEXITCODE -ne 0) { throw "GET /security/posture did not answer (exit $LASTEXITCODE)" }
           $posture = $answer | ConvertFrom-Json
           if (-not $posture) { throw "GET /security/posture answered nothing that reads as JSON" }
@@ -4643,14 +4645,15 @@ jobs:
             *"$wanted"*) ;;
             *) echo "FAIL: PID 1 was not started as: $wanted"; exit 1 ;;
           esac
-          # Signed in, like the counts above. Exit 4 is the rig failing to sign in, or the engine
-          # answering the posture with no session; the `||` lets that be said before the step ends.
+          # Signed in, like the counts above. Exit 4 is the engine not answering, refusing the
+          # sign-in, or answering the posture with no session, and rigadmin's own line says which.
+          # The `||` lets the step name the read that failed before it ends.
           posture_rc=0
           MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" docker exec -e MEFOR_RIG_ADMIN_PASSWORD mefor \
             python /rig/rigadmin.py get --engine https://127.0.0.1:8765 --cacert "$cert" \
             /security/posture > "$RUNNER_TEMP/posture.json" || posture_rc=$?
           if [ "$posture_rc" -ne 0 ]; then
-            echo "FAIL: the signed-in read of /security/posture did not answer (rigadmin exit $posture_rc; 4 is a failed sign-in)"
+            echo "FAIL: the signed-in read of /security/posture did not answer (rigadmin exit $posture_rc; its own line above says why)"
             exit 1
           fi
           python3 - "$RUNNER_TEMP/posture.json" <<'PY'

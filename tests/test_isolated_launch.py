@@ -286,6 +286,43 @@ def _step_script(job: str, name_starts: str) -> tuple[int, str]:
     return step_script("ci.yml", job, name_starts)
 
 
+#: Clients a step could read the API with and carry no session.
+_SESSIONLESS_CLIENTS = (
+    "curl",
+    "wget",
+    "urllib",
+    "urlopen",
+    "Invoke-RestMethod",
+    "Invoke-WebRequest",
+)
+
+
+def _sessionless_posture_reads(script: str) -> list[str]:
+    """Lines of a step's script that read the posture with a client that signs nobody in."""
+    return [
+        line.strip()
+        for line in script.splitlines()
+        if "/security/posture" in line and any(client in line for client in _SESSIONLESS_CLIENTS)
+    ]
+
+
+def test_the_sessionless_read_screen_sees_the_reads_it_is_for() -> None:
+    """CONTROL for the screen the two smoke-leg tests use: the reads this item first shipped, which
+    got HTTP 401 once the rigs signed in, and the signed-in read that replaced them."""
+    was = (
+        '$posture = & python -c $probe $cert "https://127.0.0.1:8765/security/posture"\n'
+        'curl --cacert "$cert" https://127.0.0.1:8765/security/posture\n'
+        "python /rig/rigadmin.py get --engine https://127.0.0.1:8765 /security/posture\n"
+        "$probe = 'import urllib.request; urllib.request.urlopen(sys.argv[2])'\n"
+    )
+    assert _sessionless_posture_reads(was) == [
+        'curl --cacert "$cert" https://127.0.0.1:8765/security/posture'
+    ]
+    # The first line names no client: the one-line probe did, and that is what the plain
+    # ``urllib.request`` screen in each test below is for.
+    assert "urllib.request" in was
+
+
 def test_the_windows_smoke_leg_reads_the_launch_off_the_running_service() -> None:
     """THIS CANNOT BE DEMONSTRATED FROM A PULL REQUEST: the job runs on a schedule, on dispatch and
     in the merge queue.
@@ -298,10 +335,10 @@ def test_the_windows_smoke_leg_reads_the_launch_off_the_running_service() -> Non
         f'$options = "{_OPTIONS}"',
         '$module = " -m messagefoundry "',
         '$command = "serve "',
+        "$tail = $module + $command",
         "$launch = '^' + [regex]::Escape($options + $tail)",
         "$registered.AppParameters -cnotmatch $launch",
-        "-m harness.load.rigadmin get --engine https://127.0.0.1:8765",
-        "/security/posture",
+        "-m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert /security/posture",
         "$interpreter.isolated -ne $true",
         "$interpreter.safe_path -ne $true",
         "$interpreter.ignore_environment -ne $true",
@@ -312,8 +349,8 @@ def test_the_windows_smoke_leg_reads_the_launch_off_the_running_service() -> Non
     # Case-sensitive throughout: -i is a different interpreter option from -I.
     assert not re.search(r"-(not)?match\b", script), "a launch comparison ignores case"
     assert "CONTROL FAILED" in script
-    # Signed in: no read of the API without a session is left in the step.
-    assert "urllib.request" not in script
+    # Signed in: the posture is read by the rig's client and by nothing that carries no session.
+    assert "urllib.request" not in script and _sessionless_posture_reads(script) == []
     # It must read the ENGINE: the token step after it puts a probe in the engine's place.
     token, token_script = _step_script(
         "windows-service-smoke", "Verify the service token is restricted"
@@ -330,6 +367,7 @@ def test_the_image_smoke_leg_reads_the_launch_and_tries_the_write() -> None:
     _, script = _step_script("docker-smoke", "Serve (loopback, signed in)")
     wanted = " ".join(_IMAGE_ENTRYPOINT[2:]) + " serve "
     needles = (
+        'if [ "$processed" -lt 1 ]; then',
         "/proc/1/cmdline",
         f'wanted="{wanted}"',
         '/security/posture > "$RUNNER_TEMP/posture.json" || posture_rc=$?',
@@ -341,11 +379,13 @@ def test_the_image_smoke_leg_reads_the_launch_and_tries_the_write() -> None:
     )
     for needle in needles:
         assert needle in script, f"the step no longer has {needle!r}"
-    # Signed in: the read goes through the rig's own client, and none is left that carries no session.
+    # Signed in: the posture is read by the rig's client and by nothing that carries no session.
+    # The step's two /health reads carry none, and /health asks for none.
     assert script.count("python /rig/rigadmin.py get --engine https://127.0.0.1:8765") == 2
-    assert "urllib.request" not in script
+    assert "urllib.request" not in script and _sessionless_posture_reads(script) == []
     assert script.count("CONTROL FAILED") >= 2
-    # After the engine is up and the message is through, in the order the checks are listed.
+    # After the engine is up and the message is through (the first needle is that assert), in
+    # the order the checks are listed.
     served = script.index("serve --config /config")
     places = [script.index(needle) for needle in needles]
     assert served < places[0] and places == sorted(places)
