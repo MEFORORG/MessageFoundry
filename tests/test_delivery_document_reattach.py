@@ -121,9 +121,6 @@ class _Collector:
         self.deliveries.append(payload)
         return None
 
-    def check_frame(self, payload: str) -> None:
-        return None  # no frame (ADR 0205 rule 1 hook on DestinationConnector)
-
     async def aclose(self) -> None:
         return None
 

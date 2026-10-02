@@ -5,7 +5,7 @@
 Every registered hostile scenario already runs against the real served graph in
 ``tests/test_harness_scenarios.py``. This file covers what that cannot: the data file and the
 message builder, the controls that prove the traversal-escape check and the round-trip byte check
-can each FAIL (in isolation and inside a live run), and the known-defect scenarios as strict xfails.
+can each FAIL (in isolation and inside a live run), and the known-defect matcher.
 Test ids are scenario or class names, never payloads. A comparison that involves a payload is taken
 into a bool first, so a failure names a label and never prints the payload.
 """

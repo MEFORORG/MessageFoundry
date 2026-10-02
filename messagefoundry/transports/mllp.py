@@ -887,15 +887,14 @@ class MLLPDestination(DestinationConnector):
         name = type(exc).__name__
         return f"{name}: {' '.join(extras)}" if extras else name
 
-    def check_frame(self, payload: str) -> None:
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
         """ADR 0205 rule 1 on ``payload`` without sending it: raise the permanent
-        :class:`NegativeAckError` :meth:`send` would. It checks the payload as :meth:`send` frames
-        it, after the same delimiter rewrites, so a rewrite that drops a frame byte at either end
-        is matched. For the delivery stage's batch members and shadow outbound, where ``send``
-        does not run on this one payload."""
-        check_frame_bytes(
-            MLLP_CODEC, self._rewrite_for_wire(payload), self.encoding, transport="MLLP"
-        )
+        :class:`NegativeAckError` :meth:`send` would. With ``rewrite`` it checks the payload as
+        :meth:`send` frames it, after the same delimiter rewrites, which drop a frame byte at either
+        end; a payload those rewrites cannot parse is their :class:`DeliveryError`. Without it, the
+        payload as given, which is how a batch member sits inside its envelope."""
+        body = self._rewrite_for_wire(payload) if rewrite else payload
+        check_frame_bytes(MLLP_CODEC, body, self.encoding, transport="MLLP")
 
     def _rewrite_for_wire(self, payload: str) -> str:
         """``payload`` after this destination's delimiter rewrites, as :meth:`send` frames it; a

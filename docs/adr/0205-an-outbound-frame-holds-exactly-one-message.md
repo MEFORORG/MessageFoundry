@@ -74,12 +74,16 @@ as the accepted draft wrote them except where a point below says otherwise.
      that only they override. The delivery stage calls it where no
      single-payload `send()` runs: on each member of an MLLP batch before the envelope is built,
      and on a simulate (shadow) outbound, which never calls `send()`. `send()` still checks the
-     bytes it frames. MLLP's `check_frame` judges the payload after the same delimiter rewrites
-     `send()` applies (`encoding_characters`, `hl7_raw_separators`), which drop a frame byte at
-     either end, and the shadow path re-attaches a detached document first, so both see the bytes a
-     live send would frame. A batch member's refusal is dead-lettered only after the rest of the
-     batch is resolved, so a store fault there cannot reach the clean members. A refusal that is
-     not permanent is the whole batch's, as from `send()`.
+     bytes it frames. For a shadow single send, MLLP's `check_frame` judges the payload after the
+     same delimiter rewrites `send()` applies (`encoding_characters`, `hl7_raw_separators`),
+     which drop a frame byte at either end, and the shadow path re-attaches a detached document
+     first, so it sees the bytes a live send would frame. Shadow mirrors rule 1 only: a re-attach
+     or rewrite failure there is skipped and the row completes, as before this change, although a
+     live send would retry it. A batch member is judged as it sits in the envelope, with no rewrite
+     (`rewrite=False`), because `send()` rewrites the whole envelope and the envelope carries each
+     member as stored. A member's refusal is dead-lettered only after the rest of the batch is
+     resolved, or before a lane stop, so a store fault there cannot reach the clean members. A
+     refusal that is not permanent is the whole batch's, as from `send()`.
 2. **A leaf write through the HL7 model never emits a raw control character.** On a component or
    subcomponent write, each C0 control character and DEL except TAB is written as an HL7 hex escape
    (`\X0B\`, uppercase digits), so a value that arrived hex-escaped leaves hex-escaped. CR and LF

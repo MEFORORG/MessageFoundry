@@ -456,9 +456,10 @@ DEAD = (MessageStatus.ERROR.value, OutboxStatus.DEAD.value)
 class _SendRecorder(MLLPDestination):
     """A real MLLP destination, so its ``check_frame`` is the real one, whose send only records."""
 
-    def __init__(self) -> None:
+    def __init__(self, **field: Any) -> None:
         settings: dict[str, object] = {"host": "127.0.0.1", "port": 1}
-        super().__init__(Destination(name=DEST, type=ConnectorType.MLLP, settings=settings))
+        config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
+        super().__init__(config)
         self.sent: list[str] = []
 
     async def send(self, payload: str, *, metadata: Any = None) -> None:
@@ -505,17 +506,22 @@ def test_the_tcp_destination_check_frame_refuses_with_its_label() -> None:
 
 
 @pytest.mark.parametrize(
-    ("body", "expected"),
-    [pytest.param(SMUGGLED, DEAD, id="smuggled"), pytest.param(CLEAN, DONE, id="clean-control")],
+    ("body", "expected", "field"),
+    [
+        pytest.param(SMUGGLED, DEAD, {}, id="smuggled"),
+        pytest.param(CLEAN, DONE, {}, id="clean-control"),
+        # A rewrite failure is not a frame refusal: shadow keeps it a completed delivery.
+        pytest.param("plain text, no MSH", DONE, {"hl7_raw_separators": True}, id="unparseable"),
+    ],
 )
 async def test_a_shadow_outbound_records_what_a_live_send_would(
-    store: MessageStore, body: str, expected: tuple[str, str]
+    store: MessageStore, body: str, expected: tuple[str, str], field: dict[str, Any]
 ) -> None:
     # Rule 1 runs inside connector.send(), which a simulate outbound skips. Before the fix shadow
     # marked the smuggled row PROCESSED, where a live send would have dead-lettered it. The batch
     # twin is in tests/test_outbound_batch.py, which runs on every store backend.
     (mid,) = await _enqueue(store, [body])
-    dest = _SendRecorder()
+    dest = _SendRecorder(**field)
     runner = wiring_runner.RegistryRunner(Registry(), store, poll_interval=0.02)
     runner._destinations[DEST] = dest
     runner._retry[DEST] = RetryPolicy()

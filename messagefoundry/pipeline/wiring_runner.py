@@ -6610,8 +6610,19 @@ class RegistryRunner:
                 # hydrated payload, as a live send sees it: an explicit TCP codec may use a byte of
                 # the base64 alphabet a re-attached document carries. A connector that does not
                 # frame keeps the default no-op, so it pays no hydration.
-                if type(connector).check_frame is not DestinationConnector.check_frame:
-                    connector.check_frame(await self._hydrate_payload(item.payload))
+                # Shadow mirrors rule 1 only: a hydration or rewrite failure is not a frame
+                # refusal, so it stays what shadow made it before, a completed delivery.
+                if _frames(connector):
+                    try:
+                        connector.check_frame(await self._hydrate_payload(item.payload))
+                    except NegativeAckError:
+                        raise
+                    except DeliveryError as exc:
+                        log.debug(
+                            "delivery worker %r: shadow frame check skipped (%s)",
+                            name,
+                            type(exc).__name__,
+                        )
                 response = None
             else:
                 # PHASE (a): the connector send->ACK round-trip. On a real cross-box outbound this is
@@ -6913,9 +6924,12 @@ class RegistryRunner:
             # and the rest batch, rather than all N dying on one envelope offset. It runs before the
             # shadow branch below, so a simulate outbound records the same dispositions. The split
             # writes nothing; the refused members are dead-lettered after this try, on every path.
-            kept, members, refused = self._split_unframeable_members(
-                name, connector, items, hydrated
-            )
+            if _frames(connector):
+                kept, members, refused = self._split_unframeable_members(
+                    name, connector, items, hydrated
+                )
+            else:
+                kept, members = list(items), list[Message | str](hydrated)
             ids = [it.id for it in kept]
             if kept:
                 first = kept[0]  # the envelope's head is the first member that survived
@@ -6937,8 +6951,10 @@ class RegistryRunner:
             # exactly as the single row does.
             fault = self._lane_stopping_fault(exc)
             if fault is not None:
-                await self._stop_lane_retaining(name, ids, exc, fault)
+                # Refused members first: a store fault here then escapes before the stop, not
+                # after a stop and alert are already recorded, so #109 cannot loop on re-auth.
                 await self._dead_letter_refused(refused)
+                await self._stop_lane_retaining(name, ids, exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
                 await self.store.dead_letter_batch(ids, safe_exc(exc))
@@ -6960,6 +6976,7 @@ class RegistryRunner:
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
             ):
+                await self._dead_letter_refused(refused)  # before the stop, as above
                 log.error(
                     "delivery worker %r: framing/internal error delivering a batch of %d (%s); STOPPING "
                     "connection (operator must fix + reload/restart to resume)",
@@ -6974,7 +6991,6 @@ class RegistryRunner:
                     name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
                 )
                 self._hold_for_operator(name, "outbound")
-                await self._dead_letter_refused(refused)
                 return _ItemOutcome.STOPPED, None
             log.warning(
                 "delivery worker %r: framing/internal error delivering a batch of %d (%s); dead-lettering",
@@ -7008,7 +7024,7 @@ class RegistryRunner:
         refused: list[tuple[str, str]] = []
         for item, payload in zip(items, payloads, strict=True):
             try:
-                connector.check_frame(payload)
+                connector.check_frame(payload, rewrite=False)
             except NegativeAckError as exc:
                 if not exc.permanent or self._lane_stopping_fault(exc) is not None:
                     raise
@@ -8619,6 +8635,15 @@ class RegistryRunner:
             return True
         except TimeoutError:
             return False
+
+
+def _frames(connector: object) -> bool:
+    """Whether ``connector`` overrides :meth:`DestinationConnector.check_frame`, that is, frames
+    its payload (MLLP, TCP). Read off the class, so a connector that does not frame costs the
+    delivery stage no hydration and no per-member pass, and a duck-typed test double that never
+    defined the hook counts as not framing."""
+    hook = getattr(type(connector), "check_frame", None)
+    return hook is not None and hook is not DestinationConnector.check_frame
 
 
 def _hl7_batch_timestamp(created_at: float | None) -> str:

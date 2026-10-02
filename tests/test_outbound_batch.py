@@ -115,9 +115,6 @@ class _Recorder:
             raise self.fail
         self.sent.append(payload)
 
-    def check_frame(self, payload: str) -> None:
-        return None  # no frame (ADR 0205 rule 1 hook on DestinationConnector)
-
     async def aclose(self) -> None:
         return None
 
@@ -493,9 +490,10 @@ async def test_max_count_caps_the_batch(store: Any) -> None:
 class _MllpRecorder(MLLPDestination):
     """A real MLLP destination, so ``check_frame`` is the real one, whose send only records."""
 
-    def __init__(self) -> None:
+    def __init__(self, **field: Any) -> None:
         settings: dict[str, object] = {"host": "127.0.0.1", "port": 1}
-        super().__init__(Destination(name=DEST, type=ConnectorType.MLLP, settings=settings))
+        config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
+        super().__init__(config)
         self.sent: list[str] = []
 
     async def send(self, payload: str, *, metadata: Any = None) -> None:
@@ -511,9 +509,9 @@ async def _enqueue_bodies(store: Any, bodies: Sequence[str]) -> list[str]:
     ]
 
 
-async def _run_one_batch(store: Any, *, simulate: bool) -> _MllpRecorder:
+async def _run_one_batch(store: Any, *, simulate: bool, **field: Any) -> _MllpRecorder:
     runner = _runner(store)
-    rec = _MllpRecorder()
+    rec = _MllpRecorder(**field)
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
     runner._simulate[DEST] = simulate
     head = await store.claim_next_fifo(DEST)
@@ -565,7 +563,7 @@ async def test_a_retryable_member_refusal_re_pends_the_whole_batch(store: Any) -
     # Only a permanent refusal takes one member out; any other is the whole batch's, as a send
     # raising it would be.
     class _Transient(_Recorder):
-        def check_frame(self, payload: str) -> None:
+        def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
             raise NegativeAckError("try later", code="framing", permanent=False)
 
     mids = await _enqueue_bodies(store, [_msg(1), _msg(2)])
@@ -585,6 +583,31 @@ async def test_a_batch_whose_every_member_holds_a_frame_byte_sends_nothing(store
     rec = await _run_one_batch(store, simulate=False)
     assert rec.sent == []
     assert await _states(store, mids) == [DEAD_LETTERED, DEAD_LETTERED]
+
+
+@pytest.mark.parametrize("simulate", [False, True], ids=["live", "shadow"])
+async def test_a_member_is_judged_as_it_sits_in_the_envelope_not_after_a_rewrite(
+    store: Any, simulate: bool
+) -> None:
+    # A delimiter rewrite would strip a trailing 0x1C from the member alone, but the envelope
+    # carries the member as stored and send() rewrites the whole envelope, so the byte is still
+    # inside it. Judged after the rewrite, the member passed and send() then refused all three.
+    bad = _msg(2) + chr(0x1C)
+    mids = await _enqueue_bodies(store, [_msg(1), bad, _msg(3)])
+    rec = await _run_one_batch(store, simulate=simulate, hl7_raw_separators=True)
+    if not simulate:
+        (envelope,) = rec.sent
+        assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG1", "MSG3"]
+    assert await _states(store, mids) == [DELIVERED, DEAD_LETTERED, DELIVERED]
+
+
+async def test_a_non_hl7_member_is_not_rewritten_per_member(store: Any) -> None:
+    # Only the envelope is rewritten, in send(). A per-member rewrite raised DeliveryError on a
+    # member with no MSH and retried the whole batch.
+    mids = await _enqueue_bodies(store, [_msg(1), "plain text, no MSH"])
+    rec = await _run_one_batch(store, simulate=False, hl7_raw_separators=True)
+    assert len(rec.sent) == 1
+    assert await _states(store, mids) == [DELIVERED, DELIVERED]
 
 
 # --- BACKLOG #82: the BATCH send seam honors send pacing (the key remainder proof) ---------------
