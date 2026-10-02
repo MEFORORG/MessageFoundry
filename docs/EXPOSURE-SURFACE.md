@@ -28,7 +28,7 @@ At least these open a listening socket. Each one binds loopback (`127.0.0.1`) by
 | What listens | Bind address | Port | Read more |
 |---|---|---|---|
 | The operator API, the web console at `/ui` and the stats WebSocket, all on one socket | `127.0.0.1` while `[security].local_access_only` is true, the default. Otherwise `[security].listen_address` | `[api].port`, default `8765` | [Control-plane listeners](ASVS-L2-PHASE0-CHANGES.md#52-control-plane-listeners) |
-| Each inbound Connection of type MLLP, raw TCP, X12, HTTP or DICOM C-STORE SCP | `[inbound].bind_host`, default `127.0.0.1`. A Connection can override it with `bind_address` | Set on the Connection. Only `DICOM()` has a default, `104` | [Message-plane connectors](ASVS-L2-PHASE0-CHANGES.md#51-message-plane-connectors) |
+| Each inbound Connection of type MLLP, raw TCP, X12, HTTP or DICOM C-STORE SCP | `[inbound].bind_host`, default `127.0.0.1`. A Connection can override it with `bind_address` | Set on the Connection | [Message-plane connectors](ASVS-L2-PHASE0-CHANGES.md#51-message-plane-connectors) |
 
 **The settings file is not the last word on a bind.** `serve --host` and `serve --port` override it,
 and so do `MEFOR_*` environment variables. Read the service's command line and environment too.
@@ -94,7 +94,7 @@ Each one is in `_serve` in `messagefoundry/__main__.py`.
 | Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
 | Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |
 | Proxy attestations | Under the default `[security].enforcement = enforce`, a non-loopback bind behind a declared TLS terminator that lacks `[api].proxy_intra_service_auth` or `[api].proxy_tls_min_version` |
-| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. `egress_open` in `messagefoundry/__main__.py` holds the rule |
+| Open egress | Under `enforce`, outbound egress that is fully open: `[security].block_unlisted_outbound` is not set to true, and no destination list that the guard counts is populated. The `egress_open` expression in `_serve` holds the rule |
 
 Under `enforcement = warn`, the proxy-attestation and open-egress guards only warn, and the
 operator-bind guard accepts the override that DEPLOYMENT.md describes. The sign-in, revocation and
@@ -126,13 +126,11 @@ and speaks plaintext to the declared proxy, so that hop is the site's to protect
 has the detail.
 
 `[security].allowed_client_networks` is a second layer. It does not limit who can reach the socket.
-It refuses a request whose client address is outside the listed networks. It is empty by default,
-which means no restriction.
-
-The check has limits, so keep a host firewall as the first layer.
+It filters requests by client address, with exemptions. It is empty by default, which means no
+restriction. The check has limits, so keep a host firewall as the first layer.
 [ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)
-names the topologies where it has no effect. [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says
-what turning a protective switch off costs.
+describes the exemptions and names the topologies where the check has no effect.
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says what turning a protective switch off costs.
 
 ## What sits on disk is listed in PHI.md
 
@@ -186,5 +184,5 @@ rest of its limits.
 | How the project ranks a dependency vulnerability | [.github/SECURITY.md](../.github/SECURITY.md#dependency-third-party-vulnerabilities) | Known exploited first (the CISA Known Exploited Vulnerabilities list), then the Exploit Prediction Scoring System (EPSS) score. The Common Vulnerability Scoring System (CVSS) score only breaks ties |
 | How long an old version stays covered | [SUPPORT-POLICY.md](SUPPORT-POLICY.md) | Only the latest release is supported, with no back-port. A clock runs on adopting each security release, and the page gives the days |
 
-The threat model and the security assessments are not published.
+Some security documents are not published.
 [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) says what is withheld and how to ask for it.
