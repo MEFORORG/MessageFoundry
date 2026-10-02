@@ -121,9 +121,10 @@ updates:
     #
     # `pydicom`, `webauthn` and `pynetdicom` are the same WIDENED-CAP case (BACKLOG #2505). A major
     # cap needs its entry as much as a minor one: `python-deps-major` is one batch on `*`, so a
-    # widened major cap holds that batch hostage too. pyproject.toml's [dicom] comment says why
-    # `pynetdicom<4` holds: no pynetdicom 4.x has been released to vet, so the cap now guards an
-    # unseen major, not a known break.
+    # widened major cap holds that batch hostage too. `webauthn<4` is the major cap of the three.
+    # `pynetdicom<3.1` is a minor cap, like `pydicom<3.1`; it was `<4` until vault BACKLOG #2713.
+    # pyproject.toml's [dicom] comment says why each holds and what raising it requires. Lift each
+    # entry in the same PR that lifts its cap.
     #
     # THE RULE (BACKLOG #2505): every upper bound in pyproject.toml has an entry here, exactly `>=`
     # the version the test derives (a `<` cap's bound; for an exact `==` pin, the next minor), unless
@@ -148,7 +149,7 @@ updates:
         versions: [">=4.0.0"]
       # Why: the comment above the [dicom] extra in pyproject.toml.
       - dependency-name: "pynetdicom"
-        versions: [">=4.0.0"]
+        versions: [">=3.1.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates), SPLIT BY UPDATE TYPE (owner
       # decision 2026-09-30) so one bad major cannot hold the routine minors and patches hostage.

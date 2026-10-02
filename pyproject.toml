@@ -182,11 +182,22 @@ fhir = ["fhir.resources>=7.1.0", "fhir-core>=1.1.11", "fhirpathpy>=2.2.0"]
 # folded into [dicom].
 # pydicom is capped below 3.1 because the deflate guard replays private pydicom header readers, and the
 # agreement test (tests/test_dicom_deflate_guard.py) only proves the locked release (BACKLOG #1926).
-# pynetdicom stays capped below 4 (its original reason is unrecorded) because no 4.x exists to vet: none on
-# PyPI or in the GitHub tags, and upstream main is 3.1.0.dev0, still pydicom>=3,<4 (checked 2026-10-01,
-# BACKLOG #2505). Sources:
+# pynetdicom is capped below 3.1 for the same kind of reason (vault BACKLOG #2713; the cap was below 4
+# until then). The DICOM listener's association server (_admitting_server_class in
+# messagefoundry/transports/dicom.py) subclasses pynetdicom's threaded server and overrides the
+# socketserver hooks it accepts connections through. That subclass was read against pynetdicom 3.0.4, the
+# locked release, and against CPython's socketserver. Its guard, _require_socketserver_routing, refuses to
+# start the listener on a pynetdicom that left that routing, but a site would only learn that when the
+# listener failed to start. The cap moves the stop to install time, where it is a reviewed step.
+# TO RAISE IT: re-read _admitting_server_class against the new release's pynetdicom/transport.py, run
+# tests/test_dicom_scp_admission.py against that release, then lift the cap and its entry in
+# .github/dependabot.yml in the same PR.
+# What the cap excludes today: no final 3.1 exists, so no stable release. PyPI does carry a 3.1.0.dev0
+# development release, which the old cap allowed to an install that opts into pre-releases and this one does
+# not. That release still requires pydicom>=3,<4. No 4.x exists on PyPI or in the GitHub tags (checked
+# 2026-10-02; BACKLOG #2505 first checked 2026-10-01). Sources:
 # https://pypi.org/pypi/pynetdicom/json and https://github.com/pydicom/pynetdicom/tags
-dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<3.1"]
+dicom = ["pynetdicom>=3.0.4,<3.1", "pydicom>=3.0.2,<3.1"]
 # Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so
 # the tolerant X12Peek/X12Message hot path (the default) never needs it. pyx12 is the reference
 # implementation-guide validator (e.g. 005010X222A1 for 837P) and also emits the 997/999 ack as a

@@ -672,3 +672,43 @@ def test_a_pynetdicom_that_left_the_socketserver_routing_is_refused() -> None:
     for left in (OwnLoop, OwnDispatch, OwnPerConnectionStep, NotThreaded):
         with pytest.raises(RuntimeError, match="does not route an accepted connection"):
             dicom_module._require_socketserver_routing(left)
+
+
+def test_the_dicom_extra_admits_only_the_pynetdicom_line_the_server_was_read_against() -> None:
+    """The ``[dicom]`` extra must not admit a pynetdicom the admitting server was not read against.
+
+    ``_admitting_server_class`` was read against pynetdicom 3.0.4. The routing guard above refuses a
+    release that left the hooks, but only when the listener starts. The cap in ``pyproject.toml``
+    stops one at install time (vault BACKLOG #2713). RED when someone widens that cap. Before you
+    change the versions below, re-read ``_admitting_server_class`` against the new release; the
+    comment above the extra in ``pyproject.toml`` has the steps.
+    """
+    import tomllib
+    from importlib.metadata import version
+
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    extra = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]["dicom"]
+    specs = [
+        req.specifier
+        for req in map(Requirement, extra)
+        if canonicalize_name(req.name) == "pynetdicom"
+    ]
+    assert len(specs) == 1, f"expected one pynetdicom requirement in [dicom], found {extra}"
+    (spec,) = specs
+
+    # CONTROL: the release the server was read against, and the one these tests ran on, are admitted.
+    assert spec.contains("3.0.4", prereleases=True)
+    assert spec.contains(version("pynetdicom"), prereleases=True), (
+        f"these tests ran on pynetdicom {version('pynetdicom')}, which [dicom] ({spec}) refuses"
+    )
+    # 3.1.0.dev0 is a real development release on PyPI, so pre-releases are checked too.
+    for unread in ("3.1.0.dev0", "3.1.0", "4.0.0"):
+        assert not spec.contains(unread, prereleases=True), (
+            f"[dicom] ({spec}) admits pynetdicom {unread}, which the admitting server was never "
+            "read against"
+        )
