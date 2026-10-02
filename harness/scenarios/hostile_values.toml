@@ -8,7 +8,8 @@
 #
 # Keys:
 #   class      the hostile class. A scenario names the classes it injects: hostile_<class> in
-#              SCENARIOS (framing_smuggle is used only by hostile_framing_bytes_via_file)
+#              SCENARIOS (framing_smuggle is used only by hostile_framing_bytes_via_file, and
+#              framing_end_block only by hostile_framing_bytes)
 #   label      a short name for reports; never the payload itself
 #   path       where the value goes. A component path (PID-5.1) escapes the message's own
 #              delimiters; a whole-field path (PID-5, MSH-10) is written verbatim
@@ -113,7 +114,7 @@ separators = { field = "|", component = "~", repetition = "^", escape = "\\", su
 
 # --- MLLP framing bytes (start block 0x0B, end block 0x1C) -------------------------------------
 # Ingress refuses an HL7 v2 body holding either byte inside the message (ADR 0205 rule 4), by any
-# driver, so both values are an ERROR (a NAK over MLLP) and reach no sink.
+# driver, so the two values below are an ERROR (a NAK over MLLP) and reach no sink.
 
 [[value]]
 class = "framing_bytes"
@@ -121,6 +122,15 @@ label = "start_and_end_block"
 path = "PID-5.1"
 text = "before\u000bmiddle\u001cafter"
 expect = "error"
+
+# An end block alone, sent over MLLP only: it ends the frame there, so the engine receives the
+# message up to "before", with no frame byte left in it, and processes that prefix. This is the live
+# check that an MLLP 0x1C ends the frame. By File the same body would be refused at ingress.
+[[value]]
+class = "framing_end_block"
+label = "end_block_only"
+path = "PID-5.1"
+text = "before\u001cafter"
 
 # A second MLLP frame hidden in a field: an end block, a start block, then a whole MSH using '#' as
 # its field separator (the model refuses a raw '|' in a whole-field write).
