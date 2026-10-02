@@ -36,3 +36,14 @@ def max_frame_bytes_arg(text: str) -> int:
     if value < 0:
         raise argparse.ArgumentTypeError(f"must be zero or more (0 turns the cap off), got {value}")
     return value
+
+
+def positive_bytes_arg(text: str) -> int:
+    """``argparse`` type for a byte cap that cannot be turned off: a whole number above zero."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be above zero, got {value}")
+    return value

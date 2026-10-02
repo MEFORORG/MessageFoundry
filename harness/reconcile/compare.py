@@ -13,10 +13,10 @@ blanks the engine-non-deterministic fields); unmatched ids on either side are su
 Inputs are read by :func:`load_messages`, which accepts a MEFOR JSONL capture (from
 :class:`harness.reconcile.capture.CaptureSink`), a directory of one-message files, or a single batch file
 of concatenated HL7 (split on ``MSH`` boundaries) — so the same loader takes both sides. Each file is
-read bounded (ASVS 5.1.1): at most ``max_file_bytes``, default the engine's per-message cap, through
-:func:`harness.bounded_file.read_capped`; a file over it, or one that is not a regular file, is refused
-with :class:`LoadError` naming the file, never read whole. ``python -m harness.reconcile compare
---max-file-bytes`` raises the cap for a long capture.
+read bounded (ASVS 5.1.1): at most ``max_file_bytes``, default :data:`DEFAULT_MAX_LOAD_FILE_BYTES`,
+through :func:`harness.bounded_file.read_capped`; a file over it, or a named path that is not a regular
+file, is refused with :class:`LoadError` naming the file, never read whole. ``python -m
+harness.reconcile compare --max-file-bytes`` changes the cap.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from harness.bounded_file import read_capped
+from harness.bounded_file import NOT_REGULAR, read_capped
 from harness.reconcile.normalize import (
     Difference,
     NormalizeRules,
@@ -56,28 +56,38 @@ def field_value(raw: str, key: tuple[str, int]) -> str | None:
     return None
 
 
+#: The largest input file :func:`load_messages` reads. A capture or an export holds many messages and
+#: is held in memory whole, so this is a file bound, not the engine's per-message cap: 64 of those,
+#: 1 GiB. ``python -m harness.reconcile compare --max-file-bytes`` changes it.
+DEFAULT_MAX_LOAD_FILE_BYTES = 64 * DEFAULT_MAX_MESSAGE_BYTES
+
+
 class LoadError(ValueError):
-    """An input file :func:`load_messages` refused to read: over the cap, or not a regular file."""
+    """An input file :func:`load_messages` refused to read: over the cap, or not a regular file.
+    ``over_cap`` says which, so a caller can name the setting that would help."""
+
+    def __init__(self, message: str, *, over_cap: bool) -> None:
+        super().__init__(message)
+        self.over_cap = over_cap
 
 
 def _read(path: Path, cap: int) -> bytes:
-    try:
-        data, reason = read_capped(path, cap)
-    except OSError as exc:
-        raise LoadError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    """``path``'s bytes, bounded. A missing or unreadable file raises ``OSError`` as it always did."""
+    data, reason = read_capped(path, cap)
     if reason:
-        raise LoadError(f"{path}: {reason}; raise --max-file-bytes to read it")
+        raise LoadError(f"{path}: {reason}", over_cap=reason != NOT_REGULAR)
     return data
 
 
 def load_messages(
-    path: str | Path, *, max_file_bytes: int = DEFAULT_MAX_MESSAGE_BYTES
+    path: str | Path, *, max_file_bytes: int = DEFAULT_MAX_LOAD_FILE_BYTES
 ) -> list[str]:
     """Load raw HL7 messages from a MEFOR JSONL capture, a directory of one-message files, or a single
     batch file of concatenated messages (split on ``MSH`` line boundaries).
 
-    Each file is capped at ``max_file_bytes`` (default the engine's per-message cap) and refused with
-    :class:`LoadError` over it, before it is read whole."""
+    Each file is capped at ``max_file_bytes`` (default :data:`DEFAULT_MAX_LOAD_FILE_BYTES`) and refused
+    with :class:`LoadError` over it, before it is read whole; so is a named path that is not a regular
+    file. In a directory, only regular files are read, and anything else in it is skipped."""
     if max_file_bytes <= 0:
         raise ValueError(f"max_file_bytes must be a positive byte count, got {max_file_bytes}")
     p = Path(path)

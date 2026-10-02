@@ -11,12 +11,19 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from harness.reconcile.__main__ import main as reconcile_main
-from harness.reconcile.compare import LoadError, field_value, load_messages, reconcile
+from harness.reconcile.compare import (
+    DEFAULT_MAX_LOAD_FILE_BYTES,
+    LoadError,
+    field_value,
+    load_messages,
+    reconcile,
+)
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -58,10 +65,11 @@ def test_load_messages_jsonl_batch_and_dir(tmp_path: Path) -> None:
 
 
 def test_load_messages_refuses_a_file_over_the_cap_in_each_shape(tmp_path: Path) -> None:
-    """ASVS 5.1.1: each input file is capped (default the engine's per-message cap) and refused
-    before it is read whole -- a batch file, a JSONL capture, and one file in a directory."""
+    """ASVS 5.1.1: each input file is capped and refused before it is read whole -- a batch file, a
+    JSONL capture, and one file in a directory. The default is a FILE bound, not the per-message cap:
+    a capture holds many messages."""
     default = inspect.signature(load_messages).parameters["max_file_bytes"].default
-    assert default == DEFAULT_MAX_MESSAGE_BYTES
+    assert default == DEFAULT_MAX_LOAD_FILE_BYTES == 64 * DEFAULT_MAX_MESSAGE_BYTES
     one = _msg("A").encode("latin-1")
     batch = tmp_path / "export.hl7"
     batch.write_bytes(one * 2)
@@ -70,8 +78,14 @@ def test_load_messages_refuses_a_file_over_the_cap_in_each_shape(tmp_path: Path)
         load_messages(batch, max_file_bytes=len(one) * 2 - 1)
     jsonl = tmp_path / "cap.jsonl"
     jsonl.write_text(json.dumps({"raw": _msg("A")}), encoding="utf-8")
-    with pytest.raises(LoadError, match="raise --max-file-bytes"):
+    with pytest.raises(LoadError, match="over the 8-byte cap") as over:
         load_messages(jsonl, max_file_bytes=8)
+    assert over.value.over_cap
+    if hasattr(os, "mkfifo"):  # POSIX: a FIFO is refused unread, never blocked on
+        os.mkfifo(tmp_path / "pipe.hl7")
+        with pytest.raises(LoadError, match="not a regular file") as odd:
+            load_messages(tmp_path / "pipe.hl7")
+        assert not odd.value.over_cap
     d = tmp_path / "exp"
     d.mkdir()
     (d / "1.hl7").write_bytes(one)
@@ -89,7 +103,8 @@ def test_compare_cli_reports_an_over_cap_input_and_exits_two(
     batch.write_text(_msg("A"), encoding="latin-1")
     argv = ["compare", "--mefor", str(batch), "--corepoint", str(batch)]
     assert reconcile_main([*argv, "--max-file-bytes", "16"]) == 2
-    assert "over the 16-byte cap" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "over the 16-byte cap" in err and "--max-file-bytes changes the cap" in err
     assert reconcile_main(argv) == 0  # the default cap reads it; the same pair is clean
     with pytest.raises(SystemExit):
         reconcile_main([*argv, "--max-file-bytes", "0"])

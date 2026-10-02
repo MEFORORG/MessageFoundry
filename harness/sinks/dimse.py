@@ -131,7 +131,10 @@ class DimseSink(Sink):
             "calling_ae": str(getattr(event.assoc.requestor, "ae_title", "") or "").strip(),
             "status": f"{self.status:04X}",
         }
-        refused = self._over_cap(event)
+        try:
+            refused = self._over_cap(event)
+        except Exception as exc:  # noqa: BLE001 - never raise to pynetdicom; refuse and record it
+            refused = f"could not be measured ({type(exc).__name__}); not decoded"
         if refused:
             meta["refused"] = refused
             meta["status"] = f"{CANNOT_UNDERSTAND:04X}"
@@ -151,22 +154,24 @@ class DimseSink(Sink):
 
     def _over_cap(self, event: Any) -> str:
         """Why the received object is refused before decode, or ``""``. Reads only the raw Data Set
-        pynetdicom buffered, as the engine's SCP does: its length (``getbuffer`` does not copy), then,
-        for a Deflated context, how far it inflates. ``event.dataset`` would inflate it unbounded."""
+        pynetdicom buffered, as the engine's SCP does: its length, then, for a Deflated context, how
+        far it inflates. ``event.dataset`` would inflate it unbounded. pynetdicom has already
+        buffered the whole Data Set when this runs, so the cap bounds decoding, not receipt, which
+        is the engine SCP's shape too."""
         data_set = getattr(getattr(event, "request", None), "DataSet", None)
         if data_set is None:
             return ""
-        with data_set.getbuffer() as raw:
-            size = raw.nbytes
-        if size > self.max_object_bytes:
-            return f"{size} bytes, over the {self.max_object_bytes}-byte cap; not decoded"
         syntax = str(getattr(getattr(event, "context", None), "transfer_syntax", "") or "")
-        if syntax == DEFLATED_EXPLICIT_VR_LE:
-            cap = min(self.max_object_bytes, DEFAULT_MAX_INFLATED_BYTES)
-            try:
-                bounded_inflate_or_error(data_set.getvalue(), max_bytes=cap)
-            except DicomBombError:
-                return f"inflates past the {cap}-byte cap; not decoded"
+        with data_set.getbuffer() as raw:  # a view: neither check copies the buffered bytes
+            size = raw.nbytes
+            if size > self.max_object_bytes:
+                return f"{size} bytes, over the {self.max_object_bytes}-byte cap; not decoded"
+            if syntax == DEFLATED_EXPLICIT_VR_LE:
+                cap = min(self.max_object_bytes, DEFAULT_MAX_INFLATED_BYTES)
+                try:
+                    bounded_inflate_or_error(raw, max_bytes=cap)
+                except DicomBombError:
+                    return f"inflates past the {cap}-byte cap; not decoded"
         return ""
 
 

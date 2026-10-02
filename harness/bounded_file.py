@@ -31,8 +31,10 @@ def read_capped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[
 
     ``reason`` is :data:`NOT_REGULAR`, an over-cap refusal naming the size, or a refusal for a file
     that grew past ``cap`` while it was read; none quotes the file's content. Raises ``OSError`` for
-    a transient failure (the file vanished, is locked, or was swapped for a symlink when
-    ``follow_symlinks`` is false), which a caller retries on its next scan.
+    a transient failure (the file vanished, is locked, or, where the OS has ``O_NOFOLLOW``, was
+    swapped for a symlink after the ``lstat`` when ``follow_symlinks`` is false), which a caller
+    retries on its next scan. Windows has no ``O_NOFOLLOW``, so there the ``lstat`` is the only
+    symlink check.
     """
     st = path.stat() if follow_symlinks else path.lstat()
     if not stat.S_ISREG(st.st_mode):

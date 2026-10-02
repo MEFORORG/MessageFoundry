@@ -356,7 +356,8 @@ def test_the_sink_reads_no_payload_over_the_cap_and_records_the_refusal(
         records = sink.records()
     assert [r.meta["control_id"] for r in records] == ["C1", "C2", "C3"]
     assert [r.payload for r in records] == [b"", b"", b"MSH|a"]
-    assert records[0].meta["refused"].startswith(f"{cap + 1} characters, over the 5-character cap")
+    # A withheld payload names the server-side cap, which the attribute cannot raise or hide.
+    assert records[0].meta["refused"].startswith(f"{cap + 1} characters, over the {cap}-character")
     assert records[1].meta["refused"].startswith("6 characters, over the 5-character cap")
     assert "refused" not in records[2].meta
     assert "MSH" not in records[1].meta["refused"]  # the refusal never quotes the payload

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -88,11 +89,11 @@ def test_watcher_refuses_an_over_cap_file_without_reading_it(
     qapp: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     opened: list[str] = []
-    real_open = Path.open
+    real_open = os.open
 
-    def spy_open(self: Path, *args: Any, **kwargs: Any) -> Any:
-        opened.append(self.name)
-        return real_open(self, *args, **kwargs)
+    def spy_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(Path(str(path)).name)
+        return real_open(path, *args, **kwargs)
 
     watcher = FolderWatcher()
     cap = len(_MSG.encode())
@@ -105,7 +106,9 @@ def test_watcher_refuses_an_over_cap_file_without_reading_it(
     try:
         (tmp_path / "at-cap.hl7").write_text(_MSG, encoding="utf-8", newline="")
         (tmp_path / "big.hl7").write_text(_MSG + "X", encoding="utf-8", newline="")
-        monkeypatch.setattr(Path, "open", spy_open)  # after the writes, which open too
+        # After the writes, which open too. The watcher reads through harness.bounded_file, which
+        # opens with os.open; Path.open would never see it.
+        monkeypatch.setattr(os, "open", spy_open)
         watcher._scan()
         watcher._scan()  # a refused file is not retried on every rescan
     finally:
@@ -113,6 +116,7 @@ def test_watcher_refuses_an_over_cap_file_without_reading_it(
     assert [r.peer for r in got] == ["at-cap.hl7"]
     assert len(refused) == 1
     assert refused[0].startswith("big.hl7: ") and f"{cap}-byte cap" in refused[0]
+    assert "at-cap.hl7" in opened, "the spy saw no open at all, so it proves nothing"
     assert "big.hl7" not in opened, "the over-cap file was opened before it was refused"
 
 

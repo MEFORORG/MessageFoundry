@@ -145,7 +145,9 @@ class FolderWatcher(QObject):
                 # A size and type check before the open, so an over-cap file is never opened, and
                 # again on the open handle, so a file swapped or grown in between is judged by what
                 # is read. Only a regular file: a FIFO named *.hl7 would block this (GUI) thread.
-                data, reason = read_capped(path, self.max_file_bytes)
+                # A symlink is not followed, so a writer to this directory cannot point the pane at
+                # a file of the operator's elsewhere.
+                data, reason = read_capped(path, self.max_file_bytes, follow_symlinks=False)
             except OSError:
                 continue  # transient lock/vanish — leave out of _seen so the next rescan retries
             # Only after a successful read or a refusal, so a failed read is retried. A refused file

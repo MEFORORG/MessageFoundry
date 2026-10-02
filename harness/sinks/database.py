@@ -42,8 +42,8 @@ class DatabaseSink(Sink):
         self._high_water = 0
         #: The last read that failed, by exception class only; the next poll retries it.
         self.last_error = ""
-        #: The most characters one payload may hold and still be recorded. The read itself never
-        #: fetches more than :data:`~harness.drivers._database.MAX_OUTBOX_PAYLOAD_CHARS`.
+        #: The most characters one payload may hold and still be recorded. It can only LOWER the cap:
+        #: the read never fetches more than :data:`~harness.drivers._database.MAX_OUTBOX_PAYLOAD_CHARS`.
         self.max_payload_chars = _database.MAX_OUTBOX_PAYLOAD_CHARS
 
     def start(self) -> None:
@@ -92,7 +92,11 @@ class DatabaseSink(Sink):
             for row_id, control_id, message_type, payload, length in self._read():
                 self._high_water = max(self._high_water, int(row_id))
                 meta = {"id": str(row_id), "control_id": control_id, "message_type": message_type}
-                cap = self.max_payload_chars
+                # The attribute can only lower the cap: the read withholds anything over the
+                # server-side cap whatever it says, and a withheld payload names that cap.
+                cap = min(self.max_payload_chars, _database.MAX_OUTBOX_PAYLOAD_CHARS)
+                if payload is None:
+                    cap = _database.MAX_OUTBOX_PAYLOAD_CHARS
                 if payload is None or len(str(payload)) > cap:
                     meta["refused"] = f"{length} characters, over the {cap}-character cap; not read"
                     self._add(Record(b"", meta))
