@@ -87,7 +87,12 @@ from messagefoundry.connection_names import (
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.secretscrub import credential_query_params, scrub_credentials
+from messagefoundry.secretscrub import (
+    CREDENTIAL_PLACEHOLDER,
+    credential_query_params,
+    has_credential_like_segment,
+    scrub_credentials,
+)
 
 __all__ = [
     "ConnectionSpec",
@@ -1403,37 +1408,52 @@ def connector_secret_env_values(
 
 #: Settings whose value is a URL that may carry `user:password@` userinfo. `proxy` has no `_url`
 #: suffix, which is why this is a NAME set plus a suffix rule rather than a suffix rule alone.
+#: CORRECTED (review of a87fcb2932): this comment named the set and no set existed, so a `proxy`
+#: key was not a URL setting at all.
 _URL_SETTING_SUFFIXES = ("url", "_url", "_uri", "endpoint", "_endpoint")
+_URL_SETTING_NAMES = frozenset({"proxy"})
+
+
+def _is_url_setting(name: str) -> bool:
+    folded = name.lower()
+    return folded in _URL_SETTING_NAMES or folded.endswith(_URL_SETTING_SUFFIXES)
 
 
 #: A URL scheme at the very start of a value, ``https://`` and the like. Shown in a withheld URL so
 #: the view still says what kind of hop it is; a scheme holds none of the characters a secret needs.
 _URL_SCHEME_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 
-#: The placeholder a withheld URL renders as, after its scheme when it has one.
-_WITHHELD_URL = "<redacted>"
+#: The placeholder a withheld URL renders as, after its scheme when it has one: the engine's one
+#: spelling of "a credential was here", imported rather than restated.
+_WITHHELD_URL = CREDENTIAL_PLACEHOLDER
 
 
 def _url_may_carry_a_credential(value: str) -> bool:
-    """Whether a URL setting must be withheld from a settings view, by a COARSE rule.
+    """Whether a URL setting must be withheld from a settings view, by a COARSE rule. This is the
+    one statement of the rule; the docs point here.
 
-    Any of these withholds it: an ``@``, ``%40`` or ``%3A`` anywhere in it (any case), a
-    credential-looking query parameter name (:func:`~messagefoundry.secretscrub.credential_query_params`,
-    the same test the construction warning uses), or a value ``urlsplit`` refuses. It does not try
-    to find WHERE a secret is: several readers parse a URL's userinfo, each differently, and three
-    review rounds on PR 1912 found a new way a precise mask disagreed with one of them. A coarse rule
-    that withholds the whole URL cannot disagree. The cost is the view: a URL with an ``@`` in its
-    path or query, such as an email address, is withheld too.
+    Any of these withholds it: an ``@``, ``%40`` or ``%3A`` anywhere in it (any case); a value
+    ``urlsplit`` refuses; a credential-looking query name by the warning detector
+    (:func:`~messagefoundry.secretscrub.credential_query_params`); or a credential-looking name in
+    any ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
+    (:func:`~messagefoundry.secretscrub.has_credential_like_segment`). It does not try to find WHERE
+    a secret is: three review rounds on PR 1912 each found a URL reader that disagreed with a mask
+    that did. The cost is the view: a URL with an ``@`` in its path or query, such as an email
+    address, is withheld too.
 
-    Every step is one scan of the value, so the rule is linear in its length."""
+    It covers at least the shapes above, not every place a URL can hold a secret: a secret that is a
+    bare path segment (``/services/T000/B000/SECRET``) has no name or delimiter to find, and is
+    shown. Each step is one scan of the value, so the rule is linear in its length."""
+    if "@" in value:
+        return True
     folded = value.casefold()
-    if "@" in value or "%40" in folded or "%3a" in folded:
+    if "%40" in folded or "%3a" in folded:
         return True
     try:
         urllib.parse.urlsplit(value)
     except ValueError:
         return True
-    return bool(credential_query_params(value))
+    return has_credential_like_segment(value) or bool(credential_query_params(value))
 
 
 def _mask_url(value: str) -> str:
@@ -1509,14 +1529,14 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             ref: dict[str, Any] = {"env": value.key}
             if value.default is not _UNSET and not is_secret:
                 default = value.default
-                if isinstance(default, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
+                if isinstance(default, str) and _is_url_setting(name):
                     # A URL default gets the same rule as a literal URL below (ASVS 14.2.1).
                     default = _mask_url(default)
                 ref["default"] = default
             out[name] = ref
         elif is_secret:
             out[name] = "***"
-        elif isinstance(value, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
+        elif isinstance(value, str) and _is_url_setting(name):
             # BACKLOG #1207 and ASVS 14.2.1: a URL that may carry a credential, in its userinfo or in
             # a credential-like query parameter, is withheld whole (_mask_url), or /metadata would
             # serve the key the construction warning names.

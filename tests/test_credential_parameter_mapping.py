@@ -451,7 +451,9 @@ def test_a_credential_parameter_lands_on_a_setting_the_redactor_covers(landing: 
     [ln for ln in LANDINGS if ln.kind == "url"],
     ids=[f"{ln.factory}.{ln.param}" for ln in LANDINGS if ln.kind == "url"],
 )
-def test_masking_a_url_destination_does_not_destroy_the_operator_view(landing: Landing) -> None:
+def test_a_url_destination_with_userinfo_is_withheld_and_a_plain_one_is_not(
+    landing: Landing,
+) -> None:
     """THE ASYMMETRY on the URL arm, and it is not decoration.
 
     A redactor that replaced every URL would satisfy the assertion above while silently mangling

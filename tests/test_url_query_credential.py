@@ -177,6 +177,49 @@ def test_a_plain_url_with_no_credential_is_unchanged(url: str) -> None:
     assert _shown(url, "smart_token_url") == url
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://h.example.invalid/x?a=1;api_key=SYNTH-B",  # Rack splits a query on ";"
+        "https://h.example.invalid/app;jsessionid=SYNTH-A?x=1",  # servlet path parameter
+        "https://h.example.invalid/x?fmt=json#access_token=SYNTH-C",  # fragment
+        "https://h.example.invalid/x?x=1?api_key=SYNTH-D",  # after a second "?"
+        "jdbc:sqlserver://db.example.invalid:1433;user=u;password=SYNTH-PW",
+        "https://h.example.invalid/x#api_\tkey=SYNTH-J",  # a tab inside a fragment name
+    ],
+)
+def test_a_credential_name_outside_the_ampersand_query_is_withheld(url: str) -> None:
+    """Review of a87fcb2932: the detector reads the query urlsplit finds, split on "&", so these
+    were shown. The segment leg reads every segment after "?", "&", "#" and ";"."""
+    shown = str(_shown(url))
+    assert "SYNTH" not in shown and "<redacted>" in shown, shown
+
+
+def test_a_bare_path_secret_is_shown_and_documented_as_such() -> None:
+    """The rule's stated limit, pinned so a reader does not take it for full coverage: a secret
+    that is a bare path segment has no name or delimiter to find."""
+    url = "https://hooks.example.invalid/services/T000/B000/SYNTH-PATH"
+    assert _shown(url) == url
+
+
+def test_every_url_setting_key_and_the_proxy_name_use_the_rule() -> None:
+    """Review of a87fcb2932: only "url" and "proxy_url" held a credential in these tests, so a
+    narrowed suffix rule would have passed. And a "proxy" key, which the suffix rule's comment
+    claimed a name set covered, was not covered at all."""
+    from messagefoundry.config.wiring import env, redacted_settings
+
+    shown = redacted_settings(
+        {
+            "smart_token_url": "https://t.example.invalid/token?client_secret=SYNTH-E",
+            "callback_uri": "https://u:SYNTH-F@c.example.invalid/cb",
+            "fhir_endpoint": "https://f.example.invalid/r4?api_key=SYNTH-G",
+            "proxy": "http://u:SYNTH-H@proxy.example.invalid:3128",
+            "url": env("MEFOR_URL", default="https://t.example.invalid/x?a=1;token=SYNTH-I"),
+        }
+    )
+    assert "SYNTH" not in str(shown), shown
+
+
 def test_an_env_default_url_is_withheld_by_the_same_rule() -> None:
     from messagefoundry.config.wiring import env, redacted_settings
 
@@ -194,6 +237,7 @@ def test_the_mask_is_linear_in_the_length_of_the_url() -> None:
     """The review of 870c1afcbf measured the span scan at about 4x per doubling on a run of "?".
     The coarse rule is a few scans; doubling the input must not much more than double the time."""
     import time
+    import urllib.parse
 
     from messagefoundry.config.wiring import _mask_url
 
@@ -201,27 +245,46 @@ def test_the_mask_is_linear_in_the_length_of_the_url() -> None:
         url = "https://h.example.invalid/x" + "?" * n + ";" * n + "&a=1" * n
         best = float("inf")
         for _ in range(5):
+            # urlsplit is lru-cached, so a repeat run would time only a cache hit (review of
+            # a87fcb2932). Clear it, so every run pays for the parse.
+            getattr(urllib.parse.urlsplit, "cache_clear", lambda: None)()
             began = time.perf_counter()
             _mask_url(url)
             best = min(best, time.perf_counter() - began)
         return best
 
-    small, large = cost(50_000), cost(200_000)
+    small, large = cost(20_000), cost(80_000)
     assert large < small * 12, (small, large)  # 4x the input; quadratic would be about 16x
 
 
 def test_the_composed_mask_never_shows_a_value_any_reader_takes() -> None:
     """The 30,000-URL oracle, kept from the precise mask. Wherever a seeded generator puts the test
     value QZXJ among the characters that move each reader's spans, and inserts "%40" and "%3A" as
-    whole tokens, a value the detector names, or one inside a password urllib's proxy parser or
-    urlsplit reads, never appears in the view."""
+    whole tokens, QZXJ never appears in the view when any of these readers takes it: the warning
+    detector, a ``;``-splitting query reader (Rack), a fragment reader, urllib's proxy parser and
+    urlsplit's netloc. The ``;`` and fragment readers are NOT the rule's own legs, so the test can
+    fail for a shape the rule does not call (review of a87fcb2932: the detector arm alone was
+    circular)."""
     import random
     import urllib.parse
     import urllib.request
 
+    from messagefoundry.secretscrub import _is_credential_param
+
+    def independent_readers(url: str) -> list[list[tuple[str, str]]]:
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except ValueError:
+            return []
+        return [
+            urllib.parse.parse_qsl(parts.query, separator=";"),
+            urllib.parse.parse_qsl(parts.fragment),
+            urllib.parse.parse_qsl(parts.query.partition("?")[2]),  # after a second "?"
+        ]
+
     rng = random.Random(14_2_1)
-    named = in_password = in_netloc = withheld = 0
-    alphabets = ("h:/@?#&=1.", "h:/@?#&=1.\t\n", "h:/@?&=1.;")
+    named = by_other_reader = in_password = in_netloc = withheld = 0
+    alphabets = ("h:/@?#&=1.", "h:/@?#&=1.\t\n", "h:/?#&=1.;")
     for _ in range(30000):
         alphabet = rng.choice(alphabets)
         tokens = [*alphabet, "%40", "%3A", "%3a"]
@@ -229,12 +292,16 @@ def test_the_composed_mask_never_shows_a_value_any_reader_takes() -> None:
         tail = "".join(
             rng.choice([t for t in tokens if t != "="]) for _ in range(rng.randint(0, 10))
         )
-        url = f"http://{head}{rng.choice('?&')}key=QZXJ{tail}"
+        url = f"http://{head}{rng.choice('?&;#')}key=QZXJ{tail}"
         shown = str(_shown(url, "proxy_url"))
         withheld += "<redacted>" in shown
         if "key" in credential_query_params(url):
             named += 1
             assert "QZXJ" not in shown, (url, shown)
+        for pairs in independent_readers(url):
+            if any("QZXJ" in val and _is_credential_param(name) for name, val in pairs):
+                by_other_reader += 1
+                assert "QZXJ" not in shown, (url, shown)
         try:
             password = urllib.request._parse_proxy(url)[2]  # type: ignore[attr-defined]
         except ValueError:
@@ -250,8 +317,11 @@ def test_the_composed_mask_never_shows_a_value_any_reader_takes() -> None:
             in_netloc += 1
             assert "QZXJ" not in shown, (url, shown)
     # Liveness: each reader's arm is reached, and the generator does not withhold everything.
-    assert named > 1000 and in_password > 100 and in_netloc > 20, (named, in_password, in_netloc)
-    assert withheld < 30000, withheld
+    assert named > 1000 and by_other_reader > 1000, (named, by_other_reader)
+    assert in_password > 100 and in_netloc > 20, (in_password, in_netloc)
+    # Every generated URL names a credential, so all are withheld; the plain-URL control is
+    # test_a_plain_url_with_no_credential_is_unchanged. This floor only shows the rule fired.
+    assert withheld == 30000, withheld
 
 
 def test_detector_drops_a_control_character_inside_a_name() -> None:

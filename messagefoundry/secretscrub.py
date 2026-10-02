@@ -106,7 +106,12 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["CREDENTIAL_PLACEHOLDER", "credential_query_params", "scrub_credentials"]
+__all__ = [
+    "CREDENTIAL_PLACEHOLDER",
+    "credential_query_params",
+    "has_credential_like_segment",
+    "scrub_credentials",
+]
 
 #: What a scrubbed credential VALUE is replaced with. Matches
 #: :class:`logging_setup.CredentialQueryScrubFilter`, so one log line cannot carry two spellings of
@@ -652,6 +657,32 @@ def credential_query_params(url: str) -> list[str]:
     except ValueError:
         return []
     return sorted({_display_name(name) for name, _ in pairs if _is_credential_param(name)})
+
+
+#: The characters that start a ``name=value`` segment for :func:`has_credential_like_segment`: a
+#: query (``?``, ``&``), a fragment (``#``), and ``;``, which Rack, servlet path parameters
+#: (``;jsessionid=``) and JDBC strings (``;password=``) all split on.
+_SEGMENT_SEPARATORS = re.compile(r"[?&#;]")
+
+
+def has_credential_like_segment(text: str) -> bool:
+    """Whether any ``name=value`` segment of ``text``, split at every ``?``, ``&``, ``#`` and ``;``,
+    has a name that looks like a credential, by the same name test as :func:`credential_query_params`.
+
+    A deliberately coarser reading than the detector's. That one reads the query ``urlsplit`` finds,
+    split on ``&``, because it feeds a warning about what reaches the partner. This one is for a
+    display rule that must fail closed, so it also reads a fragment, a second ``?`` and a ``;``-split
+    segment. A name drops tab, CR and LF inside the shared name test, as ``urlsplit`` drops them.
+    Linear in ``text``; returns at the first match."""
+    import urllib.parse  # noqa: PLC0415 -- see credential_query_params
+
+    for segment in _SEGMENT_SEPARATORS.split(text)[1:]:
+        name, equals, _value = segment.partition("=")
+        if not equals:
+            continue
+        if _is_credential_param(urllib.parse.unquote_plus(name)):
+            return True
+    return False
 
 
 def _run(text: str, placeholder: str, folded: str | None) -> str:

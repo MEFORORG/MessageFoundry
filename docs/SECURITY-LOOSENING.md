@@ -981,8 +981,9 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **What you lose:** the credential rides the request line. The partner's access log holds it, and so
   does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire. The
   engine's own log lines drop the query, and `GET /metadata` and `graph --json` withhold the whole
-  URL as `<scheme>://<redacted>`. So does any URL setting with an `@`, `%40` or `%3A` in it, which
-  hides the user, host and path of such a URL in those views.
+  URL. The rule that decides which URL settings are withheld, and what a withheld one shows, is
+  stated once, in `config/wiring.py` `_url_may_carry_a_credential`; it withholds more than this
+  entry's URLs, and it does not reach a secret that is a bare path segment.
 - **Why it is reported and not refused:** a credential in the URL's user part, `user:password@`, is
   refused at construction, because that shape never authenticated anything and its error text carried
   the password. A query credential does authenticate, and some partner APIs take it nowhere else, such
