@@ -385,6 +385,8 @@ async def test_the_early_refusal_is_the_gates_own_answer_byte_for_byte(
 
     reference = await _unauthenticated_answers(control, operations, {"no body": _NO_BODY})
     measured = await _unauthenticated_answers(live, operations, {"no body": _NO_BODY, **_PROBES})
+    # Five answers for each of at least 90 operations, so the comparison below is not over nothing.
+    assert len(measured) >= 450, len(measured)
     different = {
         key: (answer, reference[key[0], key[1], "no body"])
         for key, answer in measured.items()
@@ -613,6 +615,7 @@ async def test_one_request_charges_each_side_effect_once(
     second_read = collections.Counter(_SECOND_LOOKUP)
     seen: collections.Counter[str] = collections.Counter()
     doubled: collections.Counter[str] = collections.Counter()
+    charged: dict[str, dict[str, int]] = {}
     for scenario in _SCENARIOS:
         what = scenario[0]
         before = await one_request(control, scenario)
@@ -622,13 +625,21 @@ async def test_one_request_charges_each_side_effect_once(
         assert after[0] == before[0], (what, after, before)
         assert extra == (second_read if signed_in_with_a_body else {}), (what, extra)
         assert not collections.Counter(before[1]) - collections.Counter(after[1]), what
-        over = {name: count for name, count in after[1].items() if name in _ONCE and count > 1}
-        assert not over, (what, over)
+        charged[what] = after[1]
         seen.update(after[1])
         wrong_status, wrong = await one_request(twice, scenario)
         assert wrong_status == after[0], what
         doubled.update({name: n for name, n in wrong.items() if n == 2 * after[1].get(name, 0)})
 
+    # No scenario made a charge twice. Every scenario left a tally, so this is not over nothing.
+    assert len(charged) >= 12, sorted(charged)
+    over = {
+        (what, name): count
+        for what, tally in charged.items()
+        for name, count in tally.items()
+        if name in _ONCE and count > 1
+    }
+    assert not over, over
     # Non-vacuous: the scenarios drove every charge at least once.
     for name in _ONCE:
         assert seen[name] >= 1, (name, dict(seen))
