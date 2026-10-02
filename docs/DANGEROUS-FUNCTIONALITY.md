@@ -49,7 +49,7 @@ on its own.
 |---|---|---|---|
 | 1 | Executing your Python | Routers and Handlers | In-process, no isolation |
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
-| 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap: only with `[sandbox].mode = "subprocess"`, under `messagefoundry supervise`, or for the tray's branded relaunch |
+| 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap: for the engine, only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`; for the tray, at every Windows start where its branded launcher is available |
 | 4 | Starting processes | 11 modules | Varies, see below |
 | 5 | Calling native libraries | 18 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
@@ -145,16 +145,15 @@ de-identification leak check only, and is not on the message path.
 `python_child_argv` in `childenv.py` builds a command line that starts a Python child through it.
 At least four kinds of child start this way. Three are the engine's: the sandbox worker, each
 engine shard, and the child that loads the config before any shard starts. The fourth is the tray's
-relaunch under its branded launcher. The first tray process does not use the script. It starts
-however it was launched. Autostart launches it as `pythonw -m messagefoundry.tray`, and a `-m` start
-puts the working directory first on its import path. The script does three things:
+relaunch under its branded launcher. The first tray process does not use the script, as the last
+paragraph of this section says. The script does three things:
 
 1. It puts the folder above the package on the import path, after the standard library. The folder
    goes ahead of the site-packages folders that follow, which hold installed packages. If the script
-   cannot tell where the standard library ends, it puts the folder last. It skips this step when that folder is on the path
-   already. An absolute `PYTHONPATH` entry naming that folder counts. That entry sits ahead of the
-   standard library, so the folder stays there. The step serves the packages that ship beside the
-   engine in a checkout.
+   cannot tell where the standard library ends, it puts the folder last. It skips this step when
+   that folder is on the path already. An absolute `PYTHONPATH` entry naming that folder counts.
+   That entry sits ahead of the standard library, so the folder stays there. The step serves the
+   packages that ship beside the engine in a checkout.
 2. It loads the `messagefoundry` package by file location, from the folder the script sits in.
 3. It runs the module named on its command line, much as `python -m` would.
 
@@ -170,9 +169,18 @@ checkout's root. Step 1 usually puts it ahead of the site-packages folders. A fi
 named like a module outside the standard library would then load first in each child. Step 1 looks
 for site-packages only after the standard library ends. So a `PYTHONPATH` entry naming a
 site-packages folder cannot move the root ahead of the standard library. An absolute `PYTHONPATH`
-entry naming the root itself does. Then a file named like a standard-library module loads first
-too. In the usual installed
-engine, editable installs included, that folder is already on the path, so the script skips step 1.
+entry naming the root itself does. Then a file there named like a pure-Python standard-library
+module, such as `json`, loads first too. Built-in and frozen modules do not, because the interpreter
+finds them before it searches the path. On Python 3.14.6 on Windows, `itertools` and `runpy` are two
+of them. In the usual installed engine, editable installs included, that folder is already on the
+path, so the script skips step 1.
+
+The first tray process starts however it was launched. Autostart launches it as
+`pythonw -m messagefoundry.tray`, and a `-m` start puts the working directory first on its import
+path. That process imports part of the tray before it relaunches. It runs the whole tray itself when
+the branded launcher is unavailable, or when the branded child exits within 0.6 seconds. So a file
+planted in its working directory, named like a module the tray imports, would load in that module's
+place.
 
 ---
 
@@ -223,15 +231,16 @@ Two argument-list starts are not pinned that way:
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
-environment for the sandbox worker, the disaster-recovery hook, the engine shards, the child that
-loads the config before any shard starts, and the tray's branded relaunch. Its docstring says what
-each one gets, and why that is not an isolation boundary by itself. The tray's relaunch also takes
-its command line from that module, so it starts with `-P` like the engine's Python children. Its
-environment is the user's whole environment, less any empty or relative `PYTHONPATH` entry. The
-first tray process gets neither, as section 3 says. The other
-starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
-lists each of those with its reason, and fails a new start whose environment does not come from
-that module.
+environment for the sandbox worker, the disaster-recovery hook and the engine shards. It also
+builds it for the child that loads the config before any shard starts, and for the tray's branded
+relaunch. Its docstring says what each one gets, and why that is not an isolation boundary by
+itself. The tray's relaunch also takes its command line from that module, so it starts with `-P`
+like the engine's Python children. Its environment is the user's whole environment, less any empty
+or relative `PYTHONPATH` entry. The first tray process gets neither. It runs with its launcher's
+environment and command line, unchanged, so an autostart launch keeps the working directory on its
+import path (section 3). The other starts in the table hand over the whole environment.
+`tests/test_child_process_environment.py` lists each of those with its reason, and fails a new
+start whose environment does not come from that module.
 
 **The other forms are the ones to look at hardest.**
 
