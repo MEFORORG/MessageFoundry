@@ -94,7 +94,12 @@ from messagefoundry.transports.base import (
     wait_for_intake,
 )
 from messagefoundry.transports.base import cap_setting as _cap_setting
-from messagefoundry.transports.framing import MLLP_CODEC, frame_for_delivery, frame_reply
+from messagefoundry.transports.framing import (
+    MLLP_CODEC,
+    check_frame_bytes,
+    frame_for_delivery,
+    frame_reply,
+)
 
 __all__ = [
     "SB",
@@ -881,6 +886,12 @@ class MLLPDestination(DestinationConnector):
             extras.append(text)
         name = type(exc).__name__
         return f"{name}: {' '.join(extras)}" if extras else name
+
+    def check_frame(self, payload: str) -> None:
+        """ADR 0205 rule 1 on ``payload`` without sending it: raise the permanent
+        :class:`NegativeAckError` :meth:`send` would. For the delivery stage's batch members and
+        shadow outbound, where ``send`` does not run on this one payload."""
+        check_frame_bytes(MLLP_CODEC, payload, self.encoding, transport="MLLP")
 
     def waiting_for_reply(self, now: float) -> bool:
         """#136 (ADR 0065 amendment): whether this outbound is currently AWAITING an MLLP ACK and at

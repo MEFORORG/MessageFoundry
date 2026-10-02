@@ -21,7 +21,15 @@ from typing import Any
 import pytest
 
 from messagefoundry import actions
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source, Validation
+from messagefoundry.config.models import (
+    BatchConfig,
+    ConnectorType,
+    ContentType,
+    Destination,
+    RetryPolicy,
+    Source,
+    Validation,
+)
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -33,9 +41,10 @@ from messagefoundry.framing import MLLP_CODEC, STX_ETX_CODEC, FrameCodec
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing.dicom.hl7_map import encode_segment
 from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.split import split_batch
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run
-from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.framing import frame_for_delivery, frame_reply
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
@@ -395,6 +404,124 @@ async def test_a_leading_frame_byte_is_still_received(store: MessageStore) -> No
     await runner._handle_inbound(reg.inbound["in"], (SB + CLEAN).encode("utf-8"))
     cur = await store._db.execute("SELECT status FROM messages")
     assert [dict(r)["status"] for r in await cur.fetchall()] == [MessageStatus.RECEIVED.value]
+
+
+# --- rule 1 at the delivery stage: a batch member, and a shadow (simulate) outbound -------------
+
+DEST = "OB_FRAME"
+DONE = (MessageStatus.PROCESSED.value, OutboxStatus.DONE.value)
+DEAD = (MessageStatus.ERROR.value, OutboxStatus.DEAD.value)
+
+
+def _member(n: int, tail: str = "") -> str:
+    return (
+        f"MSH|{ENC}|A|B|C|D|2026010100000{n}||ADT^A01|MSG{n}|P|2.5{CR}PID|1||{n}00||DOE{tail}{CR}"
+    )
+
+
+class _SendRecorder(MLLPDestination):
+    """A real MLLP destination, so its ``check_frame`` is the real one, whose send only records."""
+
+    def __init__(self) -> None:
+        settings: dict[str, object] = {"host": "127.0.0.1", "port": 1}
+        super().__init__(Destination(name=DEST, type=ConnectorType.MLLP, settings=settings))
+        self.sent: list[str] = []
+
+    async def send(self, payload: str, *, metadata: Any = None) -> None:
+        self.sent.append(payload)
+
+
+def _delivery_runner(
+    store: MessageStore, dest: _SendRecorder, *, simulate: bool
+) -> wiring_runner.RegistryRunner:
+    runner = wiring_runner.RegistryRunner(Registry(), store, poll_interval=0.02)
+    runner._destinations[DEST] = dest
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = simulate
+    return runner
+
+
+async def _dispositions(store: MessageStore, mids: list[str]) -> list[tuple[str, str, str]]:
+    """Each message's status, its one outbound row's status, and that row's last error."""
+    out = []
+    for mid in mids:
+        msg = await store.get_message(mid)
+        assert msg is not None
+        (row,) = await store.outbox_for(mid)
+        out.append((str(msg["status"]), str(row["status"]), str(row["last_error"] or "")))
+    return out
+
+
+async def _enqueue(store: MessageStore, bodies: list[str]) -> list[str]:
+    return [
+        await store.enqueue_message(channel_id="c1", raw=b, deliveries=[(DEST, b)], now=100.0 + i)
+        for i, b in enumerate(bodies)
+    ]
+
+
+@pytest.mark.parametrize("simulate", [False, True], ids=["live", "shadow"])
+async def test_a_bad_batch_member_is_dead_lettered_alone(
+    store: MessageStore, simulate: bool
+) -> None:
+    # Before the fix the members were joined verbatim and send() checked the whole envelope, so one
+    # member holding 0x1C dead-lettered all three rows with one envelope offset. In shadow mode
+    # nothing was checked at all, and all three were PROCESSED.
+    mids = await _enqueue(store, [_member(1), _member(2, "^JA" + EB + "NE"), _member(3)])
+    dest = _SendRecorder()
+    runner = _delivery_runner(store, dest, simulate=simulate)
+    cfg = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._batch[DEST] = cfg
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    await runner._process_delivery_batch(DEST, head, cfg)
+    if simulate:
+        assert dest.sent == []
+    else:
+        (envelope,) = dest.sent
+        assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG1", "MSG3"]
+    got = await _dispositions(store, mids)
+    assert [g[:2] for g in got] == [DONE, DEAD, DONE]
+    assert "frame end byte 0x1C" in got[1][2] and "DOE" not in got[1][2]
+
+
+async def test_a_batch_whose_every_member_is_bad_sends_nothing(store: MessageStore) -> None:
+    mids = await _enqueue(store, [_member(1, SB), _member(2, SB)])
+    dest = _SendRecorder()
+    runner = _delivery_runner(store, dest, simulate=False)
+    cfg = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._batch[DEST] = cfg
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    await runner._process_delivery_batch(DEST, head, cfg)
+    assert dest.sent == []
+    assert [g[:2] for g in await _dispositions(store, mids)] == [DEAD, DEAD]
+
+
+async def test_a_shadow_outbound_dead_letters_what_live_would(store: MessageStore) -> None:
+    # Rule 1 runs inside connector.send(), which a simulate outbound skips. Before the fix shadow
+    # marked this row PROCESSED, where a live send would have dead-lettered it.
+    (mid,) = await _enqueue(store, [SMUGGLED])
+    dest = _SendRecorder()
+    runner = _delivery_runner(store, dest, simulate=True)
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    await runner._process_delivery_item(DEST, item)
+    assert dest.sent == []
+    ((status, row_status, error),) = await _dispositions(store, [mid])
+    assert (status, row_status) == DEAD
+    assert "frame" in error and "DOE" not in error
+
+
+async def test_a_shadow_outbound_still_processes_a_clean_payload(store: MessageStore) -> None:
+    (mid,) = await _enqueue(store, [CLEAN])
+    dest = _SendRecorder()
+    runner = _delivery_runner(store, dest, simulate=True)
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    await runner._process_delivery_item(DEST, item)
+    assert dest.sent == []
+    ((status, row_status, _),) = await _dispositions(store, [mid])
+    assert (status, row_status) == DONE
 
 
 # --- the reply path: a listener's reply is one frame, and framing it never raises ---------------
