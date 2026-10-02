@@ -309,21 +309,28 @@ def test_a_sidecar_the_loopback_rule_would_not_cover_is_refused(host: str) -> No
 # --- a per-connection proxy and a loopback destination -------------------------------------------
 
 
+#: The fixed text of the record a skipped proxy leaves.
+_SKIPPED = "the configured web proxy is not used for a loopback target"
+
+
+def _skip_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if _SKIPPED in r.getMessage()]
+
+
 def test_a_loopback_destination_gets_no_proxy_handler_and_no_proxy_credential(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A per-connection proxy resolved for a loopback target is no proxy: the shared opener, and no
     ``Proxy-Authorization`` header, which would otherwise be sent to the destination itself. The
     operator's proxy setting is inert for that host, so the log says so."""
-    skipped = "is not used for loopback host"
     settings = {"proxy_url": "http://127.0.0.1:3128", "proxy_user": "pu", "proxy_password": "pw"}
     with caplog.at_level(logging.INFO, logger=rest.__name__):
         dest = _rest("http://127.0.0.1:18080/x", **settings)
     assert dest._opener is rest._NO_REDIRECT_OPENER
     assert "Proxy-Authorization" not in dest._headers
-    assert [r.getMessage() for r in caplog.records if skipped in r.getMessage()] == [
-        "the web proxy (http://127.0.0.1:3128) is not used for loopback host '127.0.0.1': "
-        "a loopback hop is always dialled direct"
+    assert [r.getMessage() for r in _skip_records(caplog)] == [
+        "connection 'OB_REST'; the configured web proxy is not used for a loopback target, "
+        "because a loopback hop is always dialled direct"
     ]
     # CONTROL: the same proxy settings on an off-box destination carry both, and log no skip.
     caplog.clear()
@@ -331,7 +338,36 @@ def test_a_loopback_destination_gets_no_proxy_handler_and_no_proxy_credential(
         control = _rest("https://partner.invalid/x", **settings)
     assert control._opener is not rest._NO_REDIRECT_OPENER
     assert control._headers["Proxy-Authorization"].startswith("Basic ")
-    assert not [r for r in caplog.records if skipped in r.getMessage()]
+    assert not _skip_records(caplog)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {
+            "proxy_url": "http://127.0.0.1:3128",
+            "proxy_user": "user-marker",
+            "proxy_password": "secret-marker",
+        },
+        {"proxy_url": "http://user-marker:secret-marker@127.0.0.1:3128"},
+    ],
+    ids=["credential-in-settings", "credential-in-proxy-url"],
+)
+def test_the_skipped_proxy_record_carries_nothing_from_a_url_or_a_credential(
+    caplog: pytest.LogCaptureFixture, settings: dict[str, object]
+) -> None:
+    """The record names the connection and states the fact. It holds no part of the proxy URL, no
+    credential, and no part of the destination URL. Read on the record itself, arguments
+    included, so a value that a formatter would drop is still seen."""
+    with caplog.at_level(logging.INFO, logger=rest.__name__):
+        _rest("http://localhost:18080/x", **settings)
+    records = _skip_records(caplog)
+    assert len(records) == 1  # CONTROL: the record is emitted
+    record = records[0]
+    assert record.args == ("'OB_REST'",)
+    text = f"{record.getMessage()} {record.msg!r} {record.args!r}"
+    for withheld in ("user-marker", "secret-marker", "3128", "127.0.0.1", "localhost", "18080"):
+        assert withheld not in text, withheld
 
 
 def test_the_public_bypass_predicate_agrees_with_the_transport() -> None:
