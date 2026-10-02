@@ -973,14 +973,17 @@ _STATEMENT_VERBS = frozenset(
     {"itemappend", "itemclear", "itemcopy", "msgcreate", "msglog", "msgsend", "msgtreecopy"}
 )
 # What the marker says for such a statement (:func:`_label_marker`), ahead of the statement itself.
-# A markup-free statement names no handle the scan can read, so it is left as step 1 renders it.
+# Kept short: the two share one 200-character comment. A markup-free statement names no handle
+# the scan can read, so it is left as step 1 renders it.
 _LABEL_STATEMENT_WHY = (
-    "not on a Line, so whether Corepoint runs it is not known; nothing is mapped for it, and no "
-    "role-marked handle in this list is taken to be msg"
+    "not on a Line, so it may never have run; nothing is mapped and no role-marked handle here "
+    "is taken to be msg"
 )
 
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
 _BRANCH_PARENT = {"elif": "if", "else": "if", "except": "try", "match": "case"}
+# The kinds that may still adopt a branch marker written after them as a sibling.
+_ADOPTING_KINDS = frozenset(_BRANCH_PARENT.values())
 
 # Kinds whose body is emitted INSIDE a Python block — under a dead placeholder condition, or in a loop
 # that rewrites the same occurrence each pass. A statement anywhere beneath one of these is not
@@ -1476,9 +1479,16 @@ def _parse_list(
     for child in container:
         tag = _local(child.tag).lower()
         if tag in _LIST_TAGS:
-            # A doubly-wrapped list: flatten rather than lose the statements. A statement in the
-            # wrapper's own ``@Data`` is marked, never dropped (:func:`_label_marker`).
-            steps.extend(_label_marker(child))
+            # A doubly-wrapped list: flatten rather than lose the statements. A statement the rule
+            # finds in the wrapper's own ``@Data`` is marked (:func:`_label_marker`). The marker
+            # goes AHEAD of a construct that may still adopt a sibling branch marker after this
+            # wrapper: between the two it would orphan the branch, and an orphan's body renders
+            # live at this level.
+            adopting = (
+                bool(steps) and isinstance(steps[-1], Control) and steps[-1].kind in _ADOPTING_KINDS
+            )
+            at = len(steps) - 1 if adopting else len(steps)
+            steps[at:at] = _label_marker(child)
             steps.extend(_parse_list(child, subject, held, in_control, depth + 1))
             continue
         # EVERY other child is a statement position and goes through _parse_statement — including a tag
@@ -1574,8 +1584,9 @@ def _parse_statement(
 
     if marker and kind == "send":
         # A ``MsgSend`` in a Block's or a Call's ``@Data``: the marker stands for it, and the
-        # element renders as the label it is. A send that may never have run is not a delivery.
-        kind, source = _CONTAINER_KIND_BY_TAG[tag.lower()], tag
+        # element renders as a label. A send that may never have run is not a delivery, and a
+        # Call that names no list is not a call, so neither counts as mapped.
+        kind, source = "block", tag
 
     if not data and any(isinstance(s, Control) and s.kind == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
@@ -1666,15 +1677,19 @@ def _label_statement(elem: Element) -> str:
     rendered at all. It is a statement there when the element does not render the verb itself, and:
 
     * the verb is in :data:`_STATEMENT_VERBS`, in any case, with or without markup; or
-    * the element is a ``<Block>`` and its ``@Data`` LEADS with a verb the exporter styled as a
-      ``keyword``. A Block has no verb of its own, so a leading keyword is evidence. A construct or
-      a ``<Call>`` leads with its own keyword, so only the table counts for those.
+    * the element is a ``<Block>`` or a list wrapper and its ``@Data`` LEADS with a verb the
+      exporter styled as a ``keyword``. Neither has a verb of its own, so a leading keyword is
+      evidence. A construct or a ``<Call>`` leads with its own keyword, and an unmodelled element
+      may, so only the table counts for those.
 
-    A container renders a control verb itself: its own construct, a call, an exit. A ``MsgSend`` is
-    the exception. It would be live code, so in a Block's or a Call's ``@Data`` it is a statement too.
+    A container renders a control verb itself: its own construct, a call, an exit, a ``LoopExit``.
+    A ``MsgSend`` is the exception. It would deliver a message, so in a Block's or a Call's
+    ``@Data`` it is a statement too. (A ``LoopExit`` there still renders its ``break``, which
+    only ever sits in a loop that is itself a dead placeholder.)
 
-    The verb is read as a ``<Line>``'s is, so it must lead the ``@Data``. An unlisted verb with no
-    leading ``keyword`` span, or a listed verb after other words, still reads as a label."""
+    The verb is read as a ``<Line>``'s is: the first ``keyword`` span, or with none, the first
+    word. So a listed verb after other unstyled words still reads as a label, and so does an
+    unlisted verb with no leading ``keyword`` span."""
     tag = _local(elem.tag).lower()
     if tag == "line":
         return ""
@@ -1686,9 +1701,10 @@ def _label_statement(elem: Element) -> str:
     if kind is not None:
         rendered = _statement_kind(tag, verb)
         if rendered != "send" and rendered == _KIND_BY_VERB.get(lowered):
-            return ""  # the container renders this verb itself, and never as live code
+            return ""  # the container renders this verb itself, and never as a delivery
     leads = next((token for token in roles if token.role not in _PROSE_ROLES), None)
-    styled = kind == "block" and leads is not None and leads.role == "keyword" and _role_verb(roles)
+    bare = kind == "block" or tag in _LIST_TAGS  # an element with no verb of its own
+    styled = bare and leads is not None and leads.role == "keyword" and _role_verb(roles)
     return verb if lowered in _STATEMENT_VERBS or styled else ""
 
 
@@ -1696,7 +1712,9 @@ def _label_marker(elem: Element) -> list[UnmappedAction]:
     """The counted TODO for a statement :func:`_label_statement` finds on ``elem``, or ``[]``.
 
     The statement rides in the marker, after the reason, because a ``<Try>`` and a ``<List>`` wrapper
-    print their ``@Data`` nowhere else. It reaches the module only through :func:`_comment_text`."""
+    print their ``@Data`` nowhere else. It reaches the module only through :func:`_comment_text`,
+    which cuts the two at 200 characters together. Under a ``@Disabled`` ancestor the preview shows
+    only the verb, as it does for any unmapped step."""
     carried = _label_statement(elem)
     if not carried:
         return []

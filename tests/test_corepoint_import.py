@@ -1698,7 +1698,7 @@ _SEND_COPY = _role_send("other-handle", "%OUT", "OB_ACME")
 _SEND_INPUT = _role_send("input-handle", "%ADT", "OB_IN")
 _WRITE_COPY = _write("other-handle", "%OUT", "Y")
 _MERGE_LINE = _role_line(_span("keyword", "MsgTreeMerge") + " " + _span("other-handle", "%NEW"))
-_LABEL_MARKER = "not on a Line, so whether Corepoint runs it is not known"
+_LABEL_MARKER = "not on a Line, so it may never have run"
 _CONTAINER_TAGS = ("Block", "Call", "Case", "Foreach", "If", "Loop", "Try")
 # One spelling of each statement verb, by the table's own key.
 _VERB_SPELLINGS = {
@@ -1832,6 +1832,8 @@ def test_a_field_write_in_a_block_label_is_marked_and_never_mapped() -> None:
             False,
             id="block-keyword-connective-in-prose",
         ),
+        # A leading keyword on a wrapper, which has no verb of its own, is a statement too.
+        pytest.param(_container("List", _MERGE_LINE), True, id="list-wrapper-keyword"),
         # A limit ADR 0086 records: the verb is read as a Line's is, so it must lead.
         pytest.param(
             _labelled("Block", "Step 1: MsgTreeCopy %NEW/ to %OUT/"), False, id="verb-not-leading"
@@ -1890,9 +1892,51 @@ def test_a_send_in_a_block_label_is_never_a_delivery() -> None:
     assert "    # Corepoint Block: MsgSend %ADT to connection" in src
     assert "    # TODO: Corepoint MsgSend — hand-finish (not on a Line" in src
     assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["MsgSend"], 0)
+    # On a Call it is no call either: not counted as mapped, not labelled as an inlined list.
+    call = _container("Call", _role_send("input-handle", "%ADT", "OB_LABEL"))
+    assert _count_steps(_handler_steps(call), in_loop=False) == (0, ["MsgSend"], 0)
+    assert "called list inlined" not in _handler_source(call)
     # The control: the same send on a Line under a prose Block is a delivery.
     line = _labelled("Block", "Section", _role_send("input-handle", "%ADT", "OB_LABEL"))
     assert 'sends.append(Send("OB_LABEL", msg))' in _handler_source(line)
+
+
+@pytest.mark.parametrize(
+    ("construct", "branch"),
+    [
+        pytest.param('<If Data="If (x)"><List/></If>', "Else", id="if-else"),
+        pytest.param('<If Data="If (x)"><List/></If>', "ElseIf (y)", id="if-elseif"),
+        pytest.param("<Try><List/></Try>", "Catch", id="try-catch"),
+        pytest.param(
+            '<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M"', id="case-matching"
+        ),
+    ],
+)
+def test_a_wrappers_marker_never_orphans_a_sibling_branch(construct: str, branch: str) -> None:
+    """A branch marker written after its construct as a sibling is adopted by it, and its body is
+    then dead until someone writes the condition. A step between the two would orphan the branch,
+    and an orphan's body renders live. So a wrapper's marker goes ahead of the construct. The
+    control is the same list with no statement on the wrapper: it must render the same code."""
+    arm = (
+        f'<Line Data="{branch.replace(chr(34), "&quot;")}"><List>'
+        '<Line Data="ItemClear %ADT/PID-19"/><Line Data="MsgSend %ADT [OB_FLAT]"/>'
+        "</List></Line>"
+    )
+
+    def code(wrapper: str) -> list[str]:
+        lines = _handler_body(_handler_source(construct + wrapper + arm)).splitlines()
+        return [line for line in lines if not line.lstrip().startswith("#")]
+
+    marked = _handler_body(_handler_source(construct + _labelled("List", "MsgLog %ADT") + arm))
+    assert _LABEL_MARKER in marked
+    assert code(_labelled("List", "MsgLog %ADT")) == code("<List/>")
+    # Nothing of the branch runs at the handler's own level: its write and its send stay nested.
+    assert not [
+        line
+        for line in marked.splitlines()
+        if line.startswith(("    sends.append", "    set_field"))
+    ]
+    assert '        sends.append(Send("OB_FLAT", msg))' in marked
 
 
 def test_a_hostile_label_statement_cannot_escape_its_marker() -> None:
@@ -1935,10 +1979,13 @@ def test_a_marked_label_statement_is_counted_and_the_module_passes_check(tmp_pat
 
 
 def test_the_statement_verb_table_holds_every_verb_the_importer_reads_on_a_line() -> None:
-    """A verb added to the step 1 mapping or to the gate's allow-list must join the table too, or
-    its statement off a Line would go back to being a label. The table is kept apart from both, so
-    taking a verb OFF the allow-list, which narrows the gate, cannot shrink it."""
+    """A verb added to the role-parsed step 1 mapping or to the gate's allow-list must join the
+    table too, or its statement off a Line would go back to being a label. The table is kept
+    apart from both, so taking a verb OFF the allow-list, which narrows the gate, cannot shrink
+    it. These are the two tables this test can read: a verb the importer names only in code,
+    as the scan names ``msgtreecopy``, is pinned by name."""
     assert {verb.lower() for verb in _UNDERSTOOD} | set(_VERB_CONNECTIVES) <= _STATEMENT_VERBS
+    assert "msgtreecopy" in _STATEMENT_VERBS
     assert set(_VERB_SPELLINGS) == _STATEMENT_VERBS
 
 

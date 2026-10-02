@@ -436,12 +436,15 @@ itself, and either:
 
 - the verb, in any case, is one the importer reads on a `<Line>`: `ItemCopy`, `ItemClear`,
   `ItemAppend`, `MsgTreeCopy`, `MsgCreate`, `MsgLog` or `MsgSend`; or
-- the element is a `<Block>` and its `@Data` leads with a verb the exporter styled as a `keyword`. A
-  Block has no verb of its own. A construct or a `<Call>` leads with its own keyword, which no table
-  lists in full.
+- the element is a `<Block>` or a list wrapper and its `@Data` leads with a verb the exporter styled
+  as a `keyword`. Neither has a verb of its own. A construct or a `<Call>` leads with its own
+  keyword, which no table lists in full, and an unmodelled element may.
 
-A container renders a control verb itself: its own construct, a call, an exit. A `MsgSend` is the
-exception, because it would be live code. So in a Block's or a Call's `@Data` it is a statement too.
+A container renders a control verb itself: its own construct, a call, an exit, a `LoopExit`. A
+`MsgSend` is the exception, because it would deliver a message. So in a Block's or a Call's `@Data`
+it is a statement too, and the element then renders as a plain label: a Call that names no list is
+not counted as a call. A `LoopExit` there still renders its `break`, which only ever sits in a loop
+that is itself a dead placeholder.
 
 Whether Corepoint runs such a statement is not known. So:
 
@@ -449,7 +452,12 @@ Whether Corepoint runs such a statement is not known. So:
   a Block's or a Call's label comment, before a construct's placeholder, and before a list wrapper's
   flattened statements. An unmodelled element is one counted marker already, so the statement is
   named in that marker and not counted twice.
-- Nothing is mapped for it, and it is never emitted as live code.
+- A wrapper's marker never sits between a construct and a branch marker written after it as a
+  sibling. It goes ahead of that construct. Between the two it would orphan the branch, and an
+  orphaned branch renders its body live. *Corrected 2026-10-02 (code review, round 2):* the first
+  cut put the marker where the wrapper sat, and an `Else` after such a wrapper ran for every
+  message.
+- Nothing is mapped for it, and it is never emitted as a write or a delivery.
 - The scan holds no handle for the whole list. Every role-parsed send in it raises, and no
   role-parsed field write maps onto `msg`. So a clone or a send counts only on a `<Line>`.
 
@@ -462,10 +470,18 @@ label: `<Block Data="Patient identity">` renders as before.
 
 At least these limits remain:
 
-- The verb is read as a `<Line>`'s is, so it must lead the `@Data`. A table verb after other words,
-  such as `Step 1: MsgTreeCopy ...`, still reads as a label. So does a verb outside the table with
-  no leading `keyword` span, and one in a construct's, a Call's, an unmodelled element's or a
-  wrapper's `@Data`, styled or not. No word list tells prose from every verb.
+- The verb is read as a `<Line>`'s is: the first `keyword` span, or with none, the first word. So a
+  table verb after other unstyled words, such as `Step 1: MsgTreeCopy ...`, still reads as a
+  label. So does a verb outside the table with no leading `keyword` span, and one in a
+  construct's, a Call's or an unmodelled element's `@Data`, styled or not. No word list tells
+  prose from every verb.
+- The rule is blunt on purpose. Any table verb off a `<Line>`, a `MsgLog` included, leaves the
+  whole list holding no handle, so its role-parsed sends raise until someone finishes them.
+- A `<Block>` label that merely leads with a word the exporter styled as a `keyword` is read as a
+  statement. How often a real label does that was not measured: the validated export is not in
+  this repository.
+- The marker and the statement share one 200-character comment, so a statement longer than about
+  90 characters is cut. Under a `@Disabled` ancestor the preview shows only the verb.
 - A statement with no role markup names no handle the scan can read. So a markup-free write still
   maps onto `msg` and a markup-free send still sends it, in such a list as in any other (§2(b″)).
   The same holds for a markup-free `MsgTreeCopy` on a `<Line>`.
@@ -480,33 +496,42 @@ itself stays as vendored and pinned. The amendment is listed in the guard's `_ST
 the rule copied as text, so a later change to the head's rule turns the guard red until the copy is
 amended on purpose. Two more tests run the battery against the file exactly as vendored. They check
 that the amendment changes only lists that may carry a statement off a `<Line>`, by a wider reading
-written apart from the rule. Where it changes a list it only narrows: no new live send, no new
+written apart from the rule. Where it changes a list it must only narrow: no new live send, no new
 vocabulary call, and one more unmapped step, or else only comment lines change.
 
-Measured 2026-10-02. The battery now holds 7,960 shapes, 504 of them fixed seeds. The 173 new seeds
+That bound is what catches a rule that is wrong in the head and in its copy alike, where the
+head-equals-baseline check is blind. It did not catch the wrapper defect above at first, because no
+seed put a wrapper between a construct and a sibling branch. Eight seeds now do. With the first
+cut's placement put back into the baseline copy, the bound fails on all eight.
+
+Measured 2026-10-02. The battery now holds 7,968 shapes, 512 of them fixed seeds. The 181 new seeds
 put a statement on each of the seven container tags, an unmodelled tag and a list wrapper: a clone,
 a write, a send, a styled verb outside the table, and each of the seven verbs with no markup in two
-casings. The amendment changes 637 shapes, marks a live statement in 614 and drops a live send in
-512. The head equals the amended baseline on every shape. Each mutation arm of the head fails the
+casings. The amendment changes 646 shapes, marks a live statement in 623 and drops a live send in
+513. The head equals the amended baseline on every shape. Each mutation arm of the head fails the
 guard, counted in shapes:
 
 | Mutation of the head | Shapes failing |
 |---|---|
-| no rule at all | 637 |
-| the scan ignores the rule, so the render marks only | 556 |
-| the render ignores the rule, so the scan holds nothing and nothing is marked | 637 |
+| no rule at all | 646 |
+| the scan ignores the rule, so the render marks only | 557 |
+| the render ignores the rule, so the scan holds nothing and nothing is marked | 646 |
 | a construct drops its marker | 90 |
 | a `<Block>` or a `<Call>` drops its marker | 511 |
-| a list wrapper drops its marker | 18 |
+| a list wrapper drops its marker | 27 |
+| a wrapper's marker sits where the wrapper sat | 8 |
 | an unmodelled tag does not name the statement | 18 |
-| the rule reaches the seven container tags only | 36 |
+| the rule reaches the seven container tags only | 45 |
 | a send in a `<Block>` or a `<Call>` stays a live send | 6 |
-| the table loses `msgtreecopy` | 232 |
+| a `<Call>` carrying a send still renders as a call | 3 |
+| the table loses `msgtreecopy` | 230 |
 | the table loses `msgcreate` | 18 |
 | the verb is matched in its usual case only | 91 |
-| the `<Block>` keyword reading is dropped | 1 |
-| the keyword reading reaches every element | 8 |
+| the keyword reading is dropped | 2 |
+| the keyword reading is a `<Block>`'s alone | 1 |
+| the keyword reading reaches every element | 7 |
 | the keyword need not lead the `@Data` | 1 |
+| the marker leaves the statement out | 623 |
 | the gate admits a `<Block>` with a label | 248 |
 
 ### (c) Unmapped actions are never silently dropped (count-and-log)
