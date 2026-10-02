@@ -669,19 +669,29 @@ def has_credential_like_segment(text: str) -> bool:
     """Whether any ``name=value`` segment of ``text``, split at every ``?``, ``&``, ``#`` and ``;``,
     has a name that looks like a credential, by the same name test as :func:`credential_query_params`.
 
-    A deliberately coarser reading than the detector's. That one reads the query ``urlsplit`` finds,
-    split on ``&``, because it feeds a warning about what reaches the partner. This one is for a
-    display rule that must fail closed, so it also reads a fragment, a second ``?`` and a ``;``-split
-    segment. A name drops tab, CR and LF inside the shared name test, as ``urlsplit`` drops them.
-    Linear in ``text``; returns at the first match."""
+    A deliberately coarser reading than the detector's, for a display rule that must fail closed:
+    it also reads a fragment, a second ``?``, a ``;``-split segment and the first segment of a value
+    with no separator at all (``token=...``). The detector, which feeds the construction warning,
+    ``check`` and the posture entry, is unchanged by decision and reads only the ``&``-split query
+    ``urlsplit`` finds; so a ``;`` or second-``?`` credential is withheld in the views and is NOT
+    warned about. That gap is recorded rather than closed here.
+
+    A name drops tab, CR and LF BEFORE it is percent-decoded, as ``urlsplit`` drops them before
+    ``parse_qsl`` decodes: ``api%5<TAB>Fkey`` decodes to ``api_key``. Linear in ``text``; it walks
+    the separators lazily and returns at the first match."""
+    import itertools  # noqa: PLC0415 -- see credential_query_params
     import urllib.parse  # noqa: PLC0415 -- see credential_query_params
 
-    for segment in _SEGMENT_SEPARATORS.split(text)[1:]:
-        name, equals, _value = segment.partition("=")
-        if not equals:
-            continue
-        if _is_credential_param(urllib.parse.unquote_plus(name)):
-            return True
+    start = 0
+    for match in itertools.chain(_SEGMENT_SEPARATORS.finditer(text), (None,)):
+        end = len(text) if match is None else match.start()
+        name, equals, _value = text[start:end].partition("=")
+        if equals:
+            name = name.replace("\t", "").replace("\r", "").replace("\n", "")
+            if _is_credential_param(urllib.parse.unquote_plus(name)):
+                return True
+        if match is not None:
+            start = match.end()
     return False
 
 

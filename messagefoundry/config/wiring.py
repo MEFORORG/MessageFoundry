@@ -1406,17 +1406,16 @@ def connector_secret_env_values(
     return out
 
 
-#: Settings whose value is a URL that may carry `user:password@` userinfo. `proxy` has no `_url`
-#: suffix, which is why this is a NAME set plus a suffix rule rather than a suffix rule alone.
-#: CORRECTED (review of a87fcb2932): this comment named the set and no set existed, so a `proxy`
-#: key was not a URL setting at all.
-_URL_SETTING_SUFFIXES = ("url", "_url", "_uri", "endpoint", "_endpoint")
-_URL_SETTING_NAMES = frozenset({"proxy"})
+#: Settings whose value is a URL that may carry `user:password@` userinfo, by name suffix.
+#: CORRECTED (review of a87fcb2932): this comment said a NAME set covered `proxy`, and no set
+#: existed, so a `proxy` key was not a URL setting at all.
+#: Review of 0c6b32e5c4: a bare ``uri`` and ``http_proxy``-style names were missed, so the suffix
+#: rule now covers ``uri`` and ``proxy`` too (which also covers a bare ``proxy``).
+_URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy")
 
 
 def _is_url_setting(name: str) -> bool:
-    folded = name.lower()
-    return folded in _URL_SETTING_NAMES or folded.endswith(_URL_SETTING_SUFFIXES)
+    return name.lower().endswith(_URL_SETTING_SUFFIXES)
 
 
 #: A URL scheme at the very start of a value, ``https://`` and the like. Shown in a withheld URL so
@@ -1441,12 +1440,16 @@ def _url_may_carry_a_credential(value: str) -> bool:
     that did. The cost is the view: a URL with an ``@`` in its path or query, such as an email
     address, is withheld too.
 
+    The ``@``, ``%40`` and ``%3A`` tests read the value with tab, CR and LF removed, as ``urlsplit``
+    removes them before any reader decodes the host: ``%<TAB>40`` is ``%40`` to that reader.
+
     It covers at least the shapes above, not every place a URL can hold a secret: a secret that is a
-    bare path segment (``/services/T000/B000/SECRET``) has no name or delimiter to find, and is
-    shown. Each step is one scan of the value, so the rule is linear in its length."""
-    if "@" in value:
+    bare path segment (``/services/T000/B000/SECRET``) has no name to find, and is shown. Each step
+    is one scan of the value, so the rule is linear in its length."""
+    cleaned = value.replace("\t", "").replace("\r", "").replace("\n", "")
+    if "@" in cleaned:
         return True
-    folded = value.casefold()
+    folded = cleaned.casefold()
     if "%40" in folded or "%3a" in folded:
         return True
     try:
@@ -1536,10 +1539,20 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             out[name] = ref
         elif is_secret:
             out[name] = "***"
+        elif _is_env_marker(value) and _is_url_setting(name):
+            # The RAW connections.toml marker, {"env": ..., "default": ...}, when it reaches this view
+            # undecoded (a hand-built spec, a stored graph). Review of 0c6b32e5c4: it fell to the
+            # last arm and its default was served verbatim. Same treatment as an EnvRef above.
+            marker: dict[str, Any] = {"env": value.get("env")}
+            if "default" in value:
+                raw_default = value["default"]
+                marker["default"] = (
+                    _mask_url(raw_default) if isinstance(raw_default, str) else raw_default
+                )
+            out[name] = marker
         elif isinstance(value, str) and _is_url_setting(name):
-            # BACKLOG #1207 and ASVS 14.2.1: a URL that may carry a credential, in its userinfo or in
-            # a credential-like query parameter, is withheld whole (_mask_url), or /metadata would
-            # serve the key the construction warning names.
+            # BACKLOG #1207 and ASVS 14.2.1: withheld whole when it may carry a credential; the
+            # rule is stated once, on _url_may_carry_a_credential.
             out[name] = _mask_url(value)
         elif name == "headers" and isinstance(value, dict):
             # Both axes: a header NAME is rendered through _redact_header_name before it is used as

@@ -169,6 +169,9 @@ def test_a_url_that_may_carry_a_credential_is_withheld_whole(url: str, expected:
         "http://proxy.example.invalid:3128",
         "https://h.example.invalid:8443/x?fmt=json&keyword=lab#frag",
         "https://[::1]:8443/x",
+        # Review of 0c6b32e5c4: benign ";" and "#" name=value segments the segment leg reads.
+        "https://h.example.invalid/app;version=2",
+        "https://h.example.invalid/x#section=3",
     ],
 )
 def test_a_plain_url_with_no_credential_is_unchanged(url: str) -> None:
@@ -186,6 +189,16 @@ def test_a_plain_url_with_no_credential_is_unchanged(url: str) -> None:
         "https://h.example.invalid/x?x=1?api_key=SYNTH-D",  # after a second "?"
         "jdbc:sqlserver://db.example.invalid:1433;user=u;password=SYNTH-PW",
         "https://h.example.invalid/x#api_\tkey=SYNTH-J",  # a tab inside a fragment name
+        # Review of 0c6b32e5c4: a tab INSIDE a percent-escape, which urlsplit drops before decoding.
+        "https://h.example.invalid/x#api%5\tFkey=SYNTH-K",
+        "https://h.example.invalid/x?a=1;api%5\tFkey=SYNTH-L",
+        "https://h.example.invalid/x?a=1?api%5\tFkey=SYNTH-M",
+        # ... a "%40" or "%3A" broken by a tab, which urlsplit rejoins.
+        "https://SYNTH-N%\t40h.example.invalid/x",
+        "https://user%\t3ASYNTH-O%\t40h.example.invalid/x",
+        # ... and a value with no separator before its first name=value.
+        "token=SYNTH-P",
+        "AccountKey=SYNTH-Q;AccountName=x",
     ],
 )
 def test_a_credential_name_outside_the_ampersand_query_is_withheld(url: str) -> None:
@@ -202,6 +215,12 @@ def test_a_bare_path_secret_is_shown_and_documented_as_such() -> None:
     assert _shown(url) == url
 
 
+def test_a_path_name_value_is_withheld_through_the_first_segment() -> None:
+    """The first segment is read too (review of 0c6b32e5c4), so a path ``name=value`` whose name
+    ends in a credential word is withheld even with no separator before it."""
+    assert _shown("https://h.example.invalid/x/api_key=SYNTH-PATH2") == "https://<redacted>"
+
+
 def test_every_url_setting_key_and_the_proxy_name_use_the_rule() -> None:
     """Review of a87fcb2932: only "url" and "proxy_url" held a credential in these tests, so a
     narrowed suffix rule would have passed. And a "proxy" key, which the suffix rule's comment
@@ -215,9 +234,15 @@ def test_every_url_setting_key_and_the_proxy_name_use_the_rule() -> None:
             "fhir_endpoint": "https://f.example.invalid/r4?api_key=SYNTH-G",
             "proxy": "http://u:SYNTH-H@proxy.example.invalid:3128",
             "url": env("MEFOR_URL", default="https://t.example.invalid/x?a=1;token=SYNTH-I"),
+            # Review of 0c6b32e5c4: a bare "uri" and an http_proxy-style name.
+            "uri": "https://u:SYNTH-R@h.example.invalid/x",
+            "http_proxy": "http://u:SYNTH-S@p.example.invalid:3128",
+            # ... and the RAW connections.toml marker, undecoded.
+            "callback_url": {"env": "MEFOR_CB", "default": "https://u:SYNTH-T@h.example.invalid/x"},
         }
     )
     assert "SYNTH" not in str(shown), shown
+    assert shown["callback_url"] == {"env": "MEFOR_CB", "default": "https://<redacted>"}
 
 
 def test_an_env_default_url_is_withheld_by_the_same_rule() -> None:
@@ -292,10 +317,13 @@ def test_the_composed_mask_never_shows_a_value_any_reader_takes() -> None:
         tail = "".join(
             rng.choice([t for t in tokens if t != "="]) for _ in range(rng.randint(0, 10))
         )
-        url = f"http://{head}{rng.choice('?&;#')}key=QZXJ{tail}"
+        # The NAME varies too (review of 0c6b32e5c4), including a tab inside a percent-escape and
+        # a benign name, so the readers below can disagree with the rule and some URLs pass.
+        name = rng.choice(("key", "api_key", "api%5Fkey", "api%5\tFkey", "fmt"))
+        url = f"http://{head}{rng.choice('?&;#')}{name}=QZXJ{tail}"
         shown = str(_shown(url, "proxy_url"))
         withheld += "<redacted>" in shown
-        if "key" in credential_query_params(url):
+        if credential_query_params(url):
             named += 1
             assert "QZXJ" not in shown, (url, shown)
         for pairs in independent_readers(url):
@@ -319,9 +347,8 @@ def test_the_composed_mask_never_shows_a_value_any_reader_takes() -> None:
     # Liveness: each reader's arm is reached, and the generator does not withhold everything.
     assert named > 1000 and by_other_reader > 1000, (named, by_other_reader)
     assert in_password > 100 and in_netloc > 20, (in_password, in_netloc)
-    # Every generated URL names a credential, so all are withheld; the plain-URL control is
-    # test_a_plain_url_with_no_credential_is_unchanged. This floor only shows the rule fired.
-    assert withheld == 30000, withheld
+    # Some URLs carry only the benign name and nothing else that withholds, so not all are withheld.
+    assert 15000 < withheld < 30000, withheld
 
 
 def test_detector_drops_a_control_character_inside_a_name() -> None:
