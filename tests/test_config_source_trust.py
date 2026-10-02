@@ -33,6 +33,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -58,6 +59,12 @@ from messagefoundry.config.wiring import (
     _WinPathSecurity,
     load_config,
     validate_config,
+)
+from messagefoundry.pipeline.sandbox import (
+    SandboxError,
+    SandboxMode,
+    SandboxPolicy,
+    SandboxSession,
 )
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -614,6 +621,8 @@ def _loosening_names(sec: SecuritySettings | None = None) -> list[str]:
         SecretRotationSettings(),
         cleartext_hops=(),
         expiry_relaxed_hops=(),
+        hostname_unchecked_hops=(),
+        query_credential_hops=(),
         unverified_db_hops=(),
         attested_hops=(),
         revocation_attested_hops=(),
@@ -664,7 +673,10 @@ def test_escape_is_honoured_under_warn_and_named_as_a_loosening(
         registry = load_config(source)
     assert "o" in registry.outbound
     assert any("dev/test override" in r.getMessage() for r in caplog.records)
-    settings = load_settings(environ=dict(os.environ))
+    # An explicit, empty settings file, so a stray ./messagefoundry.toml cannot answer instead.
+    empty = tmp_path / "empty.toml"
+    empty.write_text("", encoding="utf-8")
+    settings = load_settings(config_path=empty, environ=dict(os.environ))
     assert settings.security.enforcement is SecurityEnforcement.WARN
     names = _loosening_names(settings.security)
     assert INSECURE_CONFIG_SOURCE_ESCAPE_ENV in names
@@ -870,22 +882,19 @@ def _load_in_a_child(source: Path, env: dict[str, str]) -> subprocess.CompletedP
         text=True,
         env=env,
         cwd=str(_REPO),
-        # Three of these run in one test. 15s each keeps the sum under the 60s pytest-timeout
-        # watchdog, so a hung child is a named TimeoutExpired here. A child import takes about 1s.
-        timeout=15,
+        # Two of these run in one test. 25s each keeps the sum under the 60s pytest-timeout
+        # watchdog, so a hung child is a named TimeoutExpired here, and leaves room for a cold
+        # import on a starved runner. A warm child import takes about 1s.
+        timeout=25,
     )
 
 
 def test_a_fresh_process_honours_the_clamp(tmp_path: Path) -> None:
     """A child process shares nothing with this one but the environment, which is why the dial is
-    read there. Three runs over one really-writable directory: refused bare, refused with the
-    escape alone, loaded with the escape and the ``warn`` dial."""
+    read there. Two runs over one really-writable directory: refused with the escape alone, loaded
+    with the escape and the ``warn`` dial. Tier 2 holds the refusal with nothing set."""
     _write_cfg(tmp_path)
     _grant_others_write(tmp_path)
-
-    bare = _load_in_a_child(tmp_path, _child_env())
-    assert bare.returncode == 3, bare.stdout + bare.stderr
-    assert INSECURE_CONFIG_SOURCE_ESCAPE_ENV not in bare.stdout
 
     clamped = _load_in_a_child(tmp_path, _child_env(**{INSECURE_CONFIG_SOURCE_ESCAPE_ENV: "1"}))
     assert clamped.returncode == 3, clamped.stdout + clamped.stderr
@@ -899,31 +908,88 @@ def test_a_fresh_process_honours_the_clamp(tmp_path: Path) -> None:
     assert "LOADED" in honoured.stdout
 
 
+def _worker_session(config_dir: Path) -> SandboxSession:
+    """A real sandbox session over ``config_dir``. ``graph=None``: these tests hold no engine graph,
+    and what they read is whether the worker's own boot load ran."""
+    return SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
+        config_dir=config_dir,
+        env=None,
+        graph=None,
+    )
+
+
 @pytest.mark.usefixtures("escape_under_enforce")
 def test_the_sandbox_worker_boot_load_honours_the_clamp(tmp_path: Path) -> None:
     """The worker loads config in its own process at boot. With the escape set under ``enforce`` it
     refuses a writable source, and the parent sees the refusal instead of a running worker."""
-    from messagefoundry.pipeline.sandbox import (
-        SandboxError,
-        SandboxMode,
-        SandboxPolicy,
-        SandboxSession,
-    )
-
     _write_cfg(tmp_path)
     _grant_others_write(tmp_path)
-    session = SandboxSession(
-        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
-        inbound="IB_T",
-        config_dir=tmp_path,
-        env=None,
-    )
+    session = _worker_session(tmp_path)
     try:
         with pytest.raises(SandboxError) as excinfo:
             session._spawn()
     finally:
         session.close()
     assert INSECURE_CONFIG_SOURCE_ESCAPE_ENV in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("escape_honoured")
+def test_the_sandbox_worker_decides_as_the_engine_did_at_warn(tmp_path: Path) -> None:
+    """The worker's environment is an allowlist. The escape crosses it, and so must the dial that
+    unlocks it, or the worker would refuse a directory the engine loaded at ``warn``. Through the
+    real spawn: with both set, the worker boots over a really-writable directory. The test above is
+    the other arm, and it would pass whether or not the dial crossed."""
+    _write_cfg(tmp_path)
+    _grant_others_write(tmp_path)
+    session = _worker_session(tmp_path)
+    try:
+        session._spawn()
+        assert session._proc is not None and session._proc.poll() is None
+    finally:
+        session.close()
+
+
+@pytest.mark.usefixtures("real_config_source_readers", "escape_under_enforce")
+def test_the_engine_refuses_the_same_directory_with_the_escape_alone(tmp_path: Path) -> None:
+    """Control for the test above. With the escape alone, the engine's own load of the same
+    really-writable directory refuses, through the real readers. An engine that cannot load its
+    graph has no inbound to start a worker for."""
+    _write_cfg(tmp_path)
+    _grant_others_write(tmp_path)
+    with pytest.raises(WiringError) as excinfo:
+        load_config(tmp_path)
+    assert INSECURE_CONFIG_SOURCE_ESCAPE_ENV in str(excinfo.value)
+
+
+@pytest.mark.parametrize("spelling", ["MEFOR_SECURITY_ENFORCEMENT", "MEFOR_SECURITY_enforcement"])
+def test_every_spelling_of_the_dial_reaches_the_worker_environment(
+    spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine's check reads every spelling of the dial the settings loader would. The worker's
+    environment carries each one that is set, read off the real spawn call, and nothing else of
+    the engine's but the escape."""
+    captured: dict[str, dict[str, str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_popen(argv: list[str], **kwargs: Any) -> None:
+        captured["env"] = kwargs["env"]
+        raise _Stop
+
+    monkeypatch.delenv(SECURITY_ENFORCEMENT_ENV, raising=False)
+    monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
+    monkeypatch.setenv(spelling, "warn")
+    monkeypatch.setenv("MEFOR_STORE_POOL_SIZE", "7")  # any other engine variable: must not cross
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    with pytest.raises(_Stop):
+        _worker_session(tmp_path)._spawn()
+    crossed = {name: value for name, value in captured["env"].items() if name.startswith("MEFOR_")}
+    # Windows holds one variable under an upper-cased name, whichever spelling set it.
+    as_stored = spelling.upper() if sys.platform == "win32" else spelling
+    assert crossed == {INSECURE_CONFIG_SOURCE_ESCAPE_ENV: "1", as_stored: "warn"}
 
 
 def test_the_loosening_page_lists_the_escape() -> None:

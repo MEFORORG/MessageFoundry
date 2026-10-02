@@ -73,7 +73,16 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[None]:
         self_sid=_SUITE_SID, read_path=lambda _path: clean, owner_in_admins=lambda _sid: False
     )
 
-    @functools.wraps(inspect.unwrap(wiring._win32_config_source_probes))
+    real = inspect.unwrap(wiring._win32_config_source_probes)
+    # The same guard the engine suite's conftest carries: a stand-in that forgot to record what it
+    # replaced would be wrapped here as "real", and hide the engine's readers from that suite.
+    if Path(real.__code__.co_filename) != Path(wiring.__file__):
+        raise RuntimeError(
+            "the Windows config-source readers found here are not the engine's own: a stand-in was "
+            "installed without functools.wraps over the readers it replaced"
+        )
+
+    @functools.wraps(real)
     def clean_readers() -> wiring._WinConfigSourceProbes:
         return probes
 

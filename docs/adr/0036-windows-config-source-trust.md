@@ -230,7 +230,11 @@ as the cure only for a dev or CI checkout, and says it is never set in productio
 process that executes config: `serve`, a reload, the sandbox worker's boot load, and offline
 commands. At least `check` and `dryrun` load config before they read any settings, and the worker
 reads no settings file. So the clamp reads the dial from the environment, where the escape itself
-lives, and every one of those processes decides the same way with nothing handed down by a caller.
+lives, and every one of those processes decides the same way with no posture handed down by a
+caller. One process needs the variables handed to it: the sandbox worker starts with an allowlisted
+environment (vault BACKLOG #2587), so the sandbox carries the escape and every spelling of the dial
+into it by name. The dial is a posture switch and not a secret. Without it the worker would see the
+escape alone and refuse a directory the engine loaded at `warn`.
 The environment outranks the settings file and no command-line override sets this dial, so an
 instance whose settings come from that environment and resolve to `enforce` cannot unlock the
 escape. The cost is one limit: **`warn` set only in the settings file does not unlock it.** That is

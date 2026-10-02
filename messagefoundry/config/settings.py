@@ -426,7 +426,9 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     any settings, and the worker never reads a settings file. A posture handed down by each caller
     would be missed by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is
     an environment variable, so the dial that unlocks it is read from the same place, the same way in
-    every one of those processes.
+    every one of those processes. The sandbox worker's environment is an allowlist, so
+    ``pipeline/sandbox.py`` carries both into it by name: the escape, and every spelling of the dial
+    that :func:`security_enforcement_env_names` finds. The worker then reads what the engine read.
 
     **Where "never under enforce" holds.** For a process whose settings come from
     :func:`load_settings` over this same environment, which is ``serve``, ``supervise`` and every CLI
@@ -453,20 +455,28 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     return insecure_config_source_allowed(env) and _environment_dial_is_warn(env)
 
 
-def _environment_dial_is_warn(env: Mapping[str, str]) -> bool:
-    """Whether every spelling of the enforcement dial that :func:`_env_overrides` would read says
-    ``warn``, and at least one is present.
+def security_enforcement_env_names(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Every name in the environment that :func:`_env_overrides` reads as the enforcement dial.
 
     ``_env_overrides`` lowercases what follows the prefix, so ``MEFOR_SECURITY_enforcement`` is the
     same setting as :data:`SECURITY_ENFORCEMENT_ENV`, and on a case-sensitive platform both can be
-    set. Which one wins there is iteration order. One that disagrees fails this closed."""
+    set. The sandbox hands exactly these names to its worker, beside the escape, so the worker's
+    config-source check reads what the engine's read."""
+    env = os.environ if environ is None else environ
     key = SECURITY_ENFORCEMENT_ENV[len(_ENV_PREFIX) :].lower()
-    spellings = [
-        value
-        for name, value in env.items()
+    return tuple(
+        name
+        for name in env
         if name.startswith(_ENV_PREFIX) and name[len(_ENV_PREFIX) :].lower() == key
-    ]
-    return bool(spellings) and all(value == SecurityEnforcement.WARN.value for value in spellings)
+    )
+
+
+def _environment_dial_is_warn(env: Mapping[str, str]) -> bool:
+    """Whether every spelling of the enforcement dial in ``env`` says ``warn``, and at least one is
+    present. Which of two spellings the settings loader takes is iteration order, so one that
+    disagrees fails this closed."""
+    names = security_enforcement_env_names(env)
+    return bool(names) and all(env[name] == SecurityEnforcement.WARN.value for name in names)
 
 
 class StoreSettings(_Section):
