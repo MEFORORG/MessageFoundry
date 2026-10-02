@@ -71,6 +71,7 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.api.security import (
     alert_sink_for,
+    answers_before_body,
     bearer_token,
     client_ip,
     get_auth,
@@ -202,8 +203,11 @@ def _rate_limited(request: Request, label: str) -> HTTPException:
     return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many attempts; please retry later")
 
 
+@answers_before_body
 async def _service(request: Request) -> AuthService:
     # ``async`` for the reason ``messagefoundry.api.app._get_engine`` gives; keep it non-blocking.
+    # Marked for the same reason as that provider: it sits ahead of the gate on every route
+    # here, so the check that runs before the body is read asks it first (vault BACKLOG #2739).
     auth = get_auth(request)
     if auth is None or not auth.enabled:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authentication is not enabled")

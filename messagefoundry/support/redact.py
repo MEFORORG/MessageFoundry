@@ -46,7 +46,13 @@ import re
 
 from messagefoundry.redaction import redact as _redact_phi
 
-__all__ = ["redact_log_line", "redact_log_text", "REDACTION_PLACEHOLDER"]
+__all__ = [
+    "redact_log_line",
+    "redact_log_record",
+    "redact_log_text",
+    "split_log_lines",
+    "REDACTION_PLACEHOLDER",
+]
 
 #: What every scrubbed span is replaced with (so a reviewer sees redaction happened, not a blank).
 REDACTION_PLACEHOLDER = "[REDACTED]"
@@ -333,9 +339,42 @@ def redact_log_line(line: str) -> str:
     return prefix + body
 
 
+def split_log_lines(text: str) -> list[str]:
+    """``text`` split into log lines at LF, CR and CRLF, and nowhere else (vault BACKLOG #2563).
+
+    ``str.splitlines`` also ends a line at VT, FF, U+001C to U+001E, U+0085, U+2028 and U+2029. The
+    write-time scrub (:func:`~messagefoundry.controlchars.scrub_control_chars`) escapes the C0 ones but
+    deliberately not the last three, so a logged value holding one of them would read back as two
+    records. The three endings kept are the ones a universal-newline file read recognises, so on those
+    the result equals ``text.splitlines()`` exactly. At least both log tail readers split here, the
+    web console viewer and the support bundle; a new reader should too."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines[-1] == "":
+        lines.pop()  # a final line ending closes the last line; it does not open an empty one
+    return lines
+
+
+#: The code points ``str.splitlines`` breaks at beyond CR and LF: VT, FF, U+001C to U+001E,
+#: U+0085, U+2028 and U+2029. Written as escapes so no editor shows one as a line break.
+_SPLITLINES_ONLY_BREAK = re.compile(r"([\x0b\x0c\x1c-\x1e\x85\u2028\u2029])")
+
+
+def redact_log_record(line: str) -> str:
+    """:func:`redact_log_line` over one line from :func:`split_log_lines`, piece by piece.
+
+    The line stays whole, but each run between the code points in ``_SPLITLINES_ONLY_BREAK`` is
+    redacted on its own, which is what the readers did while they split there. Redacting the joined
+    line instead would let a pattern span the break and redact LESS: the name-run pattern caps its
+    token count, so ``DOE JANE`` + U+2028 + ``ROE RICHARD SMITH`` leaves ``SMITH`` behind as one run,
+    where the two pieces each redact in full."""
+    parts = _SPLITLINES_ONLY_BREAK.split(line)
+    parts[::2] = [redact_log_line(part) for part in parts[::2]]
+    return "".join(parts)
+
+
 def redact_log_text(text: str) -> str:
     """Redact every line of a multi-line block (the log tail), preserving line breaks."""
-    return "\n".join(redact_log_line(ln) for ln in text.splitlines())
+    return "\n".join(redact_log_record(ln) for ln in split_log_lines(text))
 
 
 def _keep_label(m: re.Match[str]) -> str:
