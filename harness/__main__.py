@@ -5,10 +5,11 @@
 ``python -m harness``                 → launch the GUI (Send/Receive/File/Compose/Monitor).
 ``python -m harness --list-scenarios``→ list the built-in scenarios.
 ``python -m harness --scenario NAME`` → run one scenario headless against a running engine
-                                                and exit 0 (pass) / 1 (fail) — for CI.
+                                                and exit 0 (pass) / 1 (fail) / 2 (setup, or
+                                                SKIP: a precondition is missing) — for CI.
 ``python -m harness --coverage``      -> print every registered connector kind, by direction,
-                                                against the scenarios that cover it (no engine
-                                                needed).
+                                                against the scenarios that cover it or the reason
+                                                it is exempt (no engine needed); exit 1 on a gap.
 ``python -m harness --fuzz``          -> fuzz a running engine: seeded byte, field and MLLP-frame
                                                 mutations of generated HL7 through a harness driver,
                                                 checking health, ACK-implies-stored, reply shape and no
@@ -391,11 +392,13 @@ def _list_scenarios() -> int:
 
 
 def _print_coverage() -> int:
-    from harness.coverage import coverage_rows, format_report, registered_kinds
+    from harness.coverage import coverage_gaps, coverage_rows, format_report, registered_kinds
     from harness.scenarios import SCENARIOS
 
-    print(format_report(coverage_rows(registered_kinds(), SCENARIOS.values())))
-    return 0
+    rows = coverage_rows(registered_kinds(), SCENARIOS.values())
+    print(format_report(rows))
+    # Exit 1 on a gap, so a CI step can run this as the gate tests/test_harness_coverage_gate.py is.
+    return 1 if coverage_gaps(rows) else 0
 
 
 def _run_scenario(
@@ -435,6 +438,10 @@ def _run_scenario(
         # Setup, not a verdict on the engine: a sink could not bind (the GUI Receive tab already
         # holds the port, say) or a drop directory could not be made.
         print(f"SETUP {name}: {exc}", file=sys.stderr)
+        return 2
+    if result.skipped:
+        # Not a pass: the scenario's precondition (an external server, an extra) is missing here.
+        print(f"SKIP  {name}: {result.detail}")
         return 2
     print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {result.detail}")
     return 0 if result.ok else 1

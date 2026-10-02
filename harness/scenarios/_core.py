@@ -21,6 +21,7 @@ import abc
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import ClassVar
 from uuid import uuid4
 
 from harness import drivers, sinks
@@ -55,9 +56,17 @@ class ScenarioContext:
 
 @dataclass(frozen=True)
 class ScenarioResult:
+    """``skipped`` marks a run whose precondition is missing here (a family that needs an external
+    server, say). A skipped result is never ``ok``: it is reported as SKIPPED, not as a pass."""
+
     scenario: BaseScenario
     ok: bool
     detail: str
+    skipped: bool = False
+
+    def __post_init__(self) -> None:
+        if self.skipped and self.ok:
+            raise ValueError("a skipped scenario result cannot also be ok")
 
 
 class BaseScenario(abc.ABC):
@@ -65,6 +74,12 @@ class BaseScenario(abc.ABC):
 
     name: str
     description: str
+
+    #: The ``harness/config`` SUBDIRECTORY whose graph this scenario runs against, or ``""`` for the
+    #: top-level graphs ``serve --config harness/config`` loads. A family whose graph needs something
+    #: that serve does not provide (a credential, an external server) keeps it in a subdirectory, and
+    #: its own test serves it.
+    graph: ClassVar[str] = ""
 
     @property
     @abc.abstractmethod
@@ -74,6 +89,11 @@ class BaseScenario(abc.ABC):
     @abc.abstractmethod
     def run(self, ctx: ScenarioContext) -> ScenarioResult:
         """Run end to end and report pass or fail with a one-line detail."""
+
+    def unavailable(self) -> str | None:
+        """Why this scenario cannot run in this install (an optional extra it needs is missing), or
+        None. A test reports that as a skip; :meth:`run` still fails rather than passing."""
+        return None
 
 
 @dataclass(frozen=True)

@@ -1747,6 +1747,9 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     # than chasing the one the engine mints -- see crypto_inventory_check.py's INVENTORY entry for
     # the same file, which this duplicates.
     "harness/load/tlsmat.py": frozenset({"ssl"}),
+    # Vault BACKLOG #2719: the rig Administrator's per-run password draw, and the verifying TLS
+    # context its sign-in uses -- see the INVENTORY row this duplicates.
+    "harness/load/rigadmin.py": frozenset({"secrets", "ssl"}),
     # Vault BACKLOG #2354: two rigs pass an explicit warn HopPosture when they open a server store
     # against a self-signed dev container. A value type only; see the INVENTORY rows they duplicate.
     "harness/load/connscale/runner.py": frozenset({"messagefoundry.config.tls_policy"}),
