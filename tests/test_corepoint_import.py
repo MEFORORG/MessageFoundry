@@ -17,7 +17,9 @@ import pytest
 
 from messagefoundry.checks import run_checks
 from messagefoundry.corepoint_import import (
+    _CONTAINER_KIND_BY_TAG,
     _STATEMENT_VERBS,
+    _UNDERSTOOD,
     _VERB_CONNECTIVES,
     Action,
     Control,
@@ -1682,21 +1684,32 @@ def test_a_fully_understood_module_passes_check(tmp_path: Path) -> None:
     assert run_checks(tmp_path / "out", run_lint=False).ok
 
 
-# --- a statement where a container's label or condition belongs (BACKLOG #2632) -------------------
+# --- a statement anywhere but on a <Line> (BACKLOG #2632) -----------------------------------------
 #
 # A ``<Block>``, ``<Call>`` or construct whose ``@Data`` is a statement used to render as a label, or
 # as the text of a dead condition, and count nothing, while the handle scan read its ``MsgTreeCopy``
 # as a clone that was made. A send of that clone then rendered as a send of ``msg``. One rule,
-# ``_label_statement``, now answers for both: the render marks the statement as a counted TODO ahead
-# of the container's body, and the scan holds no handle for the list. All fixtures are synthetic.
+# ``_label_statement``, now answers for both, for every element that is not a ``<Line>``: the render
+# marks the statement as a counted TODO ahead of the element's body and never emits it as live
+# code, and the scan holds no handle for the list. All fixtures are synthetic.
 
 _CLONE_LINE = _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
 _SEND_COPY = _role_send("other-handle", "%OUT", "OB_ACME")
 _SEND_INPUT = _role_send("input-handle", "%ADT", "OB_IN")
 _WRITE_COPY = _write("other-handle", "%OUT", "Y")
 _MERGE_LINE = _role_line(_span("keyword", "MsgTreeMerge") + " " + _span("other-handle", "%NEW"))
-_LABEL_MARKER = "written where its container's label or condition belongs"
+_LABEL_MARKER = "not on a Line, so whether Corepoint runs it is not known"
 _CONTAINER_TAGS = ("Block", "Call", "Case", "Foreach", "If", "Loop", "Try")
+# One spelling of each statement verb, by the table's own key.
+_VERB_SPELLINGS = {
+    "itemappend": "ItemAppend",
+    "itemclear": "ItemClear",
+    "itemcopy": "ItemCopy",
+    "msgcreate": "MsgCreate",
+    "msglog": "MsgLog",
+    "msgsend": "MsgSend",
+    "msgtreecopy": "MsgTreeCopy",
+}
 
 
 def _container(tag: str, line: str, body: str = "", disabled: bool = False) -> str:
@@ -1735,6 +1748,7 @@ def test_a_blocks_marker_follows_its_label_comment_and_nothing_counts_as_mapped(
     lines = _handler_body(_handler_source(body)).splitlines()
     label = lines.index("    # Corepoint Block: MsgTreeCopy %ADT/ to %OUT/")
     assert _LABEL_MARKER in lines[label + 1]
+    assert lines[label + 1].endswith("taken to be msg: MsgTreeCopy %ADT/ to %OUT/)")
     assert _count_steps(_handler_steps(body), in_loop=False)[0] == 0
 
 
@@ -1764,7 +1778,7 @@ def test_a_field_write_in_a_block_label_is_marked_and_never_mapped() -> None:
     """Whether Corepoint runs the label is not known, so the write is a TODO, not a ``set_field``."""
     body = _container("Block", _WRITE_INPUT) + _SEND_INPUT
     src = _handler_body(_handler_source(body))
-    assert "    # TODO: Corepoint ItemCopy — hand-finish (written" in src
+    assert "    # TODO: Corepoint ItemCopy — hand-finish (not on a Line" in src
     assert "set_field(" not in src and "Send(" not in src
     assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["ItemCopy", "MsgSend"], 0)
 
@@ -1786,11 +1800,41 @@ def test_a_field_write_in_a_block_label_is_marked_and_never_mapped() -> None:
         pytest.param(_container("Block", _MERGE_LINE), True, id="block-keyword-not-in-the-table"),
         pytest.param(_labelled("If", 'MsgSend %OUT to connection "OB_X"'), True, id="if-flat-send"),
         pytest.param(_labelled("Call", "MsgLog %ADT"), True, id="call-flat-log"),
-        pytest.param(_container("If", _MERGE_LINE), False, id="construct-keyword-not-in-the-table"),
+        # A send would be live code, so a Block or a Call never renders one from its ``@Data``.
         pytest.param(
             _container("Block", _role_send("input-handle", "%ADT", "OB_LABEL")),
+            True,
+            id="block-send",
+        ),
+        pytest.param(
+            _labelled("Call", 'msgsend %ADT to connection "OB_LABEL"'), True, id="call-send"
+        ),
+        # A ``<List>`` wrapper is flattened and its own ``@Data`` was never rendered at all.
+        pytest.param(_container("Actions", _CLONE_LINE), True, id="actions-wrapper"),
+        pytest.param(_container("List", _CLONE_LINE), True, id="list-wrapper"),
+        pytest.param(
+            _container("List", _CLONE_LINE, disabled=True), True, id="disabled-list-wrapper"
+        ),
+        # An element the import does not model is already marked as that. Its statement is too.
+        pytest.param(_container("Switch", _CLONE_LINE), True, id="unmodelled-tag-clone"),
+        pytest.param(
+            _container("Switch", _role_send("input-handle", "%ADT", "OB_LABEL")),
+            True,
+            id="unmodelled-tag-send",
+        ),
+        pytest.param(_container("If", _MERGE_LINE), False, id="construct-keyword-not-in-the-table"),
+        pytest.param(
+            _container("Switch", _MERGE_LINE), False, id="unmodelled-keyword-not-in-the-table"
+        ),
+        # A keyword span that does not LEAD the label is a styled connective, not a verb.
+        pytest.param(
+            _labelled("Block", "Copy patient " + _span("keyword", "to") + " output"),
             False,
-            id="block-send-renders-as-a-send",
+            id="block-keyword-connective-in-prose",
+        ),
+        # A limit ADR 0086 records: the verb is read as a Line's is, so it must lead.
+        pytest.param(
+            _labelled("Block", "Step 1: MsgTreeCopy %NEW/ to %OUT/"), False, id="verb-not-leading"
         ),
         pytest.param(_labelled("Block", "Patient identity"), False, id="prose"),
         pytest.param(_labelled("Block", "Message header"), False, id="prose-near-a-verb"),
@@ -1800,9 +1844,6 @@ def test_a_field_write_in_a_block_label_is_marked_and_never_mapped() -> None:
         pytest.param(_labelled("Case", "ChooseFrom (x)"), False, id="case"),
         pytest.param(_labelled("Call", 'ActionListCall "Sub"'), False, id="call"),
         pytest.param(_container("Block", _CLONE_LINE, disabled=True), False, id="disabled-block"),
-        # Marked and counted already, as an element the import does not model. The scan still reads
-        # its clone as made: a limit ADR 0086 records.
-        pytest.param(_container("Switch", _CLONE_LINE), False, id="unmodelled-tag"),
     ],
 )
 def test_the_scan_and_the_render_ask_one_rule(element: str, carried: bool) -> None:
@@ -1815,6 +1856,53 @@ def test_the_scan_and_the_render_ask_one_rule(element: str, carried: bool) -> No
     assert (held == frozenset()) is carried
     assert ('Send("OB_IN", msg)' in src) is not carried
     assert ("raise NotImplementedError" in src) is carried
+    if carried:
+        assert "Send(" not in src  # no live send at all: not the input's, not the statement's
+
+
+@pytest.mark.parametrize("tag", [*_CONTAINER_TAGS, "Switch", "List"])
+@pytest.mark.parametrize("verb", sorted(_STATEMENT_VERBS))
+def test_every_statement_verb_is_marked_on_every_element_but_a_line(tag: str, verb: str) -> None:
+    """Each verb of the table, in its usual spelling, lower case and upper case, on each container,
+    an unmodelled tag and a list wrapper. On a ``<Line>`` the same text is an ordinary statement."""
+    for spelling in (_VERB_SPELLINGS[verb], verb, verb.upper()):
+        data = f"{spelling} %OUT"
+        src = _handler_body(_handler_source(_labelled(tag, data) + _SEND_INPUT))
+        assert _LABEL_MARKER in src and "Send(" not in src, spelling
+        line = _handler_body(_handler_source(_role_line(data) + _SEND_INPUT))
+        assert _LABEL_MARKER not in line, spelling
+
+
+def test_a_statement_in_a_try_or_a_list_wrapper_is_named_in_its_marker() -> None:
+    """Neither prints its ``@Data`` anywhere else, so the marker carries the statement itself."""
+    for tag in ("Try", "Actions"):
+        src = _handler_body(_handler_source(_container(tag, _CLONE_LINE) + _SEND_COPY))
+        assert src.count("MsgTreeCopy %ADT/ to %OUT/") == 1, tag
+        assert "taken to be msg: MsgTreeCopy %ADT/ to %OUT/)" in src, tag
+
+
+def test_a_send_in_a_block_label_is_never_a_delivery() -> None:
+    """A ``MsgSend`` in a Block's ``@Data`` used to render as a live send of msg, with its outbound
+    declared. It may never have run, so it is marked, and the Block renders as the label it is."""
+    body = _container("Block", _role_send("input-handle", "%ADT", "OB_LABEL"))
+    src = _handler_source(body)
+    assert "Send(" not in _handler_body(src) and 'outbound("OB_LABEL"' not in src
+    assert "    # Corepoint Block: MsgSend %ADT to connection" in src
+    assert "    # TODO: Corepoint MsgSend — hand-finish (not on a Line" in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["MsgSend"], 0)
+    # The control: the same send on a Line under a prose Block is a delivery.
+    line = _labelled("Block", "Section", _role_send("input-handle", "%ADT", "OB_LABEL"))
+    assert 'sends.append(Send("OB_LABEL", msg))' in _handler_source(line)
+
+
+def test_a_hostile_label_statement_cannot_escape_its_marker() -> None:
+    """The statement is untrusted export text. It rides in a comment, flattened and elided."""
+    hostile = "MsgTreeCopy %NEW/ to %ADT/\nimport os  # " + "x" * 5000
+    src = _handler_source(_labelled("Try", hostile) + _SEND_INPUT)
+    compile(src, "generated.py", "exec")
+    assert "\nimport os" not in src
+    marker = next(line for line in src.splitlines() if _LABEL_MARKER in line)
+    assert "MsgTreeCopy %NEW/ to %ADT/ import os" in marker and len(marker) < 400
 
 
 @pytest.mark.parametrize("tag", _CONTAINER_TAGS)
@@ -1846,10 +1934,17 @@ def test_a_marked_label_statement_is_counted_and_the_module_passes_check(tmp_pat
     assert run_checks(tmp_path / "out", run_lint=False).ok
 
 
-def test_every_verb_step_1_maps_is_a_statement_verb() -> None:
-    """The statement verbs are the gate's allow-list. Step 1's own mapping table is kept apart, so a
-    verb added there alone would otherwise go back to reading as a label."""
-    assert set(_VERB_CONNECTIVES) <= _STATEMENT_VERBS
+def test_the_statement_verb_table_holds_every_verb_the_importer_reads_on_a_line() -> None:
+    """A verb added to the step 1 mapping or to the gate's allow-list must join the table too, or
+    its statement off a Line would go back to being a label. The table is kept apart from both, so
+    taking a verb OFF the allow-list, which narrows the gate, cannot shrink it."""
+    assert {verb.lower() for verb in _UNDERSTOOD} | set(_VERB_CONNECTIVES) <= _STATEMENT_VERBS
+    assert set(_VERB_SPELLINGS) == _STATEMENT_VERBS
+
+
+def test_the_container_tags_under_test_are_the_importers_own() -> None:
+    """A container tag the importer gains must gain its cases here too."""
+    assert {tag.lower() for tag in _CONTAINER_TAGS} == set(_CONTAINER_KIND_BY_TAG)
 
 
 def test_generated_xml_module_compiles_and_passes_check(tmp_path: Path) -> None:

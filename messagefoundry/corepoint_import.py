@@ -24,9 +24,9 @@ discharged by the 2026-07-24 amendment). A real Corepoint export is **XML, not J
   the single biggest schema surprise: without the strip, the overwhelming majority of statements fail
   to classify because the leading token is markup, not a verb.
 * **``<Block>`` is a comment / section label, not an action** — it is preserved as a comment in the
-  generated module and never emitted as a step. When the label is itself a statement, as when a
-  construct's ``@Data`` is one, the statement is also marked as a counted TODO (BACKLOG #2632; see
-  :func:`_label_statement`).
+  generated module and never emitted as a step. A statement written in the ``@Data`` of any
+  element but a ``<Line>`` is marked as a counted TODO and never emitted as live code
+  (BACKLOG #2632; see :func:`_label_statement`).
 * Operands are ``$variable``, ``%tree/path`` (a message-tree path), ``"string literal"``,
   ``[bracketed option]`` and ``(parenthesised condition)``; the verb vocabulary is **42 verbs**, of
   which 30 cover 99.4% of statements.
@@ -826,24 +826,25 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     or whether a copy sits in a branch, so a send that runs before its clone is made, or a clone made
     only on one branch, still counts as held. Modelling that is #313 step 2.
 
-    A list holding a live container whose ``@Data`` is a statement (:func:`_label_statement`) holds
-    nothing at all, whatever that statement is: the render only marks it, so the scan must not count
-    a clone the render never made, nor miss an overwrite Corepoint may have run (BACKLOG #2632)."""
+    A list holding a live element, other than a ``<Line>``, whose ``@Data`` is a statement
+    (:func:`_label_statement`) holds nothing at all, whatever that statement is: the render only
+    marks it, so the scan must not count a clone the render never made, nor miss an overwrite
+    Corepoint may have run (BACKLOG #2632). So a clone or a send counts only on a ``<Line>``,
+    the one place the render emits a statement."""
     inputs: set[str] = set()
     delivered: set[str] = set()
     root_copies: list[tuple[str, str]] = []  # (source handle, destination handle)
     for elem in _live_elements(action_list):
         data = _attr(elem, "Data")
         tokens = parse_roles(data) if data else ()
-        verb = _statement_verb(tokens, _split_verb(strip_markup(data))[0])
-        if _label_statement(_local(elem.tag), tokens, verb):
+        if _label_statement(elem):
             return frozenset(), frozenset()  # see the docstring: nothing is held
         if not tokens:
             continue  # markup-free: no handle roles to learn from
         inputs.update(t.text for t in tokens if t.source_class == "input-handle")
-        # Every other live element counts, an unmodelled tag included: it ran in Corepoint even
-        # though the render only marks it. An overwrite there narrows what is held. A clone there
-        # still widens it, exactly as a clone on a ``<Line>`` does.
+        # Every live element's handles count, an unmodelled tag included. Past the rule above, a
+        # root copy or a send can only sit on a ``<Line>``.
+        verb = _statement_verb(tokens, _split_verb(strip_markup(data))[0])
         operands = _operands_from_roles(tokens)
         if _statement_kind(_local(elem.tag), verb) == "send":
             delivered.add(_whole_tree(operands[0]) if operands else "")  # "" is never held
@@ -963,12 +964,19 @@ _KIND_BY_VERB = {
     "actionliststop": "exit",
 }
 
-# What the marker says for a statement written where a container's label or condition belongs
-# (:func:`_label_statement`). The statement itself rides in the comment beside the marker: the
-# container's own label, or the text of its placeholder condition.
+# Verbs this importer reads as a STATEMENT on a ``<Line>``, lower-cased: the writes it maps or
+# binds, the clone the handle scan counts, a log and a send. :func:`_label_statement` reads the
+# ``@Data`` of every other element against it, because no word list tells prose from every verb.
+# Kept by hand and apart from the gate's allow-list, on purpose: taking a verb OFF that list
+# narrows the gate, and must not turn the verb back into a label here. A test holds it a superset.
+_STATEMENT_VERBS = frozenset(
+    {"itemappend", "itemclear", "itemcopy", "msgcreate", "msglog", "msgsend", "msgtreecopy"}
+)
+# What the marker says for such a statement (:func:`_label_marker`), ahead of the statement itself.
+# A markup-free statement names no handle the scan can read, so it is left as step 1 renders it.
 _LABEL_STATEMENT_WHY = (
-    "written where its container's label or condition belongs, and whether Corepoint runs it there "
-    "is not known; nothing is mapped for it, and no handle in this action-list is taken to be msg"
+    "not on a Line, so whether Corepoint runs it is not known; nothing is mapped for it, and no "
+    "role-marked handle in this list is taken to be msg"
 )
 
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
@@ -1468,7 +1476,9 @@ def _parse_list(
     for child in container:
         tag = _local(child.tag).lower()
         if tag in _LIST_TAGS:
-            # A doubly-wrapped list: flatten rather than lose the statements.
+            # A doubly-wrapped list: flatten rather than lose the statements. A statement in the
+            # wrapper's own ``@Data`` is marked, never dropped (:func:`_label_marker`).
+            steps.extend(_label_marker(child))
             steps.extend(_parse_list(child, subject, held, in_control, depth + 1))
             continue
         # EVERY other child is a statement position and goes through _parse_statement — including a tag
@@ -1548,12 +1558,24 @@ def _parse_statement(
         label = statement or note or tag
         return [Control("disabled", source, label, body=tuple(body))]
 
+    # A statement written anywhere but on a ``<Line>`` is marked and counted, ahead of the element's
+    # body, and never emitted as live code: whether Corepoint runs it there is not known.
+    marker = _label_marker(elem)
+
     if tag.lower() not in _STATEMENT_TAGS:
         # An element in a statement position whose tag this layer does not model. Reported and counted,
         # with its parsed subtree inlined beneath the marker — never dropped (count-and-log). The marker
         # says the element's SCOPE was lost, because an unmodelled construct may well have been
         # conditional: inlining its body is the honest, visible degradation, guessing the scope is not.
-        return [Control("unknown", tag, statement or note, body=tuple(body))]
+        # It is one counted marker already, so a statement it carries is named in that marker rather
+        # than counted a second time beside it.
+        detail = marker[0].detail if marker else statement or note
+        return [Control("unknown", tag, detail, body=tuple(body))]
+
+    if marker and kind == "send":
+        # A ``MsgSend`` in a Block's or a Call's ``@Data``: the marker stands for it, and the
+        # element renders as the label it is. A send that may never have run is not a delivery.
+        kind, source = _CONTAINER_KIND_BY_TAG[tag.lower()], tag
 
     if not data and any(isinstance(s, Control) and s.kind == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
@@ -1602,10 +1624,6 @@ def _parse_statement(
         return [Control("send", source, statement, args=args, refusal=refusal), *body]
     if kind in ("break", "exit"):
         return [Control(kind, source, statement), *body]
-    # A statement written where the container's label or condition belongs is marked and counted,
-    # ahead of the container's body, and never mapped: whether Corepoint runs it is not known.
-    carried = _label_statement(tag, roles, verb)
-    marker: list[Step] = [UnmappedAction(carried, _LABEL_STATEMENT_WHY)] if carried else []
     if kind in ("block", "call"):
         # A ``<Block>`` is a section LABEL, not an action, and a ``<Call>``'s target list is inlined:
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
@@ -1638,29 +1656,52 @@ def _statement_kind(tag: str, verb: str) -> str | None:
     return kind
 
 
-def _label_statement(tag: str, roles: tuple[RoleToken, ...], verb: str) -> str:
-    """The verb of the statement a container carries in ``@Data`` where its label or its condition
-    belongs, or ``""`` when the ``@Data`` is that label or condition (BACKLOG #2632).
+def _label_statement(elem: Element) -> str:
+    """The verb of a statement ``elem`` carries in ``@Data`` though it is not a ``<Line>``, or ``""``
+    (BACKLOG #2632).
 
-    THE one rule, asked by :func:`_parse_statement` and by :func:`_message_handles` alike, so the
-    render and the handle scan cannot disagree on it (ADR 0086 has the history). It is a statement
-    when the container does not render the verb itself and either:
+    THE one rule, asked by the render (:func:`_label_marker`) and by :func:`_message_handles` alike,
+    so the two cannot disagree on it (ADR 0086 has the history). The ``@Data`` of a container is its
+    label or its condition, an unmodelled element's is unknown, and a ``<List>`` wrapper's is never
+    rendered at all. It is a statement there when the element does not render the verb itself, and:
 
     * the verb is in :data:`_STATEMENT_VERBS`, in any case, with or without markup; or
-    * the element is a ``<Block>`` and the exporter styled a verb as a ``keyword`` there. A Block has
-      no verb of its own, so a keyword is evidence. A construct or a ``<Call>`` leads with its own
-      keyword, so only the table counts for those.
+    * the element is a ``<Block>`` and its ``@Data`` LEADS with a verb the exporter styled as a
+      ``keyword``. A Block has no verb of its own, so a leading keyword is evidence. A construct or
+      a ``<Call>`` leads with its own keyword, so only the table counts for those.
 
-    An unlisted verb in a label with no ``keyword`` span still reads as a label."""
-    kind = _CONTAINER_KIND_BY_TAG.get(tag.lower())
-    if kind is None:
-        return ""  # a <Line>, or a tag this layer does not model: it has no label to mistake
+    A container renders a control verb itself: its own construct, a call, an exit. A ``MsgSend`` is
+    the exception. It would be live code, so in a Block's or a Call's ``@Data`` it is a statement too.
+
+    The verb is read as a ``<Line>``'s is, so it must lead the ``@Data``. An unlisted verb with no
+    leading ``keyword`` span, or a listed verb after other words, still reads as a label."""
+    tag = _local(elem.tag).lower()
+    if tag == "line":
+        return ""
+    data = _attr(elem, "Data")
+    roles = parse_roles(data)
+    verb = _statement_verb(roles, _split_verb(strip_markup(data))[0])
     lowered = verb.lower()
-    if _statement_kind(tag, verb) == _KIND_BY_VERB.get(lowered):
-        return ""  # the container renders this verb itself: a send, a call, its own construct
-    if lowered in _STATEMENT_VERBS or (kind == "block" and _role_verb(roles)):
-        return verb
-    return ""
+    kind = _CONTAINER_KIND_BY_TAG.get(tag)
+    if kind is not None:
+        rendered = _statement_kind(tag, verb)
+        if rendered != "send" and rendered == _KIND_BY_VERB.get(lowered):
+            return ""  # the container renders this verb itself, and never as live code
+    leads = next((token for token in roles if token.role not in _PROSE_ROLES), None)
+    styled = kind == "block" and leads is not None and leads.role == "keyword" and _role_verb(roles)
+    return verb if lowered in _STATEMENT_VERBS or styled else ""
+
+
+def _label_marker(elem: Element) -> list[UnmappedAction]:
+    """The counted TODO for a statement :func:`_label_statement` finds on ``elem``, or ``[]``.
+
+    The statement rides in the marker, after the reason, because a ``<Try>`` and a ``<List>`` wrapper
+    print their ``@Data`` nowhere else. It reaches the module only through :func:`_comment_text`."""
+    carried = _label_statement(elem)
+    if not carried:
+        return []
+    statement = strip_markup(_attr(elem, "Data"))
+    return [UnmappedAction(carried, f"{_LABEL_STATEMENT_WHY}: {statement}")]
 
 
 def _source_label(tag: str, verb: str) -> str:
@@ -1720,10 +1761,6 @@ _UNDERSTOOD: dict[str, tuple[str, ...]] = {
     "MsgLog": ("H",),
     "MsgSend": ("H", "to", "connection", "L"),
 }
-# The same verbs, lower-cased: every verb this importer reads as a STATEMENT on a ``<Line>``.
-# :func:`_label_statement` reads a container's ``@Data`` against it, because no word list tells
-# prose from every verb, and a construct leads with a verb of its own that no table lists in full.
-_STATEMENT_VERBS = frozenset(verb.lower() for verb in _UNDERSTOOD)
 _HANDLE_CLASSES = frozenset({"input-handle", "other-handle"})
 # One token of an understood ``@Data``: a span holding plain text (no nesting, no entity, no attribute
 # but its class), or an unstyled run. :func:`_canonical` then pins the spelling of the whole value.
@@ -2850,6 +2887,10 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
     ``MsgSend`` that is refused or names no destination (*unmapped*), or preserved as
     commented-out pseudo-source under a ``@Disabled`` element or action-list (*disabled*). Nothing is
     ever silently dropped.
+
+    One element counts twice, on purpose: a construct or a ``<Call>`` whose ``@Data`` is a statement
+    (:func:`_label_marker`). The element is counted as it always was, and the statement it carried
+    is counted unmapped beside it, because the two are rendered apart.
 
     The names go through :func:`_comment_text` because the CLI prints them: the import summary is the
     count-and-log record a migrator trusts, and a JSON export naming a class
