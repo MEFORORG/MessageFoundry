@@ -16,6 +16,7 @@ database it was pointed at. Both are failures, named as such.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 from harness.drivers import _database
 from harness.scenarios._core import Scenario, ScenarioContext, ScenarioResult
@@ -24,6 +25,10 @@ from harness.scenarios._core import Scenario, ScenarioContext, ScenarioResult
 @dataclass(frozen=True)
 class DatabaseScenario(Scenario):
     """A :class:`Scenario` that first checks its preconditions and reports SKIPPED without them."""
+
+    # Served on its own (harness/config/database/), so the shared real-graph test does not start an
+    # engine on the top-level graph only to skip; tests/test_harness_database.py runs these.
+    graph: ClassVar[str] = "database"
 
     def run(self, ctx: ScenarioContext) -> ScenarioResult:
         reason = _database.unavailable(ctx.endpoints)

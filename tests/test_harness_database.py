@@ -139,7 +139,7 @@ def test_the_shared_graph_checks_walk_the_database_graph_too() -> None:
     from tests.test_harness_scenarios import _graph_dirs, _graph_env_refs
 
     assert DB_CONFIG in _graph_dirs()
-    refs = _graph_env_refs()
+    refs = {(r.key.removeprefix("harness_"), r.default) for r in _graph_env_refs()}
     assert ("database_port", 1433) in refs
     assert ("database_password", env("x").default) in refs
 
