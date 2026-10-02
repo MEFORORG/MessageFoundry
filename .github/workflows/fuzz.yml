@@ -81,6 +81,10 @@ on:
     # bottleneck, so this must not cost a slot on a pull request that cannot have changed its result.
     paths:
       - "messagefoundry/parsing/**"
+      - "messagefoundry/framing.py"
+      - "messagefoundry/mllpcodec.py"
+      - "messagefoundry/transports/http_listener.py"
+      - "messagefoundry/transports/x12.py"
       - "fuzz/**"
       - "tests/test_fuzz_targets.py"
       - ".github/workflows/fuzz.yml"

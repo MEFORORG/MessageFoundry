@@ -23,11 +23,13 @@ restate it.
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import inspect
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Never
@@ -39,15 +41,18 @@ from fuzz.targets import (
     _HL7_ROUTING_PROPERTIES,
     _STREAM_CAP,
     _X12_ISA_PROPERTIES,
+    BATCH_HEADER_REPRODUCER,
     BLANK_SEGMENT_HL7,
     DEFAULT_MAX_LEN,
     KNOWN_FINDINGS,
+    SHORT_MSH2_REPRODUCER,
     TARGETS,
     TARGETS_BY_NAME,
     WORK_DIR_ENV,
     FuzzTarget,
     HarnessRefusal,
-    _separators_undeterminable,
+    _is_batch_header_shape,
+    _is_short_msh2_shape,
     libfuzzer_argv,
     work_paths,
     work_root,
@@ -55,8 +60,13 @@ from fuzz.targets import (
 )
 from messagefoundry.framing import FrameDecoder
 from messagefoundry.mllpcodec import frame as mllp_frame
-from messagefoundry.parsing import Peek
-from messagefoundry.parsing.binary import iter_obx_documents, strip_documents
+from messagefoundry.parsing import HL7PeekError, Peek
+from messagefoundry.parsing.binary import (
+    extract_obx_document,
+    iter_obx_documents,
+    strip_documents,
+)
+from messagefoundry.parsing.compression import deflate_decompress_with_tail
 from messagefoundry.parsing.dicom import DicomPeek
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.x12 import X12FrameReader, X12Peek
@@ -237,7 +247,7 @@ def test_the_hl7_target_reads_every_named_routing_property(
     """The accessor sweep is the harness's whole point, and nothing else pinned it.
 
     ADR 0191 calls the eleven pre-ACK routing properties the load-bearing tier: a Router reads them
-    before the sender is answered, and the one finding this harness has produced lives entirely
+    before the sender is answered, and the first finding this harness produced lived entirely
     there -- fuzzing ``parse`` alone would have measured nothing. Yet deleting the
     ``for name in _HL7_ROUTING_PROPERTIES`` loop from ``_hl7_peek`` left every other test in this
     file passing, because the two fault-injection tests both fault ``Peek.routing`` and so pin
@@ -391,18 +401,22 @@ _OBX_ED_ADT = (
 
 #: One injected fault per registered target: ``(object to patch, attribute, input builder)``.
 #:
-#: Each patch point sits INSIDE the code the target drives, below the target's own ``except``, so the
-#: fault has to travel back out through every handler the engine and the target put in its way. A
-#: ``KeyError`` is used throughout because no codec's contract error is one, so a target that lets it
-#: escape is a target that would let a real one escape. The input is built BEFORE the patch goes on,
-#: because a builder may itself use what is patched (the gzip one does).
+#: Most patch points sit INSIDE the engine code the target drives, below the target's own ``except``,
+#: so the fault has to travel back out through every handler the engine and the target put in its way.
+#: Three do not, and they prove less: ``hl7_tree`` (``parse_tree`` as the target module binds it),
+#: ``dicom_peek`` (``DicomPeek.parse``) and ``stream_frames`` (``FrameDecoder.feed``) replace the entry
+#: call itself, so they show only that the TARGET lets the fault through, not that no engine handler
+#: on the way would swallow it. ``stream_frames`` has no patchable callee: ``feed`` does its work with
+#: ``bytes.find`` and slicing. A ``KeyError`` is used throughout because no codec's contract error is
+#: one, so a target that lets it escape is a target that would let a real one escape. The input is
+#: built BEFORE the patch goes on, because a builder may itself use what is patched (the gzip one does).
 _INJECTIONS: dict[str, tuple[object, str, Callable[[], bytes]]] = {
     "hl7_peek": (Peek, "routing", lambda: CLEAN_ADT.encode()),
     "hl7_tree": (fuzz_targets, "parse_tree", lambda: CLEAN_ADT.encode()),
     "x12_peek": (X12Peek, "groups", _x12_sample),
     "dicom_peek": (DicomPeek, "parse", lambda: b"\x00" * 128 + b"DICM"),
     "stream_frames": (FrameDecoder, "feed", lambda: b"\x00" + mllp_frame(CLEAN_ADT)),
-    "x12_frames": (X12FrameReader, "feed", lambda: b"\x00" + _x12_sample()),
+    "x12_frames": (X12FrameReader, "_take_one", lambda: b"\x00" + _x12_sample()),
     "http_request": (http_listener, "HttpRequest", lambda: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"),
     "compression": (gzip.GzipFile, "read", lambda: gzip.compress(CLEAN_ADT.encode(), mtime=0)),
     "binary_carriage": (Message, "count_segments", lambda: _OBX_ED_ADT),
@@ -423,6 +437,65 @@ def test_an_injected_fault_escapes_every_target(name: str, monkeypatch: pytest.M
     monkeypatch.setattr(owner, attribute, _boom(KeyError("injected")))
     with pytest.raises(KeyError, match="injected"):
         TARGETS_BY_NAME[name].run(data)
+
+
+def test_importing_the_targets_does_not_load_the_connectors() -> None:
+    """The HTTP listener is imported lazily, so the other eight targets do not drag in every connector.
+
+    Run in a fresh interpreter: this process has long since imported ``messagefoundry.transports``.
+    """
+    probe = (
+        "import sys, fuzz.targets; "
+        "loaded = sorted(m for m in sys.modules if m.startswith('messagefoundry.transports')); "
+        "print(loaded); sys.exit(1 if loaded else 0)"
+    )
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parent.parent,
+        check=False,
+    )
+    assert proc.returncode == 0, f"fuzz.targets imported transports modules: {proc.stdout}"
+
+
+def test_the_http_target_names_a_listener_function_that_exists() -> None:
+    """The lazy import keeps the rename-fails-loudly property: the names it reaches for exist."""
+    assert http_listener.__name__ == fuzz_targets.HTTP_LISTENER_MODULE
+    assert callable(http_listener._read_request)
+    assert issubclass(http_listener.HttpRequestError, Exception)
+
+
+@pytest.mark.parametrize(
+    "request_bytes",
+    [
+        b"GET / HTTP/1.1\r\nHost: h\r\nX-Pad: " + b"a" * 600 + b"\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\r\nX-Pad: " + b"a" * 2000 + b"\r\n\r\n",
+        b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 600\r\n\r\n" + b"a" * 600,
+    ],
+    ids=["head-cap", "stream-limit", "body-cap"],
+)
+def test_the_http_target_reaches_each_of_its_caps(request_bytes: bytes) -> None:
+    """Each cap branch is reachable inside DEFAULT_MAX_LEN, which the listener's defaults are not."""
+    assert len(request_bytes) < DEFAULT_MAX_LEN
+    status: list[int] = []
+
+    async def read() -> None:
+        reader = asyncio.StreamReader(limit=fuzz_targets._HTTP_STREAM_LIMIT)
+        reader.feed_data(request_bytes)
+        reader.feed_eof()
+        try:
+            await http_listener._read_request(
+                reader,
+                max_header_bytes=fuzz_targets._HTTP_HEADER_CAP,
+                max_body_bytes=fuzz_targets._HTTP_BODY_CAP,
+            )
+        except http_listener.HttpRequestError as exc:
+            status.append(exc.status)
+
+    fuzz_targets._event_loop().run_until_complete(read())
+    assert status == [413], f"expected the cap's 413, got {status}"
+    TARGETS_BY_NAME["http_request"].run(request_bytes)
 
 
 def _deaf_to_one_byte_reads(
@@ -454,11 +527,16 @@ def test_the_stream_target_catches_a_decoder_that_loses_a_frame_across_reads(
         TARGETS_BY_NAME["stream_frames"].run(data)
 
 
+@pytest.mark.parametrize("selector", [0, 0x3E], ids=["one-byte-reads", "32-byte-reads"])
 def test_the_stream_target_catches_a_payload_delivered_over_the_cap(
-    monkeypatch: pytest.MonkeyPatch,
+    selector: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An over-cap frame must raise; a decoder that ignores its cap and delivers it is a finding."""
-    data = b"\x00" + mllp_frame(b"A" * (_STREAM_CAP + 1))
+    """An over-cap frame must raise; a decoder that ignores its cap and delivers it is a finding.
+
+    The capped decoder runs over one read as well as over small reads, so the cap is charged on both
+    of the decoder's branches; the 32-byte-read case still catches it through the single-read run.
+    """
+    data = bytes([selector]) + mllp_frame(b"A" * (_STREAM_CAP + 1))
     TARGETS_BY_NAME["stream_frames"].run(data)  # control: the real decoder refuses it
     original_init = FrameDecoder.__init__
 
@@ -480,52 +558,153 @@ def test_the_x12_frame_target_catches_a_reader_that_loses_an_interchange_across_
         TARGETS_BY_NAME["x12_frames"].run(data)
 
 
+def _over(ceiling: int | None) -> bytes:
+    assert ceiling is not None
+    return b"\x00" * (ceiling + 1)
+
+
+#: One oversize stand-in per decompressor the compression target checks, each returning one byte past
+#: the ceiling it was given -- the bomb guard failing -- in that function's own return shape.
+_OVERSIZE: dict[str, Callable[..., object]] = {
+    "gzip_decompress": lambda data, *, max_output_bytes: _over(max_output_bytes),
+    "deflate_decompress": lambda data, *, max_output_bytes: _over(max_output_bytes),
+    "deflate_decompress_with_tail": lambda data, *, max_output_bytes: (
+        _over(max_output_bytes),
+        b"",
+    ),
+    "zip_decompress": lambda data, *, max_output_bytes: {"a.txt": _over(max_output_bytes)},
+}
+
+
+@pytest.mark.parametrize("function", sorted(_OVERSIZE))
 def test_the_compression_target_catches_output_over_its_ceiling(
+    function: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each ceiling check fires on its own: every decompressor is replaced in turn, the rest real."""
+    seeds = TARGETS_BY_NAME["compression"].seeds
+    for seed in seeds:
+        TARGETS_BY_NAME["compression"].run(seed)  # control
+    monkeypatch.setattr(fuzz_targets, function, _OVERSIZE[function])
+    with pytest.raises(AssertionError, match="ceiling"):
+        for seed in seeds:
+            TARGETS_BY_NAME["compression"].run(seed)
+
+
+def _deflate_with_tail_seed() -> bytes:
+    seed = next((s for s in TARGETS_BY_NAME["compression"].seeds if s.endswith(b"\r\n")), None)
+    assert seed is not None, "the compression target lost its deflate-with-tail seed"
+    return seed
+
+
+@pytest.mark.parametrize(
+    ("lie", "message"),
+    [
+        (lambda data, body: (body, data), "strict suffix"),
+        (lambda data, body: (body, b""), "does not decompress on its own"),
+        (lambda data, body: (body + b"x", data[-2:]), "body its stream does not hold"),
+    ],
+    ids=["tail-is-everything", "tail-dropped", "wrong-body"],
+)
+def test_the_compression_target_catches_a_wrong_deflate_tail(
+    lie: Callable[[bytes, bytes], tuple[bytes, bytes]],
+    message: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A decompressor that returns past its ceiling is the bomb guard failing; the target says so."""
-
-    def gzip_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
-        assert max_output_bytes is not None
-        return b"\x00" * (max_output_bytes + 1)
-
-    seed = TARGETS_BY_NAME["compression"].seeds[0]
-    TARGETS_BY_NAME["compression"].run(seed)
-    monkeypatch.setattr(fuzz_targets, "gzip_decompress", gzip_decompress)
-    with pytest.raises(AssertionError, match="ceiling"):
+    """The tail check is not a tautology: three wrong splits of a real stream-plus-CRLF are caught."""
+    seed = _deflate_with_tail_seed()
+    body, tail = deflate_decompress_with_tail(seed, max_output_bytes=None)
+    assert tail == b"\r\n"
+    TARGETS_BY_NAME["compression"].run(seed)  # control
+    monkeypatch.setattr(
+        fuzz_targets,
+        "deflate_decompress_with_tail",
+        lambda data, *, max_output_bytes: lie(data, body),
+    )
+    with pytest.raises(AssertionError, match=message):
         TARGETS_BY_NAME["compression"].run(seed)
 
 
 def test_the_short_msh2_finding_still_reproduces_through_the_raw_helpers() -> None:
-    """The registered known finding is still live in the engine, not only in the register.
+    """The first registered binary-carriage finding is still live in the engine.
 
     **When this test fails, the defect is fixed.** That is the instruction to delete its
-    ``KNOWN_FINDINGS`` entry and the carve-out in ``_binary_carriage`` (and this test), and to keep
-    the reproducer on as a ``binary_carriage`` seed so the fix cannot quietly regress -- the same
-    retirement BACKLOG #1594's finding went through.
+    ``KNOWN_FINDINGS`` entry and its shape check in ``_is_known_binary_carriage_finding`` (and this
+    test), and to keep the reproducer on as a ``binary_carriage`` seed so the fix cannot quietly
+    regress -- the same retirement BACKLOG #1594's finding went through.
     """
-    (finding,) = [f for f in KNOWN_FINDINGS if f.target == "binary_carriage"]
-    text = finding.reproducer.decode("ascii")
+    assert any(f.reproducer == SHORT_MSH2_REPRODUCER for f in KNOWN_FINDINGS)
+    text = SHORT_MSH2_REPRODUCER.decode("ascii")
     assert Peek.parse(text).control_id == "X1", "the listener-side parse no longer accepts it"
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
         strip_documents(text, pruned_at=0.0)
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
         list(iter_obx_documents(Message.parse(text)))
-    assert _separators_undeterminable(text)
+    assert _is_short_msh2_shape(text)
+    assert not _is_batch_header_shape(text)
 
 
-def test_the_short_msh2_carve_out_does_not_swallow_a_valueerror_on_any_other_body(
+def test_the_batch_header_finding_still_reproduces_through_the_raw_helpers() -> None:
+    """The second registered binary-carriage finding is still live in the engine.
+
+    **When this test fails, the defect is fixed** -- retire it the way the docstring above says.
+    """
+    assert any(f.reproducer == BATCH_HEADER_REPRODUCER for f in KNOWN_FINDINGS)
+    text = BATCH_HEADER_REPRODUCER.decode("ascii")
+    with pytest.raises(HL7PeekError):
+        Peek.parse(text)
+    message = Message.parse(text)
+    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+        list(iter_obx_documents(message))
+    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+        extract_obx_document(message)
+    assert _is_batch_header_shape(text)
+    assert not _is_short_msh2_shape(text)
+
+
+@pytest.mark.parametrize("reproducer", [SHORT_MSH2_REPRODUCER, BATCH_HEADER_REPRODUCER])
+def test_a_carve_out_does_not_swallow_a_different_valueerror_on_its_own_reproducer(
+    reproducer: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exception half of the discriminator: right shape, wrong error, so it must escape.
+
+    The first draft checked only the input, and on a matching body swallowed this planted error.
+    """
+    TARGETS_BY_NAME["binary_carriage"].run(reproducer)  # control: the real defect is recognised
+    monkeypatch.setattr(Message, "count_segments", _boom(ValueError("other")))
+    with pytest.raises(ValueError, match="other"):
+        TARGETS_BY_NAME["binary_carriage"].run(reproducer)
+
+
+def test_a_carve_out_does_not_swallow_the_engine_message_on_any_other_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The carve-out is keyed on the structural condition, never on the exception type alone.
+    """The input half of the discriminator: right error, wrong shape, so it must escape.
 
-    A ``ValueError`` planted on a body whose separators ARE readable must still escape. A carve-out
-    widened to ``except ValueError`` with no discriminator would swallow it and pass every other test.
+    The planted error carries the engine's own separators message, on a body whose separators ARE
+    readable and that has neither registered shape.
     """
-    assert not _separators_undeterminable(_OBX_ED_ADT.decode())
-    monkeypatch.setattr(Message, "count_segments", _boom(ValueError("injected")))
-    with pytest.raises(ValueError, match="injected"):
+    text = _OBX_ED_ADT.decode()
+    assert not _is_short_msh2_shape(text) and not _is_batch_header_shape(text)
+    monkeypatch.setattr(
+        Message, "count_segments", _boom(ValueError("cannot determine HL7 separators: planted"))
+    )
+    with pytest.raises(ValueError, match="planted"):
         TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
+
+
+def test_a_carve_out_does_not_swallow_a_valueerror_subclass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a BARE ``ValueError`` is the finding; a codec error with the same text is something else."""
+
+    class Other(ValueError):
+        pass
+
+    monkeypatch.setattr(
+        Message, "count_segments", _boom(Other("cannot determine HL7 separators: subclass"))
+    )
+    with pytest.raises(Other):
+        TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:

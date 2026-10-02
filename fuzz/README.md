@@ -23,7 +23,10 @@ The targets added under vault BACKLOG #2683 cover the decoders a body passes thr
 a message. Their refusals are named on each target in `fuzz/targets.py`; two are worth knowing here:
 
 * `http_request` expects `HttpRequestError`, which is **not** a `ValueError`. The HTTP listener
-  catches it by name and answers with its status.
+  catches it by name and answers with its status. It fuzzes the listener's head-then-body reader for
+  ONE request, as the listener reads one per connection, with small header, stream and body caps so
+  each cap branch is reachable. It does not run the header-mode authentication the listener runs
+  between head and body.
 * `binary_carriage` allows **no** exception at all out of `strip_documents`: the store backends'
   retention pass calls it with no `try`, so a raise there aborts the whole pass.
 
@@ -32,9 +35,11 @@ Three of the new targets also assert a property the decoder's own docstring stat
 
 * `stream_frames` and `x12_frames` feed the same bytes once in one read and once cut into small
   reads, and the output must match. Reassembling a message a peer split across reads is the whole job
-  of these decoders. With a small cap, neither may deliver a frame larger than the cap.
+  of these decoders. With a small cap, over one read and over small reads, neither may deliver a
+  frame larger than the cap.
 * `compression` checks that an accepted result is never larger than the ceiling it was given, which
-  is the decompression-bomb guarantee.
+  is the decompression-bomb guarantee, and that the tail `deflate_decompress_with_tail` returns is
+  exactly what follows the stream: the input less the tail must decompress on its own to the body.
 
 ## Run it
 
@@ -175,11 +180,13 @@ pytest tests/test_fuzz_targets.py
 
 That suite is what keeps the harness honest. It drives every target over its seeds and over
 degenerate input, and it **injects faults** to prove the detector works. Every registered target has
-an entry in its `_INJECTIONS` table, which plants a non-contract exception inside the code the target
-drives and asserts it escapes; a separate test fails when a target is registered without one. Further
-tests break the split-invariance, cap and ceiling properties on purpose and assert the target says so,
-and one asserts that the narrowed carve-out for the known finding does not swallow the same exception
-type when the structural condition is absent. A fuzz harness nobody has seen catch anything measures
+an entry in its `_INJECTIONS` table, which plants a non-contract exception and asserts it escapes;
+a separate test fails when a target is registered without one. For most targets the plant sits inside
+the engine code the target drives; for `hl7_tree`, `dicom_peek` and `stream_frames` it replaces the
+entry call itself, which shows less, and the table's comment says so. Further tests break the
+split-invariance, cap, ceiling and deflate-tail properties on purpose and assert the target says so,
+and others assert that each known-finding carve-out lets out a different `ValueError` on its own
+reproducer, and the engine's own message on a body without the registered shape. A fuzz harness nobody has seen catch anything measures
 nothing.
 
 ## Where the files go
@@ -246,7 +253,8 @@ MEFOR_FUZZ_TARGET=dicom_peek python -m fuzz.fuzz_parsers ./crash-unit.bin
 that is not fixed, so the advisory job is not red on arrival -- an advisory job that is red the day
 it lands gets ignored, and an ignored fuzzer is indistinguishable from no fuzzer.
 
-Each entry is narrow: it matches one named structural condition, never a bare exception type. And
+Each entry is narrow: it matches one named structural condition AND the exception the defect
+raises, never an exception type alone and never an input shape alone. And
 each is pinned from the outside by `tests/test_fuzz_targets.py`, which asserts the reproducer still
 provokes the violation. When the defect is fixed that test fails, and the failure is the instruction
 to delete the entry. A carve-out cannot quietly outlive its defect and become a blanket suppression.
@@ -254,22 +262,35 @@ to delete the entry. A carve-out cannot quietly outlive its defect and become a 
 The register's first entry, the empty-segment finding, was fixed under BACKLOG #1594 and came out
 with its carve-out. Its reproducer stays on as the `hl7_peek` seed `BLANK_SEGMENT_HL7`.
 
-**It holds one entry today**, produced by `binary_carriage` within its first 299 executions on the
-run that added it (vault BACKLOG #2683). An HL7 body whose MSH-2 carries fewer than four encoding
-characters is accepted by `Peek.parse` and `Message.parse`, and `build_ack` answers it `AA`; then
-`Message.field` raises a bare `ValueError` on the first read, and `strip_documents`,
-`iter_obx_documents` and `extract_obx_document` all let it out. The retention document-strip pass
-calls `strip_documents` with no `try`, so one such stored body would abort that pass on every run. The
-reproducer, the full summary and the discriminator are on the entry in `fuzz/targets.py`. It is
-registered and not fixed: fixing it is an engine change, and this harness does not make one.
+**It holds two entries today**, both from `binary_carriage` under vault BACKLOG #2683, and both a
+bare `ValueError("cannot determine HL7 separators ...")` out of `Message`, which reads its separators
+from an MSH it cannot always find. They are registered separately because their shapes and
+consequences differ:
+
+* **An MSH-led body whose MSH-2 carries fewer than four encoding characters.** `Peek.parse` and
+  `Message.parse` accept it and `build_ack` answers it `AA`; then `strip_documents`,
+  `iter_obx_documents` and `extract_obx_document` all let the `ValueError` out. The retention
+  document-strip pass calls `strip_documents` with no `try`, so on first deployment one such stored
+  body would abort that pass on every run.
+* **An FHS- or BHS-led body with no MSH.** `Peek.parse` refuses it but `Message.parse` accepts it,
+  and `iter_obx_documents` and `extract_obx_document` then raise. A Handler that parsed such a body
+  with `Message.parse` would get a bare `ValueError` from `extract_obx_document` on first deployment,
+  not the `BinaryCarriageError` that function documents. `strip_documents` is not affected.
+
+Each carve-out swallows an error only when it is a bare `ValueError` with that message AND the input
+has that entry's shape; tests plant a different `ValueError` on each reproducer, and the engine's
+message on a well-formed body, and assert both escape. The reproducers, full summaries and
+discriminators are on the entries in `fuzz/targets.py`. Both are registered and not fixed: fixing
+them is an engine change, and this harness does not make one.
 
 ## Not covered
 
 ADR 0191 has the original list and the reasoning. That list predates vault BACKLOG #2683, which
 added targets for the compression and binary-carriage codecs it names; the ADR's own text has not
-been amended for that here. What is still not covered: the strict validators (`hl7apy`, `pyx12`),
-and everything needing a live endpoint -- the listeners' socket loops, the HTTP API, ZAP and
-Schemathesis. The legacy `python-hl7` backend is retired.
+been amended for that here. Still not covered, at least: the strict validators (`hl7apy`,
+`pyx12`); everything needing a live endpoint -- the listeners' socket loops, the HTTP API, ZAP and
+Schemathesis; and every surface the table below marks "ruled out". The table records what was
+checked, not every decode surface the engine has. The legacy `python-hl7` backend is retired.
 
 ### Decode surfaces checked under vault BACKLOG #2683
 
@@ -281,10 +302,10 @@ out" says why it does not.
 | `mllpcodec.MLLPDecoder`, over `framing.FrameDecoder` (the MLLP listener's reassembler) | target `stream_frames` | Pure and stateful over socket reads; nothing covered it. |
 | `transports/tcp.py` delimiter framing | covered by `stream_frames` | The TCP source and destination build the same `FrameDecoder` from a preset or explicit bytes; the target drives the STX/ETX preset. What `tcp.py` adds is the socket loop. |
 | `parsing/x12/interchange.py` `X12FrameReader`, used by `transports/x12.py` | target `x12_frames` | The transport is a socket wrapper around this reader. The same target drives `split` and `check_integrity`. |
-| `transports/http_listener.py` `_read_head` and `_read_body` | target `http_request` | The unauthenticated, pre-ingress request parser. Driven through `_read_request` on an in-memory `StreamReader`. |
+| `transports/http_listener.py` `_read_head` and `_read_body` | target `http_request` | The unauthenticated, pre-ingress request parser. One request through `_read_request` on an in-memory `StreamReader`, with small caps; the listener's authentication step between the two reads is not run. |
 | `transports/http_listener.py` header-mode authentication (`_authorize_head`) | ruled out, for now | Needs a configured `HttpSource` with credentials. The next candidate on this surface. |
 | `parsing/compression.py`, all four decompressors | target `compression` | `gzip_decompress` runs on a File feed with `decompress="gzip"`; the rest are Handler-facing. |
-| `parsing/binary.py`: carriage `decode`, `parse_doc_ref`, `strip_documents`, `iter_obx_documents`, `extract_obx_document` | target `binary_carriage` | Produced the known finding above. |
+| `parsing/binary.py`: carriage `decode`, `parse_doc_ref`, `strip_documents`, `iter_obx_documents`, `extract_obx_document` | target `binary_carriage` | Produced both known findings above. |
 | `parsing/binary.py` `reattach_documents_in_hl7` | ruled out | Delivery side: it runs on a skeleton the engine wrote, through an async store reader. |
 | `parsing/sniff.py` | ruled out as a target of its own | Prefix tests with no exception path. The archive-member checks run inside `zip_decompress`, so `compression` reaches them. |
 | `parsing/split.py` `split_batch` (File ingress batch split) | ruled out | A regex split and string operations on a `str`, with no exception path. |

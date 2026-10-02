@@ -14,7 +14,9 @@ a malformed or hostile body raises that codec's :class:`ValueError` subclass -- 
 ``X12Error``, ``DicomError`` -- so a Router or Handler that already routes ``ValueError`` to the
 error/dead-letter path catches it without special-casing the format, and the count-and-log invariant
 holds for free. A **missing optional extra** raises ``RuntimeError`` instead, deliberately, so a
-deploy/config error is not swallowed as a data error.
+deploy/config error is not swallowed as a data error. **Not every documented refusal is a
+``ValueError``:** the HTTP intake reader's is ``HttpRequestError``, which its listener catches by
+name. Each target names the refusal it allows.
 
 A target therefore feeds a parser arbitrary bytes and lets **every other exception propagate**. An
 escaping ``IndexError``, ``KeyError``, ``AttributeError`` or ``RecursionError`` is a finding: the
@@ -22,7 +24,7 @@ parser accepted a body and then broke its own contract on a path a Router alread
 
 **Parse is not the whole surface, and that is the point.** A Router does not stop at ``parse``; it
 reads routing fields off the result. So each target parses *and then* sweeps the accessor tier.
-Fuzzing ``parse`` alone would have missed the one finding this harness has produced (an empty
+Fuzzing ``parse`` alone would have missed the first finding this harness produced (an empty
 segment, fixed under BACKLOG #1594; see :data:`KNOWN_FINDINGS`).
 
 **What that sweep is, stated accurately, because the first draft justified it wrongly.** It claimed
@@ -102,12 +104,6 @@ from messagefoundry.parsing.x12 import (
 )
 from messagefoundry.parsing.x12 import check_integrity as x12_check_integrity
 from messagefoundry.parsing.x12 import split as x12_split
-from messagefoundry.transports.http_listener import DEFAULT_MAX_BODY_BYTES as HTTP_MAX_BODY_BYTES
-from messagefoundry.transports.http_listener import (
-    DEFAULT_MAX_HEADER_BYTES as HTTP_MAX_HEADER_BYTES,
-)
-from messagefoundry.transports.http_listener import HttpRequestError
-from messagefoundry.transports.http_listener import _read_request as read_http_request
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SAMPLES = _REPO_ROOT / "samples" / "messages"
@@ -172,7 +168,7 @@ def _sample(name: str) -> tuple[bytes, ...]:
 # `_read_file_meta_info` at `filereader.py:686`. The tier attribution is right and the exec number
 # belonged to a different event, so the number is dropped rather than re-pointed.
 _MINIMAL_HL7 = b"MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\r"
-#: The reproducer of the one finding this harness produced (BACKLOG #1594), kept as a seed so a
+#: The reproducer of the first finding this harness produced (BACKLOG #1594), kept as a seed so a
 #: regression is found from the first input rather than rediscovered by mutation.
 BLANK_SEGMENT_HL7 = b"MSH|^~\\&|APP|FAC|R|RF|20260101||ADT^A01|MSG1|P|2.5\rPID|1||X\r\rPV1|1|I\r"
 _TRUNCATED_X12 = b"ISA*00*          *00*"
@@ -249,29 +245,60 @@ class KnownFinding:
 #: :func:`_hl7_peek` came out with it. Its reproducer stays on as the :data:`BLANK_SEGMENT_HL7` seed,
 #: and ``tests/test_fuzz_targets.py`` drives it, so the fix cannot quietly regress.
 #:
-#: The entry below was produced by the ``binary_carriage`` target within its first 299 executions,
-#: on the run that introduced it (vault BACKLOG #2683). It is not filed under a number of its own
-#: here: a ledger number is allocated in the maintainer-internal repository, not cited before it is.
+#: Both entries below were produced by the ``binary_carriage`` target under vault BACKLOG #2683: the
+#: first within its first 299 executions on the run that introduced it, the second by the review of
+#: that change. They share one engine message and one root -- ``Message`` reads its separators from
+#: an MSH it cannot always find -- but they are two shapes with two different consequences, so each
+#: is registered and pinned on its own. Neither is filed under a number of its own here: a ledger
+#: number is allocated in the maintainer-internal repository, not cited before it is.
+#:
+#: Both carve-outs live in :func:`_binary_carriage`, and BOTH halves must hold before anything is
+#: swallowed: the exception is a bare ``ValueError`` whose message starts with
+#: :data:`_SEPARATORS_MESSAGE`, and the input has the registered structural shape. Either half alone
+#: is too wide -- the first draft checked only the input, and swallowed any ``ValueError`` at all.
+SHORT_MSH2_REPRODUCER = (
+    b"MSH|^~|A|B|C|D|20260101||ORU^R01|X1|P|2.5\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
+)
+BATCH_HEADER_REPRODUCER = b"FHS|^~\\&|A|B\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
+
 KNOWN_FINDINGS: tuple[KnownFinding, ...] = (
     KnownFinding(
         target="binary_carriage",
         summary=(
             "strip_documents, iter_obx_documents and extract_obx_document raise a bare ValueError "
-            "('cannot determine HL7 separators') on an HL7 body whose MSH-2 carries fewer than four "
-            "encoding characters. Peek.parse and Message.parse both accept such a body, and build_ack "
-            "answers it AA; Message.field then raises on the first read. The store "
-            "backends' retention document-strip pass calls strip_documents with no try, so one such "
-            "stored body would abort that pass on every run, and the over-threshold ingress detach "
-            "in pipeline/wiring_runner.py does not list ValueError among the errors it records."
+            "('cannot determine HL7 separators') on an MSH-led HL7 body whose MSH-2 carries fewer "
+            "than four encoding characters. Peek.parse and Message.parse both accept such a body, "
+            "and build_ack answers it AA; Message.field then raises on the first read. The store "
+            "backends' retention document-strip pass calls strip_documents with no try, so on first "
+            "deployment one such stored body would abort that pass on every run, and the "
+            "over-threshold ingress detach in pipeline/wiring_runner.py does not list ValueError "
+            "among the errors it records."
         ),
         discriminator=(
-            "Message.parse accepts the text and Message._encoding_chars() raises ValueError on the "
-            "parsed message"
+            "the exception is a bare ValueError whose message starts 'cannot determine HL7 "
+            "separators', AND Peek.parse accepts the text (so it is MSH-led) AND "
+            "Message._encoding_chars() raises ValueError on the parsed message"
         ),
-        reproducer=(
-            b"MSH|^~|A|B|C|D|20260101||ORU^R01|X1|P|2.5\r"
-            b"OBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
+        reproducer=SHORT_MSH2_REPRODUCER,
+    ),
+    KnownFinding(
+        target="binary_carriage",
+        summary=(
+            "iter_obx_documents and extract_obx_document raise a bare ValueError ('cannot "
+            "determine HL7 separators', with MSH-1 and MSH-2 both empty) on a body that leads with "
+            "an FHS or BHS batch header and carries no MSH. Peek.parse refuses such a body but "
+            "Message.parse accepts it, so the two HL7 parsers disagree about it. On first "
+            "deployment a Handler that parsed such a body with Message.parse and called "
+            "extract_obx_document would get a bare ValueError, not the BinaryCarriageError that "
+            "function documents. strip_documents is not affected: it takes its HL7 path only for "
+            "an MSH-led body."
         ),
+        discriminator=(
+            "the exception is a bare ValueError whose message starts 'cannot determine HL7 "
+            "separators', AND Peek.parse refuses the text AND Message.parse accepts it AND the "
+            "parsed message has an FHS or BHS segment and no MSH segment"
+        ),
+        reproducer=BATCH_HEADER_REPRODUCER,
     ),
 )
 
@@ -422,9 +449,10 @@ def _stream_frames(data: bytes) -> None:
     * **One read versus many.** The decoder's documented job is that "a real peer may split a message
       across reads or pack several into one", so the payloads, and whether a frame is still open at
       the end, must not depend on where the reads were cut. A difference raises AssertionError.
-    * **Capped.** With a small ``max_frame_bytes`` the only allowed exception is the decoder's own
-      ``error_class``, and no yielded payload may exceed the cap: an over-cap frame must raise, never
-      be delivered.
+    * **Capped**, once over the whole stream in one read and once over the small reads, because the
+      decoder charges its cap on two different branches (a frame closed inside the read, and one still
+      open at its end). The only allowed exception is the decoder's own ``error_class``, and no
+      yielded payload may exceed the cap: an over-cap frame must raise, never be delivered.
     """
     if not data:
         return
@@ -434,9 +462,10 @@ def _stream_frames(data: bytes) -> None:
     split = _drain_frames(_new_frame_decoder(selector, None), reads)
     if whole != split:
         raise AssertionError("frame decoder output depends on how the stream was split into reads")
-    payloads, _refused, _open = _drain_frames(_new_frame_decoder(selector, _STREAM_CAP), reads)
-    if any(len(payload) > _STREAM_CAP for payload in payloads):
-        raise AssertionError("frame decoder delivered a payload larger than max_frame_bytes")
+    for cut in ([stream], reads):
+        payloads, _refused, _open = _drain_frames(_new_frame_decoder(selector, _STREAM_CAP), cut)
+        if any(len(payload) > _STREAM_CAP for payload in payloads):
+            raise AssertionError("frame decoder delivered a payload larger than max_frame_bytes")
 
 
 def _drain_x12(reader: X12FrameReader, reads: Sequence[bytes]) -> tuple[list[bytes], bool]:
@@ -454,7 +483,8 @@ def _x12_frames(data: bytes) -> None:
       :func:`_stream_frames`.
     * Every yielded interchange starts with ``ISA``: the reader drops inter-interchange noise, and a
       frame that kept some would hand a non-X12 body to the parser as if it were one.
-    * **Capped**, only ``X12FrameError`` may escape and no yielded interchange may exceed the cap.
+    * **Capped**, over one read and over the small reads, only ``X12FrameError`` may escape and no
+      yielded interchange may exceed the cap.
 
     Then the str-level :func:`split` over the same bytes, and :func:`check_integrity` over each
     interchange, both of which document ``X12PeekError`` as their only refusal.
@@ -471,9 +501,12 @@ def _x12_frames(data: bytes) -> None:
         )
     if any(not frame.startswith(b"ISA") for frame in whole):
         raise AssertionError("X12 frame reader yielded an interchange that does not start with ISA")
-    capped, _refused = _drain_x12(X12FrameReader(max_interchange_bytes=_X12_STREAM_CAP), reads)
-    if any(len(frame) > _X12_STREAM_CAP for frame in capped):
-        raise AssertionError("X12 frame reader delivered an interchange over max_interchange_bytes")
+    for cut in ([stream], reads):
+        capped, _refused = _drain_x12(X12FrameReader(max_interchange_bytes=_X12_STREAM_CAP), cut)
+        if any(len(frame) > _X12_STREAM_CAP for frame in capped):
+            raise AssertionError(
+                "X12 frame reader delivered an interchange over max_interchange_bytes"
+            )
     # latin-1 maps every byte, so this decode cannot fail and every input reaches the str surfaces.
     with contextlib.suppress(X12PeekError):
         x12_split(stream.decode("latin-1"))
@@ -495,42 +528,63 @@ def _event_loop() -> asyncio.AbstractEventLoop:
     return loop
 
 
-async def _read_every_request(data: bytes) -> None:
-    """Read pipelined requests from ``data`` until EOF or the first refusal, as one connection would.
+#: The HTTP target's caps. The listener's defaults are a 64 KiB head and a 16 MiB body, and asyncio's
+#: default ``StreamReader`` limit is 64 KiB; no input of DEFAULT_MAX_LEN bytes reaches any of them,
+#: so a run at the defaults never touches a cap branch. These put all three inside what the mutator
+#: generates, in the order the reader meets them: the head cap below the stream limit, so a head
+#: between the two is refused by the explicit length check and a longer one by the stream's own
+#: ``LimitOverrunError``, and the body cap on the declared ``Content-Length``.
+_HTTP_HEADER_CAP = 512
+_HTTP_STREAM_LIMIT = 1024
+_HTTP_BODY_CAP = 512
 
-    The reader is fed the whole input and EOF before the first read, so no await ever suspends: a
-    short body or head raises ``IncompleteReadError`` inside the listener, which maps it to its own
-    refusal. The reader's limit is asyncio's default, which is what ``asyncio.start_server`` gives
-    the listener's connections.
+#: The module the HTTP target drives. Imported lazily, by name, because importing anything under
+#: ``messagefoundry.transports`` runs that package's ``__init__``, which registers every connector --
+#: hundreds of modules every OTHER target would load, and Atheris would instrument, for nothing.
+#: ``fuzz/fuzz_parsers.py`` imports it inside ``instrument_imports`` when this target is selected,
+#: so the listener is still instrumented when it is the one being fuzzed.
+HTTP_LISTENER_MODULE = "messagefoundry.transports.http_listener"
+
+
+async def _read_one_request(data: bytes) -> None:
+    """Read ONE request from ``data`` through the listener's head-then-body reader.
+
+    One, because that is what the listener does: ``_on_client`` calls ``_serve_one`` once per
+    connection. The reader is fed the whole input and EOF before the first read, so no await ever
+    suspends, and a short head or body raises ``IncompleteReadError`` inside the listener, which maps
+    it to its own refusal. Bytes after the first request are left unread, as the listener leaves
+    them when it closes.
     """
-    reader = asyncio.StreamReader()
+    from messagefoundry.transports import http_listener
+
+    reader = asyncio.StreamReader(limit=_HTTP_STREAM_LIMIT)
     reader.feed_data(data)
     reader.feed_eof()
-    while not reader.at_eof():
-        try:
-            request = await read_http_request(
-                reader,
-                max_header_bytes=HTTP_MAX_HEADER_BYTES,
-                max_body_bytes=HTTP_MAX_BODY_BYTES,
-            )
-        except HttpRequestError:
-            return  # the contract: refused before any ingress row, answered with its status
-        _ = (request.method, request.target, request.headers, request.body, request.repeated)
+    try:
+        request = await http_listener._read_request(
+            reader, max_header_bytes=_HTTP_HEADER_CAP, max_body_bytes=_HTTP_BODY_CAP
+        )
+    except http_listener.HttpRequestError:
+        return  # the contract: refused before any ingress row, answered with its status
+    _ = (request.method, request.target, request.headers, request.body, request.repeated)
 
 
 def _http_request(data: bytes) -> None:
     """The HTTP intake listener's request reader (``transports/http_listener.py``), pre-ingress.
 
-    This is the unauthenticated half of the HTTP source: the head is parsed before any credential is
-    examined, so every byte here is attacker-chosen. ``HttpRequestError`` is the documented refusal,
-    and it is NOT a ``ValueError`` -- the listener catches it by name and answers with its status.
-    Anything else escaping is a request that would reach the listener's last-resort handler instead.
+    What is fuzzed is ``_read_request``: ``_read_head`` then ``_read_body``, with a header cap, a
+    body cap and a stream limit (see :data:`_HTTP_HEADER_CAP`). That is the listener's parse, but
+    not the whole of what ``_serve_one`` runs: there, header-mode authentication (``_authorize_head``)
+    sits between the head and the body, and this target does not run it -- it needs a configured
+    source. Both reads happen before any credential is examined or any ingress row is written, so
+    every byte here is attacker-chosen.
 
-    It drives a private function, ``_read_request``, deliberately: that is the exact composition the
-    listener runs (head, then body, with the header and body caps), and the public surface is a socket
-    server, which needs a live endpoint and is out of scope here (ADR 0191).
+    ``HttpRequestError`` is the documented refusal, and it is NOT a ``ValueError``: the listener
+    catches it by name and answers with its status. Anything else escaping is a request that would
+    reach the listener's last-resort handler instead. ``_read_request`` is private, and is driven by
+    name on purpose: a rename in the engine fails this target loudly rather than silently.
     """
-    _event_loop().run_until_complete(_read_every_request(data))
+    _event_loop().run_until_complete(_read_one_request(data))
 
 
 def _compression(data: bytes) -> None:
@@ -559,16 +613,37 @@ def _compression(data: bytes) -> None:
     else:
         if len(body) > _INFLATE_CEILING:
             raise AssertionError("deflate_decompress_with_tail returned more than its ceiling")
-        if not data.endswith(tail):
-            raise AssertionError(
-                "deflate_decompress_with_tail returned a tail that is not the input's"
-            )
+        _check_deflate_tail(data, body, tail)
     try:
         members = zip_decompress(data, max_output_bytes=_INFLATE_CEILING)
     except CompressionError:
         return
     if sum(len(member) for member in members.values()) > _INFLATE_CEILING:
         raise AssertionError("zip_decompress returned more than its ceiling in total")
+
+
+def _check_deflate_tail(data: bytes, body: bytes, tail: bytes) -> None:
+    """``deflate_decompress_with_tail``'s documented split: ``tail`` is every byte after the stream.
+
+    So the stream is the input less the tail, it is not empty (a zlib stream has a header), and on
+    its own it must decompress, with nothing trailing, to exactly ``body``. A tail that ate part of
+    the stream, or a body that does not belong to the head, fails one of those.
+    """
+    if not data.endswith(tail) or len(tail) >= len(data):
+        raise AssertionError(
+            "deflate_decompress_with_tail returned a tail that is not a strict suffix"
+        )
+    head = data[: len(data) - len(tail)]
+    try:
+        again = deflate_decompress(head, max_output_bytes=_INFLATE_CEILING)
+    except CompressionError as exc:
+        raise AssertionError(
+            "the stream deflate_decompress_with_tail delimited does not decompress on its own"
+        ) from exc
+    if again != body:
+        raise AssertionError(
+            "deflate_decompress_with_tail returned a body its stream does not hold"
+        )
 
 
 def _binary_carriage(data: bytes) -> None:
@@ -586,8 +661,8 @@ def _binary_carriage(data: bytes) -> None:
       document-detach scan, which documents no refusal -- and ``extract_obx_document`` on every OBX,
       whose refusal is ``BinaryCarriageError``.
 
-    The HL7 half carries the one carve-out in this file, for the registered known finding: see
-    :data:`KNOWN_FINDINGS` and :func:`_separators_undeterminable`.
+    The HL7 half carries the only carve-outs in this file, one per registered known finding: see
+    :data:`KNOWN_FINDINGS` and :func:`_is_known_binary_carriage_finding`.
     """
     text = data.decode("utf-8", "replace")
     with contextlib.suppress(BinaryCarriageError):
@@ -599,10 +674,9 @@ def _binary_carriage(data: bytes) -> None:
     strip_documents(CARRIAGE_MARKER + text, pruned_at=0.0)
     try:
         _strip_and_scan_hl7(text)
-    except ValueError:
-        if not _separators_undeterminable(text):
+    except ValueError as exc:
+        if not _is_known_binary_carriage_finding(text, exc):
             raise
-        # The registered known finding. Narrow on purpose: any other ValueError escapes.
 
 
 def _strip_and_scan_hl7(text: str) -> None:
@@ -618,16 +692,36 @@ def _strip_and_scan_hl7(text: str) -> None:
             extract_obx_document(message, occurrence=occurrence)
 
 
-def _separators_undeterminable(text: str) -> bool:
-    """The :data:`KNOWN_FINDINGS` discriminator: ``Message.parse`` accepts ``text``, and the parsed
-    message's own separators cannot be read back.
+#: The start of the engine's message for the one exception both known findings raise
+#: (``Message._encoding_chars``, ``parsing/message.py``).
+_SEPARATORS_MESSAGE = "cannot determine HL7 separators"
 
-    That is exactly the condition under which ``Message._encoding_chars`` raises the bare
-    ``ValueError`` behind the finding, so the check calls it rather than restating its rule: MSH-1 must
-    be one character and MSH-2 at least four. A private method, deliberately -- a copy of the rule here
-    would drift from the engine's and widen or narrow the carve-out without anyone noticing.
+
+def _is_known_binary_carriage_finding(text: str, exc: ValueError) -> bool:
+    """Whether ``exc``, raised on ``text``, is one of the two registered :data:`KNOWN_FINDINGS`.
+
+    BOTH halves are required. The EXCEPTION must be a bare ``ValueError`` (not a subclass, so no
+    codec error is taken for it) carrying the engine's separators message, and the INPUT must have
+    one of the two registered shapes. The first draft checked only the input, so on a matching body
+    it swallowed any ``ValueError`` at all -- a planted one included, and an FHS-led body that is a
+    different defect from the one then registered.
+    """
+    if type(exc) is not ValueError or not str(exc).startswith(_SEPARATORS_MESSAGE):
+        return False
+    return _is_short_msh2_shape(text) or _is_batch_header_shape(text)
+
+
+def _is_short_msh2_shape(text: str) -> bool:
+    """The first finding's shape: an MSH-led body ``Peek.parse`` accepts, whose own separators
+    ``Message`` cannot read back.
+
+    ``Peek.parse`` accepting is what makes it MSH-led, and what makes the shape reach the store at
+    all. The separator check calls ``Message._encoding_chars`` rather than restating its rule (MSH-1
+    one character, MSH-2 at least four), deliberately: a copy here would drift from the engine's and
+    widen or narrow the carve-out without anyone noticing.
     """
     try:
+        Peek.parse(text)
         message = Message.parse(text)
     except HL7PeekError:
         return False
@@ -636,6 +730,23 @@ def _separators_undeterminable(text: str) -> bool:
     except ValueError:
         return True
     return False
+
+
+def _is_batch_header_shape(text: str) -> bool:
+    """The second finding's shape: ``Peek.parse`` refuses the body, ``Message.parse`` accepts it, and
+    it carries an FHS or BHS batch header and no MSH segment at all."""
+    try:
+        Peek.parse(text)
+    except HL7PeekError:
+        pass
+    else:
+        return False
+    try:
+        message = Message.parse(text)
+    except HL7PeekError:
+        return False
+    has_batch_header = message.count_segments("FHS") + message.count_segments("BHS") > 0
+    return has_batch_header and message.count_segments("MSH") == 0
 
 
 @dataclass(frozen=True)
