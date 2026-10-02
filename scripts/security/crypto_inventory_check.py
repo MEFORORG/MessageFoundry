@@ -634,11 +634,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # when it CHANGED, and compares it to the stored fingerprint through
     # pipeline.secret_rotation.fingerprints_equal: constant-time over bytes, the same compare the
     # rotation watcher uses (ASVS 11.2.4, BACKLOG #1167), never a bare `!=`.
+    # BACKLOG #296: provision-admin also imports SigningError, to give a refused OIDC
+    # private_key_jwt key a fixed text; it signs nothing.
     "messagefoundry/__main__.py": frozenset(
         {
             "messagefoundry.config.tls_policy",
             "messagefoundry.store.crypto",
             "messagefoundry.store.keyprovider",
+            "messagefoundry.transports.signing",
         }
     ),
     # ADR 0019 §5: the `vault` connector-secret provider does a Vault KV v2 read of a connector
@@ -1404,9 +1407,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
+    # BACKLOG #296: certificate_thumbprint loads the OIDC client certificate, compares its public key
+    # to the signing key's by SubjectPublicKeyInfo bytes, and sends only its SHA-256 thumbprint.
     "messagefoundry/transports/signing.py": frozenset(
         {
             "csprng:secrets.token_urlsafe",
+            "key_cert:.public_bytes()",
+            "key_cert:cryptography.x509.load_pem_x509_certificate",
             "key_cert:.public_key()",
             "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
             "key_cert:messagefoundry.keywrap.key_wrap_refusal",

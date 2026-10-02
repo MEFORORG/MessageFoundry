@@ -6300,9 +6300,17 @@ _PROVISION_AUTH_REFUSALS = {
         "is installed in the environment that runs this command"
     ),
     "reference": (
-        "a secret the [auth] settings reference (the AD bind password or the OIDC client secret) "
-        "could not be resolved: check [secrets].provider, that its optional extra is installed, "
-        "and the reference, in the shell that runs this command"
+        "a secret the [auth] settings reference (the AD bind password, or the OIDC client secret "
+        "or signing key) could not be resolved: check [secrets].provider, that its optional extra "
+        "is installed, and the reference, in the shell that runs this command"
+    ),
+    # BACKLOG #296. SigningError's own text names the setting and never the key, but this command
+    # keeps to fixed texts, so it gets one.
+    "client_key": (
+        "the [auth] OIDC private_key_jwt credential could not be loaded: check "
+        "oidc_client_private_key (or its _ref) and its passphrase, oidc_client_certificate, and "
+        "oidc_client_assertion_algorithm, and that the account running this command can read them. "
+        "`messagefoundry verify --section federation` names the failing part"
     ),
     "ldap": (
         "the [auth] Active Directory settings could not build the directory connection: check "
@@ -6349,7 +6357,8 @@ def _build_provision_auth_service(
     existing anchor refusal. The others this function names become :class:`_ProvisionAuthRefused`,
     raised outside the handler so the original is not carried along as its context. A
     ``SecretProviderError`` loading the provider, a ``SecretProviderError`` resolving a reference,
-    an ``LdapError`` and a ``FileNotFoundError`` each get a fixed text. ``InsecureHopRefused``, a
+    an ``LdapError``, a ``FileNotFoundError`` and a ``SigningError`` (the OIDC private_key_jwt key or
+    certificate, BACKLOG #296) each get a fixed text. ``InsecureHopRefused``, a
     refusal ``serve`` also gives (an off-box OIDC IdP with no revocation check, at ``enforce``),
     keeps its own text, which names the hop, its host and the setting that clears it, and reads no
     secret. Any other exception is not this function's to name and reaches the caller as it is.
@@ -6359,6 +6368,7 @@ def _build_provision_auth_service(
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
     from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.transports.signing import SigningError
 
     refusal: str | None = None
     try:
@@ -6392,6 +6402,8 @@ def _build_provision_auth_service(
         refusal = _PROVISION_AUTH_REFUSALS["file"]
     except InsecureHopRefused as exc:
         refusal = _sentence(exc)
+    except SigningError:
+        refusal = _PROVISION_AUTH_REFUSALS["client_key"]
     raise _ProvisionAuthRefused(refusal)
 
 

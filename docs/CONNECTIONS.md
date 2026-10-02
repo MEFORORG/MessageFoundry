@@ -1629,7 +1629,7 @@ opt-out. That is expected, and the table says which they are.
 | `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink has no credential field) |
 | `[alerts]` SMTP | `settings:alerts.smtp` | **no** |
 | `[ai]` broker key | `settings:ai.broker` | **no** |
-| `[auth]` OIDC client secret | `settings:auth.oidc` | **no** |
+| `[auth]` OIDC client secret | `settings:auth.oidc` | yes: `oidc_token_endpoint_auth_method = "private_key_jwt"` (BACKLOG #296) |
 | `[auth]` AD/LDAP bind | `settings:auth.ad_bind` | **no** |
 | `[logging]` syslog forwarder | `settings:logging.forward` | yes: `forward_protocol = "tls"` with `forward_tls_client_cert` |
 

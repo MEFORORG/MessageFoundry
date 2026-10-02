@@ -43,6 +43,7 @@ import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import (
@@ -73,6 +74,7 @@ __all__ = [
     "SigningError",
     "b64u_decode",
     "b64u_encode",
+    "certificate_thumbprint",
     "client_assertion_claims",
     "require_public_key_for_alg",
     "signer_from_destination",
@@ -146,7 +148,7 @@ b64u_encode = _b64u_encode
 b64u_decode = _b64u_decode
 
 
-def _read_key_material(setting: str, private_key: str) -> bytes:
+def _read_key_material(setting: str, private_key: str, *, kind: str = "signing-key") -> bytes:
     """The PEM bytes of the signing key: the value verbatim if it is inline PEM, else read from the
     path it names (a PEM key file, OS-protected like a TLS key).
 
@@ -189,14 +191,14 @@ def _read_key_material(setting: str, private_key: str) -> bytes:
         reason = getattr(exc, "strerror", None) or type(exc).__name__
     if read_failed:
         raise SigningError(
-            f"could not read the signing-key file named by {setting!r}: {reason} "
+            f"could not read the {kind} file named by {setting!r}: {reason} "
             "(a value with no '-----BEGIN' header is read as a file path)"
         )
     # Outside the try on purpose: a SigningError IS a ValueError, and the handler above now catches
     # ValueError, so a raise inside the try would be swallowed into the read-failed arm.
     if len(material) > _MAX_KEY_FILE_BYTES:
         raise SigningError(
-            f"the signing-key file named by {setting!r} is over the {_MAX_KEY_FILE_BYTES}-byte "
+            f"the {kind} file named by {setting!r} is over the {_MAX_KEY_FILE_BYTES}-byte "
             "bound; a PEM private key is a few kilobytes -- check the path"
         )
     return material
@@ -453,6 +455,29 @@ def client_assertion_claims(
     return claims
 
 
+def certificate_thumbprint(setting: str, certificate: str, public_key: _PublicKey) -> str:
+    """The JWS ``x5t#S256`` value (RFC 7515 section 4.1.8) for the X.509 certificate that holds
+    ``public_key``: the base64url SHA-256 digest of the certificate's DER encoding (BACKLOG #296).
+
+    ``certificate`` is inline PEM or a path to a PEM file, read under the signing key's rules. A
+    certificate that does not parse, or that holds some other public key, is refused: a header naming
+    a certificate the signature does not verify under would send an IdP to the wrong key."""
+    material = _read_key_material(setting, certificate, kind="certificate")
+    cert: x509.Certificate | None = None
+    try:
+        cert = x509.load_pem_x509_certificate(material)
+    except ValueError:
+        cert = None
+    if cert is None:
+        raise SigningError(f"could not load the certificate named by {setting!r} -- check the PEM")
+    spki = serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    if cert.public_key().public_bytes(*spki) != public_key.public_bytes(*spki):
+        raise SigningError(
+            f"the certificate named by {setting!r} does not hold the public half of the signing key"
+        )
+    return _b64u_encode(cert.fingerprint(hashes.SHA256()))
+
+
 class CompactJwtSigner:
     """Mints an **attached compact JWS/JWT** (``header.payload.signature``) for an OAuth2
     ``client_assertion`` — the SMART Backend Services credential (ADR 0024).
@@ -472,6 +497,8 @@ class CompactJwtSigner:
         setting: str,
         private_key_password: str | None = None,
         key_id: str | None = None,
+        certificate: str | None = None,
+        certificate_setting: str = "certificate",
     ) -> None:
         self.algorithm = algorithm
         self.key_id = key_id
@@ -481,6 +508,12 @@ class CompactJwtSigner:
         # operator to a setting on a connector they are not configuring.
         self._key: _PrivateKey = _load_private_key(setting, private_key, private_key_password)
         _require_key_for_alg(self._key, algorithm)
+        # BACKLOG #296: an IdP that registers a certificate (Entra ID) selects it by thumbprint.
+        self.x5t_s256: str | None = (
+            certificate_thumbprint(certificate_setting, certificate, self._key.public_key())
+            if certificate
+            else None
+        )
 
     @property
     def public_key(self) -> _PublicKey:
@@ -493,6 +526,8 @@ class CompactJwtSigner:
         header: dict[str, str] = {"alg": self.algorithm.value, "typ": "JWT"}
         if self.key_id:
             header["kid"] = self.key_id
+        if self.x5t_s256:
+            header["x5t#S256"] = self.x5t_s256
         header_b64 = _b64u_encode(
             json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
         )

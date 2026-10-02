@@ -105,6 +105,7 @@ _DEK = "Store DEK"
 # Lifecycle row labels, spelled exactly as the bold lead of each row in the doc.
 _JWS = "Per-message JWS signing key"
 _SMART = "SMART Backend Services client-assertion key"
+_OIDC_ASSERTION = "OIDC client-assertion key"
 _DIRECT = "DIRECT S/MIME sender signing key"
 _SFTP = "SFTP client key"
 _API_TLS = "API TLS server key"
@@ -137,7 +138,9 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/uploads.py": frozenset({_DEK}),
     "messagefoundry/__main__.py": frozenset({_DEK, _NONPROD}),
     # Private keys the engine loads or mints.
-    "messagefoundry/transports/signing.py": frozenset({_JWS, _SMART}),
+    "messagefoundry/transports/signing.py": frozenset({_JWS, _SMART, _OIDC_ASSERTION}),
+    # BACKLOG #296: builds the private_key_jwt signer from the operator's key.
+    "messagefoundry/auth/oidc/client_auth.py": frozenset({_OIDC_ASSERTION}),
     "messagefoundry/transports/rest.py": frozenset({_JWS}),
     "messagefoundry/transports/fhir.py": frozenset({_JWS}),
     "messagefoundry/transports/soap.py": frozenset({_JWS, _MTLS_CLIENT}),

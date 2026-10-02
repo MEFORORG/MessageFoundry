@@ -26,17 +26,17 @@ the per-algorithm curve check and the refusal to echo key material are that modu
 algorithms are the asymmetric :class:`~messagefoundry.config.models.SignatureAlgorithm` set; ``none``
 and every HMAC algorithm are outside it, so neither can be configured.
 
-Like the rest of :mod:`messagefoundry.auth.oidc`, nothing here opens a socket or logs. Both
-credentials are form fields built only inside :func:`~messagefoundry.auth.oidc.flow.exchange_code`,
-which keeps every request value out of its exceptions.
+Like the rest of :mod:`messagefoundry.auth.oidc`, nothing here opens a socket or logs; building a
+:class:`PrivateKeyJwtClientAuth` reads its key (and any certificate) from a file when given a path.
+Resolving the configured credential from settings, which may call a ``[secrets]`` provider, is
+``oidc_client_auth_from_settings`` in :mod:`messagefoundry.auth.service`. Both credentials are form
+fields built only inside :func:`~messagefoundry.auth.oidc.flow.exchange_code`, which keeps every
+request value out of its exceptions.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from messagefoundry.config.models import SignatureAlgorithm
-from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.transports.signing import (
     CLIENT_ASSERTION_TYPE,
     CompactJwtSigner,
@@ -44,15 +44,11 @@ from messagefoundry.transports.signing import (
     client_assertion_claims,
 )
 
-if TYPE_CHECKING:
-    from messagefoundry.config.settings import AuthSettings
-
 __all__ = [
     "CLIENT_ASSERTION_TTL_SECONDS",
     "ClientAuthentication",
     "ClientSecretPost",
     "PrivateKeyJwtClientAuth",
-    "client_auth_from_settings",
 ]
 
 #: How long an assertion is valid. It is minted immediately before the one POST that carries it, so
@@ -90,6 +86,7 @@ class PrivateKeyJwtClientAuth:
         algorithm: SignatureAlgorithm,
         private_key_password: str | None = None,
         key_id: str | None = None,
+        certificate: str | None = None,
     ) -> None:
         self.client_id = client_id
         self.audience = audience
@@ -100,6 +97,8 @@ class PrivateKeyJwtClientAuth:
             setting="oidc_client_private_key",
             private_key_password=private_key_password,
             key_id=key_id,
+            certificate=certificate,
+            certificate_setting="oidc_client_certificate",
         )
 
     @property
@@ -123,55 +122,3 @@ class PrivateKeyJwtClientAuth:
 
 #: The credential the token request carries, whichever method is configured.
 ClientAuthentication = ClientSecretPost | PrivateKeyJwtClientAuth
-
-
-def client_auth_from_settings(
-    settings: AuthSettings, secret_provider: SecretProvider | None
-) -> ClientAuthentication | None:
-    """The configured client credential for ``[auth]``, resolved and checked.
-
-    The ONE construction, shared by :class:`~messagefoundry.auth.service.AuthService` and
-    ``messagefoundry verify --section federation``, so the check resolves exactly what the engine
-    sends. Only the configured method's credential is resolved. ``None`` means the client secret
-    resolved to nothing, which the settings validator refuses for a literal while ``oidc_enabled``
-    is set; only a provider reference that resolves empty reaches it.
-
-    Raises the secret provider's error for a reference that does not resolve, and
-    :class:`~messagefoundry.transports.signing.SigningError` for a key that cannot be read, parsed
-    or used with the configured algorithm. Neither message carries a credential.
-    """
-    if not settings.oidc_private_key_jwt:
-        secret = resolve_connector_secret(
-            secret_provider,
-            ref=settings.oidc_client_secret_ref,
-            literal=settings.oidc_client_secret,
-            label="[auth].oidc_client_secret",
-        )
-        return ClientSecretPost(secret) if secret else None
-    key = resolve_connector_secret(
-        secret_provider,
-        ref=settings.oidc_client_private_key_ref,
-        literal=settings.oidc_client_private_key,
-        label="[auth].oidc_client_private_key",
-    )
-    audience = (
-        settings.oidc_issuer
-        if settings.oidc_client_assertion_audience == "issuer"
-        else settings.oidc_token_endpoint
-    )
-    # The settings validator guarantees all three while oidc_enabled is set. Refused here as well,
-    # so a gap can never reach the signer as an empty string and fail there less clearly.
-    if not key or not settings.oidc_client_id or not audience:
-        raise ValueError(
-            "private_key_jwt needs oidc_client_id, the assertion audience "
-            f"(oidc_{settings.oidc_client_assertion_audience}) and a signing key "
-            "(oidc_client_private_key or oidc_client_private_key_ref)"
-        )
-    return PrivateKeyJwtClientAuth(
-        client_id=settings.oidc_client_id,
-        audience=audience,
-        private_key=key,
-        algorithm=settings.oidc_client_assertion_algorithm,
-        private_key_password=settings.oidc_client_private_key_password,
-        key_id=settings.oidc_client_assertion_key_id,
-    )

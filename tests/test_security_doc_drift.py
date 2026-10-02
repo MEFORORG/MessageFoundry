@@ -584,6 +584,7 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         "oidc_client_assertion_algorithm",
         "oidc_client_assertion_key_id",
         "oidc_client_assertion_audience",
+        "oidc_client_certificate",
         "oidc_authorization_endpoint",
         "oidc_token_endpoint",
         "oidc_jwks_uri",

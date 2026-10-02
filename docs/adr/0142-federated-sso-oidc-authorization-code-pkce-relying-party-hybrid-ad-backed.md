@@ -592,11 +592,13 @@ Until this amendment the relying party authenticated to the token endpoint one w
 - **Under `private_key_jwt` the request carries `client_assertion_type` and a `client_assertion`,
   and no `client_secret`.** The assertion is minted per request: `iss` = `sub` = the client id,
   `aud` = the pinned token endpoint (or the pinned issuer, by `oidc_client_assertion_audience`),
-  `iat`, `exp` 120 s later, and a fresh 256-bit `jti`. It is signed by `CompactJwtSigner`, the
-  signer the SMART client already uses, so no second JWT signer exists. Its algorithm set is
-  asymmetric only; `none` and HMAC cannot be configured.
+  `iat`, a short `exp` (`CLIENT_ASSERTION_TTL_SECONDS`), and a fresh 256-bit `jti`. The claims and
+  the signature come from `transports/signing.py`, shared with the SMART client, so no second JWT
+  signer or claim builder exists. Its algorithm set is asymmetric only; `none` and HMAC cannot be
+  configured. An optional `oidc_client_certificate` adds its `x5t#S256` thumbprint to the header,
+  for an IdP that registers a certificate (Entra ID), and must hold the key's public half.
 - **One credential, the one that is sent.** Under `private_key_jwt` a configured client secret is
-  refused at load; under `client_secret_post` a configured signing key is. The key is resolved and
+  refused at load; under `client_secret_post` any assertion setting is. The key is resolved and
   loaded when the auth service is built, so a missing, unreadable, weak or wrong-curve key refuses
   startup, as an unresolvable secret already did.
 - **AC-10 is widened:** the system SHALL NOT log the signing key, its passphrase, or a client

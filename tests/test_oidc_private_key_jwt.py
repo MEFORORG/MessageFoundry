@@ -31,9 +31,8 @@ from messagefoundry.auth.oidc.client_auth import (
     CLIENT_ASSERTION_TTL_SECONDS,
     ClientSecretPost,
     PrivateKeyJwtClientAuth,
-    client_auth_from_settings,
 )
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, oidc_client_auth_from_settings
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import AuthSettings, ServiceSettings, _warn_file_secrets
 from messagefoundry.config.static_credentials import resolved_secret_refs, static_credential_hops
@@ -223,7 +222,7 @@ def test_a_wrong_curve_or_weak_key_is_refused_at_construction(
 def test_private_key_jwt_sends_the_assertion_and_no_secret(
     ec_key: ec.EllipticCurvePrivateKey,
 ) -> None:
-    client = client_auth_from_settings(AuthSettings(**_pkjwt(_pem(ec_key))), None)
+    client = oidc_client_auth_from_settings(AuthSettings(**_pkjwt(_pem(ec_key))), None)
     assert client is not None
     opener = _FakeOpener()
     _exchange(opener, client_auth=client)
@@ -247,7 +246,7 @@ def test_the_default_client_secret_post_request_is_unchanged() -> None:
     opener = _FakeOpener()
     _exchange(
         opener,
-        client_auth=client_auth_from_settings(
+        client_auth=oidc_client_auth_from_settings(
             AuthSettings(**_auth(oidc_client_secret=SECRET)), None
         ),
     )
@@ -264,7 +263,7 @@ def test_the_default_client_secret_post_request_is_unchanged() -> None:
 def test_the_issuer_audience_option_addresses_the_pinned_issuer(
     ec_key: ec.EllipticCurvePrivateKey,
 ) -> None:
-    client = client_auth_from_settings(
+    client = oidc_client_auth_from_settings(
         AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_assertion_audience="issuer")), None
     )
     assert isinstance(client, PrivateKeyJwtClientAuth) and client.audience == ISSUER
@@ -276,7 +275,7 @@ def test_the_issuer_audience_option_addresses_the_pinned_issuer(
 def test_the_default_method_is_client_secret_post() -> None:
     settings = AuthSettings(**_auth(oidc_client_secret=SECRET))
     assert settings.oidc_token_endpoint_auth_method == "client_secret_post"
-    credential = client_auth_from_settings(settings, None)
+    credential = oidc_client_auth_from_settings(settings, None)
     assert isinstance(credential, ClientSecretPost)
     assert SECRET not in repr(credential)
 
@@ -471,3 +470,104 @@ def test_the_key_reference_is_the_one_handed_to_the_secret_provider() -> None:
     )
     settings = _service_settings(auth, secrets={"provider": "vault"})
     assert "kv/mf#oidc-key" in resolved_secret_refs(settings)
+
+
+# --- review round 1: certificate thumbprint, empty credentials, dead config ----------------------
+
+
+def _self_signed(key: ec.EllipticCurvePrivateKey) -> str:
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import NameOID
+
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-console")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def test_a_certificate_adds_its_sha256_thumbprint_to_the_header(
+    ec_key: ec.EllipticCurvePrivateKey,
+) -> None:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+
+    cert_pem = _self_signed(ec_key)
+    client = oidc_client_auth_from_settings(
+        AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_certificate=cert_pem)), None
+    )
+    assert isinstance(client, PrivateKeyJwtClientAuth)
+    assertion = client.form_fields()["client_assertion"]
+    verify_compact_jws(
+        assertion, ec_key.public_key(), allowed_algorithms=(SignatureAlgorithm.ES256,)
+    )
+    header = json.loads(base64.urlsafe_b64decode(assertion.split(".")[0] + "=="))
+    digest = x509.load_pem_x509_certificate(cert_pem.encode()).fingerprint(hashes.SHA256())
+    expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    assert header["x5t#S256"] == expected
+    # The control: no certificate, no thumbprint.
+    plain = oidc_client_auth_from_settings(AuthSettings(**_pkjwt(_pem(ec_key))), None)
+    plain_header = plain.form_fields()["client_assertion"].split(".")[0]
+    assert "x5t" not in base64.urlsafe_b64decode(plain_header + "==").decode()
+
+
+def test_a_certificate_for_another_key_is_refused(ec_key: ec.EllipticCurvePrivateKey) -> None:
+    other = _self_signed(ec.generate_private_key(ec.SECP256R1()))
+    with pytest.raises(SigningError, match="does not hold the public half"):
+        oidc_client_auth_from_settings(
+            AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_certificate=other)), None
+        )
+
+
+class _EmptyProvider:
+    def resolve(self, ref: str) -> str:
+        return ""
+
+
+def test_a_reference_resolving_empty_is_refused_not_sent_as_no_credential() -> None:
+    from messagefoundry.config.secretprovider import SecretProviderError
+
+    settings = AuthSettings(**_auth(oidc_client_secret_ref="kv/mf#oidc"))
+    with pytest.raises(SecretProviderError, match="empty"):
+        oidc_client_auth_from_settings(settings, _EmptyProvider())
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"oidc_client_assertion_algorithm": "ES256"},
+        {"oidc_client_assertion_audience": "issuer"},
+        {"oidc_client_certificate": "C:/certs/oidc.pem"},
+    ],
+)
+def test_assertion_settings_beside_the_secret_method_are_refused(extra: dict[str, str]) -> None:
+    with pytest.raises(ValidationError, match="apply only with"):
+        AuthSettings(**_auth(oidc_client_secret=SECRET, **extra))
+
+
+@pytest.mark.parametrize("kid", ["", "   ", " kid-1", "kid-1 "])
+def test_a_blank_or_padded_key_id_is_refused(kid: str, ec_key: ec.EllipticCurvePrivateKey) -> None:
+    with pytest.raises(ValidationError, match="oidc_client_assertion_key_id"):
+        AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_assertion_key_id=kid))
+
+
+def test_verify_names_a_key_file_as_a_file(
+    tmp_path: Path, ec_key: ec.EllipticCurvePrivateKey
+) -> None:
+    key_file = tmp_path / "oidc.pem"
+    key_file.write_text(_pem(ec_key), encoding="ascii")
+    rows = {r.id: r for r in run_federation_checks(_service_settings(_pkjwt(str(key_file))))}
+    assert rows["fed.client_key"].status is Status.PASS
+    assert "PEM file" in rows["fed.client_key"].detail
+    assert "environment" not in rows["fed.client_key"].detail

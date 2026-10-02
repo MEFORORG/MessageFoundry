@@ -101,7 +101,6 @@ __all__ = [
 ]
 
 # RFC 7523 / SMART Backend Services constants.
-_CLIENT_ASSERTION_TYPE = CLIENT_ASSERTION_TYPE  # the shared constant, under its old local name
 # The client_assertion lifetime. SMART caps exp at 5 min after iat; 4 min stays comfortably under the
 # ceiling while tolerating moderate clock skew. The assertion is one-time (consumed at the token POST).
 _CLIENT_ASSERTION_TTL = 240
@@ -548,7 +547,7 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         request (the assertion) or the response body (which carries the bearer token)."""
         form = {
             "grant_type": "client_credentials",
-            "client_assertion_type": _CLIENT_ASSERTION_TYPE,
+            "client_assertion_type": CLIENT_ASSERTION_TYPE,
             "client_assertion": self._signer.sign(self._assertion_claims()),
         }
         if self.scope:

@@ -213,26 +213,29 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
 
     The same construction :class:`~messagefoundry.auth.service.AuthService` runs (BACKLOG #296). No
     socket is opened and nothing is signed or sent."""
-    from messagefoundry.auth.oidc.client_auth import ClientSecretPost, client_auth_from_settings
+    from messagefoundry.auth.oidc.client_auth import ClientSecretPost
+    from messagefoundry.auth.service import oidc_client_auth_from_settings
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
 
     auth = settings.auth
     if auth.oidc_private_key_jwt:
         rid, title = "fed.client_key", "OIDC private_key_jwt signing key loads"
-        ref = auth.oidc_client_private_key_ref
+        if auth.oidc_client_private_key_ref:
+            source = "[secrets] provider reference"
+        elif "-----BEGIN" in (auth.oidc_client_private_key or ""):
+            source = "inline PEM (environment or config file)"
+        else:
+            source = "PEM file oidc_client_private_key names"
     else:
         rid, title = "fed.client_secret", "OIDC client secret resolves"
-        ref = auth.oidc_client_secret_ref
+        source = "[secrets] provider reference" if auth.oidc_client_secret_ref else "environment"
     try:
-        credential = client_auth_from_settings(auth, resolve_secret_provider(settings.secrets))
+        credential = oidc_client_auth_from_settings(auth, resolve_secret_provider(settings.secrets))
     # SigningError is a ValueError; catching the base keeps this module off the signing seam.
     except (SecretProviderError, ValueError) as exc:
         return CheckResult(rid, title, Status.FAIL, str(exc))
     except Exception as exc:  # never raise out of a check
         return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
-    if credential is None:
-        return CheckResult(rid, title, Status.FAIL, "resolved to an empty value")
-    source = "[secrets] provider reference" if ref else "environment"
     if isinstance(credential, ClientSecretPost):
         return CheckResult(rid, title, Status.PASS, f"resolved from the {source} (value not shown)")
     return CheckResult(
@@ -240,7 +243,9 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
         title,
         Status.PASS,
         f"loaded from the {source} for {auth.oidc_client_assertion_algorithm.value}, "
-        f"aud={credential.audience} (key not shown; confirm the IdP holds its public half)",
+        f"aud={credential.audience}"
+        + (", with an x5t#S256 certificate thumbprint" if auth.oidc_client_certificate else "")
+        + " (key not shown; confirm the IdP holds its public half)",
     )
 
 

@@ -2785,16 +2785,17 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `client_secret_post`, which sends the client secret in the token request body. That secret is
   reusable: nothing in it names the endpoint or bounds its lifetime. `private_key_jwt` (OIDC Core
   section 9, RFC 7523) sends a JWT signed with `[auth].oidc_client_private_key` instead, and no
-  secret. Its `iss` and `sub` are the client id, its `aud` is the pinned token endpoint (or the
-  pinned issuer, by `oidc_client_assertion_audience`), it expires 120 s after `iat`, and its `jti`
-  is fresh for every request. It is signed by the same signer as the SMART client, so the same
-  rules hold: asymmetric algorithms only (`none` and HMAC cannot be configured), RSA keys of at
-  least 3072 bits, and the curve pinned per algorithm. The key never leaves the engine and is never
-  logged; a bad key refuses startup. Configuring a secret beside the key is refused, so the
-  configured credential is always the one sent.
+  secret. The assertion is addressed to a pinned, allow-listed URL, is short-lived and is fresh for
+  every request; [CONFIGURATION.md](CONFIGURATION.md) lists its claims and the key rules. It is
+  built and signed by the same code as the SMART client's assertion, so the algorithm set (no
+  `none`, no HMAC) and the key-strength floor are that signer's. The key never leaves the engine and
+  is never logged; a bad key, or a `oidc_client_certificate` that does not hold its public half,
+  refuses startup. A secret configured beside the key is refused, and so is any assertion setting
+  configured beside the secret.
   **Limits.** The engine reads no discovery document, so it cannot check that the IdP lists
   `private_key_jwt` in `token_endpoint_auth_methods_supported`; register the client for that
-  method at the IdP. Whether the IdP *also* still accepts the secret for this client is the IdP's
+  method at the IdP. No live IdP has been tried: Entra ID's certificate path (an `x5t#S256`
+  thumbprint from `oidc_client_certificate`) is built from its documentation, not a tenant. Whether the IdP *also* still accepts the secret for this client is the IdP's
   setting, not the engine's, so remove the secret there once the key works. Default stays
   `client_secret_post`; refusing the secret method outright is an owner decision that has not
   been made.

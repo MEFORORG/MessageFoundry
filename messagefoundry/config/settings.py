@@ -2919,6 +2919,11 @@ class AuthSettings(_Section):
     # Asymmetric only: the enum holds no `none` and no HMAC algorithm, so neither can be configured.
     oidc_client_assertion_algorithm: SignatureAlgorithm = SignatureAlgorithm.RS256
     oidc_client_assertion_key_id: str | None = None  # JWS `kid`, for an IdP holding several keys
+    # The X.509 certificate holding the key's public half (inline PEM or a path; public, not secret).
+    # When set, every assertion carries its `x5t#S256` thumbprint, which is how an IdP that registers
+    # a certificate (Entra ID) finds the key. Refused at startup unless it holds the signing key's
+    # public half.
+    oidc_client_certificate: str | None = None
     # The assertion `aud`: the pinned token endpoint (OIDC Core section 9; Entra ID and Okta require
     # it), or the pinned issuer for an IdP that asks for its issuer identifier. A closed choice, so
     # the assertion is only ever addressed to a URL already pinned and allow-listed here.
@@ -3470,6 +3475,17 @@ class AuthSettings(_Section):
             )
         # A credential the configured method never sends is a live credential nobody uses. Refused
         # rather than ignored, so the configuration says exactly what goes on the wire.
+        # The signer sends any non-empty `kid` verbatim, so a blank or space-padded one would reach
+        # the IdP as a key id that matches nothing. Refused rather than trimmed.
+        kid = self.oidc_client_assertion_key_id
+        if (
+            self.oidc_private_key_jwt
+            and kid is not None
+            and (not kid.strip() or kid != kid.strip())
+        ):
+            raise ValueError(
+                "oidc_client_assertion_key_id is blank or has leading or trailing whitespace"
+            )
         if self.oidc_private_key_jwt and has_secret:
             raise ValueError(
                 "oidc_token_endpoint_auth_method='private_key_jwt' never sends the client "
@@ -3488,9 +3504,15 @@ class AuthSettings(_Section):
                 "oidc_client_private_key_ref",
                 "oidc_client_private_key_password",
                 "oidc_client_assertion_key_id",
+                "oidc_client_certificate",
             )
             if given(getattr(self, name))
         ]
+        # A non-default assertion shape set beside the secret method is dead config too.
+        if self.oidc_client_assertion_algorithm is not SignatureAlgorithm.RS256:
+            stray.append("oidc_client_assertion_algorithm")
+        if self.oidc_client_assertion_audience != "token_endpoint":
+            stray.append("oidc_client_assertion_audience")
         if not self.oidc_private_key_jwt and stray:
             raise ValueError(
                 f"{', '.join(stray)} apply only with "
@@ -4954,6 +4976,8 @@ ENFORCEABLE_SECRET_EXPIRY_CLASSES: frozenset[str] = frozenset(
         "MEFOR_AUTH_AD_BIND_PASSWORD",
         "MEFOR_ALERTS_EMAIL_PASSWORD",
         "MEFOR_AUTH_OIDC_CLIENT_SECRET",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD",
         "MEFOR_API_TLS_KEY_PASSWORD",
         "MEFOR_STORE_VAULT_TOKEN",
         "MEFOR_SECRETS_VAULT_TOKEN",

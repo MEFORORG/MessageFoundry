@@ -24,7 +24,6 @@ from messagefoundry.auth.oidc.client_auth import (
     ClientAuthentication,
     ClientSecretPost,
     PrivateKeyJwtClientAuth,
-    client_auth_from_settings,
 )
 from messagefoundry.auth.oidc.flow import (
     DEFAULT_FLOW_CACHE_MAX,
@@ -71,7 +70,6 @@ __all__ = [
     "PrivateKeyJwtClientAuth",
     "TokenRefusedError",
     "build_authorization_url",
-    "client_auth_from_settings",
     "exchange_code",
     "generate_pkce",
     "jwk_to_public_key",

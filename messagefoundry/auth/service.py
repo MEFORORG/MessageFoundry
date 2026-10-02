@@ -98,7 +98,11 @@ from messagefoundry.auth.policy import (
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
-from messagefoundry.config.secretprovider import SecretProvider
+from messagefoundry.config.secretprovider import (
+    SecretProvider,
+    SecretProviderError,
+    resolve_connector_secret,
+)
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.controlchars import scrub_log_argument
@@ -1774,6 +1778,62 @@ def _refuse_idp_revocation(
         guard.enforce_construction()
 
 
+def oidc_client_auth_from_settings(
+    settings: AuthSettings, secret_provider: SecretProvider | None
+) -> oidc.ClientAuthentication:
+    """The configured OIDC client credential, resolved and checked (BACKLOG #296).
+
+    The ONE construction, shared by :class:`AuthService` and ``messagefoundry verify --section
+    federation``, so the check resolves exactly what the engine sends. Only the configured method's
+    credential is resolved, which may call the ``[secrets]`` provider.
+
+    Raises :class:`SecretProviderError` for a reference that does not resolve or a credential that
+    resolves empty, and :class:`~messagefoundry.transports.signing.SigningError` for a key or
+    certificate that cannot be read, parsed or used with the configured algorithm. None of these
+    messages carries a credential.
+    """
+    if not settings.oidc_private_key_jwt:
+        secret = resolve_connector_secret(
+            secret_provider,
+            ref=settings.oidc_client_secret_ref,
+            literal=settings.oidc_client_secret,
+            label="[auth].oidc_client_secret",
+        )
+        # A reference that resolves empty would otherwise send no client credential at all.
+        if not secret:
+            raise SecretProviderError("[auth].oidc_client_secret resolved to an empty value")
+        return oidc.ClientSecretPost(secret)
+    key = resolve_connector_secret(
+        secret_provider,
+        ref=settings.oidc_client_private_key_ref,
+        literal=settings.oidc_client_private_key,
+        label="[auth].oidc_client_private_key",
+    )
+    audience = (
+        settings.oidc_issuer
+        if settings.oidc_client_assertion_audience == "issuer"
+        else settings.oidc_token_endpoint
+    )
+    if not key:
+        raise SecretProviderError("[auth].oidc_client_private_key resolved to an empty value")
+    # The settings validator guarantees both while oidc_enabled is set; `verify` can reach here with
+    # it off. Refused, so neither reaches the signer as an empty string.
+    if not settings.oidc_client_id or not audience:
+        raise ValueError(
+            "private_key_jwt needs oidc_client_id and the assertion audience "
+            f"(oidc_{settings.oidc_client_assertion_audience})"
+        )
+    return oidc.PrivateKeyJwtClientAuth(
+        client_id=settings.oidc_client_id,
+        audience=audience,
+        private_key=key,
+        algorithm=settings.oidc_client_assertion_algorithm,
+        private_key_password=settings.oidc_client_private_key_password,
+        key_id=settings.oidc_client_assertion_key_id,
+        certificate=settings.oidc_client_certificate,
+    )
+
+
 class AuthService:
     """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory."""
 
@@ -1950,7 +2010,7 @@ class AuthService:
             # BACKLOG #296: exactly one client credential is resolved, the one the configured method
             # sends. Under private_key_jwt the key is read and checked here, so a missing,
             # unreadable, weak or wrong-curve key refuses startup like an unresolvable secret.
-            self._oidc_client_auth = oidc.client_auth_from_settings(settings, secret_provider)
+            self._oidc_client_auth = oidc_client_auth_from_settings(settings, secret_provider)
             # Eager: a bad CA path or an unresolvable secret must refuse startup, exactly as the AD
             # bind password does. NO network I/O happens here — JwksCache opens no socket until its
             # first get_key — so an UNREACHABLE IdP still constructs cleanly (AC-8).
