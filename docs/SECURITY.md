@@ -590,7 +590,11 @@ marks the `store_privilege_preflight` audit row `over_grant_accepted`, and is na
 `enforcement = warn` every arm only warns. The key is the dial alone: since ADR 0186 every instance
 is a PHI instance. SQLite has no login, so nothing here applies to it.
 
-### Data-layer hops refuse cleartext on their defaults, except the Vault hops (ASVS 12.3.1 census)
+### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
+
+CORRECTED 2026-10-01: this heading read *"... on their defaults, except the Vault hops"*. Engine
+PR 1880 (vault BACKLOG #2317) gave the three Vault hops a scheme gate, so the exception is gone. The
+three Vault rows below say what changed.
 
 This census was read at engine commit `bca583f2a7` on 2026-09-30, under vault BACKLOG #2354. Three
 rows then changed in the same work, and each says so: the CLI row, the `DatabaseRef` row and, later,
@@ -616,15 +620,18 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS keyword or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS keyword) is refused |
 | `db_lookup` | `transports/database.py` `DatabaseLookupExecutor` | ODBC, SQL Server preset, `ApplicationIntent=ReadOnly` | `_build_dsn`, posture stamped by `RegistryRunner._build_lookup_executor` | refuses | No |
 | `DatabaseRef` reference sync | `pipeline/reference_sync.py` `database_source_dsn`, from `_load_database_source` and from `build_check` | ODBC, SQL Server preset | `_build_dsn`, with the engine's posture at sync time | refuses at `messagefoundry check`, dry-run, reload and every sync. `serve` start does not stop: its first sync fails and the set stays unloaded. CORRECTED: at `bca583f2a7` a sync read no posture and the escape was unclamped | No |
-| Vault KV secrets | `config/secretprovider_vault.py` | hvac over whatever scheme the address names | none on the scheme | an `http://` address is used as given | Off by default; once on, `http://` crosses in the clear. Vault BACKLOG #2317 |
-| Vault store key provider | `store/keyprovider_vault.py` | as above | none on the scheme | as above | as above; #2317 |
-| Vault Transit cipher | `store/crypto_transit.py` | as above | none on the scheme | as above | as above; #2317 |
+| Vault KV secrets | `config/secretprovider_vault.py` `_build_client` | hvac over the scheme the address names | a scheme gate, `transports/strict_requests.py` `_refuse_a_cleartext_vault_hop`, through the shared `insecure_hop_disposition`; run by `mount_strict_reply_adapter` at build and again before each send | refuses an `http://` address unless it is loopback and reached with no proxy. The hop holds no posture and has no escape, so it refuses the same way under `warn`. CORRECTED: at `bca583f2a7` this row read *"none on the scheme"* and *"an `http://` address is used as given"*; engine PR 1880 (vault BACKLOG #2317) added the gate | Off by default; once on, only a loopback `http://` address with no proxy crosses unencrypted |
+| Vault store key provider | `store/keyprovider_vault.py` `_build_client` | as above | as above | as above | as above |
+| Vault Transit cipher | `store/crypto_transit.py`, which builds its client through `store/keyprovider_vault.py` `_build_client` | as above | as above | as above | as above |
 | AD (LDAP) binds | `auth/ldap.py` `LdapAuthenticator` | LDAPS through `NarrowedTls`; plain LDAP for an `ldap://` address | verify-off refusal through `weakened_tls_escape_permitted`; an `ldap://` address is refused at settings load unless `[auth].ad_allow_insecure_ldap = true` and `[security].enforcement = warn` (`ServiceSettings`), and again at authenticator build | verify-off refuses. A plain `ldap://` bind refuses under `enforce`, where the opt-in is inert. Under `warn` it is honoured with a WARNING line and a `security_loosenings()` entry, and writes no audit row, like the other settings-scoped loosenings. CORRECTED: at `c31f0c37f9` this cell read *"`ad_allow_insecure_ldap = true` is honoured with no posture check, no audit line and no `security_loosenings()` entry"*; that was true then (vault BACKLOG #2354) | Off by default; `ldap://` needs the opt-in and `warn` |
 | Off-box log and audit forwarder (the audit tee in `store/audit_tee.py` writes through it) | `logging_setup.py` `_build_syslog_handler`; decided by `config/settings.py` `forward_hop_disposition` in `serve` | UDP, TCP or TLS syslog | the shared `insecure_hop_disposition` gradient | refuses a non-loopback UDP, TCP or verify-off collector unless `forward_hop_attested` | Off by default; the `udp` default is refused off loopback |
 
 **How the negatives were checked.** Each "no gate" or "not clamped" cell came from a search paired
 with a control that finds a gated site. Line counts, same files: `insecure_hop_disposition` is in 0
-lines of each Vault module and in 3 of `config/settings.py`. At `c31f0c37f9`, `ad_allow_insecure_ldap`
+lines of each Vault module and in 3 of `config/settings.py`. CORRECTED 2026-10-01, re-measured at
+`698a51bafa`: that zero still holds and no longer means no gate. The Vault provider modules reach
+the gate through `mount_strict_reply_adapter` (2 lines in each), and `transports/strict_requests.py`
+holds `insecure_hop_disposition` in 3 lines, the same count as the `config/settings.py` control. At `c31f0c37f9`, `ad_allow_insecure_ldap`
 was in 0 lines under `messagefoundry/auth/` and in 4 of `config/settings.py`; the clamp that closed
 that row added lines to both. At `bca583f2a7`, `active_hop_posture`
 was in 0 lines of `pipeline/reference_sync.py` and in 15 of `pipeline/wiring_runner.py`. The cluster modules hold 0
@@ -642,7 +649,8 @@ engine PR 1877.
 
 **Still open after this census.** At least these:
 
-- The three Vault hops need a scheme gate. That is vault BACKLOG #2317.
+- CORRECTED 2026-10-01: this list named the three Vault hops' missing scheme gate, vault BACKLOG
+  #2317. Engine PR 1880 closed it; see the Vault rows above.
 - The CLI commands in the third row refuse a weakened store even at `enforcement = warn`, because
   they pass no posture. At least `provision-admin`, `store provision-schema` and `check-privileges`
   pass one and keep the escape at `warn`. A site that needs the others on a dev store gives it a

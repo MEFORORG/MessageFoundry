@@ -151,6 +151,8 @@ def _loosening_names(store: StoreSettings) -> set[str]:
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
+            hostname_unchecked_hops=(),
+            query_credential_hops=(),
             unverified_db_hops=(),
             attested_hops=(),
             revocation_attested_hops=(),

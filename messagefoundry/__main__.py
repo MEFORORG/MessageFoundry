@@ -2394,6 +2394,8 @@ def _serve(args: argparse.Namespace) -> int:
         settings.secret_rotation,
         cleartext_hops=(),
         expiry_relaxed_hops=(),
+        hostname_unchecked_hops=(),
+        query_credential_hops=(),
         unverified_db_hops=(),
         attested_hops=(),
         revocation_attested_hops=(),
@@ -2406,7 +2408,9 @@ def _serve(args: argparse.Namespace) -> int:
         _seclog.warning(
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
-            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
+            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, tls_check_hostname, "
+            "url_query_credential, "
+            "generic-ODBC "
             "database TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
@@ -8317,6 +8321,8 @@ def _security(args: argparse.Namespace) -> int:
                 _rotation,
                 cleartext_hops=(),
                 expiry_relaxed_hops=(),
+                hostname_unchecked_hops=(),
+                query_credential_hops=(),
                 unverified_db_hops=(),
                 attested_hops=(),
                 revocation_attested_hops=(),
@@ -8342,7 +8348,9 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]); the per-connection "
-            "cleartext_accepted, tls_allow_expired, generic-ODBC database TLS, tls_hop_attested and "
+            "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
+            "generic-ODBC database TLS, "
+            "tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "

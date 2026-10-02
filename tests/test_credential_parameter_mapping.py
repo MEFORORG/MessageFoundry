@@ -430,8 +430,8 @@ def test_a_credential_parameter_lands_on_a_setting_the_redactor_covers(landing: 
         if key in NON_MATERIAL_DESTINATIONS:
             continue
         # Ask the REAL control about the destination the sentinel actually reached. For a credential
-        # parameter the whole value is secret; for a URL-bearing one only the userinfo is, and masking
-        # the whole URL would destroy the operator's view rather than protect it.
+        # parameter the whole value is secret; for a URL-bearing one the userinfo is, and the display
+        # mask withholds such a URL whole (CORRECTED: it used to keep the user, host and path).
         value = f"https://probeuser:{probe}@host.invalid/p" if landing.kind == "url" else probe
         if probe in str(redacted_settings({key: value}).get(key)):
             unmasked.append(key)
@@ -451,12 +451,19 @@ def test_a_credential_parameter_lands_on_a_setting_the_redactor_covers(landing: 
     [ln for ln in LANDINGS if ln.kind == "url"],
     ids=[f"{ln.factory}.{ln.param}" for ln in LANDINGS if ln.kind == "url"],
 )
-def test_masking_a_url_destination_does_not_destroy_the_operator_view(landing: Landing) -> None:
+def test_a_url_destination_with_userinfo_is_withheld_and_a_plain_one_is_not(
+    landing: Landing,
+) -> None:
     """THE ASYMMETRY on the URL arm, and it is not decoration.
 
-    A redactor that replaced every URL with ``***`` would satisfy the assertion above while silently
-    removing the account and host an operator needs to diagnose a connection -- a loss nothing would
-    report. The control must fail for the userinfo shape and KEEP PASSING for everything beside it.
+    A redactor that replaced every URL would satisfy the assertion above while silently mangling
+    ordinary configuration -- a loss nothing would report. The control must withhold the userinfo
+    shape and KEEP PASSING a URL with no credential unchanged.
+
+    CORRECTED (Manager decision on PR 1912, 2026-10-01): this test required the user, host and path
+    to survive beside a masked password. The display mask is now coarse and fail-closed: a URL that
+    may carry a credential is withheld whole, as ``<scheme>://<redacted>``, because every precise mask
+    tried disagreed with at least one URL reader. The scheme survives; the user and host do not.
     """
     probe = _next_sentinel()
     for key in landing.keys:
@@ -465,8 +472,8 @@ def test_masking_a_url_destination_does_not_destroy_the_operator_view(landing: L
         out = str(
             redacted_settings({key: f"https://probeuser:{probe}@host.invalid/p?q=1"}).get(key)
         )
-        assert "probeuser" in out and "host.invalid/p?q=1" in out, (
-            f"{key} lost the user, host or path: {out!r}. Only the secret is supposed to be removed."
+        assert out == "https://<redacted>", (
+            f"{key} rendered a URL with userinfo as {out!r}; it should be withheld whole."
         )
         plain = str(redacted_settings({key: "https://plain.invalid/path?q=1"}).get(key))
         assert plain == "https://plain.invalid/path?q=1", (

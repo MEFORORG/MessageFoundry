@@ -320,7 +320,9 @@ from messagefoundry.config.wiring import (
     accepted_cleartext_hops,
     attested_secure_hops,
     expiry_relaxed_hops,
+    hostname_unchecked_hops,
     load_config,
+    query_credential_hops,
     redacted_settings,
     revocation_attested_hops,
     unverified_generic_db_hops,
@@ -2221,18 +2223,22 @@ def create_app(
         if runner is not None:
             cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
             expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
+            hostname_hops = [name for name, _ in hostname_unchecked_hops(runner.registry)]
+            query_hops = [name for name, _ in query_credential_hops(runner.registry)]
             db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
             attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
             revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
         else:
-            cleartext_hops, expired_hops, db_hops = [], [], []
+            cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
+            query_hops = []
             attested_hops, revocation_hops = [], []
         loosenings_scope = (
             None
             if runner is not None
             else (
                 "settings only — no connection graph is loaded on this engine, so the per-connection "
-                "cleartext_accepted / tls_allow_expired / generic-ODBC-DATABASE-TLS / tls_hop_attested / "
+                "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
+                "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
                 "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
             )
         )
@@ -2251,6 +2257,8 @@ def create_app(
                 secret_rotation_settings,
                 cleartext_hops=cleartext_hops,
                 expiry_relaxed_hops=expired_hops,
+                hostname_unchecked_hops=hostname_hops,
+                query_credential_hops=query_hops,
                 unverified_db_hops=db_hops,
                 attested_hops=attested_hops,
                 revocation_attested_hops=revocation_hops,

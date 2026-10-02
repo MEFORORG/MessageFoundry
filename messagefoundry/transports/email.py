@@ -253,6 +253,7 @@ class EmailDestination(DestinationConnector):
                 ca_file=self.tls_ca_file,
                 check_hostname=self.tls_check_hostname,
                 trust_anchor_policy=config.trust_anchor_policy,
+                name=config.name,
             )
             if self.use_tls
             else None
