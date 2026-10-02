@@ -97,6 +97,10 @@ class HeldCrl:
     #: Every CRL block of that load. A reload needs them to prove the replacement supersedes each
     #: one; empty means unknown, and a reload then refuses rather than guess.
     blocks: tuple[CrlBlock, ...] = ()
+    #: The path as the operator configured it, for messages; ``path_key`` is the comparison form.
+    configured_path: str | None = None
+    #: How many reloads this context has taken for this file. Each one stays in its trust store.
+    reloads: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,20 +108,15 @@ class ReloadRefusal:
     """Why the file now at a held path was not applied to a running context (BACKLOG #299).
 
     ``fingerprint`` is the refused file's :func:`crl_fingerprint`, so a refusal stops applying the
-    moment the file changes again. ``restart_applies`` says whether a restart would load the file:
-    True when only the live context is in the way, such as a replacement no newer than the copy it
-    holds; False when the engine would refuse to start on the file too."""
+    moment the file changes again. ``remedy`` is what the operator does next, in the words both the
+    reload and the expiry monitor log. ``sticky`` is True when nothing but a change to the file can
+    alter the verdict, so the reload does not judge those bytes again; False for a refusal time can
+    lift, such as a CRL not yet in effect."""
 
     fingerprint: tuple[int, int]
     reason: str
-    restart_applies: bool
-
-    @property
-    def remedy(self) -> str:
-        """What the operator does next, in the words both the reload and the monitor log."""
-        if self.restart_applies:
-            return "Restart the engine to apply the file"
-        return "Fix the file: the engine would refuse to start on it too"
+    remedy: str
+    sticky: bool = True
 
 
 # Keyed by context, held weakly: an entry lives exactly as long as its context. A context may load
@@ -153,7 +152,7 @@ def record_crl_load(
     """Record that ``ctx`` now holds the CRL file ``crl_file``, whose judged bytes were ``pem``,
     whose soonest-expiring block is ``facts`` and whose blocks are ``blocks``. Called by
     ``harden_crl_check`` after a load succeeds."""
-    held = HeldCrl(_path_key(crl_file), crl_fingerprint(pem), facts, setting, blocks)
+    held = HeldCrl(_path_key(crl_file), crl_fingerprint(pem), facts, setting, blocks, crl_file)
     with _LOCK:
         _HELD[ctx] = (*_HELD.get(ctx, ()), held)
 
@@ -205,6 +204,11 @@ def reload_refusal(
     """The refusal recorded for the file at ``path`` whose bytes have ``fingerprint``, if any."""
     with _LOCK:
         refusal = _REFUSED.get(_path_key(path))
+    return _matching(refusal, fingerprint)
+
+
+def _matching(refusal: ReloadRefusal | None, fingerprint: tuple[int, int]) -> ReloadRefusal | None:
+    """``refusal`` when it was made about the bytes with ``fingerprint``, else ``None``."""
     return refusal if refusal is not None and refusal.fingerprint == fingerprint else None
 
 
@@ -240,8 +244,7 @@ class HeldCrlSnapshot:
     ) -> ReloadRefusal | None:
         """Why the file at ``path``, whose bytes have ``fingerprint``, was not applied to a running
         context, or ``None`` when no reload refused those bytes."""
-        refusal = self._refusals.get(_path_key(path))
-        return refusal if refusal is not None and refusal.fingerprint == fingerprint else None
+        return _matching(self._refusals.get(_path_key(path)), fingerprint)
 
     def unwatched(self, watched: Iterable[str | os.PathLike[str]]) -> list[str]:
         """The held paths that no entry of ``watched`` names, sorted, each once, in key form

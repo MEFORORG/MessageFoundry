@@ -28,7 +28,7 @@ import re
 import ssl
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -48,8 +48,12 @@ from messagefoundry.config.tls_policy import (
     build_verifying_client_context,
     harden_crl_check,
 )
+from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.crl_reload import (
+    FIX,
+    RESTART,
+    WAIT,
     CrlReloadRunner,
     ReloadOutcome,
     reload_replaced_crls,
@@ -85,6 +89,7 @@ class _Pki:
         lasts: datetime.timedelta,
         revoke: bool = False,
         delta: bool = False,
+        scope: bool = False,
     ) -> bytes:
         """A CRL issued ``issued`` ago (negative is in the future) that runs ``lasts`` from now."""
         builder = (
@@ -104,6 +109,20 @@ class _Pki:
             )
         if delta:
             builder = builder.add_extension(x509.DeltaCRLIndicator(1), critical=True)
+        if scope:
+            # A narrower scope OpenSSL scores lower for a leaf, so it would keep the held CRL.
+            builder = builder.add_extension(
+                x509.IssuingDistributionPoint(
+                    full_name=None,
+                    relative_name=None,
+                    only_contains_user_certs=False,
+                    only_contains_ca_certs=True,
+                    only_some_reasons=None,
+                    indirect_crl=False,
+                    only_contains_attribute_certs=False,
+                ),
+                critical=True,
+            )
         return builder.sign(self.key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
 
     def outbound_hop(self) -> ssl.SSLContext:
@@ -302,7 +321,7 @@ def test_the_alert_stays_while_any_held_copy_is_not_current(
     outcome = _reload(pki)
 
     assert outcome is not None and outcome.reloaded == 1
-    assert outcome.refusal is not None and outcome.refusal.restart_applies
+    assert outcome.refusal is not None and outcome.refusal.remedy == RESTART
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.cert_expiry"):
         assert _alerts(pki) == [5]
     assert "refused to apply" in caplog.text and "not recorded" in caplog.text
@@ -321,35 +340,51 @@ def _planted_bundle(pki: _Pki, tmp_path: Path) -> bytes:
 
 
 @pytest.mark.parametrize(
-    ("replacement", "restart_applies", "says"),
+    ("replacement", "remedy", "says"),
     [
-        (lambda p, _d: p.crl_pem(issued=10 * _DAY, lasts=-_DAY, revoke=True), False, "expired"),
-        (lambda p, _d: p.crl_pem(issued=_DAY, lasts=60 * _DAY, delta=True), False, "delta CRL"),
+        (lambda p, _d: p.crl_pem(issued=10 * _DAY, lasts=-_DAY, revoke=True), FIX, "expired"),
+        (lambda p, _d: p.crl_pem(issued=_DAY, lasts=60 * _DAY, delta=True), FIX, "delta CRL"),
         (
             lambda _p, _d: b"-----BEGIN X509 CRL-----\nnot base64\n-----END X509 CRL-----\n",
-            False,
+            FIX,
             "block 1",
         ),
-        (_planted_bundle, False, "not a CA certificate|does not already trust"),
+        (_planted_bundle, FIX, "does not already trust"),
         # Issued no later than the held copy: OpenSSL would go on choosing the held one.
-        (
-            lambda p, _d: p.crl_pem(issued=3 * _DAY, lasts=60 * _DAY, revoke=True),
-            True,
-            "issued after",
-        ),
+        (lambda p, _d: p.crl_pem(issued=3 * _DAY, lasts=60 * _DAY, revoke=True), RESTART, "choose"),
         # Issued later but ending sooner: the held copy could stand in once it lapsed.
-        (lambda p, _d: p.crl_pem(issued=_DAY, lasts=4 * _DAY, revoke=True), True, "runs at least"),
-        # Not yet in effect: OpenSSL would not use it yet.
-        (lambda p, _d: p.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True), True, "in effect"),
+        (lambda p, _d: p.crl_pem(issued=_DAY, lasts=4 * _DAY, revoke=True), RESTART, "choose"),
+        # A narrower scope: OpenSSL scores it below the held CRL and keeps using the held one.
+        # Measured by review: without the selection check this read as reloaded and changed nothing.
+        (
+            lambda p, _d: p.crl_pem(issued=_DAY, lasts=60 * _DAY, revoke=True, scope=True),
+            RESTART,
+            "same scope",
+        ),
+        # Not yet in effect: OpenSSL would not use it yet, and a restart now would break the hop.
+        (
+            lambda p, _d: p.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True),
+            WAIT,
+            "not in effect",
+        ),
     ],
-    ids=["expired", "delta", "unparseable", "planted-ca", "not-newer", "shorter", "future"],
+    ids=[
+        "expired",
+        "delta",
+        "unparseable",
+        "planted-ca",
+        "not-newer",
+        "shorter",
+        "scope",
+        "future",
+    ],
 )
 def test_a_bad_replacement_is_refused_and_the_old_copy_kept(
     pki: _Pki,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     replacement: object,
-    restart_applies: bool,
+    remedy: str,
     says: str,
 ) -> None:
     hop = pki.outbound_hop()
@@ -363,7 +398,8 @@ def test_a_bad_replacement_is_refused_and_the_old_copy_kept(
         again = _reload(pki)
 
     assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
-    assert outcome.refusal.restart_applies is restart_applies
+    assert outcome.refusal.remedy == remedy
+    assert outcome.refusal.sticky is (remedy != WAIT)
     assert re.search(says, outcome.refusal.reason), outcome.refusal.reason
     assert hop.cert_store_stats() == stats  # nothing reached the live context
     assert _accepts(hop, pki.server())  # and it still checks against the old copy
@@ -400,11 +436,19 @@ def test_the_superseding_rule() -> None:
     assert supersede_refusal(held, [_block("CN=a", 1, 30, b"new")], now=now) is None
     assert supersede_refusal(held, [_block("CN=a", 2, 5, b"old")], now=now) is None  # same CRL
     assert supersede_refusal(held, [_block("CN=a", 1, 5, b"new")], now=now) is None  # ends together
-    assert supersede_refusal(held, [_block("CN=b", 1, 30, b"new")], now=now)  # issuer dropped
-    assert supersede_refusal(held, [_block("CN=a", 1, 4, b"new")], now=now)  # ends sooner
-    assert supersede_refusal(held, [_block("CN=a", 2, 30, b"new")], now=now)  # not issued later
-    assert supersede_refusal(held, [_block("CN=a", -1, 30, b"new")], now=now)  # not in effect
-    assert supersede_refusal([], [_block("CN=a", 1, 30, b"new")], now=now)  # held unknown
+    rescoped = replace(_block("CN=a", 1, 30, b"new"), selection=(b"idp", None, frozenset()))
+
+    def waits(new: list[CrlBlock], against: list[CrlBlock] = held) -> bool:
+        verdict = supersede_refusal(against, new, now=now)
+        assert verdict is not None
+        return verdict[1]
+
+    assert not waits([_block("CN=b", 1, 30, b"new")])  # issuer dropped
+    assert not waits([_block("CN=a", 1, 4, b"new")])  # ends sooner
+    assert not waits([_block("CN=a", 2, 30, b"new")])  # not issued later
+    assert not waits([rescoped])  # same timing, a scope OpenSSL scores differently
+    assert not waits([_block("CN=a", 1, 30, b"new")], against=[])  # held copy unknown
+    assert waits([_block("CN=a", -1, 30, b"new")])  # not in effect yet: only time is missing
 
 
 def test_judge_every_crl_names_each_block(pki: _Pki) -> None:
@@ -438,3 +482,29 @@ def test_the_runner_reloads_off_the_loop_and_stops() -> None:
     asyncio.run(drive())
     assert len(seen) >= 2
     assert threading.main_thread().name not in seen
+
+
+def test_a_context_stops_taking_reloads_at_the_cap(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every reload stays in the trust store, so the count is bounded and a restart compacts it.
+    monkeypatch.setattr(crl_reload, "MAX_RELOADS", 1)
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+    assert (first := _reload(pki)) is not None and first.reloaded == 1
+
+    pki.crl.write_bytes(pki.crl_pem(issued=0.5 * _DAY, lasts=90 * _DAY, revoke=True))
+    second = _reload(pki)
+
+    assert second is not None and second.reloaded == 0 and second.refusal is not None
+    assert second.refusal.remedy == RESTART and "reloads" in second.refusal.reason
+    assert _accepts(hop, pki.server())
+
+
+def test_a_refusal_names_the_configured_path(pki: _Pki) -> None:
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(pki.crl_pem(issued=10 * _DAY, lasts=-_DAY))
+    outcome = _reload(pki)
+    assert outcome is not None and outcome.refusal is not None
+    assert repr(str(pki.crl)) in outcome.refusal.reason
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF

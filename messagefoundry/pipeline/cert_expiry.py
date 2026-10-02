@@ -464,7 +464,7 @@ def _judge_crl(
                     "Restore a valid CRL file before restarting: the engine refuses to start "
                     "on one it cannot parse",
                 )
-            elif (refused := held.refusal(cert.path, crl_fingerprint(pem))) is not None:
+            elif fingerprint is not None and (refused := held.refusal(cert.path, fingerprint)):
                 # BACKLOG #299: the reload pass tried the file on the running hop and refused it.
                 why = "that differs from the file, which the engine refused to apply to it"
                 remedy = f"Reason: {refused.reason}. {refused.remedy}"

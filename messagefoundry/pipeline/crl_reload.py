@@ -10,33 +10,44 @@ expiry alert say so. This module removes the need for the restart wherever a hop
 
 **How: add the new CRL to the live context.** Python's ``ssl.SSLContext`` can load a CRL but never
 unload one, and rebuilding each hop's context would need a seam per hop that most hops do not have.
-Adding is enough, because of how OpenSSL picks a CRL, measured on CPython 3.14 / OpenSSL 3.5.7: among
-the CRLs a store holds for one issuer it uses a current one, and among current ones the latest
-``thisUpdate``. A context holding a clean CRL and then given a newer one that revokes the peer refuses
-the peer, in either load order. So once the new CRL is in the store, OpenSSL uses it.
+Adding is enough, because of how OpenSSL picks a CRL. For one issuer it scores each CRL it holds: time
+validity, scope (the Issuing Distribution Point), Authority Key Identifier and unhandled critical
+extensions all count. Among equal scores it takes the latest ``thisUpdate``. Measured on CPython 3.14 /
+OpenSSL 3.5.7: a context holding a clean CRL and then given a newer one that revokes the peer refuses
+the peer, in either load order.
 
 **That holds only when the new file supersedes every CRL the context already holds.** For each CRL the
-running copy carries, the file must carry the same CRL, or one from the same issuer with a later
-``thisUpdate`` that is already in effect and a ``nextUpdate`` no earlier. Then no held CRL can ever be
-chosen over the file's, and the context checks exactly what the file says. A file that fails this, such
-as a rollback to an older CRL or one that drops an issuer, is refused here, and a restart applies it.
-The proof that one superseding step is enough for the next is transitivity: each held CRL is
-superseded by the file that replaced it, and that file by the next one.
+running copy carries, the file must carry the same CRL, or one from the same issuer that scores alike
+(:class:`~messagefoundry.pki.CrlBlock` ``selection``), with a later ``thisUpdate`` that is already in
+effect and a ``nextUpdate`` no earlier. Then no held CRL can ever be chosen over the file's, and the
+context checks exactly what the file says. A file that fails this, such as a rollback to an older CRL,
+one that drops an issuer, or one signed under a new key, is refused here, and a restart applies it.
+One superseding step is enough for the next by transitivity: each held CRL is superseded by the file
+that replaced it, and that file by the next one.
 
 **Every refusal keeps the old copy, and fails closed.** The replacement must first pass the rules a
 start applies (:func:`~messagefoundry.config.tls_policy.judge_crl_bytes`): every block parses, has a
 ``nextUpdate``, is not a delta CRL, and none has expired. Then it must carry no certificate the hop
 does not already trust (BACKLOG #1890). A load cannot be undone, so that is proved on a scratch context
-BEFORE the live one sees the bytes, and the live context loads a private copy of the judged bytes, never
-the operator's file a second time. A refusal is logged at ERROR once per file version, and recorded so
-the expiry monitor says why the hop's copy is still old (:func:`~messagefoundry.config.loaded_crls.
-record_reload_refusal`). The old copy then keeps its ``crl_expiry`` alert.
+BEFORE the live one sees the bytes. The live context then loads a private copy of the judged bytes in
+a directory only this account can write, never the operator's file a second time. There is no check
+after the live load: a certificate count read then races the lazy loading of a hashed root directory,
+and nothing found there could be undone anyway. A refusal is logged at ERROR once per file version and
+recorded, so the expiry monitor says why the hop's copy is still old. The old copy keeps its
+``crl_expiry`` alert.
 
-**What this does not reach.** At least these, each of which still needs a restart: a CRL block inside
-a CA bundle, which nothing records; a hop whose CRL load was not recorded (the Postgres store records
-none, and needs no reload: it builds a fresh context per pool connection, so a new connection reads
-the file); and a replacement this module refuses. A hop rebuilt by a config reload reads the file
-itself.
+**A context's trust store only grows.** Each reload adds the file's CRLs and nothing removes the old
+ones, so memory and per-handshake CRL scoring grow with every reload. :data:`MAX_RELOADS` bounds it: a
+context that has taken that many reloads for one file refuses the next, and a restart starts it afresh.
+
+**What this does not reach.** At least these. Each needs a restart, or for the first, a reconnect:
+
+* an established TLS connection, or a session resumed from an earlier handshake. A reload changes what
+  the NEXT full handshake checks; a long-lived MLLP connection from a newly revoked partner stays up;
+* a CRL block inside a CA bundle, which nothing records;
+* a hop whose CRL load was not recorded. The Postgres store records none, and needs no reload: it
+  builds a fresh context per pool connection, so a new connection reads the file;
+* a replacement this module refuses.
 
 **Off the event loop, on purpose.** :class:`CrlReloadRunner` runs each pass in a worker thread. The
 live load mutates a context the loop may be handshaking with. OpenSSL takes the trust store's lock both
@@ -56,7 +67,7 @@ import ssl
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from messagefoundry.config.loaded_crls import (
@@ -73,7 +84,11 @@ from messagefoundry.config.tls_policy import crl_label, judge_crl_bytes
 from messagefoundry.pki import CrlBlock
 
 __all__ = [
+    "FIX",
+    "MAX_RELOADS",
     "RELOAD_INTERVAL_SECONDS",
+    "RESTART",
+    "WAIT",
     "CrlReloadRunner",
     "ReloadOutcome",
     "reload_replaced_crls",
@@ -84,8 +99,20 @@ log = logging.getLogger(__name__)
 
 #: How often the engine looks for a replaced CRL file. A pass reads each held CRL file once and does
 #: nothing more unless a file changed, so a minute is cheap, and it bounds how long a revocation added
-#: to the file goes unenforced by a running hop.
+#: to the file goes unenforced by a new handshake on a running hop.
 RELOAD_INTERVAL_SECONDS = 60.0
+
+#: Reloads one context takes for one file before it refuses and asks for a restart. A daily CRL
+#: reaches it in about eight months, an hourly one in about ten days.
+MAX_RELOADS = 256
+
+#: The remedies a refusal carries. A refusal names exactly one, chosen where the refusal is made.
+RESTART = "Restart the engine to apply the file"
+FIX = "Fix the file: the engine would refuse to start on it too"
+WAIT = (
+    "Wait: the engine applies the file once its CRL takes effect. Do not restart before then, "
+    "because a hop that loads a CRL not yet in effect refuses every peer"
+)
 
 
 @dataclass(frozen=True)
@@ -101,32 +128,45 @@ class ReloadOutcome:
 
 def supersede_refusal(
     held: Sequence[CrlBlock], new: Sequence[CrlBlock], *, now: float
-) -> str | None:
-    """Why adding ``new`` to a context holding ``held`` would NOT leave it checking exactly ``new``, or
-    ``None`` when it would. The module docstring gives the rule and why it suffices."""
+) -> tuple[str, bool] | None:
+    """Why adding ``new`` to a context holding ``held`` would NOT leave it checking exactly ``new``,
+    or ``None`` when it would. The flag is True when the only thing missing is time: the file has a
+    superseding CRL that is not in effect yet. The module docstring gives the rule."""
     if not held:
-        return (
+        reason = (
             "the CRLs of the running copy were not recorded, so the engine cannot prove the file "
             "supersedes them"
         )
+        return reason, False
     when = datetime.datetime.fromtimestamp(now, tz=datetime.UTC)
     same = {block.fingerprint for block in new}
     for old in held:
         if old.fingerprint in same:
             continue
-        if any(
-            block.issuer == old.issuer
-            and old.this_update < block.this_update <= when
-            and block.next_update >= old.next_update
+        candidates = [
+            block
             for block in new
-        ):
+            if block.issuer == old.issuer
+            and block.selection == old.selection
+            and block.this_update > old.this_update
+            and block.next_update >= old.next_update
+        ]
+        if any(block.this_update <= when for block in candidates):
             continue
-        return (
-            f"it carries no CRL from issuer {old.issuer!r} that is already in effect, was issued "
-            f"after the one the running hop holds (thisUpdate {old.this_update.isoformat()}), and "
-            f"runs at least as long (nextUpdate {old.next_update.isoformat()}). A running hop can "
-            "only add CRLs, and OpenSSL would go on choosing the one it holds"
+        if candidates:
+            reason = (
+                f"its CRL from issuer {old.issuer!r} is not in effect until "
+                f"{min(b.this_update for b in candidates).isoformat()}"
+            )
+            return reason, True
+        reason = (
+            f"it carries no CRL from issuer {old.issuer!r} that OpenSSL would choose over the one "
+            f"the running hop holds (thisUpdate {old.this_update.isoformat()}, nextUpdate "
+            f"{old.next_update.isoformat()}). A superseding CRL must have a later thisUpdate, a "
+            "nextUpdate no earlier, and the same scope, signing key and critical extensions. A "
+            "running hop can only add CRLs"
         )
+        return reason, False
     return None
 
 
@@ -134,9 +174,8 @@ def _certificates_in(copy: Path, *, label: str) -> set[bytes]:
     """The DER of each certificate in the CRL file at ``copy``, read on a scratch context.
 
     A load into the live context cannot be undone, so this is where a planted certificate is found
-    (BACKLOG #1890). A non-CA certificate refuses outright: the live store's own list
-    (``get_ca_certs``) holds only CA certificates, so one could never be proved already trusted.
-    Raises ``ValueError`` led by ``label``."""
+    (BACKLOG #1890). A non-CA certificate refuses: the live store's own list (``get_ca_certs``) holds
+    only CA certificates, so one could never be proved already trusted. Raises ``ValueError``."""
     scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots: the count starts at zero
     scratch.load_verify_locations(cafile=str(copy))  # cafile= ONLY, as harden_crl_check says
     stats = scratch.cert_store_stats()
@@ -144,20 +183,28 @@ def _certificates_in(copy: Path, *, label: str) -> set[bytes]:
         raise ValueError(f"{label} loaded no CRL into a trust store")
     certificates = set(scratch.get_ca_certs(binary_form=True))
     if stats["x509"] != len(certificates):
-        raise ValueError(
-            f"{label} carries a certificate that is not a CA certificate. Give this setting a "
-            "bare CRL (BACKLOG #1890)"
+        raise _NotProvable(
+            f"{label} carries a certificate that is not a CA certificate, which a running hop "
+            "cannot prove it already trusts. Give this setting a bare CRL (BACKLOG #1890)"
         )
     return certificates
 
 
-def _apply(ctx: ssl.SSLContext, copy: Path, pem: bytes) -> None:
-    """Add the CRL file at ``copy`` to the live ``ctx``. Raises ``RuntimeError`` if the trust store
-    gained a certificate or the private copy changed, neither of which the checks before it allow."""
-    before = ctx.cert_store_stats()["x509"]
-    ctx.load_verify_locations(cafile=str(copy))  # cafile= ONLY: cadata= loads zero CRLs
-    if ctx.cert_store_stats()["x509"] != before or copy.read_bytes() != pem:
-        raise RuntimeError("the trust store changed in a way the checks before the load rule out")
+class _NotProvable(ValueError):
+    """A certificate in the file the reload cannot prove the hop already trusts. A start counts the
+    store instead, so it may accept what this refuses, and the remedy says so."""
+
+
+class _Refusals:
+    """The first refusal of a pass for one file, kept whole, and whether every one was sticky."""
+
+    def __init__(self) -> None:
+        self.first: tuple[str, str] | None = None
+        self.sticky = True
+
+    def add(self, reason: str, remedy: str, *, sticky: bool = True) -> None:
+        self.first = self.first or (reason, remedy)
+        self.sticky = self.sticky and sticky
 
 
 def _reload_path(
@@ -177,34 +224,35 @@ def _reload_path(
         clear_reload_refusal(path)
         return None
     prior = reload_refusal(path, fingerprint)
-    if prior is not None and not prior.restart_applies:
-        # Refused on the file's own content, which cannot change until the file does. Only a
-        # supersede refusal is retried, because a CRL not yet in effect comes into effect.
+    if prior is not None and prior.sticky:
+        # Nothing but a change to the file can alter this verdict, so these bytes are not judged
+        # again. A refusal time can lift is retried every pass.
         return ReloadOutcome(path, 0, prior)
-    setting = next((held.setting for _, held in stale if held.setting), None)
-    label = crl_label(path, setting)
-    reason: str | None = None
-    restart_applies = True
+    shown = next((h.configured_path for _, h in stale if h.configured_path), path)
+    label = crl_label(shown, next((h.setting for _, h in stale if h.setting), None))
+    refusals = _Refusals()
     reloaded = 0
-
-    def refuse(why: str, *, applies: bool) -> None:
-        nonlocal reason, restart_applies
-        reason = reason or why
-        restart_applies = restart_applies and applies
-
     try:
         facts, blocks = judge_crl_bytes(pem, label=label, now=now)
-        # The cheap rule first: a rollback refuses every context without touching a file.
-        verdicts: dict[tuple[CrlBlock, ...], str | None] = {}
+        # The cheap rules first: a rollback refuses every context without touching a file.
+        verdicts: dict[tuple[CrlBlock, ...], tuple[str, bool] | None] = {}
         ready: list[tuple[ssl.SSLContext, HeldCrl]] = []
         for ctx, held in stale:
+            if held.reloads >= MAX_RELOADS:
+                refusals.add(
+                    f"{label}: this hop has taken {held.reloads} CRL reloads, and each one stays in "
+                    "its trust store",
+                    RESTART,
+                )
+                continue
             if held.blocks not in verdicts:
                 verdicts[held.blocks] = supersede_refusal(held.blocks, blocks, now=now)
-            why = verdicts[held.blocks]
-            if why is None:
+            verdict = verdicts[held.blocks]
+            if verdict is None:
                 ready.append((ctx, held))
             else:
-                refuse(f"{label}: {why}", applies=True)
+                why, waiting = verdict
+                refusals.add(f"{label}: {why}", WAIT if waiting else RESTART, sticky=not waiting)
         if ready:
             with tempfile.TemporaryDirectory(prefix="mefor-crl-") as private:
                 # The live load reads this private copy of the judged bytes, never the operator's
@@ -214,47 +262,58 @@ def _reload_path(
                 certificates = _certificates_in(copy, label=label)
                 for ctx, held in ready:
                     if certificates and certificates - set(ctx.get_ca_certs(binary_form=True)):
-                        refuse(
+                        refusals.add(
                             f"{label} carries a certificate this hop does not already trust; "
                             "loading it would make it a trust anchor. Give this setting a bare "
                             "CRL (BACKLOG #1890)",
-                            applies=False,
+                            FIX,
                         )
                         continue
-                    try:
-                        _apply(ctx, copy, pem)
-                    except RuntimeError:
-                        log.critical(
-                            "crl_reload: %s changed a running hop's trust store unexpectedly "
-                            "while it was being applied. Restart the engine",
-                            label,
-                            exc_info=True,
-                        )
-                        refuse(f"{label}: the reload failed; restart the engine", applies=False)
-                        continue
-                    replaced = HeldCrl(held.path_key, fingerprint, facts, held.setting, blocks)
-                    if replace_held_copy(ctx, held, replaced):
-                        reloaded += 1
-    except ValueError as exc:
-        # The file fails a rule a start applies, so a restart would refuse it too.
-        refuse(str(exc), applies=False)
+                    ctx.load_verify_locations(
+                        cafile=str(copy)
+                    )  # cafile= ONLY: cadata= loads no CRL
+                    reloaded += replace_held_copy(
+                        ctx,
+                        held,
+                        replace(
+                            held,
+                            fingerprint=fingerprint,
+                            facts=facts,
+                            blocks=blocks,
+                            reloads=held.reloads + 1,
+                        ),
+                    )
+    except _NotProvable as exc:
+        refusals.add(
+            str(exc),
+            "Give this setting a bare CRL. A restart applies the file only if the hop already "
+            "trusts that certificate",
+        )
+    except (ValueError, ssl.SSLError) as exc:
+        # The file fails a rule a start applies, or OpenSSL will not load it, so a restart would
+        # refuse it too. An SSLError is an OSError, so it is caught before the clause below.
+        refusals.add(f"{label}: {exc}" if isinstance(exc, ssl.SSLError) else str(exc), FIX)
+    except OSError as exc:
+        # The private copy could not be written: nothing about the file, so retry next pass.
+        refusals.add(f"{label}: the reload could not stage the file ({exc})", RESTART, sticky=False)
     if reloaded:
         log.info(
             "crl_reload: applied %s to %d running TLS context(s) without a restart", label, reloaded
         )
-    if reason is None:
+    if refusals.first is None:
         clear_reload_refusal(path)
         return ReloadOutcome(path, reloaded, None)
-    refusal = ReloadRefusal(fingerprint, reason, restart_applies)
+    reason, remedy = refusals.first
+    refusal = ReloadRefusal(fingerprint, reason, remedy, refusals.sticky)
     record_reload_refusal(path, refusal)
     if prior is None or prior.reason != reason:
-        # Once per file version: the pass repeats every minute, and the monitor carries it after.
+        # Once per file version: a retried pass repeats every minute, and the monitor carries it.
         log.error(
             "crl_reload: refused to apply the replaced CRL file to %d running TLS context(s), "
             "which keep the copy they hold: %s. %s",
             len(stale) - reloaded,
             reason,
-            refusal.remedy,
+            remedy,
         )
     return ReloadOutcome(path, reloaded, refusal)
 
@@ -307,14 +366,16 @@ class CrlReloadRunner:
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
-        """Signal the loop and await its exit (idempotent)."""
+        """Signal the loop and await its exit (idempotent).
+
+        The task is NOT cancelled. A cancel would return at once while the worker thread, which
+        cannot be cancelled, went on loading CRLs into live contexts after the engine stopped, and
+        could overlap the pass of a runner started next. So a pass in flight finishes first."""
         self._stop.set()
         task = self._task
         self._task = None
         if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await task
 
     async def _run(self) -> None:
         # Sleep first: every context was just built from the file as it is now.

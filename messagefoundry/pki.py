@@ -36,7 +36,6 @@ __all__ = [
     "CrlFacts",
     "judge_every_crl",
     "read_crl_facts",
-    "read_every_crl_facts",
     "read_soonest_crl_facts",
     "soonest_crl",
     "ca_chain_to_pem",
@@ -161,7 +160,7 @@ def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
 
     Tolerates certificate blocks in the same file: the FIRST ``X509 CRL`` block is read and any
     certificate blocks are skipped. So this judges one CRL, never a whole file: a file-level caller
-    wants :func:`read_every_crl_facts` or :func:`read_soonest_crl_facts`. ``harden_crl_check`` is
+    wants :func:`judge_every_crl` or :func:`read_soonest_crl_facts`. ``harden_crl_check`` is
     stricter again, and refuses a file whose certificates the hop does not already trust (BACKLOG
     #1890).
 
@@ -226,44 +225,40 @@ def read_soonest_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     raise ValueError(_NO_CRL)
 
 
-def read_every_crl_facts(pem: bytes, *, now: float) -> list[CrlFacts]:
-    """The facts of EVERY CRL in ``pem``, in file order, refusing any block it cannot judge.
+@dataclass(frozen=True)
+class CrlBlock:
+    """One CRL in a file, in the terms OpenSSL uses to choose between CRLs (BACKLOG #299).
 
-    The strict sibling of :func:`read_soonest_crl_facts`, for the context builder
-    (``harden_crl_check``, BACKLOG #299). The monitor skips a block it cannot judge so one bad block
-    cannot hide a sibling that is about to lapse. A context build must not skip it: OpenSSL loads
-    that block too, and a CRL with no ``nextUpdate`` is one OpenSSL treats as never expiring. So
-    here any such block raises, naming its position, and a file with no CRL raises as
+    A running context can only gain CRLs. For one issuer, OpenSSL first scores each CRL it holds,
+    and a CRL scores lower when it is out of time, when its scope (the Issuing Distribution Point)
+    or its Authority Key Identifier does not fit, or when it carries a critical extension OpenSSL
+    does not handle. Among equal scores it takes the latest ``thisUpdate``. So ``selection`` holds
+    the scope, the key identifier and the critical extension OIDs, and two CRLs score alike only when
+    those match. ``fingerprint`` is the SHA-256 of the CRL's DER, so an unchanged CRL is recognised
+    however its PEM is wrapped."""
+
+    issuer: str
+    this_update: datetime.datetime
+    next_update: datetime.datetime
+    fingerprint: bytes
+    selection: tuple[bytes | None, bytes | None, frozenset[str]] = (None, None, frozenset())
+
+
+def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]]:
+    """The facts and the :class:`CrlBlock` of EVERY CRL in ``pem``, in file order, refusing any block
+    it cannot judge. One parse per block.
+
+    The strict sibling of :func:`read_soonest_crl_facts`, for a context load (``harden_crl_check``)
+    and the running-hop reload (BACKLOG #299). The monitor skips a block it cannot judge so one bad
+    block cannot hide a sibling that is about to lapse. A context load must not skip it: OpenSSL
+    loads that block too, and a CRL with no ``nextUpdate`` is one OpenSSL treats as never expiring.
+    So here any such block raises, naming its position, and a file with no CRL raises as
     :func:`read_crl_facts` does.
 
     **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it
     OpenSSL was measured to use a newer delta CRL as if it were complete. Revocations listed only
     in the base CRL were then dropped, and a revoked client was accepted. Give the setting base
     CRLs only."""
-    return [facts for facts, _ in judge_every_crl(pem, now=now)]
-
-
-@dataclass(frozen=True)
-class CrlBlock:
-    """One CRL in a file, in the terms OpenSSL uses to choose between CRLs (BACKLOG #299).
-
-    A running context can only gain CRLs. Among the CRLs it holds for one issuer, OpenSSL uses a
-    current one with the latest ``thisUpdate``. So whether a replacement file can be added to a live
-    context, and leave that context judging exactly what the file says, turns on these fields.
-    ``fingerprint`` is the SHA-256 of the CRL's DER, so an unchanged CRL is recognised however its
-    PEM is wrapped."""
-
-    issuer: str
-    this_update: datetime.datetime
-    next_update: datetime.datetime
-    fingerprint: bytes
-
-
-def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]]:
-    """:func:`read_every_crl_facts`, with each CRL's :class:`CrlBlock` beside its facts.
-
-    The same refusals, from one parse of each block. A context load that records its copy
-    (``harden_crl_check``) and the running-hop reload both need the blocks (BACKLOG #299)."""
     blocks = list(_crl_blocks(pem))
     if not blocks:
         raise ValueError(_NO_CRL)
@@ -277,20 +272,38 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
                     "it is a delta CRL, which OpenSSL would read as a complete CRL and so drop "
                     "every revocation listed only in its base CRL; give base CRLs only"
                 )
+            judged.append(
+                (
+                    _crl_facts(crl, nxt, now),
+                    CrlBlock(
+                        issuer=crl.issuer.rfc4514_string(),
+                        this_update=crl.last_update_utc,
+                        next_update=nxt,
+                        fingerprint=crl.fingerprint(hashes.SHA256()),
+                        selection=_selection(crl),
+                    ),
+                )
+            )
         except ValueError as exc:
             raise ValueError(f"{where} cannot be judged: {exc}") from exc
-        judged.append(
-            (
-                _crl_facts(crl, nxt, now),
-                CrlBlock(
-                    issuer=crl.issuer.rfc4514_string(),
-                    this_update=crl.last_update_utc,
-                    next_update=nxt,
-                    fingerprint=crl.fingerprint(hashes.SHA256()),
-                ),
-            )
-        )
     return judged
+
+
+def _selection(
+    crl: x509.CertificateRevocationList,
+) -> tuple[bytes | None, bytes | None, frozenset[str]]:
+    """What OpenSSL scores a CRL on besides time and issuer; :class:`CrlBlock` says why."""
+    scope: bytes | None = None
+    key_id: bytes | None = None
+    critical: set[str] = set()
+    for ext in crl.extensions:
+        if ext.critical:
+            critical.add(ext.oid.dotted_string)
+        if isinstance(ext.value, x509.IssuingDistributionPoint):
+            scope = ext.value.public_bytes()
+        elif isinstance(ext.value, x509.AuthorityKeyIdentifier):
+            key_id = ext.value.key_identifier
+    return scope, key_id, frozenset(critical)
 
 
 def _is_delta_crl(crl: x509.CertificateRevocationList) -> bool:
