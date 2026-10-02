@@ -67,6 +67,9 @@ _CLI_ENGINE = frozenset(
         "messagefoundry.logging_setup",
         "messagefoundry.odbc_env",
         "messagefoundry.redaction",
+        # Eager on purpose (vault BACKLOG #2700): `serve` and `supervise` call it as their first
+        # statement, ahead of their own lazy imports. Stdlib and `controlchars` only.
+        "messagefoundry.remotedebug",
         "messagefoundry.secretscrub",
     }
 )

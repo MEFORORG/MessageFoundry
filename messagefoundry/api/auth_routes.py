@@ -1318,8 +1318,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             require_step_up_action(STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY, Permission.USERS_MANAGE)
         ),
     ) -> SimpleMessage:
-        """Bind the account to an IdP ``sub`` under the configured issuer, or rebind it. A rebind
-        revokes the account's sessions with the old binding. The body carries the pair the caller
+        """Bind the account to an IdP ``sub`` under the configured issuer, or rebind it. Either
+        one revokes the account's sessions (vault BACKLOG #2609). The body carries the pair the caller
         saw, and a stored pair that differs is refused with nothing changed (BACKLOG #2026). 404 for
         an unknown user, 409 on a conflict or a changed pair, 400 for every other refusal,
         including the caller's own account."""
@@ -1348,10 +1348,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 else status.HTTP_400_BAD_REQUEST
             )
             raise HTTPException(code, detail) from exc
-        if bound.previous_subject is None and bound.previous_issuer is None:
-            return SimpleMessage(detail="federated identity bound")
+        first = bound.previous_subject is None and bound.previous_issuer is None
         return SimpleMessage(
-            detail=f"federated identity rebound; revoked {bound.sessions_revoked} session(s)"
+            detail=f"federated identity {'bound' if first else 'rebound'}; "
+            f"revoked {bound.sessions_revoked} session(s)"
         )
 
     @app.delete("/users/{user_id}/federated-identity", response_model=SimpleMessage)

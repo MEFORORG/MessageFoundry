@@ -210,11 +210,14 @@ async def test_a_row_with_no_directory_id_is_refused_unasked(
     await store._db.execute(
         "UPDATE users SET directory_object_id = NULL WHERE id = ?", (e.user_id,)
     )
-    await store._db.commit()
     if bound:
-        await store.set_user_federated_subject(
-            e.user_id, "https://idp.test.invalid", "synthetic-sub"
+        # Straight to the columns, like the id above. The store's bind ends the account's sessions
+        # (vault BACKLOG #2609), and this leg needs the session that owes the factor.
+        await store._db.execute(
+            "UPDATE users SET oidc_issuer = ?, oidc_subject = ? WHERE id = ?",
+            ("https://idp.test.invalid", "synthetic-sub", e.user_id),
         )
+    await store._db.commit()
     code = totp.totp(e.secret, now=_T1)
 
     refused = await e.service.verify_mfa(e.token, code)

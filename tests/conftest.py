@@ -15,20 +15,25 @@ asyncio_default_fixture_loop_scope = "session"), which removes the per-test even
 from __future__ import annotations
 
 import atexit
+import functools
+import inspect
 import logging
 import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 from tests._root_logging import root_logging_restored
+
+if TYPE_CHECKING:
+    from messagefoundry.config.wiring import _WinConfigSourceProbes
 
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
@@ -181,27 +186,92 @@ def _force_aad_bind_when_requested() -> Iterator[None]:
         crypto.AesGcmCipher.__init__ = orig_init  # type: ignore[method-assign]
 
 
+#: The one account in the clean read below: it owns every path and it is the engine's own user.
+_SUITE_SID = "S-1-5-21-1-2-3-1001"
+
+
+def _clean_config_source_probes() -> _WinConfigSourceProbes:
+    """Windows config-source readers that report every path clean: owned by the engine's own
+    account, with an access list that grants nobody write."""
+    from messagefoundry.config.wiring import _WinConfigSourceProbes, _WinPathSecurity
+
+    clean = _WinPathSecurity(owner_sid=_SUITE_SID, aces=())
+    return _WinConfigSourceProbes(
+        self_sid=_SUITE_SID, read_path=lambda _path: clean, owner_in_admins=lambda _sid: False
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _allow_insecure_config_source_in_tests() -> Iterator[None]:
+def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[[Path], None] | None]:
     """The suite loads sample/harness configs from the repo checkout, which is intentionally
     user-writable — and on the Windows CI runner the default workspace ACL grants ``BUILTIN\\Users``
-    write, so the SEC-003 config-source trust guard would fail-closed on every config load. Set the
-    documented dev/test escape (``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``) so the guard downgrades its
-    production refusal to a warning here. Scoped to win32 only: POSIX checkouts aren't group/world-
-    writable, so the POSIX refusal tests must keep seeing the escape OFF. The guard's own Windows
-    refusal test pins the escape back OFF to assert the fail-closed path. Never set in production."""
+    write, so the SEC-003 config-source trust guard would fail-closed on every config load.
+
+    So on win32 only, the config-source gate's OWN call (``_assert_safe_config_source_windows``) runs
+    the real check over readers that report a clean owner and access list. The check still runs and
+    still decides. A test of the gate asks for the real call back with
+    ``real_config_source_readers``, which this fixture yields (``None`` off win32). Scoped to win32
+    because a POSIX checkout is not group/world-writable, so the Linux leg runs the real check in
+    every test. The anchor-path fixture below is scoped the same way.
+
+    **Only the gate's call is replaced, never ``_win32_config_source_probes`` itself.** Those readers
+    are shared: ``messagefoundry.restricted_file`` reads a new file's access list back through them.
+    This fixture first replaced the readers for the whole session, and every restricted create on
+    Windows then compared the list it asked for with the stand-in's and refused.
+
+    This used to set ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` for the whole session. Vault BACKLOG #2599
+    clamped that escape: it is honoured only with ``MEFOR_SECURITY_ENFORCEMENT=warn`` beside it, and
+    setting the dial for a whole session would move every default-posture test to ``warn``.
+
+    A child process does not inherit this stand-in and runs the real check. A child that loads from
+    ``tmp_path`` passes it: pytest makes that directory with mode ``0o700``, which on Windows is an
+    access list of SYSTEM, Administrators and the owner alone, whatever ``%TEMP%`` grants (measured
+    2026-10-01, Python 3.14). A child that loads from the checkout needs both variables in its own
+    environment, as ``harness.load.failover.EngineNode`` sets them.
+
+    The web console suite's conftest installs the same kind of stand-in, and one ``pytest`` run can
+    load both. So the real call is found with ``inspect.unwrap``, and each stand-in records what
+    it replaced, or this fixture would capture the other suite's stand-in as "real"."""
     if sys.platform != "win32":
-        yield
+        yield None
         return
-    prev = os.environ.get(INSECURE_CONFIG_SOURCE_ESCAPE_ENV)
-    os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = "1"
+    import messagefoundry.config.wiring as wiring
+
+    real = inspect.unwrap(wiring._assert_safe_config_source_windows)
+    # A stand-in that forgot to record what it replaced would be captured here as "real", and the
+    # tests of the real access list would then pass without reading one.
+    if Path(real.__code__.co_filename) != Path(wiring.__file__):
+        raise RuntimeError(
+            "the Windows config-source check found here is not the engine's own: a stand-in was "
+            "installed without functools.wraps over the call it replaced"
+        )
+    probes = _clean_config_source_probes()
+
+    @functools.wraps(real)
+    def check_over_clean_readers(directory: Path) -> None:
+        wiring._enforce_windows_config_source(directory, probes)
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(wiring, "_assert_safe_config_source_windows", check_over_clean_readers)
     try:
-        yield
+        yield real
     finally:
-        if prev is None:
-            os.environ.pop(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, None)
-        else:
-            os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = prev
+        patch.undo()
+
+
+@pytest.fixture
+def real_config_source_readers(
+    monkeypatch: pytest.MonkeyPatch,
+    _read_the_checkout_as_a_clean_config_source: Callable[[Path], None] | None,
+) -> None:
+    """Put the gate's real Windows call back for one test, so it reads through
+    ``_win32_config_source_probes``: the real access list, or the readers a test hands it. A no-op
+    off win32, where the session fixture above installs nothing."""
+    if _read_the_checkout_as_a_clean_config_source is not None:
+        monkeypatch.setattr(
+            "messagefoundry.config.wiring._assert_safe_config_source_windows",
+            _read_the_checkout_as_a_clean_config_source,
+        )
 
 
 #: The env gates that put a session against a live server-DB container. CI sets one of them together
@@ -257,7 +327,7 @@ def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
     stubbed: ``tests/test_anchor_path.py`` calls ``anchor_path.anchor_path_verdict`` directly, and
     its preflight receipts put the real function back. POSIX ``tmp_path`` is a trusted chain (a sticky
     ``/tmp`` holding the runner's own directory), so the Linux leg runs the real check in every
-    anchor test. The insecure-config escape above is scoped to win32 the same way."""
+    anchor test. The config-source readers above are scoped to win32 the same way."""
     if sys.platform != "win32":
         yield
         return
@@ -373,6 +443,23 @@ def _quiesce_background_loggers_at_teardown(
     finally:
         # TEARDOWN: drop late emits at the source for the rest of the teardown/next-setup window.
         _quiesce_targets()
+
+
+@pytest.fixture
+def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the PROCESS reading ``GET /security/posture`` takes to the hardened launch (vault
+    BACKLOG #2700).
+
+    The route reports whether the interpreter it runs in accepts an injected script, and under
+    pytest that follows how pytest was started. OPT-IN, for a test whose subject is the SETTINGS
+    posture and which asserts the exact list. ``tests/test_remote_debug_guard.py`` covers the
+    other readings."""
+    from messagefoundry.remotedebug import RemoteDebugPosture
+
+    monkeypatch.setattr(
+        "messagefoundry.api.app.remote_debug_posture",
+        lambda: RemoteDebugPosture(interpreter_enabled=False, guard_installed=False),
+    )
 
 
 @pytest.fixture

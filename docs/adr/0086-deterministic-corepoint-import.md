@@ -199,6 +199,224 @@ At least these gaps remain:
 
 Building the other tree, and the flow the scan cannot see, is step 2 of #313.
 
+**(b‴) AMENDMENT 2026-09-30, REVISED 2026-10-01 — each handle becomes a Python local, in a fully
+understood list only (BACKLOG #313, step 2).** The owner ruled on 2026-09-26 for an importer-only fix:
+no engine change and no change to ADR 0001. A Handler can already build and send a second `Message`
+(`samples/config/IB_RADIOLOGY_SR.py` does).
+
+**The whole-list gate (Manager decision, 2026-10-01).** Before a list renders, the importer decides
+once whether the WHOLE list is fully understood. It is only when every element in it, at every
+depth, is on this allow-list, and each statement's `@Data` is exactly the canonical spelling of its
+verb's one shape, character for character:
+
+| Element | The one shape it is read in |
+|---|---|
+| `MsgTreeCopy` (a plain clone) | keyword verb, handle, path `/`, the word `to`, handle, path `/` |
+| `MsgCreate` | keyword verb, handle, `as`, a caret-form type literal, `version`, a `2.x` or `2.x.y` literal |
+| `ItemCopy`, `ItemAppend` | keyword verb, a quoted value, `to`, handle, a writable HL7 field path |
+| `ItemClear` | keyword verb, handle, a writable HL7 field path |
+| `MsgLog` | keyword verb, one handle |
+| `MsgSend` | keyword verb, one handle, `to connection`, a non-blank destination literal |
+| `<Block>` | no label: `@Data` absent or empty |
+| a surely disabled step | a `<Line>` or `<Block>` above with `@Disabled` of `1`, `true` or `yes` |
+| `<List>` | no attribute; flattened |
+
+Each statement is a `<Line>` whose only attribute is `@Data`. The verb is a `keyword` span spelled
+exactly so, and connectives are unstyled words. The canonical spelling quotes each span class with
+`'`, puts one space between tokens, and puts a path span directly after its handle span; any other
+spacing, quoting or adjacency is not understood. A written value is printable ASCII with no `"`,
+`&`, `<`, `>` or HL7 delimiter (`|`, `^`, `~`, `\`). A handle is an `input-handle` or `other-handle`
+span matching `%` plus up to 40 ASCII letters, digits and underscores. A field path is `/SEG-F`,
+optionally with up to two more `-n` coordinates, on a single-occurrence segment and never MSH-1 or
+MSH-2. A `(...)` annotation after it may carry a mode or a repetition, and no export is known to
+write the dotted form, so neither is understood. A `<Block>` label is never read: whether Corepoint
+runs a label that is a statement is not known, and no word list tells prose from a verb. Spans
+carry only plain text: no nesting, no entity, no attribute but `class`. Across the list, no two
+handle spellings may differ only in case, each handle carries one span class everywhere, there is
+at most one input handle, and no clone or `MsgCreate` writes the input. The list's own tag is
+exactly `ActionList`, every element enclosing it is a `<Package>`, and the list and each of those
+carry only `Name` and `Desc`. In the list and around it, tags are matched exactly, so a namespaced
+or differently cased tag is not understood. A
+list nested more than 25 `<List>` and `<Block>` levels deep is not understood either, so a depth
+step 1 refuses is refused the same way.
+
+**In a package that may call any list, no list is fully understood.** A called list runs when and
+as often as its caller runs it. The router forwards to every handler, so it cannot express that.
+The call check asks one question of every element in the file: may it call a list? It may when its
+tag is `Call`. That one tag is read as step 1 reads it, on the local name and in any case. It may
+also when any string it holds names a call verb. Every string is read: the tag, each attribute's
+name and value, and the text in and after the element. Each string is read three ways: raw, with
+the markup stripped, and span by span with the markup stripped. The last two are how step 1 takes a
+verb from `@Data`. Only the letters `a` to `z` count, after lower-casing, so `Action_List_Call`
+and the `action-list-call-pass` span class name a call too. A string on an element that only
+mentions a call closes the gate as well. The check does not see an XML comment or a processing
+instruction, because the parser drops both, for step 1 too.
+
+**Closing the gate is not free.** Every list in that package then renders as step 1 renders it,
+with the gaps *The cost* names below. A list the open gate would refuse at a send may send `msg`
+there under step 1. So a mention costs more than a hand-finish. The check is eager all the same: a
+called list sent for every message is the worse error, and step 1's gaps are known and recorded.
+
+**No construct is on the list:** no `If`, `ElseIf`, `Else`, `Case`, `ChooseFrom`, `Matching`,
+`ForEach`, `Loop`, `While`, `Try`, `Catch`, `Call`, `ActionListExit` or other exit, and no
+unmodelled element, anywhere in the list. At least these also make the list NOT fully understood:
+a lowercase or variant verb, a `description`, `comment` or `detail` span on a statement line, any
+attribute but the ones above (`Enabled`, `Comment`, unknown names), a markup-free statement, a path
+such as `//ADT`, a path annotation, and any `<Block>` label. When in doubt, it is not.
+*Corrected 2026-10-01 (code review of the gate, round 2):* a `<Block>` with a prose label, a path
+with a `(...)` annotation, a dotted path, a list another list calls, and a list nested in another
+list's construct each opened the gate. A label such as `While x` or a path such as
+`/PID-8 (replace all)` passed the word rules, and a called sub-list became a handler that built and
+sent its message for every inbound message.
+*Corrected 2026-10-01 (Lander QA on f0a62ef70a):* the call check read only the raw attribute
+value. So `ActionList&#67;all`, `ActionList&#x43;all` and `ActionList<b></b>Call` each left the gate
+open while step 1 read a call. A sub-list called under an `If` then sent its message for every
+inbound message, where step 1 raises. The whole value stripped is not enough alone: after an
+unclosed `&#x`, the whole value loses the verb and only the span still holds it. The code review of
+that repair widened the check twice more: from attribute values to every string, and from the
+verb's spelling to its letters. A call named by an element tag, an attribute name, element text or
+a call-marking span class had left the gate open, though step 1 reads none of those as a call. The
+same audit found the list's own tag was not matched exactly, so `<actionlist>` and a namespaced
+`<q:ActionList>` were understood. No wrong delivery is known from that. The gate now refuses both.
+
+**A list that is not fully understood renders exactly as step 1 renders it,** byte for byte, with the
+same summary counts: the importer runs step 1's code path on it, untouched, so there is no partial
+binding. The gaps (b″) names stay as they are for such a list.
+
+**In a fully understood list,** the importer walks the statements in order:
+
+| Corepoint statement | Generated Python | When |
+|---|---|---|
+| the input handle | `msg` | the list's one `input-handle` |
+| `MsgTreeCopy <src>/ to <dst>/` | `<dst>_msg = <src local>.copy()` | `<src>` holds a local here; else a TODO, and `<dst>` is unknown |
+| `MsgCreate <handle> as "ADT^A04" version "2.5.1"` | `<handle>_msg = Message.parse("MSH\|^~\\&\|...")` | always (the gate checked the type and version) |
+| `ItemCopy`/`ItemClear`/`ItemAppend` on `<handle>/path` | `set_field(<local>, ...)` | `<handle>` holds a local here; else a TODO |
+| `MsgSend <handle>` | `sends.append(Send(dest, <local>))` | `<handle>` holds a local here; else the step 1 raise |
+
+Each local is the handle's name, lower-cased, without the `%`, suffixed `_msg`. The skeleton holds
+the default encoding characters, the type in MSH-9 and the version in MSH-12, and nothing else. It
+is built through the `Message` API and emitted as one literal. A write to a built message maps only
+onto its MSH; a write to another segment is a TODO, because `Message.set` raises on a segment the
+skeleton lacks. **A write to a handle after a send of it is a TODO,** because a `Send` holds the
+object, so the write would otherwise change the message already sent. `[pipeline].snapshot_on_send`
+(ADR 0104) defaults to on in service settings and would snapshot it, but it can be turned off and a
+handler called directly holds the live object, so the importer does not rely on it. That was the
+one fail-open of round 3 inside the open gate. **Any write the binder declines leaves its handle
+unknown from there,** so a later send of it raises rather than deliver the message without the
+write. *Corrected 2026-10-01 (code review of the gate):* a declined write to a built message's
+non-MSH segment kept the handle, and its send delivered the bare skeleton where step 1 raised.
+
+**The cost.** Any list holding a construct, or anything the gate does not read, is finished by hand
+exactly as under step 1. Step 1's gaps stay with such a list: a send of a clone may still send `msg`
+where its flow-insensitive scan holds the clone, and a write to the input after a send of it still
+lands on `msg`, which only `snapshot_on_send` keeps out of the sent message. Step 2 helps only
+straight-line lists, and the canonical-spelling rule is strict: an export whose labels are wrapped in
+spans, or whose spacing differs at all, gets no help. That is deliberate.
+
+**History: why a gate, after six rounds.** Step 2 first walked every construct, tracking which local
+each handle held on each path and joining the paths. Each of six review rounds on PR 1900 built a
+shape in which the handler sent a message Corepoint never sent, and most were introduced by the
+previous round's repair: a call that stopped unbinding a handle it passed (9b8f13481); name matching
+that missed `-`, `.`, non-ASCII and `%`-free handles (d401cdb5b); a branch that came loose from its
+construct and ran for every message (d26545d6f, a HIGH); span classes trusted on a `ForEach` line
+(db8873d19e); six shapes past the first narrowing; and seven past the second (6fa49a9d5): a loose
+`Catch` or `Matching` line, an unread statement that never stopped binding, a lowercase verb label,
+a write after a send, prose spans on `MsgTreeCopy` and `MsgCreate`, an unread attribute, and a
+`//ADT` path. Each repair added a rule, and the rule set grew past what a reviewer could hold. The
+gate replaces all of it with one question asked of the whole list, and deletes the join, loop, `Try`,
+call scope, branch adoption and lost-scope machinery.
+
+**The differential guard.** `tests/test_corepoint_import_differential.py` imports every shape of a
+battery twice: with the head, and with the step 1 importer, vendored byte for byte from main at
+`bca583f2a` and pinned by its git blob id (once step 2 merges, main is the head). It asserts the
+gate's invariant directly. EITHER the head's module and summary counts equal step 1's byte for byte,
+OR the guard's own allow-list walker, written apart from the importer and never calling its gate,
+finds the list fully understood AND every oracle check passes. The oracle is an abstract interpreter
+over the shape, in a case-sensitive and a case-insensitive reading of handle names. It says which
+trees the export may send at each `MsgSend`, and which literals each tree held at the send. Both
+handlers run against one synthetic input, past every refusal, and the guard fails when the head
+renders a list step 1 refuses or refuses one step 1 renders, delivers a tree the oracle cannot
+prove, sends `msg` for another handle, sends a message carrying a literal its tree did not hold at
+the send or lacking one it did, lifts a send out of a branch, or binds a local below the handler's
+level. Where the head differs from step 1, none of these checks exempts a send step 1 also makes,
+so a write leaking into `msg` is caught too. The oracle applies `ItemCopy`, `ItemAppend` and
+`ItemClear` to the field each names. The battery's shapes all sit in one package frame, so a
+separate test checks 17 other frames. A list another list calls, before it or after it, by the verb
+or by a `<Call>` tag in any case or namespace. A list nested in another list's construct. A root
+that is no `<Package>`. An unread package attribute. A list tag in another case or in a namespace.
+A call named, or a `<Call>` tag, outside every list. Each renders exactly as step 1. The walker
+matches each
+statement against one whole-string template per verb rather than walking tokens as the importer
+does, so the two read the specification by different methods.
+
+**A call the attribute does not spell** has its own tests in the same file. They write one character
+of the verb as a character reference or behind a tag. They do so at every position, in ten ways, six
+frames and five casings. A second arm writes several characters at once in 600 seeded values. Step
+1's own parse of the package says which of them hide a call. The head's gate never says, and no list
+of spellings does. Each hidden call must render exactly as step 1, with the called list after its
+caller and before it. More tests carry a hidden call under a `data`, `DATA` or namespaced key and
+as a `<Block>` label, and name a call in twelve ways step 1 reads no call from. A control holds a
+reference and a tag in a verb that is no call, and the gate still opens.
+
+Measured 2026-10-01: 4,050 single-character spellings and 560 of the 600 hide a call. These tests
+and the package frames are 102 in all. With the importer at f0a62ef70a, 86 of them fail, on every
+one of those spellings. Each of 22 mutation arms fails too. The count after each arm is how many of
+the 102 tests fail.
+
+| Mutation of the gate | Fails |
+|---|---|
+| no call rule at all | 95 |
+| reads the raw value only | 75 |
+| reads the raw and the whole value (misses 650 of the 4,050 and 91 of the 560) | 11 |
+| reads the raw value and the spans (misses 675 and 82) | 25 |
+| drops the raw reading | 3 |
+| matches the spelling, not the letters | 5 |
+| drops only `-` and `_` | 3 |
+| reads attribute values only | 4 |
+| reads the `Data` key only | 9 |
+| reads values under a `data` key only, with every other string | 2 |
+| drops the tag, the attribute names, the text or the tail | 1 each |
+| reads elements inside lists only | 2 |
+| reads the first list only | 84 |
+| reads the last list only | 94 |
+| reads `<Line>` elements only | 3 |
+| matches the `Call` tag exactly | 3 |
+| drops the `Call` tag | 5 |
+| drops the ancestor rule | 3 |
+| drops the list-tag rule | 2 |
+
+The battery holds 7,787 shapes, measured 2026-10-01: 331 fixed seeds (every repro from every review
+of PR 1900 and every Lander repro, the 23 round-3 shapes and the gate review's 41 among them), 4,056
+ordered construct pairs, 1,000 random shapes and 2,400 drawn from the allow-list alone, a quarter of
+those carrying one spoiler just off it. The guard's walker finds 1,686 fully understood, the head
+binds a local in 1,088 of them, and the head's output differs from step 1 in 1,656. At this head it
+fails none. Each mutation arm tried fails it. Measured in the first review round: dropping the
+write-after-send rule (38 shapes), tolerating prose spans (68), folding verb case (33), ignoring
+`Enabled` and `Comment` attributes (80), sending `msg` for an unknown handle (1,042), keeping a
+handle after a declined write to its skeleton (21), tolerating whitespace (4), and dropping the
+depth bound (3). In the second: accepting any `<Block>` label (2,312), accepting path annotations
+and the dotted form (12), landing a write to an unbound handle on `msg` (180), rendering
+`ItemAppend` as a set (4), and dropping `ItemClear` (2). The package-frame test fails on dropping
+the call rule (11 of 17 frames), the ancestor rule (3 of 17) or the list-tag rule (2 of 17). Against
+the previous head, 6fa49a9d5,
+the first battery of 7,746 shapes failed 5,937, including 20 of the 23 round-3 seeds.
+
+**Unverified assumptions, shared by the importer and the oracle.** At least these: that
+`MsgTreeCopy %A/ to %B/` makes B a copy of A; that `MsgSend` leaves its handle holding the message it
+sent; that a `<Block>` with no label runs its body once, in line; that a `@Disabled`
+value of `1`, `true` or `yes` means the step never runs; that every caller of a list sits in the
+same export file, which is all the call check reads, so a list exported apart from its caller is
+read as never called; and that `MsgCreate` and `MsgSend` stamp no
+header field the skeleton lacks, such as MSH-7, MSH-10 or MSH-11. If Corepoint stamps those, a built
+message goes out without them, and the generated module does not flag it. Each was read from the
+validated export, not measured in Corepoint.
+
+**What the Steps lens shows.** `set_field(out_msg, ...)` projects as an `action` row that looks the
+same as `set_field(msg, ...)`. The row carries no field naming the message it writes. A send row
+lists only its outbound. The `.copy()` and `Message.parse(...)` lines are plain `code` rows. The
+module still round-trips with no whole-file refusal, which AC-4 requires. Showing the receiver is a
+follow-up for ADR 0076/0089.
+
 ### (c) Unmapped actions are never silently dropped (count-and-log)
 
 An action whose `class` has no v1 mapping emits, **in place**, an

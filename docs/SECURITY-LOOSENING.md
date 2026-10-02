@@ -84,6 +84,7 @@ section reference.
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
+| Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
 | | `tls_check_hostname` | `true` on every connection whose TLS context reads it (*connection-scoped*; `false` is the loosening) |
@@ -108,6 +109,13 @@ section settings are named by `security_loosenings()` from the loaded
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot). At least one per-connection row is not passed in
 yet: `update_url_form`, whose entry names the two records it does have.
+
+**One row is not a setting at all.** `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is an environment variable.
+`security_loosenings()` reads it from the environment of the process that renders the report, and
+names it only while the loader honours it. At least four other process-wide variables are still not
+reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names it),
+`MEFOR_TLS_REVOCATION_ATTESTED`, `MEFOR_ALLOW_UNVERIFIED_WEBCONSOLE` and
+`MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING`.
 
 > **Scope, stated plainly.** The registry covers *every* `[security]` switch (a completeness floor in
 > `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one), the connection
@@ -423,7 +431,9 @@ is refused, so an opt-out does nothing and is not reported.
   (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) and `[auth].ad_allow_insecure_ldap` are
   **honoured** again, the first two only where the
   code knows this posture. A check that reads no posture refuses the escape whatever the dial says
-  (vault BACKLOG #2354): at least the CLI commands that open the store without one. This reproduces the
+  (vault BACKLOG #2354): at least the CLI commands that open the store without one.
+  `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
+  environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
   off-box bind, open-egress, and single-factor-admin-at-exposure refusals downgrade to loud audited warnings,
   and an explicitly-zeroed PHI retention window warns rather than refusing. (The 30-day auto-bound of an
@@ -759,6 +769,41 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes. Supply `[api].tls_cert_file` and restart; the acknowledgement then does nothing
   and may stay. To drop the terminator instead, remove `tls_terminated_upstream`, the acknowledgement
   and `trusted_proxies` together, or the load refuses.
+
+### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
+> **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
+> (vault BACKLOG #2599). It is honoured only when `MEFOR_SECURITY_ENFORCEMENT=warn` is set in the
+> same environment. Under `enforce` it is inert: a safe config directory loads as usual, and an
+> unsafe one is refused with an error that names the variable.
+> **`warn` set only in the settings file does not unlock it.** The check runs in every process that
+> loads config, and some of those read no settings file: at least the sandbox worker, and the
+> offline commands that load config before any settings. So the dial has to sit where the escape
+> does.
+> **The dial in the environment is the instance's dial, not a switch for this check alone.** A
+> `messagefoundry check` run with both variables judges every posture gate at `warn`. To check a
+> config at `enforce`, lock its directory instead.
+> **"Refused under `enforce`" is about the environment's dial.** It holds for `serve`, `supervise`
+> and every CLI command, whose settings come from that environment. A program that embeds the engine
+> with settings it built itself has a dial this check cannot see; there the escape follows the
+> environment.
+- **What you lose:** the config-source check
+  ([ADR 0036](adr/0036-windows-config-source-trust.md)). The engine runs every `*.py` in the config
+  directory as its own account, which holds the store credentials and reads PHI. The check refuses
+  a directory or module that a broad or low-privilege principal can write, one owned by another
+  unprivileged account, and on Windows one whose access list cannot be read. With the escape
+  honoured, each of those is a WARNING and the load goes on. Whoever can write there would then run
+  code as the engine's account at the next start, reload or worker respawn.
+- **When acceptable:** a dev or CI checkout that is user-writable on purpose, with synthetic data.
+  Never a deployment.
+- **Compensating controls:** none that substitute. Lock the directory instead:
+  `install-service.ps1 -LockConfigDir` on Windows, or on POSIX own it as the engine's account and
+  remove group and world write ([SERVICE.md](SERVICE.md)).
+- **Visibility:** each load logs a WARNING for every path it let through. `serve` and
+  `GET /security/posture` name the variable while it is honoured, and both read the engine's own
+  environment. `messagefoundry security show` reads the shell it runs in, which may not be the
+  service's. Honouring it writes no audit row of its own. A `GET /security/posture` read is
+  audited, and that row lists it.
+- **Reversible:** yes, immediately — unset the variable and restart.
 
 ### `cleartext_accepted = true` on a connection — a declared cleartext hop
 > **Connection-scoped, unlike every other entry here.** It is not a `[security]` switch; it is a field on
@@ -1141,6 +1186,53 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **On a store with no key at all this entry never fires.** That chain is keyless by the audited
   at-rest opt-out, which `allow_unencrypted_phi` already reports.
 
+### `remote_debug_enabled` and `remote_debug_unguarded`: the interpreter accepts a script from another process
+
+> **An OBSERVATION, not a switch.** No setting declares it. It follows from how the interpreter of
+> the engine process was started. Vault BACKLOG #2700.
+- **What it is:** Python 3.14 lets another process run a script inside a running interpreter
+  (PEP 768, `sys.remote_exec`). The caller must be able to write the target's memory. On Windows a
+  process running as the same account, at the same integrity level, can. On Linux it depends on
+  the kernel's ptrace policy:
+  where Yama `ptrace_scope` is `1`, as Ubuntu ships it, only a parent process or one with
+  `CAP_SYS_PTRACE` can. The interface is on unless the interpreter starts with
+  `-X disable-remote-debug` or `PYTHON_DISABLE_REMOTE_DEBUG=1`.
+- **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** `serve` and
+  `supervise` each install an audit hook as their first step. The interpreter raises an event
+  before it runs an injected script. The hook raises on that event, and the interpreter then drops
+  the script. A refusal logs a WARNING with the script's file name, and no audit row. Where
+  refusals arrive faster than they are logged, lines past a backlog of 64 are dropped. Every
+  refusal is counted, and once one has been refused the entry carries the count.
+- **This is a residual, not a closed path.** At least two things stay open. A script injected
+  during start-up, before the hook is installed, runs. A caller that can restart the engine can
+  aim for that window. And a process that can write the engine's memory can run code in it by
+  other means, and can remove a hook.
+- **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process the
+  operating system lets attach could run Python inside the engine, with the store key, the
+  connection secrets and the messages in flight. An application that builds the API without
+  `serve` reports this. `serve` would report it only if another audit hook refused the engine's.
+- **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
+  the engine's own process. `supervise` logs one WARNING at start for the supervisor process, and
+  no API reports that process afterwards. The engine's Python children start with the interface
+  off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
+  `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
+  line says so. Other commands, such as `rotate-key` and `backup`, install no hook and report
+  nothing.
+- **A default start reports `remote_debug_enabled`.** `messagefoundry serve` runs through a
+  console-script launcher, which cannot pass an interpreter option, so the interface stays on. The
+  installed service and the container image start the same way, and neither sets the option or the
+  variable yet.
+- **How to clear it:** start the engine as
+  `python -P -X disable-remote-debug -m messagefoundry serve ...`. Spell the option with hyphens: the
+  interpreter accepts the underscore spelling and ignores it. `-P` keeps the working directory off
+  the import path, which `python -m` would otherwise put first.
+  `PYTHON_DISABLE_REMOTE_DEBUG=1` in the engine's environment also works, but the interpreter
+  ignores it under `-I` or `-E`.
+- **It is not refused**, at any `enforcement` level. A refusal would stop every start through the
+  console script.
+- **Attach debugging goes with it.** `python -m pdb -p <pid>` uses this interface, so it cannot
+  attach to `serve` or `supervise`. There is no switch that turns the hook off.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
@@ -1175,6 +1267,7 @@ chapter was not part of the verification above.
 | `[store].allow_unmarked_ciphertext` (unmarked-value refusal) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(c)(2) Mechanism to Authenticate ePHI |
 | `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].ad_allow_insecure_ldap` (plain `ldap://` AD bind) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(d) Person or Entity Authentication |
+| `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (config-source check downgraded to a warning) | V13 Configuration | **CM-5** Access Restrictions for Change · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold`, `[auth].lockout_max_minutes` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].phi_read_rate_limit_*`, `[auth].admin_write_*`, `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds` (PHI-read and admin-write pacing, second-step time floors) | V2 Validation and Business Logic (anti-automation, 2.4.1 / 2.4.2) | **SC-5** Denial-of-Service Protection | §164.312(a)(1) Access Control |
@@ -1190,6 +1283,7 @@ chapter was not part of the verification above.
 | generic-ODBC `DATABASE` TLS unenforced (per-connection, driver-owned) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
+| `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

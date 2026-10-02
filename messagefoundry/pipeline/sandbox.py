@@ -105,7 +105,10 @@ from typing import IO, Any, Final
 from messagefoundry.childenv import python_child_argv, worker_environment
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.run_context import RunContext
-from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
+from messagefoundry.config.settings import (
+    INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+    security_enforcement_env_names,
+)
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline._sandbox_codec import GraphShape, SandboxCodecError, SandboxError
@@ -727,12 +730,19 @@ class SandboxSession:
             close_fds=True,
             start_new_session=sys.platform != "win32",
             # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
-            # environment (vault BACKLOG #2587). The one engine variable that crosses is the
-            # config-source escape, because the child runs ``load_config`` itself and would
-            # otherwise refuse a directory its parent loaded under that escape. The operator's
-            # ``[sandbox].pass_environment`` names cross with it.
+            # environment (vault BACKLOG #2587). Two engine variables cross, and they are one
+            # decision: the config-source escape and the enforcement dial that unlocks it (vault
+            # BACKLOG #2599). The child runs ``load_config`` itself, so with only the escape it
+            # would refuse a directory its parent loaded at ``warn``. The dial is a posture
+            # switch, not a secret, and every spelling of it the parent's check read crosses, so
+            # the child's check reads the same variables. The operator's
+            # ``[sandbox].pass_environment`` names cross with them.
             env=worker_environment(
-                extra_names=(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, *self.policy.pass_environment)
+                extra_names=(
+                    INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+                    *security_enforcement_env_names(),
+                    *self.policy.pass_environment,
+                )
             ),
         )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None

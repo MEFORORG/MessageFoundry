@@ -23,6 +23,7 @@ from tests._directory_identity_store_contract import (
     _assert_username_refresh_contract,
 )
 from tests._federated_unbind_store_contract import (
+    _assert_bind_sweeps_and_unbound_guard_contract,
     _assert_federated_unbind_contract,
     _assert_session_binding_guard_contract,
 )
@@ -488,6 +489,42 @@ async def test_the_session_binding_guard_contract_on_sqlite() -> None:
     store = await _store()
     try:
         await _assert_session_binding_guard_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_the_bind_sweep_and_unbound_guard_contract_on_sqlite() -> None:
+    """vault BACKLOG #2609 on the SQLite backend: a bind ends the account's sessions in its own
+    transaction, and an insert that requires an unbound row is refused on a bound one. The same
+    shared body the PostgreSQL and SQL Server suites run."""
+    store = await _store()
+    try:
+        await _assert_bind_sweeps_and_unbound_guard_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_a_half_bound_row_is_not_unbound_to_the_session_guard() -> None:
+    """A row holding ONE half of a pair is refused an insert that requires an unbound row.
+
+    No shipped path writes a half row, so it is constructed, as the unbind test above does. The
+    guard compares the stored pair with ``(None, None)``, so either half set is "bound". The
+    control is the same row before the column is written."""
+    store = await _store()
+    try:
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="ad", now=1.0, password_generated=False
+        )
+        unbound: tuple[None, None] = (None, None)
+        assert await store.create_session(
+            token_hash="t-before", user_id="u1", expires_at=9e9, require_federated_subject=unbound
+        )
+        await store._db.execute("UPDATE users SET oidc_issuer=? WHERE id=?", ("https://idp", "u1"))
+        await store._db.commit()
+        assert not await store.create_session(
+            token_hash="t-half", user_id="u1", expires_at=9e9, require_federated_subject=unbound
+        )
+        assert await store.get_session("t-half") is None
     finally:
         await store.close()
 

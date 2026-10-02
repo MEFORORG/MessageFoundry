@@ -107,8 +107,9 @@ def ca_chain_to_pem(cas: list[x509.Certificate]) -> bytes:
 def key_to_pem(key: PrivateKeyTypes) -> bytes:
     """Serialize a private key to **unencrypted** PKCS#8 PEM.
 
-    Secret material — the caller MUST persist the result with tight permissions (``O_EXCL`` + ``0o600``
-    + the Windows DACL via ``_secure_file``), never log it, and never place it in an exception."""
+    Secret material — the caller MUST persist the result through
+    ``restricted_file.write_restricted_file`` (the CLI's ``_write_private_key``), never log it, and
+    never place it in an exception."""
     return key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
@@ -401,7 +402,7 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
     Self-issued (subject == issuer), SHA-256, basic-constraints CA=false, and a SubjectAlternativeName
     covering ``cn`` plus every name in ``sans`` (``cn`` first, de-duplicated, order-stable). Valid
     from one minute ago (clock-skew slack) for ``days`` days. The returned key PEM is unencrypted
-    PKCS#8 — the caller MUST persist it ``O_EXCL`` + ``0o600`` + ``_secure_file``. DEV ONLY: a
+    PKCS#8 — the caller MUST persist it through the CLI's ``_write_private_key``. DEV ONLY: a
     self-signed cert has no chain of trust and must never front production PHI.
 
     **An IP literal becomes an** ``iPAddress`` **entry, not a** ``DNSName``. Hostname verification for

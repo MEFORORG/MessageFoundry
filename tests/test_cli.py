@@ -20,7 +20,11 @@ import pytest
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import load_settings
-from tests._phi_gate_provisions import RETENTION_WINDOWS_ENV, setenv_at_rest_opt_out
+from tests._phi_gate_provisions import (
+    PHI_GATE_PROVISIONS_TOML,
+    RETENTION_WINDOWS_ENV,
+    setenv_at_rest_opt_out,
+)
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 ADT_A01 = (
@@ -1017,30 +1021,32 @@ def test_serve_refuses_auth_off_behind_declared_terminator(
     )  # named the terminator exposure
 
 
+#: A loopback instance with the shared PHI-gate provisions, so the sign-in arms decide the outcome.
+_LOOPBACK_TOML = PHI_GATE_PROVISIONS_TOML + "security.local_access_only = true\n"
+_SIGN_IN_OFF_LOOPBACK_TOML = _LOOPBACK_TOML + "security.require_sign_in = false\n"
+
+
 def test_serve_auth_off_on_unexposed_loopback_still_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from messagefoundry.store.crypto import generate_key
-
     # BACKLOG #1013 (negative control): the arm was WIDENED, not broadened to fire on any auth-off. A
     # true loopback dev instance with no declared terminator (instance_exposed False) is the supported
     # no-auth flow and must still start silently.
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
-    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    (tmp_path / "messagefoundry.toml").write_text(
-        "security.block_unlisted_outbound = true\n"
-        "security.allow_unencrypted_phi = true\n"
-        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
-        "alerts.security_notifications_required = false\n"
-        "security.local_access_only = true\n"
-        "security.require_sign_in = false\n",
-        encoding="utf-8",
-    )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    rc, captured = _run_secure_serve(tmp_path, monkeypatch, _SIGN_IN_OFF_LOOPBACK_TOML, env="dev")
+    assert rc == 0
     # The widened arm stayed silent because the instance is not exposed.
     assert "refusing to serve with [auth] enabled=false" not in capsys.readouterr().err
+    # vault BACKLOG #2611: the factory denies by default, so `serve` is what asks it for the open mode.
+    assert captured["allow_no_auth"] is True
+
+
+def test_serve_does_not_ask_the_factory_for_the_open_mode_with_sign_in_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control on the last assertion above: with sign-in on (the default), no opt-in is passed.
+    rc, captured = _run_secure_serve(tmp_path, monkeypatch, _LOOPBACK_TOML, env="dev")
+    assert rc == 0
+    assert captured["allow_no_auth"] is False
 
 
 def test_serve_auth_on_behind_terminator_unaffected_by_arm(
@@ -1596,33 +1602,32 @@ def test_serve_exposed_with_approvals_on_no_warn(
 
 
 def _stub_protect_key(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Stub out real DPAPI + the icacls call; capture the read-grants protect-key passes through."""
+    """Stub out real DPAPI and the restricted create; capture the read-grants protect-key asks for."""
     import messagefoundry.secrets_dpapi as dpapi_mod
-    import messagefoundry.store.store as store_mod
 
-    monkeypatch.setattr(dpapi_mod, "protect_key_to_file", lambda *a, **k: None)
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        store_mod,
-        "_secure_file",
-        lambda path, *, extra_read_grants=None: captured.update(grants=extra_read_grants),
+        dpapi_mod,
+        "protect_key_to_file",
+        lambda *a, read_grants=(), **k: captured.update(grants=list(read_grants)),
     )
     return captured
 
 
-def test_protect_key_grants_system_by_default(
+def test_protect_key_asks_for_no_extra_grant_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # SYSTEM is always read-granted so a LocalSystem service can read the key at startup (BACKLOG #44).
+    # SYSTEM can always read the key (BACKLOG #44), because the restricted create itself always names
+    # SYSTEM and Administrators; tests/test_restricted_file.py pins that. So protect-key adds nothing.
     captured = _stub_protect_key(monkeypatch)
     assert main(["protect-key", "--out", str(tmp_path / "k.dpapi"), "--generate"]) == 0
-    assert captured["grants"] == ["*S-1-5-18"]
+    assert captured["grants"] == []
 
 
 def test_protect_key_grants_named_service_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # --grant-account adds the virtual / gMSA principal alongside SYSTEM.
+    # --grant-account adds read for the virtual / gMSA principal the service runs as.
     captured = _stub_protect_key(monkeypatch)
     rc = main(
         [
@@ -1635,7 +1640,7 @@ def test_protect_key_grants_named_service_account(
         ]
     )
     assert rc == 0
-    assert captured["grants"] == ["*S-1-5-18", "NT SERVICE\\MessageFoundry"]
+    assert captured["grants"] == ["NT SERVICE\\MessageFoundry"]
 
 
 # --- protect-key exit-2 branches (off-Windows + key-validation) ----------------------------------

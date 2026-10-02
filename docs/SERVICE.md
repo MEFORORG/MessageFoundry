@@ -387,8 +387,9 @@ The key is a base64 32-byte secret. Two ways to supply it:
 
   ```powershell
   # mint + protect a fresh key (machine scope, so the service account can read it at startup).
-  # SYSTEM is granted read automatically (covers a LocalSystem service); for a virtual / gMSA service
-  # account add --grant-account '<that account>' so the service — not just you — can read the key:
+  # SYSTEM can always read the file (covers a LocalSystem service); for a virtual / gMSA service
+  # account add --grant-account '<that account>' so the service — not just you — can read the key.
+  # --out must be a NEW path: protect-key never replaces a file.
   messagefoundry protect-key --generate --out "C:\ProgramData\MessageFoundry\store.key.dpapi"
   #   (virtual account example: ... --grant-account "NT SERVICE\MessageFoundry")
   #   -> prints the base64 key ONCE to stderr; back it up offline (the file is machine-bound and
@@ -400,12 +401,18 @@ The key is a base64 32-byte secret. Two ways to supply it:
   ```
   Then **unset** `MEFOR_STORE_ENCRYPTION_KEY` (the env key takes precedence when both are set). The
   service account `CryptUnprotectData`s the file at startup; a missing/foreign/unreadable file makes
-  `serve` fail closed rather than store PHI unencrypted. `protect-key` locks the file to the minting
-  admin **plus** the service principal it grants read — SYSTEM by default, or `--grant-account` for a
-  virtual / gMSA account. It sets an explicit DACL with inheritance **disabled**, so the file does
-  **not** inherit the data-dir ACL — grant the right service account at mint time (above) rather than
-  relying on the directory. To rotate, `protect-key` a new key to the file and run `messagefoundry
-  rotate-key` with the prior key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3).
+  `serve` fail closed rather than store PHI unencrypted. `protect-key` creates the file
+  already restricted, with read for the one account `--grant-account` names (a virtual / gMSA
+  account). The file does **not** inherit the data-dir ACL, so grant the right service account at
+  mint time (above) rather than relying on the directory. If the file cannot be created restricted,
+  or `--out` already exists, the command exits non-zero and writes nothing. `serve` checks the file
+  before it uses it. Who the file is restricted to, what that check covers and what it does not are
+  stated once, in [PHI.md](PHI.md), "Key files". To rotate, `protect-key` the new key to a **new** path, point
+  `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
+  the rotation, once nothing still needs its key.
+  **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
+  after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
@@ -463,7 +470,8 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     that could not finish has not shown the code safe to run. That covers at least a Win32 API
     error, an owner SID it cannot resolve, a DACL it cannot enumerate, and this process's own token
     it cannot read. The refusal names the path and the Win32 error where there is one. The cure is
-    to fix what made the read fail. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
+    to fix what made the read fail. Where it is honoured (see *Dev/test escape* below),
+    `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
     WARNING for a dev/CI checkout only, as it does every refusal here. A `*.py` deleted while the
     load runs is skipped, as on POSIX (ADR 0036 Amendment B).
   - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
@@ -493,10 +501,15 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable or foreign-owned
     directory or module file.
   - **Dev/test escape (never set in production).** Because a default Windows checkout grants
-    `BUILTIN\Users` write, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` to downgrade the refusal to a
-    loud WARNING when running from an intentionally user-writable dev/CI tree. A production service
-    leaves it unset and locks the config dir (above), so the guard stays fail-closed; the env var is
-    the explicit, audited opt-out (mirrors `MEFOR_ALLOW_INSECURE_TLS`).
+    `BUILTIN\Users` write, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **and**
+    `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment to downgrade the refusal to a
+    loud WARNING when running from an intentionally user-writable dev/CI tree. The escape alone does
+    nothing: under `[security].enforcement = enforce`, the default, it is refused, and the refusal
+    names it. A production service leaves it unset and locks the config dir (above), so the guard
+    stays fail-closed. While it is honoured, the `serve` start-up warning and `GET /security/posture`
+    name it. Honouring it writes no audit row of its own. Its limits are stated once, in its entry in
+    [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md): among them, the dial is read from the
+    environment, so a program that embeds the engine with its own settings is outside the clamp.
 - `/config/reload` only loads from the startup `--config` directory and any directories listed in
   `[api].config_reload_roots` (see [CONFIGURATION.md](CONFIGURATION.md)); an arbitrary path is
   rejected. Keep those roots admin-owned too.

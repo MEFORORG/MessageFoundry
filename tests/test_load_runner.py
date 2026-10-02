@@ -89,7 +89,10 @@ def engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[st
     from messagefoundry.api import create_managed_app
 
     app = create_managed_app(
-        db_path=tmp_path / "load.db", config_dir=_LOAD_CONFIG, poll_interval=0.05
+        db_path=tmp_path / "load.db",
+        config_dir=_LOAD_CONFIG,
+        poll_interval=0.05,
+        allow_no_auth=True,  # the load runner reads /stats with no bearer token
     )
     uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="warning"))
     # Release the MLLP ports at the last moment (SO_REUSEADDR + never-listened sockets → immediately

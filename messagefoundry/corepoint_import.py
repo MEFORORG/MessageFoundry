@@ -65,8 +65,17 @@ XML is parsed through **defusedxml** with ``forbid_dtd``/``forbid_entities``/``f
 on, so a billion-laughs or external-entity payload raises instead of expanding.
 Paths ride across as data to :meth:`Message.set` at run time.
 
+**Message handles become Python locals, in a FULLY UNDERSTOOD list only (BACKLOG #313 step 2, ADR
+0086).** An action-list works on several message trees at once; a Handler receives one ``msg``. Before
+a list is parsed, :func:`_understood_list` decides once whether every element in it, at every depth,
+is on a small allow-list: a plain clone, a buildable ``MsgCreate``, a field write, a ``MsgLog``, a
+``MsgSend``, a ``<Block>`` with no label, and a surely disabled step, each spelled in
+exactly one canonical shape. Only then does :class:`_Binder` give each handle its own local, in
+statement order. Every other list takes the step 1 path unchanged, byte for byte.
+
 Pure (parse + string codegen): no network, no message content, no dependency beyond the engine's
-vendored ``defusedxml`` copy (``messagefoundry/_vendor/defusedxml/``) — safe to run anywhere.
+vendored ``defusedxml`` copy (``messagefoundry/_vendor/defusedxml/``) and its own HL7 model
+(:mod:`messagefoundry.parsing.message`, which builds a ``MsgCreate`` skeleton) — safe to run anywhere.
 """
 
 from __future__ import annotations
@@ -87,6 +96,7 @@ from messagefoundry._vendor.defusedxml.common import DefusedXmlException
 from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
 from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
 from messagefoundry.controlchars import strip_control_chars
+from messagefoundry.parsing.message import Message
 
 if TYPE_CHECKING:  # runtime never needs the class — only the annotations do
     from collections.abc import Callable
@@ -138,13 +148,17 @@ class Action:
     """A mapped transform step — a v1 vocabulary call ready to emit.
 
     ``args`` are already-rendered Python source fragments for the positional arguments *after* the
-    leading ``msg``; ``keywords`` are ``(name, rendered_value)`` pairs. ``source_class`` is the
-    originating Corepoint action class (kept for provenance in comments/summaries)."""
+    leading message argument; ``keywords`` are ``(name, rendered_value)`` pairs. ``source_class`` is
+    the originating Corepoint action class (kept for provenance in comments/summaries).
+
+    ``target`` is the Python local the call writes: ``msg``, or in a fully understood list the local
+    :class:`_Binder` gave another handle (BACKLOG #313 step 2). Always a name this module generated."""
 
     source_class: str
     vocabulary: str
     args: tuple[str, ...]
     keywords: tuple[tuple[str, str], ...] = ()
+    target: str = "msg"
 
 
 @dataclass(frozen=True)
@@ -177,6 +191,10 @@ class Control:
                   the export names none, which degrades to a TODO marker rather than a guess).
                   ``refusal`` is non-empty when the statement delivers a handle that is not provably
                   ``msg``; the render then raises at the send site instead of sending (BACKLOG #313).
+                  ``message`` is the local it delivers.
+    ``"clone"``   a whole-tree ``MsgTreeCopy`` that binds a handle to a local, and ``"create"`` a
+                  ``MsgCreate`` that does: ``args`` is ``(local, expression)``. Only :class:`_Binder`
+                  makes either, in a fully understood list (BACKLOG #313 step 2).
     ``"exit"``    ``Returns``/``ActionListExit``/``ActionListStop`` — no faithful vocabulary form, so a
                   TODO marker (never a silent flatten).
     ``"unknown"`` an element in a statement position whose TAG this layer does not model (a ``<Switch>``,
@@ -199,6 +217,8 @@ class Control:
     branches: tuple[Control, ...] = field(default_factory=tuple)
     # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` sets it.
     refusal: str = ""
+    # The local a live ``"send"`` delivers: a name this module generated, never export text.
+    message: str = "msg"
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -1629,6 +1649,401 @@ def _send_args(operands: list[str]) -> tuple[str, ...]:
     return ()
 
 
+# --- step 2: handle locals, in a fully understood list only (BACKLOG #313, ADR 0086) --------------
+#
+# Six review rounds of step 2 each built a list in which the previous repair failed open: the handler
+# sent a message Corepoint never sent. Every repair taught the flow one more construct or spelling,
+# and the next round found the next one. So step 2 no longer reasons about constructs at all. Before a
+# list renders, the gate below decides ONCE whether the whole list is fully understood: every element
+# at every depth is on this allow-list, and each statement's ``@Data`` is exactly the canonical
+# rendering of its verb's one shape, character for character. Only such a list binds locals. Any other
+# list takes the step 1 path untouched, so its output is step 1's byte for byte. When in doubt, a list
+# is not understood: that costs a hand-finish, as under step 1, and never a wrong delivery.
+
+#: The statements the gate reads, each as ONE token sequence after its verb, which must be the first
+#: token and a ``keyword`` span spelled exactly so. ``H`` is a message-handle span, ``/`` a path span
+#: holding only ``/``, ``F`` a path span naming a writable HL7 field, ``L`` a quoted literal span, and
+#: any other entry that exact word, unstyled. The tokens are joined by one space, except that a path
+#: span follows its handle span directly (see :func:`_canonical`).
+_UNDERSTOOD: dict[str, tuple[str, ...]] = {
+    "MsgTreeCopy": ("H", "/", "to", "H", "/"),
+    "MsgCreate": ("H", "as", "L", "version", "L"),
+    "ItemCopy": ("L", "to", "H", "F"),
+    "ItemClear": ("H", "F"),
+    "ItemAppend": ("L", "to", "H", "F"),
+    "MsgLog": ("H",),
+    "MsgSend": ("H", "to", "connection", "L"),
+}
+_HANDLE_CLASSES = frozenset({"input-handle", "other-handle"})
+# One token of an understood ``@Data``: a span holding plain text (no nesting, no entity, no attribute
+# but its class), or an unstyled run. :func:`_canonical` then pins the spelling of the whole value.
+_STRICT_TOKEN = re.compile(r"<span class='([a-z-]+)'>([^<>&]*)</span>|([^<>&]+)")
+# A written value: printable ASCII with no HL7 delimiter or escape character, so the value is one
+# field's text in every reading (``Message.set`` would split or escape anything else).
+_VALUE = re.compile(r"[ !#-%'-;=?-\[\]_-{}]*", re.ASCII)
+# ASCII only, short, and no ``/``, so a handle has one spelling, one reading and a safe local name.
+_HANDLE_NAME = re.compile(r"%[A-Za-z][A-Za-z0-9_]{0,39}", re.ASCII)
+# ``/PID-5`` or ``/PID-5-1``: a field or a component, never a tree node, a segment, a ``(...)``
+# annotation (it may carry a mode or a repetition) or the dotted form no export is known to write.
+_FIELD_PATH = re.compile(r"/[A-Z][A-Z0-9]{2}(?:-[1-9][0-9]*){1,3}", re.ASCII)
+# The ``@Disabled`` values read as disabled with confidence. Any other value closes the gate.
+_DISABLED_SURE = frozenset({"1", "true", "yes"})
+# The message-type and version a ``MsgCreate`` must name to build a valid MSH. Only the caret form of
+# the type is read: ``ADT_A01`` is also how HL7 spells a message STRUCTURE (MSH-9.3).
+_MESSAGE_TYPE = re.compile(r"([A-Z0-9]{3})\^([A-Z0-9]{3})(?:\^([A-Z0-9_]{3,7}))?")
+_HL7_VERSION = re.compile(r"2\.[1-9](?:\.[1-9])?")
+_NOT_A_LETTER = re.compile(r"[^a-z]+")
+
+
+def _letters(text: str) -> str:
+    """The letters ``a`` to ``z`` of ``text`` once it is lower-cased, with everything else dropped."""
+    return _NOT_A_LETTER.sub("", text.lower())
+
+
+# What step 1 reads as a call, taken from its own tables: the tags (``call``) and the verbs
+# (``actionlistcall``), each verb as its letters. Used only by the package-wide call check.
+_CALL_TAGS = frozenset(tag for tag, kind in _CONTAINER_KIND_BY_TAG.items() if kind == "call")
+_CALL_WORDS = tuple(_letters(verb) for verb, kind in _KIND_BY_VERB.items() if kind == "call")
+
+
+@dataclass(frozen=True)
+class _Statement:
+    """One statement the gate read: its verb, each handle with whether it is styled as the input,
+    the field a write addresses, its literals, a ``MsgCreate``'s skeleton, and the plain text."""
+
+    verb: str
+    handles: tuple[tuple[str, bool], ...]
+    path: str
+    literals: tuple[str, ...]
+    skeleton: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _Understood:
+    """One element of a fully understood list: a statement line, or a ``<Block>`` (``statement`` is
+    ``None``) with its body. ``disabled`` marks a surely ``@Disabled`` element."""
+
+    elem: Element
+    statement: _Statement | None
+    body: tuple[_Understood, ...]
+    disabled: bool
+
+
+def _understood_list(
+    action_list: Element, parents: dict[Element, Element]
+) -> tuple[str, tuple[_Understood, ...]] | None:
+    """``(input handle, elements)`` when the whole list is fully understood, else ``None``.
+
+    The list's own tag is exactly ``ActionList``, every element enclosing it is a ``<Package>``, and
+    the list and each of those carry only ``Name`` and ``Desc``. Beyond each element's
+    own shape (see :func:`_understood_body`), the list as a whole must name its handles
+    unambiguously: no two spellings that differ only in case (whether Corepoint folds case is
+    unverified), each handle styled the same way everywhere, at most one input handle, and no clone or
+    ``MsgCreate`` into the input, which would replace ``msg``."""
+    if action_list.tag != "ActionList":
+        return None
+    node: Element | None = action_list
+    while node is not None:
+        if not set(node.attrib) <= {"Name", "Desc"}:
+            return None
+        node = parents.get(node)
+        if node is not None and node.tag != "Package":
+            return None
+    if (action_list.text or "").strip():
+        return None
+    body = _understood_body(action_list, 0)
+    if body is None:
+        return None
+    styles: dict[str, set[bool]] = {}
+    written: set[str] = set()
+    stack = list(body)
+    while stack:
+        item = stack.pop()
+        stack.extend(item.body)
+        if item.statement is None:
+            continue
+        for handle, is_input in item.statement.handles:
+            styles.setdefault(handle, set()).add(is_input)
+        if item.statement.verb in ("MsgTreeCopy", "MsgCreate"):
+            written.add(item.statement.handles[-1][0])
+    inputs = [handle for handle, style in styles.items() if True in style]
+    if (
+        len({handle.lower() for handle in styles}) != len(styles)
+        or any(len(style) > 1 for style in styles.values())
+        or len(inputs) > 1
+        or written & set(inputs)
+    ):
+        return None
+    return (inputs[0] if inputs else ""), body
+
+
+def _understood_body(container: Element, depth: int) -> tuple[_Understood, ...] | None:
+    """The elements under ``container`` when every one is understood, else ``None``.
+
+    A ``<List>`` wrapper must carry no attribute and is flattened; every other child must be a
+    ``<Line>`` holding one understood statement in ``@Data`` and nothing else, or a ``<Block>`` with
+    no label whose body is understood too. A label is never read: whether Corepoint runs one that is a
+    statement is not known, and no word list tells prose from a verb. Each may carry ``@Disabled`` only
+    with a sure value. No element may hold text outside its attributes. Tags are matched exactly, so a
+    namespaced or differently cased tag is not understood.
+
+    The depth bound is a quarter of step 1's: the two count levels differently, and any list deeper
+    than this takes the step 1 path, which refuses it there or renders it as step 1 does."""
+    if depth > _MAX_NESTING // 4:
+        return None
+    found: list[_Understood] = []
+    for child in container:
+        if (child.tail or "").strip() or (child.text or "").strip():
+            return None
+        if child.tag == "List":
+            inner = _understood_body(child, depth + 1) if not child.attrib else None
+            if inner is None:
+                return None
+            found.extend(inner)
+            continue
+        attrs = dict(child.attrib)
+        disabled = "Disabled" in attrs
+        if disabled and attrs.pop("Disabled").lower() not in _DISABLED_SURE:
+            return None
+        data = attrs.pop("Data", "")
+        if attrs:
+            return None
+        if child.tag == "Line" and not len(child):
+            statement = _understood_statement(data)
+            if statement is None:
+                return None
+            found.append(_Understood(child, statement, (), disabled))
+        elif child.tag == "Block" and not data:
+            inner = _understood_body(child, depth + 1)
+            if inner is None:
+                return None
+            found.append(_Understood(child, None, inner, disabled))
+        else:
+            return None
+    return tuple(found)
+
+
+def _canonical(tokens: list[tuple[str, str]]) -> str:
+    """The one spelling of a statement's tokens: single-quoted span classes, one space between
+    tokens, and a path span directly after the handle span it addresses."""
+    out: list[str] = []
+    previous = ""
+    for cls, text in tokens:
+        if out:
+            out.append("" if cls == "path" and previous in _HANDLE_CLASSES else " ")
+        out.append(f"<span class='{cls}'>{text}</span>" if cls else text)
+        previous = cls
+    return "".join(out)
+
+
+def _understood_statement(data: str) -> _Statement | None:
+    """Read ``@Data`` in the one shape :data:`_UNDERSTOOD` gives its verb, or ``None``."""
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(data):
+        token = _STRICT_TOKEN.match(data, pos)
+        if token is None:
+            return None
+        if token.group(1) is not None:
+            tokens.append((token.group(1), token.group(2)))
+        else:
+            tokens.extend(("", word) for word in token.group(3).split())
+        pos = token.end()
+    if not tokens or tokens[0][0] != "keyword" or _canonical(tokens) != data:
+        return None
+    verb = tokens[0][1]
+    shape = _UNDERSTOOD.get(verb)
+    if shape is None or len(tokens) != len(shape) + 1:
+        return None
+    handles: list[tuple[str, bool]] = []
+    literals: list[str] = []
+    path: str | None = ""
+    for want, (cls, text) in zip(shape, tokens[1:], strict=True):
+        if want == "H":
+            if cls not in _HANDLE_CLASSES or not _HANDLE_NAME.fullmatch(text):
+                return None
+            handles.append((text, cls == "input-handle"))
+        elif want == "/":
+            if cls != "path" or text != "/":
+                return None
+        elif want == "F":
+            path = _corepoint_path(text) if cls == "path" and _FIELD_PATH.fullmatch(text) else None
+            if not _writable(path) or (path or "").split(".", 1)[0] in _FRAMING_PATHS:
+                return None
+        elif want == "L":
+            if cls != "literal" or len(text) < 2 or text[0] != '"' or text[-1] != '"':
+                return None
+            if not _VALUE.fullmatch(text[1:-1]) and verb != "MsgCreate":
+                return None
+            literals.append(text[1:-1])
+        elif cls or text != want:
+            return None
+    skeleton = ""
+    if verb == "MsgCreate":
+        skeleton = _skeleton(*literals)
+        if not skeleton:
+            return None
+    if verb == "MsgSend" and not literals[0].strip():
+        return None
+    assert path is not None  # a write's path was checked by _writable above
+    return _Statement(verb, tuple(handles), path, tuple(literals), skeleton, strip_markup(data))
+
+
+def _skeleton(message_type: str, version: str) -> str:
+    """The MSH a ``MsgCreate`` builds, or ``""`` when no valid MSH can be built.
+
+    It carries the default encoding characters, the message type in MSH-9 and the version in MSH-12,
+    and nothing else: every other header field is whatever the list itself writes. Built through
+    :class:`Message` and encoded, never assembled by string slicing."""
+    found = _MESSAGE_TYPE.fullmatch(message_type)
+    if found is None or not _HL7_VERSION.fullmatch(version):
+        return ""
+    try:
+        skeleton = Message.parse("MSH|^~\\&|")
+        for index, part in enumerate(found.groups(), start=1):
+            if part is not None:
+                skeleton.set(f"MSH-9.{index}", part)
+        skeleton.set("MSH-12", version)
+    except ValueError:  # HL7PeekError included: a refusal, never a traceback
+        return ""
+    return skeleton.encode().rstrip("\r")
+
+
+class _Binder:
+    """Render a fully understood list in statement order, each handle holding its own local.
+
+    The input handle is ``msg``. A clone of a handle that holds a local binds its destination to
+    ``<local> = <source>.copy()``, a ``MsgCreate`` binds its handle to ``<local> =
+    Message.parse(<skeleton>)``, a field write addresses the local of its handle, and a send of a
+    handle that holds a local delivers it. A send of any other handle raises, as in step 1. The list
+    is straight-line (the gate admits no construct), so no state ever has to be joined.
+
+    A write to a handle after a send of it would change the message already sent, because a ``Send``
+    holds the object, not a copy, unless ``[pipeline].snapshot_on_send`` is on (ADR 0104). So that
+    write is a TODO. Any write this declines leaves its handle unknown from there, so a later send of
+    it raises rather than deliver a message without the write."""
+
+    def __init__(self, input_handle: str, subject: frozenset[str], held: frozenset[str]) -> None:
+        # Step 1's reading of the list, used only to preview a disabled step exactly as step 1 does.
+        self._preview = (subject, held)
+        self._held: dict[str, str] = {input_handle: "msg"} if input_handle else {}
+        self._sent: set[str] = set()
+        self._built: set[str] = set()  # locals holding a MsgCreate skeleton: an MSH only
+
+    def run(self, items: tuple[_Understood, ...]) -> tuple[Step, ...]:
+        steps: list[Step] = []
+        for item in items:
+            if item.disabled:
+                # Never runs, so it touches no handle: step 1 renders it as commented-out source.
+                steps.extend(_parse_statement(item.elem, *self._preview, False))
+            elif item.statement is None:
+                steps.append(Control("block", "Block", "Block", body=self.run(item.body)))
+            else:
+                steps.append(self._statement(item.statement))
+        return tuple(steps)
+
+    def _statement(self, st: _Statement) -> Step:
+        if st.verb == "MsgSend":
+            return self._send(st)
+        if st.verb == "MsgLog":
+            return UnmappedAction(st.verb, "no v1 vocabulary mapping")
+        if st.verb == "MsgCreate":
+            return self._bind(st, f"Message.parse({_lit(st.skeleton)})", built=True)
+        if st.verb == "MsgTreeCopy":
+            source, dest = st.handles[0][0], st.handles[1][0]
+            held = self._held.get(source)
+            if held is None:
+                self._held.pop(dest, None)
+                return UnmappedAction(
+                    st.verb,
+                    f"copies {source}, which holds no message this import can identify here, "
+                    f"over {dest}, which is unknown from here on",
+                )
+            return self._bind(st, f"{held}.copy()", built=held in self._built)
+        return self._write(st)
+
+    def _bind(self, st: _Statement, expression: str, *, built: bool) -> Control:
+        handle = st.handles[-1][0]
+        local = f"{handle[1:].lower()}_msg"  # unique: the gate refused a case collision
+        self._held[handle] = local
+        self._sent.discard(local)  # a fresh object: the one already sent is not this one
+        if built:
+            self._built.add(local)
+        else:
+            self._built.discard(local)
+        kind = "create" if st.verb == "MsgCreate" else "clone"
+        return Control(kind, st.verb, st.text, args=(local, expression))
+
+    def _write(self, st: _Statement) -> Action | UnmappedAction:
+        handle = st.handles[0][0]
+        local = self._held.get(handle)
+        why = ""
+        if local is None:
+            why = (
+                f"addresses {handle}, which holds no message this import can identify at this "
+                "point (cross-message)"
+            )
+        elif local in self._sent:
+            why = (
+                f"writes {handle} after a MsgSend of it, which would change the message already "
+                "sent"
+            )
+        elif local in self._built and not st.path.startswith("MSH-"):
+            why = (
+                "writes a message MsgCreate built, whose skeleton has only an MSH segment, so the "
+                "segment this write needs must be added by hand"
+            )
+        if why or local is None:
+            self._held.pop(handle, None)
+            return UnmappedAction(
+                st.verb, f"{why}; {handle} is unknown from here on; intended target {st.path}"
+            )
+        value = "" if st.verb == "ItemClear" else st.literals[0]
+        vocabulary = "append_to_field" if st.verb == "ItemAppend" else "set_field"
+        return Action(st.verb, vocabulary, (_lit(st.path), _lit(value)), target=local)
+
+    def _send(self, st: _Statement) -> Control:
+        handle = st.handles[0][0]
+        local = self._held.get(handle)
+        args = (_lit(_connection_name(_sanitize(st.literals[0]))),)
+        if local is None:
+            refusal = (
+                f"MsgSend delivers {handle}, which at this point holds no message this import can "
+                "identify (it is not the input handle, nor bound by a clone or a MsgCreate before "
+                "this send); the import refuses to send msg in its place"
+            )
+            return Control("send", st.verb, st.text, args=args, refusal=refusal)
+        self._sent.add(local)
+        return Control("send", st.verb, st.text, args=args, message=local)
+
+
+def _names_a_call(text: str) -> bool:
+    """Whether the letters of any reading of ``text`` spell a call verb.
+
+    Step 1 never reads a verb from the raw value. It reads it through :func:`strip_markup`, which
+    removes tags and resolves character references: from a ``keyword`` span, read span by span
+    (:func:`parse_roles`), or else from the head of the whole value. So ``ActionList&#67;all`` and
+    ``ActionList<b></b>Call`` are both calls to step 1, and the two readings can differ from each
+    other: after an unclosed ``&#x``, only the span still holds the verb.
+
+    The gate therefore looks in all three texts, anywhere in each, and at their letters alone. Every
+    verb step 1 can read is a run of letters in one of them, so this is true wherever step 1 reads a
+    call. It is also true of text that only mentions a call, or marks one in another spelling, such
+    as the ``action-list-call-pass`` span class. That closes the gate too, and every list in the
+    package then renders as step 1 renders it, step 1's own gaps included (ADR 0086, the cost)."""
+    readings = (text, strip_markup(text), *(token.text for token in parse_roles(text)))
+    return any(word in _letters(reading) for reading in readings for word in _CALL_WORDS)
+
+
+def _may_call(elem: Element) -> bool:
+    """Whether ``elem`` may call a list: step 1 reads its tag as a call, or any string it holds names
+    one. Every string is read, not only ``@Data``: the tag, each attribute's name and value, and the
+    text in and after the element, which step 1 never reads."""
+    strings = (elem.tag, *elem.attrib, *elem.attrib.values(), elem.text or "", elem.tail or "")
+    return _local(elem.tag).lower() in _CALL_TAGS or any(map(_names_a_call, strings))
+
+
 def _hardened_fromstring(text: str) -> Element:
     """THE XML parse surface of this module — ``defusedxml`` with every hardening flag ON.
 
@@ -1683,6 +2098,9 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
     # ElementTree carries no parent link, so build one pass of child→parent up front: an <ActionList>
     # is switched off by @Disabled on ITSELF or on any element enclosing it (typically <Package>).
     parents = {child: parent for parent in root.iter() for child in parent}
+    # A list another list may call runs when and as often as its caller runs it, which the router
+    # cannot express: so in a package that may call any list, no list is fully understood.
+    calls = any(map(_may_call, root.iter()))
 
     handlers: list[Handler] = []
     taken: set[str] = {"route"}
@@ -1698,9 +2116,16 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
                 n += 1
             name = f"{name}_{n}"
         taken.add(name)
-        subject, held = _message_handles(action_list)
-        steps = tuple(_container_steps(action_list, subject, held, False))
         scope = _disabled_scope(action_list, parents)
+        # The whole-list gate (BACKLOG #313 step 2, ADR 0086): decided ONCE, for the whole list. A
+        # list it does not fully understand takes the step 1 path below untouched, so its output is
+        # step 1's byte for byte; there is no partial binding.
+        understood = _understood_list(action_list, parents) if scope is None and not calls else None
+        subject, held = _message_handles(action_list)
+        if understood is not None:
+            steps = _Binder(understood[0], subject, held).run(understood[1])
+        else:
+            steps = tuple(_container_steps(action_list, subject, held, False))
         if scope is not None:
             # The whole list is switched off: wrap it in ONE disabled node so it is preserved as
             # commented-out pseudo-source, counted as disabled, and — because _collect_sends skips a
@@ -1809,6 +2234,8 @@ def generate_module(channel: Channel) -> str:
     ]
 
     surface = ["Send", "handler", "inbound", "outbound", "router"]
+    if any(_any_live_control(h.steps, lambda c: c.kind == "create") for h in channel.handlers):
+        surface.append("Message")  # a MsgCreate binds its handle to Message.parse(...)
     surface_imports = sorted({*surface, *used_connectors})
     lines.append(f"from messagefoundry import {', '.join(surface_imports)}")
     if used_vocab:
@@ -1908,7 +2335,7 @@ def _generate_steps(steps: tuple[Step, ...], indent: int, *, in_loop: bool) -> l
     out: list[str] = []
     for step in steps:
         if isinstance(step, Action):
-            parts = [f"msg, {', '.join(step.args)}"] if step.args else ["msg"]
+            parts = [f"{step.target}, {', '.join(step.args)}"] if step.args else [step.target]
             for kw_name, kw_val in step.keywords:
                 parts.append(f"{kw_name}={kw_val}")
             out.append(f"{pad}{step.vocabulary}({', '.join(parts)})")
@@ -1982,7 +2409,15 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
                 f"{pad}# TODO: Corepoint {ctrl.source_verb} — hand-finish: no destination named "
                 f"({label})"
             ]
-        return [f"{pad}sends.append(Send({ctrl.args[0]}, msg))  # Corepoint {ctrl.source_verb}"]
+        return [
+            f"{pad}sends.append(Send({ctrl.args[0]}, {ctrl.message}))  # Corepoint {ctrl.source_verb}"
+        ]
+    if ctrl.kind in ("clone", "create"):
+        # Both halves are generated: the local is a name _Binder made from a handle the gate held to
+        # ``%`` plus ASCII letters, digits and underscores, and the expression is a local plus
+        # ``.copy()`` or a ``Message.parse`` of a :func:`_lit` literal. No export text reaches here raw.
+        local, expression = ctrl.args
+        return [f"{pad}{local} = {expression}  # Corepoint {label or ctrl.source_verb}"]
     if ctrl.kind == "break":
         if in_loop:
             return [f"{pad}break  # Corepoint {ctrl.source_verb}"]
@@ -2195,23 +2630,23 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list."""
-    return _any_live_send(steps, lambda send: bool(send.args))
+    return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
 
 
 def _has_refused_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree renders a refused ``MsgSend`` as a live ``raise`` (see :func:`_send_refusal`)."""
-    return _any_live_send(steps, lambda send: bool(send.refusal))
+    return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.refusal))
 
 
-def _any_live_send(steps: tuple[Step, ...], test: Callable[[Control], bool]) -> bool:
-    """Whether any live (not ``@Disabled``) ``send`` in the tree, branches included, passes ``test``."""
+def _any_live_control(steps: tuple[Step, ...], test: Callable[[Control], bool]) -> bool:
+    """Whether any live (not ``@Disabled``) control in the tree, branches included, passes ``test``."""
     for step in steps:
         if not isinstance(step, Control) or step.kind == "disabled":
             continue
-        if step.kind == "send" and test(step):
+        if test(step):
             return True
-        if _any_live_send(step.body, test) or any(
-            _any_live_send(b.body, test) for b in step.branches
+        if _any_live_control(step.body, test) or any(
+            _any_live_control(b.body, test) for b in step.branches
         ):
             return True
     return False
@@ -2334,7 +2769,8 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 # BRANCH asks :func:`_renders_as_branch` rather than this set, and an orphaned marker counts unmapped.
 # ``break`` is faithful only inside a loop, so :func:`_count_steps` also reads its loop context: a
 # ``LoopExit`` outside a loop is a TODO marker and counts unmapped (BACKLOG #1860). A ``send`` that is
-# refused, or names no destination, is not sent either, and also counts unmapped (BACKLOG #313).
+# refused, or names no destination, is not sent either, and also counts unmapped (BACKLOG #313). A
+# ``clone`` or ``create`` is the local a fully understood list binds (BACKLOG #313 step 2).
 _MAPPED_CONTROL_KINDS = frozenset(
     {
         "if",
@@ -2349,6 +2785,8 @@ _MAPPED_CONTROL_KINDS = frozenset(
         "break",
         "send",
         "call",
+        "clone",
+        "create",
     }
 )
 

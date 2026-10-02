@@ -79,13 +79,18 @@ def _allow_repo_config_on_windows() -> None:
     ACLs do not apply, and never on the runner it exists to measure. ubuntu produced a full 12-run
     table; both Windows legs died in the first second.
 
-    This sets the SAME documented dev/test escape the suite already uses for the SAME reason —
-    `tests/conftest.py::_allow_insecure_config_source_in_tests` — which is why
+    This sets the documented dev/test escape. The test suite meets the same refusal for the same
+    reason and answers it in-process instead
+    (`tests/conftest.py::_read_the_checkout_as_a_clean_config_source`), which is why
     `tests/test_load_runner.py` loads this identical config dir on those runners and passes. Kept
-    win32-only for the same reason it is there: a POSIX checkout is not group/world-writable, so the
-    escape must stay OFF so the POSIX refusal path keeps being exercised.
+    win32-only: a POSIX checkout is not group/world-writable, so the escape must stay OFF so the
+    POSIX refusal path keeps being exercised.
 
-    `setdefault`, not assignment: an operator who deliberately set it to "0" keeps that choice.
+    The escape is honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` beside it (vault BACKLOG
+    #2599), so this sets both. The probe builds its engine without reading settings from the
+    environment, so the dial here unlocks the escape and changes nothing else about the engine.
+
+    `setdefault`, not assignment: an operator who deliberately set either one keeps that choice.
 
     NEVER set in production. Scoped to a throwaway measurement whose engine binds loopback on
     ephemeral ports, writes a temp SQLite file, and dies with the process.
@@ -93,6 +98,7 @@ def _allow_repo_config_on_windows() -> None:
     if sys.platform != "win32":
         return
     os.environ.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
+    os.environ.setdefault("MEFOR_SECURITY_ENFORCEMENT", "warn")
 
 
 def _reserve() -> socket.socket:
@@ -155,7 +161,11 @@ def probe(rate: float, duration_s: float = 1.5, pool_size: int = 4) -> int:
     from messagefoundry.api import create_managed_app
 
     app = create_managed_app(
-        db_path=Path(tmp) / "probe.db", config_dir=_CONFIG_DIR, poll_interval=0.05
+        db_path=Path(tmp) / "probe.db",
+        config_dir=_CONFIG_DIR,
+        poll_interval=0.05,
+        # The load runner reads /stats with no bearer token, on a loopback socket and a temp store.
+        allow_no_auth=True,
     )
     uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="error"))
     # Release the MLLP ports at the last moment; hand the still-bound API socket to uvicorn.

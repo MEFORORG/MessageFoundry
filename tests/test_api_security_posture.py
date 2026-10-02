@@ -134,6 +134,7 @@ async def test_posture_reports_security_and_has_no_write_route(engine: Engine) -
             )
 
 
+@pytest.mark.usefixtures("remote_debugging_off")  # the process reading, pinned: see the fixture
 async def test_posture_on_secure_defaults_reports_no_loosenings(engine: Engine) -> None:
     # All-secure defaults: nothing reported. Every instance carries patient data (BACKLOG #1279),
     # so this is now the ONLY quiet posture -- there is no second, quieter one a declaration buys.

@@ -13,9 +13,13 @@ be driven two ways:
   and anything driven by a synchronous test client).
 
 Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached (the
-``serve`` path always attaches one). With **no** auth attached the routes are **fail-closed** (403)
-unless the app explicitly opts out via ``allow_no_auth=True`` (embedding / dev), in which case
-requests run as the full-access system identity (SYS-1). The API binds localhost by default and
+``serve`` path attaches one unless ``[security].require_sign_in`` is off). With **no** enabled auth
+attached, both factories are **fail-closed**: every protected route is refused (503) unless the
+caller passes ``allow_no_auth=True`` (embedding / dev), in which case requests run as the
+full-access system identity (SYS-1). ``serve`` passes the opt-in itself when sign-in is off, after
+its own start-up refusals.
+
+The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
 engine mints and reuses a self-signed pair on first run. ONE TOPOLOGY IS EXCLUDED --
 ``[api].tls_terminated_upstream`` declares a reverse proxy terminating TLS in front and speaking
@@ -357,6 +361,7 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
+from messagefoundry.remotedebug import remote_debug_posture
 from messagefoundry.service_status import query_service_state
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
@@ -2266,6 +2271,9 @@ def create_app(
                 store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
                 audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
+                # Vault BACKLOG #2700: read off THIS process, which is the engine. An app built
+                # without `serve` never installed the hook, and the reading then says so.
+                remote_debug=remote_debug_posture(),
             )
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
@@ -7661,6 +7669,7 @@ def create_managed_app(
     env_values: Mapping[str, Any] | None = None,
     env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
     auth_settings: AuthSettings | None = None,
+    allow_no_auth: bool = False,
     ai_settings: AiSettings | None = None,
     security_settings: SecuritySettings | None = None,
     alerts_settings: AlertsSettings | None = None,
@@ -7712,7 +7721,10 @@ def create_managed_app(
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
-    built-in roles; it creates no account (ADR 0183). The store is opened via the
+    built-in roles; it creates no account (ADR 0183). With unset or disabled ``auth_settings`` every
+    protected route is refused (503) unless the caller passes ``allow_no_auth=True``, the same opt-in
+    :func:`create_app` takes; beside enabled ``auth_settings`` that opt-in raises ``ValueError``.
+    The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
     — the CLI server passes it; in-process/test callers omit it (no separate API socket is bound).
@@ -7729,6 +7741,14 @@ def create_managed_app(
             raise ValueError("create_managed_app requires either store_settings or db_path")
         store_settings = sqlite_settings(db_path, synchronous=synchronous)
     resolved = store_settings
+    # create_app can ignore the opt-in beside an enabled service, because it is handed the service
+    # already attached. Here the service attaches in the lifespan, so an app that never ran it
+    # would answer as the system identity. The combination is refused instead.
+    if allow_no_auth and auth_settings is not None and auth_settings.enabled:
+        raise ValueError(
+            "create_managed_app: allow_no_auth=True was passed beside enabled auth_settings; "
+            "pass the opt-in only when sign-in is off"
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -8380,9 +8400,8 @@ def create_managed_app(
                 # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
                 await notifier.aclose()
 
-    # Auth disabled (or unset) → explicitly run open (dev/loopback; __main__ refuses a non-loopback
-    # serve when auth is off). Auth enabled → fail-closed until the lifespan attaches the service.
-    allow_no_auth = auth_settings is None or not auth_settings.enabled
+    # Unset or disabled auth_settings no longer select the open mode: only the caller's opt-in,
+    # checked at the top, does (vault BACKLOG #2611).
     return create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test

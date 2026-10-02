@@ -26,12 +26,13 @@ class AuthProvider(str, Enum):  # noqa: UP042
 class SessionMechanism(str, Enum):  # noqa: UP042
     """How a SESSION was minted, stored on ``sessions.auth_mechanism`` (ADR 0184 item (iv)).
 
-    Distinct from :class:`AuthProvider`, which describes the ACCOUNT. A hybrid directory account can
-    sign in by Kerberos or through the federated IdP, and both report ``AuthProvider.AD``; only the
-    session knows which one happened. Its one consumer is the step-up leg: an ``OIDC`` session steps
-    up at the IdP with ``max_age=0`` and ``prompt=login`` and never by a password (ADR 0142
-    Amendment B). A NULL column (a row written before the column existed) reads as ``None`` and
-    takes the non-federated leg.
+    Distinct from :class:`AuthProvider`, which describes the ACCOUNT. A directory account signs in
+    by Kerberos until an administrator binds it to a federated identity, and through the federated
+    IdP after that (vault BACKLOG #2609). Both report ``AuthProvider.AD``; only the session knows
+    which one happened. Its one consumer is the step-up leg: an ``OIDC`` session steps up at the IdP
+    with ``max_age=0`` and ``prompt=login`` and never by a password (ADR 0142 Amendment B). A NULL
+    column (a row written before the column existed) reads as ``None`` and takes the non-federated
+    leg.
     """
 
     PASSWORD = "password"  # nosec B105 -- a session-mechanism label, not a credential

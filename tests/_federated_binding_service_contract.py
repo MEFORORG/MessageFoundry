@@ -54,21 +54,23 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
         token_hash="t-bind-a", user_id="bind-a", expires_at=_EXPIRES, now=1_000.0
     )
 
-    # 1. A first bind writes the pair and revokes nothing: it adds a way in.
+    # 1. A first bind writes the pair and ends the account's sessions (vault BACKLOG #2609): the
+    #    account moves behind its identity provider, so nothing minted before outlives the bind.
     first = await service.bind_federated_subject(
         "bind-a", FIRST_SUB, expected_issuer=None, expected_subject=None, actor="admin"
     )
     assert (first.previous_issuer, first.previous_subject, first.sessions_revoked) == (
         None,
         None,
-        0,
+        1,
     )
     holder = await store.get_user_by_federated_subject(ISSUER, FIRST_SUB)
     assert holder is not None and holder.id == "bind-a"
-    live = await store.get_session("t-bind-a")
-    assert live is not None and live.revoked_at is None
+    ended = await store.get_session("t-bind-a")
+    assert ended is not None and ended.revoked_at is not None
     [bound] = await _audit(store, "auth.federated_subject_bound")
     assert bound["actor"] == "admin"
+    assert json.loads(bound["detail"])["sessions_revoked"] == 1
 
     # 2. A second account asking for a held pair is refused before any write.
     with pytest.raises(FederatedSubjectHeld):
@@ -110,13 +112,17 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
     assert len(winners) == 1
 
     # 4. A rebind clears first, in the unbind's own transaction: the old identity's session ends and
-    #    the audit row names the pair that transaction cleared.
+    #    the audit row names the pair that transaction cleared. The session is a new one, minted
+    #    under the first binding, because the first bind ended the earlier one.
+    await store.create_session(
+        token_hash="t-bind-a2", user_id="bind-a", expires_at=_EXPIRES, now=1_000.0
+    )
     rebound = await service.bind_federated_subject(
         "bind-a", REBOUND_SUB, expected_issuer=ISSUER, expected_subject=FIRST_SUB, actor="admin"
     )
     assert (rebound.previous_issuer, rebound.previous_subject) == (ISSUER, FIRST_SUB)
     assert rebound.sessions_revoked == 1
-    gone = await store.get_session("t-bind-a")
+    gone = await store.get_session("t-bind-a2")
     assert gone is not None and gone.revoked_at is not None
     assert await store.get_user_by_federated_subject(ISSUER, FIRST_SUB) is None
     [row] = await _audit(store, "auth.federated_subject_rebound")
