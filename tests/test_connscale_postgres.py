@@ -27,6 +27,7 @@ import pytest
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.runner import run_connscale
 from tests._connscale_ports import reserve_api_and_sink_bases
+from tests._rig_store import reset_accounts
 
 pytestmark = [
     pytest.mark.skipif(
@@ -80,6 +81,9 @@ zero_loss = true
     # of the machine. The families now come from disjoint windows below the OS ephemeral floors and
     # every port in both ranges is probed.
     api_port, sink_port = reserve_api_and_sink_bases(profile, sink_ports=1)
+    # This leg shares its database with the failover-load test, which runs as another pytest
+    # process: the rig provisions its own Administrator, so none may be there already.
+    await reset_accounts("postgres")
     report = await run_connscale(
         profile,
         engine_api_port_base=api_port,

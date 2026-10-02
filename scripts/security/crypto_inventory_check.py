@@ -378,6 +378,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the engine mints, so no client ever races a file that doesn't exist until the engine writes it.
     # Non-prod only: the pair lives in a per-process temp dir and covers loopback names alone.
     "harness/load/tlsmat.py": frozenset({"ssl"}),
+    # Vault BACKLOG #2719: CI and load rigs sign in. This module draws the rig Administrator's
+    # per-run password (secrets.token_hex) and signs in over the engine's TLS listener with a
+    # verifying context (ssl.create_default_context, pinned to a PEM when one is given; there is
+    # no verification-off path). Test tooling: the password is hashed by the same argon2id path
+    # as any local account, in a store the rig provisions. This module never writes it to a
+    # file or prints it.
+    "harness/load/rigadmin.py": frozenset({"secrets", "ssl"}),
     # Vault BACKLOG #2354: these two rigs open a server store against a self-signed dev container
     # directly, so they pass an explicit warn HopPosture; a missing posture now refuses the escape.
     # A value type only: no context is built through it.
@@ -873,6 +880,9 @@ IMPORT_ONLY: dict[str, str] = {
 #: to perform. Rationale for a file's crypto lives on its INVENTORY row above; rows for files the
 #: import arm never saw carry their own.
 OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    "harness/load/rigadmin.py": frozenset(
+        {"csprng:secrets.token_hex", "tls_context:ssl.create_default_context"}
+    ),
     "harness/load/tlsmat.py": frozenset(
         {
             "key_cert:via messagefoundry.pki",
@@ -1493,8 +1503,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via harness.load.tlsmat",
         }
     ),
+    # enginepoll.py also signs its clients in as the rig Administrator (vault BACKLOG #2719),
+    # which reaches that module's password draw and its verifying TLS context.
     "harness/load/enginepoll.py": frozenset(
-        {"key_cert:via harness.load.tlsmat", "sign_verify:via harness.load.tlsmat"}
+        {
+            "csprng:via harness.load.rigadmin",
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.rigadmin",
+        }
     ),
     "harness/load/estate/runner.py": frozenset(
         {
@@ -1517,6 +1534,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via harness.load.tlsmat",
         }
     ),
+    # The harness SMTP sink answers STARTTLS by wrapping the accepted socket with a server-side
+    # context its CALLER builds and passes in (non-prod, loopback only). It imports no crypto module,
+    # owns no key and decides no TLS policy: the test that mints the throwaway certificate does.
+    "harness/sinks/email.py": frozenset({"tls_context:.wrap_socket()"}),
     "messagefoundry/api/auth_routes.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
     "messagefoundry/tray/poller.py": frozenset({"tls_context:via messagefoundry.tray.probe"}),
     "messagefoundry/verify/federation.py": frozenset(

@@ -64,11 +64,17 @@ from harness.load.connscale.report import (
 )
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
+from harness.load.enginepoll import (
+    SIGN_IN_ERRORS,
+    EnginePoller,
+    EngineSample,
+    sample_until_reconciled,
+)
 from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.rigadmin import RIG_SESSION
 from harness.load.sender import _BACKOFF_MAX
 from harness.load.sink import CorrelationSink
 from messagefoundry.config.tls_policy import HopPosture
@@ -435,7 +441,7 @@ async def _run_one_step(
     # instant each was taken, and those instants must sit on the SAME clock as `EngineSample.elapsed_s`
     # or nothing downstream can put a probe reading beside the engine sample it belongs next to.
     origin = time.perf_counter()
-    poller = EnginePoller(node.url, token=None, origin=origin)
+    poller = EnginePoller(node.url, token=RIG_SESSION, origin=origin)
     # BACKLOG #1292: the per-message send ledger the intake audit reads. None disables the audit
     # wholesale (the sender's write path is then byte-identical to pre-#1292).
     ledger = IntakeLedger() if profile.intake_audit else None
@@ -474,12 +480,14 @@ async def _run_one_step(
                 before,
                 after,
             )
-        await node.start()
         # Any start/preflight failure is re-wrapped as ConnScaleError carrying the engine LOG TAIL
         # (captured NOW, before the `finally` stops the node and unlinks its log). This lets
         # run_connscale distinguish the benign pooled RCSI fail-closed gate from a REAL defect, and
         # converts the port-preflight's FailoverError so it can't escape and crash the whole sweep.
+        # The start is inside it because it provisions the rig Administrator first, and the open
+        # signs in: a refusal at either is a setup failure like the rest (SIGN_IN_ERRORS).
         try:
+            await node.start()
             await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
             await poller.open()
             await poller.sample_once()  # baseline
@@ -489,7 +497,7 @@ async def _run_one_step(
                 sink_host, profile.base_port + count - 1, timeout=_PORTS_READY_TIMEOUT
             )
             await _await_inbound_rows(poller, count, timeout=_PORTS_READY_TIMEOUT)
-        except (ConnScaleError, FailoverError) as exc:
+        except (ConnScaleError, FailoverError, *SIGN_IN_ERRORS) as exc:
             raise ConnScaleError(_startup_failure_detail(exc, node)) from exc
         # FD sampler keyed on the engine PID (the harness owns it).
         pid = node.pid
@@ -779,9 +787,8 @@ def _node_env(
     name_prefix: str = "",
 ) -> dict[str, str]:
     env = dict(base)
-    env["MEFOR_SECURITY_REQUIRE_SIGN_IN"] = (
-        "false"  # the poller reads /stats etc. without a bearer token
-    )
+    # No sign-in setting here: the node serves with sign-in on, and `EngineNode` provisions the rig
+    # Administrator the poller signs in as (harness.load.rigadmin).
     # ADR 0066 A/B seam: settings.py parses MEFOR_PIPELINE_CLAIM_MODE into PipelineSettings.claim_mode,
     # which threads __main__ -> api/app -> engine -> RegistryRunner.start() (pooled builds
     # StageDispatchers). "per_lane" is the engine default, so a per_lane arm is behaviorally unchanged.
@@ -1217,6 +1224,9 @@ async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:
     client = poller.client
     if client is None:
         return None, True
+    # Before the timer starts: the reload route wants a credential proved within the last few
+    # minutes, and proving it inside the timed call would charge a sign-in to the reload.
+    await poller.prove_sign_in()
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, time_reload_outcome, client, None)
 

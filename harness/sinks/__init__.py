@@ -8,9 +8,10 @@ that sets ``KIND`` (the connector kind it receives from, as the registry spells 
 ``build(endpoints, key)`` returning a :class:`Sink`. Modules are discovered, so a new family is a
 new file.
 
-Every sink binds 127.0.0.1 (:data:`LOOPBACK`) and nothing else, whatever the ``host`` endpoint
-says -- that key is the address drivers and engine outbounds DIAL -- so a sink never accepts traffic
-from another machine. A family's ``build()`` must keep it that way. A sink records payloads in
+Every sink that listens binds 127.0.0.1 (:data:`LOOPBACK`) and nothing else, whatever the ``host``
+endpoint says -- that key is the address drivers and engine outbounds DIAL -- so a sink never accepts
+traffic from another machine. A family's ``build()`` must keep it that way. (A sink that dials
+instead, like the database sink reading a server's table, binds nothing.) A sink records payloads in
 memory for the scenario to assert on and never logs them: the harness sends synthetic data, but a
 sink must not become the place where a full message body reaches a log.
 """
