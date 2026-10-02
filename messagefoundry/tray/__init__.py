@@ -18,8 +18,8 @@ neutral, stdlib-only engine modules ADR 0113 ratifies: the NSSM helpers
 the log backoff ``messagefoundry.log_backoff`` (amendment 2026-09-26), and the three log-scrub leaves
 ``messagefoundry.redaction``, ``messagefoundry.secretscrub`` and ``messagefoundry.controlchars``
 that ``tray/logscrub.py`` composes for ``tray.log`` (amendment 2026-09-27), and
-``messagefoundry.childenv``, which ``tray/branding.py`` starts its relaunch through (amendment
-2026-10-02). ``tray/config.py`` also
+``messagefoundry.childenv``, which ``tray/branding.py`` starts its relaunch through and
+``tray/autostart.py`` builds the login command with (amendment 2026-10-02). ``tray/config.py`` also
 imports the stdlib-only ``messagefoundry.api_tls_source``, which the ADR does not list. The
 package must never import ``pipeline``/``store``/``transports``/``config``/``api`` (beyond the
 Pydantic models the apiclient returns), PySide6, or FastAPI.

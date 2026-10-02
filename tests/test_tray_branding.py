@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import struct
 import subprocess
@@ -13,8 +14,9 @@ from typing import Any
 
 import pytest
 
+import messagefoundry
 from messagefoundry import _child_bootstrap
-from messagefoundry.tray import branding
+from messagefoundry.tray import autostart, branding
 
 
 def test_build_version_info_is_self_consistent() -> None:
@@ -119,6 +121,105 @@ def test_relaunch_hands_over_to_a_child_started_like_every_other_python_child(
     env = kwargs["env"]
     assert env["PYTHONPATH"] == kept
     assert env["MF_2801_ORDINARY"] == "crosses"  # the tray keeps the user's environment
+
+
+# --- Real children through the bootstrap (vault BACKLOG #2822) -----------------------------------
+#
+# A broken bootstrap does not fail the tray loudly: the branded child dies inside the grace window
+# and the first process runs the tray unbranded. So these start real interpreters. Each runs a
+# trivial module in place of the tray, from a working directory holding a decoy `messagefoundry`
+# package, and reports what it saw. A `-m` start would import the decoy and exit nonzero.
+
+_PROBE_MODULE = "mf_2822_tray_probe"
+_PROBE_SOURCE = """\
+import json, sys
+import messagefoundry
+with open(sys.argv[1], "w", encoding="utf-8") as out:
+    json.dump({"executable": sys.executable, "safe_path": sys.flags.safe_path,
+               "remote_debug": sys.is_remote_debug_enabled(), "package": messagefoundry.__file__},
+              out)
+"""
+
+
+def _probe_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """The probe's folder, a working directory with a decoy package in it, and the report path."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    (probe_dir / f"{_PROBE_MODULE}.py").write_text(_PROBE_SOURCE, encoding="utf-8")
+    cwd = tmp_path / "cwd"
+    decoy = cwd / "messagefoundry"
+    decoy.mkdir(parents=True)
+    (decoy / "__init__.py").write_text("raise SystemExit('the decoy answered')\n", encoding="utf-8")
+    return probe_dir, cwd, tmp_path / "report.json"
+
+
+def _assert_started_through_the_bootstrap(report: Path) -> dict[str, Any]:
+    seen: dict[str, Any] = json.loads(report.read_text(encoding="utf-8"))
+    assert Path(seen["package"]).resolve() == Path(messagefoundry.__file__).resolve()
+    assert seen["safe_path"] is True
+    assert seen["remote_debug"] is False
+    return seen
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="the tray is Windows-only")
+
+
+@_WINDOWS_ONLY
+def test_the_login_command_starts_a_real_first_process_through_the_bootstrap(
+    tmp_path: Path,
+) -> None:
+    """The Run-key string itself, parsed by Windows, from a working directory Windows chose. Red
+    before vault BACKLOG #2822: ``-m`` put the working directory first and the decoy answered."""
+    probe_dir, cwd, report = _probe_layout(tmp_path)
+    command = autostart.launcher_command(sys.executable)
+    assert command.endswith(" messagefoundry.tray"), command
+    command = command.removesuffix("messagefoundry.tray") + " ".join(
+        [_PROBE_MODULE, autostart._run_key_argument(str(report))]
+    )
+    env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONSAFEPATH"}
+    env["PYTHONPATH"] = str(probe_dir)
+    done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
+        command, cwd=cwd, env=env, capture_output=True, text=True, timeout=120, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    _assert_started_through_the_bootstrap(report)
+
+
+@_WINDOWS_ONLY
+def test_the_relaunch_starts_a_real_branded_child_through_the_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``relaunch_branded`` itself, with a real branded launcher. Only the module name changes on
+    the way out, so the command line and the environment are the relaunch's own."""
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    branded = branding.ensure_branded_launcher(scripts_dir=scripts)
+    if branded is None:
+        pytest.skip("no base pythonw.exe available to brand")
+    # The branded copy finds the standard library through the pyvenv.cfg one folder up, as it does
+    # in a real venv. Measured: without one it dies with "No module named 'encodings'".
+    (tmp_path / "pyvenv.cfg").write_text(
+        f"home = {branding._base_pythonw().parent}\n", encoding="utf-8"
+    )
+    probe_dir, cwd, report = _probe_layout(tmp_path)
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("PYTHONPATH", str(probe_dir))
+    real_popen = subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+
+    def _popen(argv: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        assert argv[-1] == "messagefoundry.tray", argv
+        child = real_popen([*argv[:-1], _PROBE_MODULE, str(report)], **kwargs)  # noqa: S603
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    monkeypatch.setattr(branding, "ensure_branded_launcher", lambda *a, **k: branded)
+    branding.relaunch_branded()  # the probe may outlive the grace window or not; either is fine
+    [child] = children
+    assert child.wait(timeout=120) == 0
+    seen = _assert_started_through_the_bootstrap(report)
+    assert Path(seen["executable"]).name == branding.BRANDED_EXE_NAME
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="version resource + parser are Windows-only")

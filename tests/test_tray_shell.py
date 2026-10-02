@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
-from messagefoundry.tray.autostart import launcher_command, pythonw_executable
+from messagefoundry import _child_bootstrap
+from messagefoundry.childenv import python_child_argv
+from messagefoundry.tray.autostart import _run_key_argument, launcher_command, pythonw_executable
 from messagefoundry.tray.menu import Action, assign_command_ids, build_menu
 from messagefoundry.tray.state import StatusSnapshot, TrayState
 
@@ -67,9 +70,67 @@ def test_disabled_action_is_not_dispatchable() -> None:
     assert Action.EXIT in mapping.values()  # always available
 
 
-def test_launcher_command_quotes_absolute_pythonw() -> None:
+def test_launcher_command_starts_the_tray_through_the_bootstrap() -> None:
+    """Vault BACKLOG #2822: the login command starts the first tray process like the engine's own
+    Python children, so no working directory leads its import path. Typed out rather than read from
+    childenv, so the test does not check a list against itself."""
     cmd = launcher_command(r"C:\repo\.venv\Scripts\pythonw.exe")
-    assert cmd == r'"C:\repo\.venv\Scripts\pythonw.exe" -m messagefoundry.tray'
+    bootstrap = Path(_child_bootstrap.__file__).resolve()
+    assert cmd == (
+        rf'"C:\repo\.venv\Scripts\pythonw.exe" -P -X disable-remote-debug "{bootstrap}" '
+        "messagefoundry.tray"
+    )
+
+
+def _windows_argv(command_line: str) -> list[str]:
+    """``command_line`` split by Windows' own parser, ``CommandLineToArgvW``."""
+    if sys.platform != "win32":  # the skipif already guarantees it; this narrows mypy's linux pass
+        pytest.skip("Win32 only")
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    shell32.CommandLineToArgvW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LocalFree.argtypes = (wintypes.HLOCAL,)
+    count = ctypes.c_int()
+    parsed = shell32.CommandLineToArgvW(command_line, ctypes.byref(count))
+    assert parsed, ctypes.get_last_error()
+    try:
+        return [parsed[i] for i in range(count.value)]
+    finally:
+        kernel32.LocalFree(ctypes.cast(parsed, wintypes.HLOCAL))
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(
+    sys.platform != "win32", reason="the Run key and its parser are Windows-only"
+)
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "pythonw",
+    [r"C:\Program Files\Python 3.14\pythonw.exe", r"C:\repo\.venv\Scripts\pythonw.exe"],
+)
+def test_windows_reads_the_launcher_command_back_as_the_child_command_line(pythonw: str) -> None:
+    """Windows splits the Run-key string into exactly the argument list a child gets, with a space
+    in a path and without one."""
+    assert _windows_argv(launcher_command(pythonw)) == python_child_argv(
+        "messagefoundry.tray", executable=pythonw
+    )
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("argument", ["C:\\a b\\", "C:\\a\\\\", "C:\\a b", "-P", "x.y"])
+def test_windows_reads_each_quoted_argument_back_unchanged(argument: str) -> None:
+    # A backslash run before a closing quote is the case the quoting has to double.
+    assert _windows_argv(f'"C:\\x.exe" {_run_key_argument(argument)}') == ["C:\\x.exe", argument]
+
+
+def test_a_quote_in_a_run_key_argument_is_refused() -> None:
+    with pytest.raises(ValueError, match="quote"):
+        _run_key_argument('C:\\a"b')
 
 
 def test_pythonw_executable_falls_back_to_given_path(tmp_path: object) -> None:

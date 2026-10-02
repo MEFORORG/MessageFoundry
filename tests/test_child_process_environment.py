@@ -794,8 +794,8 @@ def test_one_function_builds_the_command_line_of_a_python_child() -> None:
     """``python_child_argv`` is where the interpreter flags are added, so a Python child started any
     other way would start without them. Two tray modules also name the executable.
     ``tray/branding.py`` reads it to place the branded launcher and to tell whether it is running
-    under it. ``tray/autostart.py`` writes the login command, which starts the first tray process
-    WITHOUT these flags; the ADR 0113 amendment of 2026-10-02 names that limit (vault BACKLOG #2801)."""
+    under it. ``tray/autostart.py`` reads it to find ``pythonw.exe`` for the login command, which
+    it then builds with ``python_child_argv`` (vault BACKLOG #2822)."""
     names_the_interpreter = {
         rel
         for rel, source in _scanned_sources().items()
