@@ -19,9 +19,10 @@ Three tiers:
      only when ``MEFOR_SECURITY_ENFORCEMENT=warn`` sits in the same environment. Under ``enforce``
      it is inert, the refusal names it, and the loosening registry names it only while it is live.
 
-On win32 the suite's session fixture makes the Windows readers report a clean access list. Tiers 3
-and 4 hand the check their own readers, so they run the same on every host. The tests that need the
-real access list ask for it (``real_config_source_readers``).
+On win32 the suite's session fixture replaces the gate's own Windows call with one that reads a
+clean access list. Every test here is a test of that gate, so the whole module asks for the real
+call back (``real_config_source_readers``): tiers 3 and 4 then hand it their own readers, and tier 2
+reads the real access list.
 """
 
 from __future__ import annotations
@@ -66,6 +67,8 @@ from messagefoundry.pipeline.sandbox import (
     SandboxPolicy,
     SandboxSession,
 )
+
+pytestmark = pytest.mark.usefixtures("real_config_source_readers")
 
 _REPO = Path(__file__).resolve().parent.parent
 

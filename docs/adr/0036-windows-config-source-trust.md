@@ -244,10 +244,11 @@ program that embeds the engine with settings it built itself.
 
 **The test suite changed with it.** It used to set the escape for every win32 test. Under the clamp
 that would also need the `warn` dial for the whole session, which would move every default-posture
-test to `warn`. So on win32 the suite's readers now report a clean owner and access list in its own
-process, at the seam Amendment B built, and the check still runs and decides. The tests that need
-the real access list ask for the real readers back. A child process the suite spawns does not
-inherit that, and gets both variables where it needs them.
+test to `warn`. So on win32 the suite replaces the gate's own Windows call, in its own process, with
+one that runs the real check over a clean owner and access list. The gate's tests ask for the real
+call back. Only that call is replaced. The readers behind it are shared with other code, at least
+the restricted file create, and replacing them for a whole session broke it. A child process the
+suite spawns does not inherit the stand-in, and gets both variables where it needs them.
 
 **Who decided.** The Manager seat, on 2026-10-01, under the owner's standing rule. The owner may
 overturn it.

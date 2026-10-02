@@ -53,15 +53,19 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[None]:
     user-writable — and on the Windows CI runner the default workspace ACL grants ``BUILTIN\\Users``
     write, so the SEC-003 config-source trust guard would fail-closed on every config load.
 
-    So on win32 only, the READERS the Windows check consults report a clean owner and access list in
-    this process, as the engine suite's conftest does and for the reason it gives: the
-    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape this used to set is honoured only at
-    ``[security].enforcement = warn`` now (vault BACKLOG #2599). The check itself still runs. POSIX
-    checkouts aren't group/world-writable, so the Linux leg keeps running the real readers. The
+    So on win32 only, the config-source gate's OWN call (``_assert_safe_config_source_windows``) runs
+    the real check over readers that report a clean owner and access list, as the engine suite's
+    conftest does and for the reason it gives: the ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape this
+    used to set is honoured only at ``[security].enforcement = warn`` now (vault BACKLOG #2599).
+    POSIX checkouts aren't group/world-writable, so the Linux leg keeps running the real check. The
     check's own tests live in the engine suite.
 
+    Only the gate's call is replaced, never the shared ``_win32_config_source_probes``, which
+    ``messagefoundry.restricted_file`` also reads through. The engine conftest says what replacing
+    the readers themselves broke.
+
     One ``pytest`` run can load both conftests. The stand-in records what it replaced
-    (``functools.wraps``), so the engine suite's fixture can still find the real readers when this
+    (``functools.wraps``), so the engine suite's fixture can still find the real call when this
     one ran first."""
     if sys.platform != "win32":
         yield
@@ -73,21 +77,21 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[None]:
         self_sid=_SUITE_SID, read_path=lambda _path: clean, owner_in_admins=lambda _sid: False
     )
 
-    real = inspect.unwrap(wiring._win32_config_source_probes)
+    real = inspect.unwrap(wiring._assert_safe_config_source_windows)
     # The same guard the engine suite's conftest carries: a stand-in that forgot to record what it
-    # replaced would be wrapped here as "real", and hide the engine's readers from that suite.
+    # replaced would be wrapped here as "real", and hide the engine's own call from that suite.
     if Path(real.__code__.co_filename) != Path(wiring.__file__):
         raise RuntimeError(
-            "the Windows config-source readers found here are not the engine's own: a stand-in was "
-            "installed without functools.wraps over the readers it replaced"
+            "the Windows config-source check found here is not the engine's own: a stand-in was "
+            "installed without functools.wraps over the call it replaced"
         )
 
     @functools.wraps(real)
-    def clean_readers() -> wiring._WinConfigSourceProbes:
-        return probes
+    def check_over_clean_readers(directory: Path) -> None:
+        wiring._enforce_windows_config_source(directory, probes)
 
     patch = pytest.MonkeyPatch()
-    patch.setattr(wiring, "_win32_config_source_probes", clean_readers)
+    patch.setattr(wiring, "_assert_safe_config_source_windows", check_over_clean_readers)
     try:
         yield
     finally:

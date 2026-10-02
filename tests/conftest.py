@@ -202,55 +202,57 @@ def _clean_config_source_probes() -> _WinConfigSourceProbes:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _read_the_checkout_as_a_clean_config_source() -> Iterator[
-    Callable[[], _WinConfigSourceProbes] | None
-]:
+def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[[Path], None] | None]:
     """The suite loads sample/harness configs from the repo checkout, which is intentionally
     user-writable — and on the Windows CI runner the default workspace ACL grants ``BUILTIN\\Users``
     write, so the SEC-003 config-source trust guard would fail-closed on every config load.
 
-    So on win32 only, the READERS the Windows check consults report a clean owner and access list in
-    this process. The check itself still runs and still decides, at the seam its own tests already
-    use (``_win32_config_source_probes``): a test that hands it a failing read gets the refusal. A
-    test that needs the real access list asks for it with ``real_config_source_readers``, which this
-    fixture yields (``None`` off win32). Scoped to win32 because a POSIX checkout is not
-    group/world-writable, so the Linux leg runs the real check in every test. The anchor-path
-    fixture below is scoped the same way.
+    So on win32 only, the config-source gate's OWN call (``_assert_safe_config_source_windows``) runs
+    the real check over readers that report a clean owner and access list. The check still runs and
+    still decides. A test of the gate asks for the real call back with
+    ``real_config_source_readers``, which this fixture yields (``None`` off win32). Scoped to win32
+    because a POSIX checkout is not group/world-writable, so the Linux leg runs the real check in
+    every test. The anchor-path fixture below is scoped the same way.
+
+    **Only the gate's call is replaced, never ``_win32_config_source_probes`` itself.** Those readers
+    are shared: ``messagefoundry.restricted_file`` reads a new file's access list back through them.
+    This fixture first replaced the readers for the whole session, and every restricted create on
+    Windows then compared the list it asked for with the stand-in's and refused.
 
     This used to set ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` for the whole session. Vault BACKLOG #2599
     clamped that escape: it is honoured only with ``MEFOR_SECURITY_ENFORCEMENT=warn`` beside it, and
     setting the dial for a whole session would move every default-posture test to ``warn``.
 
-    A child process does not inherit these readers and runs the real check. A child that loads from
+    A child process does not inherit this stand-in and runs the real check. A child that loads from
     ``tmp_path`` passes it: pytest makes that directory with mode ``0o700``, which on Windows is an
     access list of SYSTEM, Administrators and the owner alone, whatever ``%TEMP%`` grants (measured
     2026-10-01, Python 3.14). A child that loads from the checkout needs both variables in its own
     environment, as ``harness.load.failover.EngineNode`` sets them.
 
     The web console suite's conftest installs the same kind of stand-in, and one ``pytest`` run can
-    load both. So the real readers are found with ``inspect.unwrap``, and each stand-in records what
+    load both. So the real call is found with ``inspect.unwrap``, and each stand-in records what
     it replaced, or this fixture would capture the other suite's stand-in as "real"."""
     if sys.platform != "win32":
         yield None
         return
     import messagefoundry.config.wiring as wiring
 
-    real = inspect.unwrap(wiring._win32_config_source_probes)
+    real = inspect.unwrap(wiring._assert_safe_config_source_windows)
     # A stand-in that forgot to record what it replaced would be captured here as "real", and the
     # tests of the real access list would then pass without reading one.
     if Path(real.__code__.co_filename) != Path(wiring.__file__):
         raise RuntimeError(
-            "the Windows config-source readers found here are not the engine's own: a stand-in was "
-            "installed without functools.wraps over the readers it replaced"
+            "the Windows config-source check found here is not the engine's own: a stand-in was "
+            "installed without functools.wraps over the call it replaced"
         )
     probes = _clean_config_source_probes()
 
     @functools.wraps(real)
-    def clean_readers() -> _WinConfigSourceProbes:
-        return probes
+    def check_over_clean_readers(directory: Path) -> None:
+        wiring._enforce_windows_config_source(directory, probes)
 
     patch = pytest.MonkeyPatch()
-    patch.setattr(wiring, "_win32_config_source_probes", clean_readers)
+    patch.setattr(wiring, "_assert_safe_config_source_windows", check_over_clean_readers)
     try:
         yield real
     finally:
@@ -260,13 +262,14 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[
 @pytest.fixture
 def real_config_source_readers(
     monkeypatch: pytest.MonkeyPatch,
-    _read_the_checkout_as_a_clean_config_source: Callable[[], _WinConfigSourceProbes] | None,
+    _read_the_checkout_as_a_clean_config_source: Callable[[Path], None] | None,
 ) -> None:
-    """Put the real Windows config-source readers back for one test, so it sees the real access
-    list. A no-op off win32, where the session fixture above installs nothing."""
+    """Put the gate's real Windows call back for one test, so it reads through
+    ``_win32_config_source_probes``: the real access list, or the readers a test hands it. A no-op
+    off win32, where the session fixture above installs nothing."""
     if _read_the_checkout_as_a_clean_config_source is not None:
         monkeypatch.setattr(
-            "messagefoundry.config.wiring._win32_config_source_probes",
+            "messagefoundry.config.wiring._assert_safe_config_source_windows",
             _read_the_checkout_as_a_clean_config_source,
         )
 
