@@ -508,9 +508,8 @@ async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
     ``auth.permission_denied`` row naming the missing permission, and ``/responses`` returns a null
     ``body``, the answer a caller without ``view_raw`` gets.
 
-    Minting refuses such a custom role and decoding drops ``view_raw`` from a stored one (see
-    test_custom_roles.py). This pins the route gates as the second line, so it lifts that one
-    rule (``tests/_role_pairing.py``).
+    Minting refuses such a role, so this lifts that rule (see ``tests/_role_pairing.py``) to pin
+    the route gates as the second line.
 
     The ``both`` custom role is the control arm: it differs from ``rawonly`` by ``view_summary``
     alone, and it reads both bodies, so the refusals are that permission and not a broken route."""
@@ -589,13 +588,22 @@ async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) 
             },
         )
         assert made.status_code == 201, made.text
+        role_url = f"/roles/custom/{made.json()['id']}"
+        both = ["messages:read", "messages:view_raw", "messages:view_summary"]
+        # PUT control: the same edit keeping view_summary is accepted.
+        kept = await c.put(role_url, headers=h, json={"display_name": "R", "permissions": both})
+        assert kept.status_code == 200, kept.text
+        # The refused edit drops view_summary only.
         edited = await c.put(
-            f"/roles/custom/{made.json()['id']}",
+            role_url,
             headers=h,
-            json={"display_name": "Raw", "permissions": ["messages:view_raw"]},
+            json={"display_name": "R", "permissions": ["messages:read", "messages:view_raw"]},
         )
         assert edited.status_code == 400, edited.text
         assert "messages:view_raw needs messages:view_summary" in edited.json()["detail"]
+        # Neither refusal wrote anything: one role, still holding view_summary.
+        listed = (await c.get("/roles/custom", headers=h)).json()
+        assert [r["permissions"] for r in listed] == [sorted(both)], listed
 
 
 def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:

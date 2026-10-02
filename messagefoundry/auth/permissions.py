@@ -16,7 +16,7 @@ endpoints can be gated the moment they land, without a roles migration.
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Iterable
+from collections.abc import Iterable
 from enum import Enum
 
 
@@ -256,7 +256,7 @@ def validate_custom_role_permissions(values: Iterable[str]) -> list[Permission]:
     return sorted(perms, key=lambda p: p.value)
 
 
-def raw_body_without_summary(perms: Collection[Permission]) -> bool:
+def raw_body_without_summary(perms: Iterable[Permission]) -> bool:
     """True for a permission set holding ``messages:view_raw`` without ``messages:view_summary``.
 
     Minting refuses that shape (ASVS 14.2.6, vault BACKLOG #1187). Owner ruling R18 makes a
@@ -265,7 +265,8 @@ def raw_body_without_summary(perms: Collection[Permission]) -> bool:
     every body route (``/raw``, attachments, the console body page, export) rather than one route at
     a time; the routes keep their own gates as a second line. No built-in role has this shape.
     """
-    return Permission.MESSAGES_VIEW_RAW in perms and Permission.MESSAGES_VIEW_SUMMARY not in perms
+    held = set(perms)  # one pass, so an iterator argument answers correctly
+    return Permission.MESSAGES_VIEW_RAW in held and Permission.MESSAGES_VIEW_SUMMARY not in held
 
 
 def decode_custom_role_permissions(raw: str | None) -> frozenset[Permission]:

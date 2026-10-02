@@ -15,8 +15,8 @@ the point:
 * **Viewer** (``monitoring:read`` + ``messages:read``) covers the five ``messages:read`` surfaces;
 * a **custom role** holding ``messages:view_raw`` *without* ``messages:view_summary`` covers
   ``GET /messages/{id}``. Minting refuses that role since vault BACKLOG #1187, so the fixture
-  bypasses the minting and decoding rule (``tests/_role_pairing.py``, which lifts that one rule only) to prove the route-level
-  redaction still holds as a second line (``view_raw`` is not a superset of ``view_summary``);
+  lifts the rule (see ``tests/_role_pairing.py``) to prove the route redaction holds as a second
+  line (``view_raw`` is not a superset of ``view_summary``);
 * a **custom role** holding ``monitoring:diagnose`` *without* ``messages:view_summary`` covers
   ``GET /alerts/active`` (BACKLOG #2443), since no built-in role holds that split.
 
@@ -370,15 +370,18 @@ async def test_the_seed_actually_carries_every_gated_model_property_pair(seeded:
 async def test_route_tier_withholds_gated_properties_from_a_view_raw_only_identity(
     seeded: _Seed,
 ) -> None:
-    """With minting and decoding bypassed, a ``view_raw``-only identity still gets the open and the
-    body but no gated property: the route-level tier holds on its own. Minting refuses this role
-    since vault BACKLOG #1187; see test_custom_roles.py for that first line."""
+    """A ``view_raw``-only identity (see ``tests/_role_pairing.py``) gets the open and the body, but
+    no gated property, on both seeded rows: the PROCESSED one carries summary and metadata, and the
+    ERROR one carries ``error``, so each withholding assertion has a value to withhold."""
     async with _client(seeded.engine, seeded.service) as client:
         headers = await _login(client, "rawonly")
         response = await client.get(f"/messages/{seeded.message_id}", headers=headers)
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body["summary"] is None and body["error"] is None and body["metadata"] is None
+        assert body["summary"] is None and body["metadata"] is None
+        errored = await client.get(f"/messages/{seeded.error_message_id}", headers=headers)
+        assert errored.status_code == 200, errored.text
+        assert errored.json()["error"] is None
         # The body is its own fetch since BACKLOG #2345, on the same messages:view_raw gate.
         raw = await client.get(f"/messages/{seeded.message_id}/raw", headers=headers)
         assert raw.status_code == 200, raw.text
