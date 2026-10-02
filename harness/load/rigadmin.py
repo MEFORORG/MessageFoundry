@@ -242,7 +242,14 @@ def provision(
     ``harness/load`` holds modules named like standard-library ones.
     """
     admin = admin or rig_admin()
-    child_env = {**env, ADMIN_NAME_ENV: admin.username, ADMIN_PASS_ENV: admin.password}
+    # The child is Python, so pin what it writes to UTF-8 and decode it as UTF-8. Only its exit
+    # code is parsed; the text is carried into an error, so a bad byte is replaced, not raised.
+    child_env = {
+        **env,
+        ADMIN_NAME_ENV: admin.username,
+        ADMIN_PASS_ENV: admin.password,
+        "PYTHONIOENCODING": "utf-8",
+    }
     argv = [sys.executable, "-P", str(Path(__file__).resolve()), "provision"]
     if db is not None:
         argv += ["--db", db]
@@ -255,6 +262,8 @@ def provision(
             cwd=None if cwd is None else str(cwd),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_PROVISION_TIMEOUT_S,
             check=False,
         )

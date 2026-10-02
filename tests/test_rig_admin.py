@@ -244,7 +244,10 @@ def test_provision_hands_the_password_to_the_child_in_its_environment_and_never_
         **env,
         rigadmin.ADMIN_NAME_ENV: "rig-operator",
         rigadmin.ADMIN_PASS_ENV: admin.password,
+        "PYTHONIOENCODING": "utf-8",
     }
+    # The child's output is pinned to UTF-8 on both ends, so a non-ASCII refusal cannot fail to decode.
+    assert (seen["encoding"], seen["errors"]) == ("utf-8", "replace")
     assert seen["cwd"] == str(tmp_path)
     # -P keeps harness/load, which holds a module named `profile`, off the child's sys.path.
     assert seen["argv"][:2] == [sys.executable, "-P"]
