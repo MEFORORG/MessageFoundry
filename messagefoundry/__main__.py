@@ -3139,8 +3139,9 @@ def _serve(args: argparse.Namespace) -> int:
         if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
             print(
                 f"error: {exposure_desc} on a {'production ' if production else ''}PHI "
-                f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — the "
-                "Administrator role would authenticate with a single factor over the network. "
+                f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — every "
+                "account with no second factor enrolled, Administrators included, would "
+                "authenticate with a single factor over the network. "
                 "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
                 "API (on an AD-only deployment it binds directory principals too, each enrolling "
                 "an engine factor); or set [security].allow_single_factor_admin_when_exposed=true to "
@@ -3155,16 +3156,16 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).warning(
                 "AUDIT: %s on a %sPHI instance (environment %r) with [security].require_mfa "
                 "off, permitted because [security].allow_single_factor_admin_when_exposed=true — every "
-                "account in [security].require_mfa_scope is single-factor over the network.",
+                "account with no second factor enrolled is single-factor over the network.",
                 exposure_desc,
                 "production " if production else "",
                 env_name,
             )
         print(
             f"warning: {exposure_desc} in a PHI-carrying "
-            f"environment ({env_name!r}) with [security].require_mfa off — every account in "
-            "[security].require_mfa_scope is single-factor over the network. Enable [security].require_mfa=true (WP-14 native TOTP) "
-            "before exposure.",
+            f"environment ({env_name!r}) with [security].require_mfa off — every account with no "
+            "second factor enrolled is single-factor over the network. Enable "
+            "[security].require_mfa=true (WP-14 native TOTP) before exposure.",
             file=sys.stderr,
         )
 
@@ -3189,8 +3190,8 @@ def _serve(args: argparse.Namespace) -> int:
             "warning: [security].web_console_public_address is set with no declared TLS terminator "
             "on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
-            "UNDECLARED reverse proxy, every account in [security].require_mfa_scope is single-factor over "
-            "the network and "
+            "UNDECLARED reverse proxy, every account with no second factor enrolled is single-factor "
+            "over the network and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
             "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
             "trusted_proxies, or set [security].require_mfa=true.",
