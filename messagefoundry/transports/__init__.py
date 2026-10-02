@@ -38,11 +38,13 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     InboundHandler,
     NegativeAckError,
+    RegisteredKinds,
     SourceConnector,
     build_destination,
     build_source,
     register_destination,
     register_source,
+    registered_kinds,
 )
 
 __all__ = [
@@ -55,4 +57,6 @@ __all__ = [
     "build_destination",
     "register_source",
     "register_destination",
+    "RegisteredKinds",
+    "registered_kinds",
 ]
