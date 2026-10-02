@@ -7141,7 +7141,7 @@ def security_loosenings(
                 f"{len(query_credential_hops)} connection(s) carry a credential in the "
                 f"endpoint url's query string ({named}) — it rides the request line, so the "
                 "partner's and any proxy's access log holds it; the engine's own log lines drop the "
-                "query, its settings views mask the value, and on an https hop TLS still encrypts "
+                "query, its settings views withhold the URL, and on an https hop TLS still encrypts "
                 "it on the wire",
             )
         )

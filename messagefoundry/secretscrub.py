@@ -106,13 +106,7 @@ from __future__ import annotations
 
 import re
 
-__all__ = [
-    "CREDENTIAL_PLACEHOLDER",
-    "credential_query_params",
-    "credential_value_spans",
-    "mask_credential_query",
-    "scrub_credentials",
-]
+__all__ = ["CREDENTIAL_PLACEHOLDER", "credential_query_params", "scrub_credentials"]
 
 #: What a scrubbed credential VALUE is replaced with. Matches
 #: :class:`logging_setup.CredentialQueryScrubFilter`, so one log line cannot carry two spellings of
@@ -658,59 +652,6 @@ def credential_query_params(url: str) -> list[str]:
     except ValueError:
         return []
     return sorted({_display_name(name) for name, _ in pairs if _is_credential_param(name)})
-
-
-def credential_value_spans(text: str) -> list[tuple[int, int]]:
-    """The ``[start, end)`` span of the VALUE of every credential-like ``name=value`` segment in
-    ``text``, wherever it sits.
-
-    A segment starts after any ``?``, ``&``, ``#`` or ``;`` (a path parameter such as
-    ``;jsessionid=``, or a server that splits its query on ``;``) and ends at the next ``&`` or
-    ``#``. It does not care where a URL parser would put the query, which is the point:
-    ``config.wiring._mask_url`` unions these with password spans so that at least the misreadings
-    tested there cannot hide a credential. A segment in a fragment or a path that looks like a
-    credential is masked too; that is the safe direction. A name is judged after dropping tab, CR
-    and LF, which ``urlsplit`` drops before ``parse_qsl`` decodes it, then by the same test as
-    :func:`credential_query_params`. An empty value has no span. One pass, linear in ``text``."""
-    import urllib.parse  # noqa: PLC0415 -- see credential_query_params
-
-    n = len(text)
-    # next_end[i]: the first "&" or "#" at or after i, else n. Built right to left, once.
-    next_end = [n] * (n + 1)
-    for i in range(n - 1, -1, -1):
-        next_end[i] = i if text[i] in "&#" else next_end[i + 1]
-    spans: list[tuple[int, int]] = []
-    for i, ch in enumerate(text):
-        if ch not in "?&#;":
-            continue
-        seg_start = i + 1
-        seg_end = next_end[seg_start]
-        equals = text.find("=", seg_start, seg_end)
-        if equals < 0 or equals + 1 >= seg_end:
-            continue
-        name = text[seg_start:equals].replace("\t", "").replace("\r", "").replace("\n", "")
-        if _is_credential_param(urllib.parse.unquote_plus(name)):
-            spans.append((equals + 1, seg_end))
-    return spans
-
-
-def mask_credential_query(url: str, *, placeholder: str = "***") -> str:
-    """``url`` with every span :func:`credential_value_spans` finds replaced by ``placeholder``.
-
-    The query-credential half of the settings-view mask. ``config.wiring._mask_url`` does NOT call
-    this: it unions these spans with userinfo password spans and replaces them together, so that one
-    mask cannot cut the string the other reads. Use this alone only for a URL known to carry no
-    userinfo. Everything that is not a span is kept as written."""
-    out: list[str] = []
-    cursor = 0
-    for start, end in credential_value_spans(url):
-        if start < cursor:
-            continue
-        out.append(url[cursor:start])
-        out.append(placeholder)
-        cursor = end
-    out.append(url[cursor:])
-    return "".join(out)
 
 
 def _run(text: str, placeholder: str, folded: str | None) -> str:

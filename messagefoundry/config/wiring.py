@@ -87,11 +87,7 @@ from messagefoundry.connection_names import (
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.secretscrub import (
-    credential_query_params,
-    credential_value_spans,
-    scrub_credentials,
-)
+from messagefoundry.secretscrub import credential_query_params, scrub_credentials
 
 __all__ = [
     "ConnectionSpec",
@@ -1410,131 +1406,53 @@ def connector_secret_env_values(
 _URL_SETTING_SUFFIXES = ("url", "_url", "_uri", "endpoint", "_endpoint")
 
 
-def _proxy_userinfo_split(value: str) -> tuple[str, str, str] | None:
-    """``(text before the user, user, text after the userinfo's "@")`` where urllib's proxy parser
-    finds a user AND a password in ``value``, else ``None``.
+#: A URL scheme at the very start of a value, ``https://`` and the like. Shown in a withheld URL so
+#: the view still says what kind of hop it is; a scheme holds none of the characters a secret needs.
+_URL_SCHEME_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 
-    A re-statement, in code written here, of CPython's ``urllib.request._parse_proxy`` (3.14), the
-    parser that sends a ``proxy_url``'s password. It is private, so it is mirrored rather than
-    called, and ``tests/test_url_query_credential.py`` checks this against it case by case. In order:
-
-    * The scheme is the text before the first ``:``, if that text is not empty and holds no ``/``
-      (``_splittype``). What follows it, or the whole value when there is no scheme, is the rest.
-      When the rest does not start with ``/``, the WHOLE value is the authority, so
-      ``user:pw@proxy:3128`` has a password.
-    * Otherwise the rest must start with ``//``; if it does not, the parser raises, reads no
-      password, and this returns ``None``.
-    * If an ``@`` appears ANYWHERE after the ``:``, the authority runs from after ``//`` to the
-      first ``/`` after the FIRST ``@``, or to the end. So ``user:1234/5@proxy`` has the password
-      ``1234/5``, and a query ``@`` (``h:8443/x?email=a@b``) makes everything up to the next ``/``
-      authority too, which is why this can mask a URL with no real userinfo.
-    * The userinfo is the authority before its LAST ``@``; the user is the userinfo before its first
-      ``:``, and the password is what follows that ``:``. This returns a split only when that
-      password is not empty: urllib sends no credential otherwise, and an empty one is no secret.
-      The user may be empty (``http://:pw@proxy``)."""
-    colon = value.find(":")
-    rest = colon + 1 if colon > 0 and "/" not in value[:colon] else 0
-    if not value.startswith("/", rest):
-        auth_start, auth_end = 0, len(value)
-    elif not value.startswith("//", rest):
-        return None
-    else:
-        auth_start = rest + 2
-        first_at = value.find("@", rest)
-        slash = value.find("/", first_at if first_at >= 0 else auth_start)
-        auth_end = len(value) if slash < 0 else slash
-    authority = value[auth_start:auth_end]
-    userinfo, at, hostport = authority.rpartition("@")
-    if not at:
-        return None
-    user, _colon, password = userinfo.partition(":")
-    if not password:
-        return None  # no password, or an empty one -- nothing secret to remove
-    return value[:auth_start], user, hostport + value[auth_end:]
+#: The placeholder a withheld URL renders as, after its scheme when it has one.
+_WITHHELD_URL = "<redacted>"
 
 
-def _raw_password_spans(value: str) -> list[tuple[int, int]]:
-    """The password span the proxy mirror finds in ``value`` as given, if any.
-    :func:`_password_spans` runs this over normalised copies as well."""
-    split = _proxy_userinfo_split(value)
-    if split is None:
-        return []
-    before, user, after = split
-    return [(len(before) + len(user) + 1, len(value) - len(after) - 1)]
+def _url_may_carry_a_credential(value: str) -> bool:
+    """Whether a URL setting must be withheld from a settings view, by a COARSE rule.
 
+    Any of these withholds it: an ``@``, ``%40`` or ``%3A`` anywhere in it (any case), a
+    credential-looking query parameter name (:func:`~messagefoundry.secretscrub.credential_query_params`,
+    the same test the construction warning uses), or a value ``urlsplit`` refuses. It does not try
+    to find WHERE a secret is: several readers parse a URL's userinfo, each differently, and three
+    review rounds on PR 1912 found a new way a precise mask disagreed with one of them. A coarse rule
+    that withholds the whole URL cannot disagree. The cost is the view: a URL with an ``@`` in its
+    path or query, such as an email address, is withheld too.
 
-def _password_spans(value: str) -> list[tuple[int, int]]:
-    """The ``[start, end)`` span of every userinfo password at least these readers find in
-    ``value``, in ``value``'s own coordinates:
-
-    * urllib's proxy parser (:func:`_proxy_userinfo_split`). Its password span CONTAINS the one a
-      ``urlsplit`` netloc read finds for a dialled URL, so no second reader is kept for that:
-      ``tests/test_url_query_credential.py`` drives ``urlsplit(...).password`` through the
-      composed mask to keep that claim tested (review of 2544705869, which measured a separate
-      netloc reader adding nothing);
-    * that reader over a copy with tab, CR and LF removed, because ``urlsplit`` removes them
-      before it looks for ``//`` (``http:/\t/user:pw@h``);
-    * that reader over a copy with ``%40`` read as ``@``, because urllib's ``Request`` unquotes
-      the host, so ``user:pw%40h`` leaks like ``user:pw@h`` (``transports.rest.refuse_url_credentials``).
-
-    Every span is masked whichever key holds the URL, which fails toward masking: a credential-free
-    URL with a ``:`` before a query ``@`` can lose its host in the view. A reader not listed here
-    is not modelled."""
-    spans = _raw_password_spans(value)
-    # %40 -> "@" plus two placeholders keeps every index where it was.
-    at_decoded = value.replace("%40", "@\0\0")
-    if at_decoded != value:
-        spans += _raw_password_spans(at_decoded)
-    kept = [i for i, ch in enumerate(value) if ch not in "\t\r\n"]
-    if len(kept) != len(value):
-        stripped = "".join(value[i] for i in kept)
-        for copy in {stripped, stripped.replace("%40", "@\0\0")}:
-            spans += [(kept[s], kept[e - 1] + 1) for s, e in _raw_password_spans(copy) if e > s]
-    return spans
+    Every step is one scan of the value, so the rule is linear in its length."""
+    folded = value.casefold()
+    if "@" in value or "%40" in folded or "%3a" in folded:
+        return True
+    try:
+        urllib.parse.urlsplit(value)
+    except ValueError:
+        return True
+    return bool(credential_query_params(value))
 
 
 def _mask_url(value: str) -> str:
-    """A URL setting as ``redacted_settings`` shows it: the userinfo password and the value of each
-    credential-like query parameter replaced with ``***``, everything else kept.
+    """A URL setting as ``redacted_settings`` shows it: unchanged, or ``<scheme>://<redacted>`` when
+    :func:`_url_may_carry_a_credential` says it may carry one (just ``<redacted>`` when the value
+    does not start with a scheme and ``//``).
 
     BACKLOG #1207. ``url="https://user:SECRET@host/path"`` was returned verbatim by both serializers
     while ``proxy_password`` on the SAME object masked -- the credential was safe in the typed field
-    and disclosed in the URL beside it. The user half and the host and path are PRESERVED
-    deliberately: an operator diagnosing a connection needs to see which account and which host.
+    and disclosed in the URL beside it.
 
-    It masks the UNION of spans found in the ORIGINAL string, never a substring another mask cut:
-    the passwords :func:`_password_spans` finds, and the value of every credential-like
-    ``name=value`` segment (:func:`~messagefoundry.secretscrub.credential_value_spans`). Spans that
-    overlap or touch merge into one ``***``. So at least the readers and misreadings modelled there
-    cannot hide one another's secret; a reader not modelled can.
-
-    CORRECTED (Lander QA on PR 1912, 2026-10-01): a hand-rolled authority rule showed
-    ``http://user:1234/5@proxy`` verbatim, and urllib reads ``1234/5`` as the password. The next
-    attempt masked the query only in the text after the userinfo, which served ``api_key`` when a
-    ``:`` and an ``@`` later in the query made the proxy reader's USER swallow it. Masking spans of
-    the original string closes both. The cost is the view, never a modelled secret: a credential-free
-    URL with a ``:`` before a query ``@`` can show a ``***`` and the wrong host, and a fragment or
-    path segment that looks like a credential is masked too.
-
-    Not masked, by decision: a userinfo with a user and no password (``https://TOKEN@host``). #1207
-    keeps the user visible, and a URL key carrying one is refused at build; an ``env()`` default or
-    a hand-built settings map is not, so such a token would be shown."""
-    spans = sorted(_password_spans(value) + credential_value_spans(value))
-    if not spans:
+    CORRECTED (Manager decision on PR 1912, 2026-10-01): #1207 masked only the password and kept the
+    user, host and path, and later rounds tried to mask exactly what each URL reader reads. Each
+    round of review found a reader that disagreed with the mask. This rule withholds the whole URL
+    instead, failing closed, and gives up the user, host and path in the view for such a URL."""
+    if not _url_may_carry_a_credential(value):
         return value
-    out: list[str] = []
-    cursor = 0
-    for start, end in spans:
-        if end <= cursor:
-            continue  # inside a span already masked
-        if start <= cursor and out:
-            cursor = end  # overlaps or touches the previous span: extend that one "***"
-            continue
-        out.append(value[cursor:start])
-        out.append("***")
-        cursor = end
-    out.append(value[cursor:])
-    return "".join(out)
+    scheme = _URL_SCHEME_PREFIX.match(value)
+    return f"{scheme.group(0)}{_WITHHELD_URL}" if scheme else _WITHHELD_URL
 
 
 def _redact_header_name(name: object) -> str:
@@ -1581,8 +1499,9 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     """A JSON-safe, secret-scrubbed view of a connection's settings for the API ``/metadata`` endpoint:
     each EnvRef becomes ``{"env": key}`` (the value is never resolved — only the key is shown), a
     credential field rendered inline is replaced with ``"***"`` (an ``env()`` *default* is dropped for
-    a credential field so a fallback secret can't leak), and a credential header inside a ``headers``
-    table is redacted too."""
+    a credential field so a fallback secret can't leak), a credential header inside a ``headers``
+    table is redacted too, and a URL setting that may carry a credential is withheld whole as
+    ``<scheme>://<redacted>`` (:func:`_mask_url`)."""
     out: dict[str, Any] = {}
     for name, value in settings.items():
         is_secret = _is_secret_setting(name)
@@ -1591,16 +1510,16 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             if value.default is not _UNSET and not is_secret:
                 default = value.default
                 if isinstance(default, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
-                    # A URL default gets the same two masks as a literal URL below (ASVS 14.2.1).
+                    # A URL default gets the same rule as a literal URL below (ASVS 14.2.1).
                     default = _mask_url(default)
                 ref["default"] = default
             out[name] = ref
         elif is_secret:
             out[name] = "***"
         elif isinstance(value, str) and name.lower().endswith(_URL_SETTING_SUFFIXES):
-            # BACKLOG #1207 -- a credential in URL userinfo, masked without destroying the view. ASVS
-            # 14.2.1 -- and the value of a credential-like QUERY parameter, by the same name test
-            # the construction warning uses, or /metadata would serve the key it warns about.
+            # BACKLOG #1207 and ASVS 14.2.1: a URL that may carry a credential, in its userinfo or in
+            # a credential-like query parameter, is withheld whole (_mask_url), or /metadata would
+            # serve the key the construction warning names.
             out[name] = _mask_url(value)
         elif name == "headers" and isinstance(value, dict):
             # Both axes: a header NAME is rendered through _redact_header_name before it is used as
