@@ -182,11 +182,14 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
 It also probes each Vault token the engine uses and the AD bind account, when they are
 configured. A Vault token that holds more than the engine needs, or an AD bind account in an
 administrative group, makes it exit 3. A Vault or AD probe that cannot run makes it exit 4. Those
-findings are reported only; they never stop a start. Run the task with the service's environment,
-so the probes read the engine's own tokens and bind password. A Vault hop whose
-`MEFOR_*_VAULT_TOKEN` is unset is not observed, and the check never falls back to `VAULT_TOKEN`. Each
-run binds to AD as the service account, so a wrong bind password counts toward the account lockout
-threshold every time. SMTP and the identity provider are
+findings are reported only; they never stop a start.
+
+**Do not copy the Vault token or the AD bind password into the scheduled task.** That task usually
+lacks them, so in it the Vault and AD hops read as not observed and the command exits 4 even for a
+clean login. Run it with `--json` and read the `store` hop's `state` for this step. Run the full
+check where the service's environment already exists. A Vault hop whose `MEFOR_*_VAULT_TOKEN` is
+unset is not observed, and the check never falls back to `VAULT_TOKEN`. Each run binds to AD as the
+service account, so a wrong bind password counts toward the account lockout threshold every time. SMTP and the identity provider are
 printed with the identity the engine presents and the least grant each needs, marked **not probed**.
 Confirm those by hand; they never change the exit code. The full per-hop table is in
 [`SECURITY.md`](SECURITY.md) §*Each backend hop's least privilege; the engine probes the store,

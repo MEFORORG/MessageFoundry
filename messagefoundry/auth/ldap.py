@@ -158,6 +158,8 @@ class BindAccountReading:
     member_of: tuple[str, ...] = ()
     primary_group_rid: int | None = None
     problem: str | None = None
+    #: False when no bind was made at all, so nothing here was read from the directory.
+    bound: bool = True
 
 
 class _Lookup(NamedTuple):
@@ -1006,16 +1008,21 @@ class LdapAuthenticator:
                 why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
                 return BindAccountReading(who, problem=f"group membership not read: {why}")
             entry = svc.entries[0] if svc.entries else None
+            result = svc.result if isinstance(svc.result, dict) else {}
         except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
         finally:
             with contextlib.suppress(ldap3.core.exceptions.LDAPException):
                 svc.unbind()
         if entry is None:
+            # ldap3 does not raise on a failed search here, so the result code is the only record of
+            # why: invalidDNSyntax for a bind identity that is a UPN or DOMAIN\\user rather than a
+            # DN, insufficientAccessRights for an entry the account may not read.
+            why = result.get("description") or "no result code"
             return BindAccountReading(
                 who,
-                problem="group membership not read: the bind DN's own entry was not returned "
-                "(is [auth].ad_bind_dn a distinguished name?)",
+                problem=f"group membership not read: the base read of [auth].ad_bind_dn returned "
+                f"no entry ({why}); the read needs a distinguished name the account may read",
             )
         raw = entry["tokenGroups"].raw_values if "tokenGroups" in entry else ()
         sids = tuple(

@@ -584,7 +584,7 @@ except that a Vault token missing a capability the engine calls is noted.
   command runs the same read on demand.
 - **Each Vault token.** The command reads the token's own policies, TTL and renewability
   (`auth/token/lookup-self`), then its capabilities (`sys/capabilities-self`) on each path the engine
-  calls and on seven administrative paths it never calls. The token, its id and its accessor are
+  calls and on administrative paths it never calls. The token, its id and its accessor are
   never printed. It reads only the token in `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN`.
 - **The AD bind account.** The command binds as the service account and asks the directory who it
   is (the RFC 4532 "Who am I?" operation). It then reads that account's own `tokenGroups`, which AD
@@ -623,17 +623,25 @@ A Vault token is **over-granted** when any of these holds:
 
 - it carries the `root` policy;
 - a path the engine calls grants more than that call needs;
-- an administrative path grants anything but `deny`;
+- an administrative path it is asked about grants anything but `deny`;
 - the store and the connector-secret hops hold the same token. Then each hop is judged against the
   union of both grants, so each holds the other's paths beyond its own least grant.
 
-The seven administrative paths are two policy writes (`sys/policies/acl/` and the older
-`sys/policy/`), two identity-group paths that can attach a policy (`identity/group` and
-`identity/group/name/`), a secrets mount (`sys/mounts/`), an auth method (`sys/auth/`) and
-`auth/token/create`. Grants on other paths the engine does not call are not read, so a clean token
-still needs its policy read by hand.
+The administrative paths it is asked about are at least these:
 
-The AD bind account is **over-granted** when it is in an administrative group:
+- two policy writes under a placeholder name, `sys/policies/acl/` and the older `sys/policy/`;
+- the same two writes for each policy the token carries, which catches a policy that may rewrite
+  itself;
+- two identity-group paths that can attach a policy, `identity/group` and `identity/group/name/`;
+- a secrets mount (`sys/mounts/`), an auth method (`sys/auth/`) and `auth/token/create`;
+- for each Transit key the engine uses, its `config` (which can make the key exportable), `rotate`,
+  `export` and `backup` paths.
+
+Grants on other paths the engine does not call are not read, so a clean token still needs its policy
+read by hand.
+
+The AD bind account is **over-granted** when it is in an administrative group the check knows.
+These are at least:
 
 - **By fixed SID**, read from `tokenGroups`: Domain Admins, Domain Controllers, Schema Admins,
   Enterprise Admins, Group Policy Creator Owners, Key Admins and Enterprise Key Admins in its
@@ -644,9 +652,15 @@ The AD bind account is **over-granted** when it is in an administrative group:
   installed. So it is found only in the direct `memberOf`, and a nested DnsAdmins membership is not
   seen.
 
+A clean LDAP hop means none of these groups, not no powerful group: a group outside the list, such
+as one an Exchange install creates with rights on the domain, is not flagged.
+
 When `tokenGroups` cannot be read, the probe falls back to the direct `memberOf` and
 `primaryGroupID`, which miss a nested group, and reports the hop as not observed unless it finds
-one. A Who am I that names no identity is also not observed, never clean.
+one. A bind that succeeds but whose Who am I names no identity is also not observed, never
+clean. When the base read of `[auth].ad_bind_dn` returns no entry, the hop names the directory's
+result code: `invalidDNSyntax` means the bind identity is a UPN or `DOMAIN\user` rather than a
+distinguished name, and the group read needs a DN.
 
 These probes add read-only calls the engine does not otherwise make: the token self-lookup, the
 capabilities read, Who am I and one read of the bind account's own entry. Each goes through the

@@ -79,6 +79,7 @@ __all__ = [
     "settings_hops",
     "store_hop",
     "vault_consumers",
+    "vault_admin_paths",
     "vault_hop",
 ]
 
@@ -205,6 +206,38 @@ VAULT_ADMIN_PATHS: tuple[str, ...] = (
     "auth/token/create",
 )
 
+#: The Transit operations on a key the engine uses that would let a token change the key or take it
+#: out of Vault: its config (which can set ``exportable``), a rotation, an export and a backup.
+_TRANSIT_KEY_ADMIN = (
+    "{mount}/keys/{key}/config",
+    "{mount}/keys/{key}/rotate",
+    "{mount}/export/encryption-key/{key}",
+    "{mount}/export/hmac-key/{key}",
+    "{mount}/backup/{key}",
+)
+
+
+def vault_admin_paths(
+    required: Mapping[str, frozenset[str]], policies: Iterable[str]
+) -> tuple[str, ...]:
+    """Every path to ask a token about that the engine never calls, in a fixed order.
+
+    :data:`VAULT_ADMIN_PATHS`, then a write of each policy the token carries (``sys/policies/acl/``
+    and ``sys/policy/``), which the placeholder names cannot catch when a policy grants writes only
+    on names like its own, then each Transit key's config, rotate, export and backup paths, which
+    would let the token make the store key exportable and read it out. At least these: grants on
+    other paths are not read."""
+    out = list(VAULT_ADMIN_PATHS)
+    for policy in policies:
+        if policy != "root":  # root is judged on its own, and has no path to write
+            out += [f"sys/policies/acl/{policy}", f"sys/policy/{policy}"]
+    for path in required:
+        mount, kind, key = (path.split("/", 2) + ["", ""])[:3]
+        if kind == "keys" and key:  # a Transit key's metadata path: <mount>/keys/<key>
+            out += [template.format(mount=mount, key=key) for template in _TRANSIT_KEY_ADMIN]
+    return tuple(dict.fromkeys(out))
+
+
 #: What the check itself needs on every token: both are in Vault's ``default`` policy, so a token
 #: made with ``-no-default-policy`` needs them granted to read clean.
 _SELF_READ_GRANT = (
@@ -320,7 +353,7 @@ def vault_hop(
             over.append(f"{path} also grants {_caps(excess)} (needs {_caps(needed)})")
         if missing:
             notes.append(f"{path} lacks {_caps(missing)}, so the engine's own call would fail")
-    for path in VAULT_ADMIN_PATHS:
+    for path in reading.admin_paths:
         extra = set(reading.capabilities.get(path, ())) - {"deny"}
         if extra:
             over.append(f"{path} grants {_caps(extra)}; the engine never calls it")
@@ -355,7 +388,7 @@ def vault_hop(
     else:
         state = HopState.CLEAN
     parts = [*(f"over-granted: {o}" for o in over), *seen, *notes]
-    parts += [f"could not observe: {p}" for p in reading.problems]
+    parts += [f"could not observe: {printable(p)}" for p in reading.problems]
     if state is HopState.CLEAN:
         parts.append(
             "paths the engine does not call were read only for the administrative ones; "
@@ -453,10 +486,12 @@ def ad_bind_configured(settings: ServiceSettings) -> bool:
 def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading]) -> HopPrivilege:
     """Probe and judge the bind account, when AD is configured.
 
-    Over-granted: any administrative group, by SID from ``tokenGroups`` (every nested and primary
-    group), by name from the direct ``memberOf``, or by the ``primaryGroupID``. Clean: Who am I
-    named the bound identity and the transitive read found none. Unobservable: the bind or a read
-    failed, Who am I named no identity, or only the direct read was possible and it found none."""
+    Over-granted: any administrative group the check knows, by SID from ``tokenGroups`` (every
+    nested and primary group), by name from the direct ``memberOf``, or by the ``primaryGroupID``.
+    Clean: Who am I named the bound identity and the transitive read found none of them, which is
+    not a claim that the account holds no other powerful group. Unobservable: the bind or a read
+    failed, a bound Who am I named no identity, or only the direct read was possible and it found
+    none."""
     if not ad_bind_configured(settings):
         return _not_configured("ldap", "[auth].enabled or [auth].ad_enabled is off")
     auth = settings.auth
@@ -466,16 +501,16 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     )
     reading = probe()
     transitive = bool(reading.group_sids)
-    found = {g for sid in reading.group_sids if (g := administrative_group(sid))}
+    by_sid = {g for sid in reading.group_sids if (g := administrative_group(sid))}
     # The canonical spelling, never the directory's, so nothing remote reaches the output. Read on
     # both paths: it is the only read that can see DnsAdmins.
-    found |= {
+    direct = {
         _ADMIN_GROUP_NAMES[c.lower()] for c in reading.member_of if c.lower() in _ADMIN_GROUP_NAMES
     }
     if reading.primary_group_rid in _ADMIN_DOMAIN_RIDS:
-        found.add(_ADMIN_DOMAIN_RIDS[reading.primary_group_rid])
+        direct.add(_ADMIN_DOMAIN_RIDS[reading.primary_group_rid])
     problems = [reading.problem] if reading.problem is not None else []
-    if reading.authzid is None:
+    if reading.bound and reading.authzid is None:
         problems.append("Who am I returned no identity, so the bound identity is not proven")
     if reading.problem is None and not transitive:
         problems.append(
@@ -485,16 +520,18 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     parts: list[str] = []
     if reading.authzid is not None:
         parts.append(f"Who am I: bound as {printable(reading.authzid)!r}")
-    scope = "transitive, from tokenGroups" if transitive else "direct memberOf only"
+    # Each group is labelled by the read that found it, so a direct-only find is not read as nested.
+    found = [f"{g} (transitive, from tokenGroups)" for g in sorted(by_sid)]
+    found += [f"{g} (direct memberOf)" for g in sorted(direct - by_sid)]
     if found:
         state = HopState.OVER_GRANTED
-        parts.insert(0, f"over-granted: member of {', '.join(sorted(found))} ({scope})")
+        parts.insert(0, f"over-granted: member of {', '.join(found)}")
     elif problems:
         state = HopState.UNOBSERVABLE
     else:
         state = HopState.CLEAN
-        parts.append(f"no administrative group ({scope})")
-    parts += [f"could not observe: {p}" for p in problems]
+        parts.append("in none of the administrative groups the check knows (transitive read)")
+    parts += [f"could not observe: {printable(p)}" for p in problems]
     parts.append(_LDAP_RIGHTS_NOT_READ)
     return HopPrivilege("ldap", state, identity, minimal, ". ".join(parts))
 

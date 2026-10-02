@@ -221,15 +221,12 @@ def build_provider(settings: SecretsSettings) -> VaultSecretProvider:
 # --- what this hop's token must be able to do (BACKLOG #305, ASVS 13.2.2) ---------------------------
 
 
-def secrets_vault_client() -> Any:
-    """The connector-secret hop's Vault client, built from the same environment and by the same
-    :func:`_build_client` :meth:`VaultSecretProvider.resolve` uses: same TLS narrowing, same anchor,
-    no redirects, and the same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``,
-    which reads the token's own grants through it and changes nothing.
+def secrets_vault_token() -> str:
+    """The connector-secret token named in ``MEFOR_SECRETS_VAULT_TOKEN``, for ``check-privileges``.
 
-    **It refuses when ``MEFOR_SECRETS_VAULT_TOKEN`` is unset, where the provider does not.** Given
-    no token, hvac reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is
-    the operator's own token, and the check would judge it as the engine's. Raises
+    **It refuses when that variable is unset, where the provider does not.** Given no token, hvac
+    reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is the operator's
+    own token, and the check would judge it, or read a secret with it, as the engine's. Raises
     :class:`SecretProviderError`, which the probe reports as not observed."""
     token = os.environ.get(_ENV_TOKEN)
     if not token:
@@ -238,6 +235,14 @@ def secrets_vault_client() -> Any:
             f"only the token named there, never VAULT_TOKEN or ~/.vault-token; run it with the "
             f"service's environment"
         )
+    return token
+
+
+def secrets_vault_client(token: str) -> Any:
+    """The connector-secret hop's Vault client for ``token``, built by the same :func:`_build_client`
+    :meth:`VaultSecretProvider.resolve` uses: same TLS narrowing, same anchor, no redirects, and the
+    same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
+    own grants through it and changes nothing. Take ``token`` from :func:`secrets_vault_token`."""
     return _build_client(os.environ.get(_ENV_ADDR), token)
 
 

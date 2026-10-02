@@ -691,10 +691,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # capabilities through the providers' own client builders (store_vault_client, the Transit
     # cipher's and the KEK's required-path helpers), so it carries their TLS narrowing, anchor and
     # cleartext refusal and builds no client of its own. tls_policy and keyprovider are imported only
-    # to recognise the engine's fixed-text refusals (InsecureHopRefused, KeyProviderError). No
-    # primitive is called here: no encrypt, decrypt, MAC or key load.
+    # to recognise the engine's fixed-text refusals (InsecureHopRefused, KeyProviderError). hashlib:
+    # a SHA-256 digest of each Vault token, held in memory only to tell whether two hops hold the
+    # same token, and never printed. No encrypt, decrypt, MAC or key load.
     "messagefoundry/privilege_probes.py": frozenset(
         {
+            "hashlib",
             "messagefoundry.config.tls_policy",
             "messagefoundry.store.crypto_transit",
             "messagefoundry.store.keyprovider",
@@ -863,11 +865,6 @@ IMPORT_ONLY: dict[str, str] = {
     "messagefoundry/pipeline/wiring_runner.py": (
         "INSTRUMENT LIMIT. Decides whether a plaintext hop is allowed (is_loopback_hop_host, "
         "active_hop_posture): a TLS posture decision with no crypto-shaped call in it"
-    ),
-    "messagefoundry/privilege_probes.py": (
-        "reads a Vault token's policies and capabilities through the providers' own client builders, "
-        "which are inventoried in store/keyprovider_vault.py and config/secretprovider_vault.py; "
-        "imports the refusal types only to recognise their fixed text, and calls no primitive"
     ),
     "messagefoundry/store/cipher_cells.py": (
         "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "
@@ -1249,6 +1246,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
         }
     ),
+    # BACKLOG #305: check-privileges digests each Vault token with SHA-256 to tell whether two hops
+    # hold the same token. An identity comparison held in memory, never printed or stored.
+    "messagefoundry/privilege_probes.py": frozenset({"hash:hashlib.sha256"}),
     # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
     # tls_policy.assert_hvac_tls_suites and mounts it, so a TLS context is built here now.
     "messagefoundry/store/keyprovider_vault.py": frozenset(

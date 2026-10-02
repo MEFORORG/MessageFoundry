@@ -10,8 +10,9 @@ no client of its own:
 
 * **Vault**, per token: ``GET /v1/auth/token/lookup-self`` for the token's policies, TTL and
   renewability, then one ``POST /v1/sys/capabilities-self`` for the exact paths the engine calls
-  plus :data:`~messagefoundry.privilege_check.VAULT_ADMIN_PATHS`. Both are calls a token's
-  ``default`` policy allows, and both only read.
+  plus the paths it never needs (:func:`~messagefoundry.privilege_check.vault_admin_paths`). Both
+  are calls a token's ``default`` policy allows, and both only read. Only the token named in the
+  hop's own ``MEFOR_*_VAULT_TOKEN`` is read, never one hvac would fall back to.
 * **LDAP**: the RFC 4532 "Who am I?" extended operation on the service-account bind, then a read of
   that account's own groups (:meth:`~messagefoundry.auth.ldap.LdapAuthenticator.read_bind_account`).
 
@@ -24,13 +25,14 @@ refusal text, never a server's error body.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.controlchars import strip_control_chars
-from messagefoundry.privilege_check import VAULT_ADMIN_PATHS
+from messagefoundry.privilege_check import printable, vault_admin_paths
 
 logger = logging.getLogger(__name__)
 
@@ -53,32 +55,35 @@ class VaultTokenReading:
     """What one Vault token said about itself. Holds no part of the token.
 
     ``required`` is each path the engine calls with the capabilities that call needs; it is empty
-    when the paths could not be named. ``capabilities`` is Vault's answer for those paths and for
-    the administrative ones. ``problems`` names every part that could not be read.
+    when the paths could not be named. ``admin_paths`` is every path asked about that the engine
+    never calls (:func:`~messagefoundry.privilege_check.vault_admin_paths`). ``capabilities`` is
+    Vault's answer for both sets. ``problems`` names every part that could not be read.
 
-    ``token_ref`` is the token's ACCESSOR, as lookup-self reported it. It is kept only so
-    :meth:`same_token_as` can tell when two hops hold one token, and it is never printed: it is out
-    of ``repr`` and out of every hop's text. An accessor cannot authenticate, but with the right
-    policy it can look up or revoke the token, so it is treated as a value not to show."""
+    ``token_ref`` is a SHA-256 digest of the token, kept only so :meth:`same_token_as` can tell
+    when two hops hold one token, whatever the token type and whether or not lookup-self answered.
+    It is never printed: it is out of ``repr`` and out of every hop's text. A digest of a
+    high-entropy token gives nothing back to a reader, but it is still not shown."""
 
     looked_up: bool = False
     policies: tuple[str, ...] = ()
     ttl: int | None = None
     renewable: bool | None = None
     required: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    admin_paths: tuple[str, ...] = ()
     capabilities: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     problems: tuple[str, ...] = ()
     token_ref: str | None = field(default=None, repr=False, compare=False)
 
     def same_token_as(self, other: VaultTokenReading) -> bool:
-        """Whether lookup-self named the same token for both readings. ``False`` when either could
-        not name its token."""
+        """Whether both readings were taken with the same token. ``False`` when either has no
+        token to compare, because its token variable was unset."""
         return self.token_ref is not None and self.token_ref == other.token_ref
 
 
 def _problem(text: str) -> str:
-    """Log one probe problem and return it. The text is already secret-free (:func:`_why`)."""
-    logger.warning("check-privileges: %s", text)
+    """Log one probe problem and return it. The text is already secret-free (:func:`_why`), and
+    is logged without control or format characters, as it is printed."""
+    logger.warning("check-privileges: %s", printable(text))
     return text
 
 
@@ -106,18 +111,24 @@ def _strings(value: object) -> tuple[str, ...]:
 
 
 def read_vault_token(
-    build_client: Callable[[], Any], required: Callable[[], Mapping[str, frozenset[str]]]
+    token: Callable[[], str],
+    build_client: Callable[[str], Any],
+    required: Callable[[], Mapping[str, frozenset[str]]],
 ) -> VaultTokenReading:
     """Read one token's own policies and capabilities through the engine's client for that hop.
 
-    ``build_client`` is the hop's own constructor, and ``required`` names the paths the engine calls
-    on it; both live beside the calls they describe (``store/keyprovider_vault.py``,
-    ``store/crypto_transit.py``, ``config/secretprovider_vault.py``)."""
+    ``token`` returns the token named in the hop's own variable and refuses when it is unset, so
+    hvac never substitutes ``VAULT_TOKEN``. ``build_client`` is the hop's own constructor, and
+    ``required`` names the paths the engine calls on it; all three live beside the calls they
+    describe (``store/keyprovider_vault.py``, ``store/crypto_transit.py``,
+    ``config/secretprovider_vault.py``)."""
     problems: list[str] = []
     try:
-        client = build_client()
-    except Exception as exc:  # any build failure is this hop's finding, reported, never raised
+        named = token()
+        client = build_client(named)
+    except Exception as exc:  # an unset token or a refused client: reported, never raised
         return VaultTokenReading(problems=(_problem(f"no Vault client: {_why(exc)}"),))
+    token_ref = hashlib.sha256(named.encode("utf-8")).hexdigest()
     try:
         needed = dict(required())
     except Exception as exc:  # an unset key name or a malformed reference
@@ -128,7 +139,6 @@ def read_vault_token(
     policies: tuple[str, ...] = ()
     ttl: int | None = None
     renewable: bool | None = None
-    token_ref: str | None = None
     try:
         response: Any = client.auth.token.lookup_self()
         data = response.get("data") if isinstance(response, Mapping) else None
@@ -143,18 +153,17 @@ def read_vault_token(
         ttl = raw_ttl if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) else None
         raw_renewable = data.get("renewable")
         renewable = raw_renewable if isinstance(raw_renewable, bool) else None
-        raw_ref = data.get("accessor")
-        token_ref = raw_ref if isinstance(raw_ref, str) and raw_ref else None
     except OSError as exc:
         # A transport failure (requests' errors are OSErrors): the capabilities read would wait out
         # the same timeout against the same server, so it is not sent.
         problems.append(_problem(f"token lookup-self failed: {_why(exc)}"))
-        return VaultTokenReading(required=needed, problems=tuple(problems))
+        return VaultTokenReading(required=needed, problems=tuple(problems), token_ref=token_ref)
     except Exception as exc:  # Vault answered and refused, or answered in an unexpected shape
         problems.append(_problem(f"token lookup-self failed: {_why(exc)}"))
 
+    admin = vault_admin_paths(needed, policies)
     capabilities: dict[str, tuple[str, ...]] = {}
-    paths = [*needed, *VAULT_ADMIN_PATHS]
+    paths = [*needed, *admin]
     try:
         answer: Any = client.sys.get_capabilities(paths=paths)
         # Vault answers each path at the top level and again under "data"; read the "data" copy.
@@ -176,6 +185,7 @@ def read_vault_token(
         ttl=ttl,
         renewable=renewable,
         required=needed,
+        admin_paths=admin,
         capabilities=capabilities,
         problems=tuple(problems),
         token_ref=token_ref,
@@ -190,41 +200,59 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
         from messagefoundry.config.secretprovider_vault import (
             kv_required_capabilities,
             secrets_vault_client,
+            secrets_vault_token,
         )
 
         return read_vault_token(
-            secrets_vault_client, lambda: kv_required_capabilities(consumer.refs)
+            secrets_vault_token,
+            secrets_vault_client,
+            lambda: kv_required_capabilities(consumer.refs),
         )
     from messagefoundry.store.keyprovider_vault import (
         kek_required_capabilities,
         store_vault_client,
+        store_vault_token,
     )
 
     if kind == "transit":
         from messagefoundry.store.crypto_transit import transit_cipher_required_capabilities
 
-        return read_vault_token(store_vault_client, transit_cipher_required_capabilities)
+        return read_vault_token(
+            store_vault_token, store_vault_client, transit_cipher_required_capabilities
+        )
     if kind == "kek":
-        return read_vault_token(store_vault_client, kek_required_capabilities)
+        return read_vault_token(store_vault_token, store_vault_client, kek_required_capabilities)
     # Unreachable while VaultKind has three members; a fourth must be routed here, not defaulted.
     raise ValueError(f"no Vault probe for consumer kind {kind!r}")
 
 
 def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> BindAccountReading:
     """Build the AD authenticator with the arguments ``AuthService`` gives it and read its bind
-    account. The bind password resolves through ``[secrets]`` as it does under ``serve``. Any
-    failure comes back in ``problem``; this never raises."""
+    account. The bind password resolves through ``[secrets]`` as it does under ``serve``, except
+    that a Vault-held password is read only with the token in ``MEFOR_SECRETS_VAULT_TOKEN``, never
+    one hvac would substitute. Any failure comes back in ``problem``; this never raises."""
     from messagefoundry.auth.ldap import BindAccountReading, LdapAuthenticator
     from messagefoundry.config.secretprovider import resolve_secret_provider
     from messagefoundry.config.settings import SecurityEnforcement
 
     try:
+        if settings.auth.ad_bind_password_secret and settings.secrets.provider == "vault":
+            from messagefoundry.config.secretprovider_vault import secrets_vault_token
+
+            secrets_vault_token()  # refuses before any read when the engine's token is unset
         authenticator = LdapAuthenticator(
             settings.auth,
             secret_provider=resolve_secret_provider(settings.secrets),
             posture=posture,
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
         )
+    except Exception as exc:  # no extra, no CA file, an unset token: reported, never raised
+        return BindAccountReading(
+            None, problem=_problem(f"AD bind probe not run: {_why(exc)}"), bound=False
+        )
+    try:
         return authenticator.read_bind_account()
-    except Exception as exc:  # no extra, no CA file, a failed bind: reported, never raised
-        return BindAccountReading(None, problem=_problem(f"AD bind probe: {_why(exc)}"))
+    except Exception as exc:  # the bind itself failed: reported, never raised
+        return BindAccountReading(
+            None, problem=_problem(f"AD bind probe: {_why(exc)}"), bound=False
+        )
