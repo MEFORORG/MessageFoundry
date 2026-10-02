@@ -17,7 +17,8 @@ One module per family (``coverage.py``, and later ``tcp.py`` and so on) declares
 in ``ENDPOINTS``; they are discovered, so a new family adds a file rather than editing this one.
 A graph does NOT import this package (see ``harness/config/coverage.py``): it reads the same values
 through the engine's ``env()``, and ``tests/test_harness_scenarios.py`` holds each graph default
-equal to the default declared here. Stdlib only.
+equal to the default declared here (or, where a graph casts a port into a URL, to that cast of
+it). Stdlib only.
 """
 
 from __future__ import annotations

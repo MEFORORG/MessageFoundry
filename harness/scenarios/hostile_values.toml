@@ -1,0 +1,248 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+#
+# Hostile field values for harness/scenarios/hostile.py. DATA, never instructions: every value is
+# synthetic, and a value that reads like a command is still only a field value. Each one is placed
+# into an otherwise well-formed generated ADT^A01 with the parsed-message API, never by slicing raw
+# HL7. The scenario module, not this file, says what the engine should do with each class and why.
+#
+# Keys:
+#   class      the hostile class. A scenario names the classes it injects: hostile_<class> in
+#              SCENARIOS, or a KNOWN_DEFECTS scenario (framing_smuggle is used only there)
+#   label      a short name for reports; never the payload itself
+#   path       where the value goes. A component path (PID-5.1) escapes the message's own
+#              delimiters; a whole-field path (PID-5, MSH-10) is written verbatim
+#   text       the value. "{token}" becomes this run's fresh control-id token
+#   fill       instead of text: one character repeated to a size, with cap_fraction (a share of the
+#              engine's per-message cap) or below_cap (bytes left under the cap for the rest)
+#   charset    MSH-18, set before the value
+#   encoding   how the whole message is encoded on the wire (default utf-8)
+#   expect     the disposition: processed (default) or error
+#   separators MSH-1 and MSH-2 to re-encode the message with before the value is placed
+
+# --- path separators and traversal, in the field FILE-OUT_Hostile names its file from ----------
+
+[[value]]
+class = "path_traversal"
+label = "posix_parent"
+path = "MSH-10"
+text = "../../../hostile-{token}"
+
+[[value]]
+class = "path_traversal"
+label = "windows_parent"
+path = "MSH-10"
+text = '..\..\hostile-{token}'
+
+[[value]]
+class = "path_traversal"
+label = "absolute"
+path = "MSH-10"
+text = "/tmp/hostile-{token}"
+
+[[value]]
+class = "path_traversal"
+label = "nested_dirs"
+path = "MSH-10"
+text = "sub/dir/hostile-{token}"
+
+# A NUL truncates a C file name. The ingress guard refuses any body carrying one (INGEST-4), so it
+# never reaches the File outbound: ERROR, and a NAK over MLLP.
+[[value]]
+class = "path_traversal"
+label = "nul_byte"
+path = "MSH-10"
+text = "hostile-{token}\u0000.sh"
+expect = "error"
+
+# --- SQL metacharacters: in MSH-10, the store's control-id lookup sees them too ----------------
+
+[[value]]
+class = "sql_metacharacters"
+label = "control_id_quote"
+path = "MSH-10"
+text = "{token}'; DROP TABLE messages; --"
+
+[[value]]
+class = "sql_metacharacters"
+label = "name_tautology"
+path = "PID-5.1"
+text = "O'Brien\" OR 1=1; DELETE FROM messages WHERE '1'='1"
+
+[[value]]
+class = "sql_metacharacters"
+label = "like_wildcards"
+path = "PID-5.2"
+text = "%_%'/*comment*/"
+
+# --- HL7 escape sequences, carried verbatim in a whole field -----------------------------------
+
+[[value]]
+class = "hl7_escapes"
+label = "structural"
+path = "PID-5"
+text = '\F\ \S\ \T\ \R\ \E\'
+
+[[value]]
+class = "hl7_escapes"
+label = "hex_and_format"
+path = "PID-5"
+text = '\X0D0A\ \H\bold\N\ \.br\ \Zcustom\'
+
+[[value]]
+class = "hl7_escapes"
+label = "unterminated"
+path = "PID-5"
+text = 'tail \F'
+
+# --- redefined delimiters in MSH-1 and MSH-2 ---------------------------------------------------
+
+[[value]]
+class = "redefined_delimiters"
+label = "hash_set"
+path = "PID-5.1"
+text = "default|chars^are~data\\now&here"
+separators = { field = "#", component = "$", repetition = "*", escape = "!", subcomponent = "@" }
+
+[[value]]
+class = "redefined_delimiters"
+label = "shuffled_default_chars"
+path = "PID-5.1"
+text = "plain value"
+separators = { field = "|", component = "~", repetition = "^", escape = "\\", subcomponent = "&" }
+
+# --- MLLP framing bytes (start block 0x0B, end block 0x1C) -------------------------------------
+
+[[value]]
+class = "framing_bytes"
+label = "start_and_end_block"
+path = "PID-5.1"
+text = "before\u000bmiddle\u001cafter"
+
+# A second MLLP frame hidden in a field: an end block, a start block, then a whole MSH using '#' as
+# its field separator (the model refuses a raw '|' in a whole-field write).
+[[value]]
+class = "framing_smuggle"
+label = "second_frame"
+path = "PID-5"
+text = "x\u001c\u000bMSH#^~\\&#HOSTILE#SYN#R#F#20260101##ADT^A08^ADT_A01#SMUG{token}#P#2.5.1"
+
+# --- bare line breaks inside a field (the model refuses them, so they exist only on the wire) ---
+
+[[value]]
+class = "line_breaks"
+label = "bare_lf"
+path = "PID-5.1"
+text = "before\nZHX|1|after a bare LF"
+
+[[value]]
+class = "line_breaks"
+label = "bare_crlf"
+path = "PID-5.1"
+text = "before\r\nZHX|1|after a CRLF"
+
+[[value]]
+class = "line_breaks"
+label = "bare_cr"
+path = "PID-5.1"
+text = "before\rZHX|1|after a bare CR"
+
+# --- an oversize field, under the engine's per-message cap -------------------------------------
+
+[[value]]
+class = "oversize_field"
+label = "quarter_cap"
+path = "PID-5.1"
+fill = "X"
+cap_fraction = 0.25
+
+[[value]]
+class = "oversize_field"
+label = "near_cap"
+path = "OBX-5"
+fill = "Y"
+below_cap = 65536
+
+# --- non-ASCII text under a declared MSH-18 character set --------------------------------------
+
+[[value]]
+class = "non_ascii"
+label = "utf8_declared"
+path = "PID-5.1"
+text = "M\u00fcller \u738b\u5c0f\u660e \u0416\u0443\u043a\u043e\u0432 Pe\u00f1a \u00c5se"
+charset = "UNICODE UTF-8"
+
+# The connection decodes by its own `encoding` (utf-8), not by MSH-18, and a body that does not
+# decode is an ERROR rather than a silent U+FFFD substitution.
+[[value]]
+class = "non_ascii"
+label = "latin1_on_a_utf8_connection"
+path = "PID-5.1"
+text = "M\u00fcller Pe\u00f1a"
+charset = "8859/1"
+encoding = "latin-1"
+expect = "error"
+
+# --- spreadsheet-formula prefixes ---------------------------------------------------------------
+
+[[value]]
+class = "spreadsheet_formula"
+label = "equals_hyperlink"
+path = "PID-5.1"
+text = "=HYPERLINK(\"http://example.invalid/x\",\"open\")"
+
+[[value]]
+class = "spreadsheet_formula"
+label = "plus"
+path = "PID-5.2"
+text = "+1+cmd"
+
+[[value]]
+class = "spreadsheet_formula"
+label = "minus"
+path = "PID-11.1"
+text = "-2+3+cmd"
+
+[[value]]
+class = "spreadsheet_formula"
+label = "at_and_dde"
+path = "PID-5.3"
+text = "@SUM(1+1)*cmd|' /C calc'!A0"
+
+[[value]]
+class = "spreadsheet_formula"
+label = "tab_prefixed"
+path = "PID-13.1"
+text = "\t=1+1"
+
+# --- markup the web console could render --------------------------------------------------------
+
+[[value]]
+class = "markup"
+label = "script_tag"
+path = "PID-5.1"
+text = "<script>alert(1)</script>"
+
+[[value]]
+class = "markup"
+label = "event_handler"
+path = "PID-5.2"
+text = "<img src=x onerror=alert(1)>"
+
+[[value]]
+class = "markup"
+label = "attribute_breakout"
+path = "PID-11.1"
+text = "\"><svg onload=alert(1)>"
+
+[[value]]
+class = "markup"
+label = "javascript_url"
+path = "PID-13.1"
+text = "javascript:alert(1)"
+
+[[value]]
+class = "markup"
+label = "in_the_control_id"
+path = "MSH-10"
+text = "<b onmouseover=alert(1)>{token}"

@@ -100,7 +100,8 @@ listed, so a new family is a new file and never an edit to a shared table:
   default=...)` and imports nothing from the harness; the harness resolves the same name as
   `--endpoint KEY=VALUE`, then the `MEFOR_VALUE_HARNESS_<KEY>` environment variable, then the
   documented default (`mllp_in` is 2575, `file_in` is `./harness_io/in`, and so on). A test holds
-  every graph default equal to its endpoint default. The engine applies `MEFOR_VALUE_*` only with an
+  every graph default equal to its endpoint default (or, where a graph casts a port into a URL, to
+  that cast of it). The engine applies `MEFOR_VALUE_*` only with an
   environment active, so serve with `--env dev` when you move an endpoint. The tests serve the real
   graph with every port ephemeral and every directory temporary. Relative directories resolve
   against each process's own working directory, so run the engine and the harness from the same
@@ -143,3 +144,139 @@ python -m harness --load fanout-baseline --engine URL --token T --report-json ou
 
 Full guide — profile schema, the env knobs, reading the report/SLOs, exit codes, baseline
 comparison, and the backend-comparison recipe — is in [docs/LOAD-TESTING.md](../docs/LOAD-TESTING.md).
+
+## Transport families and hostile content
+
+### Hostile content (MLLP and File)
+
+`harness/scenarios/hostile.py` sends WELL-FORMED HL7 whose field values are hostile to a downstream
+sink: path traversal in the field the File outbound names its file from, SQL and spreadsheet-formula
+metacharacters, markup, raw HL7 escapes, redefined MSH-1/MSH-2 delimiters, MLLP framing bytes, bare
+line breaks, an oversize field and non-ASCII text under MSH-18. The values are data in
+`harness/scenarios/hostile_values.toml`; each is placed with the `Message` API, never by slicing raw
+HL7, and a report names a value by its label, never its content.
+
+Each `hostile_<class>` scenario injects through the MLLP and File drivers (framing bytes through MLLP
+only) into the pass-through graph `harness/config/hostile.py` (ports 2628/2629,
+`./harness_io/hostile_*`). It asserts the disposition; the bytes the MLLP and File sinks received
+(identical to what was sent, except where the engine documents a change: line endings normalized to
+CR, and an MLLP frame ending at its first 0x1C); that every written file is a single name inside its
+directory, with nothing where an unconfined `{MSH-10}.hl7` would have landed outside it; and that
+`/health` answers with every hostile connection still running. A NUL, or a body that does not decode
+on the connection's charset, is a documented ERROR.
+
+`KNOWN_DEFECTS` holds the scenarios an engine defect fails today, outside the registry (so not
+reachable from `--scenario`); `tests/test_harness_hostile.py` runs each as a strict xfail on the
+defect's own signature. Today that is MLLP framing bytes carried in by File and forwarded over
+MLLP, which the peer receives truncated at the end block, with any later start block read as a
+second message.
+
+### Fuzzing a live engine
+
+`python -m harness --fuzz` fuzzes a RUNNING engine in pure Python, so it runs on Windows too (the
+repo-root `fuzz/` package is the in-process Atheris parser fuzzer; this one is `harness/fuzz/`). It
+takes the generators' synthetic HL7, applies seeded mutations at three layers -- bytes, fields
+(through the parsed `Message` model) and MLLP frames -- and sends each case through a harness
+driver. After every `--fuzz-batch` cases it checks that `/health` answers `ok`; that every
+positive ACK (AA/CA) names, in MSA-2, a control id the store holds with a disposition; that the
+store grew across the batch by at least the number of ACKs and NAKs sent (a NAK's row often has no
+control id, so it is counted, not matched); that every complete frame sent got exactly one reply,
+each a well-formed ACK or NAK, followed by a clean close; and that no API call answered 5xx. `harness/fuzz/invariants.py` says why
+each holds.
+
+```powershell
+python -m messagefoundry serve --config harness/config --db ./fuzz.db
+python -m harness --fuzz --engine URL --cacert PEM --token T --fuzz-seed 7 --fuzz-iterations 100000 --fuzz-seconds 300
+python -m harness --fuzz-replay <path printed by the failure> --engine URL --cacert PEM --token T
+```
+
+`--fuzz-driver KIND` and `--fuzz-endpoint KEY` pick the driver and the endpoint (`mllp` defaults to
+`mllp_in`; any other driver must name one). Only `mllp` carries the frame layer and counts replies
+per frame; through another driver a send error or a reply that is not an ACK still fails the case,
+but nothing is matched to the store. Point the mllp driver at an inbound that answers in HL7: one
+with `ack_mode = "none"` never replies, and every case would fail the reply rule. The store checks read
+`GET /messages` about twice per case, so on an auth-enabled engine the per-user read limit (120 a
+minute by default) sets the pace: the fuzzer waits out a 429 rather than failing. Exit 0 when every
+invariant held, 1 when one broke, 2 on a setup error (including a 4xx mid-run). A failure prints the
+seed, iteration, layer, mutation and sizes -- never a body -- and writes the exact bytes sent under
+`--fuzz-out` (default: `messagefoundry-harness-fuzz` in the system temp directory, outside any
+checkout). The same seed always produces the same bytes.
+
+### Raw TCP and X12
+
+`harness/config/tcp_x12.py` adds two independent paths on ports 2580 to 2583 (`tcp_in`,
+`tcp_out`, `x12_in`, `x12_out`): an STX/ETX-framed `Tcp()` inbound carrying HL7 to a `Tcp()`
+outbound that expects a reply frame, and an `X12()` inbound (`content_type="x12"`, framed by the
+`ISA...IEA` interchange itself) to an `X12()` outbound that requires a TA1. The drivers and sinks
+(`harness/drivers/tcp.py`, `x12.py`; `harness/sinks/tcp.py`, `x12.py`) use the engine's own pure
+codecs, `messagefoundry.framing` and `messagefoundry.parsing.x12.X12FrameReader`, never
+`transports/`. The X12 payloads come from a small synthetic builder,
+`harness/drivers/_x12_interchange.py` (ISA15 `T`, no patient data).
+
+```
+python -m harness --scenario tcp_delivered              # AA ACK, PROCESSED, byte-for-byte at a tcp sink
+python -m harness --scenario tcp_handler_error          # ADT^A03 -> the handler raises -> ERROR
+python -m harness --scenario tcp_not_hl7_nak            # a non-HL7 frame -> framed AR NAK
+python -m harness --scenario tcp_dead_letter            # a sink that closes unanswered -> retried, dead-lettered
+python -m harness --scenario x12_delivered              # PROCESSED, verbatim at an x12 sink answering TA1*A
+python -m harness --scenario x12_envelope_rejected      # IEA02 != ISA13 -> the handler raises -> ERROR
+python -m harness --scenario x12_ta1_reject_dead_letter # TA1*R -> dead-lettered after one attempt
+```
+
+The engine records MSH-10 as the control id of an HL7 frame arriving over TCP, so the TCP
+scenarios match by it. It records **no** control id for an X12 interchange (a non-HL7 inbound
+commits its body with `control_id=None`), so the X12 scenarios list the inbound's newest rows,
+open each new row's body once through the audited `GET /messages/{id}/raw` (surface `harness`),
+and match this run's fresh ISA13 values. On an auth-enabled engine that read needs a token with
+`messages:view_raw`, which the TCP and MLLP scenarios do not. A burst of other traffic large
+enough to push this run's rows off that page reads as "not found", never as a pass.
+
+### HTTP: the Http inbound, and the REST, SOAP, FHIR and DICOMweb outbounds
+
+`harness/config/http.py` takes HL7 v2 over `POST` on `http_in` (2590) and a DICOM Part-10 object on
+`http_dicom_in` (2591). ADT goes out as JSON to the REST outbound, ORM as a SOAP 1.1 envelope, ORU
+as a FHIR Patient create, and the DICOM object as a STOW-RS `multipart/related` store. Each
+outbound posts to a harness HTTP sink on loopback (`http_rest` 2592, `http_soap` 2593, `http_fhir`
+2594, `http_dicomweb` 2595), which records the method, path, headers and body, and answers a status
+the scenario chooses.
+
+These outbounds sit behind `[egress].allowed_http`. `serve` turns
+`[security].block_unlisted_outbound` on unless you set it, and then an empty list refuses all four,
+so allow loopback first: `[egress] allowed_http = ["127.0.0.1"]`, or
+`MEFOR_EGRESS_ALLOWED_HTTP=127.0.0.1`. The same rule applies to every other transport the directory
+serves; the coverage graph's MLLP and File outbounds need `allowed_mllp` and `allowed_file_dirs`.
+The tests serve the graph with `allowed_http` set, and check that an empty or wrong list makes the
+delivery scenarios fail.
+
+```powershell
+python -m harness --scenario http_rest_delivered          # also soap / fhir / dicomweb
+python -m harness --scenario http_fhir_retry_dead_letter  # sink answers 503: retried, then dead-lettered
+python -m harness --scenario http_rest_rejected_dead_letter  # sink answers 400: one attempt only
+```
+
+A delivery scenario checks that each message reached `PROCESSED` (by control id; a DICOM object
+has none, so by the `message_id` in the inbound's `202` receipt), then checks every request the
+sink saw: the destination's method, path and `Content-Type`, and this run's control id in the body.
+The DICOMweb scenario also requires the stored part to equal the object it sent, byte for byte, and
+is registered only where the `[dicom]` extra is installed. The sink redacts the values of common
+credential headers and never logs a body. An outbound URL is always loopback: a sink binds nothing
+else, so moving `host` moves only where a driver dials.
+
+### TIMER, PassThrough and Loopback (internal inbounds)
+
+`harness/config/internal.py` serves the three inbound kinds that have no external peer of their
+own, and `harness/scenarios/internal.py` drives each from its natural source (ports and the
+directory in `harness/endpoints/internal.py`, defaults 2610-2614):
+
+- `internal_timer` -- nothing to inject. `IB_Internal_Timer` fires a fixed synthetic ADT^A08 every
+  2 seconds into a File archive (`./harness_io/internal_timer_out` by default; a served harness
+  keeps writing one small file per tick). The scenario counts only records received after it
+  started and files that appeared after its sink started, so an earlier run cannot satisfy it.
+- `internal_passthrough` -- MLLP in on 2610; the handler `Send`s into `PT_Internal_Relay`, whose
+  own router forwards to a sink on 2611. The re-ingressed child is asserted on its own channel. The
+  engine records a PassThrough child with no control id, so the scenario finds it by its body (an
+  audited read); `tests/test_harness_internal.py` pins that gap with a strict xfail.
+- `internal_loopback` -- MLLP in on 2612; the capturing outbound (`reingress_to`) dials a harness
+  sink on 2613, and that sink's ACK is the message that re-enters on `LB_Internal_Reply`, whose
+  router forwards it to a sink on 2614. The scenario asserts the forwarded copy is that ACK
+  (MSA-2 naming the control id sent), not the original.
