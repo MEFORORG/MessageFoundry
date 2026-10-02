@@ -59,8 +59,13 @@ from tests._ast_sites import callee_name, named_func, parse_source
 _REPO = Path(messagefoundry.__file__).resolve().parents[1]
 
 #: Seconds to wait for a child to start, for an injected script to run, and for a child to stop.
-#: Generous: a starved machine must not turn the control into a false "nothing ran".
-_WAIT = 60.0
+#: Generous, so a starved machine does not turn the control into a false "nothing ran", and
+#: shorter than the suite's per-test watchdog, so a wait that fails says what it was waiting for.
+_WAIT = 20.0
+
+#: The injection test's own watchdog, above the sum of its waits. The suite default is shorter
+#: than three child interpreters can need on a starved runner.
+_INJECTION_TEST_TIMEOUT = 240
 
 # The target process. It idles in Python, so the interpreter reaches the point where it looks for
 # an injected script. It writes its OWN process id: on Windows a virtual environment's python.exe
@@ -86,7 +91,7 @@ posture = remote_debug_posture()
 pathlib.Path(ready).write_text(
     f"{os.getpid()} {posture.interpreter_enabled} {posture.guard_installed}", encoding="utf-8"
 )
-deadline = time.monotonic() + 300
+deadline = time.monotonic() + 120
 while time.monotonic() < deadline and not os.path.exists(stop):
     time.sleep(0.02)
 pathlib.Path(final).write_text(str(remote_debug_posture().refused_scripts), encoding="utf-8")
@@ -192,6 +197,7 @@ def _inject(target: _Target) -> None:
         pytest.skip(f"this platform refused to attach to a child process: {exc}")
 
 
+@pytest.mark.timeout(_INJECTION_TEST_TIMEOUT)
 @pytest.mark.skipif(
     not sys.is_remote_debug_enabled(),
     reason="this test process was started with remote debugging off, so it cannot inject",
@@ -394,9 +400,48 @@ def test_install_tries_again_while_the_hook_does_not_answer(
     install_remote_debug_guard()
     install_remote_debug_guard()
     assert installs.hooks == [remotedebug._guard, remotedebug._guard]
-    # A hook the interpreter dropped gets no reporter thread and no change to the unraisable hook.
+    # A hook the interpreter dropped gets no reporter thread, and the unraisable hook is put back.
     assert installs.reporters == 0
     assert sys.unraisablehook is before
+
+
+def test_the_unraisable_hook_is_wrapped_before_the_audit_hook_is_added(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal in between would be reported by the interpreter with the script's full path."""
+    installs = _Installs(monkeypatch)
+    before = sys.unraisablehook
+    seen: list[bool] = []
+    monkeypatch.setattr(
+        sys, "addaudithook", lambda hook: seen.append(sys.unraisablehook is not before)
+    )
+    answers = iter([False, True])
+    monkeypatch.setattr(remotedebug, "_guard_answers", lambda: next(answers))
+    install_remote_debug_guard()
+    assert seen == [True] and installs.reporters == 1
+
+
+def test_a_probe_another_hook_objects_to_reads_as_not_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another audit hook may raise on an event it does not know. The probe must not pass that
+    on: it would stop ``serve`` at its first statement and fail the posture route."""
+
+    def objecting(event: str, *args: object) -> None:
+        raise ValueError(f"unknown event {event}")
+
+    monkeypatch.setattr(sys, "audit", objecting)
+    assert remotedebug._guard_answers() is False
+    assert remote_debug_posture().guard_installed is False
+
+    # CONTROL: a hook that objects AFTER this one answered still reads as installed, so the
+    # False above is the probe's answer and not a blanket result of catching the error.
+    def answering_then_objecting(event: str, *args: object) -> None:
+        remotedebug._guard(event, args)
+        raise ValueError(f"unknown event {event}")
+
+    monkeypatch.setattr(sys, "audit", answering_then_objecting)
+    assert remotedebug._guard_answers() is True
 
 
 def test_install_adds_nothing_where_the_interpreter_refuses_injection_already(

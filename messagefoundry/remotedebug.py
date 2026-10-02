@@ -21,13 +21,13 @@ event ``cpython.remote_debugger_script``, and it does not run the script when an
 the interpreter's and could change under this module.
 
 **What this is not.** The hook closes the interpreter's own injection interface, from the moment
-it is installed. Two things stay open. A script injected earlier in start-up runs: the process
-has to import this module and reach the install call first, and a caller that can restart the
-engine can aim for that window. And the capability underneath is untouched: a process that can
-write this process's memory can run code in it some other way, and can remove a hook. So an
+it is installed. At least two things stay open. A script injected earlier in start-up runs: the
+process has to import this module and reach the install call first, and a caller that can restart
+the engine can aim for that window. And the capability underneath is untouched: a process that
+can write this process's memory can run code in it some other way, and can remove a hook. So an
 enabled interface with the hook in place is reported as a residual
 (:func:`remote_debug_loosening`), and turning the interface off at launch is separate work.
-Running untrusted code under a different account is what takes the capability away.
+``docs/SECURITY-LOOSENING.md`` carries the operator's account of what stays open.
 
 **Why the hook does so little.** The interpreter calls it on the main thread between two bytecodes
 of whatever was running, which is the position a signal handler is in. The engine's log handlers
@@ -173,7 +173,11 @@ def _without_own_refusals(
 
 def _guard_answers() -> bool:
     answer: list[bool] = []
-    sys.audit(_PROBE_EVENT, answer)
+    # never-raise: another audit hook may raise on an event it does not know. That must not stop
+    # `serve` at its first statement or fail the posture route. The reading is then whatever this
+    # hook managed to say, and a hook that could not answer is reported as not installed.
+    with contextlib.suppress(Exception):
+        sys.audit(_PROBE_EVENT, answer)
     return bool(answer)
 
 
@@ -195,11 +199,16 @@ def install_remote_debug_guard() -> None:
     with _install_lock:
         if _guard_answers():
             return
+        # Quiet first, so no refusal is ever reported with its full path.
+        previous = sys.unraisablehook
+        quiet = sys.unraisablehook = _without_own_refusals(previous)
         sys.addaudithook(_guard)
         if not _guard_answers():
-            return  # dropped: there is nothing to report for, and nothing to quiet
+            # Dropped: there is nothing to report for, and nothing to quiet.
+            if sys.unraisablehook is quiet:
+                sys.unraisablehook = previous
+            return
         _start_reporter()
-        sys.unraisablehook = _without_own_refusals(sys.unraisablehook)
 
 
 def remote_debug_posture() -> RemoteDebugPosture:

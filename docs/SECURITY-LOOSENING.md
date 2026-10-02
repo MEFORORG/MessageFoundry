@@ -1155,8 +1155,9 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** `serve` and
   `supervise` each install an audit hook as their first step. The interpreter raises an event
   before it runs an injected script. The hook raises on that event, and the interpreter then drops
-  the script. Each refusal logs a WARNING with the script's file name. Once one has been refused,
-  the entry carries the count.
+  the script. A refusal logs a WARNING with the script's file name, and no audit row. Where
+  refusals arrive faster than they are logged, lines past a backlog of 64 are dropped. Every
+  refusal is counted, and once one has been refused the entry carries the count.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. And a process that can write the engine's memory can run code in it by
@@ -1184,6 +1185,8 @@ This section is kept rather than deleted, because the claim it used to make is t
   ignores it under `-I` or `-E`.
 - **It is not refused**, at any `enforcement` level. A refusal would stop every start through the
   console script.
+- **Attach debugging goes with it.** `python -m pdb -p <pid>` uses this interface, so it cannot
+  attach to `serve` or `supervise`. There is no switch that turns the hook off.
 
 ---
 
