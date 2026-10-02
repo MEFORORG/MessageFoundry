@@ -423,6 +423,17 @@ def _can_add_files(directory: Path) -> bool | None:
     read-only attribute and no permission. Elsewhere ``os.access`` asks the kernel, with the
     effective ids where the platform supports that, and a read-only file system answers no.
 
+    So the answer is about the token that asks, never a reading of the access list.
+    ``tests/test_startup_code_inventory.py`` asks under a write-restricted copy of its own token,
+    the kind the service gets: a directory that only Users may write then answers no.
+
+    **A privilege can answer yes where the access list says no.** A directory can only be opened
+    with backup semantics, and on such an open Windows grants write access to a token that holds
+    the restore privilege switched on, whatever the directory's permissions are. That yes is
+    true of the process: code in it could create the file the same way. The installed service's
+    token keeps one privilege, and it is not that one, so there the access list decides. An
+    elevated administrator's process may hold it.
+
     It does not ask whether an EXISTING file in the directory can be rewritten. A start-up file
     the account owns inside a directory it cannot add to is not seen here."""
     if sys.platform != "win32":
