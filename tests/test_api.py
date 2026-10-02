@@ -1474,7 +1474,7 @@ async def test_connection_control_audits_the_resolved_role(
 
 
 def test_ws_stats_pushes_queue_depth(tmp_path: Path) -> None:
-    app = create_managed_app(db_path=tmp_path / "ws.db", poll_interval=0.05)
+    app = create_managed_app(db_path=tmp_path / "ws.db", poll_interval=0.05, allow_no_auth=True)
     # TestClient drives the lifespan, so the engine is created/started on its own loop.
     with TestClient(app) as tc, tc.websocket_connect("/ws/stats") as ws:
         data = ws.receive_json()

@@ -1153,7 +1153,9 @@ def test_serve_lifespan_runs_the_preflight_and_stashes_a_real_observation(tmp_pa
 
     from messagefoundry.api.app import create_managed_app
 
-    app = create_managed_app(store_settings=sqlite_settings(tmp_path / "managed.db"))
+    app = create_managed_app(
+        store_settings=sqlite_settings(tmp_path / "managed.db"), allow_no_auth=True
+    )
     with TestClient(app) as tc:
         resp = tc.get("/security/posture")
     assert resp.status_code == 200
@@ -1278,7 +1280,9 @@ def test_the_preflight_reads_the_PASSED_store_settings_not_the_ambient_environme
 
     for key, value in hostile.items():
         monkeypatch.setenv(key, value)
-    app = create_managed_app(store_settings=sqlite_settings(tmp_path / "pinned.db"))
+    app = create_managed_app(
+        store_settings=sqlite_settings(tmp_path / "pinned.db"), allow_no_auth=True
+    )
     with TestClient(app) as tc:
         resp = tc.get("/security/posture")
     assert resp.status_code == 200

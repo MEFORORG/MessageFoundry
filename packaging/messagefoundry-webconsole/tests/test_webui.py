@@ -2241,7 +2241,9 @@ def test_ws_stats_payload_is_enriched(tmp_path: Path) -> None:
 
     from messagefoundry.api import create_managed_app
 
-    app = create_managed_app(db_path=tmp_path / "wsx.db", poll_interval=0.05, serve_ui=True)
+    app = create_managed_app(
+        db_path=tmp_path / "wsx.db", poll_interval=0.05, serve_ui=True, allow_no_auth=True
+    )
     with TestClient(app) as tc, tc.websocket_connect("/ws/stats") as ws:
         data = ws.receive_json()
         assert "outbox_by_status" in data and isinstance(data["outbox_by_status"], dict)
@@ -2258,7 +2260,7 @@ def test_ws_stats_payload_is_counts_only_without_serve_ui(tmp_path: Path) -> Non
 
     from messagefoundry.api import create_managed_app
 
-    app = create_managed_app(db_path=tmp_path / "wsx.db", poll_interval=0.05)
+    app = create_managed_app(db_path=tmp_path / "wsx.db", poll_interval=0.05, allow_no_auth=True)
     with TestClient(app) as tc, tc.websocket_connect("/ws/stats") as ws:
         data = ws.receive_json()
         assert "outbox_by_status" in data and isinstance(data["outbox_by_status"], dict)

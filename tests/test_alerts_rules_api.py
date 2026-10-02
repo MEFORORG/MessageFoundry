@@ -255,7 +255,9 @@ def test_alerts_rules_lifespan_plumbs_alerts_settings(tmp_path: Path) -> None:
             )
         ]
     )
-    app = create_managed_app(db_path=tmp_path / "managed.db", alerts_settings=alerts)
+    app = create_managed_app(
+        db_path=tmp_path / "managed.db", alerts_settings=alerts, allow_no_auth=True
+    )
     with TestClient(app) as tc:
         r = tc.get("/alerts/rules")
         assert r.status_code == 200

@@ -4139,6 +4139,8 @@ def _serve(args: argparse.Namespace) -> int:
         audit_all_authz=settings.diagnostics.audit_all_authz,
         env_values_provider=env_values,
         auth_settings=settings.auth,
+        # The factory denies unless told (vault BACKLOG #2611), so sign-in off is said here.
+        allow_no_auth=not settings.auth.enabled,
         ai_settings=settings.ai,
         alerts_settings=settings.alerts,
         secrets_settings=settings.secrets,

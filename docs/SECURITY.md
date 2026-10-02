@@ -143,9 +143,10 @@ token at all** — it authenticates by verified mTLS client certificate only. Ev
 with its gate, in [Route → permission map](#route--permission-map-engine-api) below; nothing is left
 implicit.
 
-The in-process embedding factory `create_app(engine)` is **fail-closed**: with no `AuthService`
-attached it denies every protected route (503) unless the caller explicitly opts out with
-`create_app(..., allow_no_auth=True)` — the deliberate embedding/local-dev escape hatch. The `serve`
+Both app factories are **fail-closed**. With no enabled `AuthService` attached, `create_app(engine)`
+and `create_managed_app(...)` deny every protected route (503) unless the caller explicitly opts out
+with `allow_no_auth=True` — the deliberate embedding/local-dev escape hatch. Neither factory reaches
+that mode by omission. The `serve`
 path runs auth-enabled by default; if `[security] require_sign_in = false` it sets that opt-in itself, and
 `__main__` refuses to serve auth-off on an exposed instance — a non-loopback host, or a loopback host
 behind a declared TLS terminator — and, even with auth enabled, a
