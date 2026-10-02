@@ -14,8 +14,9 @@ the point:
 
 * **Viewer** (``monitoring:read`` + ``messages:read``) covers the five ``messages:read`` surfaces;
 * a **custom role** holding ``messages:view_raw`` *without* ``messages:view_summary`` covers
-  ``GET /messages/{id}`` — and demonstrates that the doc's "the split is reachable" claim is real,
-  not theoretical (``view_raw`` is not a superset of ``view_summary``);
+  ``GET /messages/{id}``. Minting refuses that role since vault BACKLOG #1187, so the fixture
+  bypasses the minting and decoding rule (``_bypass_the_pairing_rule``) to prove the route-level
+  redaction still holds as a second line (``view_raw`` is not a superset of ``view_summary``);
 * a **custom role** holding ``monitoring:diagnose`` *without* ``messages:view_summary`` covers
   ``GET /alerts/active`` (BACKLOG #2443), since no built-in role holds that split.
 
@@ -46,6 +47,27 @@ from messagefoundry.store import MessageStatus
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >= 15 chars, satisfies the ASVS password policy
+
+
+def _bypass_the_pairing_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a custom role hold ``messages:view_raw`` without ``messages:view_summary``.
+
+    Minting refuses that shape and decoding drops ``view_raw`` from a stored row of it (vault BACKLOG
+    #1187). This test pins the ROUTE-level redaction, the second line, so it stands in a validator and
+    a decoder from before that rule: the routes must still withhold every gated property even if both
+    first lines were bypassed. Test-only; nothing in the engine can reach these stand-ins.
+    """
+    import messagefoundry.auth.service as service_module
+
+    def validate(values: list[str]) -> list[Permission]:
+        return sorted({Permission(v) for v in values}, key=lambda p: p.value)
+
+    def decode(raw: str | None) -> frozenset[Permission]:
+        return frozenset(Permission(v) for v in json.loads(raw or "[]"))
+
+    monkeypatch.setattr(service_module, "validate_custom_role_permissions", validate)
+    monkeypatch.setattr(service_module, "decode_custom_role_permissions", decode)
+
 
 #: Synthetic ADT — invented MRN/name, never real PHI.
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSGSEED|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
@@ -134,9 +156,10 @@ def _objects(node: object) -> list[dict[str, object]]:
 
 
 @pytest.fixture
-async def seeded(tmp_path: Path) -> AsyncIterator[_Seed]:
+async def seeded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_Seed]:
     """An engine holding one message with a summary, an error, metadata, a captured reply and a
     dead-lettered delivery — so every gated property has a non-null value to withhold."""
+    _bypass_the_pairing_rule(monkeypatch)
     engine = await Engine.create(tmp_path / "field_authz_sites.db", poll_interval=0.02)
     try:
         # require_mfa=False: this is a redaction test, not an MFA test — the step-up surfaces
@@ -364,8 +387,9 @@ async def test_the_seed_actually_carries_every_gated_model_property_pair(seeded:
 
 
 async def test_view_raw_without_view_summary_is_reachable(seeded: _Seed) -> None:
-    """The doc claims a custom role may hold ``view_raw`` without ``view_summary``. Pin it, since the
-    whole reason the disposition fields sit on the view_summary tier rests on that being possible."""
+    """With minting and decoding bypassed, a ``view_raw``-only identity still gets the open and the
+    body but no gated property: the route-level tier holds on its own. Minting refuses this role
+    since vault BACKLOG #1187; see test_custom_roles.py for that first line."""
     async with _client(seeded.engine, seeded.service) as client:
         headers = await _login(client, "rawonly")
         response = await client.get(f"/messages/{seeded.message_id}", headers=headers)

@@ -110,6 +110,79 @@ def test_decode_malformed_or_empty_is_empty() -> None:
     assert decode_custom_role_permissions(json.dumps({"a": 1})) == frozenset()
 
 
+# --- view_raw needs view_summary (ASVS 14.2.6, vault BACKLOG #1187) ----------------------------------
+
+
+def test_validate_refuses_view_raw_without_view_summary() -> None:
+    with pytest.raises(CustomRoleError, match="messages:view_raw needs messages:view_summary"):
+        validate_custom_role_permissions(["messages:read", "messages:view_raw"])
+    with pytest.raises(CustomRoleError, match="messages:view_raw needs messages:view_summary"):
+        validate_custom_role_permissions(["messages:view_raw"])
+
+
+def test_validate_accepts_view_raw_with_view_summary_and_summary_alone() -> None:
+    # Control arms: the rule is the pair, not view_raw itself, and view_summary alone is fine.
+    assert validate_custom_role_permissions(
+        ["messages:read", "messages:view_raw", "messages:view_summary"]
+    ) == [Permission.MESSAGES_READ, Permission.MESSAGES_VIEW_RAW, Permission.MESSAGES_VIEW_SUMMARY]
+    assert validate_custom_role_permissions(["messages:view_summary"]) == [
+        Permission.MESSAGES_VIEW_SUMMARY
+    ]
+
+
+def test_decode_drops_view_raw_from_a_stored_row_without_view_summary() -> None:
+    # A row of the refused shape (hand-edited, or written before the rule) keeps everything but the
+    # body read. The control row, holding both, keeps both.
+    assert decode_custom_role_permissions(
+        json.dumps(["messages:read", "messages:view_raw"])
+    ) == frozenset({Permission.MESSAGES_READ})
+    assert decode_custom_role_permissions(
+        json.dumps(["messages:view_raw", "messages:view_summary"])
+    ) == frozenset({Permission.MESSAGES_VIEW_RAW, Permission.MESSAGES_VIEW_SUMMARY})
+
+
+def test_no_builtin_role_has_the_refused_shape() -> None:
+    from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, raw_body_without_summary
+
+    assert not [
+        r for r, perms in BUILTIN_ROLE_PERMISSIONS.items() if raw_body_without_summary(perms)
+    ]
+    # Control: the predicate does fire on the shape it exists for.
+    assert raw_body_without_summary({Permission.MESSAGES_VIEW_RAW})
+
+
+async def test_service_refuses_to_mint_or_edit_into_view_raw_without_view_summary() -> None:
+    store = await _store()
+    try:
+        service = await _service(store)
+        with pytest.raises(CustomRoleError):
+            await service.create_custom_role(
+                display_name="Raw only",
+                description=None,
+                permissions=["messages:read", "messages:view_raw"],
+                actor="admin",
+            )
+        assert await service.list_custom_roles() == []
+        role = await service.create_custom_role(
+            display_name="Raw and summary",
+            description=None,
+            permissions=["messages:read", "messages:view_raw", "messages:view_summary"],
+            actor="admin",
+        )
+        with pytest.raises(CustomRoleError):
+            await service.update_custom_role(
+                role.id,
+                display_name="Raw and summary",
+                description=None,
+                permissions=["messages:read", "messages:view_raw"],
+                actor="admin",
+            )
+        (kept,) = await service.list_custom_roles()
+        assert Permission.MESSAGES_VIEW_SUMMARY in kept.permissions
+    finally:
+        await store.close()
+
+
 # --- service: create + resolve (AC-1) ----------------------------------------
 
 

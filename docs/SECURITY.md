@@ -709,6 +709,18 @@ replacement:
 - It may **never** grant `users:manage`, `approvals:approve`, `dr:operate`, `cluster:control` or
   `files:access_any`
   (`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`) — the escalation primitives stay admin-only.
+- It may not hold `messages:view_raw` **without** `messages:view_summary` (`CustomRoleError` on
+  create and edit; a stored row of that shape decodes with `view_raw` dropped).
+  *Added 2026-10-01, ASVS 14.2.6, vault BACKLOG #1187.* This is a minting rule, unlike the
+  `messages:edit` implies `messages:view_raw` convention the catalogue describes, and the two
+  differ for a reason. A role holding `edit` without `view_raw` is narrower than intended, and it
+  fails closed: the console editor refuses it, and nothing is disclosed. A role holding `view_raw`
+  without `view_summary` is not a coherent role: it may read the whole message body while being
+  denied the patient summary drawn from that body, and owner ruling R18 makes a one-message read
+  the reveal act only for a `view_summary` holder. Refusing it at minting closes every body route
+  at once (`/raw`, attachments, `/ui/messages/{id}/body`, a one-id `/messages/export`), and the
+  route gates on `/outbound` and the `/responses` body stay as a second line. No deployment exists,
+  so no stored role is broken by the change.
 - An empty set or an unknown permission string is rejected on write (`CustomRoleError`); a
   malformed/hand-edited persisted `roles.permissions` row decodes **defensively to the empty set**, and
   a forbidden value that somehow reached storage is dropped.
@@ -873,7 +885,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/messages/{message_id}/raw` | `messages:view_raw` | `require_phi_read` | the raw body, as its own act: writes a `message_body_view` audit row carrying a `surface`. An HTTP caller declares `harness`, `apiclient` or `api` (the default); the engine records `console` itself for the web console's in-process call, and the query parameter does not accept it (BACKLOG #2345) |
 | `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes |
 | `GET` | `/messages/{message_id}/responses` | `messages:read` | `require_phi_read` | the reply **body** additionally needs `messages:view_raw` **and** `messages:view_summary`, enforced inline at the route; without either, `body` is null |
-| `GET` | `/messages/{message_id}/outbound` | `messages:view_raw` + `messages:view_summary` | `require_phi_read` | the transformed outbound payload; one of the two-permission routes on the JSON plane, and it fails closed on either: a caller missing one gets 403 and an `auth.permission_denied` row. Owner ruling R18 makes this request the reveal act only for a `messages:view_summary` holder, and an ADR 0045 custom role may hold `messages:view_raw` alone (ASVS 14.2.6, vault BACKLOG #1187) |
+| `GET` | `/messages/{message_id}/outbound` | `messages:view_raw` + `messages:view_summary` | `require_phi_read` | the transformed outbound payload; one of the two-permission routes on the JSON plane, and it fails closed on either: a caller missing one gets 403 and an `auth.permission_denied` row. Owner ruling R18 makes this request the reveal act only for a `messages:view_summary` holder. Minting now refuses a custom role holding `messages:view_raw` alone, so this gate is the second line (ASVS 14.2.6, vault BACKLOG #1187) |
 | `POST` | `/messages/{message_id}/replay` | `messages:replay` | `require_step_up` | per-channel scope |
 | `POST` | `/messages/{message_id}/resend` | `messages:resend` | `require_step_up` | per-channel access to **both** the origin's and the alternate outbound's channel |
 | `POST` | `/messages/{message_id}/edit-resend` | `messages:edit` | `require_step_up` | implies `messages:view_raw`; the DIRECT `to` power-path additionally requires per-channel access to the alternate outbound's channel |
@@ -2057,17 +2069,20 @@ reach — `MessageSummary` × 3, `DeadLetterRow` × 2, `CapturedResponseInfo.det
 `ConnectionEventInfo.reason`, `ConnectionRow.error`, `ConnectionMetadata.error` — as `null`, and is
 refused `GET /messages/{id}` outright, since that route gates on `messages:view_raw`, which a Viewer
 does not hold. The other five rows (`MessageDetail` × 3, `OutboxInfo.last_error`, `EventInfo.detail`)
-are reached only by a role holding `view_raw` — including a custom role granted `view_raw` **without**
-`view_summary`, which is precisely why those rows sit on the `view_summary` tier. The fifteenth row,
+are reached only by a role holding `view_raw`. A custom role granted `view_raw` **without**
+`view_summary` was the reason those rows sit on the `view_summary` tier; minting refuses that role
+since vault BACKLOG #1187 (see [Custom roles](#custom-roles-adr-0045)), and the tier stays as a
+second line. The fifteenth row,
 `AlertInstanceInfo.reason`, is reached only by a role holding `monitoring:diagnose`: of the built-in
 roles only Operator and Administrator hold it, and both also hold `view_summary`, so the row is
 withheld only from a custom role granted `monitoring:diagnose` without `view_summary`. Deployment,
 Coding and Auditor hold neither `view_raw` nor `view_summary`, and reach the `ConnectionEventInfo.reason`,
 `ConnectionRow.error` and `ConnectionMetadata.error` rows through `monitoring:read`) — but that is a
-**role-policy** convention, not a permission-model guarantee, and the split is **reachable**: a custom
-role may be granted `view_raw` without `view_summary` (only `users:manage`, `approvals:approve` and
-`dr:operate` are non-assignable). The disposition fields therefore sit on the `view_summary` tier
-deliberately, so such a role still cannot reach exception text.
+**role-policy** convention, not a permission-model guarantee. Since vault BACKLOG #1187 minting
+refuses a custom role holding `view_raw` without `view_summary`, and decoding drops `view_raw` from
+a stored one, so the split is no longer reachable through a role. The disposition fields still sit
+on the `view_summary` tier, so an identity of that shape could not reach exception text even if
+both of those lines were bypassed; `tests/test_field_authz_enforcement_sites.py` pins that.
 
 **Not part of this control.** Connection-credential scrubbing (`redacted_settings()` on
 `GET /connections/{name}/metadata`) is applied **unconditionally, identically for every role including

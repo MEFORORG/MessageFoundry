@@ -1051,7 +1051,14 @@ async def test_edit_editor_opens_for_a_custom_role_holding_both(engine: Engine) 
     role = await service.create_custom_role(
         display_name="Resubmit And Read",
         description=None,
-        permissions=["messages:edit", "messages:view_raw", "messages:read"],
+        # view_summary too: minting refuses view_raw without it (vault BACKLOG #1187). This test is
+        # about edit + view_raw, and the summary permission does not touch the editor's gate.
+        permissions=[
+            "messages:edit",
+            "messages:view_raw",
+            "messages:view_summary",
+            "messages:read",
+        ],
         actor="test",
     )
     await _add_with_role_ids(service, "editor", [role.id])

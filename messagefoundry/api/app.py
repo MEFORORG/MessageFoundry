@@ -4792,9 +4792,9 @@ def create_app(
         (``response.read``).
 
         Why both (ASVS 14.2.6, vault BACKLOG #1187): owner ruling R18 makes this one-message JSON
-        request the reveal act only for a ``view_summary`` holder. An ADR 0045 custom role may hold
-        ``view_raw`` alone, and no built-in role does; such a caller gets a null ``body``, the same
-        answer as a caller without ``view_raw``."""
+        request the reveal act only for a ``view_summary`` holder. Minting refuses a custom role
+        holding ``view_raw`` alone and no built-in role has that shape, so this is the second line;
+        such a caller gets a null ``body``, the same answer as a caller without ``view_raw``."""
         row = await engine.store.get_message(message_id)
         # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
         # channel (per-channel RBAC), mirroring get_message.
@@ -4854,8 +4854,9 @@ def create_app(
         destination (#14 parity tool). The PHI bodies are returned in full, so the route requires
         ``MESSAGES_VIEW_RAW`` and ``MESSAGES_VIEW_SUMMARY`` outright (unlike ``/responses``, where the
         body is conditional). The second is there because owner ruling R18 makes this one-message
-        request the reveal act only for a ``view_summary`` holder (ASVS 14.2.6, vault BACKLOG #1187);
-        an ADR 0045 custom role holding ``view_raw`` alone gets the ordinary 403. Works on
+        request the reveal act only for a ``view_summary`` holder (ASVS 14.2.6, vault BACKLOG #1187).
+        Minting refuses a custom role holding ``view_raw`` alone, so this is the second line; such
+        an identity gets the ordinary 403. Works on
         both simulate/shadow and live runs — the transformed payload is retained on the done outbound
         row in either mode. Every access is audited (``outbound.read`` + a per-message ``viewed``
         event when bodies are returned)."""

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -498,15 +499,32 @@ async def _add_custom(service: AuthService, username: str, permissions: list[str
     await _clear_must_change(service, user_id)
 
 
-async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(engine: Engine) -> None:
+async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """ASVS 14.2.6, vault BACKLOG #1187, ground (b2): owner ruling R18 makes a one-message JSON
-    request the reveal act only for a ``messages:view_summary`` holder. A custom role holding
+    request the reveal act only for a ``messages:view_summary`` holder. A caller holding
     ``view_raw`` without it gets neither body: ``/outbound`` answers 403 with an
     ``auth.permission_denied`` row naming the missing permission, and ``/responses`` returns a null
     ``body``, the answer a caller without ``view_raw`` gets.
 
+    Minting refuses such a custom role and decoding drops ``view_raw`` from a stored one (see
+    test_custom_roles.py). This pins the route gates as the second line, so it stands in a
+    validator and decoder from before that rule.
+
     The ``both`` custom role is the control arm: it differs from ``rawonly`` by ``view_summary``
     alone, and it reads both bodies, so the refusals are that permission and not a broken route."""
+    import messagefoundry.auth.service as service_module
+    from messagefoundry.auth.permissions import Permission
+
+    def validate(values: list[str]) -> list[Permission]:
+        return sorted({Permission(v) for v in values}, key=lambda p: p.value)
+
+    def decode(raw: str | None) -> frozenset[Permission]:
+        return frozenset(Permission(v) for v in json.loads(raw or "[]"))
+
+    monkeypatch.setattr(service_module, "validate_custom_role_permissions", validate)
+    monkeypatch.setattr(service_module, "decode_custom_role_permissions", decode)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     await _add(service, "adm", Role.ADMINISTRATOR)
