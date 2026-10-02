@@ -5683,8 +5683,8 @@ class RegistryRunner:
         except IngressBodyRejected as exc:
             # INGEST-4: dead-letter a NUL-bearing body BEFORE Peek.parse and any store write, so text
             # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
-            # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte past its
-            # start lands here too (ADR 0205 rule 4).
+            # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte inside the
+            # message, not in the whitespace at either end, lands here too (ADR 0205 rule 4).
             await self.store.record_received(
                 channel_id=ic.name,
                 raw=store_safe_raw(raw, ic.content_type.value, text=text),
@@ -5953,8 +5953,8 @@ class RegistryRunner:
             # at the first NUL). Dead-letter it here, BEFORE Peek.parse and any store write, so text (and
             # control_id/summary/strict-fail errors derived from it) is NUL-free for the rest of this
             # handler. NAK AR mirrors the decode/parse-error precedent for a malformed body. An HL7 v2
-            # body holding an MLLP frame byte past its start is refused the same way, with its own
-            # fixed MSA-3 text (ADR 0205 rule 4).
+            # body holding an MLLP frame byte inside the message, not in the whitespace at either end,
+            # is refused the same way, with its own fixed MSA-3 text (ADR 0205 rule 4).
             body_err = exc.reason
             mid = await self.store.record_received(
                 channel_id=ic.name,
