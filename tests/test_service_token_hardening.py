@@ -311,8 +311,12 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
     lockdown = calls("Set-SecureDataDirAcl")
     if not grants or not lockdown or grants[0]["start"] < lockdown[0]["start"]:
         problems.append("the service's grant is not read back after the data-directory lockdown")
-    read = [a["rhsText"] for a in facts["assignments"] if a["lhs"] == "writeDirs"]
-    if not any("$DbPath" in rhs for rhs in read):
+    rhs = {
+        a["lhs"]: a["rhsText"]
+        for a in facts["assignments"]
+        if a["lhs"] in ("storeDir", "writeDirs")
+    }
+    if "$DbPath" not in rhs.get("storeDir", "") or rhs.get("writeDirs") != "$storeDir":
         problems.append(
             "the store's own directory is not read back, so a -DbPath elsewhere is missed"
         )
@@ -338,7 +342,7 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
             "is not exactly",
         ),
         ("$problem = Get-WriteGrantProblem -Path $dir", "$problem = '' # -Path $dir", "read back"),
-        ("$writeDirs += (Split-Path -Parent $DbPath)", "", "store's own directory"),
+        ("$writeDirs += $storeDir", "", "store's own directory"),
     ],
     ids=["call-removed", "switch-unwired", "privilege-added", "grant-not-read", "store-not-read"],
 )
@@ -375,7 +379,7 @@ def test_the_services_own_grant_is_read_from_the_dacl(tmp_path: Path) -> None:
     """Modify granted by name reads clean. Read-only, and no entry at all, are both named. Run on a
     real directory, with the test's own account standing in for the service's."""
     assert _SCRIPT is not None
-    names = ("modify", "read", "none", "only")
+    names = ("modify", "read", "none", "only", "generic")
     dirs = {name: tmp_path / f"{name}-{uuid.uuid4().hex[:8]}" for name in names}
     table = "; ".join(f"{name} = {_psq(str(path))}" for name, path in dirs.items())
     for d in dirs.values():
@@ -391,6 +395,7 @@ def test_the_services_own_grant_is_read_from_the_dacl(tmp_path: Path) -> None:
     & icacls $dirs.read /inheritance:r /grant:r "${{me}}:(OI)(CI)RX" '*S-1-5-18:(OI)(CI)F' | Out-Null
     & icacls $dirs.none /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)M' | Out-Null
     & icacls $dirs.only /inheritance:r /grant:r "${{me}}:M" '*S-1-5-18:(OI)(CI)F' | Out-Null
+    & icacls $dirs.generic /inheritance:r /grant:r "${{me}}:(OI)(CI)(GA)" '*S-1-5-18:(OI)(CI)F' | Out-Null
     foreach ($name in $dirs.Keys) {{
       $out[$name] = Get-WriteGrantProblem -Path $dirs[$name] -Principal $me
     }}
@@ -408,6 +413,12 @@ def test_the_services_own_grant_is_read_from_the_dacl(tmp_path: Path) -> None:
     assert "Modify by name" in got["only"], (
         "a grant on the folder alone passed. What the service creates there would not inherit it, "
         "so it could create its store and be refused on it at the next start."
+    )
+    # Windows stores a generic-rights grant as a PAIR: a folder-only entry and an inherit-only one.
+    # Neither half is a whole grant, and together they are. A reader that wants one entry to carry
+    # both would warn about a directory the service can write.
+    assert got["generic"] == "", (
+        f"a grant stored as a split pair read as no grant: {got['generic']}"
     )
 
 
@@ -626,6 +637,10 @@ def _smoke_step_script(name_starts: str) -> str:
     steps = jobs_of("ci.yml")["windows-service-smoke"]["steps"]
     found = [s for s in steps if str(s.get("name", "")).startswith(name_starts)]
     assert len(found) == 1, f"expected one step named {name_starts!r}, found {len(found)}"
+    name = str(found[0]["name"])
+    assert name.count("(") == name.count(")"), (
+        f"the step name is cut short; an unquoted ' #' starts a YAML comment: {name!r}"
+    )
     lines = str(found[0]["run"]).splitlines()
     return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
 
@@ -716,6 +731,8 @@ def test_the_uninstaller_looks_for_the_key_after_it_removes_the_service(tmp_path
     delete = [c for c in cmds if c["name"] == "sc.exe" and "delete" in c["text"]]
     probe = [c for c in cmds if c["name"] == "Test-Path" and "$svcKey" in c["text"]]
     notice = [c for c in cmds if c["name"] == "Get-UninstallResidueNotice"]
-    assert len(delete) == 1 and len(probe) == 1 and len(notice) == 1, (delete, probe, notice)
-    assert delete[0]["start"] < probe[0]["start"] < notice[0]["start"]
+    assert len(delete) == 1 and probe and len(notice) == 1, (delete, probe, notice)
+    # More than one read: the key is given a few seconds to go. Every one of them is after the
+    # removal and before the inventory.
+    assert all(delete[0]["start"] < c["start"] < notice[0]["start"] for c in probe), probe
     assert "-RegistrationPending:$registrationPending" in notice[0]["text"]

@@ -564,8 +564,8 @@ write wherever its account, or any group the account is in, can. `-AllowLocalSys
 effect, and so does `-ServiceAccount` when it names any account but the service's own virtual
 account, because the installer sets the restricted SID only for that one. The restriction does not
 contain code that runs inside the engine.
-[SERVICE.md](SERVICE.md#restrict-the-service-token) holds the whole rule: what such a token may
-write, what the restriction covers and what it does not.
+[SERVICE.md](SERVICE.md#restrict-the-service-token) says what such a token may write, what the
+restriction covers and what it does not.
 
 Other switches on `install-service.ps1` change more than the service:
 

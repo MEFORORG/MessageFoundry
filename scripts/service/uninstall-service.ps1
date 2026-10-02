@@ -676,8 +676,13 @@ Write-Host "Removed '$ServiceName'." -ForegroundColor Green
 # reverses them. sc.exe exits 0 when Windows only MARKS a service for deletion, which it does while a
 # handle to the service is open or its process is still running. The key, and both settings in it,
 # then stay until that ends. So the key is looked for after the removal, and the inventory says so
-# when it is still there.
+# when it is still there. It is given a few seconds first: a removal that is only finishing is not
+# one that was left behind, and reporting it as pending would send an operator after nothing.
 $registrationPending = Test-Path -LiteralPath $svcKey
+for ($i = 0; $registrationPending -and $i -lt 10; $i++) {
+    Start-Sleep -Milliseconds 500
+    $registrationPending = Test-Path -LiteralPath $svcKey
+}
 
 # --- the two residues an operator can hand back to this script (BACKLOG #1704) ----------------------
 # Both run AFTER the registration is gone, against facts read BEFORE it: the service must not lose the

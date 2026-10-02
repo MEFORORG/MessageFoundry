@@ -4019,7 +4019,8 @@ jobs:
       # A SID-type change is documented to need a system start. This install is the service's
       # first, so the token read here is the one its first start got. A red at reading 2 with a
       # green reading 1 would be that case, and is not to be turned green by dropping reading 2.
-      - name: Verify the service token is restricted (vault BACKLOG #2702)
+      # The name is quoted: unquoted, YAML reads " #2702)" as a comment and cuts the name there.
+      - name: "Verify the service token is restricted (vault BACKLOG #2702)"
         run: |
           $privilege = "SeChangeNotifyPrivilege"
           $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
@@ -4095,8 +4096,8 @@ jobs:
           Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
           & "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry
           Assert-Native "stopping the engine"
-          # The engine's program and parameters are saved, raw, and put back as soon as the probe
-          # is running. The service reads them only when it starts, so the probe keeps running,
+          # The engine's program and parameters are saved, raw, and put back once the probe has
+          # reported. The service reads them only when it starts, so the probe keeps running,
           # and the uninstall step below reads the ENGINE's registration, as it did before this
           # step existed. Written straight to the registry, so the quotes inside the engine's
           # parameters never pass through a command line.
@@ -4117,6 +4118,14 @@ jobs:
             Assert-Native "setting the probe's parameters"
             & "$env:SMOKE_NSSM_DIR\nssm.exe" start MessageFoundry
             Assert-Native "starting the service with the probe"
+            # The wait is INSIDE the try, so the engine's values go back only once the probe has
+            # reported or the wait has run out. A probe that dies at once is restarted by the
+            # service from the registry; put back any sooner, that restart would start the ENGINE,
+            # and the red would show a healthy engine and no report.
+            foreach ($i in 1..120) {
+              if (Test-Path -LiteralPath $report) { break }
+              Start-Sleep -Milliseconds 500
+            }
           } finally {
             foreach ($value in $saved.Keys) {
               Set-ItemProperty -LiteralPath $parameters -Name $value -Value $saved[$value].Text -Type $saved[$value].Kind
@@ -4124,10 +4133,6 @@ jobs:
           }
           $restored = (Get-Item -LiteralPath $parameters).GetValue("AppParameters", $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
           if ($restored -ne $saved.AppParameters.Text) { throw "the engine's parameters were not put back: $restored" }
-          foreach ($i in 1..120) {
-            if (Test-Path -LiteralPath $report) { break }
-            Start-Sleep -Milliseconds 500
-          }
           if (-not (Test-Path -LiteralPath $report)) { throw "the probe wrote no report as the service; see the service logs below" }
           & python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege
           Assert-Native "the check on what the service token can do"
@@ -4154,7 +4159,10 @@ jobs:
       # vault BACKLOG #2702: the SID type and the privilege list are settings on the registration,
       # so the uninstall reverses them by removing it. This reads that back: the service's registry
       # key, which holds both, must be gone. The control key is a service Windows always has, so
-      # an "absent" reading cannot come from a read that sees no service key at all.
+      # an "absent" reading cannot come from a read that sees no service key at all. It says only
+      # that no key is LEFT: when the install above failed before it registered anything, there
+      # was never one, and the red is that step's. The key is given 30 seconds, so a removal that
+      # is still finishing is not read as one that was left behind.
       - name: Confirm the uninstall took the token settings with the registration
         if: always()
         shell: powershell
@@ -4163,11 +4171,15 @@ jobs:
           if (-not (Test-Path -LiteralPath "$services\EventLog")) {
             throw "CONTROL FAILED: this read cannot see the EventLog service key, so it proves nothing"
           }
+          foreach ($i in 1..60) {
+            if (-not (Test-Path -LiteralPath "$services\MessageFoundry")) { break }
+            Start-Sleep -Milliseconds 500
+          }
           if (Test-Path -LiteralPath "$services\MessageFoundry") {
             Get-ItemProperty -LiteralPath "$services\MessageFoundry" | Format-List ServiceSidType, RequiredPrivileges, DeleteFlag
             throw "the MessageFoundry service key is still there after the uninstall, with the SID type and privilege list in it"
           }
-          "the registration is gone, and the SID type and the privilege list with it"
+          "no MessageFoundry service key is left, so no SID type and no privilege list is either"
 
       # --- ADR 0183 Amendment A, Wave 0 (BACKLOG #1136): the AUTH-ON arm ------------------------------
       # Everything above runs with sign-in OFF, so it cannot see the question these two steps ask:

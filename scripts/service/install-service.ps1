@@ -56,8 +56,8 @@ param(
     # it with a write-restricted token: a grant to Users or to Authenticated Users no longer lets it
     # write. Pass -SkipRestrictedServiceSid to leave the SID type at "none", for a host where the
     # engine must write somewhere you cannot grant to NT SERVICE\<ServiceName>. The privilege list
-    # is set with or without this switch. docs/SERVICE.md "Restrict the service token" has the
-    # whole rule for what such a token may write.
+    # is set with or without this switch. docs/SERVICE.md "Restrict the service token" says what
+    # such a token may write.
     [switch]$SkipRestrictedServiceSid,
     # Opt-in: strip inherited ACEs from the config dir and lock it to SYSTEM + Administrators + the
     # service account (RX). The in-process source-trust guard (SEC-003) refuses to load config from a
@@ -1012,9 +1012,10 @@ function Get-ServiceSidTypeChoice {
       Returns @{ SidType; Reason }. Reason is "" for "restricted".
 
       RESTRICTED ONLY FOR THE SERVICE'S OWN VIRTUAL ACCOUNT. A restricted service SID makes the token
-      write-restricted: a write is allowed only where a permission names the service SID, the logon
-      session, Everyone or WRITE RESTRICTED. NT SERVICE\<ServiceName> IS the service SID, so every
-      grant this script writes for that account, and the account's own profile, still counts.
+      write-restricted: for a write, a grant to the account or to most of its groups stops counting,
+      and a grant to the service SID still does (docs/SERVICE.md "Restrict the service token" holds
+      the rule, stated once). NT SERVICE\<ServiceName> IS the service SID, so every grant this
+      script writes for that account, and the account's own profile, still counts.
 
       Any other account is a different SID. Its profile and the grants written for it would stop
       counting, and no run has shown what such a service then fails to write. So LocalSystem, a gMSA
@@ -1127,20 +1128,24 @@ function Get-WriteGrantProblem {
       Why $Principal has no entry of its own granting Modify on the folder $Path, or "" when it has.
 
       Set-SecureDataDirAcl leaves a named account one way to write the data directory, its own
-      grant. Under a restricted service SID that is the only kind of grant that counts anywhere (with
-      the logon session, Everyone and WRITE RESTRICTED). So "the service can write its data
-      directory" is read from the DACL here and not assumed from the icacls call that was meant to
-      write it: that call is best-effort and only warns when it fails.
+      grant, and a restricted service SID stops the account's groups counting on any directory
+      (docs/SERVICE.md "Restrict the service token" has the rule). So "the service can write its
+      data directory" is read from the DACL here and not assumed from the icacls call that was meant
+      to write it: that call is best-effort and only warns when it fails.
 
-      An entry marked inherit-only does not apply to the folder itself, so it does not count. Nor
-      does one that the files and folders created there do not inherit: the service could create its
-      store and then be refused on it at the next start. The generic-all bit counts: an entry written
-      that way shows no named right.
+      TWO THINGS ARE WANTED, AND ONE ENTRY NEED NOT CARRY BOTH. The grant must apply to the folder
+      itself, and the files and folders created there must inherit it, or the service could create
+      its store and be refused on it at the next start. Windows stores a grant written with generic
+      rights as a pair, a folder-only entry and an inherit-only one, so each half is looked for on
+      its own. The generic-all bit counts: an entry written that way shows no named right. A Deny
+      entry is NOT read, so this can report a grant that a Deny then takes away.
+
+      A ".\name" account is looked up under this computer's name, which is how its entry is stored.
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Principal)
     $sid = $Principal
     try {
-        $sid = ([Security.Principal.NTAccount]$Principal).Translate(
+        $sid = ([Security.Principal.NTAccount]($Principal -replace '^\.\\', "$env:COMPUTERNAME\")).Translate(
             [Security.Principal.SecurityIdentifier]).Value
     } catch { }
     $acl = $null
@@ -1155,10 +1160,10 @@ function Get-WriteGrantProblem {
     $inheritOnly = [Security.AccessControl.PropagationFlags]::InheritOnly
     $toChildren = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
         [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $onFolder = $false
+    $onChildren = $false
     foreach ($rule in $acl.Access) {
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
-        if (($rule.PropagationFlags -band $inheritOnly) -ne 0) { continue }
-        if (($rule.InheritanceFlags -band $toChildren) -ne $toChildren) { continue }
         $name = "$($rule.IdentityReference)"
         $ruleSid = $name
         try {
@@ -1167,8 +1172,11 @@ function Get-WriteGrantProblem {
         } catch { }
         if (($ruleSid -ne $sid) -and ($name -ne $Principal)) { continue }
         $rights = [int]$rule.FileSystemRights
-        if ((($rights -band $modify) -eq $modify) -or (($rights -band $genericAll) -ne 0)) { return "" }
+        if ((($rights -band $modify) -ne $modify) -and (($rights -band $genericAll) -eq 0)) { continue }
+        if (($rule.PropagationFlags -band $inheritOnly) -eq 0) { $onFolder = $true }
+        if (($rule.InheritanceFlags -band $toChildren) -eq $toChildren) { $onChildren = $true }
     }
+    if ($onFolder -and $onChildren) { return "" }
     return ("no permission on '$Path' grants '$Principal' Modify by name, for the folder and for " +
         "what is created in it")
 }
@@ -1400,7 +1408,8 @@ function Stop-ServiceAndConfirm {
 # If the service already exists, reconfigure it in place (idempotent install).
 # Detect via Get-Service rather than `nssm status` (which errors to stderr on a missing
 # service and would abort under ErrorActionPreference=Stop).
-if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+$ServiceExisted = [bool](Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
+if ($ServiceExisted) {
     Write-Host "Service '$ServiceName' exists - stopping and reconfiguring..."
     if (-not (Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $NssmPath)) {
         Write-Warning ("Reconfiguring '$ServiceName' while it is still running. NSSM writes the new " +
@@ -1517,6 +1526,8 @@ if ($ServiceAccount) {
 # the restricted SID and why the others do not.
 $SidChoice = Get-ServiceSidTypeChoice -ServiceName $ServiceName -ServiceAccount $ServiceAccount `
     -Skip:$SkipRestrictedServiceSid
+# Read BEFORE the change: non-empty when the registration does not already hold what is asked for.
+$TokenWas = Get-ServiceTokenProblem -ServiceName $ServiceName -SidType $SidChoice.SidType -Privileges $ServicePrivileges
 Set-ServiceTokenHardening -ServiceName $ServiceName -SidType $SidChoice.SidType -Privileges $ServicePrivileges
 Write-Host ("  Token  : privileges limited to $($ServicePrivileges -join ', '). Windows removes " +
     "every other privilege of '$RunAsObjectName' when the service starts.")
@@ -1536,6 +1547,15 @@ if ($SidChoice.SidType -eq "restricted") {
         "stop counting, and no run has shown what such a service then fails to write. " +
         "'$ServiceName' can write wherever '$RunAsObjectName' can. A SID type set by hand is " +
         "replaced on every run. See docs/SERVICE.md 'Restrict the service token'.")
+}
+# The lines above say what the REGISTRATION now holds. On a service that was already installed, the
+# token may not follow until the host restarts: Microsoft documents a SID type change that way, and
+# only a new service's first start has been measured (docs/SERVICE.md). So a re-install that changed
+# either setting says so, and does not let the lines above read as the token in force.
+if ($ServiceExisted -and $TokenWas) {
+    Write-Warning ("This changed the token settings of a service that was already installed. " +
+        "Windows may apply a SID type change only after the host restarts, so until then " +
+        "'$ServiceName' may start with its earlier token. Restart the host to be sure.")
 }
 
 # --- ACLs: applied AFTER the service exists + ObjectName is set (S4 ordering, #224) ------------------
@@ -1561,22 +1581,30 @@ Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount
 # The owner too, not only the DACL: the engine's store rule reads it (ADR 0183 Wave 0b).
 Set-DataDirOwner -Path $DataDir
 # The lockdown above removes Users and Authenticated Users, so a named account writes the data
-# directory only through its own grant, and under the restricted service SID nothing else counts at
-# all. That grant is read back on the two directories the service must write (vault BACKLOG #2702).
-# LocalSystem has no named grant: it writes through the SYSTEM entry. A warning, like the rest of the
-# lockdown: the operator is told what would stop the first start, and how to fix it.
+# directory through its own grant. That grant is read back on the two directories the service must
+# write (vault BACKLOG #2702). LocalSystem has no named grant: it writes through the SYSTEM entry.
+# A warning, like the rest of the lockdown: the operator is told what would stop the first start,
+# and how to fix it.
 #
-# THE STORE'S OWN DIRECTORY IS READ TOO, under the restricted SID. -DbPath may sit outside the data
-# directory, where this script grants nothing. A group grant there used to be enough; it no longer
-# is, and the store, its generated certificate and its log spool all live beside the database.
+# THE STORE'S OWN DIRECTORY IS READ TOO, under the restricted SID, when -DbPath puts it outside the
+# data directory, where this script grants nothing. A group grant there used to be enough; it no
+# longer is, and the store, its generated certificate and its log spool all live beside the
+# database. A network share is left out: the file server checks the account there, and a grant to
+# this machine's service cannot exist on it.
 if ($ServiceAccount) {
     $writeDirs = @($DataDir, $LogDir)
-    if ($SidChoice.SidType -eq "restricted") { $writeDirs += (Split-Path -Parent $DbPath) }
-    foreach ($dir in ($writeDirs | Select-Object -Unique)) {
+    $storeDir = Split-Path -Parent $DbPath
+    $underData = ($storeDir.TrimEnd('\') + '\').StartsWith(
+        $DataDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+    if (($SidChoice.SidType -eq "restricted") -and -not $underData -and -not $storeDir.StartsWith('\\')) {
+        $writeDirs += $storeDir
+    }
+    foreach ($dir in $writeDirs) {
         $problem = Get-WriteGrantProblem -Path $dir -Principal $ServiceAccount
         if ($problem) {
-            Write-Warning ("The service would not be able to write '$dir': $problem. Grant it " +
-                "with 'icacls ""$dir"" /grant ""${ServiceAccount}:(OI)(CI)M""'.")
+            Write-Warning ("The service would not be able to write '$dir': $problem. Grant " +
+                "'$ServiceAccount' Modify there, inherited by files and folders: with icacls the " +
+                "permission is written (OI)(CI)M.")
         }
     }
 }

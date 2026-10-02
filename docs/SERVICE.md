@@ -302,10 +302,18 @@ set for the default account, for `-ServiceAccount` and for `-AllowLocalSystem` a
 
 **A restricted service SID, for the default account.** When the service runs as its own virtual
 account, `NT SERVICE\<ServiceName>`, the installer sets its SID type to `restricted`. Windows then
-gives it a write-restricted token. It reads what it could read before. It writes only where a
-permission names the service itself, its logon session, `Everyone` or the special
-`WRITE RESTRICTED` group. A permission for `Users`, `Authenticated Users` or any other group the
-account belongs to no longer lets it write.
+gives it a write-restricted token. It reads what it could read before. A permission for `Users`,
+`Authenticated Users` or any other group the account belongs to no longer lets it write. It still
+writes where a permission names at least one of these:
+
+- the service itself, `NT SERVICE\<ServiceName>`;
+- its logon session, `Everyone`, or the special `WRITE RESTRICTED` group;
+- `OWNER RIGHTS`, on a file or folder the service owns. Measured 2026-10-01 with a stand-in token:
+  it wrote inside a folder it had created whose only entries were SYSTEM, Administrators and
+  `OWNER RIGHTS`.
+
+So when you check whether the engine can write a directory, look for those entries and for who
+owns it, and not only for the service's name.
 
 What that changes for you:
 

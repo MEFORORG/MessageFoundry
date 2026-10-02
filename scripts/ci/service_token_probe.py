@@ -288,7 +288,6 @@ def read_token(pid: int | None = None) -> dict[str, Any]:
     if pid is None:
         process = kernel32.GetCurrentProcess()
     else:
-        _enable_debug_privilege(advapi32, kernel32)
         process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not process:
             raise _win_error(f"OpenProcess({pid})")
@@ -542,6 +541,9 @@ def _report_problems(subject: str, problems: list[str]) -> None:
 def _check_read(args: argparse.Namespace) -> int:
     rule = {"service_sid": args.service_sid, "privileges": args.privilege}
     failed = False
+    # Only here, and not in read_token: a caller that imports this module, such as a test, must not
+    # be left holding a privilege it did not ask for.
+    _enable_debug_privilege(*_dlls())
     for pid in args.pid:
         # A process that cannot be read is judged like any other reading, and fails. Raising here
         # would hide every reading this call did get.
