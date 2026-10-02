@@ -238,8 +238,7 @@ class Control:
     message: str = "msg"
     # ``"call"`` on a ``"block"`` that would have been one, had its ``@Data`` not been a statement
     # off a ``<Line>`` (BACKLOG #2632). It renders and counts as the label it is. Only the test
-    # that decides the shape of the tree reads it (:func:`_structural_kind`). A send off a
-    # ``<Line>`` is never demoted: it stays a ``"send"``, refused (:data:`_LABEL_SEND_REFUSAL`).
+    # that decides the shape of the tree reads it (:func:`_structural_kind`).
     demoted_from: str = ""
 
 
@@ -1653,7 +1652,7 @@ def _parse_statement(
         # and does not count as mapped: the marker stands for the statement, under a plain label.
         # The label keeps the SHAPE the element had, and remembers its kind for the branch-group
         # test. (A send off a ``<Line>`` is not demoted. It is refused, in the send arm below.)
-        return [Control("block", tag, statement, body=(*marker, *body), demoted_from=kind)]
+        return [Control("block", tag, statement, body=(*marker, *body), demoted_from="call")]
 
     if not data and any(_structural_kind(s) == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
@@ -1698,13 +1697,15 @@ def _parse_statement(
         # ``*body`` matters: a ``MsgSend`` element that carries a nested list would otherwise lose it
         # (the break/exit path below always kept its body — this one silently did not).
         args = _role_send_args(role_operands) if roles else _send_args(operands)
-        if marker:
+        if tag.lower() != "line":
             # A ``MsgSend`` in a Block's or a Call's ``@Data``. It may never have run, so it is
             # never a delivery. It is no comment either: it is a send, refused, in the form main
             # gives a refused send and at the same place, with its body after it. So its
             # destination stays declared, it selects the handler's closing ``return`` as main's
             # send does, a ``try`` around it re-raises, and it counts unmapped once. The refusal
             # stands in for the marker, so the statement is not counted a second time beside it.
+            # The test is the element, not the marker: a send off a ``<Line>`` must be refused
+            # even if a later verb table left :func:`_label_statement` not naming it.
             refusal = _LABEL_SEND_REFUSAL
         else:
             refusal = _send_refusal(role_operands, held) if roles else ""
@@ -2812,12 +2813,8 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list.
 
-    A send off a ``<Line>`` is refused, and still a send (BACKLOG #2632), so this reads the tree
-    as main does and a handler ends as main ends it. That matters twice. Taking a handler's only
-    visible send away would move it to the trailing ``return Send(...)`` form, which delivers
-    every destination :func:`_collect_sends` finds, including a send the render never reaches.
-    And adding the list where main has none would replace the ``return None`` that says no
-    destination was named with a bare ``return sends``."""
+    A send off a ``<Line>`` is refused and still a send (:data:`_LABEL_SEND_REFUSAL`), so this
+    reads the tree as main does, and a handler ends on the ``return`` main gives it."""
     return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
 
 
