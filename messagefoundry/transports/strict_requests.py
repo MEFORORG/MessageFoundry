@@ -530,7 +530,9 @@ def _refuse_a_cleartext_vault_hop(url: str, proxy: str | None, *, connector: str
     like this hop's two older refusals (an ``https://`` proxy in front of an ``http://`` Vault, and
     ``verify=False``), neither of which has an escape. The HTTP-family sibling is
     ``transports.rest``'s ``_hop_guard_host``; it echoes the host and has no proxy arm, so it is
-    not reused here.
+    not reused here. That family needs no proxy arm in its guard: its openers dial a loopback
+    host direct (``bounded_read.LoopbackDirectProxyHandler``, vault BACKLOG #2579). requests
+    has no such handler, which is why this hop refuses instead.
 
     Raises :class:`~messagefoundry.config.tls_policy.InsecureHopRefused`, a ``ValueError``, with
     fixed text."""
