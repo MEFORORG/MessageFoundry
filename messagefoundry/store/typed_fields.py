@@ -18,6 +18,7 @@ engine and holds no key, so any later integrity tag can share it.
 
 from __future__ import annotations
 
+import functools
 import struct
 from collections.abc import Iterable
 
@@ -39,6 +40,12 @@ def _prefixed(data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + data
 
 
+@functools.lru_cache(maxsize=256)
+def _name(name: str) -> bytes:
+    """A field name, length-prefixed. Cached: callers pass the same few names on every call."""
+    return _prefixed(name.encode("utf-8"))
+
+
 def encode_typed_fields(fields: Iterable[tuple[str, TypedValue]]) -> bytes:
     """Encode ``fields`` -- ``(name, value)`` pairs, in the caller's order -- to canonical bytes.
 
@@ -46,7 +53,7 @@ def encode_typed_fields(fields: Iterable[tuple[str, TypedValue]]) -> bytes:
     means an integer passes an integer, so ``True`` can never be read back as ``1``. A lone
     surrogate in a string encodes rather than raising (``surrogatepass``), so the mapping is total
     over every ``str`` CPython can hold."""
-    out = bytearray()
+    out: list[bytes] = []
     for name, value in fields:
         if value is None:
             tag, body = _NONE, b""
@@ -62,7 +69,5 @@ def encode_typed_fields(fields: Iterable[tuple[str, TypedValue]]) -> bytes:
             tag, body = _BYTES, value
         else:
             raise TypeError(f"field {name!r}: {type(value).__name__} is not an encodable type")
-        out += _prefixed(name.encode("utf-8"))
-        out += tag
-        out += _prefixed(body)
-    return bytes(out)
+        out += (_name(name), tag, _prefixed(body))
+    return b"".join(out)

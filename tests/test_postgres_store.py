@@ -38,7 +38,7 @@ from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import load_audit_chain
-from tests.audit_chain_cases import CASES, ChainBackend
+from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
 _ADT_SEARCH = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
@@ -4417,39 +4417,16 @@ async def test_audit_anchor_cli_server(store, capsys) -> None:
 
 
 def _chain_backend(store) -> ChainBackend:
-    """The live Postgres store, as ``tests/audit_chain_cases.py`` drives it. The raw statements run
-    through the fixture's own handle, which holds no key."""
+    """The live Postgres store, as ``tests/audit_chain_cases.py`` drives it."""
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
 
-    settings = load_settings(environ=os.environ).store
-
-    async def open_keyed(active: str, retired: tuple[str, ...]):
-        cipher = make_cipher(active, retired)
-        return await PostgresStore.open(
-            settings, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
-        )
-
-    async def open_keyless():
-        return await PostgresStore.open(settings)
-
-    async def execute(sql: str) -> None:
-        await store._execute(sql)
-
-    async def fetch(sql: str):
-        return [dict(r) for r in await store._fetchall(sql)]
-
-    async def reset() -> None:
-        await store._execute("TRUNCATE audit_log RESTART IDENTITY")
-
-    return ChainBackend(
-        name="postgres",
-        open_keyed=open_keyed,
-        open_keyless=open_keyless,
-        execute=execute,
-        fetch=fetch,
-        reset=reset,
-        concurrent_open=True,
+    return server_chain_backend(
+        "postgres",
+        PostgresStore,
+        load_settings(environ=os.environ).store,
+        store,
+        reset_sql="TRUNCATE audit_log RESTART IDENTITY",
     )
 
 

@@ -134,7 +134,6 @@ from messagefoundry.store.store import (
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
-    AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
@@ -193,8 +192,7 @@ from messagefoundry.store.store import (
     _session_live_params,
     audit_append_refusal,
     audit_append_secret,
-    audit_next_link,
-    audit_row_hash,
+    audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
     check_password_generated,
@@ -1775,9 +1773,11 @@ _SCHEMA: list[str] = [
     # column as NULLable for stores written before hash-chaining, a population that does not exist.
     # `seq` is the row's position in the hash chain: 1, then rising by one, with no gap. It is inside
     # the row's MAC and is what an anchor and the off-box tee name a row by. `id` is only the surrogate
-    # key: IDENTITY can skip values. UNIQUE, so two appends can never take one position.
+    # key: IDENTITY can skip values. UNIQUE, so two appends can never take one position. `seq` is the
+    # CLUSTERED key because the chain is read in `seq` order: the verify walk is then one ordered scan
+    # with no sort, and the append's head read is a seek to the end of the table.
     """IF OBJECT_ID('audit_log','U') IS NULL CREATE TABLE audit_log (
-        id INT IDENTITY(1,1) PRIMARY KEY, seq BIGINT NOT NULL UNIQUE,
+        id INT IDENTITY(1,1) PRIMARY KEY NONCLUSTERED, seq BIGINT NOT NULL UNIQUE CLUSTERED,
         ts FLOAT NOT NULL, actor NVARCHAR(256) NULL,
         action NVARCHAR(128) NOT NULL, channel_id NVARCHAR(256) NULL, detail NVARCHAR(MAX) NULL,
         client NVARCHAR(256) NULL, row_hash NVARCHAR(64) NOT NULL)""",
@@ -3187,31 +3187,28 @@ class SqlServerStore:
         provider (``vault_transit`` mode, ADR 0138). Either keys the chain; neither leaves it keyless."""
         return self._audit_mac_key is not None or self._audit_mac_fn is not None
 
-    async def _audit_rows(
-        self, from_seq: int, *, limit: int | None = None
-    ) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: audit rows with ``seq >= from_seq``, in ``seq`` order."""
+    async def _audit_rows(self, *, limit: int | None = None) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every audit row, in ``seq`` order."""
         top = "" if limit is None else f"TOP ({int(limit)}) "
         rows: list[Mapping[str, Any]] = list(
             await self._fetchall(
                 f"SELECT {top}id, seq, ts, actor, action, channel_id, detail, client, row_hash"
-                " FROM audit_log WHERE seq >= ? ORDER BY seq, id",
-                (from_seq,),
+                " FROM audit_log ORDER BY seq"
             )
         )
         return rows
 
-    async def _audit_range_rows(self, from_seq: int) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: every range row at or after ``from_seq``, in ``seq`` order.
+    async def _audit_range_rows(self) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row after the genesis row, in ``seq`` order.
 
         The shared walk matches the action EXACTLY. ``audit_log.action`` takes the database's
         case-insensitive default, so the predicate is BIN2; and SQL Server pads trailing spaces for
         ``=`` under EVERY collation, BIN2 included, so the exact match is re-applied here in Python --
         otherwise ``'audit.key_epoch '`` would be read as a range row the walk treats as ordinary."""
         rows = await self._fetchall(
-            "SELECT id, seq, action, detail FROM audit_log"
-            " WHERE action COLLATE Latin1_General_BIN2 = ? AND seq >= ? ORDER BY seq, id",
-            (AUDIT_KEY_EPOCH_ACTION, from_seq),
+            "SELECT seq, action, detail FROM audit_log"
+            " WHERE action COLLATE Latin1_General_BIN2 = ? AND seq > 1 ORDER BY seq",
+            (AUDIT_KEY_EPOCH_ACTION,),
         )
         exact: list[Mapping[str, Any]] = [r for r in rows if r["action"] == AUDIT_KEY_EPOCH_ACTION]
         return exact
@@ -10695,19 +10692,16 @@ class SqlServerStore:
         await cur.execute("SELECT TOP (1) seq, row_hash FROM audit_log ORDER BY seq DESC")
         last = await cur.fetchone()
         # BACKLOG #1904: raises AuditHeadMovedError when the caller sealed a different head.
-        seq, prev = audit_next_link(None if last is None else (last[0], last[1]), expect_prev)
-        _key, _mac = self._audit_append_mac()  # this handle's key for the current range
-        row_hash = audit_row_hash(
-            prev,
-            seq=seq,
+        seq, row_hash = audit_seal_next(
+            None if last is None else (last[0], last[1]),
+            expect_prev,
+            self._audit_append_mac,
             ts=now,
             actor=actor,
             action=action,
             channel_id=channel_id,
             detail=detail,
             client=client,
-            key=_key,
-            mac=_mac,
         )
         # OUTPUT INSERTED.id gives the row id in the same statement, so it cannot name
         # a row another session inserted (which is what SCOPE_IDENTITY over a pooled
@@ -10958,7 +10952,7 @@ class SqlServerStore:
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
-            await self._audit_rows(AUDIT_ALL_ROWS),
+            await self._audit_rows(),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
             capable=self._audit_keyed_capable(),

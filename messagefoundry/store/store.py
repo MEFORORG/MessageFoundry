@@ -2130,10 +2130,6 @@ def audit_mac_bytes(value: str | None) -> bytes:
 #   the MAC'd chain (and so inside the out-of-band anchor), a range row must match the range it closes,
 #   and no key may open a second range -- so a leaked retired key cannot switch the chain back to itself.
 
-#: The lowest ``audit_log.seq`` a verify walk reads from -- the BIGINT floor, so a row a writer
-#: inserted with a NEGATIVE sequence number is still walked (and reported), not dropped from the check.
-AUDIT_ALL_ROWS: Final = -(2**63)
-
 
 class AuditHeadMovedError(RuntimeError):
     """``record_audit(expect_prev=...)`` found a different chain head from the one expected.
@@ -2251,33 +2247,75 @@ def audit_append_secret(
     return secret
 
 
+def _strict_int(value: object) -> int | None:
+    """``value`` when it is an integer and not a ``bool``, else ``None``. The ``seq`` column is
+    attacker-writable, so every read of it goes through here rather than trusting its type."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def audit_next_link(head: Sequence[Any] | None, expect_prev: str | None) -> tuple[int, str]:
     """``(seq, prev_hash)`` for the row about to be appended -- shared by all three backends.
 
-    ``head`` is the chain's newest row as ``(seq, row_hash)``, read under the backend's append lock
-    (SQLite's writer lock, the Postgres advisory lock, the SQL Server applock), or ``None`` for an
-    empty log. Every append on every backend holds that lock from this read to its INSERT, so
-    ``head.seq + 1`` is the next number across engine shards and cluster nodes alike; the UNIQUE
-    constraint on ``audit_log.seq`` turns a writer that somehow skipped the lock into a refused
-    INSERT rather than a forked chain.
+    ``head`` is the chain's newest row as ``(seq, row_hash)``, or ``None`` for an empty log. The
+    server backends read it under the lock every append takes in the DATABASE (the Postgres
+    advisory lock, the SQL Server applock) and hold that lock to the commit, so ``head.seq + 1``
+    is the next number across engine shards and cluster nodes alike. SQLite reads it under the
+    handle's writer lock, which does not reach a second connection to the same file; its append
+    covers that case itself (``MessageStore._append_audit_row``). On every backend the UNIQUE
+    constraint on ``audit_log.seq`` turns two appends at one position into a refused INSERT rather
+    than a forked chain.
 
     ``expect_prev`` is :class:`AuditHeadMovedError`'s seam: the append is refused when the head is not
     the one the caller sealed. ``""`` means the caller requires an EMPTY log."""
     if head is None:
         seq, prev = 1, ""
     else:
-        head_seq, head_hash = head[0], head[1]
-        if not isinstance(head_seq, int) or isinstance(head_seq, bool):
+        head_seq = _strict_int(head[0])
+        if head_seq is None:
             raise RuntimeError(
                 "the audit log's newest row holds no usable sequence number; refusing to append to "
                 "it. Run `messagefoundry audit-verify`"
             )
-        seq, prev = head_seq + 1, (head_hash or "")
+        seq, prev = head_seq + 1, (head[1] or "")
     if expect_prev is not None and (
         prev != expect_prev or (expect_prev == "" and head is not None)
     ):
         raise AuditHeadMovedError(prev)
     return seq, prev
+
+
+def audit_seal_next(
+    head: Sequence[Any] | None,
+    expect_prev: str | None,
+    append_mac: Callable[[], tuple[bytes | None, AuditMacFn | None]],
+    *,
+    ts: float,
+    actor: str | None,
+    action: str,
+    channel_id: str | None,
+    detail: str | None,
+    client: str | None,
+) -> tuple[int, str]:
+    """``(seq, row_hash)`` for the row about to be appended -- the middle of every backend's
+    ``_append_audit_row``, stated once so the order cannot drift between them: take the next link
+    from the head (refusing a head the caller did not seal), take this handle's key for the current
+    range, then hash. Each backend keeps only what differs: its lock, its head read and its
+    INSERT."""
+    seq, prev = audit_next_link(head, expect_prev)
+    key, mac = append_mac()
+    row_hash = audit_row_hash(
+        prev,
+        seq=seq,
+        ts=ts,
+        actor=actor,
+        action=action,
+        channel_id=channel_id,
+        detail=detail,
+        client=client,
+        key=key,
+        mac=mac,
+    )
+    return seq, row_hash
 
 
 def audit_genesis_detail(key_id: str) -> str:
@@ -2314,11 +2352,9 @@ def _audit_genesis_key(row: Mapping[str, Any]) -> str | None:
     return parse_audit_genesis(row["detail"])
 
 
-def _audit_row_seq(row: Mapping[str, Any]) -> int | None:
-    """``row``'s sequence number, or ``None`` when the column holds anything but an integer. The
-    column is attacker-writable, so the walk reads it without trusting its type."""
-    seq = row["seq"]
-    return seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+#: The columns of an ``audit_log`` row that its hash covers besides ``seq`` and the previous hash,
+#: in the order :func:`audit_row_hash` takes them. The two row readers below are built from it.
+_AUDIT_CHAINED_COLUMNS: Final = ("ts", "actor", "action", "channel_id", "detail", "client")
 
 
 def _audit_row_mac(
@@ -2330,12 +2366,7 @@ def _audit_row_mac(
         return audit_row_hash(
             prev,
             seq=row["seq"],
-            ts=row["ts"],
-            actor=row["actor"],
-            action=row["action"],
-            channel_id=row["channel_id"],
-            detail=row["detail"],
-            client=row["client"],
+            **{column: row[column] for column in _AUDIT_CHAINED_COLUMNS},
             key=key,
             mac=mac,
         )
@@ -2350,16 +2381,7 @@ def _audit_digest_line(r: Mapping[str, Any]) -> bytes:
     sealed digest contains."""
     try:
         return encode_typed_fields(
-            (
-                ("seq", r["seq"]),
-                ("ts", r["ts"]),
-                ("actor", r["actor"]),
-                ("action", r["action"]),
-                ("channel_id", r["channel_id"]),
-                ("detail", r["detail"]),
-                ("client", r["client"]),
-                ("row_hash", r["row_hash"]),
-            )
+            (column, r[column]) for column in ("seq", *_AUDIT_CHAINED_COLUMNS, "row_hash")
         )
     except TypeError:
         return b"\x00unencodable audit row\x00"
@@ -2516,15 +2538,13 @@ def verify_audit_rows(
     #: (walk position, row id, reason). The position is the sequence number that row should hold.
     breaks: list[tuple[int, Any, str | None]] = []
     prev: Any = ""
-    count = 0
     #: Head as it stood AT ``expected_prefix[0]`` rows. Stays None when the walk never gets there,
     #: which is the truncation case and must FAIL rather than pass vacuously (BACKLOG #328).
     prefix_head: str | None = None
-    # The range being walked: its key, its first position and that row's id, its digest and row count.
+    # The range being walked: its key, its first position and that row's id, and its digest.
     range_key: str | None = None
     range_from, range_from_id = 1, None
     range_digest = hashlib.sha256()
-    range_rows = 0
     #: Stored ``row_hash`` of the row just before the range being walked: its link to the chain below.
     range_prev: Any = ""
     seen_keys: set[str] = set()
@@ -2532,7 +2552,7 @@ def verify_audit_rows(
     closings: list[tuple[int, Any, str | None, str, dict[str, Any], str, dict[str, Any]]] = []
     for pos, r in enumerate(rows, start=1):
         rid = r["id"]
-        seq_ok = _audit_row_seq(r) == pos
+        seq_ok = _strict_int(r["seq"]) == pos
         if not seq_ok:
             breaks.append(
                 (
@@ -2569,7 +2589,7 @@ def verify_audit_rows(
                             "key_id": range_key,
                             "from_seq": range_from,
                             "to_seq": pos - 1,
-                            "rows": range_rows,
+                            "rows": pos - range_from,
                             "digest": range_digest.hexdigest(),
                             "prev_hash": range_prev,
                         },
@@ -2577,7 +2597,7 @@ def verify_audit_rows(
                 )
                 seen_keys.add(new_key)
                 range_key, range_from, range_from_id = new_key, pos, rid
-                range_digest, range_rows = hashlib.sha256(), 0
+                range_digest = hashlib.sha256()
                 range_prev = prev  # the link below the range, which must outlive its key
         key: bytes | None = None
         mac: AuditMacFn | None = None
@@ -2596,17 +2616,15 @@ def verify_audit_rows(
             breaks.append((pos, rid, None))
         if capable:
             range_digest.update(_audit_digest_line(r))
-            range_rows += 1
         # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
         # row, instead of cascading a false break onto every successor.
         prev = r["row_hash"] or ""
-        count += 1
         # BACKLOG #328: remember the head AT the recorded prefix position, in this same pass. A
         # POSITION test, not a data-dependent branch, so it does not reintroduce the early-return
         # the walk deliberately avoids (ASVS 11.2.4) and costs one comparison per row. On a chain
         # with no break the position IS the row's sequence number, so the anchor's number, the tee's
         # and the walk's are one coordinate.
-        if expected_prefix is not None and count == expected_prefix[0]:
+        if expected_prefix is not None and pos == expected_prefix[0]:
             prefix_head = prev
     if (
         capable
@@ -2654,6 +2672,7 @@ def verify_audit_rows(
                     "audit key-range row is not authorised by the key of the range it closes",
                 )
             )
+    count = len(rows)
     if breaks:
         first_pos, first_id, reason = min(breaks, key=lambda b: (b[0], b[2] is not None))
         return False, f"audit chain broken at seq={first_pos}, row id={first_id}" + (
@@ -2694,16 +2713,16 @@ class AuditRangeHost(Protocol):
     _audit_range_keys: list[str]
     _audit_ranges_trusted: bool
 
-    async def _audit_rows(
-        self, from_seq: int, *, limit: int | None = None
-    ) -> list[Mapping[str, Any]]:
-        """``audit_log`` rows with ``seq >= from_seq``, in ``seq`` order, with ``id``, ``seq`` and
-        the chained columns; at most ``limit`` of them when given."""
+    async def _audit_rows(self, *, limit: int | None = None) -> list[Mapping[str, Any]]:
+        """Every ``audit_log`` row in ``seq`` order, with ``id``, ``seq`` and the chained columns;
+        the first ``limit`` of them when given. No lower bound: a row a writer inserted with a
+        negative sequence number is walked, and reported, like any other."""
         ...
 
-    async def _audit_range_rows(self, from_seq: int) -> list[Mapping[str, Any]]:
-        """Every ``AUDIT_KEY_EPOCH_ACTION`` row with ``seq >= from_seq`` (``seq``, ``detail``), in
-        ``seq`` order, matched EXACTLY on the action (a case-insensitive collation must not widen it)."""
+    async def _audit_range_rows(self) -> list[Mapping[str, Any]]:
+        """Every ``AUDIT_KEY_EPOCH_ACTION`` row after the genesis row (``seq``, ``detail``), in
+        ``seq`` order, matched EXACTLY on the action (a case-insensitive collation must not widen
+        it)."""
         ...
 
     async def record_audit(
@@ -2744,7 +2763,7 @@ async def load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     host._audit_range_keys = []
     host._audit_ranges_trusted = True
     active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
-    head = await host._audit_rows(AUDIT_ALL_ROWS, limit=1)
+    head = await host._audit_rows(limit=1)
     if not head and active_id is not None and not read_only:
         # Suppressed: another process started the chain between the read and the append. The re-read
         # below adopts the row it wrote.
@@ -2755,7 +2774,7 @@ async def load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
                 detail=audit_genesis_detail(active_id),
                 expect_prev="",
             )
-        head = await host._audit_rows(AUDIT_ALL_ROWS, limit=1)
+        head = await host._audit_rows(limit=1)
     if not head:
         return  # an empty log: nothing to settle, and a keyless handle may start a keyless chain
     genesis_key = _audit_genesis_key(head[0])
@@ -2767,11 +2786,11 @@ async def load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
         return
     host._audit_chain_keyed = True
     if active_id is not None:
-        await settle_audit_ranges(host, head[0], genesis_key)
+        await settle_audit_ranges(host, head[0], genesis_key, active_id)
 
 
 async def settle_audit_ranges(
-    host: AuditRangeHost, genesis: Mapping[str, Any], genesis_key: str
+    host: AuditRangeHost, genesis: Mapping[str, Any], genesis_key: str, active_id: str
 ) -> None:
     """At open, on a keyed chain: find the CURRENT range -- the one new rows join.
 
@@ -2785,9 +2804,6 @@ async def settle_audit_ranges(
 
     Between a key change and ``rotate-key`` the current range is legitimately a RETIRED key's; the
     store says so, and says differently when that key is not configured at all."""
-    host._audit_range_keys = []
-    host._audit_ranges_trusted = True
-    active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
     keys = host._audit_mac_keys
     problem: str | None = None
     first_secret = _audit_secret_for(genesis_key, keys, host._audit_mac_fn)
@@ -2796,13 +2812,13 @@ async def settle_audit_ranges(
         mac_ok = hmac.compare_digest(
             audit_mac_bytes(genesis["row_hash"]), audit_mac_bytes(expected)
         )
-        if not mac_ok or expected is None or _audit_row_seq(genesis) != 1:
+        if not mac_ok or expected is None or _strict_int(genesis["seq"]) != 1:
             problem = "the audit chain's genesis row does not verify under the key it names"
     current, current_from = genesis_key, 1
     seen: list[str] = [genesis_key]
     if problem is None:
-        for e in await host._audit_range_rows(2):
-            seq = _audit_row_seq(e)
+        for e in await host._audit_range_rows():
+            seq = _strict_int(e["seq"])
             parsed = parse_audit_epoch(e["detail"])
             if parsed is None or seq is None:
                 problem = f"the audit key-range row at seq={e['seq']!r} is malformed"
@@ -2840,7 +2856,7 @@ async def settle_audit_ranges(
         )
         return
     host._audit_range_key_id, host._audit_range_from = current, current_from
-    if active_id is None or current == active_id:
+    if current == active_id:
         return
     if _audit_secret_for(current, keys, host._audit_mac_fn) is None:
         # Refusing every append would stop every audited action, sign-in included, for as long as the
@@ -2893,15 +2909,18 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
             "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
         )
     current, current_from = host._audit_range_key_id, host._audit_range_from
-    if current is None or current_from is None:
-        return False, "the audit chain does not record which key its current range is under"
+    # A keyed, trusted chain was settled at open, which sets all three. The test narrows the types.
+    if current is None or current_from is None or not host._audit_range_keys:
+        return (
+            False,
+            "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
+        )
     # BACKLOG #1945: `current` is where NEW rows go, and settle_audit_ranges moves that to the active
     # key when the chain's own current range is under a key that is not configured. Read as the
     # chain's state, a dropped key looked like "already under the active key", and this reported OK
     # over a chain audit-verify calls broken. The chain's own answer is the last key its ranges name.
-    # Settle leaves that list non-empty on a trusted chain; the fallback covers a host it never ran on.
     # Past the check below the two names agree, since settle moves `current` only off a missing key.
-    recorded = host._audit_range_keys[-1] if host._audit_range_keys else current
+    recorded = host._audit_range_keys[-1]
     out_secret = _audit_secret_for(recorded, host._audit_mac_keys, host._audit_mac_fn)
     if out_secret is None:
         # Worded for an empty range too, which audit-verify still passes: the range cannot be closed,
@@ -2920,7 +2939,7 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     # ONE read, verified and sealed from the same rows, so the closing record cannot describe a
     # different chain from the one the verify passed. The no-op below verifies too: its OK is read
     # as "the rotation is done", so it must not stand over a chain audit-verify fails (#1945).
-    rows = await host._audit_rows(AUDIT_ALL_ROWS)
+    rows = await host._audit_rows()
     ok, msg = verify_audit_rows(
         rows,
         mac_keys=host._audit_mac_keys,
@@ -2933,6 +2952,14 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         return False, f"refusing to roll a broken audit chain: {msg}"
     if current == active_id:
         return True, f"audit chain already under the active key (range from seq={current_from})"
+    if len(rows) < current_from:
+        # The log is shorter than the range this handle read at open: rows went missing while it
+        # was open. A shorter chain still verifies, so this is the one place the roll can see it.
+        return False, (
+            f"the audit log holds {len(rows)} row(s) but its current range opened at seq="
+            f"{current_from}; rows are missing, so nothing was written. Run `messagefoundry "
+            "audit-verify`"
+        )
     # The verify passed, so every row's sequence number is its position: row N sits at index N - 1.
     split = current_from - 1
     closes = audit_range_closing(
@@ -2941,7 +2968,7 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         from_seq=current_from,
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
-    sealed_head = (rows[-1]["row_hash"] or "") if rows else ""
+    sealed_head = rows[-1]["row_hash"] or ""
     handover = audit_handover_tag(active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
@@ -5483,28 +5510,25 @@ class MessageStore:
             mac_fn=self._audit_mac_fn,
         )
 
-    async def _audit_rows(
-        self, from_seq: int, *, limit: int | None = None
-    ) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: audit rows with ``seq >= from_seq``, in ``seq`` order."""
+    async def _audit_rows(self, *, limit: int | None = None) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every audit row, in ``seq`` order."""
         # A LIMIT of -1 is SQLite's "no limit", which keeps this ONE literal statement: the
         # writer-transaction guard reads every execute() argument as text, and a built string is a
         # blind spot to it.
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, seq, ts, actor, action, channel_id, detail, client, row_hash"
-                " FROM audit_log WHERE seq >= ? ORDER BY seq, id LIMIT ?",
-                (from_seq, -1 if limit is None else limit),
+                " FROM audit_log ORDER BY seq LIMIT ?",
+                (-1 if limit is None else limit,),
             )
             return cast("list[Mapping[str, Any]]", list(await cur.fetchall()))
 
-    async def _audit_range_rows(self, from_seq: int) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: every range row at or after ``from_seq``, in ``seq`` order."""
+    async def _audit_range_rows(self) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row after the genesis row, in ``seq`` order."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT id, seq, detail FROM audit_log WHERE action = ? AND seq >= ?"
-                " ORDER BY seq, id",
-                (AUDIT_KEY_EPOCH_ACTION, from_seq),
+                "SELECT seq, detail FROM audit_log WHERE action = ? AND seq > 1 ORDER BY seq",
+                (AUDIT_KEY_EPOCH_ACTION,),
             )
             return cast("list[Mapping[str, Any]]", list(await cur.fetchall()))
 
@@ -10758,21 +10782,16 @@ class MessageStore:
             )
             last = await cur.fetchone()
             # BACKLOG #1904: raises AuditHeadMovedError when the caller sealed a different head.
-            seq, prev = audit_next_link(
-                None if last is None else (last["seq"], last["row_hash"]), expect_prev
-            )
-            _key, _mac = self._audit_append_mac()  # this handle's key for the current range
-            row_hash = audit_row_hash(
-                prev,
-                seq=seq,
+            seq, row_hash = audit_seal_next(
+                None if last is None else (last["seq"], last["row_hash"]),
+                expect_prev,
+                self._audit_append_mac,
                 ts=now,
                 actor=actor,
                 action=action,
                 channel_id=channel_id,
                 detail=detail,
                 client=client,
-                key=_key,
-                mac=_mac,
             )
             try:
                 ins = await self._db.execute(
@@ -11150,7 +11169,7 @@ class MessageStore:
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
-            await self._audit_rows(AUDIT_ALL_ROWS),
+            await self._audit_rows(),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
             capable=self._audit_keyed_capable(),

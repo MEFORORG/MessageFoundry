@@ -152,7 +152,6 @@ from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
     _SESSION_CAP_ORDER_SQL,
-    AUDIT_ALL_ROWS,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
@@ -207,8 +206,7 @@ from messagefoundry.store.store import (
     _session_cap_groups,
     audit_append_refusal,
     audit_append_secret,
-    audit_next_link,
-    audit_row_hash,
+    audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
     check_password_generated,
@@ -2421,27 +2419,23 @@ class PostgresStore:
         provider (``vault_transit`` mode, ADR 0138). Either keys the chain; neither leaves it keyless."""
         return self._audit_mac_key is not None or self._audit_mac_fn is not None
 
-    async def _audit_rows(
-        self, from_seq: int, *, limit: int | None = None
-    ) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: audit rows with ``seq >= from_seq``, in ``seq`` order."""
+    async def _audit_rows(self, *, limit: int | None = None) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every audit row, in ``seq`` order."""
         sql = (
             "SELECT id, seq, ts, actor, action, channel_id, detail, client, row_hash"
-            " FROM audit_log WHERE seq >= $1 ORDER BY seq, id"
+            " FROM audit_log ORDER BY seq"
         )
         if limit is not None:
-            rows: list[Mapping[str, Any]] = await self._fetchall(sql + " LIMIT $2", from_seq, limit)
+            rows: list[Mapping[str, Any]] = await self._fetchall(sql + " LIMIT $1", limit)
         else:
-            rows = await self._fetchall(sql, from_seq)
+            rows = await self._fetchall(sql)
         return rows
 
-    async def _audit_range_rows(self, from_seq: int) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: every range row at or after ``from_seq``, in ``seq`` order."""
+    async def _audit_range_rows(self) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row after the genesis row, in ``seq`` order."""
         rows: list[Mapping[str, Any]] = await self._fetchall(
-            "SELECT id, seq, detail FROM audit_log WHERE action = $1 AND seq >= $2"
-            " ORDER BY seq, id",
+            "SELECT seq, detail FROM audit_log WHERE action = $1 AND seq > 1 ORDER BY seq",
             AUDIT_KEY_EPOCH_ACTION,
-            from_seq,
         )
         return rows
 
@@ -7013,21 +7007,16 @@ class PostgresStore:
         await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
         last = await conn.fetchrow("SELECT seq, row_hash FROM audit_log ORDER BY seq DESC LIMIT 1")
         # BACKLOG #1904: raises AuditHeadMovedError when the caller sealed a different head.
-        seq, prev = audit_next_link(
-            None if last is None else (last["seq"], last["row_hash"]), expect_prev
-        )
-        _key, _mac = self._audit_append_mac()  # this handle's key for the current range
-        row_hash = audit_row_hash(
-            prev,
-            seq=seq,
+        seq, row_hash = audit_seal_next(
+            None if last is None else (last["seq"], last["row_hash"]),
+            expect_prev,
+            self._audit_append_mac,
             ts=now,
             actor=actor,
             action=action,
             channel_id=channel_id,
             detail=detail,
             client=client,
-            key=_key,
-            mac=_mac,
         )
         # RETURNING gives the row id without a second round trip or a currval() read that
         # another session's insert could race.
@@ -7332,7 +7321,7 @@ class PostgresStore:
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
-            await self._audit_rows(AUDIT_ALL_ROWS),
+            await self._audit_rows(),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
             capable=self._audit_keyed_capable(),

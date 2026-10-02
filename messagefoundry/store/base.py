@@ -2896,9 +2896,9 @@ async def _refuse_to_start_a_keyless_chain(
     keyless row 1."""
     try:
         count, _head = await store.audit_anchor()
-        # A keyed chain is never empty, since it holds its genesis row. The second test stays as a
-        # backstop: a handle whose appends already refuse is not about to start a keyless chain.
-        starts_keyless = count == 0 and store.audit_append_refusal() is None
+        # A keyed chain is never empty, since it holds its genesis row. So an empty log is one
+        # nobody has started, and this handle's first append would start it keyless.
+        starts_keyless = count == 0
     except BaseException:
         await _close_quietly(store)
         raise

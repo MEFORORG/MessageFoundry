@@ -196,8 +196,12 @@ authenticated.
 4. **A handle with no key learns from the genesis row that the chain is keyed.** It refuses to
    append to it, and reports that it cannot verify it.
 5. **Every row carries `seq` inside its MAC.** `audit_log.seq` is `NOT NULL` and `UNIQUE`. It
-   starts at 1 and each append takes the head's `seq` plus one, read under the lock every append
-   already holds (the SQLite writer lock, the PostgreSQL advisory lock, the SQL Server applock).
+   starts at 1 and each append takes the head's `seq` plus one. On PostgreSQL and SQL Server the
+   head is read under the lock every append already takes in the database (the advisory lock, the
+   applock), so the number is safe across engine shards and cluster nodes. On SQLite the writer
+   lock belongs to one handle, so a second connection to the same file, such as a CLI command run
+   beside the engine, can append in between. The `UNIQUE` constraint refuses the second insert,
+   and the append reads the head again while it holds SQLite's write lock.
    The verifier walks in `seq` order and requires the numbers to start at 1 and rise by one. The
    row `id` stays a surrogate key outside the chain: a rolled-back insert can skip an `id`, and
    nothing in the chain reads it.

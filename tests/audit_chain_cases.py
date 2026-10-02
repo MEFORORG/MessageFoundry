@@ -36,14 +36,14 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from messagefoundry.store.crypto import generate_key
+from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     audit_row_hash,
     parse_audit_genesis,
 )
 
-__all__ = ["CASES", "ChainBackend"]
+__all__ = ["CASES", "ChainBackend", "server_chain_backend"]
 
 
 @dataclass(frozen=True)
@@ -64,6 +64,43 @@ class ChainBackend:
     #: Whether two handles may open the same fresh store at the same moment. The server backends
     #: serialise that in the database; a test's SQLite file is opened one handle at a time.
     concurrent_open: bool = False
+
+
+def server_chain_backend(
+    name: str, store_cls: Any, settings: Any, raw: Any, *, reset_sql: str
+) -> ChainBackend:
+    """The adapter for a live server backend, shared by the Postgres and SQL Server test modules.
+
+    ``store_cls.open(settings, ...)`` opens each handle on the one database ``settings`` names.
+    ``raw`` is a handle that holds no key -- the test module's own fixture -- and the raw statements
+    run through it. ``reset_sql`` empties ``audit_log`` in that backend's dialect. Two handles may
+    open the same fresh store at once: the server backends serialise that in the database."""
+
+    async def open_keyed(active: str, retired: tuple[str, ...]) -> Any:
+        cipher = make_cipher(active, retired)
+        return await store_cls.open(settings, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+
+    async def open_keyless() -> Any:
+        return await store_cls.open(settings)
+
+    async def execute(sql: str) -> None:
+        await raw._execute(sql)
+
+    async def fetch(sql: str) -> Sequence[Mapping[str, Any]]:
+        return [dict(r) for r in await raw._fetchall(sql)]
+
+    async def reset() -> None:
+        await raw._execute(reset_sql)
+
+    return ChainBackend(
+        name=name,
+        open_keyed=open_keyed,
+        open_keyless=open_keyless,
+        execute=execute,
+        fetch=fetch,
+        reset=reset,
+        concurrent_open=True,
+    )
 
 
 async def _seed(store: Any, tag: str, n: int) -> None:

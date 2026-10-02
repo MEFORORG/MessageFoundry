@@ -13,6 +13,7 @@ would have inherited.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -22,7 +23,7 @@ import pytest
 
 from messagefoundry.__main__ import _build_parser
 from messagefoundry.store import MessageStore
-from messagefoundry.store.crypto import make_cipher
+from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.privilege import AUDIT_APPEND_ONLY_TABLES
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
@@ -211,8 +212,6 @@ def test_a_range_record_is_not_a_genesis_record() -> None:
         "digest": "d",
         "prev_hash": "",
     }
-    import json
-
     detail = json.dumps({"key_id": "n", "closes": closes, "handover": "t"})
     assert parse_audit_epoch(detail) is not None
     assert parse_audit_genesis(detail) is None
@@ -270,7 +269,7 @@ def test_the_parser_offers_no_rekey_audit_command() -> None:
 
 async def test_a_keyed_store_lists_its_genesis_row_like_any_other(tmp_path: Path) -> None:
     """The genesis row is an ordinary audit row to a reader: it is listed, with the system actor."""
-    cipher = make_cipher(_key())
+    cipher = make_cipher(generate_key())
     store = await MessageStore.open(
         tmp_path / "list.db", cipher=cipher, audit_mac_key=cipher.audit_mac_key()
     )
@@ -279,9 +278,3 @@ async def test_a_keyed_store_lists_its_genesis_row_like_any_other(tmp_path: Path
         assert [(r["action"], r["actor"]) for r in rows] == [(AUDIT_KEY_EPOCH_ACTION, "system")]
     finally:
         await store.close()
-
-
-def _key() -> str:
-    from messagefoundry.store.crypto import generate_key
-
-    return generate_key()

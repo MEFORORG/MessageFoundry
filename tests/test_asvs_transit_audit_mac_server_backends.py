@@ -111,16 +111,12 @@ def chained_rows(
 
 def serve_rows(store: Any, rows: list[dict[str, Any]]) -> None:
     """Make ``store`` read and append ``rows`` as its ``audit_log``. Both chain reads go through
-    ``_fetchall``; the range-row read filters on the action, so it gets the key-epoch rows from its
-    lower bound. ``record_audit`` appends to the same list, as the open's genesis write needs."""
+    ``_fetchall``; the range-row read filters on the action, so it gets the key-epoch rows after the
+    genesis row. ``record_audit`` appends to the same list, as the open's genesis write needs."""
 
     async def _fetchall(sql: str, *args: Any, **_kw: Any) -> list[dict[str, Any]]:
         if "WHERE action" in sql:
-            flat = args[0] if args and isinstance(args[0], tuple) else args
-            floor = int(flat[-1])
-            return [
-                r for r in rows if r["action"] == AUDIT_KEY_EPOCH_ACTION and int(r["seq"]) >= floor
-            ]
+            return [r for r in rows if r["action"] == AUDIT_KEY_EPOCH_ACTION and int(r["seq"]) > 1]
         return rows
 
     async def record_audit(

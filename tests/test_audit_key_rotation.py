@@ -803,10 +803,8 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
     try:
         real_rows = store._audit_rows
 
-        async def rows_then_a_racing_append(
-            from_seq: int, *, limit: int | None = None
-        ) -> list[Mapping[str, Any]]:
-            got = await real_rows(from_seq, limit=limit)
+        async def rows_then_a_racing_append(*, limit: int | None = None) -> list[Mapping[str, Any]]:
+            got = await real_rows(limit=limit)
             await store.record_audit("racing", actor="engine")  # lands after the seal
             return got
 
@@ -825,23 +823,3 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
         assert ok, detail
     finally:
         await store.close()
-
-
-async def test_sql_server_passes_the_every_row_floor_through() -> None:
-    """``audit_log.seq`` is BIGINT on SQL Server, so the every-row floor fits the column and is
-    handed over unchanged, as is a real lower bound."""
-
-    from messagefoundry.store.store import AUDIT_ALL_ROWS
-    from tests.test_asvs_transit_audit_mac_server_backends import _bare
-
-    store = _bare("sqlserver")
-    seen: list[tuple[Any, ...]] = []
-
-    async def _fetchall(_sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-        seen.append(params)
-        return []
-
-    store._fetchall = _fetchall
-    await store._audit_rows(AUDIT_ALL_ROWS)
-    await store._audit_rows(7)
-    assert seen == [(AUDIT_ALL_ROWS,), (7,)]
