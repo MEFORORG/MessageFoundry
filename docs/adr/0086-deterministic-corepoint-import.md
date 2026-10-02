@@ -474,8 +474,8 @@ Whether Corepoint runs such a statement is not known. So:
     label marker is none, so `<Line Data="Catch"><List Data="MsgLog …"/></Line>` still opens its
     branch, and the label marker leads it.
   - The branch-group test reads the kind a label had before it was demoted from a call
-    (`Control.demoted_from`). So a demoted label makes no group appear and none go. A send off
-    a `<Line>` is a send still, so it needs no such memory.
+    (`Control.demoted_from`). So a demoted label makes no group appear and none go. A send in
+    a Block's or a Call's `@Data` is a send still, so it needs no such memory.
 
   Among the steps that are not adopted, every marker stays where its element sat, in source
   order. *Corrected 2026-10-02, three times.* The first cut let the sibling adoption see the
@@ -486,7 +486,8 @@ Whether Corepoint runs such a statement is not known. So:
   review of it found the other two places above, each with a branch main keeps dead that
   rendered live. Moving one marker, and then guarding one test, were both too narrow. The rule
   is now stated for the whole tree, and a test compares that tree with main's.
-- A send off a `<Line>` is no marker. It is a refused send, in the tree where main's send is. So
+- A send in a Block's or a Call's `@Data` is no marker. It is a refused send, in the tree where
+  main's send is. So
   it selects the handler's `sends` list exactly where main's send does. That matters: a handler
   with no send the render reaches ends on a `return Send(...)` for every destination in its tree,
   rendered or not. *Corrected 2026-10-02 (code review of the repair, round 2):* an earlier cut
@@ -500,8 +501,9 @@ That fails toward the visible side: a clone such a statement names is never trea
 overwrite it names is never ignored. The scan is never more permissive than it was.
 
 **Never quieter than main.** This is the rule for the whole amendment. It is written out because
-three holds on PR 1938 each found one more list on which the branch was quieter than main. For
-every list, against main's step 1 tree:
+each round of review on PR 1938 found one more list on which the branch did worse than main: a
+branch main keeps dead rendered live, and then a refusal became a silent filter. For every list,
+against main's step 1 tree:
 
 - **(a)** The head adds no live send, inline or in a closing `return`, and no vocabulary call.
 - **(b)** Where main sends or refuses, the head sends or refuses. No `raise NotImplementedError`
@@ -547,10 +549,10 @@ At least these limits remain:
   The same holds for a markup-free `MsgTreeCopy` on a `<Line>`.
 - The refusal at a send on a `<Line>`, and the reason on a declined write, still name the two
   older causes: no single input handle, or an overwritten input. The marker carries the true one.
-  A send off a `<Line>` names its own cause in its refusal.
+  A send in a Block's or a Call's `@Data` names its own cause in its refusal.
 - A construct carrying a statement counts twice: once as the construct, as before, and once
-  unmapped for the statement. A `<Call>` carrying one counts once, for the statement. A send off
-  a `<Line>` counts once, as the refusal it is.
+  unmapped for the statement. A `<Call>` carrying one counts once, for the statement. A send in
+  a Block's or a Call's `@Data` counts once, as the refusal it is.
 - A wrapper that holds a statement of its own, between a construct and its sibling branch, orphans
   that branch. main does the same whatever the wrapper's `@Data`, and this amendment leaves it as
   it found it. `test_a_wrappers_marker_changes_nothing_where_main_already_orphans` pins that.
@@ -576,12 +578,17 @@ live send is read inline and in the handler's closing `return`. *Corrected 2026-
 of the repair, round 2):* the bound read the inline form alone, so it could not see a closing
 `return Send(...)` that the amendment added.
 
-The bound now also checks clauses (b) and (c) of "Never quieter than main". It counts the loud
-lines of the handler by depth: each live send, each refusal, and each guard that re-raises a
-refusal ahead of a Catch. None may go. The closing `return` must be main's line. Every name main
-counted unmapped must still be counted, and the `# TODO` lines must not drop. Depth stands in for
-"runs": a line one level in sits under a dead placeholder, or in a `try`. The shape test is what
-keeps a line from moving between those two.
+The bound now also checks clauses (b) and (c) of "Never quieter than main". It reads every send
+and every refusal of the handler, by depth and by destination. A refusal of a send stands for
+that send. None may go. A `try` that holds a refusal must open on the guard that re-raises it,
+or the Catch would swallow it. The closing `return` must be main's line. Every name main counted
+unmapped must still be counted. Every `# TODO` main writes must still be written, at its depth
+and naming the same word. Depth stands in for "runs": a line one level in sits under a dead
+placeholder, or in a `try`. The shape test is what keeps a line from moving between those two.
+*Corrected 2026-10-02 (code review of this repair):* the first cut counted lines by depth
+alone, so a send that went could hide behind a refusal gained elsewhere at the same depth.
+At least one limit remains: the unmapped names are compared as a set of counts, so a name main
+counted can go unseen where the amendment adds a marker of the same name.
 
 It holds the head to the same bound, against the same vendored file, wherever the
 gate is closed. And `test_no_raw_list_is_quieter_than_main` runs it over the 4,000 lists drawn
@@ -590,6 +597,8 @@ hold):* the bound checked none of that and read the battery alone. Every seed pu
 DELIVERS where a label belongs, so no shape it read held a refusal that could go.
 `test_the_bound_sees_a_refusal_turned_into_a_quiet_filter` is the control: it renders a send off
 a `<Line>` as a comment once more, and the bound must then be red.
+`test_the_bound_sees_each_mutant_of_the_ending_and_the_guard` breaks the closing `return` and
+the guard in turn, and the bound must be red on the seed written for each.
 
 That bound is what catches a rule that is wrong in the head and in its copy alike, where the
 head-equals-baseline check is blind. It missed the wrapper defect twice, each time for want of a
@@ -644,25 +653,26 @@ of this battery, not proofs about the change.
 The two rows about a send label were measured before the second repair, when a send off a
 `<Line>` was a label. It is a refused send now, so neither mutation exists as written.
 
-Measured 2026-10-02 at the second repair. The battery holds 8,093 shapes. Ten are new seeds, on a
-`<Block>` and on a `<Call>`: a send off a `<Line>` that main refuses, alone, beside another send
-and in a `Try` with a Catch, and a send naming no destination, with role markup and without. The
-amendment changes 771 battery shapes and 2,929 of the 4,000 raw lists. "Put back" restores the
+Measured 2026-10-02 at the second repair. The battery holds 8,095 shapes. Twelve are new seeds,
+on a `<Block>` and on a `<Call>`: a send off a `<Line>` that main refuses, alone, beside another
+send and in a `Try` with a Catch; a send naming no destination, with role markup and without;
+and a send main delivers, in a `Try` with a Catch. The amendment changes 773 battery shapes and
+2,929 of the 4,000 raw lists. "Put back" restores the
 earlier rule, a send off a `<Line>` rendered as a label and a marker, in the head and in the
 baseline copy alike.
 
-| | Battery, of 8,093 | Raw lists, of 4,000 |
+| | Battery, of 8,095 | Raw lists, of 4,000 |
 |---|---|---|
-| The bound is red, with the earlier rule put back | 20 | 429 |
+| The bound is red, with the earlier rule put back | 22 | 429 |
 | The same, counting refusals alone and not sends | 8 | 128 |
 | The bound is red, with the repair in place | 0 | 0 |
 
-The second row is the first cut of this check, which counted only the refusals. All 8 of its
-battery shapes are new seeds. So a lost refusal could not show on the 8,083 older shapes by any
-check, and it showed on the raw lists once the bound read them. Counting sends too adds ten older
-seeds, where main delivers the send and the earlier rule left a comment. The count is the same
-with the earlier rule in the head alone. This is still a sample. It shows no quieter list among
-those it draws, not that none exists.
+The second row is the first cut of this check, which counted only the refusals, over the ten
+seeds it then had. All 8 of its battery shapes are new seeds. So a lost refusal could not show on
+the 8,083 older shapes by any check, and it showed on the raw lists once the bound read them.
+Counting sends too adds ten older seeds, where main delivers the send and the earlier rule left
+a comment. Of the 22, twelve are new seeds and ten are older. This is still a sample. It shows
+no quieter list among those it draws, not that none exists.
 
 The measurement below is older. It was taken the same day at `880f431d94`, before the repair, and
 was not run again. The battery then held 7,968 shapes, 512 of them fixed seeds. The 181 seeds new
@@ -786,7 +796,8 @@ omitting it would claim it vanished.
 - **AC-6g (a statement off a `<Line>`, amendment 2026-10-02)** — an element other than a `<Line>`
   whose `@Data` is a statement (§2(b.4)) SHALL emit a counted TODO naming it, SHALL emit no
   write and no delivery for it, and its list SHALL hold no handle as `msg`; a prose label SHALL
-  stay a comment. A `MsgSend` there SHALL be a refused send, which raises. The marker SHALL NOT
+  stay a comment. A `MsgSend` in a Block's or a Call's `@Data` SHALL be a refused send, which
+  raises. The marker SHALL NOT
   change the shape of the tree: which construct holds which branch. The head SHALL be no quieter
   than main on any list: no refusal, marked ending, unmapped count or TODO main has SHALL go.
   → `::test_a_clone_where_a_label_belongs_is_marked_and_its_send_is_judged_on_the_marker`,

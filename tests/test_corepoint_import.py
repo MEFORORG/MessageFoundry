@@ -2123,13 +2123,16 @@ def test_a_demoted_label_changes_no_shape_around_it(
     )
     assert _LABEL_MARKER in marked and _LABEL_MARKER not in control
 
-    def around(src: str) -> list[str]:
-        return [line for line in _code(src) if "OB_LABEL" not in line]
+    def in_place(src: str, kind: str) -> list[str]:
+        """The code, with a line of that send of ``kind`` cut to its indent and nothing else."""
+        return [
+            line[: len(line) - len(line.lstrip())] + "SEND"
+            if "OB_LABEL" in line and line.lstrip().startswith(kind)
+            else line
+            for line in _code(src)
+        ]
 
-    assert around(marked) == around(control)
-    sent = [line for line in _code(control) if "OB_LABEL" in line]
-    refused = [line for line in _code(marked) if "OB_LABEL" in line]
-    assert len(refused) == len(sent) and all("raise NotImplementedError(" in r for r in refused)
+    assert in_place(marked, "raise NotImplementedError(") == in_place(control, "sends.append(")
     assert marked.count(_ORPHAN) == control.count(_ORPHAN) == orphans
 
 

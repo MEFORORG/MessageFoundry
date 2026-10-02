@@ -26,7 +26,8 @@ discharged by the 2026-07-24 amendment). A real Corepoint export is **XML, not J
 * **``<Block>`` is a comment / section label, not an action** — it is preserved as a comment in the
   generated module and never emitted as a step. A statement written in the ``@Data`` of any
   element but a ``<Line>`` is marked as a counted TODO and never emitted as a write or a
-  delivery; a ``MsgSend`` there is a refused send, which raises (BACKLOG #2632; see
+  delivery; a ``MsgSend`` in a Block's or a Call's ``@Data`` is a refused send, which
+  raises (BACKLOG #2632; see
   :func:`_label_statement`).
 * Operands are ``$variable``, ``%tree/path`` (a message-tree path), ``"string literal"``,
   ``[bracketed option]`` and ``(parenthesised condition)``; the verb vocabulary is **42 verbs**, of
@@ -999,7 +1000,7 @@ _LABEL_STATEMENT_WHY = (
     "not on a Line, so it may never have run; nothing is mapped and no role-marked handle here "
     "is taken to be msg"
 )
-# Why a ``MsgSend`` in a Block's or a Call's ``@Data`` is refused, whatever it names. A send is the
+# Why a ``MsgSend`` in a Block's or a Call's ``@Data`` is refused, whatever it names. It is the
 # one statement off a ``<Line>`` that is not marked with a comment alone. main renders it where it
 # sits: as a delivery, or as a refusal that raises. A comment in its place would turn that refusal
 # into a handler that returns nothing, so the message would be FILTERED where main sent it to ERROR.
@@ -1634,7 +1635,8 @@ def _parse_statement(
         return [Control("disabled", source, label, body=tuple(body))]
 
     # A statement written anywhere but on a ``<Line>`` is marked and counted, and never emitted as
-    # a write or a delivery: whether Corepoint runs it there is not known. A send there is refused.
+    # a write or a delivery: whether Corepoint runs it there is not known. A send in a Block's
+    # or a Call's ``@Data`` is refused.
     marker = _label_marker(elem)
 
     if tag.lower() not in _STATEMENT_TAGS:
@@ -2813,7 +2815,8 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list.
 
-    A send off a ``<Line>`` is refused and still a send (:data:`_LABEL_SEND_REFUSAL`), so this
+    A send in a Block's or a Call's ``@Data`` is refused and still a send
+    (:data:`_LABEL_SEND_REFUSAL`), so this
     reads the tree as main does, and a handler ends on the ``return`` main gives it."""
     return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
 
@@ -2990,7 +2993,8 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
     (:func:`_label_marker`). The construct is counted as it always was, and the statement it carried
     is counted unmapped beside it, because the two are rendered apart. A ``<Call>`` carrying one
     is a plain label and is not counted as a call, so only its statement counts. A ``MsgSend``
-    off a ``<Line>`` counts once too: it is a refused send, which is unmapped as any refusal is.
+    in a Block's or a Call's ``@Data`` counts once too: it is a refused send, which is
+    unmapped as any refusal is.
 
     The names go through :func:`_comment_text` because the CLI prints them: the import summary is the
     count-and-log record a migrator trusts, and a JSON export naming a class
