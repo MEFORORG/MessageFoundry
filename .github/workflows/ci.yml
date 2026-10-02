@@ -3761,6 +3761,18 @@ jobs:
           # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
           # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
           .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir @cached
+          # vault BACKLOG #2702: that install gives the service a restricted token, which writes
+          # only where a permission names NT SERVICE\MessageFoundry itself. The samples graph has
+          # File connections under the working directory (in\, dev-inbox\, out\), and a grant to
+          # Users there no longer counts. So they get the grant docs/SERVICE.md tells an operator
+          # to add for any directory a File connection writes. The installer grants the data
+          # directory itself; the "Verify the service token" step below shows a directory with
+          # no such grant is refused.
+          foreach ($d in "in", "dev-inbox", "out") {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            & icacls $d /grant "NT SERVICE\MessageFoundry:(OI)(CI)M" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "could not grant the service account on '$d' (icacls exit $LASTEXITCODE)" }
+          }
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
           # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
           # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an
@@ -3982,6 +3994,119 @@ jobs:
           if ($total -lt 1) { throw "message was not recorded by the engine" }
           "messages.total = $total"
 
+      # vault BACKLOG #2702: install-service.ps1 sets a restricted service SID and a one-entry
+      # RequiredPrivileges list. The two steps above show the engine still starts and still takes a
+      # message under that token. Without THIS step they would be green whether or not the token is
+      # restricted, so it reads the token three ways, and each reading has a control that must NOT
+      # read the same way.
+      #
+      # 1. The registration, through the Service Control Manager (sc.exe qsidtype, sc.exe qprivs).
+      # 2. The token of the RUNNING engine: nssm.exe, the launcher and the python.exe it started.
+      #    Settings on a registration are not a token, and the child is the process that does the
+      #    work. scripts/ci/service_token_probe.py holds the rule; this shell is its control.
+      # 3. What the token can DO, which only code running under it can show. The service is stopped
+      #    and started again with the probe in place of the engine, under the same registration. It
+      #    must write the data directory, be REFUSED on a directory that grants only Users and
+      #    Authenticated Users, find a writable temporary directory, and get through the engine's
+      #    alternate-credential logon (transports/wincred.py), which is documented to need no
+      #    privilege. The probe keeps running afterwards, so the stop step below still has a
+      #    running service to stop.
+      #
+      # NOT PROVEN HERE: an explicit -ServiceAccount, a gMSA and -AllowLocalSystem. The installer
+      # does not set the restricted SID for those, and no leg installs under them. Nor is a real
+      # network share: the probe's credential is made up, so it runs the logon and the
+      # impersonation and never the SMB hop, which the far end checks and this token does not.
+      #
+      # A SID-type change is documented to need a system start. This install is the service's
+      # first, so the token read here is the one its first start got. A red at reading 2 with a
+      # green reading 1 would be that case, and is not to be turned green by dropping reading 2.
+      - name: Verify the service token is restricted (vault BACKLOG #2702)
+        run: |
+          $name = "MessageFoundry"
+          $privilege = "SeChangeNotifyPrivilege"
+          function Assert-Native([string]$What) {
+            if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+          }
+
+          # --- 1. the registration -----------------------------------------------------------------
+          $sidType = (& sc.exe qsidtype $name | Out-String); Assert-Native "sc.exe qsidtype $name"
+          $privs = (& sc.exe qprivs $name | Out-String); Assert-Native "sc.exe qprivs $name"
+          "===== sc.exe qsidtype $name ====="; $sidType
+          "===== sc.exe qprivs $name ====="; $privs
+          $restricted = '(?m)SID_TYPE\s*:\s*RESTRICTED\s*$'
+          # CONTROL: the other two values must NOT match, or the pattern matches everything.
+          # UNRESTRICTED ends in the same letters, which is the one a loose pattern lets through.
+          foreach ($not in "SERVICE_SID_TYPE:  UNRESTRICTED", "SERVICE_SID_TYPE:  NONE") {
+            if ($not -match $restricted) { throw "CONTROL FAILED: '$not' reads as RESTRICTED, so the pattern proves nothing" }
+          }
+          if ($sidType -notmatch $restricted) { throw "the service SID type is not RESTRICTED" }
+          $listed = @([regex]::Matches($privs, 'Se[A-Za-z]+Privilege') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+          if (($listed -join ',') -ne $privilege) {
+            throw "the registration lists [$($listed -join ', ')], not exactly $privilege"
+          }
+
+          # --- 2. the running engine's token -------------------------------------------------------
+          $serviceSid = ([Security.Principal.NTAccount]"NT SERVICE\$name").Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+          $svc = Get-CimInstance Win32_Service -Filter "Name='$name'"
+          if (-not $svc -or -not $svc.ProcessId) { throw "the service is not running, so there is no token to read" }
+          # Every process under the service's root. A child must be at least as new as its parent:
+          # a process whose parent id was only REUSED by the root is not under it. The same walk
+          # as Get-ServiceProcess in scripts/service/measure-store-access.ps1.
+          $all = @(Get-CimInstance Win32_Process)
+          $tree = @($all | Where-Object { [int]$_.ProcessId -eq [int]$svc.ProcessId })
+          $frontier = $tree
+          while ($frontier.Count -gt 0) {
+            $frontier = @(foreach ($parent in $frontier) {
+              $all | Where-Object {
+                ([int]$_.ParentProcessId -eq [int]$parent.ProcessId) -and
+                ($_.CreationDate -ge $parent.CreationDate) -and
+                (@($tree | ForEach-Object { [int]$_.ProcessId }) -notcontains [int]$_.ProcessId)
+              }
+            })
+            $tree += $frontier
+          }
+          $tree | Format-Table ProcessId, ParentProcessId, Name -AutoSize | Out-String
+          # The engine is the python.exe the launcher starts, so that is the token that matters.
+          # The service's root process and the launcher are read as well, and every one must pass.
+          $procs = @($tree[0]) + @($tree | Select-Object -Skip 1 | Where-Object {
+            $_.Name -in @("messagefoundry.exe", "python.exe", "pythonw.exe")
+          })
+          if (-not ($procs | Where-Object { $_.Name -eq "python.exe" })) {
+            throw "no python.exe runs under the service, so the engine's own token was not read"
+          }
+          $pids = @($procs | ForEach-Object { "--pid"; "$($_.ProcessId)" })
+          & python scripts\ci\service_token_probe.py check-read --service-sid $serviceSid --privilege $privilege --control-pid $PID @pids
+          Assert-Native "the token check on the running service"
+
+          # --- 3. what the token can do ------------------------------------------------------------
+          $data = "C:\ProgramData\MessageFoundry"
+          $denied = "C:\mefor-token-probe-denied"
+          $report = Join-Path $data "token-probe.json"
+          $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
+          $python = (Get-Command python).Source
+          # The parameters are stored as one string, unquoted, so no path in it may hold a space.
+          if ("$probe$report$data$denied" -match '\s') { throw "a probe path holds a space: $probe $report $denied" }
+          New-Item -ItemType Directory -Force -Path $denied | Out-Null
+          & icacls $denied /inheritance:r /grant:r "*S-1-5-32-545:(OI)(CI)M" "*S-1-5-11:(OI)(CI)M" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
+          Assert-Native "icacls on $denied"
+          Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry
+          Assert-Native "stopping the engine"
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry Application $python
+          Assert-Native "setting the probe as the service's program"
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry AppParameters "$probe inside --report $report --granted-dir $data --denied-dir $denied --hold-seconds 900"
+          Assert-Native "setting the probe's parameters"
+          & "$env:SMOKE_NSSM_DIR\nssm.exe" start MessageFoundry
+          Assert-Native "starting the service with the probe"
+          foreach ($i in 1..120) {
+            if (Test-Path -LiteralPath $report) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not (Test-Path -LiteralPath $report)) { throw "the probe wrote no report as the service; see the service logs below" }
+          & python scripts\ci\service_token_probe.py check-inside --report $report --service-sid $serviceSid --privilege $privilege
+          Assert-Native "the check on what the service token can do"
+
       - name: Stop the service (graceful)
         if: always()
         run: '& "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry'
@@ -4000,6 +4125,24 @@ jobs:
         if: always()
         shell: powershell
         run: .\scripts\service\uninstall-service.ps1
+
+      # vault BACKLOG #2702: the SID type and the privilege list are settings on the registration,
+      # so the uninstall reverses them by removing it. This reads that back: the service's registry
+      # key, which holds both, must be gone. The control key is a service Windows always has, so
+      # an "absent" reading cannot come from a read that sees no service key at all.
+      - name: Confirm the uninstall took the token settings with the registration
+        if: always()
+        shell: powershell
+        run: |
+          $services = "HKLM:\SYSTEM\CurrentControlSet\Services"
+          if (-not (Test-Path -LiteralPath "$services\EventLog")) {
+            throw "CONTROL FAILED: this read cannot see the EventLog service key, so it proves nothing"
+          }
+          if (Test-Path -LiteralPath "$services\MessageFoundry") {
+            Get-ItemProperty -LiteralPath "$services\MessageFoundry" | Format-List ServiceSidType, RequiredPrivileges, DeleteFlag
+            throw "the MessageFoundry service key is still there after the uninstall, with the SID type and privilege list in it"
+          }
+          "the registration is gone, and the SID type and the privilege list with it"
 
       # --- ADR 0183 Amendment A, Wave 0 (BACKLOG #1136): the AUTH-ON arm ------------------------------
       # Everything above runs with sign-in OFF, so it cannot see the question these two steps ask:

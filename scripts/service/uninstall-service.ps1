@@ -25,6 +25,10 @@
     later: -RemoveLogonRight drops the "Log on as a service" right, and -RemoveAccountAces drops
     the run-as account's entry from the data and config directories.
 
+    The service SID type and the privilege list the installer sets are part of the registration,
+    so they go with it. The script looks for the service's registry key after the removal, and the
+    inventory says so when Windows has only marked the service for deletion.
+
     Run from an elevated (Administrator) PowerShell prompt.
 
 .EXAMPLE
@@ -255,6 +259,10 @@ function Get-UninstallResidueNotice {
         [switch]$LogonRightRemoved,
         [switch]$DataAceRemoved,
         [switch]$ConfigAceRemoved,
+        # Read AFTER the removal: the service's registry key is still there. Windows has only marked
+        # the service for deletion, and the key holds the SID type and the privilege list the
+        # installer set (vault BACKLOG #2702).
+        [switch]$RegistrationPending,
         # Named where a read failed, so a thin notice is never mistaken for a clean host.
         [string[]]$Unreadable
     )
@@ -280,6 +288,18 @@ function Get-UninstallResidueNotice {
     $lines += "                   turning inheritance back on would hand the parent directory's"
     $lines += "                   users read access to logs that can carry patient data. Read the"
     $lines += "                   permissions yourself before you rely on them: icacls `"$DataDir`""
+
+    if ($RegistrationPending) {
+        # The SID type and the privilege list are settings ON the registration, so removing it is
+        # what takes them back. Said only when the key was read and found still there: a removal
+        # that has not finished is the one case where they are still on the host.
+        $lines += "  Registration     '$ServiceName' is marked for deletion, and its registry key is"
+        $lines += "                   still there. Windows removes it when the last handle to the"
+        $lines += "                   service closes, or at the next restart. Until then the key"
+        $lines += "                   still holds the service SID type and the privilege list the"
+        $lines += "                   installer set. They go with it; nothing else on this host"
+        $lines += "                   carries them. Check with: sc.exe query `"$ServiceName`""
+    }
 
     if ($CachedNssm) {
         $lines += "  NSSM binary      $CachedNssm"
@@ -651,6 +671,14 @@ if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed (exit $LASTEXITCODE)" }
 
 Write-Host "Removed '$ServiceName'." -ForegroundColor Green
 
+# THE SID TYPE AND THE PRIVILEGE LIST GO WITH THE REGISTRATION, AND THAT IS READ BACK (vault BACKLOG
+# #2702). install-service.ps1 sets both on the registration and nowhere else, so deleting it is what
+# reverses them. sc.exe exits 0 when Windows only MARKS a service for deletion, which it does while a
+# handle to the service is open or its process is still running. The key, and both settings in it,
+# then stay until that ends. So the key is looked for after the removal, and the inventory says so
+# when it is still there.
+$registrationPending = Test-Path -LiteralPath $svcKey
+
 # --- the two residues an operator can hand back to this script (BACKLOG #1704) ----------------------
 # Both run AFTER the registration is gone, against facts read BEFORE it: the service must not lose the
 # right or the entry while it is still registered to use them.
@@ -711,5 +739,6 @@ Get-UninstallResidueNotice `
     -LogonRightRemoved:$logonRightRemoved `
     -DataAceRemoved:$dataAceRemoved `
     -ConfigAceRemoved:$configAceRemoved `
+    -RegistrationPending:$registrationPending `
     -Unreadable $unreadable |
     ForEach-Object { Write-Host $_ }
