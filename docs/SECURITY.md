@@ -157,6 +157,39 @@ store vouches for. `serve --allow-insecure-bind`, or its config twin `[security]
 unauthenticated full access — or to silently void the loopback assumption by changing
 `[security].local_access_only` / `listen_address` (SYS-1).
 
+**Sign-in is checked before the request body is read (vault BACKLOG #2739).** FastAPI reads and
+decodes a declared request body before it runs a route's dependencies, and the `require*()` gate
+is a dependency. Left alone, a gated JSON route that declares a body would answer a caller with no
+session from the body parser. The answer would be **422** for JSON that does not parse, or **400**
+for bytes that cannot be read. The engine's route class, `AuthenticatedBeforeBodyRoute`
+(`messagefoundry/api/security.py`), stops that. On a gated route that declares a body, it runs
+the gate's authentication step before FastAPI reads the body. The guards that sit ahead of the
+gate run first, in the order FastAPI would run them. So a caller with no identity gets the gate's
+own refusal whatever the body holds. The response does not say whether the body parsed, or whether
+the route takes a body.
+
+- `create_app` sets the class on the app's router. Each route registered on the app gets the
+  check with nothing to remember, and no list of routes is kept.
+- Some route shapes are not covered, and the engine has none of them. The class docstring is the
+  one list. It names at least a route added through `include_router`, a gate nested inside
+  another dependency, and an unmarked dependency ahead of a gate. An embedder who adds routes in
+  one of those ways must check them.
+- The gate itself does not change. After the body is read it runs in full, as before: sign-in
+  again, then the password and factor checks, the permission check and its audit rows, pacing and
+  step-up. So a signed-in caller that the gate then refuses still gets the parser's answer first
+  for a body that does not parse.
+- Nothing is handed from the early check to the gate. A session that ends while the body is
+  arriving is refused by the gate. The price is one more identity lookup for a signed-in
+  request to a route with a body. That lookup reads the session, its user and the user's roles.
+  It writes nothing, so it does not move the session's idle clock.
+- A route with no gate is not touched. `POST /auth/login` has to parse a body from a caller with
+  no session. A gated route that declares no body is not touched either, because FastAPI already
+  runs its gate first. That includes the web console's `/ui` routes, which read their forms
+  inside the handler.
+
+`tests/test_auth_before_body.py` tests the mechanism. `tests/test_preauth_malformed_body.py` pins
+what an unauthenticated caller gets on every operation that takes a body.
+
 **The proxy-to-engine hop is yours to secure, and `serve` makes you say so (BACKLOG #1179).** With
 `tls_terminated_upstream`, the proxy terminates TLS and the engine mints no certificate
 ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
@@ -684,7 +717,9 @@ route handler only when all of them pass.
    cookie** serves the `/ui` routes and a same-origin browser's `/ws/stats` handshake. The JSON API's
    `require*()` gates never read the cookie. `/ws/stats` accepts two planes, cookie first and
    header token second; the WebSocket note under the gate table below has the order.
-3. **The `require*()` deny-by-default ladder**, in this order: **503** `authentication is not configured`
+3. **The `require*()` deny-by-default ladder.** Its first two rungs, the 503 and the 401, answer
+   before the request body is read; [Enforcement model](#enforcement-model) says how. The ladder
+   runs in this order: **503** `authentication is not configured`
    when no enabled `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
    required` when the identity is flagged `must_change_password` and the path is not must-change
@@ -2010,8 +2045,13 @@ sign-in mints one session, so the AD role-resync and revocation side effect fire
 never per navigation. The directory bind **as the user** survives only as the step-up re-bind at
 `POST /ui/reauth` and `POST /me/reauth`, where it re-proves a session **Kerberos** minted, or a session
 row written before `sessions.auth_mechanism` existed. An OIDC session never reaches it: it steps up at the IdP instead (`POST /ui/reauth/oidc`; see
-[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)). MFA is
-**not** delegated: the engine's own second factor binds a directory account like any other
+[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)). A directory account's second
+factor follows the rule in [Multi-factor authentication](#multi-factor-authentication-totp-wp-14).
+It shares the local account's rule, with at least two differences. First, while `[security].require_mfa` is
+on, a directory session that proved no factor at sign-in owes an engine factor under either
+`require_mfa_scope` value. That includes at least every Kerberos session and an OIDC session minted
+while `[auth].oidc_require_mfa_claim` is off. Second, an OIDC sign-in meets its factor at mint on the
+identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` is on, the default
 (BACKLOG #1144).
 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
@@ -2590,6 +2630,8 @@ flowchart TB
   steps that come before the ladder and the conditions on each rung.
 - Not every route takes this path. [Enforcement model](#enforcement-model) lists the routes that
   need no session, and the one route that authenticates by client certificate.
+- On a route that declares a body, the session check runs before the body is read and again
+  after it. The checks below it run after.
 - The six-sided boxes are checks, and they run from top to bottom. Each account check lets a short
   list of self-service routes through. That lets a person change the password, prove the factor or
   set the address.
@@ -4078,20 +4120,56 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-Two controls answer it, and they differ in strength:
+Three controls answer it, and they differ in strength:
 
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
-- **The engine process itself refuses the script.** `serve` and `supervise` start through a
-  console-script launcher, which cannot pass that option. So the command line installs an audit
-  hook as it starts, for every command (`messagefoundry/remotedebug.py`). The interpreter raises
-  an event before it runs an injected script, the hook raises on it, and the interpreter drops
-  the script.
+- **The shipped service launches start the engine with the interface off.** The Windows installer
+  and the container image run the interpreter itself, with `-X disable-remote-debug`, and no
+  longer the console-script launcher, which cannot pass an option
+  ([the next section](#isolated-mode-and-start-up-code-of-the-engines-interpreter)).
+- **The engine process refuses the script where the interface is still on.** A start through the
+  console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
+  installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
+  interpreter raises an event before it runs an injected script, the hook raises on it, and the
+  interpreter drops the script.
 
-The hook is the weaker of the two, so an engine that starts with the interface on reports it as
-the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported, what
-a default start reports and how to clear it are stated once, in
+The hook is the weakest of the three, so an engine that starts with the interface on reports it
+as the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported,
+which starts report it and how to clear it are stated once, in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
+
+### Isolated mode and start-up code of the engine's interpreter
+
+Two things put code inside a Python process before its first line runs: the `PYTHON*`
+environment variables, and the interpreter's start-up code (a `.pth` line that begins with
+`import`, and a `sitecustomize` module). On a first deployment either would run inside the
+engine, with everything the engine holds.
+
+Three controls answer it:
+
+- **The shipped service launches are isolated.** The Windows installer registers the install's
+  `python.exe` with `-I -X disable-remote-debug -m messagefoundry serve ...`, and the container
+  image's entry point is the same command with `-u -B` added. What the options do is stated once,
+  in [SERVICE.md](SERVICE.md#the-service-launch). `tests/test_isolated_launch.py` holds both
+  launches to one list of options, and each smoke leg reads the flags off the running engine.
+- **`serve` and `supervise` inventory the start-up code** (`messagefoundry/startupcode.py`).
+  Isolated mode does not stop it. Under `[security].enforcement = "enforce"` they refuse to start
+  on a file no installed package records. This is detection: start-up code runs before the check.
+- **The directories start-up code is read from should not be writable by the service account.**
+  That is the prevention, and it is a deployment requirement the engine checks and reports. The
+  container image meets it: its virtual environment is owned by root and the engine runs as
+  another user.
+
+What each control leaves open, what counts as expected start-up code, which entries a development
+start reports and how to clear each are stated once, in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-startup_directory_writable-what-runs-in-the-interpreter-before-the-engine-does).
+
+**The engine's Python children are not isolated.** The sandbox worker and each engine shard start
+with `-P -X disable-remote-debug`, and the engine hands them the `PYTHON*` variables it holds,
+by name (`messagefoundry/childenv.py`). So a `PYTHONPATH` in the service's environment that the
+engine ignores would still reach an engine shard. The engine reports that case as
+`python_variables_reach_children`, and its inventory searches the entries a child would inherit.
 
 ### HIPAA §164.312 alignment
 

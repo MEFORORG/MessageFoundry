@@ -94,6 +94,7 @@ from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
 from messagefoundry.service_status import is_safe_service_name
+from messagefoundry.startupcode import StartupPosture, startup_loosenings
 
 __all__ = [
     "StoreBackend",
@@ -5644,7 +5645,7 @@ class SecuritySettings(_Section):
     # to every local account (ASVS 6.3.3); "administrators" restores the pre-6.3.3 posture.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     allow_single_factor_admin_when_exposed: bool = (
-        False  # ADR 0140: permit single-factor admin on an EXPOSED production-PHI bind
+        False  # ADR 0140: lift the require_mfa-off refusal at exposure under enforcement = enforce
     )
     sign_out_after_idle_minutes: int = 30
     max_session_hours: int = 12
@@ -6802,6 +6803,7 @@ def security_loosenings(
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
+    startup: StartupPosture | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -6825,7 +6827,8 @@ def security_loosenings(
     with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
     ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
-    the engine process (vault BACKLOG #2700), and
+    the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
+    interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
@@ -6886,6 +6889,12 @@ def security_loosenings(
     hook is installed. It is a fact about one process, so only a caller running IN the engine
     process passes a reading (``serve``, ``GET /security/posture``). ``None`` means this call site
     is some other process (``messagefoundry security show``), which says so in its own output.
+
+    ``startup`` is the second PROCESS observation (vault BACKLOG #2701), from
+    :func:`messagefoundry.startupcode.startup_posture`: whether the interpreter was started in
+    isolated mode, the start-up code (``.pth`` import lines, ``sitecustomize``) it does not know,
+    and whether the engine's own account can write the directories that code is read from.
+    ``None`` has the meaning it has for ``remote_debug``, for the same reason.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -7010,12 +7019,15 @@ def security_loosenings(
                 "(loopback-only; a non-loopback bind refuses)",
             )
         )
+    # Vault BACKLOG #2798: each text names only the accounts its switch frees; the tests say why.
     if not sec.require_mfa:
         out.append(
             (
                 "require_mfa",
-                "every account is single-factor — no engine second factor is required, and a "
-                "directory session is admitted on a ticket that asserts no strength",
+                "an account with no second factor enrolled is single-factor, so a Kerberos session "
+                "enters on a ticket that asserts no strength. An enrolled account must still "
+                "satisfy its factor, and an OIDC sign-in still needs a checked amr/acr claim while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7024,15 +7036,20 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa_scope",
-                "only Administrators must enroll a second factor — every other account, local or "
-                "directory, is single-factor until it opts in by enrolling",
+                "a local account without the Administrator role is single-factor until it enrolls "
+                "a second factor. Administrators and directory accounts still owe one; an OIDC "
+                "sign-in meets it with an amr/acr claim checked while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:
         out.append(
             (
                 "allow_single_factor_admin_when_exposed",
-                "single-factor admin is permitted on an EXPOSED production-PHI bind — no second factor over the network",
+                "an EXPOSED instance under enforcement = enforce may start with "
+                "[security].require_mfa off, on an audited warning instead of the refusal. Every "
+                "account with no second factor enrolled is then single-factor over the network, "
+                "unless an OIDC sign-in carries a checked amr/acr claim",
             )
         )
     if not sec.encrypt_stored_data:
@@ -7422,6 +7439,10 @@ def security_loosenings(
     # The wording lives beside the hook, in one place for this registry and `supervise`.
     if remote_debug is not None and (entry := remote_debug_loosening(remote_debug)) is not None:
         out.append(entry)
+    # --- the engine PROCESS's observed launch and start-up code (vault BACKLOG #2701). The same
+    # kind of observation, with its wording beside its reader for the same reason.
+    if startup is not None:
+        out.extend(startup_loosenings(startup))
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.

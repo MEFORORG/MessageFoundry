@@ -124,7 +124,7 @@ against the scenarios that cover it. It reads the engine's live connector regist
 kept here, and flags a scenario that claims a kind the engine does not register. It needs no
 running engine. `harness/coverage.py` is the one harness module allowed to import
 `messagefoundry.transports` (read-only; `_CLIENT_ALLOWED` in `tests/test_dependency_boundaries.py`
-names it), because the registries have no public listing.
+names it); its module docstring says what it may read.
 
 It is also a gate. Every registered (kind, direction) pair must have a scenario or an entry, with a
 reason, in `EXEMPT` in `harness/coverage.py`; `--coverage` prints a `GAP:` line and exits 1 when
@@ -159,6 +159,9 @@ $env:MEFOR_LOAD_FANOUT=20; $env:MEFOR_LOAD_TRANSFORM="edit"; $env:MEFOR_LOAD_SIN
 python -m messagefoundry serve --config harness/config/load --db ./load.db   # swap --db for backends
 python -m harness --load fanout-baseline --engine URL --token T --report-json out/load/run.json
 ```
+
+The engine serves with sign-in on, and `--token` is a session for it. `python -m harness.load.rigadmin`
+provisions an Administrator for the run and signs in for you; the guide below shows the three steps.
 
 Full guide — profile schema, the env knobs, reading the report/SLOs, exit codes, baseline
 comparison, and the backend-comparison recipe — is in [docs/LOAD-TESTING.md](../docs/LOAD-TESTING.md).

@@ -89,6 +89,7 @@ def _pairs(
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
+        startup=None,
     )
 
 
@@ -140,6 +141,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     assert "aad_bind" in named
@@ -171,6 +173,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -199,6 +202,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     assert "ad_session_recheck_seconds" in named
@@ -248,6 +252,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     assert "admin_new_ip_step_up" in named
@@ -396,6 +401,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     ).get(switch)
 
@@ -968,6 +974,7 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     ).get("trusted_proxies")
     assert risk is not None
@@ -998,6 +1005,7 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )["trusted_proxies"]
     assert risk.count("::/0") == 1
@@ -1060,6 +1068,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     risk = named["plaintext_upstream_hop_acknowledged"]
@@ -1738,6 +1747,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     assert "cleartext_accepted" in named
@@ -1781,6 +1791,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     assert "tls_allow_expired" in named
@@ -1815,6 +1826,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     assert "generic_odbc_tls_unenforced" in named
@@ -1846,6 +1858,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     )
     assert "tls_revocation_attested" in named

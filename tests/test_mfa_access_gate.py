@@ -998,6 +998,51 @@ async def test_require_mfa_off_is_still_a_global_escape_for_the_directory_leg(
     assert await service.mfa_satisfied(out.token) is True
 
 
+async def test_scope_administrators_frees_a_local_non_admin_and_no_directory_session(
+    engine: Engine,
+) -> None:
+    """RED when: the directory floor starts honouring require_mfa_scope.
+
+    Vault BACKLOG #2798: the ``require_mfa_scope`` advisory in ``config/settings.py`` names only a
+    local account without the Administrator role as freed by ``"administrators"``. This pins the
+    behaviour behind that text. The local arm is the positive control on the same dial, so a floor
+    that refused everything would red here rather than pass."""
+    service = await _service(
+        engine,
+        AuthSettings(login_rate_limit_enabled=False, require_mfa_scope="administrators"),
+    )
+    directory = await service._complete_ad_login(_principal("aduser4"), None, mfa_verified=False)
+    assert directory.ok and directory.token is not None
+    assert await service.mfa_satisfied(directory.token) is False
+    await _add(service, "vw4", Role.VIEWER)
+    local = await service.login("vw4", PW)
+    assert local.ok and local.token is not None
+    assert await service.mfa_satisfied(local.token) is True
+
+
+async def test_require_mfa_off_still_holds_an_enrolled_account_to_its_factor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: turning require_mfa off starts excusing a factor the account already enrolled.
+
+    Vault BACKLOG #2798: the ``require_mfa`` advisory in ``config/settings.py`` says the switch frees
+    only an account with no factor enrolled. The un-enrolled arm is the positive control."""
+    service = await _service(
+        engine, AuthSettings(login_rate_limit_enabled=False, require_mfa=False)
+    )
+    await _add(service, "enr", Role.VIEWER)
+    await _add(service, "bare", Role.VIEWER)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    await _enroll_totp_out_of_band(service, "enr", now=t0)
+    enrolled = await service.login("enr", PW)
+    assert enrolled.ok and enrolled.token is not None
+    assert await service.mfa_satisfied(enrolled.token) is False
+    bare = await service.login("bare", PW)
+    assert bare.ok and bare.token is not None
+    assert await service.mfa_satisfied(bare.token) is True
+
+
 def test_the_per_user_rule_reads_no_provider_at_all(engine: Engine) -> None:
     """RED when: ``_mfa_required_for`` re-adds ANY provider branch, allow-list or deny-list.
 

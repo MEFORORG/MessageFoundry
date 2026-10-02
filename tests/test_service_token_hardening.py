@@ -634,20 +634,11 @@ def test_a_report_with_a_step_missing_is_not_a_pass() -> None:
 def _smoke_step_script(name_starts: str) -> str:
     """The run script of one windows-service-smoke step, without its comment lines.
 
-    Read from the parsed workflow, so a needle cannot be satisfied by a YAML comment above the step
-    or by a comment inside it. Imported here: without PyYAML that module skips whoever imports it.
+    Imported here: without PyYAML that module skips whoever imports it.
     """
-    from tests._workflow_contexts import jobs_of
+    from tests._workflow_contexts import step_script
 
-    steps = jobs_of("ci.yml")["windows-service-smoke"]["steps"]
-    found = [s for s in steps if str(s.get("name", "")).startswith(name_starts)]
-    assert len(found) == 1, f"expected one step named {name_starts!r}, found {len(found)}"
-    name = str(found[0]["name"])
-    assert name.count("(") == name.count(")"), (
-        f"the step name is cut short; an unquoted ' #' starts a YAML comment: {name!r}"
-    )
-    lines = str(found[0]["run"]).splitlines()
-    return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+    return step_script("ci.yml", "windows-service-smoke", name_starts)[1]
 
 
 def _sample_file_directories() -> set[str]:

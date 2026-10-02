@@ -131,9 +131,11 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 
 ## 6. Identity, access, audit
 
-- **Authentication required + MFA.** `MEFOR_SECURITY_REQUIRE_SIGN_IN=true`; `MEFOR_SECURITY_REQUIRE_MFA=true` for local
-  Administrator accounts on an exposed PHI bind (the startup gate **refuses** a production-PHI off-loopback
-  bind with local admins and `require_mfa=false`). AD/Entra MFA stays delegated to your IdP.
+- **Authentication required + MFA.** `MEFOR_SECURITY_REQUIRE_SIGN_IN=true`; `MEFOR_SECURITY_REQUIRE_MFA=true`, the default.
+  It covers directory accounts too; [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14)
+  states which accounts owe a factor. An instance is exposed when it has an off-loopback bind or a
+  declared TLS-terminating proxy. An exposed instance with `require_mfa=false` **refuses** to start
+  under the shipped `enforce`, unless `[security].allow_single_factor_admin_when_exposed` is set.
 - **Deny-by-default egress.** `MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true` + the `MEFOR_EGRESS_ALLOWED_*` lists, so a
   transform can only send to approved destinations — a fail-closed exfiltration guard.
 - **Full audit, off-box to your SIEM.** Every PHI access (raw view, summary) is audited with the acting

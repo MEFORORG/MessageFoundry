@@ -146,6 +146,7 @@ from messagefoundry.api.models import (
     GraphResponse,
     Health,
     IntegrityResult,
+    InterpreterView,
     LogInfo,
     LogLevelInfo,
     LogLevelUpdate,
@@ -205,6 +206,8 @@ from messagefoundry.api.multipart import (
 )
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
+    AuthenticatedBeforeBodyRoute,
+    answers_before_body,
     authorize_ws,
     client_ip,
     deadline_utc,
@@ -363,6 +366,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import remote_debug_posture
 from messagefoundry.service_status import query_service_state
+from messagefoundry.startupcode import startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
 from messagefoundry.store.content_search import (
@@ -654,7 +658,7 @@ def _read_log_tail(
     and the page boundaries do not count them either (BACKLOG #1131; see
     :func:`~messagefoundry.auth.audit_visibility.reads_audit_copies_in_the_log`)."""
     from messagefoundry.auth.audit_visibility import is_audit_copy_line
-    from messagefoundry.support.redact import redact_log_line
+    from messagefoundry.support.redact import redact_log_record, split_log_lines
 
     if not log_dir:
         return [], 0, False
@@ -671,14 +675,14 @@ def _read_log_tail(
         text = newest.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return [], 0, False
-    all_lines = text.splitlines()
+    all_lines = split_log_lines(text)
     if not audit_copies:
         all_lines = [line for line in all_lines if not is_audit_copy_line(line)]
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
     page = all_lines[start:end]
-    return [redact_log_line(line) for line in page], total, True
+    return [redact_log_record(line) for line in page], total, True
 
 
 def _cookie_secure(request: Request) -> bool:
@@ -691,10 +695,14 @@ def _cookie_secure(request: Request) -> bool:
     )
 
 
+@answers_before_body
 async def _get_engine(request: Request) -> Engine:
     # ``async`` so FastAPI runs this provider on the event loop instead of taking a thread from the
     # shared AnyIO worker pool on every request (ASVS 15.4.4, BACKLOG #1195). It must stay
     # non-blocking: a blocking call here would stall the loop instead.
+    #
+    # Marked because it sits AHEAD of the gate on most routes, so its 503 is what a caller with no
+    # session gets from an app with no engine (vault BACKLOG #2739; see ``answers_before_body``).
     engine: Engine | None = getattr(request.app.state, "engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="engine not started")
@@ -1710,6 +1718,13 @@ def create_app(
         openapi_url="/openapi.json" if expose_docs else None,
         redirect_slashes=False,
     )
+    # Vault BACKLOG #2739: every route registered on this app from here on is built by this class,
+    # which refuses a caller with no identity BEFORE FastAPI reads the request body. Set before the
+    # first route is added, and on the router because ``FastAPI()`` takes no route class. The class
+    # says what it does not cover; a route reached through ``include_router`` is one. The engine
+    # includes no router. The route walk cannot see into one, so
+    # tests/test_preauth_malformed_body.py fails on the first that is added.
+    app.router.route_class = AuthenticatedBeforeBodyRoute
     if engine is not None:
         app.state.engine = engine
         # No notifier exists on this direct-construction path, so the gate's alerts log (its default).
@@ -2252,6 +2267,14 @@ def create_app(
         # the registry then reports nothing for it and `store_privilege` below renders the explicit
         # `not_probed` status, so silence never reads as a clean observation.
         store_privilege = getattr(request.app.state, "store_privilege", None)
+        # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
+        # once here, so the loosening list and the `interpreter` block below report one reading.
+        # An app built without `serve` never installed the remote-debugging hook, and the reading
+        # then says so. The start-up reading is the one `serve` took as it started, kept for the
+        # life of the process. An app built without `serve` takes it here, once, and that first
+        # reading reads files, so the call is kept off the event loop.
+        remote_debug = remote_debug_posture()
+        startup = await asyncio.to_thread(startup_posture)
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
             for name, risk in security_loosenings(
@@ -2271,11 +2294,11 @@ def create_app(
                 store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
                 audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
-                # Vault BACKLOG #2700: read off THIS process, which is the engine. An app built
-                # without `serve` never installed the hook, and the reading then says so.
-                remote_debug=remote_debug_posture(),
+                remote_debug=remote_debug,
+                startup=startup,
             )
         ]
+        interpreter_view = InterpreterView.from_readings(startup, remote_debug)
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
         # read live off the running graph, like the loosenings above; the settings half from the resolved
         # service configuration `serve` stashed (`cred_settings`, read above with `security`, so the
@@ -2366,6 +2389,7 @@ def create_app(
             store_privilege=store_privilege_view,
             static_credential_hops=static_hops,
             static_credential_hops_scope=static_hops_scope,
+            interpreter=interpreter_view,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
             kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?
