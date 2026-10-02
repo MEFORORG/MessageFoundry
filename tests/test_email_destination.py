@@ -9,17 +9,20 @@ from __future__ import annotations
 import smtplib
 import ssl
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings, load_settings
 from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
     active_hop_posture,
 )
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.email import EmailDestination
@@ -448,20 +451,34 @@ async def test_test_connection_failure_raises_delivery_error(
 # --- [egress].allowed_smtp deny-by-default / host gate ----------------------------------------------
 
 
-def _email_dest(host: str, port: int = 587) -> Destination:
+#: The recipient domain every host-gate test below lists, so those tests exercise the host arm alone.
+_RCPT_DOMAINS = ["y.org"]
+
+
+def _email_dest(
+    host: str, port: int = 587, recipients: list[str] | str | None = None
+) -> Destination:
     return Destination(
         name="OB_EMAIL",
         type=ConnectorType.EMAIL,
-        settings={"host": host, "sender": "s@x.org", "recipients": ["r@y.org"], "port": port},
+        settings={
+            "host": host,
+            "sender": "s@x.org",
+            "recipients": ["r@y.org"] if recipients is None else recipients,
+            "port": port,
+        },
     )
 
 
 def test_allowed_smtp_empty_is_unrestricted() -> None:
-    check_egress_allowed(_email_dest("any.smtp.example"), EgressSettings())  # no raise
+    e = EgressSettings(allowed_recipient_domains=_RCPT_DOMAINS)
+    check_egress_allowed(_email_dest("any.smtp.example"), e)  # no raise
 
 
 def test_allowed_smtp_host_and_port_gate() -> None:
-    e = EgressSettings(allowed_smtp=["smtp.partner.org:587", "10.0.0.9"])
+    e = EgressSettings(
+        allowed_smtp=["smtp.partner.org:587", "10.0.0.9"], allowed_recipient_domains=_RCPT_DOMAINS
+    )
     check_egress_allowed(_email_dest("smtp.partner.org", 587), e)  # exact host:port
     check_egress_allowed(_email_dest("10.0.0.9", 2525), e)  # host-only entry → any port
     with pytest.raises(Exception, match="allowed_smtp"):
@@ -479,10 +496,98 @@ def test_allowed_smtp_deny_by_default_refuses_empty() -> None:
 
 
 def test_allowed_smtp_deny_by_default_honours_set_list() -> None:
-    e = EgressSettings(deny_by_default=True, allowed_smtp=["smtp.partner.org:587"])
+    e = EgressSettings(
+        deny_by_default=True,
+        allowed_smtp=["smtp.partner.org:587"],
+        allowed_recipient_domains=_RCPT_DOMAINS,
+    )
     check_egress_allowed(_email_dest("smtp.partner.org", 587), e)  # listed → allowed
     with pytest.raises(Exception, match="allowed_smtp"):
         check_egress_allowed(_email_dest("evil.relay.example", 587), e)
+
+
+# --- [egress].allowed_recipient_domains (vault BACKLOG #2616) ---------------------------------------
+
+
+def _relay_listed(domains: list[str]) -> EgressSettings:
+    """The relay host is listed, so only the recipient-domain arm can refuse."""
+    return EgressSettings(allowed_smtp=["smtp.hospital.example"], allowed_recipient_domains=domains)
+
+
+@pytest.mark.parametrize(
+    "recipients",
+    [
+        ["a@hospital.example"],
+        ["Ops <ops@HOSPITAL.example>"],  # display name, and the domain match ignores case
+        ["a@hospital.example", "", "b@hospital.example"],  # a blank entry is not a recipient
+    ],
+)
+def test_listed_recipient_domain_passes(recipients: list[str]) -> None:
+    e = _relay_listed(["Hospital.Example"])
+    check_egress_allowed(_email_dest("smtp.hospital.example", recipients=recipients), e)
+
+
+@pytest.mark.parametrize(
+    "recipients",
+    [
+        ["a@partner.example"],  # unlisted domain
+        ["a@hospital.example", "b@partner.example"],  # every recipient must be listed
+        # The transport joins the entries into one To: header, so every address inside one entry
+        # is checked, whether the setting is a list or a lone string.
+        ["a@hospital.example, b@partner.example"],
+        "a@hospital.example, b@partner.example",
+        ["a@mail.hospital.example"],  # a subdomain is a different domain
+        ["a@nothospital.example"],  # a listed domain as a suffix does not match
+        ["no-at-sign"],  # no readable domain
+        ["a@"],
+        [""],
+        [],
+    ],
+)
+def test_unlisted_or_unreadable_recipient_is_refused(recipients: list[str] | str) -> None:
+    e = _relay_listed(["hospital.example"])
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(_email_dest("smtp.hospital.example", recipients=recipients), e)
+
+
+@pytest.mark.parametrize(
+    "egress",
+    [EgressSettings(), EgressSettings(allowed_smtp=["smtp.hospital.example"])],
+    ids=["nothing-listed", "relay-listed"],
+)
+def test_recipient_domains_empty_refuses_every_email_destination(egress: EgressSettings) -> None:
+    # Deny-by-default on its own terms: no list means no recipient is permitted, whatever the host
+    # lists and whatever [security].block_unlisted_outbound says.
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(
+            _email_dest("smtp.hospital.example", recipients=["a@hospital.example"]), egress
+        )
+
+
+def test_recipient_domains_do_not_gate_direct() -> None:
+    # DIRECT encrypts to one partner certificate, so the row scopes this list to EMAIL only.
+    d = Destination(
+        name="OB_DIRECT",
+        type=ConnectorType.DIRECT,
+        settings={"host": "hisp.example", "recipients": ["a@partner.example"], "port": 587},
+    )
+    check_egress_allowed(d, EgressSettings())  # no raise
+
+
+def test_recipient_domains_load_from_the_environment(tmp_path: Path) -> None:
+    empty = tmp_path / "settings.toml"
+    empty.write_text("", encoding="utf-8")
+    environ = {"MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS": "Hospital.Example., lab.example"}
+    loaded = load_settings(config_path=empty, environ=environ).egress
+    assert loaded.allowed_recipient_domains == ["hospital.example", "lab.example"]
+
+
+@pytest.mark.parametrize(
+    "entry", ["a@hospital.example", "https://hospital.example", "hospital.example:25", "*.example"]
+)
+def test_a_recipient_domain_that_can_never_match_is_refused_at_load(entry: str) -> None:
+    with pytest.raises(ValidationError, match="bare domain"):
+        EgressSettings(allowed_recipient_domains=[entry])
 
 
 # --- registry + factory surface ---------------------------------------------------------------------

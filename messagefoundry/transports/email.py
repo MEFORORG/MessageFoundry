@@ -28,7 +28,8 @@ escape) — the same ``refuse_cleartext_credentials`` posture the REST destinati
 transport consumes (refuse enforcing-production-PHI off-loopback, warn non-enforcing PHI, allow
 loopback / synthetic / attested), rather than the bare warning it used to get. The
 ``[egress].allowed_smtp`` allowlist is the authoritative fail-closed host gate (enforced by the runner
-at load/reload/start).
+at load/reload/start), and the deny-by-default ``[egress].allowed_recipient_domains`` list bounds the
+``recipients`` (vault BACKLOG #2616).
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** the email; a mailbox has no
 idempotency key, so a rare duplicate is possible after a transient failure between server-accept and
@@ -46,7 +47,9 @@ import logging
 import smtplib
 import ssl
 from collections.abc import Mapping
+from email.errors import MessageError
 from email.message import EmailMessage
+from email.utils import getaddresses
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -69,7 +72,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
 
-__all__ = ["EmailDestination"]
+__all__ = ["EmailDestination", "envelope_recipients"]
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,28 @@ def _as_recipients(value: Any) -> list[str]:
     if not recipients:
         raise ValueError("Email destination requires a non-empty 'recipients' setting")
     return recipients
+
+
+def _to_header(recipients: list[str]) -> str:
+    """The ``To:`` header value the destination sends. ``smtplib`` takes the envelope recipients
+    from this header, so :func:`envelope_recipients` reads the same value."""
+    return ", ".join(recipients)
+
+
+def envelope_recipients(value: Any) -> list[str]:
+    """Every envelope address an Email destination with this ``recipients`` setting would send to.
+
+    One entry can hold several addresses, so this parses the joined ``To:`` header with the same
+    stdlib parser ``smtplib`` uses, rather than reading one address per entry. The ``[egress]``
+    recipient-domain check (vault BACKLOG #2616) calls it, so the gate reads the send path itself.
+    An address the parser cannot read comes back as ``""``. Raises :class:`ValueError` for an empty
+    setting, as construction does."""
+    msg = EmailMessage()
+    try:
+        msg["To"] = _to_header(_as_recipients(value))
+    except MessageError as exc:
+        raise ValueError("Email destination 'recipients' is not a readable address list") from exc
+    return [addr for _, addr in getaddresses([str(h) for h in msg.get_all("To", [])])]
 
 
 class EmailDestination(DestinationConnector):
@@ -288,7 +313,7 @@ class EmailDestination(DestinationConnector):
         msg = EmailMessage()
         msg["Subject"] = self.subject
         msg["From"] = self.sender
-        msg["To"] = ", ".join(self.recipients)
+        msg["To"] = _to_header(self.recipients)
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
         msg.set_content(payload, charset=self.encoding)

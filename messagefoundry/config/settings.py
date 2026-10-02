@@ -3820,6 +3820,17 @@ class EgressSettings(_Section):
     # "host:port" (ADR 0085). Kept SEPARATE from allowed_smtp so an operator can permit a Direct HISP
     # relay without opening generic email egress (a distinct trust relationship carrying encrypted PHI).
     allowed_direct: list[str] = []
+    # Allowed EMAIL recipient domains (vault BACKLOG #2616): every address an Email destination
+    # sends to must sit in one of these domains. `allowed_smtp` gates only the relay HOP; a listed
+    # relay forwards to whatever address the connection names, so this list bounds where the mail
+    # ends up. Each entry is a bare domain ("hospital.example"), matched exactly and without regard
+    # to case: a subdomain needs its own entry.
+    #
+    # DENY-BY-DEFAULT, like `allowed_proxy` below and unlike the permissive-when-empty `allowed_*`
+    # destination lists: an EMAIL destination is refused at config load while this list is empty,
+    # whatever [security].block_unlisted_outbound says. It does not gate DIRECT, which encrypts to
+    # one partner certificate. Env (comma-separated): MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS.
+    allowed_recipient_domains: list[str] = []
 
     # ADR 0126 (#112/#128): a site-wide DEFAULT forward/egress web proxy for the HTTP family
     # (REST/SOAP/FHIR/fhir_lookup/DICOMweb + the OAuth2/SMART token endpoints). A connection that sets no
@@ -3873,6 +3884,7 @@ class EgressSettings(_Section):
         "allowed_remote",
         "allowed_smtp",
         "allowed_direct",
+        "allowed_recipient_domains",
         "proxy_no_proxy",
         "allowed_proxy",
         mode="before",
@@ -3883,6 +3895,29 @@ class EgressSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("allowed_recipient_domains", mode="after")
+    @classmethod
+    def _recipient_domains_are_bare(cls, value: list[str]) -> list[str]:
+        """Normalise each entry once, at load, and refuse one that can never match.
+
+        A recipient domain is compared exactly against the part of an address after its last ``@``.
+        So an address, a URL, a port or a wildcard looks plausible and matches nothing, and an
+        operator would believe they had listed a domain they had not. Unlike
+        ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry."""
+        cleaned: list[str] = []
+        for raw in value:
+            item = raw.strip().lower().rstrip(".")
+            if not item:
+                continue
+            if any(ch in item for ch in "@/:* "):
+                raise ValueError(
+                    f"[egress].allowed_recipient_domains: {item!r} must be a bare domain such as "
+                    "'hospital.example', not an address, URL, port or wildcard; list each subdomain "
+                    "as its own entry"
+                )
+            cleaned.append(item)
+        return cleaned
 
 
 #: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
