@@ -380,24 +380,103 @@ def weakened_tls_escape_permitted_here() -> bool:
 INSECURE_CONFIG_SOURCE_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE"
 
 
-def insecure_config_source_allowed() -> bool:
-    """Whether the explicit dev/test escape to load config from a writable-by-others source is set.
+#: The documented environment spelling of the ``[security].enforcement`` dial. The config-source
+#: escape reads the dial from the environment; :func:`insecure_config_source_escape_permitted` says why.
+SECURITY_ENFORCEMENT_ENV = "MEFOR_SECURITY_ENFORCEMENT"
+
+
+def insecure_config_source_allowed(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the dev/test escape to load config from a writable-by-others source is SET.
+
+    Set is not honoured. :func:`insecure_config_source_escape_permitted` is the question the loader
+    asks, and it also needs the ``warn`` dial. This one says only that the variable is present, so a
+    refusal can name it.
 
     The config loader executes config Python as the engine's service account (which holds PHI + DB
     credentials), so a directory a low-privileged user can write is a local code-execution vector and
-    is **refused** at load time (SEC-003, CWE-732). A production deployment locks the config dir (the
-    installer does — see docs/SERVICE.md), so the permission arms do not trip. A Windows read that
-    cannot finish still refuses (ADR 0036 Amendment B); fix the read rather than set this. This escape
-    downgrades the refusal to a
+    is **refused** at load time (SEC-003, CWE-732). A production deployment locks the config dir
+    (``install-service.ps1 -LockConfigDir``, see docs/SERVICE.md), so the permission arms do not trip.
+    A Windows read that cannot finish still refuses (ADR 0036 Amendment B); fix the read rather than
+    set this. Where it is honoured, the escape downgrades the refusal to a
     loud warning for a dev/CI checkout that is intentionally user-writable (e.g. the default ACL on a
-    Windows runner grants ``BUILTIN\\Users`` write); it must never be set in production, mirroring
-    ``MEFOR_ALLOW_INSECURE_TLS``."""
-    return os.environ.get(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "").strip().lower() in (
+    Windows runner grants ``BUILTIN\\Users`` write); it must never be set in production."""
+    env = os.environ if environ is None else environ
+    return env.get(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
+
+
+def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` may downgrade the config-source refusal, CLAMPED
+    so it never does under ``[security].enforcement = enforce`` (vault BACKLOG #2599).
+
+    The escape is honoured only when the SAME environment also carries
+    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert, as ``MEFOR_ALLOW_INSECURE_TLS``
+    is (:func:`weakened_tls_escape_permitted`): a safe source loads, an unsafe one is refused, and the
+    refusal names the variable. It used to be honoured at any dial, so one variable in the service
+    environment would have turned off the check that keeps writable Python from running as the service
+    account, and nothing would have reported it.
+
+    **Why the dial is read from the environment and not from loaded settings.** The check runs inside
+    ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
+    boot load, and offline commands. At least ``check`` and ``dryrun`` load config before they read
+    any settings, and the worker never reads a settings file. A posture handed down by each caller
+    would be missed by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is
+    an environment variable, so the dial that unlocks it is read from the same place, the same way in
+    every one of those processes. The sandbox worker's environment is an allowlist, so
+    ``pipeline/sandbox.py`` carries both into it by name: the escape, and every spelling of the dial
+    that :func:`security_enforcement_env_names` finds. The worker then reads what the engine read.
+
+    **Where "never under enforce" holds.** For a process whose settings come from
+    :func:`load_settings` over this same environment, which is ``serve``, ``supervise`` and every CLI
+    command. There the environment outranks the settings file and no command-line override sets this
+    dial, so the dial being ``warn`` here means the instance resolves to ``warn``.
+    ``tests/test_config_source_trust.py`` pins both halves. Only the exact value settings accept
+    counts. The settings loader lowercases variable names, so on POSIX two spellings of the dial can
+    coexist; every one it would read must say ``warn``, or the escape stays inert.
+
+    **Where it does not hold.** A caller that builds an engine from settings it constructed itself,
+    and never calls :func:`load_settings`, has a dial this function cannot see. The escape follows
+    the environment there, not those settings. ``harness/load/ingress_probe.py`` is such a caller,
+    on purpose.
+
+    **Two limits, stated so nobody trips on them.** ``warn`` set only in the settings FILE does not
+    unlock the escape; mirror it into the environment beside the escape. And the dial in the
+    environment is the instance's dial: a ``check`` run with both variables judges every posture gate
+    at ``warn``, not only this one. To check a config at ``enforce``, lock its directory instead. Both
+    are the strict direction, and the escape is for a dev or CI checkout, never for a deployment.
+
+    Reads ``os.environ`` unless a mapping is passed. :func:`security_loosenings` asks the same
+    question, so the report and the loader cannot disagree."""
+    env = os.environ if environ is None else environ
+    return insecure_config_source_allowed(env) and _environment_dial_is_warn(env)
+
+
+def security_enforcement_env_names(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Every name in the environment that :func:`_env_overrides` reads as the enforcement dial.
+
+    ``_env_overrides`` lowercases what follows the prefix, so ``MEFOR_SECURITY_enforcement`` is the
+    same setting as :data:`SECURITY_ENFORCEMENT_ENV`, and on a case-sensitive platform both can be
+    set. The sandbox hands exactly these names to its worker, beside the escape, so the worker's
+    config-source check reads what the engine's read."""
+    env = os.environ if environ is None else environ
+    key = SECURITY_ENFORCEMENT_ENV[len(_ENV_PREFIX) :].lower()
+    return tuple(
+        name
+        for name in env
+        if name.startswith(_ENV_PREFIX) and name[len(_ENV_PREFIX) :].lower() == key
+    )
+
+
+def _environment_dial_is_warn(env: Mapping[str, str]) -> bool:
+    """Whether every spelling of the enforcement dial in ``env`` says ``warn``, and at least one is
+    present. Which of two spellings the settings loader takes is iteration order, so one that
+    disagrees fails this closed."""
+    names = security_enforcement_env_names(env)
+    return bool(names) and all(env[name] == SecurityEnforcement.WARN.value for name in names)
 
 
 class StoreSettings(_Section):
@@ -6764,6 +6843,14 @@ def security_loosenings(
     cannot be added quietly), which is a larger change than the item that exposed it — filed as
     content rather than folded in.
 
+    **One entry is read from the process environment and from no argument:**
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (vault BACKLOG #2599), named while
+    :func:`insecure_config_source_escape_permitted` says the loader honours it. It reports the
+    environment of the process that renders the list. For ``serve`` and ``GET /security/posture``
+    that is the engine's own. ``messagefoundry security show`` reads the shell it runs in, which may
+    not be the service's, and its scope marker says so. Other process-wide variables are still
+    unreported here; ``docs/SECURITY-LOOSENING.md`` names them, under *The switches*.
+
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement.
 
@@ -6832,6 +6919,23 @@ def security_loosenings(
                 "hops, keyless PHI, open egress, single-factor admin at exposure) are WARNED + audited "
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
                 "--allow-insecure-bind escapes are honored",
+            )
+        )
+    # Vault BACKLOG #2599: the config-source escape, named whenever it is LIVE. It is an environment
+    # variable and not a setting, so it is read from this process's environment, by the predicate the
+    # loader itself asks. Under enforce that predicate is False, the escape is inert, and nothing is
+    # named. Not a parameter, on purpose: every parameter here is required so that a call site cannot
+    # leave a detector out, and a direct read cannot be left out either.
+    if insecure_config_source_escape_permitted():
+        out.append(
+            (
+                INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+                "the config-source check is downgraded to a warning -- if the config directory or "
+                "a module in it is writable by a broad or low-privilege principal, or its access "
+                "list cannot be read, the engine loads and runs it as its own account anyway, so "
+                "anyone who can write there would run code as that account at the next start, "
+                "reload or worker respawn (this names the switch, not an observed writable "
+                "directory)",
             )
         )
     if not sec.local_access_only:

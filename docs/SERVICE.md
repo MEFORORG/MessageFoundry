@@ -394,7 +394,8 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     that could not finish has not shown the code safe to run. That covers at least a Win32 API
     error, an owner SID it cannot resolve, a DACL it cannot enumerate, and this process's own token
     it cannot read. The refusal names the path and the Win32 error where there is one. The cure is
-    to fix what made the read fail. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
+    to fix what made the read fail. Where it is honoured (see *Dev/test escape* below),
+    `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
     WARNING for a dev/CI checkout only, as it does every refusal here. A `*.py` deleted while the
     load runs is skipped, as on POSIX (ADR 0036 Amendment B).
   - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
@@ -424,10 +425,15 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable or foreign-owned
     directory or module file.
   - **Dev/test escape (never set in production).** Because a default Windows checkout grants
-    `BUILTIN\Users` write, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` to downgrade the refusal to a
-    loud WARNING when running from an intentionally user-writable dev/CI tree. A production service
-    leaves it unset and locks the config dir (above), so the guard stays fail-closed; the env var is
-    the explicit, audited opt-out (mirrors `MEFOR_ALLOW_INSECURE_TLS`).
+    `BUILTIN\Users` write, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **and**
+    `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment to downgrade the refusal to a
+    loud WARNING when running from an intentionally user-writable dev/CI tree. The escape alone does
+    nothing: under `[security].enforcement = enforce`, the default, it is refused, and the refusal
+    names it. A production service leaves it unset and locks the config dir (above), so the guard
+    stays fail-closed. While it is honoured, the `serve` start-up warning and `GET /security/posture`
+    name it. Honouring it writes no audit row of its own. Its limits are stated once, in its entry in
+    [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md): among them, the dial is read from the
+    environment, so a program that embeds the engine with its own settings is outside the clamp.
 - `/config/reload` only loads from the startup `--config` directory and any directories listed in
   `[api].config_reload_roots` (see [CONFIGURATION.md](CONFIGURATION.md)); an arbitrary path is
   rejected. Keep those roots admin-owned too.

@@ -8,6 +8,10 @@
   **Amended 2026-09-26 (Amendment B, BACKLOG #1654):** the read-failure arms now fail closed too,
   under the same escape. Amendment B supersedes the fail-open text in Decision 3 and in
   *Alternatives considered*.
+  **Amended 2026-10-01 (Amendment C, vault BACKLOG #2599):** the escape is refused under
+  `[security].enforcement = enforce`. It is honoured only at `warn`, and it is then a reported
+  loosening. Wherever this ADR says the escape downgrades a refusal, read "where Amendment C lets
+  it". The amendment has its own section below.
 - **Built:** yes — [`_assert_safe_config_source`](../../messagefoundry/config/wiring.py) now dispatches
   to a real Windows check (`_assert_safe_config_source_windows` + the pure `_evaluate_config_dacl`
   policy) instead of an unconditional early-return; [`install-service.ps1`](../../scripts/service/install-service.ps1)
@@ -203,6 +207,52 @@ could drop/rewrite a config module that executes as the service account on the n
    longer shadow that module for the duration of the load. No allow-set / `find_spec`-elsewhere probe is
    needed: every legitimate sibling helper is `_`-prefixed and no stdlib/installed top-level module is.
 
+## Amendment C (2026-10-01, vault BACKLOG #2599): the escape is clamped by the enforcement dial
+
+**What changed.** `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` no longer downgrades a refusal at every
+posture. It is honoured only when `MEFOR_SECURITY_ENFORCEMENT=warn` is set in the same environment.
+Under `[security].enforcement = enforce`, the shipped default, it is inert: a safe source loads, and
+an unsafe one is refused with an error that names the variable. While it is honoured,
+`security_loosenings()` names it, so the `serve` warning and `GET /security/posture` show it.
+[`docs/SECURITY-LOOSENING.md`](../SECURITY-LOOSENING.md) has its entry.
+
+**Why.** This ADR defined the escape with no posture limit. One variable in the service environment
+would have turned off the whole control at the strict posture, and no report named it. The blunt
+escapes `MEFOR_ALLOW_INSECURE_TLS` and `--allow-insecure-bind` were already inert under `enforce`
+([ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2).
+
+**Nothing in this ADR needed the escape under `enforce`.** Each refusal a deployment can meet has
+its own cure here: lock or re-own the directory (`-LockConfigDir`, Decision 4), point `-Config` at
+an admin-owned directory, or fix the read that failed (Amendment B). The text above names the escape
+as the cure only for a dev or CI checkout, and says it is never set in production.
+
+**How the dial is read, and the limit that follows.** The check runs inside `load_config`, in every
+process that executes config: `serve`, a reload, the sandbox worker's boot load, and offline
+commands. At least `check` and `dryrun` load config before they read any settings, and the worker
+reads no settings file. So the clamp reads the dial from the environment, where the escape itself
+lives, and every one of those processes decides the same way with no posture handed down by a
+caller. One process needs the variables handed to it: the sandbox worker starts with an allowlisted
+environment (vault BACKLOG #2587), so the sandbox carries the escape and every spelling of the dial
+into it by name. The dial is a posture switch and not a secret. Without it the worker would see the
+escape alone and refuse a directory the engine loaded at `warn`.
+The environment outranks the settings file and no command-line override sets this dial, so an
+instance whose settings come from that environment and resolve to `enforce` cannot unlock the
+escape. The cost is one limit: **`warn` set only in the settings file does not unlock it.** That is
+the strict direction. `insecure_config_source_escape_permitted()` in `config/settings.py` is the one
+place the rule lives, with its other limits: what the dial in the environment does to `check`, and a
+program that embeds the engine with settings it built itself.
+
+**The test suite changed with it.** It used to set the escape for every win32 test. Under the clamp
+that would also need the `warn` dial for the whole session, which would move every default-posture
+test to `warn`. So on win32 the suite replaces the gate's own Windows call, in its own process, with
+one that runs the real check over a clean owner and access list. The gate's tests ask for the real
+call back. Only that call is replaced. The readers behind it are shared with other code, at least
+the restricted file create, and replacing them for a whole session broke it. A child process the
+suite spawns does not inherit the stand-in, and gets both variables where it needs them.
+
+**Who decided.** The Manager seat, on 2026-10-01, under the owner's standing rule. The owner may
+overturn it.
+
 ## Alternatives considered
 
 - **Keep the documented-delegation status quo** (no-op + install-time ACL). Rejected: Windows is the
@@ -261,6 +311,9 @@ could drop/rewrite a config module that executes as the service account on the n
   permission arms do not trip there, but a read failure still can (Amendment B), and its cure is to
   fix the read, not to set the escape. The test suite sets it only on win32, and the guard's own
   refusal test pins it back OFF. See `insecure_config_source_allowed()` in `config/settings.py`.
+  *Amended by Amendment C: the escape also needs `MEFOR_SECURITY_ENFORCEMENT=warn` beside it, the
+  test suite no longer sets it, and the function to read is
+  `insecure_config_source_escape_permitted()`.*
 - `docs/SERVICE.md` "Lock down the config directory" is updated to say the guard is now actively
   enforced and to document `-LockConfigDir`.
 

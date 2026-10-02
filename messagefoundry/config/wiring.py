@@ -6681,15 +6681,16 @@ def _evaluate_config_dacl(
     membership could **not** be determined, and that is a **refusal**, not a warning-and-proceed —
     ASVS v5.0.0 V16.5.3 (fail gracefully and securely, no fail-open when validation logic errors).
     The refusal carries the documented ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape because it is
-    raised through :func:`_refuse_unsafe_config_source`.
+    raised through :func:`_refuse_unsafe_config_source`, which says where that escape is honoured.
 
     Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
     reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
     process token could not be read) **skips** the owner comparison here, because there is nothing to
     compare an owner against. This function does not refuse on it; the caller does.
     :func:`_enforce_windows_config_source` refuses an unreadable token before any path is evaluated
-    (BACKLOG #1654), so the skip is reached only when ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` has
-    downgraded that refusal, and the ACE pass still runs for that load.
+    (BACKLOG #1654), so the skip is reached only when an honoured
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` has downgraded that refusal, and the ACE pass still runs
+    for that load.
 
     Kept free of ctypes so the policy is unit-testable on every platform."""
     trusted = set(_WIN_TRUSTED_SIDS)
@@ -6770,10 +6771,10 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
     enumerated, and a process token that cannot be read. Each refusal goes through
     :func:`_refuse_unsafe_config_source`, so ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` downgrades it to a
-    WARNING. That is the same shape as the owner-membership arm. A check that could not finish has not
+    WARNING where that function honours it. That is the same shape as the owner-membership arm. A check that could not finish has not
     shown the code safe to execute, and ASVS v5.0.0 V16.5.3 forbids proceeding on that.
 
-    With the escape set, an unreadable token lets the load go on with the owner comparison skipped,
+    With the escape honoured, an unreadable token lets the load go on with the owner comparison skipped,
     and the ACE pass still runs. A per-path read failure skips that one path.
 
     One read failure is not a refusal: a ``*.py`` that is gone by the time it is read, confirmed by
@@ -7193,12 +7194,18 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
 
 
 def _refuse_unsafe_config_source(message: str) -> None:
-    """Raise ``WiringError(message)`` unless the explicit dev/test escape is set, then warn instead.
+    """Raise ``WiringError(message)`` unless the dev/test escape is honoured, then warn instead.
 
     Fail-closed by default: a PHI service must not execute config Python a low-privileged user can
     rewrite. ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (off by default; never set in production)
     downgrades the refusal to a loud warning for a user-writable dev/CI checkout. Symmetric across the
     POSIX and Windows guards.
+
+    **The escape is clamped (vault BACKLOG #2599).** It is honoured only with
+    ``MEFOR_SECURITY_ENFORCEMENT=warn`` in the same environment. Under ``enforce`` it is inert and the
+    refusal names it, so an operator who set it learns why it did nothing.
+    :func:`~messagefoundry.config.settings.insecure_config_source_escape_permitted` owns the rule and
+    the reasoning. Every load passes through here, so no entry point can skip the clamp.
 
     A locked install (``-LockConfigDir``) does not trip the permission arms. It can still trip a
     Windows read-failure arm (ADR 0036 Amendment B), and the cure there is to fix what made the read
@@ -7206,16 +7213,30 @@ def _refuse_unsafe_config_source(message: str) -> None:
     # Local import keeps the settings <-> wiring module load order independent (no circular import).
     from messagefoundry.config.settings import (
         INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+        SECURITY_ENFORCEMENT_ENV,
         insecure_config_source_allowed,
+        insecure_config_source_escape_permitted,
     )
 
-    if insecure_config_source_allowed():
+    if insecure_config_source_escape_permitted():
         _logger.warning(
-            "%s — proceeding because %s is set (dev/test override; NEVER set this in production)",
+            "%s — proceeding because %s is set on an instance at %s=warn (dev/test override; "
+            "NEVER set this in production)",
             message,
             INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+            SECURITY_ENFORCEMENT_ENV,
         )
         return
+    if insecure_config_source_allowed():
+        # True in every case that reaches here: no dial in the environment, a dial that is not
+        # warn, warn in the settings file only, and two spellings of the dial that disagree.
+        raise WiringError(
+            f"{message}. {INSECURE_CONFIG_SOURCE_ESCAPE_ENV} is set but not honoured: it works only "
+            f"with {SECURITY_ENFORCEMENT_ENV}=warn in the same environment, and every spelling of "
+            "that name there must say warn. The settings file's dial does not count, and under "
+            "[security].enforcement = enforce the escape is refused. Lock the config directory "
+            "instead (docs/SERVICE.md)"
+        )
     raise WiringError(message)
 
 
