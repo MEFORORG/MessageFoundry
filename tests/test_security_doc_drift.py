@@ -1405,7 +1405,8 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
     ): (
         "absence of retired delegated-directory-MFA, local-only-lockout and local-admin-gate "
         "sentences in operator docs and container manifests (BACKLOG #1133); the MFA rule they "
-        "describe is pinned by calling it in the tenth-sweep probe test"
+        "describe is pinned by calling it in the tenth-sweep probe test, the exposure gate by "
+        "tests/test_cli.py, and the lockout claim by absence only"
     ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"

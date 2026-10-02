@@ -2012,7 +2012,7 @@ never per navigation. The directory bind **as the user** survives only as the st
 row written before `sessions.auth_mechanism` existed. An OIDC session never reaches it: it steps up at the IdP instead (`POST /ui/reauth/oidc`; see
 [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142)). A directory account's second
 factor follows the rule in [Multi-factor authentication](#multi-factor-authentication-totp-wp-14).
-It shares the local account's rule, with two differences. First, while `[security].require_mfa` is
+It shares the local account's rule, with at least two differences. First, while `[security].require_mfa` is
 on, a directory session that proved no factor at sign-in owes an engine factor under either
 `require_mfa_scope` value. That includes at least every Kerberos session and an OIDC session minted
 while `[auth].oidc_require_mfa_claim` is off. Second, an OIDC sign-in meets its factor at mint on the

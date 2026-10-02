@@ -199,7 +199,7 @@ account is not exempt from the engine's second factor
   `[security].enforcement = enforce` (the default) **and**
   `[security].allow_single_factor_admin_when_exposed` is not set
   ([`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block). Either switch turns the
-  refusal into a loud warning that starts, and the allow flag also writes an audit line. No instance
+  refusal into a loud warning that starts, and under `enforce` the allow flag also writes an audit line. No instance
   is exempt: the engine treats every instance as carrying PHI (BACKLOG #1279).
   **"Exposed" here is the bind-and-proxy posture, not the console**: an off-loopback bind, **or**
   `[api].tls_terminated_upstream` — whether or not `/ui` ends up mounted. So the recommended
@@ -210,8 +210,8 @@ account is not exempt from the engine's second factor
   first, and would have missed exactly that topology on first deployment.) An **undeclared** proxy —
   a set `[security].web_console_public_address` with no `tls_terminated_upstream` — is outside the
   predicate and does **not** refuse: nothing was declared, so exposure would be an inference. It gets
-  its own **warning** instead, naming single-factor admin explicitly, on a PHI instance with
-  `require_mfa` off. That is a distinct arm — **not** the ADR 0068 §8 undeclared-proxy warning, which
+  its own **warning** instead, naming single-factor admin explicitly, whenever
+  `require_mfa` is off. That is a distinct arm — **not** the ADR 0068 §8 undeclared-proxy warning, which
   is about the `/ui` cookie and HSTS and is suppressed by §3's auto-degrade in the same posture. See
   the `allow_single_factor_admin_when_exposed` row in [`CONFIGURATION.md`](CONFIGURATION.md) and
   [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md).

@@ -2457,8 +2457,9 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
     found the claim in more files, with two neighbours: a lockout said to cover local accounts only,
     which `verify_mfa` and the step-up re-bind contradict, and container comments keying the
     MFA-at-exposure gate on local admins and the PHI tier, neither of which the `admin_exposed`
-    block in `__main__.py` reads. The probes earlier in this file pin the code; these assertions
-    red if an old phrasing returns. ADRs are dated records and are not read here."""
+    block in `__main__.py` reads. The probes earlier in this file pin the MFA code. They do not pin
+    the lockout or the gate: `tests/test_cli.py` tests the gate. These assertions red if an old
+    phrasing returns. ADRs are dated records and are not read here."""
     retired_by_doc = {
         "docs/SECURITY.md": ("binds a directory account like any other",),
         "docs/DEPLOYMENT.md": (
@@ -2482,6 +2483,7 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
         ),
         "docs/MENTAL-MODEL.md": (
             "the \\[webauthn\\] extra) for local accounts,",
+            "the [webauthn] extra) for local accounts,",
             "as a second factor for local accounts.",
         ),
         "docs/CONTAINER-EXPOSURE-EVALUATION.md": (
@@ -2502,8 +2504,9 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
         text = _flat((_ROOT / name).read_text(encoding="utf-8"))
         for phrase in retired:
             assert phrase not in text, (
-                f"{name} says {phrase!r} again, which the code contradicts; the docstring names "
-                "the rule each phrase broke (BACKLOG #1133)."
+                f"{name} says {phrase!r} again (BACKLOG #1133). Each retired phrase said one of: "
+                "directory MFA is delegated, the lockout covers local accounts only, or the "
+                "MFA-at-exposure gate keys on local admins or the PHI tier. The code says none."
             )
     doc = _flat(_doc_text())
     assert (
