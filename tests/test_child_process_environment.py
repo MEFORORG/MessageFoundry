@@ -23,6 +23,7 @@ import ast
 import asyncio
 import functools
 import os
+import shutil
 import site
 import subprocess
 import sys
@@ -368,9 +369,10 @@ _BUILDERS_OF_A_PYTHON_CHILD = (childenv.worker_environment, childenv.engine_envi
     ["", ".", os.pathsep + _OPERATOR_PATH, _OPERATOR_PATH + os.pathsep, "relative-directory"],
 )
 def test_an_entry_that_names_the_working_directory_does_not_reach_the_child(inherited: str) -> None:
-    """An empty or relative ``PYTHONPATH`` entry is the working directory by another name, so
-    carrying it across would undo ``-P``. An absolute entry crosses, and nothing is added: the
-    child is told where the package is by its bootstrap, never through ``PYTHONPATH``."""
+    """An empty or relative ``PYTHONPATH`` entry resolves against the working directory, which the
+    child's script start keeps off its path, so it must not cross. An absolute entry crosses, and
+    nothing is added: the child is told where the package is by its bootstrap, never through
+    ``PYTHONPATH``."""
     expected = [_OPERATOR_PATH] if _OPERATOR_PATH in inherited else []
     for build in _BUILDERS_OF_A_PYTHON_CHILD:
         crossed = build({"PYTHONPATH": inherited}).get("PYTHONPATH", "")
@@ -426,19 +428,78 @@ def test_the_bootstrap_runs_a_module_with_its_arguments_and_without_the_working_
     assert f"package: {Path(messagefoundry.__file__).resolve().parent}" in done.stdout
 
 
+#: ``base`` is the interpreter's base prefix in the placement test below; the standard library's
+#: entries sit inside it.
+_VENV_SITES = ["site"]
+_NO_VENV_WINDOWS_SITES = ["base", "base/Lib/site-packages"]
+
+
 @pytest.mark.parametrize(
-    ("path", "expected"),
+    ("sites", "path", "expected"),
     [
         # Not on the path: it goes after the standard library and ahead of site-packages.
-        (["zip", "stdlib", "site", "user-site"], ["zip", "stdlib", "ROOT", "site", "user-site"]),
+        (
+            _VENV_SITES,
+            ["base/zip", "base/Lib", "site", "user-site"],
+            ["base/zip", "base/Lib", "ROOT", "site", "user-site"],
+        ),
         # No site-packages on the path at all: last.
-        (["zip", "stdlib"], ["zip", "stdlib", "ROOT"]),
+        (_VENV_SITES, ["base/zip", "base/Lib"], ["base/zip", "base/Lib", "ROOT"]),
         # Already there, which is the installed case: untouched.
-        (["zip", "stdlib", "site", "ROOT"], ["zip", "stdlib", "site", "ROOT"]),
+        (
+            _VENV_SITES,
+            ["base/zip", "base/Lib", "site", "ROOT"],
+            ["base/zip", "base/Lib", "site", "ROOT"],
+        ),
+        # PYTHONPATH named site-packages, so it sits ahead of the standard library. The directory
+        # still goes after the standard library (vault BACKLOG #2800).
+        (
+            _VENV_SITES,
+            ["site", "base/zip", "base/Lib", "user-site"],
+            ["site", "base/zip", "base/Lib", "ROOT", "user-site"],
+        ),
+        # The same, with no site-packages directory left after the standard library: last.
+        (_VENV_SITES, ["site", "base/zip", "base/Lib"], ["site", "base/zip", "base/Lib", "ROOT"]),
+        # No entry is found to be the standard library: last, the one place certainly after it.
+        (
+            _VENV_SITES,
+            ["site", "elsewhere", "user-site"],
+            ["site", "elsewhere", "user-site", "ROOT"],
+        ),
+        # An operator's own PYTHONPATH entry ahead of the standard library changes nothing.
+        (
+            _VENV_SITES,
+            ["operator", "base/zip", "base/Lib", "site"],
+            ["operator", "base/zip", "base/Lib", "ROOT", "site"],
+        ),
+        # Windows without a virtual environment: the base prefix is a site directory, and an
+        # entry a .pth file adds inside site-packages is not the standard library.
+        (
+            _NO_VENV_WINDOWS_SITES,
+            ["base/zip", "base/Lib", "base", "base/Lib/site-packages", "base/Lib/site-packages/w"],
+            [
+                "base/zip",
+                "base/Lib",
+                "ROOT",
+                "base",
+                "base/Lib/site-packages",
+                "base/Lib/site-packages/w",
+            ],
+        ),
+        # The same, with site-packages named on PYTHONPATH.
+        (
+            _NO_VENV_WINDOWS_SITES,
+            ["base/Lib/site-packages", "base/zip", "base/Lib", "base"],
+            ["base/Lib/site-packages", "base/zip", "base/Lib", "ROOT", "base"],
+        ),
     ],
 )
 def test_where_the_bootstrap_puts_the_package_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: list[str], expected: list[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sites: list[str],
+    path: list[str],
+    expected: list[str],
 ) -> None:
     """The placement itself. An editable install already has the directory on the path, so a real
     child in this suite never takes the inserting branch."""
@@ -447,11 +508,56 @@ def test_where_the_bootstrap_puts_the_package_directory(
     def real(names: list[str]) -> list[str]:
         return [root if name == "ROOT" else str(tmp_path / name) for name in names]
 
-    monkeypatch.setattr(site, "getsitepackages", lambda: real(["site"]))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(sys, "base_exec_prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(site, "getsitepackages", lambda: real(sites))
     monkeypatch.setattr(site, "getusersitepackages", lambda: real(["user-site"])[0])
     monkeypatch.setattr(sys, "path", real(path))
     _child_bootstrap._place_package_root()
     assert sys.path == real(expected)
+
+
+def test_a_site_packages_directory_on_pythonpath_does_not_let_the_checkout_shadow_the_stdlib(
+    tmp_path: Path,
+) -> None:
+    """Through a real interpreter (vault BACKLOG #2800). A copy of the bootstrap sits in a checkout
+    that is not on the path, beside a decoy ``json.py``. ``PYTHONPATH`` names a real site-packages
+    directory, which the interpreter puts ahead of the standard library. The child must still import
+    the standard library's ``json``. The control is a marker module beside the decoy: it must
+    import, or the decoy's absence would only show the checkout was never on the path."""
+    checkout = tmp_path / "checkout"
+    package = checkout / "messagefoundry"
+    package.mkdir(parents=True)
+    shutil.copyfile(_child_bootstrap.__file__, package / "_child_bootstrap.py")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    # A json already imported at start-up would make the decoy's absence prove nothing.
+    (package / "probe.py").write_text(
+        "import sys\n"
+        "if 'json' in sys.modules:\n"
+        "    raise SystemExit('json was imported before the bootstrap placed the checkout')\n"
+        "import json\nimport mf_checkout_marker\nprint(json.__file__)\n",
+        encoding="utf-8",
+    )
+    (checkout / "json.py").write_text("raise SystemExit('the decoy answered')\n", encoding="utf-8")
+    (checkout / "mf_checkout_marker.py").write_text("", encoding="utf-8")
+    site_packages = site.getsitepackages()[-1]
+
+    done = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
+        [
+            sys.executable,
+            *childenv.CHILD_INTERPRETER_FLAGS,
+            str(package / "_child_bootstrap.py"),
+            "messagefoundry.probe",
+        ],
+        cwd=tmp_path,
+        env=childenv.engine_environment({**os.environ, "PYTHONPATH": site_packages}),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert Path(done.stdout.strip()).resolve().parent != checkout.resolve()
 
 
 # --- the static guard ---------------------------------------------------------------------------
