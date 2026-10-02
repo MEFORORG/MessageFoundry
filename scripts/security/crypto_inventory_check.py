@@ -687,6 +687,20 @@ INVENTORY: dict[str, frozenset[str]] = {
             "messagefoundry.store.keyprovider",
         }
     ),
+    # BACKLOG #305 (ASVS 13.2.2): check-privileges reads each Vault token's own policies and
+    # capabilities through the providers' own client builders (store_vault_client, the Transit
+    # cipher's and the KEK's required-path helpers), so it carries their TLS narrowing, anchor and
+    # cleartext refusal and builds no client of its own. tls_policy and keyprovider are imported only
+    # to recognise the engine's fixed-text refusals (InsecureHopRefused, KeyProviderError). No
+    # primitive is called here: no encrypt, decrypt, MAC or key load.
+    "messagefoundry/privilege_probes.py": frozenset(
+        {
+            "messagefoundry.config.tls_policy",
+            "messagefoundry.store.crypto_transit",
+            "messagefoundry.store.keyprovider",
+            "messagefoundry.store.keyprovider_vault",
+        }
+    ),
     # --- non-messagefoundry roots (#283's _CRYPTO_SITES_OUTSIDE_THE_PACKAGE, now walked by this gate) ---
     # ASVS 3.4.7/3.4.8: mints the per-response CSP script nonce (secrets) stamped into <script> for the
     # effective-https /ui nonce-CSP. A single-use per-response nonce, not a stored key.
@@ -849,6 +863,11 @@ IMPORT_ONLY: dict[str, str] = {
     "messagefoundry/pipeline/wiring_runner.py": (
         "INSTRUMENT LIMIT. Decides whether a plaintext hop is allowed (is_loopback_hop_host, "
         "active_hop_posture): a TLS posture decision with no crypto-shaped call in it"
+    ),
+    "messagefoundry/privilege_probes.py": (
+        "reads a Vault token's policies and capabilities through the providers' own client builders, "
+        "which are inventoried in store/keyprovider_vault.py and config/secretprovider_vault.py; "
+        "imports the refusal types only to recognise their fixed text, and calls no primitive"
     ),
     "messagefoundry/store/cipher_cells.py": (
         "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "

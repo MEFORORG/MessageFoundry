@@ -364,3 +364,37 @@ class VaultKeyProvider:
 def build_provider(settings: StoreSettings) -> VaultKeyProvider:
     """The dispatch entrypoint ``keyprovider._load_external_provider`` imports and calls by name."""
     return VaultKeyProvider(settings)
+
+
+# --- what this hop's token must be able to do (BACKLOG #305, ASVS 13.2.2) ---------------------------
+
+#: hvac's default Transit mount. No Transit call in this module or in ``crypto_transit.py`` passes
+#: ``mount_point``, so this is the mount they reach; the path pins in
+#: ``tests/test_vault_ldap_privilege_probes.py`` fail if that stops being true.
+TRANSIT_MOUNT = "transit"
+
+
+def store_vault_client() -> Any:
+    """The store hop's Vault client, built from the same environment and by the same
+    :func:`_build_client` the providers use: same TLS narrowing, same anchor, no redirects, and the
+    same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
+    own grants through it and changes nothing."""
+    return _build_client(os.environ.get(_ENV_ADDR), os.environ.get(_ENV_TOKEN))
+
+
+def kek_required_capabilities() -> dict[str, frozenset[str]]:
+    """Every Vault path :meth:`VaultKeyProvider.active_key` calls, with the capability each call needs.
+
+    Kept beside the calls so the two cannot drift: ``read_key`` is a read of ``transit/keys/<KEK>``
+    and ``decrypt_data`` an update of ``transit/decrypt/<KEK>``. Raises :class:`KeyProviderError`
+    when the KEK name is not set, as the provider itself would."""
+    kek = os.environ.get(_ENV_TRANSIT_KEY)
+    if not kek:
+        raise KeyProviderError(
+            f"[store].key_provider={_EXTRA!r} is selected but {_ENV_TRANSIT_KEY} is not set, so the "
+            f"Transit paths the engine reads are not known."
+        )
+    return {
+        f"{TRANSIT_MOUNT}/keys/{kek}": frozenset({"read"}),
+        f"{TRANSIT_MOUNT}/decrypt/{kek}": frozenset({"update"}),
+    }

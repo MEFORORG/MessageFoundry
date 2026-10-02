@@ -128,6 +128,37 @@ class DirectoryProbe:
             )
 
 
+def sid_text(raw: bytes) -> str | None:
+    """A binary Windows SID (the MS-DTYP SID structure) as ``S-1-...`` text, or ``None`` if it is malformed.
+
+    Not ldap3's ``format_sid``: that hands a malformed value back unchanged, and a caller comparing
+    the result against a SID would then compare against raw bytes."""
+    if len(raw) < 8 or len(raw) != 8 + 4 * raw[1]:
+        return None
+    authority = int.from_bytes(raw[2:8], "big")
+    subs = (int.from_bytes(raw[8 + 4 * i : 12 + 4 * i], "little") for i in range(raw[1]))
+    return "S-" + "-".join(str(part) for part in (raw[0], authority, *subs))
+
+
+@dataclass(frozen=True, slots=True)
+class BindAccountReading:
+    """What the service-account bind can read about itself (BACKLOG #305, ASVS 13.2.2). Facts
+    only: ``privilege_check`` judges them.
+
+    ``authzid`` is the RFC 4532 "Who am I?" answer: the identity the directory says the bind
+    authenticated as. It proves identity, not rights. ``group_sids`` is the account's own
+    ``tokenGroups``, which AD computes over every nested group and the primary group; empty when it
+    could not be read. ``member_of`` (the CN of each direct ``memberOf``) and ``primary_group_rid``
+    are the direct reads, for when it could not. ``problem`` says what could not be read. Nothing
+    here is a secret: no password is held."""
+
+    authzid: str | None
+    group_sids: tuple[str, ...] = ()
+    member_of: tuple[str, ...] = ()
+    primary_group_rid: int | None = None
+    problem: str | None = None
+
+
 class _Lookup(NamedTuple):
     """One user search: the answer, and the extracted entry when the answer is FOUND."""
 
@@ -938,6 +969,62 @@ class LdapAuthenticator:
         except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
             raise LdapError(str(exc)) from exc
         return DirectoryProbe(DirectoryAnswer.FOUND, _principal_from(info, user_dn, groups))
+
+    def read_bind_account(self) -> BindAccountReading:
+        """Who the service-account bind is, and which groups it is in, read-only.
+
+        For ``check-privileges`` (BACKLOG #305, ASVS 13.2.2). It opens the same connection every
+        lookup here opens -- the LDAPS bind with the narrowed, anchored TLS context, finite timeouts
+        and no referral following -- and only reads: the RFC 4532 "Who am I?" extended operation,
+        then one BASE-scope read of ``[auth].ad_bind_dn``'s own entry. It never writes.
+
+        Raises :class:`LdapError` when the bind itself fails. A failed group read is reported in
+        :attr:`BindAccountReading.problem` instead, so the identity the bind proved is kept."""
+        import ldap3
+
+        try:
+            with self._service_conn() as svc:
+                who = _authzid_text(svc.extend.standard.who_am_i())
+                try:
+                    _search(
+                        svc,
+                        "bind-account group read",
+                        search_base=self._s.ad_bind_dn,
+                        search_filter="(objectClass=*)",
+                        search_scope=ldap3.BASE,
+                        attributes=["tokenGroups", "memberOf", "primaryGroupID"],
+                    )
+                except (ldap3.core.exceptions.LDAPException, LdapError) as exc:
+                    # An LdapError is a refused referral, whose text is the engine's own.
+                    why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
+                    return BindAccountReading(who, problem=f"group membership not read: {why}")
+                entry = svc.entries[0] if svc.entries else None
+        except ldap3.core.exceptions.LDAPException as exc:
+            raise LdapError(str(exc)) from exc
+        if entry is None:
+            return BindAccountReading(
+                who,
+                problem="group membership not read: the bind DN's own entry was not returned "
+                "(is [auth].ad_bind_dn a distinguished name?)",
+            )
+        raw = entry["tokenGroups"].raw_values if "tokenGroups" in entry else ()
+        sids = tuple(
+            sid for v in raw if isinstance(v, (bytes, bytearray)) and (sid := sid_text(bytes(v)))
+        )
+        rid = _attr(entry, "primaryGroupID")
+        return BindAccountReading(
+            who,
+            group_sids=sids,
+            member_of=tuple(cn for dn in _multi(entry, "memberOf") if (cn := _cn_of(dn))),
+            primary_group_rid=int(rid) if rid and rid.isascii() and rid.isdigit() else None,
+        )
+
+
+def _authzid_text(value: object) -> str | None:
+    """The "Who am I?" answer as printable text, or ``None`` for an anonymous or absent one."""
+    from messagefoundry.controlchars import strip_control_chars
+
+    return strip_control_chars(str(value)) if value else None
 
 
 def _kerberos_acceptor(settings: AuthSettings) -> Any:

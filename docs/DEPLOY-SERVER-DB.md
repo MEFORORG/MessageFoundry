@@ -154,7 +154,7 @@ require_managed_identity = true    # refuse a static SQL login on production PHI
 
 **6. Check the gMSA's grant before the first start** (after steps 3 to 5, and again after any grant
 change). `messagefoundry check-privileges` runs the startup probe (§1.3) once and changes nothing. It
-opens one connection, reads the login's roles and permissions, and prints the store and four other
+opens one connection, reads the login's roles and permissions, and reports the store and the other
 backend hops.
 
 Under `auth = "integrated"` it connects as the Windows account that runs it. So run it **as the
@@ -179,10 +179,15 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
   or a permission read that came back NULL. That is not a clean result.
 - It exits 1 when the service settings do not load.
 
-Vault, LDAP, SMTP and the identity provider are printed with the identity the engine presents and
-the least grant each needs, marked **not probed**. The engine has no read-only way to inspect those
-grants, so you confirm them by hand. They never change the exit code. The full per-hop table is in
-[`SECURITY.md`](SECURITY.md) §*Each backend hop's least privilege; the engine probes only the store*.
+It also probes each Vault token the engine uses and the AD bind account, when they are
+configured. A Vault token that holds more than the engine needs, or an AD bind account in an
+administrative group, makes it exit 3. A Vault or AD probe that cannot run makes it exit 4. Those
+findings are reported only; they never stop a start. Run the task with the service's environment,
+so the probes read the engine's own tokens and bind password. SMTP and the identity provider are
+printed with the identity the engine presents and the least grant each needs, marked **not probed**.
+Confirm those by hand; they never change the exit code. The full per-hop table is in
+[`SECURITY.md`](SECURITY.md) §*Each backend hop's least privilege; the engine probes the store,
+Vault and LDAP*.
 
 > **Why the `$`:** a gMSA authenticates as a *computer-class* principal, so its SQL login name carries the
 > trailing `$` (`CORP\mefor-svc$`) — the same name the service's `ObjectName` uses.

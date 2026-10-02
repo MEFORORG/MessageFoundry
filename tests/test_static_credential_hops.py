@@ -788,27 +788,34 @@ def test_an_auth_secret_reference_dials_vault_only_while_its_feature_is_on(
 
 def test_the_least_privilege_table_reads_the_same_references() -> None:
     """``privilege_check`` lists the Vault hop from the same reader, so the two cannot disagree."""
-    from messagefoundry.privilege_check import HopState, _vault_hop
+    from messagefoundry.privilege_check import vault_consumers
 
     ad: dict[str, object] = {"ad_bind_password_secret": "kv/mf#ad"}
-    assert _vault_hop(_with(secrets=_VAULT, auth=ad)).state is HopState.NOT_CONFIGURED
+    assert vault_consumers(_with(secrets=_VAULT, auth=ad)) == []
     # The control: AD on, so the reference is resolved and the Vault hop is used.
-    on = _vault_hop(_with(secrets=_VAULT, auth={**ad, "ad_enabled": True}))
-    assert on.state is HopState.NOT_PROBED and "1 reference" in on.identity
+    (on,) = vault_consumers(_with(secrets=_VAULT, auth={**ad, "ad_enabled": True}))
+    assert on.hop == "vault.secrets" and "1 reference" in on.identity
+    assert on.refs == ("kv/mf#ad",)
 
 
-@pytest.mark.parametrize(
-    ("feature", "row"), [("ad_enabled", "_ldap_hop"), ("oidc_enabled", "_idp_hop")]
-)
+@pytest.mark.parametrize(("feature", "row"), [("ad_enabled", "ldap"), ("oidc_enabled", "idp")])
 def test_the_least_privilege_auth_rows_need_auth_enabled(feature: str, row: str) -> None:
     """The LDAP and IdP rows agree with the Vault row: nothing is dialled with ``[auth]`` off."""
     import messagefoundry.privilege_check as pc
+    from messagefoundry.auth.ldap import BindAccountReading
 
-    hop = getattr(pc, row)
-    off = hop(_with(auth={feature: True, "enabled": False}))
+    def _hop(settings: ServiceSettings) -> pc.HopPrivilege:
+        hops = pc.settings_hops(
+            settings,
+            vault_probe=lambda consumer: pytest.fail("no Vault consumer is configured"),
+            ldap_probe=lambda: BindAccountReading("u:EXAMPLE\svc", ("S-1-5-32-545",)),
+        )
+        return next(h for h in hops if h.hop == row)
+
+    off = _hop(_with(auth={feature: True, "enabled": False}))
     assert off.state is pc.HopState.NOT_CONFIGURED
     # The control: [auth] on, so the row is in use.
-    assert hop(_with(auth={feature: True})).state is pc.HopState.NOT_PROBED
+    assert _hop(_with(auth={feature: True})).state is not pc.HopState.NOT_CONFIGURED
 
 
 def test_an_smtp_secret_reference_dials_vault_even_with_smtp_off() -> None:
