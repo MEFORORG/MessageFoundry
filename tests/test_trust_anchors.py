@@ -1607,7 +1607,9 @@ async def test_the_reload_route_still_refuses_a_swapped_settings_anchor_the_same
     spec, anchor = _pinned_ad_anchor(tmp_path, monkeypatch)
     cfg = tmp_path / "cfg"
     _file_graph(cfg)
-    app = create_managed_app(db_path=tmp_path / "m.db", config_dir=cfg, trust_anchor_specs=[spec])
+    app = create_managed_app(
+        db_path=tmp_path / "m.db", config_dir=cfg, trust_anchor_specs=[spec], allow_no_auth=True
+    )
     async with app.router.lifespan_context(app):
         engine = app.state.engine
         live = engine.registry_runner.registry

@@ -85,6 +85,7 @@ def server(tmp_path: Path) -> Iterator[tuple[str, int]]:
         db_path=tmp_path / "scenarios.db",
         config_dir=tmp_path / "config",
         poll_interval=0.05,
+        allow_no_auth=True,  # the harness reads the API with no session
     )
     api_port = _free_port()
     uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="warning"))

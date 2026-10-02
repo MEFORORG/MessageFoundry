@@ -155,7 +155,11 @@ def probe(rate: float, duration_s: float = 1.5, pool_size: int = 4) -> int:
     from messagefoundry.api import create_managed_app
 
     app = create_managed_app(
-        db_path=Path(tmp) / "probe.db", config_dir=_CONFIG_DIR, poll_interval=0.05
+        db_path=Path(tmp) / "probe.db",
+        config_dir=_CONFIG_DIR,
+        poll_interval=0.05,
+        # The load runner reads /stats with no bearer token, on a loopback socket and a temp store.
+        allow_no_auth=True,
     )
     uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="error"))
     # Release the MLLP ports at the last moment; hand the still-bound API socket to uvicorn.

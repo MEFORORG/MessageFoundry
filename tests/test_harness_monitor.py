@@ -95,7 +95,10 @@ def _serve(
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     _write_config(tmp_path / "config", inbox, outdir)
     app = create_managed_app(
-        db_path=tmp_path / "console.db", config_dir=tmp_path / "config", poll_interval=0.05
+        db_path=tmp_path / "console.db",
+        config_dir=tmp_path / "config",
+        poll_interval=0.05,
+        allow_no_auth=True,  # the monitor reads the API with no session
     )
     port = _free_port()
     uv = uvicorn.Server(
