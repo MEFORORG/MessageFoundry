@@ -8,6 +8,12 @@ the SQL Server named by ``database_server`` and reads ``dbo.mf_harness_outbox``
 it records the high-water ``id`` at start and reads only above it -- so a long-lived table cannot
 satisfy a scenario with an earlier run's rows. Needs the ``[sqlserver]`` extra and a SQL Server;
 ``pyodbc`` is imported lazily so discovery works without either.
+
+Each payload is bounded before it is fetched (ASVS 5.1.1): the read withholds, server-side, any
+payload over :data:`~harness.drivers._database.MAX_OUTBOX_PAYLOAD_CHARS` (the engine's per-message
+cap), and the sink records such a row with an empty payload and a ``refused`` reason naming its
+length, so it is counted rather than silently dropped. The same cap is applied again to what is
+fetched, and :attr:`DatabaseSink.max_payload_chars` can lower it.
 """
 
 from __future__ import annotations
@@ -36,6 +42,9 @@ class DatabaseSink(Sink):
         self._high_water = 0
         #: The last read that failed, by exception class only; the next poll retries it.
         self.last_error = ""
+        #: The most characters one payload may hold and still be recorded. The read itself never
+        #: fetches more than :data:`~harness.drivers._database.MAX_OUTBOX_PAYLOAD_CHARS`.
+        self.max_payload_chars = _database.MAX_OUTBOX_PAYLOAD_CHARS
 
     def start(self) -> None:
         """Connect, create the tables if absent, and note where this run's rows begin. Raises
@@ -80,9 +89,14 @@ class DatabaseSink(Sink):
 
     def records(self) -> list[Record]:
         if self._started:
-            for row_id, control_id, message_type, payload in self._read():
+            for row_id, control_id, message_type, payload, length in self._read():
                 self._high_water = max(self._high_water, int(row_id))
                 meta = {"id": str(row_id), "control_id": control_id, "message_type": message_type}
+                cap = self.max_payload_chars
+                if payload is None or len(str(payload)) > cap:
+                    meta["refused"] = f"{length} characters, over the {cap}-character cap; not read"
+                    self._add(Record(b"", meta))
+                    continue
                 self._add(Record(str(payload).encode("utf-8"), meta))
         return super().records()
 

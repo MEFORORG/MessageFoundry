@@ -12,7 +12,11 @@ blanks the engine-non-deterministic fields); unmatched ids on either side are su
 
 Inputs are read by :func:`load_messages`, which accepts a MEFOR JSONL capture (from
 :class:`harness.reconcile.capture.CaptureSink`), a directory of one-message files, or a single batch file
-of concatenated HL7 (split on ``MSH`` boundaries) — so the same loader takes both sides.
+of concatenated HL7 (split on ``MSH`` boundaries) — so the same loader takes both sides. Each file is
+read bounded (ASVS 5.1.1): at most ``max_file_bytes``, default the engine's per-message cap, through
+:func:`harness.bounded_file.read_capped`; a file over it, or one that is not a regular file, is refused
+with :class:`LoadError` naming the file, never read whole. ``python -m harness.reconcile compare
+--max-file-bytes`` raises the cap for a long capture.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from harness.bounded_file import read_capped
 from harness.reconcile.normalize import (
     Difference,
     NormalizeRules,
@@ -28,6 +33,7 @@ from harness.reconcile.normalize import (
     Separators,
     diff,
 )
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.parsing.peek import normalize as _normalize_line_endings
 
 #: Default per-connection match key — the message control id (``MSH-10``).
@@ -50,25 +56,46 @@ def field_value(raw: str, key: tuple[str, int]) -> str | None:
     return None
 
 
-def load_messages(path: str | Path) -> list[str]:
+class LoadError(ValueError):
+    """An input file :func:`load_messages` refused to read: over the cap, or not a regular file."""
+
+
+def _read(path: Path, cap: int) -> bytes:
+    try:
+        data, reason = read_capped(path, cap)
+    except OSError as exc:
+        raise LoadError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    if reason:
+        raise LoadError(f"{path}: {reason}; raise --max-file-bytes to read it")
+    return data
+
+
+def load_messages(
+    path: str | Path, *, max_file_bytes: int = DEFAULT_MAX_MESSAGE_BYTES
+) -> list[str]:
     """Load raw HL7 messages from a MEFOR JSONL capture, a directory of one-message files, or a single
-    batch file of concatenated messages (split on ``MSH`` line boundaries)."""
+    batch file of concatenated messages (split on ``MSH`` line boundaries).
+
+    Each file is capped at ``max_file_bytes`` (default the engine's per-message cap) and refused with
+    :class:`LoadError` over it, before it is read whole."""
+    if max_file_bytes <= 0:
+        raise ValueError(f"max_file_bytes must be a positive byte count, got {max_file_bytes}")
     p = Path(path)
     if p.is_dir():
         out: list[str] = []
         for child in sorted(p.iterdir()):
             if child.is_file():
-                out.extend(_split_batch(child.read_text(encoding="latin-1")))
+                out.extend(_split_batch(_read(child, max_file_bytes).decode("latin-1")))
         return out
-    text = p.read_text(encoding="utf-8" if p.suffix == ".jsonl" else "latin-1")
+    raw = _read(p, max_file_bytes)
     if p.suffix == ".jsonl":
         msgs: list[str] = []
-        for line in text.splitlines():
+        for line in raw.decode("utf-8").splitlines():
             line = line.strip()
             if line:
                 msgs.append(json.loads(line)["raw"])
         return msgs
-    return _split_batch(text)
+    return _split_batch(raw.decode("latin-1"))
 
 
 def _split_batch(text: str) -> list[str]:

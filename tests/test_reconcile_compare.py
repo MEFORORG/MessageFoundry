@@ -9,12 +9,17 @@ against engine-non-determinism, MEFOR-only / Corepoint-only, unkeyed, duplicate 
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
-from harness.reconcile.compare import field_value, load_messages, reconcile
+import pytest
+
+from harness.reconcile.__main__ import main as reconcile_main
+from harness.reconcile.compare import LoadError, field_value, load_messages, reconcile
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
 
 def _msg(control_id: str, *, name: str = "DOE^JANE", stamp: str = "20260101000000") -> str:
@@ -50,6 +55,44 @@ def test_load_messages_jsonl_batch_and_dir(tmp_path: Path) -> None:
     (d / "1.hl7").write_text(_msg("A"), encoding="latin-1")
     (d / "2.hl7").write_text(_msg("B"), encoding="latin-1")
     assert sorted(field_value(m, ("MSH", 10)) or "" for m in load_messages(d)) == ["A", "B"]
+
+
+def test_load_messages_refuses_a_file_over_the_cap_in_each_shape(tmp_path: Path) -> None:
+    """ASVS 5.1.1: each input file is capped (default the engine's per-message cap) and refused
+    before it is read whole -- a batch file, a JSONL capture, and one file in a directory."""
+    default = inspect.signature(load_messages).parameters["max_file_bytes"].default
+    assert default == DEFAULT_MAX_MESSAGE_BYTES
+    one = _msg("A").encode("latin-1")
+    batch = tmp_path / "export.hl7"
+    batch.write_bytes(one * 2)
+    assert len(load_messages(batch, max_file_bytes=len(one) * 2)) == 2  # at the cap: read
+    with pytest.raises(LoadError, match=f"over the {len(one) * 2 - 1}-byte cap"):
+        load_messages(batch, max_file_bytes=len(one) * 2 - 1)
+    jsonl = tmp_path / "cap.jsonl"
+    jsonl.write_text(json.dumps({"raw": _msg("A")}), encoding="utf-8")
+    with pytest.raises(LoadError, match="raise --max-file-bytes"):
+        load_messages(jsonl, max_file_bytes=8)
+    d = tmp_path / "exp"
+    d.mkdir()
+    (d / "1.hl7").write_bytes(one)
+    (d / "2.hl7").write_bytes(one + one)
+    with pytest.raises(LoadError, match="2.hl7"):
+        load_messages(d, max_file_bytes=len(one))
+    with pytest.raises(ValueError, match="positive"):
+        load_messages(batch, max_file_bytes=0)
+
+
+def test_compare_cli_reports_an_over_cap_input_and_exits_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    batch = tmp_path / "export.hl7"
+    batch.write_text(_msg("A"), encoding="latin-1")
+    argv = ["compare", "--mefor", str(batch), "--corepoint", str(batch)]
+    assert reconcile_main([*argv, "--max-file-bytes", "16"]) == 2
+    assert "over the 16-byte cap" in capsys.readouterr().err
+    assert reconcile_main(argv) == 0  # the default cap reads it; the same pair is clean
+    with pytest.raises(SystemExit):
+        reconcile_main([*argv, "--max-file-bytes", "0"])
 
 
 def test_reconcile_identical_is_clean() -> None:

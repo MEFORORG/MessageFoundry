@@ -28,6 +28,7 @@ from typing import Any
 
 from harness.endpoints import ENV_PREFIX, Endpoints
 from harness.endpoints.database import ENVIRONMENT_ONLY
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
 #: The ODBC driver the engine's SQL Server preset names, and so the one the harness dials with.
 ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
@@ -86,8 +87,18 @@ CREATE_TABLES = (
 )
 INSERT_INBOX = f"INSERT INTO {INBOX} (payload) VALUES (?)"
 OUTBOX_HIGH_WATER = f"SELECT COALESCE(MAX(id), 0) FROM {OUTBOX}"
+#: The most characters one outbox payload may hold and still be read by the database sink: the
+#: engine's per-message cap, measured in characters as the engine measures a decoded text body.
+MAX_OUTBOX_PAYLOAD_CHARS = DEFAULT_MAX_MESSAGE_BYTES
+#: The sink's read. A payload over the cap is withheld by the SERVER (NULL in its place, with its
+#: length in UTF-16 code units beside it), so an oversized row is never fetched into the harness.
+#: NVARCHAR stores UTF-16, so DATALENGTH / 2 counts code units; that is never fewer than characters,
+#: so the bound errs toward refusing. The cap is a harness constant, never derived from a message.
 SELECT_OUTBOX_AFTER = (
-    f"SELECT id, control_id, message_type, payload FROM {OUTBOX} WHERE id > ? ORDER BY id"
+    f"SELECT id, control_id, message_type, "
+    f"CASE WHEN DATALENGTH(payload) <= {2 * MAX_OUTBOX_PAYLOAD_CHARS} THEN payload END, "
+    f"DATALENGTH(payload) / 2 "
+    f"FROM {OUTBOX} WHERE id > ? ORDER BY id"
 )
 
 #: Seconds a login may take before the harness gives up on the server.

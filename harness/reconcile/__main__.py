@@ -28,11 +28,18 @@ import sys
 from pathlib import Path
 
 from harness.frame_cap import max_frame_bytes_arg
-from harness.reconcile.compare import DEFAULT_KEY, ReconcileResult, load_messages, reconcile
+from harness.reconcile.compare import (
+    DEFAULT_KEY,
+    LoadError,
+    ReconcileResult,
+    load_messages,
+    reconcile,
+)
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.mllpcodec import DEFAULT_MAX_FRAME_BYTES, AckMode
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
 
 def _parse_field(spec: str) -> tuple[str, int]:
@@ -41,6 +48,17 @@ def _parse_field(spec: str) -> tuple[str, int]:
     if not seg or not num.isdigit():
         raise argparse.ArgumentTypeError(f"expected SEG-FIELD (e.g. MSH-10), got {spec!r}")
     return (seg.upper(), int(num))
+
+
+def _positive_bytes(text: str) -> int:
+    """``argparse`` type for ``--max-file-bytes``: a whole number above zero."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be above zero, got {value}")
+    return value
 
 
 def _rules_from_args(args: argparse.Namespace) -> NormalizeRules:
@@ -83,9 +101,15 @@ async def _run_capture(args: argparse.Namespace) -> int:
 
 
 def _run_compare(args: argparse.Namespace) -> int:
+    try:
+        mefor = load_messages(args.mefor, max_file_bytes=args.max_file_bytes)
+        corepoint = load_messages(args.corepoint, max_file_bytes=args.max_file_bytes)
+    except LoadError as exc:
+        print(f"compare: {exc}", file=sys.stderr)
+        return 2
     result: ReconcileResult = reconcile(
-        load_messages(args.mefor),
-        load_messages(args.corepoint),
+        mefor,
+        corepoint,
         connection=args.connection,
         key=args.key,
         rules=_rules_from_args(args),
@@ -155,6 +179,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     cmp.add_argument("--ignore-segment", action="append", help="segment id dropped from both sides")
     cmp.add_argument("--report-json", help="write the structured report here")
+    cmp.add_argument(
+        "--max-file-bytes",
+        type=_positive_bytes,
+        default=DEFAULT_MAX_MESSAGE_BYTES,
+        help="largest input file read; a bigger one is refused, never read whole "
+        "(default: %(default)s, the engine's per-message cap)",
+    )
 
     args = parser.parse_args(argv)
     if args.cmd == "capture":
