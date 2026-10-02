@@ -29,7 +29,9 @@ of whatever was running, which is the position a signal handler is in. The engin
 take locks that are not reentrant, and the interrupted code may hold one, so a log call made here
 could wait on its own thread forever. The hook therefore only counts, queues the file name on a
 ``queue.SimpleQueue`` (whose ``put`` is documented as reentrant) and raises. A daemon thread
-writes the WARNING.
+writes the WARNING, with the script's file name only. The interpreter also reports the hook's
+exception itself, through ``sys.unraisablehook``: by default one line on standard error with the
+script's full path, and a traceback.
 
 **Cost.** An audit hook runs on every audited operation in the process, not only this event.
 Measured on one Windows development machine, CPython 3.14.6: about 60 to 90 ns for each audited
@@ -37,7 +39,8 @@ operation. How many audited operations the engine performs for each message is n
 the interface is already disabled the event cannot fire, so no hook is installed and nothing is
 paid.
 
-Stdlib only, no engine state, so any package may import it.
+No engine state. It imports the standard library and ``messagefoundry.controlchars``, which
+imports nothing, so any package may import it.
 """
 
 from __future__ import annotations
@@ -49,6 +52,8 @@ import sys
 import threading
 from dataclasses import dataclass
 from typing import Final
+
+from messagefoundry.controlchars import scrub_log_argument
 
 __all__ = [
     "REMOTE_SCRIPT_EVENT",
@@ -115,12 +120,13 @@ def _guard(event: str, args: tuple[object, ...]) -> None:
 
 
 def _report(name: str) -> None:
-    # %a, not %s: the name comes from the injecting process and may hold a line break.
+    # Scrubbed here as well as by the handlers: the injecting process chooses the name, it may
+    # hold a line break, and a handler with no filter chain would write it as it came.
     _log.warning(
         "refused a script that another process injected through the interpreter's remote "
-        "debugging (audit event %s, script file name %a). Nothing in it ran.",
+        "debugging (audit event %s, script file name %s). Nothing in it ran.",
         REMOTE_SCRIPT_EVENT,
-        name,
+        scrub_log_argument(name),
     )
 
 
@@ -188,12 +194,16 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
             "install the hook at start. Start the interpreter with -X disable-remote-debug to "
             "turn the interface off",
         )
+    refused = (
+        f" It has refused {posture.refused_scripts} since this process started."
+        if posture.refused_scripts
+        else ""
+    )
     return (
         "remote_debug_enabled",
         "the interpreter's remote debugging (PEP 768) is enabled in this process. The engine "
-        "refuses a script injected through it "
-        f"({posture.refused_scripts} refused since start), so this is a residual and not an open "
-        "path. A process that can write into this process's address space can still run code "
-        "in it by other means. Start the interpreter with -X disable-remote-debug to turn the "
-        "interface off",
+        "refuses a script injected through it, so this is a residual and not an open path."
+        f"{refused} A process that can write into this process's address space can still run "
+        "code in it by other means. Start the interpreter with -X disable-remote-debug to turn "
+        "the interface off",
     )

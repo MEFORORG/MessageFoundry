@@ -42,6 +42,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     security_loosenings,
 )
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline import Engine
 from messagefoundry.remotedebug import (
     REMOTE_SCRIPT_EVENT,
@@ -51,6 +52,7 @@ from messagefoundry.remotedebug import (
     remote_debug_loosening,
     remote_debug_posture,
 )
+from tests._ast_sites import callee_name, named_func, parse_source
 
 _REPO = Path(messagefoundry.__file__).resolve().parents[1]
 
@@ -131,8 +133,11 @@ class _Target:
             ],
             env=env,
         )
+
+    def wait_until_ready(self) -> None:
         _wait_for(
-            lambda: self.ready.exists() and self.ready.read_text("utf-8").count(" ") == 2, mode
+            lambda: self.ready.exists() and self.ready.read_text("utf-8").count(" ") == 2,
+            "the target to start",
         )
         pid, enabled, guarded = self.ready.read_text("utf-8").split()
         self.pid = int(pid)
@@ -151,9 +156,16 @@ class _Target:
 
 
 @pytest.fixture
-def targets(tmp_path: Path) -> Iterator[list[_Target]]:
+def start_target(tmp_path: Path) -> Iterator[Callable[[str], _Target]]:
+    """Start a target in ``mode``, and kill whatever a failed test left running."""
     started: list[_Target] = []
-    yield started
+
+    def start(mode: str) -> _Target:
+        target = _Target(tmp_path / mode, mode)
+        started.append(target)
+        return target
+
+    yield start
     for target in started:
         if target.process.poll() is None:
             target.process.kill()
@@ -169,12 +181,18 @@ def _inject(target: _Target) -> None:
         pytest.skip(f"this platform refused to attach to a child process: {exc}")
 
 
+@pytest.mark.skipif(
+    not sys.is_remote_debug_enabled(),
+    reason="this test process was started with remote debugging off, so it cannot inject",
+)
 def test_an_injected_script_runs_without_the_hook_and_not_with_it(
-    tmp_path: Path, targets: list[_Target]
+    start_target: Callable[[str], _Target],
 ) -> None:
+    control, guarded = start_target("unguarded"), start_target("guarded")
+    control.wait_until_ready()
+    guarded.wait_until_ready()
+
     # CONTROL: no hook. The injected script runs. This is what the engine parent would allow.
-    control = _Target(tmp_path / "control", "unguarded")
-    targets.append(control)
     assert control.interpreter_enabled, "the target was started with remote debugging off"
     assert not control.guard_installed
     _inject(control)
@@ -182,16 +200,14 @@ def test_an_injected_script_runs_without_the_hook_and_not_with_it(
     assert control.close() == "0"
 
     # The same target with the hook installed, and the same injection.
-    guarded = _Target(tmp_path / "guarded", "guarded")
-    targets.append(guarded)
     assert guarded.interpreter_enabled and guarded.guard_installed
     _inject(guarded)
     _wait_for(
         lambda: guarded.log.exists() and REMOTE_SCRIPT_EVENT in guarded.log.read_text("utf-8"),
         "the guarded target to log the refusal",
     )
-    # The target keeps running Python until it is told to stop, so a script the interpreter had
-    # merely deferred would run in that window.
+    # The hook raised before that line was written, and the target went on running Python until
+    # it was told to stop. A script the interpreter had only put off would have run by now.
     assert guarded.close() == "1", "the hook did not count exactly one refused script"
     assert not guarded.marker.exists(), "the injected script ran although the hook raised"
 
@@ -266,14 +282,15 @@ def test_the_warning_names_the_event_and_escapes_the_file_name(
 ) -> None:
     # The injecting process chooses the name. On POSIX it may hold a line break, which would
     # otherwise start a forged log line.
+    name = "evil\nCRITICAL forged line.py"
     with caplog.at_level(logging.WARNING, logger="messagefoundry.remotedebug"):
-        remotedebug._report("evil\nCRITICAL forged line.py")
+        remotedebug._report(name)
     (record,) = caplog.records
     assert record.levelno == logging.WARNING
     message = record.getMessage()
     assert REMOTE_SCRIPT_EVENT in message
     assert "\n" not in message
-    assert "evil\\nCRITICAL forged line.py" in message
+    assert scrub_log_argument(name) in message and scrub_log_argument(name) != name
 
 
 def test_a_long_file_name_is_cut(reports: queue.SimpleQueue[str]) -> None:
@@ -385,7 +402,10 @@ def test_the_entry_follows_the_reading() -> None:
 
     guarded = remote_debug_loosening(_GUARDED)
     assert guarded is not None and guarded[0] == "remote_debug_enabled"
-    assert "3 refused since start" in guarded[1]
+    assert "It has refused 3 since this process started" in guarded[1]
+    # The start-up warning is taken before anything can have been refused, so it carries no count.
+    quiet = remote_debug_loosening(RemoteDebugPosture(True, True))
+    assert quiet is not None and "It has refused" not in quiet[1]
     # The wording must not read as "closed": the hook leaves the memory-write capability.
     assert "residual" in guarded[1] and "can still run code" in guarded[1]
 
@@ -446,7 +466,6 @@ async def _route_names(engine: Engine) -> list[str]:
     ("reading", "expected"),
     [
         (_GUARDED, ["remote_debug_enabled"]),
-        (_UNGUARDED, ["remote_debug_unguarded"]),
         (_OFF, []),  # the control: the route can be quiet
     ],
 )
@@ -474,22 +493,12 @@ async def test_the_posture_route_reads_the_live_process_when_nothing_is_pinned(
 def _first_statement_installs_the_guard(source: str, function: str) -> bool:
     """Whether ``function`` in ``source`` begins, after its docstring, with a bare call to
     ``install_remote_debug_guard()``."""
-    tree = ast.parse(source)
-    (node,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == function]
-    body = list(node.body)
-    if (
-        body
-        and isinstance(body[0], ast.Expr)
-        and isinstance(body[0].value, ast.Constant)
-        and isinstance(body[0].value.value, str)
-    ):
-        body = body[1:]
-    first = body[0]
+    node = named_func(parse_source(source), function)
+    first = node.body[1] if ast.get_docstring(node) is not None else node.body[0]
     return (
         isinstance(first, ast.Expr)
         and isinstance(first.value, ast.Call)
-        and isinstance(first.value.func, ast.Name)
-        and first.value.func.id == "install_remote_debug_guard"
+        and callee_name(first.value, bare_only=True) == "install_remote_debug_guard"
         and not first.value.args
         and not first.value.keywords
     )

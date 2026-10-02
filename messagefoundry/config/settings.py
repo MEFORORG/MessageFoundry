@@ -6745,7 +6745,8 @@ def security_loosenings(
     ``DATABASE`` hop
     with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
     ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
-    (#1008), the OBSERVED keying of the audit chain (#1905), and
+    (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
+    the engine process (vault BACKLOG #2700), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
@@ -7314,10 +7315,8 @@ def security_loosenings(
     # --- the engine PROCESS's observed remote-debugging state (vault BACKLOG #2700). An observation
     # like the two above: no setting declares it, it follows from how the interpreter was started.
     # The wording lives beside the hook, in one place for this registry and `supervise`.
-    if remote_debug is not None:
-        remote_debug_entry = remote_debug_loosening(remote_debug)
-        if remote_debug_entry is not None:
-            out.append(remote_debug_entry)
+    if remote_debug is not None and (entry := remote_debug_loosening(remote_debug)) is not None:
+        out.append(entry)
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.

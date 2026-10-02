@@ -40,7 +40,6 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline import Engine
-from messagefoundry.remotedebug import RemoteDebugPosture
 
 
 def _ad(**over: object) -> AuthSettings:
@@ -1657,18 +1656,6 @@ def test_the_revocation_attestation_is_actually_wired() -> None:
 # --- the API surface: GET /security/posture reports store + auth deviations --------------------
 
 
-def _interpreter_started_with_remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the PROCESS reading the posture route takes (vault BACKLOG #2700).
-
-    The route reports whether the interpreter it runs in accepts an injected script, and under
-    pytest that follows how pytest was started. A test about the SETTINGS defaults pins it to the
-    hardened launch. ``tests/test_remote_debug_guard.py`` covers the other readings."""
-    monkeypatch.setattr(
-        "messagefoundry.api.app.remote_debug_posture",
-        lambda: RemoteDebugPosture(interpreter_enabled=False, guard_installed=False),
-    )
-
-
 async def _posture_body(engine: Engine, **state: object) -> dict[str, object]:
     app = create_app(engine, allow_no_auth=True)
     for key, value in state.items():
@@ -1700,11 +1687,9 @@ async def test_posture_route_reports_the_auth_deviation(engine: Engine) -> None:
     assert "ad_session_recheck_seconds" in switches
 
 
-async def test_posture_route_reports_the_plaintext_hop_acknowledgement(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.usefixtures("remote_debugging_off")  # the process reading, pinned: see the fixture
+async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: Engine) -> None:
     """BACKLOG #1179: the route reads [api] off the resolved settings serve stashes (#1989)."""
-    _interpreter_started_with_remote_debugging_off(monkeypatch)
     body = await _posture_body(
         engine, static_credential_settings=ServiceSettings(api=_terminated(ack=True))
     )
@@ -1717,15 +1702,13 @@ async def test_posture_route_reports_the_plaintext_hop_acknowledgement(
     assert quiet["loosenings"] == []
 
 
-async def test_posture_route_reports_nothing_at_the_shipped_defaults(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.usefixtures("remote_debugging_off")
+async def test_posture_route_reports_nothing_at_the_shipped_defaults(engine: Engine) -> None:
     """The route must be quiet on a default instance, or its signal is worthless.
 
     Default SETTINGS, on an interpreter started with remote debugging off. A default launch through
     the console script leaves it on, and the route then names it: see
     ``tests/test_remote_debug_guard.py``."""
-    _interpreter_started_with_remote_debugging_off(monkeypatch)
     body = await _posture_body(engine)
     assert body["loosenings"] == []
 

@@ -1141,6 +1141,44 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **On a store with no key at all this entry never fires.** That chain is keyless by the audited
   at-rest opt-out, which `allow_unencrypted_phi` already reports.
 
+### `remote_debug_enabled` and `remote_debug_unguarded`: the interpreter accepts a script from another process
+
+> **An OBSERVATION, not a switch.** No setting declares it. It follows from how the interpreter of
+> the engine process was started. Vault BACKLOG #2700.
+- **What it is:** Python 3.14 lets another process run a script inside a running interpreter
+  (PEP 768, `sys.remote_exec`). The caller must be able to write the target's memory. On a default
+  Windows or Linux host, a process running as the same account can. The interface is on unless the
+  interpreter starts with `-X disable-remote-debug` or `PYTHON_DISABLE_REMOTE_DEBUG=1`.
+- **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** `serve` and
+  `supervise` install an audit hook as their first step. The interpreter raises an event before it
+  runs an injected script. The hook raises on that event, and the interpreter then drops the
+  script. Each refusal logs a WARNING with the script's file name, and the entry carries the count.
+  The interpreter also writes one line with the script's full path to the engine's standard error.
+  **This is a residual, not a closed path.** A process that can write the engine's memory can run
+  code in it by other means, and can remove a hook. A script injected before the hook is in place
+  runs.
+- **`remote_debug_unguarded`: the interface is on, and the hook is not installed.** A process
+  running as the engine's account could run Python inside the engine, with the store key, the
+  connection secrets and the messages in flight. An application that builds the API without
+  `serve` reports this. `serve` would report it only if another audit hook refused the engine's.
+- **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
+  the engine's own process. `supervise` logs one WARNING at start for the supervisor process. Engine
+  shards and the sandbox worker start with the interface off and report nothing.
+  `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
+  line says so.
+- **A default start reports `remote_debug_enabled`.** `messagefoundry serve` runs through a
+  console-script launcher, which cannot pass an interpreter option, so the interface stays on. The
+  installed service and the container image start the same way, and neither sets the option or the
+  variable yet.
+- **How to clear it:** start the engine as
+  `python -P -X disable-remote-debug -m messagefoundry serve ...`. Spell the option with hyphens: the
+  interpreter accepts the underscore spelling and ignores it. `-P` keeps the working directory off
+  the import path, which `python -m` would otherwise put first.
+  `PYTHON_DISABLE_REMOTE_DEBUG=1` in the engine's environment also works, but the interpreter
+  ignores it under `-I` or `-E`.
+- **It is not refused**, at any `enforcement` level. A refusal would stop every start through the
+  console script.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)

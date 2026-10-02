@@ -4020,6 +4020,31 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   entry rather than enforced by the engine. 11.7.2's encrypt-after-use guarantee is active only on a
   keyed instance (a key must be configured), which is already the case for any PHI-bearing deployment.
 
+### Remote debugging of the engine process (PEP 768)
+
+Python 3.14 lets another process run a script inside a running interpreter. The caller must be able
+to write the target's memory, which a process running as the same account can do on a default
+Windows or Linux host. On a first deployment, code running as the service account would be able to
+run Python inside the engine that way, with everything the engine holds.
+
+Two controls answer it, and they differ in strength:
+
+- **The engine's children start with the interface off.** The sandbox worker, the engine shards and
+  the child that loads the config before any shard starts all run with `-X disable-remote-debug`.
+  See the `[sandbox]` table in [CONFIGURATION.md](CONFIGURATION.md) and
+  `messagefoundry/childenv.py`.
+- **The engine process itself refuses the script.** `serve` and `supervise` start through a
+  console-script launcher, which cannot pass that option. So each installs an audit hook as its
+  first step (`messagefoundry/remotedebug.py`). The interpreter raises an event before it runs an
+  injected script, the hook raises on it, and the interpreter drops the script. The hook logs a
+  WARNING with the script's file name.
+
+The hook is the weaker of the two. It closes the interpreter's own interface, not the memory-write
+capability under it, and a script injected before the hook is in place runs. So an engine that
+starts with the interface on reports it: the loosening `remote_debug_enabled`, described in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Neither the installed service nor the container
+image turns the interface off at launch yet, and `serve` does not refuse to start with it on.
+
 ### HIPAA §164.312 alignment
 
 - **Unique user identification** (required) — every user is a distinct account; no shared logins.

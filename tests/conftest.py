@@ -376,6 +376,23 @@ def _quiesce_background_loggers_at_teardown(
 
 
 @pytest.fixture
+def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the PROCESS reading ``GET /security/posture`` takes to the hardened launch (vault
+    BACKLOG #2700).
+
+    The route reports whether the interpreter it runs in accepts an injected script, and under
+    pytest that follows how pytest was started. OPT-IN, for a test whose subject is the SETTINGS
+    posture and which asserts the exact list. ``tests/test_remote_debug_guard.py`` covers the
+    other readings."""
+    from messagefoundry.remotedebug import RemoteDebugPosture
+
+    monkeypatch.setattr(
+        "messagefoundry.api.app.remote_debug_posture",
+        lambda: RemoteDebugPosture(interpreter_enabled=False, guard_installed=False),
+    )
+
+
+@pytest.fixture
 def bounded_warn_only_retention(monkeypatch: pytest.MonkeyPatch) -> None:
     """BACKLOG #1967: an enforcing start refuses a warn-only retention tier with neither a window nor
     its acknowledgement. OPT-IN, never autouse, so a test module names the gate it stands down
