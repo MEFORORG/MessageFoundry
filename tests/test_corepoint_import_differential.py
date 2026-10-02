@@ -108,8 +108,8 @@ _STATEMENT_VERBS = frozenset(
     {"itemappend", "itemclear", "itemcopy", "msgcreate", "msglog", "msgsend", "msgtreecopy"}
 )
 _LABEL_STATEMENT_WHY = (
-    "not on a Line, so whether Corepoint runs it is not known; nothing is mapped for it, and no "
-    "role-marked handle in this list is taken to be msg"
+    "not on a Line, so it may never have run; nothing is mapped and no role-marked handle here "
+    "is taken to be msg"
 )
 
 
@@ -127,7 +127,8 @@ def _label_statement(elem: Element) -> str:
         if rendered != "send" and rendered == _KIND_BY_VERB.get(lowered):
             return ""
     leads = next((token for token in roles if token.role not in _PROSE_ROLES), None)
-    styled = kind == "block" and leads is not None and leads.role == "keyword" and _role_verb(roles)
+    bare = kind == "block" or tag in _LIST_TAGS
+    styled = bare and leads is not None and leads.role == "keyword" and _role_verb(roles)
     return verb if lowered in _STATEMENT_VERBS or styled else ""
 
 
@@ -160,8 +161,18 @@ _STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
         "        if _label_statement(elem):\n            return frozenset(), frozenset()\n"
         + _SCAN_SKIP,
     ),
-    # The render, a ``<List>`` wrapper: the marker ahead of the flattened body.
-    (_WRAPPER_FLATTEN, "            steps.extend(_label_marker(child))\n" + _WRAPPER_FLATTEN),
+    # The render, a ``<List>`` wrapper: the marker ahead of the flattened body, and ahead of a
+    # construct that may still adopt a sibling branch marker after the wrapper.
+    (
+        _WRAPPER_FLATTEN,
+        "            adopting = (\n"
+        "                bool(steps)\n"
+        "                and isinstance(steps[-1], Control)\n"
+        "                and steps[-1].kind in _BRANCH_PARENT.values()\n"
+        "            )\n"
+        "            at = len(steps) - 1 if adopting else len(steps)\n"
+        "            steps[at:at] = _label_marker(child)\n" + _WRAPPER_FLATTEN,
+    ),
     # The render, an unmodelled tag: the statement is named in the marker that tag already has.
     (_UNKNOWN_ARM, "    marker = _label_marker(elem)\n" + _UNKNOWN_ARM),
     (
@@ -170,7 +181,7 @@ _STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
         '        return [Control("unknown", tag, detail, body=tuple(body))]\n'
         # A send in a Block's or a Call's ``@Data`` is never a live send.
         '    if marker and kind == "send":\n'
-        "        kind, source = _CONTAINER_KIND_BY_TAG[tag.lower()], tag\n",
+        '        kind, source = "block", tag\n',
     ),
     # The render, a container: the marker ahead of its body, or ahead of the construct.
     (_BLOCK_RETURN, _BLOCK_RETURN.replace("body=tuple(body)", "body=(*marker, *body)")),
@@ -2215,6 +2226,20 @@ def _label_statement_shapes() -> Iterator[Shape]:
                     "%ADT",
                     (carrying(tag, f"{spelling} %NEW/ to %ADT/"), SendS(_ADT, "OB_IN")),
                 )
+    # A wrapper holding a statement, between a construct and the branch marker written after it
+    # as a sibling. The marker must not come between the two: an orphaned branch renders live.
+    arm = (Write(_ADT, "W5Z", markup=False), SendS(_ADT, "OB_ARM", markup=False))
+    for name, construct, branch in (
+        ("if-else", '<If Data="If (x)"><List/></If>', "Else"),
+        ("if-elseif", '<If Data="If (x)"><List/></If>', "ElseIf (y)"),
+        ("try-catch", "<Try><List/></Try>", "Catch"),
+        ("case-matching", '<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M0"'),
+    ):
+        for label, data in (("log", "MsgLog %ADT"), ("clone", clone)):
+            between = Raw(
+                construct + carrying("List", data).xml + _line(branch, _render(arm, "%ADT"))
+            )
+            yield Shape(f"2632-List-{label}-before-a-sibling-{name}", "%ADT", (between,))
     # A keyword span that does not lead a Block's label, and a table verb that does not lead it:
     # both still read as a label.
     connective = f"Copy patient {_kw('to')} output"
@@ -2672,7 +2697,7 @@ def test_the_amendment_reaches_every_seed_written_for_it() -> None:
     assert _amendment_changes(recorded)
     for shape in _label_statement_shapes():
         _, tag, kind = shape.name.split("-", 2)
-        expected = tag == "Block" if kind == "keyword" else tag != "not"
+        expected = tag in ("Block", "Actions") if kind == "keyword" else tag != "not"
         assert _amendment_changes(shape) is expected, shape.name
 
 
