@@ -527,8 +527,8 @@ _CLIENT_ALLOWED: Mapping[str, _Allowance] = MappingProxyType(
         ),
         "harness/coverage.py": _Allowance(
             frozenset({"messagefoundry.transports"}),
-            "reads the live connector registries, read-only, to report which connector kinds the "
-            "scenarios cover; the registries have no public listing (vault BACKLOG #2672)",
+            "reads the live connector registries, read-only, through the public registered_kinds "
+            "accessor, to report which connector kinds the scenarios cover (vault BACKLOG #2672)",
         ),
         "harness/load/shardcert.py": _Allowance(
             frozenset({"messagefoundry.config", "messagefoundry.pipeline", "messagefoundry.store"}),

@@ -71,7 +71,7 @@ services:
     image: messagefoundry:latest
 
     # serve loads the config modules from /config and runs the 'prod' environment (production posture:
-    # PHI-at-rest fail-closed, deny-by-default egress, MFA-for-local-admins). env() value files resolve
+    # PHI-at-rest fail-closed, deny-by-default egress, MFA on for every account). env() value files resolve
     # under /config/environments/ (MEFOR_ENVIRONMENTS_BASE_DIR is /config in the image).
     command: ["serve", "--config", "/config", "--env", "prod"]
 
@@ -84,7 +84,7 @@ services:
       MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
       MEFOR_INBOUND_BIND_HOST: "0.0.0.0"   # MLLP listener off-loopback; each MLLP() MUST set tls=True (gate)
       # --- production guardrails (the engine refuses to start off-loopback without these) ---
-      MEFOR_SECURITY_REQUIRE_MFA: "true"        # required for local Administrator accounts on an exposed PHI bind
+      MEFOR_SECURITY_REQUIRE_MFA: "true"        # the default; covers directory accounts too. Off + exposed = refused under enforce
       MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # fail closed if no store key (PHI at rest must not be plaintext)
       # --- deny-by-default egress (prod posture) — list YOUR graph's outbound destinations ---
       MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"

@@ -491,7 +491,7 @@ def test_the_line_annotator_agrees_with_the_toml_fence_extractor() -> None:
 
 # THE MEASURED BASELINE, AND WHY THIS IS A RATCHET RATHER THAN A CLEAN GATE.
 #
-# 24 documents carry 55 of these citations -- the row count and the sum of the table below, pinned
+# 23 documents carry 54 of these citations -- the row count and the sum of the table below, pinned
 # by test_the_header_count_matches_the_table, because two drafts of this line have already drifted
 # from the dict they describe: one said 58 against a sum of 59, and the document count read 27
 # against 26 rows. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY -- the ASVS tracker
@@ -600,7 +600,6 @@ _BASELINE: dict[str, int] = {
     "docs/adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md": 1,
     "docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md": 2,
     "docs/adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md": 1,
-    "docs/CLOUD-PHI-HIPAA.md": 1,
     "docs/CONFIGURATION.md": 3,
     # Fence + section: was 9, the single largest false-positive cluster in the corpus and the one
     # that made both instruments load-bearing at once -- 6 were `python` fences (connector and
@@ -701,8 +700,8 @@ def test_the_header_count_matches_the_table() -> None:
     # `_SCAN_GENERATION == _SCAN_GENERATION` would pass whatever it said, which is the vacuous shape
     # this file keeps pairing controls against. Change the constant and this literal together.
     assert (len(_BASELINE), sum(_BASELINE.values()), _SCAN_GENERATION) == (
-        24,
-        55,
+        23,
+        54,
         "fence-aware + section-aware, 2026-09-20",
     )
 

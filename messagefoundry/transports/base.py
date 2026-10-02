@@ -63,6 +63,8 @@ __all__ = [
     "register_destination",
     "build_source",
     "build_destination",
+    "RegisteredKinds",
+    "registered_kinds",
     "ECH_UNSUPPORTED_DESTINATION_MSG",
     "ECH_UNSUPPORTED_SOURCE_MSG",
     "peer_ip_allowed",
@@ -871,6 +873,37 @@ def _register[B](
             "pass replace=True to replace it deliberately"
         )
     table[kind] = builder
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RegisteredKinds:
+    """The connector kinds the registry holds a builder for, per direction. See :func:`registered_kinds`.
+
+    A dataclass, not a tuple: both fields have the same type, so positional unpacking or comparison
+    against a plain pair could swap the directions with no type error. Keyword-only construction,
+    so neither field can be filled by position."""
+
+    sources: frozenset[ConnectorType]
+    destinations: frozenset[ConnectorType]
+
+
+def registered_kinds() -> RegisteredKinds:
+    """A read-only snapshot of which kinds have an inbound and which an outbound builder.
+
+    The public way to ask "what connectors exist" without reaching into ``_SOURCES`` /
+    ``_DESTINATIONS``, so a client (the test harness's ``--coverage`` report) depends on no
+    private engine name. Engine-side tests still read the tables directly.
+
+    It lists the kinds registered when it is called. Take it from the package,
+    ``from messagefoundry.transports import registered_kinds``: that import completes the package
+    ``__init__``, which registers every built-in, or raises. Importing ``transports.base`` alone
+    does not guarantee that. The answer is partial in at least these cases: a call made while the
+    package ``__init__`` is still running (from a connector module at import time, or from another
+    thread), and a call after a failed package import. The two tables are copied one after the
+    other, not as one atomic snapshot; registration finishing at import is what makes that safe.
+    The builders are deliberately not exposed: building a connector goes through
+    :func:`build_source` / :func:`build_destination`, which carry the checks."""
+    return RegisteredKinds(sources=frozenset(_SOURCES), destinations=frozenset(_DESTINATIONS))
 
 
 # --- ECH egress: refuse the key where it would be a silent no-op (ADR 0139, ASVS 12.1.5, #1176) ----
