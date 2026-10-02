@@ -19,6 +19,7 @@ import pytest
 
 from harness.load.connscale import remote as rr
 from harness.load.connscale.runner import ConnScaleError
+from harness.load.rigadmin import REMOTE_RIG_SESSION
 
 
 def test_check_remote_bands_disjoint_and_overlap() -> None:
@@ -40,7 +41,9 @@ def test_check_remote_bands_disjoint_and_overlap() -> None:
 
 
 def _install_remote_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
-    rec = types.SimpleNamespace(driver_hosts=[], driver_bases=[], sink=None, poller_urls=[])
+    rec = types.SimpleNamespace(
+        driver_hosts=[], driver_bases=[], sink=None, poller_urls=[], poller_tokens=[]
+    )
 
     class FakeDriver:
         def __init__(
@@ -82,6 +85,7 @@ def _install_remote_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
     class FakePoller:
         def __init__(self, urls: Any, token: Any = None, *, origin: Any = None) -> None:
             rec.poller_urls.append(list(urls))
+            rec.poller_tokens.append(token)
             self.baseline: Any = None
             self.final: Any = None
 
@@ -133,6 +137,9 @@ async def test_run_connscale_remote_wires_remote_engines_and_local_sink(
     assert rec.sink == (loadgen_ip, (40000, 40001, 40002, 41000, 41001, 41002))
     # The poller reads the REMOTE engine /stats URLs.
     assert rec.poller_urls == [[f"http://{engine_ip}:9000", f"http://{engine_ip}:9001"]]
+    # ...signed in, and with the credential that ANOTHER process's engines were provisioned with:
+    # the remote marker refuses to draw one of its own, which could only be wrong there.
+    assert rec.poller_tokens == [REMOTE_RIG_SESSION]
     assert report.engine_bands == 2
     assert report.sink_ports == (40000, 40001, 40002, 41000, 41001, 41002)
     assert report.engine_index_base == 2

@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,7 @@ from messagefoundry.transports.base import (
     build_source,
     register_destination,
     register_source,
+    registered_kinds,
 )
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 
@@ -213,6 +216,68 @@ def test_replace_true_replaces_and_a_first_registration_needs_no_flag(
 
     register_destination(ConnectorType.MLLP, _destination_builder, replace=True)
     assert destinations[ConnectorType.MLLP] is _destination_builder
+
+
+def test_registered_kinds_is_the_live_registry_per_direction() -> None:
+    """The public accessor the harness reads in place of the private tables. Equality with the
+    tables is the claim; the MLLP pins are the control that the import really populated them."""
+    kinds = registered_kinds()
+    assert kinds.sources == frozenset(transport_base._SOURCES)
+    assert kinds.destinations == frozenset(transport_base._DESTINATIONS)
+    assert ConnectorType.MLLP in kinds.sources
+    assert ConnectorType.MLLP in kinds.destinations
+
+
+def test_the_package_import_alone_registers_every_built_in() -> None:
+    """The harness takes the accessor with ``from messagefoundry.transports import ...`` and
+    nothing else. This module imports the package itself, so an in-process check would pass on
+    that import; a fresh interpreter proves the one-line import is enough on its own."""
+    probe = (
+        "from messagefoundry.transports import registered_kinds as r\n"
+        "k = r()\n"
+        "print(','.join(sorted(x.value for x in k.sources)))\n"
+        "print(','.join(sorted(x.value for x in k.destinations)))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True, timeout=120
+    ).stdout.splitlines()
+    here = registered_kinds()
+    assert out == [
+        ",".join(sorted(x.value for x in here.sources)),
+        ",".join(sorted(x.value for x in here.destinations)),
+    ]
+    assert "mllp" in out[0].split(",")
+
+
+def test_registered_kinds_follows_a_registration_made_after_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot taken at call time, not at import: a kind registered later appears, in its own
+    direction only, and an earlier snapshot does not change under it. Runs against fresh empty
+    tables swapped in for the real ones, so the real registry is untouched."""
+    monkeypatch.setattr(transport_base, "_SOURCES", {})
+    monkeypatch.setattr(transport_base, "_DESTINATIONS", {})
+    before = registered_kinds()
+    assert before.sources == frozenset()
+    assert before.destinations == frozenset()
+
+    def _source_builder(config: Source) -> SourceConnector:
+        raise NotImplementedError
+
+    def _destination_builder(config: Destination) -> DestinationConnector:
+        raise NotImplementedError
+
+    register_source(ConnectorType.TCP, _source_builder)
+    after_source = registered_kinds()
+    assert after_source.sources == {ConnectorType.TCP}
+    assert after_source.destinations == frozenset()
+
+    register_destination(ConnectorType.FILE, _destination_builder)
+    after_both = registered_kinds()
+    assert after_both.sources == {ConnectorType.TCP}
+    assert after_both.destinations == {ConnectorType.FILE}
+    assert before.sources == frozenset()
+    assert before.destinations == frozenset()
 
 
 # --- stop() is idempotent --------------------------------------------------------------------------

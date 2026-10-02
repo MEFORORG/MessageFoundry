@@ -43,12 +43,18 @@ from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, NoLoss
 from harness.load.connscale.runner import ConnScaleError, _reconcile
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
+from harness.load.enginepoll import (
+    SIGN_IN_ERRORS,
+    EnginePoller,
+    EngineSample,
+    sample_until_reconciled,
+)
 from harness.load.failover import _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.multishard import _build_ms_corpus
 from harness.load.profile import TypeMix
+from harness.load.rigadmin import REMOTE_RIG_SESSION
 
 _STOP_GRACE = 5.0
 _SETTLE = 0.5
@@ -277,13 +283,22 @@ async def run_connscale_remote(
         )
         for k in range(n)
     ]
-    poller = EnginePoller(engine_urls, token=None, origin=time.perf_counter())
+    # The engines are another process's (the batch engine half, or an operator's), and they
+    # serve with sign-in on. This process signs in as the same rig Administrator: a child of a
+    # harness process inherits the credential, and any other process must be given it
+    # (MEFOR_RIG_ADMIN_USERNAME / MEFOR_RIG_ADMIN_PASSWORD, see harness.load.rigadmin). The REMOTE
+    # marker refuses to sign in without one: a password drawn here could only be wrong.
+    poller = EnginePoller(engine_urls, token=REMOTE_RIG_SESSION, origin=time.perf_counter())
     samples: list[EngineSample] = []
     notes: list[str] = []
     aggregate_rate = per_conn_rate * count  # per band
     try:
         await sink.start()
-        await poller.open()
+        try:
+            await poller.open()
+        except SIGN_IN_ERRORS as exc:
+            # A setup failure, in words: under the batch driver this process's stderr is discarded.
+            raise ConnScaleError(f"could not sign in to the engines: {exc}") from exc
         await poller.sample_once()  # aggregate baseline
 
         # Preflight EVERY band's inbound block reachable on the ENGINE box before the hold.

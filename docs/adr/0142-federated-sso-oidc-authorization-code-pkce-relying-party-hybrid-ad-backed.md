@@ -229,6 +229,11 @@ documents on **our** origin and does not block an IdP-served POST binding) would
 reversal on a bad premise. Demand-gate trigger: **a named deployment whose IdP will not issue an OIDC
 application registration for the console.**
 
+*Amended 2026-10-02 (vault BACKLOG #2315):* the verify path no longer discards the verifier's
+return value. It refuses any document the signature does not wholly cover and returns the signed
+bytes as `signed_content`. That refusal also rejects the SAML shape of a signed assertion inside an
+unsigned response, so the decline stands on the other grounds listed above.
+
 ## Consequences
 
 **Positive** — Closes #99(g) with a real (IdP-asserted, signature-verified) MFA signal instead of an

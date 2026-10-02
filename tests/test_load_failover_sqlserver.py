@@ -28,6 +28,7 @@ from _failover_load_support import (
 )
 
 from harness.load.failover import run_failover_load
+from tests._rig_store import reset_accounts
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -71,6 +72,7 @@ async def _reset_store() -> None:
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
 async def test_failover_load_sqlserver() -> None:
     await _reset_store()
+    await reset_accounts("sqlserver")  # the rig provisions its own Administrator
     report = await run_failover_load(
         failover_test_profile(),
         ports=reserve_failover_ports(),
