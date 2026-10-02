@@ -400,6 +400,7 @@ So the relaunch now builds its command line with `childenv.python_child_argv`, a
 directory back under `-P`.
 
 This adds `messagefoundry.childenv` to the tray-importable list, on the same terms as the modules above. It
-imports only the standard library. `tests/test_tray_branding.py` pins the command line and the environment.
+is accepted because `childenv` imports only the standard library, so it brings none of the packages the
+tray must never import. `tests/test_tray_branding.py` pins the command line and the environment.
 
 The **Must never import** list is unchanged.

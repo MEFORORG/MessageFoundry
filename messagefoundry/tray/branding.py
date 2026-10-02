@@ -43,9 +43,6 @@ from messagefoundry.tray import __version__
 
 log = logging.getLogger("messagefoundry.tray.branding")
 
-#: The module the branded child runs, as ``python -m`` would.
-_TRAY_MODULE = "messagefoundry.tray"
-
 _LEADING_DIGITS = re.compile(r"\d+")
 
 BRANDED_EXE_NAME = "MessageFoundryTray.exe"
@@ -352,7 +349,7 @@ def relaunch_branded() -> bool:
         # tray needs the user's whole environment; engine_environment is that, less any PYTHONPATH
         # entry that would put the working directory back.
         child = subprocess.Popen(  # nosec B603 - fixed argv (our own branded launcher, the child interpreter flags, our own bootstrap script, a module name), shell=False
-            python_child_argv(_TRAY_MODULE, executable=str(branded)),
+            python_child_argv("messagefoundry.tray", executable=str(branded)),
             env=engine_environment(),
             close_fds=True,
         )

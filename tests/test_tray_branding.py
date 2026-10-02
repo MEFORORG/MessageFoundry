@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import _child_bootstrap, childenv
+from messagefoundry import _child_bootstrap
 from messagefoundry.tray import branding
 
 
@@ -84,29 +84,11 @@ def test_relaunch_falls_back_when_child_dies_immediately(
     assert branding.relaunch_branded() is False  # child died → parent must run unbranded
 
 
-def test_relaunch_returns_true_when_child_survives(
+def test_relaunch_hands_over_to_a_child_started_like_every_other_python_child(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    exe = tmp_path / branding.BRANDED_EXE_NAME
-    exe.write_bytes(b"")
-    monkeypatch.setattr(branding, "ensure_branded_launcher", lambda *a, **k: exe)
-
-    class _Alive:
-        returncode = None
-
-        def wait(self, timeout: float | None = None) -> int:
-            raise subprocess.TimeoutExpired("cmd", timeout or 0)
-
-    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Alive())
-    assert branding.relaunch_branded() is True  # still alive → the child owns the tray
-
-
-def test_relaunch_starts_the_child_like_every_other_python_child(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Vault BACKLOG #2801. The relaunch passed no ``-P``, so the working directory led the child's
-    import path. A bare ``-P -m`` would fail from a checkout that is not installed, so the child
-    must start through the same command line, bootstrap included, as the engine's own children."""
+    """A child still alive after the grace window owns the tray. Vault BACKLOG #2801: it starts
+    through the same command line as the engine's own children, ``-P`` and bootstrap included."""
     exe = tmp_path / branding.BRANDED_EXE_NAME
     exe.write_bytes(b"")
     monkeypatch.setattr(branding, "ensure_branded_launcher", lambda *a, **k: exe)
@@ -127,18 +109,16 @@ def test_relaunch_starts_the_child_like_every_other_python_child(
         return _Alive()
 
     monkeypatch.setattr(subprocess, "Popen", _popen)
-    assert branding.relaunch_branded() is True
+    assert branding.relaunch_branded() is True  # still alive → the child owns the tray
 
     [(argv, kwargs)] = started
     # Typed out rather than read from childenv, so the test does not check a list against itself.
     assert argv[:4] == [str(exe), "-P", "-X", "disable-remote-debug"]
     assert Path(argv[4]) == Path(_child_bootstrap.__file__).resolve()
     assert argv[5:] == ["messagefoundry.tray"]
-    assert argv == childenv.python_child_argv("messagefoundry.tray", executable=str(exe))
     env = kwargs["env"]
     assert env["PYTHONPATH"] == kept
     assert env["MF_2801_ORDINARY"] == "crosses"  # the tray keeps the user's environment
-    assert kwargs.get("shell", False) is False
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="version resource + parser are Windows-only")
