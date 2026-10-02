@@ -2245,7 +2245,7 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         # flip never builds (ad_enabled stays off). The plain-LDAP section above pins it (#2354).
         "ad_allow_insecure_ldap",
         # Security-relevant and gated ELSEWHERE, not by this registry — same owed note as [store].
-        "enabled",  # the serve-time exposed-gates refuse an exposed auth-off instance outright
+        "enabled",  # serve refuses auth off on every bind, and no config key sets it (#2719)
         "require_mfa",  # refused at exposure by the __main__ posture gates
         "ad_tls_verify",  # gated by weakened_tls_escape_permitted
         "oidc_require_mfa_claim",  # gated by the OIDC serve gate

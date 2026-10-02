@@ -72,6 +72,26 @@ async def test_one_local_administrator_with_a_password_silences_it() -> None:
         await store.close()
 
 
+async def test_a_local_administrator_whose_temporary_password_expired_does_not_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``create_admin`` writes a must-change credential. Once its deadline has passed the login gate
+    refuses it, so it is no way back in either. Before its deadline it counts (the control)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        await _directory_admin(service, "dir-a")
+        await create_admin(service)
+        assert await service.administrators_needing_an_outside_service() == ()
+        monkeypatch.setattr(service, "initial_credential_deadline", lambda _changed_at: 0.0)
+        assert await service.administrators_needing_an_outside_service() == (
+            "dir-a",
+            ADMIN_USERNAME,
+        )
+    finally:
+        await store.close()
+
+
 async def test_a_disabled_local_administrator_does_not_count() -> None:
     """A disabled local Administrator cannot sign in, so it is no way back in."""
     store = await MessageStore.open(":memory:")

@@ -1843,8 +1843,8 @@ def _serve(args: argparse.Namespace) -> int:
         print(
             "error: refusing to serve with authentication disabled; the API would answer every "
             "request as a full-privilege system identity with no sign-in. `serve` always requires "
-            "sign-in, on every bind (vault BACKLOG #2719). Create the first Administrator with "
-            "`messagefoundry provision-admin`.",
+            "sign-in, on every bind (vault BACKLOG #2719): build the settings with "
+            "[auth].enabled on.",
             file=sys.stderr,
         )
         return 2
@@ -3574,8 +3574,8 @@ def _serve(args: argparse.Namespace) -> int:
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
     # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py
     # builds the notifier only when BOTH are on, so with either off it is silently absent (which the
-    # defaults and the off-loopback runbook never set). Under enforce, an instance with sign-in on
-    # and no effective channel REFUSES to start, unless
+    # defaults and the off-loopback runbook never set). Under enforce, an instance with no effective
+    # channel REFUSES to start (sign-in is always on, vault BACKLOG #2719), unless
     # [alerts].security_notifications_required=false.
     # No instance is exempt as synthetic or dev. The refuse/warn split is [security].enforcement,
     # NOT the deployment tier — the branch below reads `enforcing`, and `enforce` is the shipped
