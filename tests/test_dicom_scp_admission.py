@@ -675,14 +675,15 @@ def test_a_pynetdicom_that_left_the_socketserver_routing_is_refused() -> None:
 
 
 def test_the_dicom_extra_admits_only_the_pynetdicom_line_the_server_was_read_against() -> None:
-    """The ``[dicom]`` extra must not admit a pynetdicom the admitting server was not read against.
+    """The ``[dicom]`` extra must admit only the pynetdicom 3.0 line, from 3.0.4 up.
 
     ``_admitting_server_class`` was read against pynetdicom 3.0.4. The routing guard above refuses a
     release that left the hooks, but only when the listener starts. The cap in ``pyproject.toml``
     stops a 3.1 or later at install time (vault BACKLOG #2713). RED when someone widens that cap or
-    lowers the floor. A 3.0.x patch above 3.0.4 is still admitted, and the routing guard is what
-    covers one. Before you change the versions below, re-read ``_admitting_server_class`` against
-    the new release; the comment above the extra in ``pyproject.toml`` has the steps.
+    lowers the floor. A 3.0.x patch above 3.0.4 is still admitted. Only the routing guard stands in
+    front of one, and it checks the routing alone. Before you change the versions below, re-read
+    ``_admitting_server_class`` against the new release; the comment above the extra in
+    ``pyproject.toml`` has the steps.
     """
     import tomllib
     from importlib.metadata import version
