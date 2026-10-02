@@ -504,9 +504,10 @@ three holds on PR 1938 each found one more list on which the branch was quieter 
 every list, against main's step 1 tree:
 
 - **(a)** The head adds no live send, inline or in a closing `return`, and no vocabulary call.
-- **(b)** The head refuses at least where main refuses. No `raise NotImplementedError` goes, at
-  any depth. A handler that main ends on a marked `return`, such as the `return None` that says no
-  destination was named, ends on that same line, and never on a bare `return sends`.
+- **(b)** Where main sends or refuses, the head sends or refuses. No `raise NotImplementedError`
+  goes, at any depth, and no send becomes a comment. A handler ends on the closing `return` main
+  gives it. So one that main ends on the `return None` that says no destination was named never
+  ends on a bare `return sends`.
 - **(c)** What main counted unmapped is still counted. What main marked `# TODO` is still marked.
 
 Louder is allowed, and it is all this amendment does: a delivery becomes a refusal, and a mapped
@@ -575,10 +576,14 @@ live send is read inline and in the handler's closing `return`. *Corrected 2026-
 of the repair, round 2):* the bound read the inline form alone, so it could not see a closing
 `return Send(...)` that the amendment added.
 
-The bound now also checks clauses (b) and (c) of "Never quieter than main", for each handler.
-It counts the refusals by depth, and none may go. A closing `return` that carries a marker must
-be main's line. Every name main counted unmapped must still be counted, and the `# TODO` lines
-must not drop. It holds the head to the same bound, against the same vendored file, wherever the
+The bound now also checks clauses (b) and (c) of "Never quieter than main". It counts the loud
+lines of the handler by depth: each live send, each refusal, and each guard that re-raises a
+refusal ahead of a Catch. None may go. The closing `return` must be main's line. Every name main
+counted unmapped must still be counted, and the `# TODO` lines must not drop. Depth stands in for
+"runs": a line one level in sits under a dead placeholder, or in a `try`. The shape test is what
+keeps a line from moving between those two.
+
+It holds the head to the same bound, against the same vendored file, wherever the
 gate is closed. And `test_no_raw_list_is_quieter_than_main` runs it over the 4,000 lists drawn
 with no grammar, which the next paragraphs describe. *Corrected 2026-10-02 (the Lander's second
 hold):* the bound checked none of that and read the battery alone. Every seed put a send main
@@ -648,14 +653,16 @@ baseline copy alike.
 
 | | Battery, of 8,093 | Raw lists, of 4,000 |
 |---|---|---|
-| The bound is red, with the earlier rule put back | 8 | 128 |
+| The bound is red, with the earlier rule put back | 20 | 429 |
+| The same, counting refusals alone and not sends | 8 | 128 |
 | The bound is red, with the repair in place | 0 | 0 |
 
-All 8 are new seeds. So no check could show the defect on the 8,083 older shapes, and the raw
-lists could show it once the bound read them. The two seeds with a second send beside the first
-stay green either way: the scan holds no handle for that list, so the second send is refused in
-its turn and the handler raises as often as main's does. This is still a sample. It shows no
-quieter list among those it draws, not that none exists.
+The second row is the first cut of this check, which counted only the refusals. All 8 of its
+battery shapes are new seeds. So a lost refusal could not show on the 8,083 older shapes by any
+check, and it showed on the raw lists once the bound read them. Counting sends too adds ten older
+seeds, where main delivers the send and the earlier rule left a comment. The count is the same
+with the earlier rule in the head alone. This is still a sample. It shows no quieter list among
+those it draws, not that none exists.
 
 The measurement below is older. It was taken the same day at `880f431d94`, before the repair, and
 was not run again. The battery then held 7,968 shapes, 512 of them fixed seeds. The 181 seeds new
