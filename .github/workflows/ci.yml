@@ -911,6 +911,10 @@ jobs:
           RETRY_NATIVE_CRASH_CAUSE: ""
           # BACKLOG #2084: this leg installs [sftp]; the guard test fails if paramiko cannot import.
           MEFOR_REQUIRE_SFTP_EXTRA: "1"
+          # BACKLOG #1415: the leg, spelled as the connscale-readings artifact suffix. The connscale
+          # smoke arms the predicted herd floor only on the legs its harvest cleared, and this is
+          # the one place a leg is named; a run that does not set it is never graded.
+          MEFOR_CONNSCALE_LEG: ${{ matrix.os }}-py${{ matrix.python-version }}
         # `--ignore-glob` subtracts the web console package, which runs as its OWN step below. BACKLOG
         # #1027 added that package to the root `testpaths` so a bare local `pytest` stops silently
         # excluding it; without this subtraction the SAME 356 tests would then run TWICE on every leg.

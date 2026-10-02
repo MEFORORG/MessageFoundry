@@ -866,6 +866,7 @@ class ConnScaleReport:
         context: dict[str, str] | None = None,
         max_rows: int = _MAX_SUMMARY_ROWS,
         base_count: int | None = None,
+        enforced: bool = False,
     ) -> str:
         """Every reading of one monotonic metric as a markdown table — the passing ones included.
 
@@ -915,8 +916,16 @@ class ConnScaleReport:
             f"{1.0 - tolerance:.2f}. For this metric it is RECORDED AND NO LONGER ENFORCED -- an "
             f"OUTSIDE BAND row here fails nothing. The width is left untouched, but the VALUES "
             f"changed window at BACKLOG #1420: readings harvested before that change are not "
-            f"comparable with these (the JSON copy carries `rate_window`). What IS asserted, and "
-            f"the predicted floor that is not, are below."
+            f"comparable with these (the JSON copy carries `rate_window`)."
+            # Only when the floor table below will actually render: a sentence about a table the
+            # early return drops would tell the reader the opposite of what was graded.
+            + (
+                ""
+                if base_count is None or not rows
+                else " The predicted herd floor below IS ENFORCED on this leg (BACKLOG #1415)."
+                if enforced
+                else " The predicted herd floor below is recorded and not enforced on this leg."
+            )
         )
         head.append("")
         if not rows:
@@ -929,7 +938,7 @@ class ConnScaleReport:
             out.append("")
             out.append(f"{dropped} further row(s) not shown: capped at {max_rows}.")
         if base_count is not None:
-            out.extend(self._render_herd_floor_rows(key, base_count=base_count))
+            out.extend(self._render_herd_floor_rows(key, base_count=base_count, enforced=enforced))
         return "\n".join(out) + "\n"
 
     def _render_herd_floor_rows(
@@ -937,13 +946,15 @@ class ConnScaleReport:
         key: Callable[[ConnScaleRecord], float | int | None],
         *,
         base_count: int,
+        enforced: bool = False,
     ) -> list[str]:
         """The base-count reading against the level its own configuration predicts.
 
-        RECORDED, NOT GATED (BACKLOG #1415). This table is what a later harvest reads to decide whether
-        the predicted floor can become a merge gate, and it is written from the emitter that already
-        runs on every pass and every failure -- so that decision will rest on a distribution rather
-        than on excursions, which is the whole lesson of #1211 limb one.
+        RECORDED ON EVERY RUN, GATED ONLY WHERE ``enforced`` (BACKLOG #1415). The caller says whether
+        this run's leg is one the profile arms, and the heading says which, so a step summary never
+        tells its reader a BELOW FLOOR row failed nothing when it did. The table comes from the
+        emitter that runs on every pass and every failure, so the harvest behind the arming rests on
+        a distribution rather than on excursions, the lesson of #1211 limb one.
 
         The verdict column renders THREE ways because :attr:`HerdFloorReading.ok` has three states.
         ``None`` is falsy, so a two-way truthiness test would print an ungraded lane as a breach and
@@ -952,12 +963,18 @@ class ConnScaleReport:
         readings = herd_floor_readings(self.records, key, base_count=base_count)
         out = [
             "",
-            f"### predicted herd floor at N={base_count} (recorded, not enforced -- BACKLOG #1415)",
+            f"### predicted herd floor at N={base_count} "
+            f"({'ENFORCED on this leg' if enforced else 'recorded, not enforced'} -- BACKLOG #1415)",
             "",
             f"Predicted from the sweep's own configuration: "
             f"{CONNSCALE_WORKERS_PER_CONNECTION} workers per connection, "
             f"{ENGINE_IDLE_POLL_INTERVAL_S}s engine idle-poll backstop. No number here was chosen "
-            f"against an observed reading, and no merge gate rides on it.",
+            f"against an observed reading. "
+            + (
+                "This leg's harvest cleared the arming rule, so a BELOW FLOOR row fails the run."
+                if enforced
+                else "No merge gate rides on it on this leg."
+            ),
             "",
             "| lane | N | reading | predicted total | floor | margin | verdict |",
             "|---|---|---|---|---|---|---|",
@@ -981,6 +998,7 @@ class ConnScaleReport:
         tolerance: float,
         context: dict[str, str] | None = None,
         base_count: int | None = None,
+        enforced: bool = False,
     ) -> dict[str, object]:
         """The same readings as :meth:`render_readings_markdown`, machine-readable.
 
@@ -1057,15 +1075,15 @@ class ConnScaleReport:
             "readings": readings,
         }
         if base_count is not None:
-            # RECORDED, NOT ENFORCED (BACKLOG #1415). This block is what a later harvest reads to decide
-            # whether the predicted floor can become a gate; writing it from the same emitter that
-            # already runs on every pass and every failure is why that decision will rest on a
-            # distribution rather than on excursions, which is the whole lesson of #1211 limb one.
+            # RECORDED ON EVERY RUN, ENFORCED ONLY ON AN ARMED LEG (BACKLOG #1415). This block is what
+            # the harvest read to decide where the predicted floor could become a gate; writing it from
+            # the emitter that runs on every pass and every failure is why that decision rests on a
+            # distribution rather than on excursions, the whole lesson of #1211 limb one.
             payload["herd_floor"] = {
                 "base_count": base_count,
                 "workers_per_connection": CONNSCALE_WORKERS_PER_CONNECTION,
                 "idle_poll_interval_s": ENGINE_IDLE_POLL_INTERVAL_S,
-                "enforced": False,
+                "enforced": enforced,
                 "readings": [
                     {
                         "lane": r.label,

@@ -56,3 +56,125 @@ entry that names a path inside a force-included tree. A guard test
 ([../../../tests/test_load_config.py](../../../tests/test_load_config.py)) asserts the shipped
 profiles + load config carry none of a denylist of real tokens. Generated traffic is synthetic HL7
 (the `messagefoundry` generators); run artifacts carry metrics only — never message bodies.
+
+## The connscale herd floor is armed on ubuntu-latest only (2026-10-01, BACKLOG #1415)
+
+The predicted empty-claims herd floor now fails a CI run on the `ubuntu-latest` py3.14 leg, and only
+there. Both Windows legs failed the margin clause of the arming rule, so the floor stays recorded
+and not graded on them.
+
+Where it lives:
+
+- The `[connscale.slo]` key `empty_claims_herd_floor_legs` names the legs it is armed on
+  ([../connscale/profile.py](../connscale/profile.py)). The check is
+  `_empty_claims_herd_floor_slo` in [../connscale/runner.py](../connscale/runner.py).
+- A leg is `<matrix os>-py<python version>`. ci.yml's `Tests (pytest)` step exports it as
+  `MEFOR_CONNSCALE_LEG`. A run without it, such as a local run, is never graded.
+- It is armed in the inline N=12/24 profile in `tests/test_connscale_smoke.py`, which is what CI
+  runs. It is not armed in `connscale-smoke.toml`: that file's base count is N=50, nothing runs it,
+  and no harvest exists at that point.
+
+### The harvest covers every event and gives each cell 137 to 144 passing readings
+
+The scan covered every `ci.yml` run of any event created from 2026-09-30T12:00:00Z to
+2026-10-01T20:10:00Z. The first payload of the fitted population (`rate_window =
+in_hold_excl_drain_reload_tail`, written since BACKLOG #2024) was uploaded at 2026-09-30T23:46:25Z,
+so the window starts before any of it exists. The floor is fitted to that population only.
+
+| What | Count |
+|---|---:|
+| Runs scanned | 408 |
+| Runs still running at harvest time, listed and not scanned | 4 |
+| `test` jobs harvested, both populations | 1,121 |
+| Jobs with no readable artifact, counted unknown and adverse | 59 (56 cancelled, 3 failure, 0 success) |
+| Jobs whose suite step was skipped, excluded | 45 |
+| Artifacts not joined to a job | 30 |
+
+All 30 unjoined artifacts carry a payload naming fake run 12345, which a unit test writes into the
+real readings path (vault BACKLOG #2585). Each sits on a cancelled or failed job, so no passing job
+lost its reading. Those 30 jobs are among the 59 counted adverse.
+
+The wake pin reads VERIFIED for the fitted population: all 480 of its harvested jobs record
+`per_lane_wake = false`. The older population records no pin, because it predates BACKLOG #2013.
+Read VERIFIED for what it is. Each payload records the value the engine's own settings parser
+derives from the environment the runner hands the engine, where the runner pins it to false. It is
+not read back from the running engine, which vault BACKLOG #2013 records as still open. So the pin
+is in force by construction on every counted run, and the record proves the harness pinned it,
+not what the engine did with it.
+
+The control that must be non-zero held: the same scan harvested 641 older-population jobs from the
+same window. The branch fix is what made the counts reachable. Over this window the runs listing
+returns 412 runs with no branch filter, the 408 scanned plus the 4 still running, and 63 with
+`branch=main`, which is the filter the script used to send.
+
+### Only the two ubuntu cells clear the margin
+
+`F` is the predicted floor, the geometric mean of the herd-present and herd-gone levels. `idle` is
+the herd-gone level. Neither was chosen against a reading.
+
+| Leg | Lane | n | min | p1 | p5 | median | F | idle | min / F | Decision |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| ubuntu-latest | fixed_aggregate | 137 | 26.73 | 27.16 | 31.66 | 35.55 | 15.30 | 6 | 1.747 | **Armed** |
+| ubuntu-latest | fixed_per_conn | 137 | 31.69 | 34.63 | 36.82 | 39.25 | 23.24 | 12 | 1.364 | **Armed** |
+| windows-2022 | fixed_aggregate | 142 | 14.36 | 14.50 | 20.35 | 26.74 | 15.30 | 6 | 0.939 | Recorded only |
+| windows-2022 | fixed_per_conn | 142 | 27.58 | 27.65 | 33.92 | 38.47 | 23.24 | 12 | 1.187 | Recorded only |
+| windows-2025 | fixed_aggregate | 144 | 13.65 | 14.85 | 21.04 | 27.44 | 15.30 | 6 | 0.892 | Recorded only |
+| windows-2025 | fixed_per_conn | 144 | 26.76 | 28.56 | 34.60 | 38.67 | 23.24 | 12 | 1.152 | Recorded only |
+
+The median is the lower median, and every percentile is nearest-rank, so each figure is a recorded
+reading.
+
+### Ubuntu passes all four clauses, and Windows fails the margin
+
+1. (a) Margin. `min / F` must reach 1.25. Both ubuntu cells pass. All four Windows cells fail,
+   and on two of them `F` sits above a passing reading: 2 passing jobs on each Windows
+   fixed_aggregate cell read below 15.30.
+2. (b) It grades more than the sign test. `F` must sit above the herd-gone level, not merely
+   above zero. Every cell passes: 15.30 is above 6, and 23.24 is above 12.
+3. (c) The known-answer case. Run 36797223259, job 110163384729, `test (windows-2022, py3.14)`,
+   lane `fixed_aggregate`, read 22.36. Against that cell's `F` of 15.30 it is not below, so (c)
+   holds. The cell is still not armed, because (a) fails.
+4. (d) A true positive or a negative control. `tests/test_connscale_herd_floor.py` feeds both
+   lanes their herd-gone level on an armed leg. The floor trips, and the sign test passes the same
+   readings.
+
+**No lower floor was taken for Windows.** A smaller `F` would satisfy (a) arithmetically, for
+example anything up to 11.49 on windows-2022 fixed_aggregate. Picking it after reading the numbers
+is the fitted-threshold defect BACKLOG #1211 measured, and #1415's rule forbids it.
+
+### The decision leaves these questions open
+
+- 137 passing readings with none below `F` bound the false-alarm rate per lane per run at about
+  2.2 percent, by the rule of three. The observed margin of 1.36 or more suggests far lower, but it
+  is not a measurement of it.
+- `ubuntu-latest` is a moving image label. A runner image change is a new leg in all but name.
+- One cancelled windows-2022 job (run 36913644165) read 5.36 on fixed_per_conn, below that lane's
+  herd-gone level. Nothing establishes that run as bad, so it is not used as a true positive.
+- The readings span every event. A pull_request run tests that PR's code, which may never merge,
+  and one commit can be read up to three times, as a PR, a merge_group and a push run. Each is a
+  separate engine run on a separate runner, but the cell is not 137 commits.
+- Arming censors the next harvest of an armed leg. A job whose base reading falls below `F` now
+  fails because of it, and leaves the passing cells. Read that leg's non-passing readings for floor
+  breaches before re-applying the rule, or the gate's own fires will not show.
+- The floor is armed at the point measured: N=12, offering 24 msg/s (fixed_aggregate) and 12 msg/s
+  (fixed_per_conn), with the inline profile's hold, batching, poll and reload settings.
+  `tests/test_connscale_herd_floor.py` reds if the CI profile moves off any of them, or if the `test`
+  matrix stops carrying an armed leg.
+
+### Every number here can be re-checked from committed files
+
+The readings are committed under
+[../../../docs/benchmarks/results/2026-10-01-connscale-herd-floor-harvest/](../../../docs/benchmarks/results/2026-10-01-connscale-herd-floor-harvest/):
+`harvest.md` is the script's own report, and the three CSVs hold every reading, job and unjoined
+artifact. `tests/test_connscale_herd_floor.py` recomputes clauses (a) to (c) from `readings.csv` on
+every run and requires the armed legs to equal the legs that clear them. It also asserts clause
+(c) by run id, job id and value.
+
+To regenerate the scan while its artifacts last (they expire about 2026-12-30), in PowerShell 7.
+A re-run scans 412 runs, not 408: the 4 that were still running at harvest time were created inside
+the window and have since finished, so its counts will differ by those runs.
+
+```powershell
+python scripts/connscale_harvest.py --since 2026-09-30T12:00:00Z --until 2026-10-01T20:10:00Z --json-out out/harvest.json
+python scripts/connscale_harvest.py --from-json out/harvest.json --csv-dir out/harvest-csv > out/harvest.md
+```

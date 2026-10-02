@@ -22,10 +22,11 @@ lane per stage.
 WHAT IS STILL MEASURED IS UNCHANGED; ONLY THE VERDICT SHRANK. ``empty_claims_per_msg`` is computed
 on every record and RECORDED on every run, pass or fail, to the job summary and to the readings
 JSON (``_record_ratio_readings``, which runs in the fixture so a green run is recorded as fully as
-a red one). The PREDICTED HERD FLOOR for the base reading rides along in both emitters. That floor
-is RECORDED, NOT GATED, by owner ruling: it reproduces four harvested medians closely and still
-missed its own pre-landing counterfactual on a leg that passed, so gating on it would have reddened
-a green leg. Arming it from its own distribution is BACKLOG #1415.
+a red one). The PREDICTED HERD FLOOR for the base reading rides along in both emitters. It was
+recorded and not gated by owner ruling, because it missed its own pre-landing counterfactual on a
+leg that passed. BACKLOG #1415 harvested its distribution per (leg, lane) and ARMED it only on the
+legs ``_HERD_FLOOR_LEGS`` names, in the ``..._herd_floor_on_an_armed_leg`` test below. On every
+other leg, and locally, it is still recorded only.
 
 THE MASTER TEST PLAN'S COVERAGE ROW FOR THIS MODULE IS STALE, AND IT IS NOT IN THIS REPOSITORY ANY
 MORE. It lived in ``docs/testing/master-test-plan/17-performance-and-scale.md``; commit 921db74a1
@@ -84,6 +85,8 @@ from harness.load.connscale.report import (
 from harness.load.connscale.runner import (
     _MIN_IN_HOLD_SAMPLES,
     _MONOTONIC_TOLERANCE,
+    current_leg,
+    herd_floor_armed,
     run_connscale,
 )
 from tests._connscale_ports import (
@@ -98,6 +101,13 @@ pytestmark = pytest.mark.timeout(120)  # the per-test 60s default is too tight f
 
 # The connection-count sweep; its max sets the contiguous inbound-port width (BACKLOG #1014).
 _SMOKE_COUNTS = (12, 24)
+
+# The CI legs on which this profile ARMS the predicted herd floor (BACKLOG #1415). Only legs whose
+# own harvest at THIS profile's N=12 base count and rates cleared #1415's four-clause arming rule.
+# The per-cell table and the decision are in harness/load/profiles/README.md, section dated
+# 2026-10-01. The two Windows legs failed the margin clause and stay recorded-only. Adding a leg here
+# needs that leg's own harvest to clear the same rule first; widening the floor to fit is forbidden.
+_HERD_FLOOR_LEGS = ("ubuntu-latest-py3.14",)
 
 # The three port families this run consumes -- inbound, API and sink -- are all reserved as whole
 # contiguous ranges by tests/_connscale_ports.py, which is where the windows and the rationale for
@@ -128,6 +138,7 @@ corpus_count_per_trigger = 5
 zero_loss = true
 fd_monotonic = true
 empty_claims_base_reading = true
+empty_claims_herd_floor_legs = {list(_HERD_FLOOR_LEGS)}
 """)
 
 
@@ -337,7 +348,7 @@ def _append_step_summary(text: str) -> None:
         )
 
 
-def _record_ratio_readings(report: ConnScaleReport) -> None:
+def _record_ratio_readings(report: ConnScaleReport, *, enforced: bool = False) -> None:
     """Persist every ``empty_claims_per_msg`` reading this run produced (BACKLOG #1211).
 
     The SLO records a number only once it has already left its band, so the only samples that ever
@@ -366,6 +377,7 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             tolerance=_MONOTONIC_TOLERANCE,
             context=_run_context(report),
             base_count=min(_SMOKE_COUNTS),
+            enforced=enforced,
         )
     )
     _write_readings_json(
@@ -375,6 +387,7 @@ def _record_ratio_readings(report: ConnScaleReport) -> None:
             tolerance=_MONOTONIC_TOLERANCE,
             context=_run_context(report),
             base_count=min(_SMOKE_COUNTS),
+            enforced=enforced,
         )
     )
 
@@ -492,7 +505,10 @@ async def smoke_report() -> ConnScaleReport:
         install_executor_shim=True,
     )
     # In the FIXTURE, so the readings are recorded before any assertion can fail the module.
-    _record_ratio_readings(report)
+    _record_ratio_readings(
+        report,
+        enforced=herd_floor_armed(profile, current_leg()),  # type: ignore[arg-type]
+    )
     _record_diagnostics(report)
     return report
 
@@ -629,6 +645,26 @@ def test_the_empty_claim_counter_moved_at_the_base_connection_count(
         f"N={min(_SMOKE_COUNTS)}, so the SLO's green says nothing. Lanes and why each was skipped: "
         f"{[(r.label, r.not_graded) for r in readings] or 'no lanes at all'}."
     )
+
+
+def test_the_base_reading_clears_the_predicted_herd_floor_on_an_armed_leg(
+    smoke_report: ConnScaleReport,
+) -> None:
+    """The predicted herd floor, enforced only on the legs ``_HERD_FLOOR_LEGS`` names (BACKLOG #1415).
+
+    On any other leg, and on every local run, the SLO reports NOT GRADED with ``ok=True``, which is
+    the recorded-only state the two Windows legs stay in. On an armed leg the same run-level bound as
+    the sign test applies: a green that graded nothing would say nothing, so require a graded lane.
+    """
+    slo_by_name = {c.name: c for c in smoke_report.slos}
+    check = slo_by_name["empty_claims_herd_floor"]
+    assert check.ok, check.observed
+    if current_leg() in _HERD_FLOOR_LEGS:
+        assert str(check.observed).startswith("above the floor on "), (
+            f"FLOOR ARMED ON {current_leg()} BUT NEVER GRADED: {check.observed}"
+        )
+    else:
+        assert str(check.observed).startswith("NOT GRADED -- recorded only"), check.observed
 
 
 def test_the_additive_engine_fields_are_populated(smoke_report: ConnScaleReport) -> None:

@@ -22,8 +22,9 @@ BACKLOG #1211 limb two then changed WHAT IS GRADED, and several tests below were
 ``empty_claims_per_msg`` is still the metric and is still recorded on every run; what went away is
 the vs-N slope gate over it, replaced by ``_empty_claims_base_reading_slo`` -- a sign test on each
 ``per_lane`` lane's reading at the BASE connection count -- plus a predicted herd floor that is
-recorded and not enforced. Every retarget kept the property and changed the subject; each one says
-which, at the test.
+recorded on every run and, since BACKLOG #1415, enforced only on the CI legs a profile names
+(``tests/test_connscale_herd_floor.py``). Every retarget kept the property and changed the subject;
+each one says which, at the test.
 """
 
 from __future__ import annotations
@@ -925,8 +926,8 @@ def test_a_reading_UNDER_its_predicted_floor_is_graded_below_floor() -> None:
     prediction.floor`` was only ever exercised on one side. A comparison pinned in one direction
     cannot be told apart from a constant: three separate mutations of it -- ``ok = True``, the
     renderer's verdict column hard-coded to "above floor", and ``ok = value >= 0.0`` -- all left the
-    suite green. The recorded floor column is what BACKLOG #1415 will read to decide whether to gate,
-    so a column that cannot register a breach is a measurement nobody can act on.
+    suite green. The same ``ok`` is what the floor BACKLOG #1415 armed grades on, so a comparison
+    that cannot register a breach would be a gate that cannot fail.
 
     9.0 IS CHOSEN TO SEPARATE THE FLOOR FROM THE SIGN TEST, which is the mutation that would otherwise
     hide. At N=12 offering 24.0/s the predicted floor is 15.297, so 9.0 is a breach -- and it is
@@ -1000,7 +1001,7 @@ def test_the_floor_block_says_the_same_thing_in_both_renderings() -> None:
     assert isinstance(block, dict)
 
     assert block["base_count"] == 12
-    assert block["enforced"] is False, "the floor is recorded, not gated -- an owner ruling"
+    assert block["enforced"] is False, "unarmed by default; only an armed leg passes enforced=True"
     assert block["workers_per_connection"] == CONNSCALE_WORKERS_PER_CONNECTION
     assert block["idle_poll_interval_s"] == ENGINE_IDLE_POLL_INTERVAL_S
 
