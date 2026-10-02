@@ -105,7 +105,8 @@ the overwhelming majority of statements fail to classify.
 
 **`<Block>` is a comment / section label, not an action.** It is preserved as a comment in the
 generated module and its body is emitted at the *same* indentation. Emitting it as a step would invent
-an action the export never had.
+an action the export never had. *Amended 2026-10-02 (§2(b⁗)):* a label that is itself a statement
+also gets a counted TODO marker.
 
 **Statement grammar.** After stripping: `Verb operand …`, where an operand is `$variable`,
 `%tree/path` (a message-tree path whose leaf carries the HL7 coordinates), `"string literal"`,
@@ -347,7 +348,9 @@ that is no `<Package>`. An unread package attribute. A list tag in another case 
 A call named, or a `<Call>` tag, outside every list. Each renders exactly as step 1. The walker
 matches each
 statement against one whole-string template per verb rather than walking tokens as the importer
-does, so the two read the specification by different methods.
+does, so the two read the specification by different methods. *Amended 2026-10-02 (§2(b⁗)):* the
+guard now runs that vendored file plus one amendment made as it loads. The file itself is unchanged
+and still pinned.
 
 **A call the attribute does not spell** has its own tests in the same file. They write one character
 of the verb as a character reference or behind a tag. They do so at every position, in ten ways, six
@@ -416,6 +419,64 @@ same as `set_field(msg, ...)`. The row carries no field naming the message it wr
 lists only its outbound. The `.copy()` and `Message.parse(...)` lines are plain `code` rows. The
 module still round-trips with no whole-file refusal, which AC-4 requires. Showing the receiver is a
 follow-up for ADR 0076/0089.
+
+**(b⁗) AMENDMENT 2026-10-02 — a statement where a label belongs is marked, and its list holds no
+handle (BACKLOG #2632).** A `<Block>`, `<Call>`, `<Case>`, `<Foreach>`, `<If>`, `<Loop>` or `<Try>`
+can carry a statement in `@Data`, such as `<Block Data="MsgTreeCopy %ADT/ to %OUT/">`. The render
+kept it only as label text, or as the text of a dead condition, and counted nothing for it. The
+handle scan read its `MsgTreeCopy` as a clone that was made. So a later send of `%OUT` rendered as a
+send of `msg`, with no marker anywhere.
+
+One function, `_label_statement`, now decides it for the render and the scan alike. The `@Data` is
+a statement when the container does not render its verb itself, and either:
+
+- the verb, in any case, is one the importer reads on a `<Line>`: `ItemCopy`, `ItemClear`,
+  `ItemAppend`, `MsgTreeCopy`, `MsgCreate`, `MsgLog` or `MsgSend`; or
+- the element is a `<Block>` and the exporter styled a verb as a `keyword` there. A Block has no verb
+  of its own. A construct or a `<Call>` leads with its own keyword, which no table lists in full.
+
+Whether Corepoint runs such a statement is not known. So the render emits a counted TODO for it,
+ahead of the container's body: after a Block's or a Call's label comment, and before a construct's
+placeholder. Nothing is mapped for it. The scan holds no handle for the whole list, so every
+role-parsed send in it raises and no field write maps onto `msg`. That fails toward the visible
+side: a clone the label names is never treated as made, and an overwrite it names is never ignored.
+
+The whole-list gate is unchanged and stays closed for such a list, because it admits a `<Block>` only
+with no label and no construct at all. Prose stays a label: `<Block Data="Patient identity">` renders
+as before.
+
+At least these limits remain:
+
+- A verb outside the table, written with no `keyword` span, still reads as a label. So does one in a
+  construct's or a Call's `@Data`, styled or not. No word list tells prose from every verb.
+- In a list with no role markup, a send still renders as before (§2(b″)).
+- A statement in an element whose tag the importer does not model is marked as that element and
+  counted. The scan still reads a clone there as made.
+
+The differential guard compares a gate-declined list with step 1. That step 1 path now carries this
+rule. So the guard runs the vendored step 1 file with one amendment made as it loads. The file
+itself stays as vendored and pinned. The amendment is listed in the guard's `_STEP1_AMENDMENTS`, with
+the rule copied as text, so a later change to the head's rule turns the guard red until the copy is
+amended on purpose. A separate test runs the battery against the file exactly as vendored. It checks
+that the amendment changes only lists that may carry a statement label, by a wider reading written
+apart from the rule. Where it changes a list it only narrows: no new live send, no new vocabulary
+call, and one more unmapped step, or under a `@Disabled` ancestor only a commented preview line.
+
+Measured 2026-10-02. The battery now holds 7,829 shapes, 373 of them fixed seeds: 42 new seeds put a
+statement on each of the seven tags. The amendment changes 508 shapes, marks a live statement in 485
+and drops a live send in 383. The head equals the amended baseline on every shape. Each mutation arm
+of the head's rule fails the guard, counted in shapes:
+
+| Mutation of the head | Shapes failing |
+|---|---|
+| no rule at all | 508 |
+| the scan ignores the rule, so the render marks only | 427 |
+| the render ignores the rule, so the scan holds nothing and nothing is marked | 508 |
+| a construct drops its marker | 25 |
+| the table loses `msgtreecopy` | 217 |
+| the `<Block>` keyword reading is dropped | 1 |
+| the keyword reading reaches every container | 6 |
+| the gate admits a `<Block>` with a label | 233 |
 
 ### (c) Unmapped actions are never silently dropped (count-and-log)
 
@@ -503,6 +564,11 @@ omitting it would claim it vanished.
 - **AC-6f (hardened XML)** — a DTD/entity payload and malformed XML SHALL raise
   `CorepointImportError`; a hostile `@Data` SHALL NOT inject code.
   → `::test_malformed_or_hostile_xml_raises_cleanly`, `::test_hostile_xml_values_cannot_inject_code`
+- **AC-6g (a statement where a label belongs, amendment 2026-10-02)** — a container whose `@Data` is
+  a statement (§2(b⁗)) SHALL emit a counted TODO ahead of its body and map nothing for it, and its
+  list SHALL hold no handle as `msg`; a prose label SHALL stay a comment.
+  → `::test_a_clone_where_a_label_belongs_is_marked_and_its_send_is_judged_on_the_marker`,
+  `::test_a_prose_block_label_stays_a_label`, `::test_the_scan_and_the_render_ask_one_rule`
 
 ## 4. Consequences
 

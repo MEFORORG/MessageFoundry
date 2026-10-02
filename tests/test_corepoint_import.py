@@ -17,6 +17,8 @@ import pytest
 
 from messagefoundry.checks import run_checks
 from messagefoundry.corepoint_import import (
+    _STATEMENT_VERBS,
+    _VERB_CONNECTIVES,
     Action,
     Control,
     CorepointImportError,
@@ -25,9 +27,12 @@ from messagefoundry.corepoint_import import (
     _corepoint_path,
     _corepoint_segment,
     _count_steps,
+    _hardened_fromstring,
+    _message_handles,
     _operands_from_roles,
     _role_prose,
     _role_verb,
+    _understood_list,
     generate_module,
     import_corepoint,
     parse_any,
@@ -1675,6 +1680,176 @@ def test_a_fully_understood_module_passes_check(tmp_path: Path) -> None:
     summary = import_corepoint(export, tmp_path / "out").to_json()
     assert summary["total_unmapped"] == 0
     assert run_checks(tmp_path / "out", run_lint=False).ok
+
+
+# --- a statement where a container's label or condition belongs (BACKLOG #2632) -------------------
+#
+# A ``<Block>``, ``<Call>`` or construct whose ``@Data`` is a statement used to render as a label, or
+# as the text of a dead condition, and count nothing, while the handle scan read its ``MsgTreeCopy``
+# as a clone that was made. A send of that clone then rendered as a send of ``msg``. One rule,
+# ``_label_statement``, now answers for both: the render marks the statement as a counted TODO ahead
+# of the container's body, and the scan holds no handle for the list. All fixtures are synthetic.
+
+_CLONE_LINE = _root_copy("input-handle", "%ADT", "other-handle", "%OUT")
+_SEND_COPY = _role_send("other-handle", "%OUT", "OB_ACME")
+_SEND_INPUT = _role_send("input-handle", "%ADT", "OB_IN")
+_WRITE_COPY = _write("other-handle", "%OUT", "Y")
+_MERGE_LINE = _role_line(_span("keyword", "MsgTreeMerge") + " " + _span("other-handle", "%NEW"))
+_LABEL_MARKER = "written where its container's label or condition belongs"
+_CONTAINER_TAGS = ("Block", "Call", "Case", "Foreach", "If", "Loop", "Try")
+
+
+def _container(tag: str, line: str, body: str = "", disabled: bool = False) -> str:
+    """A ``<tag>`` carrying the ``@Data`` of ``line``, a ``<Line .../>`` as :func:`_role_line`
+    builds one, around ``body``."""
+    opening = line.replace("<Line ", f"<{tag} ", 1).removesuffix("/>")
+    return f"{opening}{' Disabled="1"' if disabled else ''}><List>{body}</List></{tag}>"
+
+
+def _labelled(tag: str, data: str, body: str = "") -> str:
+    """A ``<tag>`` whose ``@Data`` is the plain text ``data``."""
+    return _container(tag, _role_line(data), body)
+
+
+@pytest.mark.parametrize("tag", _CONTAINER_TAGS)
+def test_a_clone_where_a_label_belongs_is_marked_and_its_send_is_judged_on_the_marker(
+    tag: str,
+) -> None:
+    """The defect as filed, on each container. The copy is marked and counted, at the handler's own
+    level and ahead of everything in the container's body. It is not emitted as a clone, so the
+    later send of the copy is refused, where it used to send msg."""
+    body = _container(tag, _CLONE_LINE, _WRITE_COPY) + _SEND_COPY
+    lines = _handler_body(_handler_source(body)).splitlines()
+    marker = next(i for i, line in enumerate(lines) if _LABEL_MARKER in line)
+    assert lines[marker].startswith("    # TODO: Corepoint MsgTreeCopy — hand-finish (")
+    assert marker < next(i for i, line in enumerate(lines) if "Corepoint ItemCopy" in line)
+    assert not any("Send(" in line or "_msg = " in line for line in lines)
+    assert not any("set_field(" in line for line in lines)
+    assert any("raise NotImplementedError" in line for line in lines)
+    unmapped = _count_steps(_handler_steps(body), in_loop=False)[1]
+    assert unmapped == ["MsgTreeCopy", "ItemCopy", "MsgSend"]
+
+
+def test_a_blocks_marker_follows_its_label_comment_and_nothing_counts_as_mapped() -> None:
+    body = _container("Block", _CLONE_LINE, _WRITE_COPY) + _SEND_COPY
+    lines = _handler_body(_handler_source(body)).splitlines()
+    label = lines.index("    # Corepoint Block: MsgTreeCopy %ADT/ to %OUT/")
+    assert _LABEL_MARKER in lines[label + 1]
+    assert _count_steps(_handler_steps(body), in_loop=False)[0] == 0
+
+
+def test_a_prose_block_label_stays_a_label() -> None:
+    """The control: prose is a label. Nothing is marked, the write maps and the input still sends."""
+    body = _labelled("Block", "Patient identity", _WRITE_INPUT) + _SEND_INPUT
+    src = _handler_body(_handler_source(body))
+    assert "    # Corepoint Block: Patient identity\n" in src
+    assert _LABEL_MARKER not in src and "TODO" not in src
+    assert '    set_field(msg, "MSH-6", "X")\n' in src
+    assert '    sends.append(Send("OB_IN", msg))' in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (2, [], 0)
+
+
+def test_the_same_clone_on_a_line_is_still_read_as_made() -> None:
+    """The control for the scan. The clone is a ``<Line>`` under a prose Block, which closes the
+    gate, so this is the step 1 path too. There the copy still counts, and its send still sends. So
+    the refusals above come from where the statement sits, not from the copy itself."""
+    src = _handler_body(
+        _handler_source(_labelled("Block", "Patient identity", _CLONE_LINE) + _SEND_COPY)
+    )
+    assert '    sends.append(Send("OB_ACME", msg))' in src
+    assert "raise NotImplementedError" not in src and _LABEL_MARKER not in src
+
+
+def test_a_field_write_in_a_block_label_is_marked_and_never_mapped() -> None:
+    """Whether Corepoint runs the label is not known, so the write is a TODO, not a ``set_field``."""
+    body = _container("Block", _WRITE_INPUT) + _SEND_INPUT
+    src = _handler_body(_handler_source(body))
+    assert "    # TODO: Corepoint ItemCopy — hand-finish (written" in src
+    assert "set_field(" not in src and "Send(" not in src
+    assert _count_steps(_handler_steps(body), in_loop=False) == (0, ["ItemCopy", "MsgSend"], 0)
+
+
+@pytest.mark.parametrize(
+    ("element", "carried"),
+    [
+        pytest.param(_container("Block", _CLONE_LINE), True, id="block-role-clone"),
+        # The row's own example: no role markup, so the scan could never read what it overwrites.
+        pytest.param(
+            _labelled("Block", "MsgTreeCopy %NEW/ to %ADT/"), True, id="block-flat-copy-over-input"
+        ),
+        pytest.param(_labelled("Block", "itemclear OUT"), True, id="block-flat-lowercase-verb"),
+        pytest.param(
+            _labelled("Block", _span("block", "MsgTreeCopy %NEW/ to %ADT/")),
+            True,
+            id="block-label-span-around-a-statement",
+        ),
+        pytest.param(_container("Block", _MERGE_LINE), True, id="block-keyword-not-in-the-table"),
+        pytest.param(_labelled("If", 'MsgSend %OUT to connection "OB_X"'), True, id="if-flat-send"),
+        pytest.param(_labelled("Call", "MsgLog %ADT"), True, id="call-flat-log"),
+        pytest.param(_container("If", _MERGE_LINE), False, id="construct-keyword-not-in-the-table"),
+        pytest.param(
+            _container("Block", _role_send("input-handle", "%ADT", "OB_LABEL")),
+            False,
+            id="block-send-renders-as-a-send",
+        ),
+        pytest.param(_labelled("Block", "Patient identity"), False, id="prose"),
+        pytest.param(_labelled("Block", "Message header"), False, id="prose-near-a-verb"),
+        pytest.param(_labelled("If", 'If (%ADT/PID-8 = "M")'), False, id="if-condition"),
+        pytest.param(_labelled("Foreach", "ForEach %ADT/OBX $obx"), False, id="foreach"),
+        pytest.param(_labelled("Loop", "While (x)"), False, id="loop-with-another-verb"),
+        pytest.param(_labelled("Case", "ChooseFrom (x)"), False, id="case"),
+        pytest.param(_labelled("Call", 'ActionListCall "Sub"'), False, id="call"),
+        pytest.param(_container("Block", _CLONE_LINE, disabled=True), False, id="disabled-block"),
+        # Marked and counted already, as an element the import does not model. The scan still reads
+        # its clone as made: a limit ADR 0086 records.
+        pytest.param(_container("Switch", _CLONE_LINE), False, id="unmodelled-tag"),
+    ],
+)
+def test_the_scan_and_the_render_ask_one_rule(element: str, carried: bool) -> None:
+    """Wherever the render marks a statement, the scan holds nothing, and nowhere else. Each list
+    ends with a send of its one input handle, so the scan holds that handle unless the rule fires."""
+    body = element + _SEND_INPUT
+    src = _handler_body(_handler_source(body))
+    held = _message_handles(_hardened_fromstring(_package(body))[0])[1]
+    assert (_LABEL_MARKER in src) is carried
+    assert (held == frozenset()) is carried
+    assert ('Send("OB_IN", msg)' in src) is not carried
+    assert ("raise NotImplementedError" in src) is carried
+
+
+@pytest.mark.parametrize("tag", _CONTAINER_TAGS)
+def test_a_statement_label_keeps_the_whole_list_gate_closed(tag: str) -> None:
+    """The gate admits a ``<Block>`` only with no label, and no construct at all. So a list holding
+    such a container never binds a local: it takes the step 1 path, where the rule above applies.
+    The same list without the container opens the gate, which
+    ``test_an_enclosing_element_with_an_unread_attribute_closes_the_gate`` shows as its control."""
+    body = _CLONE_WRITE_SEND + _container(tag, _CLONE_LINE)
+    root = _hardened_fromstring(_package(body))
+    assert (
+        _understood_list(root[0], {child: parent for parent in root.iter() for child in parent})
+        is None
+    )
+    src = _handler_body(_handler_source(body))
+    assert "_msg = " not in src and "Send(" not in src
+
+
+def test_a_send_of_a_clone_only_a_label_names_raises_when_the_handler_runs(tmp_path: Path) -> None:
+    with pytest.raises(NotImplementedError, match="MsgSend delivers %OUT"):
+        _run_handler(tmp_path, _container("Block", _CLONE_LINE) + _SEND_COPY)
+
+
+def test_a_marked_label_statement_is_counted_and_the_module_passes_check(tmp_path: Path) -> None:
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(_container("Block", _CLONE_LINE) + _SEND_COPY), encoding="utf-8")
+    summary = import_corepoint(export, tmp_path / "out").to_json()
+    assert (summary["total_mapped"], summary["total_unmapped"]) == (0, 2)
+    assert run_checks(tmp_path / "out", run_lint=False).ok
+
+
+def test_every_verb_step_1_maps_is_a_statement_verb() -> None:
+    """The statement verbs are the gate's allow-list. Step 1's own mapping table is kept apart, so a
+    verb added there alone would otherwise go back to reading as a label."""
+    assert set(_VERB_CONNECTIVES) <= _STATEMENT_VERBS
 
 
 def test_generated_xml_module_compiles_and_passes_check(tmp_path: Path) -> None:
