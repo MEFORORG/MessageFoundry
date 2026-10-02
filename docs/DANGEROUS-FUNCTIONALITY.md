@@ -143,13 +143,17 @@ de-identification leak check only, and is not on the message path.
 
 `_child_bootstrap.py` loads the engine package by path, then runs a module by name.
 `python_child_argv` in `childenv.py` builds a command line that starts a Python child through it.
-At least three kinds of child start this way. They are the sandbox worker, each engine shard, and
-the child that loads the config before any shard starts. The tray starts its own Python child with
-`-m` and does not use the script. The script does three things:
+At least four kinds of child start this way. They are the sandbox worker, each engine shard, the
+child that loads the config before any shard starts, and the tray's relaunch under its branded
+launcher. The first tray process does not. Its launcher starts it without the script, whether that
+is autostart's `pythonw -m messagefoundry.tray` or the `messagefoundry-tray` command. The script
+does three things:
 
-1. It puts the folder above the package on the import path, ahead of site-packages, the folder
-   that holds installed packages. Usually that is after the standard library. It skips this step
-   when that folder is on the path already. The step serves the packages that ship beside the
+1. It puts the folder above the package on the import path, after the standard library and ahead
+   of site-packages, the folder that holds installed packages. If it cannot tell where the standard
+   library ends, it puts the folder last. It skips this step when that folder is on the path
+   already. An absolute `PYTHONPATH` entry naming that folder counts. That entry sits ahead of the
+   standard library, so the folder stays there. The step serves the packages that ship beside the
    engine in a checkout.
 2. It loads the `messagefoundry` package by file location, from the folder the script sits in.
 3. It runs the module named on its command line, much as `python -m` would.
@@ -159,14 +163,14 @@ passes a module name fixed in the code, and nothing from a message reaches the c
 arguments after the module name are another matter. An engine shard's command line carries at least
 the config path and the shard name. An author sets that name in `connections.toml` or in
 `inbound(shard=...)`. Each child starts from an argument list with no shell (section 4). The engine
-starts the script and never imports it.
+and the tray start the script and never import it.
 
 One edge is worth knowing. In a checkout that is not installed, the folder above the package is the
 checkout's root, and step 1 puts it ahead of site-packages. A file or folder at that root named like
-a module outside the standard library would then load first, inside each of these children. If
-`PYTHONPATH` names a site-packages folder, step 1 can put the root ahead of the standard library
-too. In the usual installed engine, editable installs included, that folder is already on the path,
-so the script skips step 1.
+a module outside the standard library would then load first, inside each of these children. Step 1
+looks for site-packages only after the standard library ends. So a `PYTHONPATH` entry naming a
+site-packages folder cannot move the root ahead of the standard library. In the usual installed
+engine, editable installs included, that folder is already on the path, so the script skips step 1.
 
 ---
 
