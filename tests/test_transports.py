@@ -1273,7 +1273,8 @@ async def test_file_destination_refuses_path_escape(
     monkeypatch.setattr(
         "messagefoundry.transports.file.render_filename", lambda *a, **k: "../escape.hl7"
     )
-    with pytest.raises(DeliveryError, match="outside the destination directory"):
+    # ADR 0204: a name that carries a separator is the message's doing, so it is a permanent refusal.
+    with pytest.raises(DeliveryError, match="not a single path component"):
         await dest.send("MSH|x\r")
     assert not (tmp_path / "escape.hl7").exists()
 
