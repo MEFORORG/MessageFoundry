@@ -1585,20 +1585,38 @@ def test_a_write_after_a_send_never_reaches_the_sent_message(tmp_path: Path) -> 
     assert isinstance(first[0], list) and first[0][0].message.field("MSH-6") == "Y"
 
 
-def test_a_write_to_a_built_message_outside_its_msh_declines() -> None:
+def test_a_write_to_a_built_message_outside_its_msh_declines_and_its_send_raises() -> None:
     """The skeleton holds only an MSH, and Message.set raises on an absent segment, so a write to
-    another segment of a built message is a TODO."""
+    another segment of a built message is a TODO. Any write the binder declines leaves its handle
+    unknown, so the send raises rather than deliver the skeleton without the write. A write to the
+    MSH maps (the control arm)."""
     body = _handler_body(
         _handler_source(
             _create("%NEW")
-            + _write("other-handle", "%NEW", "A", "/PID-8")
             + _write("other-handle", "%NEW", "B", "/MSH-10")
+            + _write("other-handle", "%NEW", "A", "/PID-8")
             + _role_send("other-handle", "%NEW", "OB_NEW")
         )
     )
+    assert 'set_field(new_msg, "MSH-10", "B")' in body
     assert 'set_field(new_msg, "PID-8"' not in body
     assert "whose skeleton has only an MSH segment" in body
-    assert 'set_field(new_msg, "MSH-10", "B")' in body
+    assert 'Send("OB_NEW"' not in body
+    assert "raise NotImplementedError" in body
+
+
+def test_an_enclosing_element_with_an_unread_attribute_closes_the_gate() -> None:
+    """The list and every element around it carry only Name and Desc; anything else, such as an
+    ``Enabled`` on the package, renders the list as step 1 does."""
+    src = generate_module(
+        parse_package(
+            '<Package Name="ACME X" Enabled="false"><ActionList Name="T"><List>'
+            + _CLONE_WRITE_SEND
+            + "</List></ActionList></Package>"
+        )[0]
+    )
+    assert "out_msg" not in src
+    assert "out_msg = msg.copy()" in _handler_source(_CLONE_WRITE_SEND)  # the control arm
 
 
 @pytest.mark.parametrize(

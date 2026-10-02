@@ -206,14 +206,14 @@ no engine change and no change to ADR 0001. A Handler can already build and send
 
 **The whole-list gate (Manager decision, 2026-10-01).** Before a list renders, the importer decides
 once whether the WHOLE list is fully understood. It is only when every element in it, at every
-depth, is on this allow-list and reads in exactly one shape, with no word, span, attribute, marker
-or text left unread:
+depth, is on this allow-list, and each statement's `@Data` is exactly the canonical spelling of its
+verb's one shape, character for character:
 
 | Element | The one shape it is read in |
 |---|---|
 | `MsgTreeCopy` (a plain clone) | keyword verb, handle, path `/`, the word `to`, handle, path `/` |
 | `MsgCreate` | keyword verb, handle, `as`, a caret-form type literal, `version`, a `2.x` or `2.x.y` literal |
-| `ItemCopy`, `ItemAppend` | keyword verb, a quoted literal, `to`, handle, a writable HL7 field path |
+| `ItemCopy`, `ItemAppend` | keyword verb, a quoted value, `to`, handle, a writable HL7 field path |
 | `ItemClear` | keyword verb, handle, a writable HL7 field path |
 | `MsgLog` | keyword verb, one handle |
 | `MsgSend` | keyword verb, one handle, `to connection`, a non-blank destination literal |
@@ -222,21 +222,26 @@ or text left unread:
 | `<List>` | no attribute; flattened |
 
 Each statement is a `<Line>` whose only attribute is `@Data`. The verb is a `keyword` span spelled
-exactly so, and connectives are unstyled words. A handle is an `input-handle` or `other-handle`
+exactly so, and connectives are unstyled words. The canonical spelling quotes each span class with
+`'`, puts one space between tokens, and puts a path span directly after its handle span; any other
+spacing, quoting or adjacency is not understood. A written value is printable ASCII with no `"`,
+`&`, `<`, `>` or HL7 delimiter (`|`, `^`, `~`, `\`). A handle is an `input-handle` or `other-handle`
 span matching `%` plus up to 40 ASCII letters, digits and underscores. A field path is `/SEG-F`,
 optionally with up to two more `-n` coordinates and a `(label)`, or the dotted form, on a
 single-occurrence segment and never MSH-1 or MSH-2. Spans carry only plain text: no nesting, no
 entity, no attribute but `class`. Across the list, no two handle spellings may differ only in case,
 each handle carries one span class everywhere, there is at most one input handle, and no clone or
-`MsgCreate` writes the input. The `<ActionList>` carries only `Name` and `Desc`. Tags are matched
-exactly, so a namespaced or differently cased tag is not understood.
+`MsgCreate` writes the input. The `<ActionList>` and every element enclosing it carry only `Name`
+and `Desc`. Tags are matched exactly, so a namespaced or differently cased tag is not understood. A
+list nested more than 25 `<List>` and `<Block>` levels deep is not understood either, so a depth
+step 1 refuses is refused the same way.
 
 **No construct is on the list:** no `If`, `ElseIf`, `Else`, `Case`, `ChooseFrom`, `Matching`,
 `ForEach`, `Loop`, `While`, `Try`, `Catch`, `Call`, `ActionListExit` or other exit, and no
-unmodelled element, anywhere in the list. A lowercase or variant verb, a `description`, `comment` or
-`detail` span on a statement line, any unread attribute (`Enabled`, `Comment`, unknown names), a
-markup-free statement, and a path such as `//ADT` each make the list NOT fully understood. When in
-doubt, it is not.
+unmodelled element, anywhere in the list. At least these also make the list NOT fully understood:
+a lowercase or variant verb, a `description`, `comment` or `detail` span on a statement line, any
+attribute but the ones above (`Enabled`, `Comment`, unknown names), a markup-free statement, a path
+such as `//ADT`, and a `<Block>` label wrapped in a span. When in doubt, it is not.
 
 **A list that is not fully understood renders exactly as step 1 renders it,** byte for byte, with the
 same summary counts: the importer runs step 1's code path on it, untouched, so there is no partial
@@ -256,16 +261,21 @@ Each local is the handle's name, lower-cased, without the `%`, suffixed `_msg`. 
 the default encoding characters, the type in MSH-9 and the version in MSH-12, and nothing else. It
 is built through the `Message` API and emitted as one literal. A write to a built message maps only
 onto its MSH; a write to another segment is a TODO, because `Message.set` raises on a segment the
-skeleton lacks. **A write to a handle after a send of it is a TODO, and the handle is unknown from
-there,** so a later send of it raises. A `Send` holds the object, so the write would otherwise change
-the message already sent. `[pipeline].snapshot_on_send` (ADR 0104) defaults to on in service settings
-and would snapshot it, but it can be turned off and a handler called directly holds the live object,
-so the importer does not rely on it. That was the one fail-open of round 3 inside the open gate.
+skeleton lacks. **A write to a handle after a send of it is a TODO,** because a `Send` holds the
+object, so the write would otherwise change the message already sent. `[pipeline].snapshot_on_send`
+(ADR 0104) defaults to on in service settings and would snapshot it, but it can be turned off and a
+handler called directly holds the live object, so the importer does not rely on it. That was the
+one fail-open of round 3 inside the open gate. **Any write the binder declines leaves its handle
+unknown from there,** so a later send of it raises rather than deliver the message without the
+write. *Corrected 2026-10-01 (code review of the gate):* a declined write to a built message's
+non-MSH segment kept the handle, and its send delivered the bare skeleton where step 1 raised.
 
 **The cost.** Any list holding a construct, or anything the gate does not read, is finished by hand
-exactly as under step 1: a send it cannot prove is `msg` raises, and a send of a clone may still send
-`msg` where step 1's flow-insensitive scan holds the clone. Step 2 helps only straight-line lists.
-That is deliberate.
+exactly as under step 1. Step 1's gaps stay with such a list: a send of a clone may still send `msg`
+where its flow-insensitive scan holds the clone, and a write to the input after a send of it still
+lands on `msg`, which only `snapshot_on_send` keeps out of the sent message. Step 2 helps only
+straight-line lists, and the canonical-spelling rule is strict: an export whose labels are wrapped in
+spans, or whose spacing differs at all, gets no help. That is deliberate.
 
 **History: why a gate, after six rounds.** Step 2 first walked every construct, tracking which local
 each handle held on each path and joining the paths. Each of six review rounds on PR 1900 built a
@@ -289,25 +299,31 @@ finds the list fully understood AND every oracle check passes. The oracle is an 
 over the shape, in a case-sensitive and a case-insensitive reading of handle names. It says which
 trees the export may send at each `MsgSend`, and which literals each tree held at the send. Both
 handlers run against one synthetic input, past every refusal, and the guard fails when the head
-delivers a tree the oracle cannot prove, sends `msg` for another handle, sends a message carrying a
-literal its tree did not hold at the send, lifts a send out of a branch, or binds a local below the
-handler's level.
+renders a list step 1 refuses, delivers a tree the oracle cannot prove, sends `msg` for another
+handle, sends a message carrying a literal its tree did not hold at the send or lacking one it did,
+lifts a send out of a branch, or binds a local below the handler's level. The walker matches each
+statement against one whole-string template per verb rather than walking tokens as the importer
+does, so the two read the specification by different methods.
 
-The battery holds 7,746 shapes, measured 2026-10-01: 290 fixed seeds (every repro from every review
-of PR 1900 and every Lander repro, the 23 round-3 shapes among them), 4,056 ordered construct pairs,
-1,000 random shapes and 2,400 drawn from the allow-list alone, a quarter of those carrying one
-spoiler just off it. The guard's walker finds 1,842 fully understood, the head binds a local in
-1,231 of them, and the head's output differs from step 1 in 1,810. At this head it fails none. Six
-mutation arms each fail it: dropping the write-after-send rule (41 shapes), tolerating prose spans
-(68), folding verb case (33), accepting any `<Block>` label (80), ignoring `Enabled` and `Comment`
-attributes (80), and sending `msg` for an unknown handle (1,030). Against the previous head,
-6fa49a9d5, it fails 5,937, including 20 of the 23 round-3 seeds.
+The battery holds 7,763 shapes, measured 2026-10-01: 307 fixed seeds (every repro from every review
+of PR 1900 and every Lander repro, the 23 round-3 shapes and the gate review's 17 among them), 4,056
+ordered construct pairs, 1,000 random shapes and 2,400 drawn from the allow-list alone, a quarter of
+those carrying one spoiler just off it. The guard's walker finds 1,847 fully understood, the head
+binds a local in 1,233 of them, and the head's output differs from step 1 in 1,812. At this head it
+fails none. Nine mutation arms each fail it: dropping the write-after-send rule (38 shapes),
+tolerating prose spans (68), folding verb case (33), accepting any `<Block>` label (80), ignoring
+`Enabled` and `Comment` attributes (80), sending `msg` for an unknown handle (1,042), keeping a
+handle after a declined write to its skeleton (21), tolerating whitespace (4), and dropping the
+depth bound (3). Against the previous head, 6fa49a9d5, it fails 5,937 of the first 7,746, including
+20 of the 23 round-3 seeds.
 
-**Unverified assumptions, shared by the importer and the oracle.** That `MsgTreeCopy %A/ to %B/`
-makes B a copy of A; that `MsgSend` leaves its handle holding the message it sent; that a `<Block>`
-label written in plain prose is never run as a statement; and that a `@Disabled` value of `1`,
-`true` or `yes` means the step never runs. Each was read from the validated export, not measured in
-Corepoint.
+**Unverified assumptions, shared by the importer and the oracle.** At least these: that
+`MsgTreeCopy %A/ to %B/` makes B a copy of A; that `MsgSend` leaves its handle holding the message it
+sent; that a `<Block>` label written in plain prose is never run as a statement; that a `@Disabled`
+value of `1`, `true` or `yes` means the step never runs; and that `MsgCreate` and `MsgSend` stamp no
+header field the skeleton lacks, such as MSH-7, MSH-10 or MSH-11. If Corepoint stamps those, a built
+message goes out without them, and the generated module does not flag it. Each was read from the
+validated export, not measured in Corepoint.
 
 **What the Steps lens shows.** `set_field(out_msg, ...)` projects as an `action` row that looks the
 same as `set_field(msg, ...)`. The row carries no field naming the message it writes. A send row

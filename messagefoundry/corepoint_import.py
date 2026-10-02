@@ -69,10 +69,9 @@ Paths ride across as data to :meth:`Message.set` at run time.
 0086).** An action-list works on several message trees at once; a Handler receives one ``msg``. Before
 a list is parsed, :func:`_understood_list` decides once whether every element in it, at every depth,
 is on a small allow-list: a plain clone, a buildable ``MsgCreate``, a field write, a ``MsgLog``, a
-``MsgSend``, a ``<Block>`` whose label is prose, and a surely disabled step, each in exactly one
-shape with nothing unread. Only then does :class:`_Binder` give each handle its own local, in
-statement order. Every other list takes the step 1 path unchanged, byte for byte: a send it cannot
-prove is ``msg`` raises.
+``MsgSend``, a ``<Block>`` whose label is prose, and a surely disabled step, each spelled in
+exactly one canonical shape. Only then does :class:`_Binder` give each handle its own local, in
+statement order. Every other list takes the step 1 path unchanged, byte for byte.
 
 Pure (parse + string codegen): no network, no message content, no dependency beyond the engine's
 vendored ``defusedxml`` copy (``messagefoundry/_vendor/defusedxml/``) and its own HL7 model
@@ -1656,15 +1655,16 @@ def _send_args(operands: list[str]) -> tuple[str, ...]:
 # sent a message Corepoint never sent. Every repair taught the flow one more construct or spelling,
 # and the next round found the next one. So step 2 no longer reasons about constructs at all. Before a
 # list renders, the gate below decides ONCE whether the whole list is fully understood: every element
-# at every depth is on this allow-list and reads in exactly one shape, with no word, span, attribute,
-# marker or text left unread. Only such a list binds locals. Any other list takes the step 1 path
-# untouched, so its output is step 1's byte for byte. When in doubt, a list is not understood: that
-# costs a hand-finish, as under step 1, and never a wrong delivery.
+# at every depth is on this allow-list, and each statement's ``@Data`` is exactly the canonical
+# rendering of its verb's one shape, character for character. Only such a list binds locals. Any other
+# list takes the step 1 path untouched, so its output is step 1's byte for byte. When in doubt, a list
+# is not understood: that costs a hand-finish, as under step 1, and never a wrong delivery.
 
 #: The statements the gate reads, each as ONE token sequence after its verb, which must be the first
 #: token and a ``keyword`` span spelled exactly so. ``H`` is a message-handle span, ``/`` a path span
 #: holding only ``/``, ``F`` a path span naming a writable HL7 field, ``L`` a quoted literal span, and
-#: any other entry that exact word, unstyled.
+#: any other entry that exact word, unstyled. The tokens are joined by one space, except that a path
+#: span follows its handle span directly (see :func:`_canonical`).
 _UNDERSTOOD: dict[str, tuple[str, ...]] = {
     "MsgTreeCopy": ("H", "/", "to", "H", "/"),
     "MsgCreate": ("H", "as", "L", "version", "L"),
@@ -1676,8 +1676,11 @@ _UNDERSTOOD: dict[str, tuple[str, ...]] = {
 }
 _HANDLE_CLASSES = frozenset({"input-handle", "other-handle"})
 # One token of an understood ``@Data``: a span holding plain text (no nesting, no entity, no attribute
-# but its class), or an unstyled run. Anything else in the value makes the statement unread.
-_STRICT_TOKEN = re.compile(r"<span class=(['\"])([a-z-]+)\1>([^<>&]*)</span>|([^<>&]+)")
+# but its class), or an unstyled run. :func:`_canonical` then pins the spelling of the whole value.
+_STRICT_TOKEN = re.compile(r"<span class='([a-z-]+)'>([^<>&]*)</span>|([^<>&]+)")
+# A written value: printable ASCII with no HL7 delimiter or escape character, so the value is one
+# field's text in every reading (``Message.set`` would split or escape anything else).
+_VALUE = re.compile(r"[ !#-%'-;=?-\[\]_-{}]*", re.ASCII)
 # ASCII only, short, and no ``/``, so a handle has one spelling, one reading and a safe local name.
 _HANDLE_NAME = re.compile(r"%[A-Za-z][A-Za-z0-9_]{0,39}", re.ASCII)
 # ``/PID-5-1``, ``/PID-5-1 (Patient Name)`` or ``/PID-5.1``: a field, never a tree node or a segment.
@@ -1723,14 +1726,22 @@ class _Understood:
     disabled: bool
 
 
-def _understood_list(action_list: Element) -> tuple[str, tuple[_Understood, ...]] | None:
+def _understood_list(
+    action_list: Element, parents: dict[Element, Element]
+) -> tuple[str, tuple[_Understood, ...]] | None:
     """``(input handle, elements)`` when the whole list is fully understood, else ``None``.
 
-    Beyond each element's own shape (see :func:`_understood_body`), the list as a whole must name its
-    handles unambiguously: no two spellings that differ only in case (whether Corepoint folds case
-    is unverified), each handle styled the same way everywhere, at most one input handle, and no
-    clone or ``MsgCreate`` into the input, which would replace ``msg``."""
-    if not set(action_list.attrib) <= {"Name", "Desc"} or (action_list.text or "").strip():
+    The list and every element enclosing it carry only ``Name`` and ``Desc``. Beyond each element's
+    own shape (see :func:`_understood_body`), the list as a whole must name its handles
+    unambiguously: no two spellings that differ only in case (whether Corepoint folds case is
+    unverified), each handle styled the same way everywhere, at most one input handle, and no clone or
+    ``MsgCreate`` into the input, which would replace ``msg``."""
+    node: Element | None = action_list
+    while node is not None:
+        if not set(node.attrib) <= {"Name", "Desc"}:
+            return None
+        node = parents.get(node)
+    if (action_list.text or "").strip():
         return None
     body = _understood_body(action_list, 0)
     if body is None:
@@ -1765,9 +1776,12 @@ def _understood_body(container: Element, depth: int) -> tuple[_Understood, ...] 
     ``<Line>`` holding one understood statement in ``@Data`` and nothing else, or a ``<Block>`` with
     a prose label (see :data:`_LABEL`) whose body is understood too. Each may carry ``@Disabled`` only
     with a sure value. No element may hold text outside its attributes. Tags are matched exactly, so a
-    namespaced or differently cased tag is not understood."""
-    if depth > _MAX_NESTING:
-        return None  # the step 1 path refuses the depth with a clean error
+    namespaced or differently cased tag is not understood.
+
+    The depth bound is a quarter of step 1's: the two count levels differently, and any list deeper
+    than this takes the step 1 path, which refuses it there or renders it as step 1 does."""
+    if depth > _MAX_NESTING // 4:
+        return None
     found: list[_Understood] = []
     for child in container:
         if (child.tail or "").strip() or (child.text or "").strip():
@@ -1812,6 +1826,19 @@ def _prose_label(data: str) -> bool:
     )
 
 
+def _canonical(tokens: list[tuple[str, str]]) -> str:
+    """The one spelling of a statement's tokens: single-quoted span classes, one space between
+    tokens, and a path span directly after the handle span it addresses."""
+    out: list[str] = []
+    previous = ""
+    for cls, text in tokens:
+        if out:
+            out.append("" if cls == "path" and previous in _HANDLE_CLASSES else " ")
+        out.append(f"<span class='{cls}'>{text}</span>" if cls else text)
+        previous = cls
+    return "".join(out)
+
+
 def _understood_statement(data: str) -> _Statement | None:
     """Read ``@Data`` in the one shape :data:`_UNDERSTOOD` gives its verb, or ``None``."""
     tokens: list[tuple[str, str]] = []
@@ -1820,12 +1847,12 @@ def _understood_statement(data: str) -> _Statement | None:
         token = _STRICT_TOKEN.match(data, pos)
         if token is None:
             return None
-        if token.group(2) is not None:
-            tokens.append((token.group(2), token.group(3)))
+        if token.group(1) is not None:
+            tokens.append((token.group(1), token.group(2)))
         else:
-            tokens.extend(("", word) for word in token.group(4).split())
+            tokens.extend(("", word) for word in token.group(3).split())
         pos = token.end()
-    if not tokens or tokens[0][0] != "keyword":
+    if not tokens or tokens[0][0] != "keyword" or _canonical(tokens) != data:
         return None
     verb = tokens[0][1]
     shape = _UNDERSTOOD.get(verb)
@@ -1847,9 +1874,9 @@ def _understood_statement(data: str) -> _Statement | None:
             if not _writable(path) or (path or "").split(".", 1)[0] in _FRAMING_PATHS:
                 return None
         elif want == "L":
-            if cls != "literal" or len(text) < 2 or text[0] != '"' or '"' in text[1:-1]:
+            if cls != "literal" or len(text) < 2 or text[0] != '"' or text[-1] != '"':
                 return None
-            if text[-1] != '"':
+            if not _VALUE.fullmatch(text[1:-1]) and verb != "MsgCreate":
                 return None
             literals.append(text[1:-1])
         elif cls or text != want:
@@ -1896,9 +1923,12 @@ class _Binder:
 
     A write to a handle after a send of it would change the message already sent, because a ``Send``
     holds the object, not a copy, unless ``[pipeline].snapshot_on_send`` is on (ADR 0104). So that
-    write is a TODO, and the handle is unknown from there: a later send of it raises."""
+    write is a TODO. Any write this declines leaves its handle unknown from there, so a later send of
+    it raises rather than deliver a message without the write."""
 
-    def __init__(self, input_handle: str) -> None:
+    def __init__(self, input_handle: str, subject: frozenset[str], held: frozenset[str]) -> None:
+        # Step 1's reading of the list, used only to preview a disabled step exactly as step 1 does.
+        self._preview = (subject, held)
         self._held: dict[str, str] = {input_handle: "msg"} if input_handle else {}
         self._sent: set[str] = set()
         self._built: set[str] = set()  # locals holding a MsgCreate skeleton: an MSH only
@@ -1908,7 +1938,7 @@ class _Binder:
         for item in items:
             if item.disabled:
                 # Never runs, so it touches no handle: step 1 renders it as commented-out source.
-                steps.extend(_parse_statement(item.elem, frozenset(), frozenset(), False))
+                steps.extend(_parse_statement(item.elem, *self._preview, False))
             elif item.statement is None:
                 label = _attr(item.elem, "Data") or "Block"
                 steps.append(Control("block", "Block", label, body=self.run(item.body)))
@@ -1958,10 +1988,9 @@ class _Binder:
                 "point (cross-message)"
             )
         elif local in self._sent:
-            del self._held[handle]
             why = (
                 f"writes {handle} after a MsgSend of it, which would change the message already "
-                f"sent; {handle} is unknown from here on"
+                "sent"
             )
         elif local in self._built and not st.path.startswith("MSH-"):
             why = (
@@ -1969,7 +1998,10 @@ class _Binder:
                 "segment this write needs must be added by hand"
             )
         if why or local is None:
-            return UnmappedAction(st.verb, f"{why}; intended target {st.path}")
+            self._held.pop(handle, None)
+            return UnmappedAction(
+                st.verb, f"{why}; {handle} is unknown from here on; intended target {st.path}"
+            )
         value = "" if st.verb == "ItemClear" else st.literals[0]
         vocabulary = "append_to_field" if st.verb == "ItemAppend" else "set_field"
         return Action(st.verb, vocabulary, (_lit(st.path), _lit(value)), target=local)
@@ -2062,11 +2094,11 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
         # The whole-list gate (BACKLOG #313 step 2, ADR 0086): decided ONCE, for the whole list. A
         # list it does not fully understand takes the step 1 path below untouched, so its output is
         # step 1's byte for byte; there is no partial binding.
-        understood = _understood_list(action_list) if scope is None else None
+        understood = _understood_list(action_list, parents) if scope is None else None
+        subject, held = _message_handles(action_list)
         if understood is not None:
-            steps = _Binder(understood[0]).run(understood[1])
+            steps = _Binder(understood[0], subject, held).run(understood[1])
         else:
-            subject, held = _message_handles(action_list)
             steps = tuple(_container_steps(action_list, subject, held, False))
         if scope is not None:
             # The whole list is switched off: wrap it in ONE disabled node so it is preserved as
@@ -2176,7 +2208,7 @@ def generate_module(channel: Channel) -> str:
     ]
 
     surface = ["Send", "handler", "inbound", "outbound", "router"]
-    if any(_any_live_send(h.steps, lambda _: True, "create") for h in channel.handlers):
+    if any(_any_live_control(h.steps, lambda c: c.kind == "create") for h in channel.handlers):
         surface.append("Message")  # a MsgCreate binds its handle to Message.parse(...)
     surface_imports = sorted({*surface, *used_connectors})
     lines.append(f"from messagefoundry import {', '.join(surface_imports)}")
@@ -2572,26 +2604,23 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list."""
-    return _any_live_send(steps, lambda send: bool(send.args))
+    return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
 
 
 def _has_refused_send(steps: tuple[Step, ...]) -> bool:
     """Whether the tree renders a refused ``MsgSend`` as a live ``raise`` (see :func:`_send_refusal`)."""
-    return _any_live_send(steps, lambda send: bool(send.refusal))
+    return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.refusal))
 
 
-def _any_live_send(
-    steps: tuple[Step, ...], test: Callable[[Control], bool], kind: str = "send"
-) -> bool:
-    """Whether any live (not ``@Disabled``) ``send`` in the tree, branches included, passes ``test``.
-    ``kind`` asks the same of another control kind (a ``"create"``)."""
+def _any_live_control(steps: tuple[Step, ...], test: Callable[[Control], bool]) -> bool:
+    """Whether any live (not ``@Disabled``) control in the tree, branches included, passes ``test``."""
     for step in steps:
         if not isinstance(step, Control) or step.kind == "disabled":
             continue
-        if step.kind == kind and test(step):
+        if test(step):
             return True
-        if _any_live_send(step.body, test, kind) or any(
-            _any_live_send(b.body, test, kind) for b in step.branches
+        if _any_live_control(step.body, test) or any(
+            _any_live_control(b.body, test) for b in step.branches
         ):
             return True
     return False

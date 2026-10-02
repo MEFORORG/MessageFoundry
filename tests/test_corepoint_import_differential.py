@@ -514,25 +514,46 @@ def _package(body: str) -> str:
 # nothing here imports or calls the importer's gate. Where the head's output differs from step 1, the
 # list must be fully understood by THIS walker, or the importer's gate is wider than the allow-list.
 
-# Each verb's one shape after its keyword: H a handle span, R a path span "/", F a path span naming a
-# writable field, L a quoted literal span, and any other entry that exact unstyled word.
-_ALLOWED = {
-    "MsgTreeCopy": "H R to H R",
-    "MsgCreate": "H as L version L",
-    "ItemCopy": "L to H F",
-    "ItemClear": "H F",
-    "ItemAppend": "L to H F",
-    "MsgLog": "H",
-    "MsgSend": "H to connection L",
-}
-_SPAN_PIECE = re.compile(r"<span class=(['\"])([a-z-]+)\1>([^<>&]*)</span>")
-_G_HANDLE = re.compile(r"%[A-Za-z][A-Za-z0-9_]{0,39}")
-_G_FIELD = re.compile(
-    r"/(MSH|EVN|PID|PD1|PV1|PV2|MRG|ACC|UB1|UB2)"
-    r"(?:-([1-9]\d*)(?:-[1-9]\d*){0,2}(?: \([A-Za-z0-9 ]+\))?|-([1-9]\d*)(?:\.[1-9]\d*){1,2})"
+
+# Each allowed statement as ONE whole-string template, matched against the entire ``@Data`` at once:
+# the exact spelling, spacing and span quoting, not a token walk. H names a handle span, R the root
+# path span, F a single-occurrence field path span (never MSH-1 or MSH-2), and L a quoted literal span.
+def _h(n: int) -> str:
+    return (
+        rf"<span class='(?P<c{n}>input-handle|other-handle)'>"
+        rf"(?P<h{n}>%[A-Za-z][A-Za-z0-9_]{{0,39}})</span>"
+    )
+
+
+_R = r"<span class='path'>/</span>"
+_F = (
+    r"<span class='path'>/(?:MSH-(?![12](?![0-9]))|(?:EVN|PID|PD1|PV1|PV2|MRG|ACC|UB1|UB2)-)"
+    r"(?:[1-9][0-9]*(?:-[1-9][0-9]*){0,2}(?: \([A-Za-z0-9 ]+\))?|[1-9][0-9]*(?:\.[1-9][0-9]*){1,2})"
+    r"</span>"
 )
-_G_TYPE = re.compile(r"[A-Z0-9]{3}\^[A-Z0-9]{3}(?:\^[A-Z0-9_]{3,7})?")
-_G_VERSION = re.compile(r"2\.[1-9](?:\.[1-9])?")
+# A written value: printable ASCII less the quote, the markup characters and the HL7 delimiters.
+_VAL = r"<span class='literal'>\"(?P<v>(?:(?![\"&<>\\^|~])[ -~])*)\"</span>"
+
+
+def _kwd(verb: str) -> str:
+    return f"<span class='keyword'>{verb}</span>"
+
+
+_TEMPLATES = {
+    "MsgTreeCopy": re.compile(_kwd("MsgTreeCopy") + " " + _h(1) + _R + " to " + _h(2) + _R),
+    "MsgCreate": re.compile(
+        _kwd("MsgCreate")
+        + " "
+        + _h(1)
+        + r" as <span class='literal'>\"[A-Z0-9]{3}\^[A-Z0-9]{3}(?:\^[A-Z0-9_]{3,7})?\"</span>"
+        + r" version <span class='literal'>\"2\.[1-9](?:\.[1-9])?\"</span>"
+    ),
+    "ItemCopy": re.compile(_kwd("ItemCopy") + " " + _VAL + " to " + _h(1) + _F),
+    "ItemClear": re.compile(_kwd("ItemClear") + " " + _h(1) + _F),
+    "ItemAppend": re.compile(_kwd("ItemAppend") + " " + _VAL + " to " + _h(1) + _F),
+    "MsgLog": re.compile(_kwd("MsgLog") + " " + _h(1)),
+    "MsgSend": re.compile(_kwd("MsgSend") + " " + _h(1) + " to connection " + _VAL),
+}
 _G_CONTROL_WORDS = frozenset(
     [
         "if",
@@ -555,66 +576,21 @@ _G_CONTROL_WORDS = frozenset(
 )
 
 
-def _g_tokens(data: str) -> list[tuple[str, str]] | None:
-    """``[(span class, text)]`` with each unstyled word as ``("", word)``, or None."""
-    out: list[tuple[str, str]] = []
-    rest = data
-    while rest:
-        found = _SPAN_PIECE.match(rest)
-        if found:
-            out.append((found.group(2), found.group(3)))
-            rest = rest[found.end() :]
-            continue
-        plain = re.match(r"[^<>&]+", rest)
-        if plain is None:
-            return None
-        out.extend(("", w) for w in plain.group(0).split())
-        rest = rest[plain.end() :]
-    return out
-
-
 def _g_statement(data: str, handles: list[tuple[str, str]], writes: list[str]) -> bool:
     """Whether ``data`` is one allowed statement; record its handles and what it overwrites."""
-    tokens = _g_tokens(data)
-    if not tokens or tokens[0][0] != "keyword" or tokens[0][1] not in _ALLOWED:
-        return False
-    verb = tokens[0][1]
-    want = _ALLOWED[verb].split()
-    if len(tokens) - 1 != len(want):
-        return False
-    named: list[str] = []
-    lits: list[str] = []
-    for w, (cls, text) in zip(want, tokens[1:], strict=True):
-        if w == "H":
-            if cls not in ("input-handle", "other-handle") or not _G_HANDLE.fullmatch(text):
-                return False
-            handles.append((text, cls))
-            named.append(text)
-        elif w == "R":
-            if (cls, text) != ("path", "/"):
-                return False
-        elif w == "F":
-            field_path = _G_FIELD.fullmatch(text) if cls == "path" else None
-            if field_path is None:
-                return False
-            if field_path.group(1) == "MSH" and (field_path.group(2) or field_path.group(3)) in (
-                "1",
-                "2",
-            ):
-                return False
-        elif w == "L":
-            if cls != "literal" or not re.fullmatch(r'"[^"]*"', text):
-                return False
-            lits.append(text[1:-1])
-        elif (cls, text) != ("", w):
+    for verb, template in _TEMPLATES.items():
+        found = template.fullmatch(data)
+        if found is None:
+            continue
+        named = found.groupdict()
+        pairs = [(named[f"h{n}"], named[f"c{n}"]) for n in (1, 2) if named.get(f"h{n}")]
+        if verb == "MsgSend" and not named["v"].strip():
             return False
-    if verb == "MsgCreate" and not (_G_TYPE.fullmatch(lits[0]) and _G_VERSION.fullmatch(lits[1])):
-        return False
-    if verb == "MsgSend" and not lits[0].strip():
-        return False
-    if verb in ("MsgTreeCopy", "MsgCreate"):
-        writes.append(named[-1])
-    return True
+        handles.extend(pairs)
+        if verb in ("MsgTreeCopy", "MsgCreate"):
+            writes.append(pairs[-1][0])
+        return True
+    return False
 
 
 def _g_label(data: str) -> bool:
@@ -764,7 +740,8 @@ class _Oracle:
         self.dead: set[str] = set()
         self.doubt: set[str] = set()
         self.may_skip: set[str] = set()
-        self.lits: dict[Val, set[str]] = {}
+        # Each tree's field writes, path to literal: a later write to a field replaces the earlier.
+        self.lits: dict[Val, dict[str, str]] = {}
         # The literals each send's tree held AT the send: a later write changes the tree in
         # Corepoint, not the message already sent.
         self.sent_lits: dict[str, set[str]] = {}
@@ -798,16 +775,16 @@ class _Oracle:
                     root = v[2] if v[0] == "clone" else v
                     made: Val = ("clone", uid, root)
                     # A copy holds what its source held at the copy, and nothing written later.
-                    self.lits.setdefault(made, set()).update(self.lits.get(v, set()))
+                    self.lits.setdefault(made, {}).update(self.lits.get(v, {}))
                     new.add(made)
                 env.vals[self.key(dst.name)] = frozenset(new)
             case Create(h, k, good, _):
                 env.vals[self.key(h.name)] = frozenset({("create", k) if good else UNK})
-            case Write(h, lit, _, _):
+            case Write(h, lit, path, _):
                 key = self.key(h.name)
                 vals = env.get(key)
                 for v in vals - {UNK, EMPTY}:
-                    self.lits.setdefault(v, set()).add(lit)
+                    self.lits.setdefault(v, {})[path] = lit
                 if EMPTY in vals:  # a write into nothing may build a tree
                     env.vals[key] = (vals - {EMPTY}) | {UNK}
             case Log():
@@ -815,7 +792,7 @@ class _Oracle:
             case SendS(h, dest, _):
                 self.sends.setdefault(dest, set()).update(env.get(self.key(h.name)))
                 for v in env.get(self.key(h.name)):
-                    self.sent_lits.setdefault(dest, set()).update(self.lits.get(v, set()))
+                    self.sent_lits.setdefault(dest, set()).update(self.lits.get(v, {}).values())
                 self.send_keys.setdefault(dest, set()).add(self.key(h.name))
                 if ctx.dead and not env.ended:
                     self.dead.add(dest)
@@ -1065,9 +1042,12 @@ def _violations(shape: Shape) -> list[str]:
     or it is open, and then the guard's OWN walker (:func:`_fully_understood`, never the importer's
     gate) must find every element allow-listed, and every oracle check must pass."""
     xml = _render(shape.nodes, shape.inp)
-    if _generate(head, xml) == _generate(step1, xml):
+    head_out, step1_out = _generate(head, xml), _generate(step1, xml)
+    if head_out == step1_out:
         return []
     found: list[str] = []
+    if not step1_out[0]:
+        found.append("(refusal) step 1 refuses the list, and the head renders it")
     if not _fully_understood(xml):
         found.append("(gate) the head differs from step 1 on a list that is not fully understood")
     return found + _oracle_violations(shape, xml)
@@ -1149,11 +1129,15 @@ def _oracle_violations(shape: Shape, xml: str) -> list[str]:
             if _kind(value) != seen:
                 found.append(f"(i) {dest} delivers {seen}; the export sends {_kind(value)}")
             assert isinstance(message, Message)
-            stray = set(_LITERAL.findall(message.encode())) - verdict.sent_lits.get(dest, set())
+            held = set(_LITERAL.findall(message.encode()))
+            stray = held - verdict.sent_lits.get(dest, set())
             if stray:
                 found.append(
                     f"(i) {dest} carries {sorted(stray)}, written to another tree or after the send"
                 )
+            missing = verdict.sent_lits.get(dest, set()) - held
+            if missing:
+                found.append(f"(i) {dest} lacks {sorted(missing)}, which its tree held at the send")
     return found
 
 
@@ -1198,7 +1182,8 @@ class _Build:
         return Clone(self.spell(src), self.spell(dst), self._next(), self.m())
 
     def create(self, h: H, good: bool = True) -> Create:
-        return Create(self.spell(h), 1 + self._next() % 98, good, self.m())
+        # Never ADT^A01: that is the synthetic input's type, which _observed reads as a copy of it.
+        return Create(self.spell(h), 2 + self._next() % 97, good, self.m())
 
     def write(self, h: H) -> Write:
         return Write(
@@ -1823,6 +1808,7 @@ def _seed_shapes() -> Iterator[Shape]:
             (Clone(_ADT, h, 1), SendS(h, "OB_BEFORE"), Call((Log(_P),)), SendS(h, "OB_AFTER")),
         )
     yield from _round3_shapes()
+    yield from _gate_review_shapes()
     # The Lander's QA of db8873d19e, pre-existing on main: a line between an If and its Else.
     for between in (
         "<Line/>",
@@ -1993,6 +1979,50 @@ def _round3_shapes() -> Iterator[Shape]:
     }
     for name, nodes in shapes.items():
         yield Shape(f"review-6fa49a9d5-{name}", "%ADT", nodes)
+
+
+def _gate_review_shapes() -> Iterator[Shape]:
+    """The code review of the whole-list gate itself (round 1): a skeleton written outside its MSH
+    then sent, statements spelled with other spacing or quoting, literals carrying HL7 delimiters,
+    and lists nested deeper than step 1 accepts."""
+    out = H("%OUT")
+    clone = Clone(_ADT, out, 1)
+    send = f"{_kw('MsgSend')} {_hs(out, '%ADT')} to connection {_lit('OB_OUT')}"
+    spelled = {
+        "no-spaces": f"{_kw('MsgSend')}{_hs(out, '%ADT')}to connection{_lit('OB_OUT')}",
+        "double-space": send.replace(" to ", "  to ", 1),
+        "nbsp": send.replace("to connection", "to connection"),
+        "line-separator": send.replace("to connection", "to connection"),
+        "double-quoted-class": send.replace("class='keyword'", 'class="keyword"'),
+        "leading-space": " " + send,
+    }
+    for name, data in spelled.items():
+        yield Shape(f"gate-review-send-{name}", "%ADT", (clone, Raw(_line(data), havoc=False)))
+    spaced_clone = (
+        f"{_kw('MsgTreeCopy')} {_hs(_ADT, '%ADT')} {_span('path', '/')} to "
+        f"{_hs(out, '%ADT')} {_span('path', '/')}"
+    )
+    yield Shape(
+        "gate-review-clone-space-before-path",
+        "%ADT",
+        (Raw(_line(spaced_clone), havoc=False), SendS(out, "OB_OUT")),
+    )
+    yield Shape(
+        "gate-review-skeleton-write-then-send",
+        "%ADT",
+        (Create(out, 4), Write(out, "W7Z", "/PID-8"), SendS(out, "OB_OUT")),
+    )
+    for value in ("A|B", "a\\F\\b", "x^y", "q~r", "t&u"):
+        yield Shape(
+            f"gate-review-delimiter-{value!r}",
+            "%ADT",
+            (clone, Write(out, value), SendS(out, "OB_OUT")),
+        )
+    for depth in (12, 34, 40, 49):
+        nested: Node = Block((clone, SendS(out, "OB_OUT")))
+        for _ in range(depth - 1):
+            nested = Block((nested,))
+        yield Shape(f"gate-review-nested-{depth}", "%ADT", (nested,))
 
 
 # --- the guard ------------------------------------------------------------------------------------
