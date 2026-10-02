@@ -197,8 +197,11 @@ authenticated.
    added beside the key id.
 4. **A handle with no key learns from the genesis row that the chain is keyed.** It refuses to
    append to it, and reports that it cannot verify it.
-5. **Every row carries `seq` inside its MAC.** `audit_log.seq` is `NOT NULL` and `UNIQUE`, and a
-   `CHECK` refuses a value below 1 (on SQLite, also a value that is not an integer). It
+5. **Every row carries `seq` inside its MAC.** `audit_log.seq` is `NOT NULL` and `UNIQUE`. On
+   PostgreSQL and SQL Server a `CHECK` also refuses a value below 1, to a role that cannot alter
+   the table. SQLite carries no such `CHECK`: every writer of a SQLite file can switch one off,
+   and a row that broke it would fail the store's integrity check, where it is the audit
+   verify's to report. It
    starts at 1 and each append takes the head's `seq` plus one. On PostgreSQL and SQL Server the
    head is read under the lock every append already takes in the database (the advisory lock, the
    applock), so the number is safe across engine shards and cluster nodes. On SQLite the writer

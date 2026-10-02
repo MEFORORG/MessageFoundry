@@ -54,13 +54,7 @@ def _sqlite_backend(path: Path) -> ChainBackend:
 
     # A plain stdlib connection: the writer these cases stand in for never holds the store's key.
     async def execute(sql: str) -> None:
-        with sqlite3.connect(path, timeout=10) as conn:
-            conn.execute(sql)
-            conn.commit()
-        conn.close()
-
-    async def execute_unchecked(sql: str) -> None:
-        _unchecked(path, sql)
+        _write(path, sql)
 
     async def fetch(sql: str) -> Sequence[Mapping[str, Any]]:
         conn = sqlite3.connect(path, timeout=10)
@@ -82,18 +76,17 @@ def _sqlite_backend(path: Path) -> ChainBackend:
         execute=execute,
         fetch=fetch,
         reset=reset,
-        execute_unchecked=execute_unchecked,
     )
 
 
-def _unchecked(path: Path, sql: str, params: tuple[Any, ...] = ()) -> None:
-    """Run one statement as a writer that opened the file directly and switched the CHECK
-    constraints off. No key is involved: the pragma is the connection's own."""
-    with sqlite3.connect(path, timeout=10) as conn:
-        conn.execute("PRAGMA ignore_check_constraints = ON")
+def _write(path: Path, sql: str, params: tuple[Any, ...] = ()) -> None:
+    """Run one statement as a writer that opened the file directly and holds no key."""
+    conn = sqlite3.connect(path, timeout=10)
+    try:
         conn.execute(sql, params)
         conn.commit()
-    conn.close()
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.__name__)
@@ -137,26 +130,28 @@ def test_no_backend_schema_or_statement_names_the_removed_table(module: str) -> 
     assert not statements, statements
 
 
-@pytest.mark.parametrize("value", [0, -1, "zzz", 7.5], ids=repr)
-async def test_the_schema_refuses_a_position_that_is_not_a_whole_number_from_one(
-    tmp_path: Path, value: object
-) -> None:
-    """The CHECK on ``audit_log.seq``. The control is the same statement with a usable number,
-    which the table takes."""
-    path = tmp_path / "floor.db"
-    store = await MessageStore.open(path)
+async def test_a_row_numbered_below_one_is_the_audit_verifys_to_report(tmp_path: Path) -> None:
+    """SQLite's ``audit_log.seq`` carries no CHECK, deliberately. A row numbered below 1 is reported
+    by the audit verify, and the store's own integrity check still passes: a CHECK there would
+    fail that check on such a row, and with it every backup that verifies its restore. The
+    control is the same store before the row is added, where both checks pass."""
+    path = tmp_path / "integrity.db"
+    store = await _keyed(path, generate_key())
     try:
         await store.record_audit("act", actor="u")
+        assert await store.integrity_check() == (True, "ok")
+        ok, message = await store.verify_audit_chain()
+        assert ok, message
+        _write(
+            path,
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (0, 1.0, 'someone', 'added', NULL, NULL, NULL, 'deadbeef')",
+        )
+        assert await store.integrity_check() == (True, "ok")
+        ok, message = await store.verify_audit_chain()
+        assert not ok and "seq=1" in (message or ""), message
     finally:
         await store.close()
-    conn = sqlite3.connect(path)
-    try:
-        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
-            conn.execute("UPDATE audit_log SET seq = ? WHERE seq = 1", (value,))
-        conn.execute("UPDATE audit_log SET seq = 50 WHERE seq = 1")
-        assert conn.execute("SELECT seq FROM audit_log").fetchall() == [(50,)]
-    finally:
-        conn.close()
 
 
 @pytest.mark.parametrize("module", ["postgres", "sqlserver"])
@@ -420,9 +415,9 @@ async def test_the_anchor_is_total_over_a_head_whose_sequence_number_is_not_an_i
         for i in range(4):
             await store.record_audit("act", actor="u", detail=str(i))
         assert (await store.audit_anchor())[0] == 4  # the control
-        _unchecked(path, "DELETE FROM audit_log WHERE seq = 1")
-        _unchecked(path, "UPDATE audit_log SET seq = 'zzy' WHERE seq = 3")
-        _unchecked(path, "UPDATE audit_log SET seq = 'zzz' WHERE seq = 4")
+        _write(path, "DELETE FROM audit_log WHERE seq = 1")
+        _write(path, "UPDATE audit_log SET seq = 'zzy' WHERE seq = 3")
+        _write(path, "UPDATE audit_log SET seq = 'zzz' WHERE seq = 4")
         seq, head = await store.audit_anchor()
         assert seq == 3 and len(head) == 64
         with pytest.raises(RuntimeError, match="no usable sequence number"):
@@ -442,7 +437,7 @@ async def test_the_anchor_never_reads_a_log_that_holds_rows_as_empty(tmp_path: P
     try:
         assert await store.audit_anchor() == (0, "")  # the control
         await store.record_audit("act", actor="u")
-        _unchecked(path, "UPDATE audit_log SET seq = 0")
+        _write(path, "UPDATE audit_log SET seq = 0")
         seq, head = await store.audit_anchor()
         assert seq == 1 and len(head) == 64
     finally:
@@ -465,7 +460,7 @@ async def test_a_keyed_store_opens_and_reports_a_log_with_no_row_at_position_one
         assert store.audit_chain_unkeyed() is False
     finally:
         await store.close()
-    _unchecked(path, "UPDATE audit_log SET seq = 7.5 WHERE seq = 1")
+    _write(path, "UPDATE audit_log SET seq = 7.5 WHERE seq = 1")
     with caplog.at_level("ERROR"):
         store = await _keyed(path, key)  # must not raise
     try:
@@ -500,7 +495,7 @@ async def test_every_row_is_compared_when_a_row_sits_below_the_genesis_row(
         ok, message = await store.verify_audit_chain()
         assert ok, message
         assert computed == [1, 2, 3, 4]  # the control
-        _unchecked(
+        _write(
             path,
             "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
             " VALUES (0, 1.0, 'someone', 'added', NULL, NULL, NULL, 'deadbeef')",

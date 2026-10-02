@@ -1773,9 +1773,11 @@ _SCHEMA: list[str] = [
     # column as NULLable for stores written before hash-chaining, a population that does not exist.
     # `seq` is the row's position in the hash chain: 1, then rising by one, with no gap. It is inside
     # the row's MAC and is what an anchor and the off-box tee name a row by. `id` is only the surrogate
-    # key: IDENTITY can skip values. UNIQUE, so two appends can never take one position. CHECK, so no
-    # role can put a row below position 1. `id` stays the clustered key: the audit listings read
-    # newest-first by `id`, and the append's head read is one seek on the UNIQUE index.
+    # key: IDENTITY can skip values. UNIQUE, so two appends can never take one position. The CHECK
+    # refuses a row below position 1 to a role that cannot alter the table. Whoever owns the table can
+    # drop or disable it, so every reader of `seq` still treats the value as untrusted. `id` stays the
+    # clustered key: the audit listings read newest-first by `id`, and the append's head read is one
+    # seek on the UNIQUE index. The chain walk reads in `seq` order through that index.
     """IF OBJECT_ID('audit_log','U') IS NULL CREATE TABLE audit_log (
         id INT IDENTITY(1,1) PRIMARY KEY, seq BIGINT NOT NULL UNIQUE CHECK (seq >= 1),
         ts FLOAT NOT NULL, actor NVARCHAR(256) NULL,
@@ -10932,7 +10934,8 @@ class SqlServerStore:
         rows = await self._fetchall("SELECT TOP (1) seq, row_hash FROM audit_log ORDER BY seq DESC")
         if not rows:
             return 0, ""
-        return int(rows[0]["seq"]), (rows[0]["row_hash"] or "")
+        # Never 0 for a log that holds a row: 0 means "empty" to every caller.
+        return max(int(rows[0]["seq"]), 1), (rows[0]["row_hash"] or "")
 
     async def has_prior_backup_history(self) -> bool:
         """See :meth:`AuditStore.has_prior_backup_history` — ≥1 ``dr_backup`` audit row (the #102 server-DB

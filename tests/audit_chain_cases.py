@@ -62,10 +62,10 @@ class ChainBackend:
     fetch: Callable[[str], Awaitable[Sequence[Mapping[str, Any]]]]
     #: Empty ``audit_log``.
     reset: Callable[[], Awaitable[None]]
-    #: Run one statement with the table's CHECK constraints switched off, or ``None`` where no
-    #: writer can do that. A SQLite file can be opened directly by anyone who can write it; a
-    #: server database enforces the constraint on every role.
-    execute_unchecked: Callable[[str], Awaitable[None]] | None = None
+    #: Whether the table's CHECK refuses a row numbered below 1. The server backends carry one,
+    #: which binds a role that cannot alter the table. SQLite carries none: every writer of a
+    #: SQLite file could switch it off.
+    refuses_a_position_below_one: bool = False
     #: Whether two handles may open the same fresh store at the same moment. The server backends
     #: serialise that in the database; a test's SQLite file is opened one handle at a time.
     concurrent_open: bool = False
@@ -105,6 +105,7 @@ def server_chain_backend(
         fetch=fetch,
         reset=reset,
         concurrent_open=True,
+        refuses_a_position_below_one=True,
     )
 
 
@@ -139,7 +140,7 @@ async def _recompute_without_a_key(b: ChainBackend) -> None:
     """Renumber the rows from 1 and recompute every ``row_hash`` as plain SHA-256: the most a writer
     with no key can do to make a changed chain look whole."""
     rows = await _chain(b)
-    # Step aside from the UNIQUE constraint, staying above the floor the CHECK sets.
+    # Step aside from the UNIQUE constraint, staying above the floor a server backend's CHECK sets.
     await b.execute("UPDATE audit_log SET seq = seq + 1000000")
     prev = ""
     for position, r in enumerate(rows, start=1):
@@ -441,13 +442,14 @@ async def two_opens_of_a_fresh_keyed_store_share_one_genesis_row(b: ChainBackend
 async def a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is(
     b: ChainBackend,
 ) -> None:
-    """A row numbered below 1 is refused by the table's CHECK constraint, on every backend.
+    """A row numbered below 1. On a server backend the table's CHECK refuses it; the control there
+    is the same statement with a free, usable number, which the table takes.
 
-    Where a writer can switch that constraint off (a SQLite file opened directly), the row is a
-    reported break and nothing more. Whether a chain is keyed is read from the row AT sequence
-    number 1, a position the UNIQUE constraint lets nobody take twice, and not from whichever row
-    sorts first: the keyed handle still treats the chain as keyed, and a handle with no key still
-    refuses to append. The control is the same chain before the row is added."""
+    On SQLite, which carries no such CHECK, the row is a reported break and nothing more. Whether a
+    chain is keyed is read from the row AT sequence number 1, a position the UNIQUE constraint lets
+    nobody take twice, and not from whichever row sorts first: the keyed handle still treats the
+    chain as keyed, and a handle with no key still refuses to append. The control is the same
+    chain before the row is added."""
     await b.reset()
     key = generate_key()
     store = await b.open_keyed(key, ())
@@ -457,21 +459,27 @@ async def a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is(
         assert ok, f"{b.name}: the control must verify: {message}"
     finally:
         await store.close()
-    insert = (
-        "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
-        " VALUES (0, 1.0, 'someone', 'added', NULL, NULL, NULL, 'deadbeef')"
-    )
+
+    def insert(seq: int) -> str:
+        return (
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            f" VALUES ({seq}, 1.0, 'someone', 'added', NULL, NULL, NULL, 'deadbeef')"
+        )
+
     before = await _chain(b)
-    try:
-        await b.execute(insert)
-    except Exception:  # each driver has its own name for a refused constraint
-        pass
-    else:
-        raise AssertionError(f"{b.name}: the database took a row numbered below 1")
-    assert await _chain(b) == before, f"{b.name}: the refused statement changed the log"
-    if b.execute_unchecked is None:
+    if b.refuses_a_position_below_one:
+        await b.execute(insert(1000))  # the control: the statement itself is one the table takes
+        assert len(await _chain(b)) == len(before) + 1, f"{b.name}: the control row was not added"
+        await b.execute("DELETE FROM audit_log WHERE seq = 1000")
+        try:
+            await b.execute(insert(0))
+        except Exception as exc:  # each driver has its own type; the text names the constraint
+            assert "check constraint" in str(exc).lower(), f"{b.name}: {exc!r}"
+        else:
+            raise AssertionError(f"{b.name}: the database took a row numbered below 1")
+        assert await _chain(b) == before, f"{b.name}: the refused statement changed the log"
         return
-    await b.execute_unchecked(insert)
+    await b.execute(insert(0))
     assert len(await _chain(b)) == len(before) + 1, f"{b.name}: the row was never added"
     store = await b.open_keyed(key, ())
     try:

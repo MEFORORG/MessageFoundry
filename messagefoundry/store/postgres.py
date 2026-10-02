@@ -594,7 +594,9 @@ _SCHEMA: list[str] = [
         -- The row's position in the hash chain: 1, then rising by one, with no gap. It is inside the
         -- row's MAC and is what an anchor and the off-box tee name a row by. `id` is only the
         -- surrogate key: a rolled-back INSERT burns a BIGSERIAL value, so `id` can skip. UNIQUE, so
-        -- two appends can never take one position. CHECK, so no role can put a row below position 1.
+        -- two appends can never take one position. The CHECK refuses a row below position 1 to a
+        -- role that cannot alter the table. Whoever owns the table can drop it, so every reader of
+        -- `seq` still treats the value as untrusted.
         seq        BIGINT NOT NULL UNIQUE CHECK (seq >= 1),
         ts         DOUBLE PRECISION NOT NULL,
         actor      TEXT,
@@ -7306,7 +7308,8 @@ class PostgresStore:
         row = await self._fetchone("SELECT seq, row_hash FROM audit_log ORDER BY seq DESC LIMIT 1")
         if row is None:
             return 0, ""
-        return int(row["seq"]), (row["row_hash"] or "")
+        # Never 0 for a log that holds a row: 0 means "empty" to every caller.
+        return max(int(row["seq"]), 1), (row["row_hash"] or "")
 
     async def has_prior_backup_history(self) -> bool:
         """See :meth:`AuditStore.has_prior_backup_history` — ≥1 ``dr_backup`` audit row (the #102 server-DB

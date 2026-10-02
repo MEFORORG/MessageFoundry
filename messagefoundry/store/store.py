@@ -2537,11 +2537,11 @@ def verify_audit_rows(
     :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, the walk always runs to completion, and
     the first divergent position is reported after it. A structural break is reported at its own
     position, with the reason."""
-    # The row AT seq 1 when there is one, and only otherwise the row that sorts first. A row added
-    # below the genesis row must not change what the chain is: with a key in hand it would leave
-    # every row's MAC uncompared, and with none it would make a keyed chain read as keyless. The
-    # fallback keeps a chain whose numbers were all shifted compared under the key it names.
-    opening = next((r for r in rows if _strict_int(r["seq"]) == 1), rows[0] if rows else None)
+    # The row AT seq 1, not the row that sorts first, which is the rule the open applies too
+    # (``load_audit_chain``). A row added below the genesis row must not change what the chain is:
+    # with a key in hand it would leave every row's MAC uncompared, and with none it would make a
+    # keyed chain read as keyless.
+    opening = next((r for r in rows if _strict_int(r["seq"]) == 1), None)
     genesis_key = _audit_genesis_key(opening) if opening is not None else None
     if not capable and genesis_key is not None:
         # A keyed chain and no key/MAC in hand (opened without the DEK or the vault):
@@ -4556,11 +4556,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     -- The row's position in the hash chain: 1 for the first row, then rising by one, with no gap.
     -- It is inside the row's MAC, and it is the number an anchor and the off-box tee name a row by.
-    -- `id` is only the surrogate key. UNIQUE, so two appends can never take one position. The
-    -- CHECK refuses a position below 1 and a value that is not an integer, which SQLite would
-    -- otherwise store in any column. It binds a writer that goes through SQL. A writer that opens
-    -- the file can switch it off, so every reader of `seq` still treats the value as untrusted.
-    seq         INTEGER NOT NULL UNIQUE CHECK (typeof(seq) = 'integer' AND seq >= 1),
+    -- `id` is only the surrogate key. UNIQUE, so two appends can never take one position. No
+    -- CHECK on it here, deliberately, though the server backends carry one. Every writer of a
+    -- SQLite file can switch a CHECK off, so it would stop nobody; and a row that broke it would
+    -- fail the store's own integrity check, which stops a backup that verifies its restore. A
+    -- row with an unusable number is the audit verify's to report. Every reader of `seq`
+    -- treats the value as untrusted.
+    seq         INTEGER NOT NULL UNIQUE,
     ts          REAL NOT NULL,
     actor       TEXT,                 -- who: a username or 'system' (auth is built; always populated)
     action      TEXT NOT NULL,        -- e.g. summary_search_display, message_view, export
