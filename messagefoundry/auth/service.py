@@ -7059,9 +7059,65 @@ class AuthService:
             _log.error("startup probe: %s", problem)
         return problem is None
 
+    async def administrators_needing_an_outside_service(self) -> tuple[str, ...]:
+        """The enabled Administrators, by username, when NONE of them can sign in without an outside
+        identity service; empty otherwise (vault BACKLOG #2711, step 2).
+
+        An Administrator counts as self-sufficient when it is a local account with a password and no
+        federated binding. A directory account needs the directory, and a bound account needs the
+        identity provider. ``provision-admin`` refuses while any enabled Administrator exists,
+        whichever kind, so a site whose every Administrator needs an outside service has no host
+        command to get back in while that service is down. Empty too when there is no enabled
+        Administrator at all: the first-run notices of ADR 0183 cover that case."""
+        admins: list[str] = []
+        for user in await self._store.list_users():
+            if user.disabled:
+                continue
+            if Role.ADMINISTRATOR.value not in await self._store.get_user_role_ids(user.id):
+                continue
+            if (
+                user.auth_provider == AuthProvider.LOCAL.value
+                and user.password_hash is not None
+                and user.oidc_issuer is None
+                and user.oidc_subject is None
+            ):
+                return ()
+            admins.append(user.username)
+        return tuple(sorted(admins))
+
+    async def report_administrators_needing_an_outside_service(self) -> tuple[str, ...]:
+        """Run :meth:`administrators_needing_an_outside_service` at startup: WARN and write one audit
+        row when it names anyone, and do nothing more. Usernames only. Never refuses the start: a
+        directory-only site is a choice, and the notice exists so it is an informed one."""
+        names = await self.administrators_needing_an_outside_service()
+        if not names:
+            return names
+        _log.warning(
+            "every enabled Administrator signs in through an outside identity service (the "
+            "directory or a federated identity provider): %s. If that service is down, nobody can "
+            "sign in to manage this engine, and `messagefoundry provision-admin` will not create a "
+            "local Administrator while these accounts exist. Create a local Administrator now, "
+            "before an outage (docs/SECURITY.md, 'Keep a local Administrator').",
+            ", ".join(names),
+        )
+        await self._audit(
+            "auth.no_local_administrator",
+            actor="system",
+            detail=_json({"administrators": list(names)}),
+        )
+        return names
+
     async def report_lockable_account_census(self) -> LockableAccountCensus:
         """Run :meth:`lockable_account_census` at startup: WARN and write one audit row when it
-        names anyone, and do nothing more (AC-A9). Usernames only, never a secret."""
+        names anyone, and do nothing more (AC-A9). Usernames only, never a secret.
+
+        It also runs :meth:`report_administrators_needing_an_outside_service`, the start notice of
+        vault BACKLOG #2711, because this is the one account census the lifespan already calls at
+        start. That notice is guarded on its own, so its failure cannot cost this census."""
+        try:
+            await self.report_administrators_needing_an_outside_service()
+        except Exception:  # noqa: BLE001 -- a start notice must never cost the census or the start
+            _log.exception("the local-Administrator notice could not run; startup continues")
         census = await self.lockable_account_census()
         if census.clean:
             return census

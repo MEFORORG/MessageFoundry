@@ -5638,7 +5638,10 @@ class SecuritySettings(_Section):
     static_credential_accepted: dict[str, str] = Field(default_factory=dict)
 
     # ── Sign-in & identity ───────────────────────────────────────────
-    require_sign_in: bool = True  # authenticate every request
+    # There is no sign-in switch here. `serve` always requires sign-in (vault BACKLOG #2719): the
+    # loopback no-auth mode it once offered was removed, not relocated, so `require_sign_in` is
+    # refused at load as a REMOVED key (_REMOVED_KEYS). AuthSettings.enabled survives only for
+    # embedders and tests that build the app themselves with allow_no_auth=True.
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
     # Who must enroll one when require_mfa is on. Default widens the gate past the Administrator role
     # to every local account (ASVS 6.3.3); "administrators" restores the pre-6.3.3 posture.
@@ -6125,7 +6128,6 @@ _RELOCATED_TO_SECURITY: dict[tuple[str, str], str] = {
     ("api", "serve_ui"): "serve_web_console",
     ("api", "public_origin"): "web_console_public_address",
     ("store", "allow_unencrypted_phi"): "allow_unencrypted_phi",
-    ("auth", "enabled"): "require_sign_in",
     ("auth", "require_mfa"): "require_mfa",
     ("auth", "require_mfa_scope"): "require_mfa_scope",
     ("auth", "session_idle_timeout_minutes"): "sign_out_after_idle_minutes",
@@ -6172,6 +6174,22 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
         "sets it. To request the web console explicitly, set [security].serve_web_console"
     ),
+    # Vault BACKLOG #2719. Named here rather than left to the unknown-key refusal, because that one
+    # offers the nearest spelling, and for this key the nearest is `require_mfa`: an operator following
+    # the hint would swap one loosening for another.
+    ("security", "require_sign_in"): (
+        "`serve` always requires sign-in, on every bind, and this switch was removed rather than "
+        "relocated (vault BACKLOG #2719). Remove this line, or unset MEFOR_SECURITY_REQUIRE_SIGN_IN "
+        "if the environment sets it. On a store with no Administrator yet, create the first one "
+        "with `messagefoundry provision-admin`"
+    ),
+    # Vault BACKLOG #2719. It had moved to [security].require_sign_in under ADR 0118, and that key is
+    # gone too, so the relocation notice would have named a key that no longer exists.
+    ("auth", "enabled"): (
+        "`serve` always requires sign-in, and the switch that turned it off was removed (vault "
+        "BACKLOG #2719). ADR 0118 had relocated it to [security].require_sign_in, and that key is "
+        "retired too. Remove this line, or unset MEFOR_AUTH_ENABLED if the environment sets it"
+    ),
     # BACKLOG #2090 (ADR 0066 §12): `false` could only start the mode that deadlocks.
     ("pipeline", "require_rcsi_for_pooled"): (
         "a SQL Server store no longer opens with READ_COMMITTED_SNAPSHOT off. The pooled start "
@@ -6187,7 +6205,6 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
 #: are handled explicitly in :func:`_desugar_security`.
 _SECURITY_PASSTHROUGH: tuple[tuple[str, str, str], ...] = (
     ("serve_web_console", "api", "serve_ui"),
-    ("require_sign_in", "auth", "enabled"),
     ("require_mfa", "auth", "require_mfa"),
     ("require_mfa_scope", "auth", "require_mfa_scope"),
     ("sign_out_after_idle_minutes", "auth", "session_idle_timeout_minutes"),
@@ -7002,14 +7019,6 @@ def security_loosenings(
                 + " (ASVS 3.7.3)",
             )
         )
-    if not sec.require_sign_in:
-        out.append(
-            (
-                "require_sign_in",
-                "authentication is DISABLED — requests run as a full-privilege system identity "
-                "(loopback-only; a non-loopback bind refuses)",
-            )
-        )
     if not sec.require_mfa:
         out.append(
             (
@@ -7153,9 +7162,9 @@ def security_loosenings(
     # Vault BACKLOG #2354: a plain ldap:// AD bind. ServiceSettings refuses it at load under enforce, so a
     # loaded config reaches this only at warn. Conditional on the bind being live: the flag beside an
     # ldaps:// address, with AD off, or with sign-in off (nothing builds the authenticator) changes
-    # nothing and is not named. Sign-in is read off [security], as for the limiter entries below, so
-    # `security set` turning it on shows this at once.
-    if sec.require_sign_in and auth.plain_ldap_bind:
+    # nothing and is not named. Sign-in is off only on an app an embedder or a test built itself;
+    # `serve` always requires it (vault BACKLOG #2719).
+    if auth.enabled and auth.plain_ldap_bind:
         out.append(
             (
                 "ad_allow_insecure_ldap",
@@ -7178,10 +7187,9 @@ def security_loosenings(
     # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
-    # Gated on [security].require_sign_in rather than [auth].enabled (the desugar makes them equal on
-    # every loaded path): `security set` passes the NEW [security] beside the [auth] it read before
-    # the edit, so turning sign-in on there must show these at once.
-    if sec.require_sign_in:
+    # Gated on [auth].enabled. A loaded config always has it on: `serve` requires sign-in and no key
+    # turns it off (vault BACKLOG #2719). Only an app an embedder or a test built itself has it off.
+    if auth.enabled:
         out.extend(_auth_limit_loosenings(auth))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what

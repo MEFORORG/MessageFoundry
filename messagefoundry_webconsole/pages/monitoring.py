@@ -580,7 +580,6 @@ def status(
             ["Serve web console", _sec("serve_web_console")],
             ["Encrypt stored data", _sec("encrypt_stored_data")],
             ["Allow unencrypted PHI", _sec("allow_unencrypted_phi")],
-            ["Require sign-in", _sec("require_sign_in")],
             ["Require MFA", _sec("require_mfa")],
             ["Sign out after idle (min)", _sec("sign_out_after_idle_minutes")],
             ["Max session (hours)", _sec("max_session_hours")],

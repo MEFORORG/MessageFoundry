@@ -12,12 +12,12 @@ be driven two ways:
 * :func:`create_managed_app(...)` — own the engine via an ASGI lifespan (the CLI server,
   and anything driven by a synchronous test client).
 
-Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached (the
-``serve`` path attaches one unless ``[security].require_sign_in`` is off). With **no** enabled auth
-attached, both factories are **fail-closed**: every protected route is refused (503) unless the
-caller passes ``allow_no_auth=True`` (embedding / dev), in which case requests run as the
-full-access system identity (SYS-1). ``serve`` passes the opt-in itself when sign-in is off, after
-its own start-up refusals.
+Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached. The
+``serve`` path always attaches one: it refuses to start with sign-in off, on every bind (vault
+BACKLOG #2719). With **no** enabled auth attached, both factories are **fail-closed**: every
+protected route is refused (503) unless the caller passes ``allow_no_auth=True``, in which case
+requests run as the full-access system identity (SYS-1). Only embedders and tests pass it;
+``serve`` never does.
 
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
