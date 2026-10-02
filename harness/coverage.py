@@ -10,9 +10,10 @@ not there.
 
 THIS IS THE ONE HARNESS MODULE THAT IMPORTS ``messagefoundry.transports``, and it is named in
 ``tests/test_dependency_boundaries.py``'s ``_CLIENT_ALLOWED`` for exactly that. The import is
-read-only -- it builds no connector and opens no socket -- and the registries have no public
-listing, so reading them is the only way to answer "what kinds exist" from the live code. Nothing
-else in the harness may reach ``transports/``; a new need goes through the same allow-list review.
+read-only -- it builds no connector and opens no socket -- and it takes only the public
+``registered_kinds`` accessor, never the private tables behind it (the import shape is pinned in
+``tests/test_harness_scenarios.py``). Nothing else in the harness may reach ``transports/``; a new
+need goes through the same allow-list review.
 """
 
 from __future__ import annotations
@@ -38,14 +39,14 @@ class CoverageRow:
 def registered_kinds() -> dict[str, frozenset[str]]:
     """The engine's live connector registries: direction to the set of connector kind values.
 
-    ``import messagefoundry.transports`` registers every built-in connector as a side effect,
-    which is how the engine itself populates the tables."""
-    import messagefoundry.transports  # noqa: F401  (import = registration)
-    from messagefoundry.transports import base
+    Imported from the package, not from ``transports.base``: the package import is what registers
+    every built-in connector, and the accessor's docstring says why the spelling matters."""
+    from messagefoundry.transports import registered_kinds as engine_registered_kinds
 
+    live = engine_registered_kinds()
     return {
-        INBOUND: frozenset(kind.value for kind in base._SOURCES),
-        OUTBOUND: frozenset(kind.value for kind in base._DESTINATIONS),
+        INBOUND: frozenset(kind.value for kind in live.sources),
+        OUTBOUND: frozenset(kind.value for kind in live.destinations),
     }
 
 

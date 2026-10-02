@@ -122,7 +122,7 @@ against the scenarios that cover it. It reads the engine's live connector regist
 kept here, and flags a scenario that claims a kind the engine does not register. It needs no
 running engine. `harness/coverage.py` is the one harness module allowed to import
 `messagefoundry.transports` (read-only; `_CLIENT_ALLOWED` in `tests/test_dependency_boundaries.py`
-names it), because the registries have no public listing.
+names it); its module docstring says what it may read.
 
 ## Load testing (headless)
 

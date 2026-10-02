@@ -283,6 +283,8 @@ def test_coverage_reads_the_live_registries_not_a_list() -> None:
     from messagefoundry.transports import base
 
     live = registered_kinds()
+    # The private tables, not the accessor the harness calls: an oracle independent of the path
+    # under test, so an accessor regression cannot pass by agreeing with itself.
     assert live["inbound"] == {k.value for k in base._SOURCES}
     assert live["outbound"] == {k.value for k in base._DESTINATIONS}
     rows = coverage_rows(live, SCENARIOS.values())
@@ -312,6 +314,28 @@ def test_coverage_reports_an_uncovered_kind_and_a_stale_claim() -> None:
     assert "inbound  smoke       NONE" in report
     assert "NOT REGISTERED, claimed by claims_kafka" in report
     assert report.endswith("0 of 2 registered (kind, direction) pairs have a scenario")
+
+
+def test_coverage_names_only_the_public_registry_accessor() -> None:
+    """harness/coverage.py's allowance covers the whole ``messagefoundry.transports`` package, so
+    the boundary test cannot see WHICH names it uses. This pins its static import shape: one import
+    from transports, of the public accessor. It is a check on import statements only; a dynamic
+    reach (``sys.modules``, ``importlib``) is outside what an AST walk of imports can see."""
+    import ast
+
+    source = Path(__file__).resolve().parents[1] / "harness" / "coverage.py"
+    package = "messagefoundry.transports"
+
+    def in_transports(name: str) -> bool:
+        return name == package or name.startswith(package + ".")
+
+    transports_imports: list[tuple[str, tuple[str, ...]]] = []
+    for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            transports_imports += [(a.name, ()) for a in node.names if in_transports(a.name)]
+        elif isinstance(node, ast.ImportFrom) and in_transports(node.module or ""):
+            transports_imports.append((node.module or "", tuple(a.name for a in node.names)))
+    assert transports_imports == [(package, ("registered_kinds",))]
 
 
 def test_a_scenario_claims_an_outbound_only_through_a_sink() -> None:
