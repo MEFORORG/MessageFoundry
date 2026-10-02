@@ -4,13 +4,16 @@
 
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from messagefoundry import _child_bootstrap, childenv
 from messagefoundry.tray import branding
 
 
@@ -96,6 +99,46 @@ def test_relaunch_returns_true_when_child_survives(
 
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Alive())
     assert branding.relaunch_branded() is True  # still alive → the child owns the tray
+
+
+def test_relaunch_starts_the_child_like_every_other_python_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #2801. The relaunch passed no ``-P``, so the working directory led the child's
+    import path. A bare ``-P -m`` would fail from a checkout that is not installed, so the child
+    must start through the same command line, bootstrap included, as the engine's own children."""
+    exe = tmp_path / branding.BRANDED_EXE_NAME
+    exe.write_bytes(b"")
+    monkeypatch.setattr(branding, "ensure_branded_launcher", lambda *a, **k: exe)
+    # A relative entry names the working directory and would undo -P; an absolute one stays.
+    kept = str(tmp_path / "site")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([".", kept]))
+    monkeypatch.setenv("MF_2801_ORDINARY", "crosses")
+    started: list[tuple[Any, dict[str, Any]]] = []
+
+    class _Alive:
+        returncode = None
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired("cmd", timeout or 0)
+
+    def _popen(argv: Any, **kwargs: Any) -> _Alive:
+        started.append((argv, kwargs))
+        return _Alive()
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    assert branding.relaunch_branded() is True
+
+    [(argv, kwargs)] = started
+    # Typed out rather than read from childenv, so the test does not check a list against itself.
+    assert argv[:4] == [str(exe), "-P", "-X", "disable-remote-debug"]
+    assert Path(argv[4]) == Path(_child_bootstrap.__file__).resolve()
+    assert argv[5:] == ["messagefoundry.tray"]
+    assert argv == childenv.python_child_argv("messagefoundry.tray", executable=str(exe))
+    env = kwargs["env"]
+    assert env["PYTHONPATH"] == kept
+    assert env["MF_2801_ORDINARY"] == "crosses"  # the tray keeps the user's environment
+    assert kwargs.get("shell", False) is False
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="version resource + parser are Windows-only")

@@ -515,10 +515,6 @@ _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
     ("tray/actions.py", "_open_path", "webbrowser.open"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/actions.py", "open_console", "webbrowser.open" + _AS_A_VALUE): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/app.py", "TrayApp._edit_settings", "os.startfile"): _TRAY_OPENS_FOR_ITS_USER,
-    ("tray/branding.py", "relaunch_branded", "subprocess.Popen"): (
-        "the tray starting itself again under its branded launcher: the same program, as the same "
-        "desktop user, so it needs the environment it already has"
-    ),
 }
 
 #: Listed sites that hold more than one start, with the number.
@@ -535,6 +531,10 @@ _MUST_CHOOSE = frozenset(
         ("pipeline/dr.py", "_run_command", "create_subprocess_shell"),
         ("pipeline/supervisor.py", "_default_spawn", "create_subprocess_exec"),
         ("pipeline/supervisor.py", "preflight_shard_config", "create_subprocess_exec"),
+        # The tray starting itself again under its branded launcher (vault BACKLOG #2801). It
+        # keeps the user's whole environment, through the builder that drops a PYTHONPATH entry
+        # naming the working directory, which would undo the child's -P.
+        ("tray/branding.py", "relaunch_branded", "subprocess.Popen"),
     }
 )
 

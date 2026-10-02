@@ -90,6 +90,8 @@ _PROBES = {
             {
                 "messagefoundry",
                 "messagefoundry.api_tls_source",
+                # `tray.branding` builds the relaunch command line from it (vault BACKLOG #2801).
+                "messagefoundry.childenv",
                 "messagefoundry.controlchars",
                 "messagefoundry.redaction",
                 "messagefoundry.secretscrub",

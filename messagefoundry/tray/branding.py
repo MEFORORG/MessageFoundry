@@ -38,9 +38,13 @@ import sys
 from ctypes import wintypes
 from pathlib import Path
 
+from messagefoundry.childenv import engine_environment, python_child_argv
 from messagefoundry.tray import __version__
 
 log = logging.getLogger("messagefoundry.tray.branding")
+
+#: The module the branded child runs, as ``python -m`` would.
+_TRAY_MODULE = "messagefoundry.tray"
 
 _LEADING_DIGITS = re.compile(r"\d+")
 
@@ -342,7 +346,16 @@ def relaunch_branded() -> bool:
     if branded is None:
         return False
     try:
-        child = subprocess.Popen([str(branded), "-m", "messagefoundry.tray"], close_fds=True)  # nosec B603 - fixed argv (our own branded launcher + module name), shell=False
+        # Started like every other Python child (vault BACKLOG #2801): the interpreter flags keep
+        # the working directory off the child's import path. A bare ``-P -m`` cannot find this
+        # package from a checkout that is not installed, so the bootstrap names its location. The
+        # tray needs the user's whole environment; engine_environment is that, less any PYTHONPATH
+        # entry that would put the working directory back.
+        child = subprocess.Popen(  # nosec B603 - fixed argv (our own branded launcher, the child interpreter flags, our own bootstrap script, a module name), shell=False
+            python_child_argv(_TRAY_MODULE, executable=str(branded)),
+            env=engine_environment(),
+            close_fds=True,
+        )
     except OSError:
         log.exception("could not relaunch via %s", branded)
         return False
