@@ -6,8 +6,8 @@ The store encryption key is normally supplied as base64 via ``MEFOR_STORE_ENCRYP
 cross-platform default). On Windows an operator may instead keep it in a **DPAPI-protected key file**
 (``[store].encryption_key_file``): ``CryptProtectData`` binds the ciphertext to this machine
 (``LOCAL_MACHINE`` scope), so a copied file is useless off the protecting host and the plaintext key
-never sits in the service's environment block (readable by any local admin). At startup the service
-account ``CryptUnprotectData``s the file back to the base64 key.
+never sits in the service's environment block (readable by any local user: docs/SERVICE.md). At
+startup the service account ``CryptUnprotectData``s the file back to the base64 key.
 
 DPAPI is **Windows-only**. Every entry point raises :class:`DpapiUnavailable` elsewhere so callers
 degrade gracefully to the env-var key — this module never imports anything Windows-specific at module
