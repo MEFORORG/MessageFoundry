@@ -15,6 +15,120 @@ with secure defaults, and AD-group→role mapping is automatic.
 
 ---
 
+## Trust boundaries and PHI data flow
+
+These two diagrams answer one question: where does PHI enter, rest and leave, and which control
+sits on each boundary. Each outer box is a trust zone, and each arrow names what crosses the
+boundary. The table under the diagrams gives the protocol and the control for each hop. The
+diagrams show the default posture, `[security].enforcement = "enforce"`, on the MLLP path, which
+is the HL7 v2 default. They are a summary. The sections below and [PHI.md](PHI.md) are the source
+of record.
+
+The first diagram follows a message.
+
+```mermaid
+flowchart TB
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef engine fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+
+  subgraph M_SENDERS["Sending partner systems, private network"]
+    SRC["Sending system"]:::ext
+  end
+
+  subgraph M_ENGINE["Engine process"]
+    INB["Inbound Connection"]:::engine
+    WORK["Router and Handler workers"]:::engine
+    OUTB["Outbound Connection"]:::engine
+  end
+
+  subgraph M_STORE["Message store"]
+    QUEUE["Messages and staged queue<br/>PHI columns sealed with AES-256-GCM"]:::store
+  end
+
+  subgraph M_RECEIVERS["Receiving partner systems and lookup sources, private network"]
+    DST["Receiving system"]:::ext
+    LKP["Lookup source"]:::ext
+  end
+
+  SRC -->|"MLLP, TLS when the<br/>Connection sets it"| INB
+  INB -->|"commit, then ACK"| QUEUE
+  QUEUE -->|"staged rows"| WORK
+  WORK -->|"outbound rows,<br/>staged in the store"| OUTB
+  WORK -->|"database or FHIR lookup"| LKP
+  OUTB -->|"MLLP, TLS when the<br/>Connection sets it"| DST
+```
+
+The second diagram follows an operator, the audit trail and the log.
+
+```mermaid
+flowchart TB
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef client fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef engine fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+
+  subgraph O_CLIENTS["Operator clients, on the engine host by default"]
+    BROWSER["Operator's browser"]:::client
+    TOOLS["API clients<br/>(VS Code extension, test harness)"]:::client
+  end
+
+  subgraph O_ENGINE["Engine process"]
+    GATE["API and web console at /ui<br/>sign-in, session check,<br/>permission check, deny by default"]:::api
+    PIPE["Connections and workers<br/>(first diagram)"]:::engine
+    LOGF["Log handlers<br/>with redaction filters"]:::engine
+  end
+
+  subgraph O_STORE["Message store"]
+    MSGS["Messages<br/>PHI columns sealed with AES-256-GCM"]:::store
+    AUDIT["Audit trail<br/>hash-chained rows"]:::store
+  end
+
+  subgraph O_SERVICES["Services the default posture requires"]
+    SIEM["Log collector<br/>on another host"]:::ext
+    MAIL["Mail relay"]:::ext
+  end
+
+  BROWSER -->|"HTTPS, session cookie"| GATE
+  TOOLS -->|"HTTPS, bearer token"| GATE
+  GATE -->|"PHI reads, by permission"| MSGS
+  GATE -->|"audit rows"| AUDIT
+  GATE -->|"log records"| LOGF
+  PIPE -->|"log records"| LOGF
+  LOGF -->|"syslog over TLS"| SIEM
+  GATE -->|"SMTP with STARTTLS"| MAIL
+```
+
+| Hop or resting place | Protocol | Control |
+|---|---|---|
+| Sending system to inbound Connection | MLLP | TLS when the Connection sets `tls=true`. By default the engine refuses a listener that would take messages off the loopback address without TLS. |
+| Engine to message store | A local SQLite file, or a SQL Server or PostgreSQL connection | The listener commits the raw message before it sends the ACK. A server database connection uses TLS and verifies the server certificate by default. Each later stage hands off through the store. |
+| At rest in the message store | Not a hop | A store key seals the PHI columns with AES-256-GCM, and each sealed value is bound to its own table, column and row. By default `serve` refuses to start without a store key. [PHI.md section 2](PHI.md#2-where-phi-lives--data-at-rest-inventory) lists each at-rest location. |
+| Outbound Connection to receiving system | MLLP | TLS when the Connection sets `tls=true`. By default the engine refuses an outbound MLLP hop that would leave the host in cleartext. The destination must be on an egress allow-list. |
+| Handler to lookup source | A database connection for `db_lookup`, HTTPS for `fhir_lookup` | The server must be on `[egress].allowed_db` or `[egress].allowed_http`. By default the engine refuses a `fhir_lookup` over cleartext HTTP to another host. |
+| Browser or API client to the API | HTTPS, TLS 1.2 or later | The API binds 127.0.0.1 by default. The engine serves TLS with the operator's certificate, or with a self-signed pair it creates on first run. The console session cookie is HttpOnly, SameSite=Strict and Secure. An API client sends a bearer session token. |
+| API to audit trail | Rows in the message store | Each row's hash covers the row before it, so an edited or reordered row fails verification. Sign-ins and permission refusals write rows, and opening a message writes a row that names the acting user. See [Audit](#audit-1). |
+| Engine log to log collector | Syslog over TLS | The engine verifies the collector's certificate. Records from the API, the Connections and the workers pass the same handlers. A filter on each handler redacts HL7-shaped text and scrubs credentials before a record is written or forwarded. |
+| Engine to mail relay | SMTP with STARTTLS | The engine verifies the server certificate by default. The default posture requires the relay for account-security notices. It also carries at least operator alert email. Neither holds message bodies. |
+
+Four more facts:
+
+- Egress is closed by default. Under the default posture `serve` refuses to start until the
+  operator says where the engine may send. That means at least one `[egress].allowed_*` list, or
+  `[security].block_unlisted_outbound = true`. With that setting left unset, `serve` turns it on.
+  A transport whose list is empty then refuses every destination of its type.
+- Full message bodies belong in the message store, not in the general log. Treat the log files and
+  the off-box copy as sensitive all the same.
+  [PHI.md section 7](PHI.md#7-logging--phi-redaction) covers redaction and the logging rules.
+- Under the default posture `serve` requires a log collector on another host, reached over
+  verified TLS. It also requires a mail relay for account-security notices.
+- Two topologies change the API row. One is a bind opened beyond the engine host. The other is a
+  declared reverse proxy that terminates TLS in front of the engine.
+  [Enforcement model](#enforcement-model) states the rules for both.
+
+---
+
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
@@ -1529,7 +1643,23 @@ with no page.
   flagged at that release, like any new account, and its notification address gets the
   `account_created` notice.
 - **A directory grant.** An account that gets Administrator because the *directory* added it to a
-  group already mapped to Administrator raises no alert. The engine never sees that grant.
+  group already mapped to Administrator raises no `administrator_granted` alert. The API's
+  user-administration routes raise that alert, and a directory change does not pass through them.
+  The engine does see the grant, in one of the two places below. Neither names the role in an
+  alert, and the route can end with no alert at all. An account with no live session raises none.
+  Nor does one that signs in again before the next reconciler pass. So watch membership of the
+  mapped group in the directory itself.
+  **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
+  - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
+    with the old and new roles. It also sends a best-effort roles-changed notice to that
+    account's own notification address, when the account has one and security notices are set
+    up. It raises no alert.
+  - **Sooner, when the account holds a live session.** A pass of the
+    [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
+    that completes stores the new roles and revokes the session. It writes
+    `auth.ad_session_revoked` with the new roles, sends the same notice, and raises
+    `ad_session_revoked` with reason `roles_changed`. The next sign-in then writes no
+    `auth.ad_roles_resynced` row. That section lists when a pass revokes or alerts nothing.
 
 The check also flags some releases that changed nothing. A login that rehashes a password after an
 argon2 parameter change restamps `password_changed_at`, so each approver's first release after such a
@@ -2338,6 +2468,118 @@ clinical service it would challenge legitimate night staff by design. Device pos
 Cross-links: function-level rules are the
 [route → permission map](#route--permission-map-engine-api) (8.1.1); property-level rules are
 [Field-level authorization](#field-level-property-authorization-wp-9) (8.1.2).
+
+---
+
+## Sign-in and the permission check
+
+These two diagrams answer one question: how does a request get from a person to a permitted
+action. The first shows sign-in. The second shows the check the JSON API then runs on a request
+that carries a session token. Both show the default, `[security].require_mfa = true`. They are a
+summary. The linked sections are the source of record.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as Person
+  participant E as Engine
+  participant D as Active Directory
+  participant S as Store
+  participant A as Audit trail
+
+  alt Local account
+    P->>E: Username and password, HTTPS
+    Note over E: Rate limit and lockout check,<br/>then argon2id verify
+    E->>S: Save SHA-256 of a new token
+    E-->>P: Session token, factor still owed
+    P->>E: TOTP or recovery code,<br/>or passkey in the browser
+    E->>S: Mark factor met, replace token
+    E-->>P: New session token
+  else Directory account, off by default
+    P->>E: Kerberos ticket,<br/>or OIDC sign-in
+    Note over E: For OIDC, trade the code at the provider<br/>over HTTPS and verify the ID token
+    E->>D: Look up user and groups, LDAPS
+    E->>S: Set roles from the group map,<br/>save SHA-256 of a new token
+    E-->>P: Session token
+    P->>E: Second factor, when the<br/>sign-in path leaves one owed
+    E-->>P: New session token
+  end
+  E->>A: Rows for sign-in success and refusal
+```
+
+- A person signs in from a browser at the web console, or from an API client.
+- A local account proves a password, which the engine checks against an argon2id hash. Its second
+  factor is a TOTP code, a single-use recovery code, or a WebAuthn passkey in the web console. A
+  local account that has TOTP may also send the password and the code in one request. See
+  [Multi-factor authentication](#multi-factor-authentication-totp-wp-14) and
+  [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
+- A directory account signs in with Windows SSO (Kerberos) or, in the browser, with OIDC. Both are
+  off by default. The engine looks the user up in Active Directory over LDAPS and sets roles from
+  the [AD-group to role map](#ad-group--role-mapping) at each sign-in.
+  [Local vs Active Directory](#local-vs-active-directory) states the rules for each path.
+- What a directory session owes as a second factor depends on the sign-in path.
+  [Multi-factor authentication](#multi-factor-authentication-totp-wp-14) states the rule for each.
+- The session is opaque. The client holds a random token, and the store keeps only its SHA-256.
+  The engine replaces the token when the second factor is proven. The web console keeps the token
+  in a cookie, and an API client sends it as a bearer header. See [Sessions](#sessions).
+
+```mermaid
+flowchart TB
+  classDef client fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
+  classDef engine fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+
+  REQ["Request with a session token"]:::client
+  SESS{{"Live session?"}}:::api
+  PWD{{"Password change owed?"}}:::api
+  MFA{{"Second factor owed?"}}:::api
+  ADDR{{"Notice address owed?"}}:::api
+  PERM{{"Holds the permission?"}}:::api
+  RUN["The route runs<br/>audit row, see the notes"]:::engine
+  R401["401"]:::ext
+  R403P["403, change the password"]:::ext
+  R403M["403 and X-MFA-Required<br/>audit row auth.mfa_denied"]:::ext
+  R403A["403, set a notice address"]:::ext
+  R403D["403, missing permission<br/>audit row auth.permission_denied"]:::ext
+
+  REQ --> SESS
+  SESS -->|"no"| R401
+  SESS -->|"yes"| PWD
+  PWD -->|"yes"| R403P
+  PWD -->|"no"| MFA
+  MFA -->|"yes"| R403M
+  MFA -->|"no"| ADDR
+  ADDR -->|"yes"| R403A
+  ADDR -->|"no"| PERM
+  PERM -->|"no"| R403D
+  PERM -->|"yes"| RUN
+```
+
+- The diagram draws the JSON API's `require*()` ladder from the session check on.
+  [Authorization design](#authorization-design-asvs-811) is the source of record. It lists the
+  steps that come before the ladder and the conditions on each rung.
+- Not every route takes this path. [Enforcement model](#enforcement-model) lists the routes that
+  need no session, and the one route that authenticates by client certificate.
+- The six-sided boxes are checks, and they run from top to bottom. Each account check lets a short
+  list of self-service routes through. That lets a person change the password, prove the factor or
+  set the address.
+- A live session is one that is not revoked and is inside both its idle limit and its absolute
+  limit. Its user must still be enabled. The engine looks the session up by the hash of the token.
+- The permission check denies by default. An identity's permissions are the union of what its
+  roles grant, and a role the engine does not know grants nothing. The built-in roles are fixed,
+  and a custom role can only bundle permissions from the same catalogue. See
+  [Roles & permissions](#roles--permissions).
+- A permitted request writes an `auth.permission_granted` row. Two cases differ. A route gated
+  only by a PHI-view permission records the read in its own row. A route that names no permission
+  writes no grant row.
+- Routes that act on a Connection also check the identity's connection scope. That scope starts
+  empty for every role except Administrator.
+- Sensitive routes add a step-up re-check on top of this flow. See
+  [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753).
+- The web console has its own gate for its cookie session. It runs the account checks in the same
+  order. Where the API answers 401, the console sends the browser to the sign-in page, and it has
+  its own change-password and second-factor pages.
 
 ---
 
@@ -3579,9 +3821,23 @@ inherited from another caller. It is surfaced on `GET /audit` and in the `audit:
 > rather than merely lossy. `audit_log.client` is the per-action address and is the one to trust.
 
 **Tamper-evidence (AUDIT-INTEGRITY).** Each `audit_log` row carries a `row_hash` that chains the
-previous row's hash with this row's content (SHA-256), so deleting, editing, or reordering any row is
-detectable. Verify the chain with `messagefoundry audit-verify` — exit 0 means at least that no
-surviving row was edited or reordered. **A scheduled job reads the exit code and nothing else, so
+previous row's hash with this row's content, so a deleted, edited or reordered row no longer fits
+the chain. What that proves depends on the key. On a keyed row the digest is HMAC-SHA-256 under a
+key derived from the store key. Someone who can write rows but does not hold the key cannot
+recompute it. Under `cipher_provider = "vault_transit"` the MAC is computed inside Transit instead.
+On a keyless row the digest is plain SHA-256, which anyone who can write the table can recompute.
+So a keyless chain shows corruption or a careless edit, not a rewrite by someone who can write the
+table. A store that has a key can still hold a keyless chain, or one keyed only from a later row
+on. [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, says
+which rows are keyed. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless digest
+only, and it said any such change is detectable without that condition. Verify the chain with
+`messagefoundry audit-verify` — exit 0 means at least that no surviving row was edited or
+reordered by someone who could not recompute the chain. Run it with the store key in its
+environment: a keyed chain cannot be verified without that key, and the verify fails. Exit 0 does
+not say the chain is keyed. A store that has a key and opens onto a keyless chain is reported
+apart from the verify, as
+[`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
+**A scheduled job reads the exit code and nothing else, so
 these four are kept distinct:** `0` a clean walk over at least one row, `1` a broken chain, `2` the
 path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an
 absent path, a zero-byte file, a file carrying no `audit_log` table, and a path that is not a SQLite

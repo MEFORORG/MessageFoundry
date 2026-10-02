@@ -3,11 +3,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Harvest the connscale empty-claims BASE READINGS from CI, joined to each job's conclusion.
 
-BACKLOG #1415, build 1 of 2. **This is a scan, not a gate.** It computes no floor, proposes no
-threshold and applies no arming rule. Build 2 does that, once post-#1420 data exists and the owner
-has ruled. What this script owes build 2 is a distribution a reader can audit and re-run, which the
-#1211 harvest was not: that one was drawn by a script outside the tree, into a scratchpad, against
-artifacts that expire.
+BACKLOG #1415's instrument. **This is a scan, not a gate.** It computes no floor, proposes no
+threshold and applies no arming rule. Build 2 applied #1415's rule to its post_2024 cells, and the
+decision is in ``harness/load/profiles/README.md`` (section dated 2026-10-01). What this script owes
+that decision is a distribution a reader can audit and re-run, which the #1211 harvest was not: that
+one was drawn by a script outside the tree, into a scratchpad, against artifacts that expire.
+
+ONCE A FLOOR IS ARMED ON A LEG, ITS PASSING DISTRIBUTION IS CENSORED. A job whose base reading
+falls below the floor now fails BECAUSE of it, and leaves the passing cells. A re-harvest of an armed
+leg must read its non-passing readings for floor breaches, or it understates the gate's own fires.
 
 WHAT IT READS. Every ``test (<os>, py<ver>)`` job of the CI workflow uploads its connscale readings
 as an artifact named ``connscale-readings-<os>-py<ver>``, holding ``empty_claims.json``. The base
@@ -35,6 +39,12 @@ THE THREE RULES THAT MAKE IT A HARVEST RATHER THAN A SAMPLE.
    the commit that added the ``herd_floor`` block. Pass ``--with-tail-until`` once #1420 has
    landed, so a payload that lost the field fails closed rather than joining the with-tail cells.
    Anything else is excluded and counted by reason.
+
+WHICH RUNS. Every run of the workflow in the window, of every event and branch, unless ``--branch``
+or ``--event`` narrows it. The runs listing's ``branch`` filter matches a run's head branch, so
+``main`` keeps only pushes: a pull_request run carries the PR's branch and a merge_group run a
+``gh-readonly-queue/main/...`` branch, and both run the same sweep. A run from a fork is listed and
+never scanned.
 
 THE JOIN. An artifact names its leg but not its attempt, and a re-run attempt is a separate engine
 run. Since BACKLOG #2013 the payload's ``context`` names its own run, run attempt and workflow job
@@ -64,11 +74,13 @@ Usage (PowerShell 7)::
 
     python scripts/connscale_harvest.py --since 2026-09-01T13:01:20Z --max-runs 20
     python scripts/connscale_harvest.py --since 2026-09-20T00:00:00Z --json-out out/harvest.json
+    python scripts/connscale_harvest.py --from-json out/harvest.json --csv-dir out/harvest-csv
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import io
 import json
 import math
@@ -85,9 +97,24 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
+# Run as `python scripts/connscale_harvest.py`, sys.path[0] is scripts/, so the checkout root is put
+# on the path for the engine import below. Only when it is missing: under pytest the root is already
+# there, and an import-time insert would reorder sys.path for every test that imports this module.
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+# ASVS 1.2.10: the --csv-dir writer is a recorded spreadsheet writer, and its cells go through the
+# one canonical formula-injection rule (tests/test_csv_formula_consistency.py), never a local copy.
+from messagefoundry.spreadsheet import spreadsheet_safe  # noqa: E402
+
 DEFAULT_REPO = "MEFORORG/MessageFoundry"
 DEFAULT_WORKFLOW = "ci.yml"
-DEFAULT_BRANCH = "main"
+#: No branch filter by default. The runs listing matches ``branch=`` against a run's head branch,
+#: so ``branch=main`` keeps only push runs: a pull_request run carries the PR's branch and a
+#: merge_group run a ``gh-readonly-queue/main/...`` branch, and both run the same connscale sweep
+#: (BACKLOG #1415). A fork's run is still left out, by its head repository.
+DEFAULT_BRANCH: str | None = None
 ARTIFACT_PREFIX = "connscale-readings-"
 READINGS_FILE = "empty_claims.json"
 #: The ci.yml step that runs the suite, connscale sweep included. Skipped means no sweep ran.
@@ -359,7 +386,8 @@ class JobOutcome:
 class Harvest:
     repo: str
     workflow: str
-    branch: str
+    #: ``None`` means every branch, which is the default.
+    branch: str | None
     since: str
     until: str
     #: The selection, recorded so the output alone is enough to re-run it.
@@ -374,8 +402,8 @@ class Harvest:
     #: Completed runs that carried no ``test (...)`` job at all, so no leg could have produced a
     #: reading. Listed rather than dropped, so a reader can see the runs the job table cannot.
     runs_without_test_jobs: list[int] = field(default_factory=list)
-    #: Runs whose head repository is not ``repo``: a fork's pull request from its own ``main``
-    #: matches ``branch=main`` but is not this repository's code. Listed, never scanned.
+    #: Runs whose head repository is not ``repo``: a fork's pull request is not this repository's
+    #: code, and one from the fork's own ``main`` matches ``branch=main`` too. Listed, never scanned.
     runs_from_other_repos: list[int] = field(default_factory=list)
     #: Job rows a "re-run failed jobs" attempt listed again for a leg it did not re-run: same leg,
     #: same start and end, new id. Each is one engine run, so it is counted once, here.
@@ -491,13 +519,14 @@ def _suite_skipped(job: dict[str, Any]) -> bool:
     )
 
 
+_UNJOINED_FIELDS = ("run_id", "artifact_id", "name", "reason")
+
+
 def _unjoined(run_id: int, artifact: dict[str, Any], reason: str) -> dict[str, Any]:
-    return {
-        "run_id": run_id,
-        "artifact_id": artifact["id"],
-        "name": artifact["name"],
-        "reason": reason,
-    }
+    # Built from _UNJOINED_FIELDS, so the row and the CSV header are one definition.
+    return dict(
+        zip(_UNJOINED_FIELDS, (run_id, artifact["id"], artifact["name"], reason), strict=True)
+    )
 
 
 def harvest_run(api: Api, repo: str, run: dict[str, Any], acc: Harvest) -> None:
@@ -658,7 +687,7 @@ def harvest(
     *,
     repo: str,
     workflow: str,
-    branch: str,
+    branch: str | None,
     since: datetime,
     until: datetime,
     max_runs: int | None = None,
@@ -666,7 +695,10 @@ def harvest(
     with_tail_until: datetime | None = None,
     progress: bool = False,
 ) -> Harvest:
-    """Scan the workflow's runs on ``branch`` created in ``[since, until]``, newest first.
+    """Scan the workflow's runs created in ``[since, until]``, newest first.
+
+    ``branch=None`` lists runs of every branch and so every event: a pull_request or merge_group
+    run never carries ``main`` as its head branch, so a ``main`` filter keeps only pushes.
 
     ``max_runs`` caps the COMPLETED runs scanned. It never selects on whether a run carries
     artifacts: a pool chosen by that outcome could not report the missingness it exists to count.
@@ -681,7 +713,9 @@ def harvest(
         max_runs=max_runs,
         with_tail_until=None if with_tail_until is None else _iso(with_tail_until),
     )
-    query = {"branch": branch, "created": f"{_iso(since)}..{_iso(until)}"}
+    query = {"created": f"{_iso(since)}..{_iso(until)}"}
+    if branch:
+        query["branch"] = branch
     if event:
         query["event"] = event
     path = f"repos/{repo}/actions/workflows/{workflow}/runs"
@@ -798,24 +832,42 @@ def _cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
-def pin_verified(result: Harvest) -> bool:
-    """True only when there are harvested jobs and every one's payload records the pinned value."""
-    harvested = [j for j in result.jobs if j.status == HARVESTED]
+def _harvested(result: Harvest, population: str | None) -> list[JobOutcome]:
+    return [
+        j
+        for j in result.jobs
+        if j.status == HARVESTED and (population is None or j.population == population)
+    ]
+
+
+def pin_verified(result: Harvest, population: str | None = None) -> bool:
+    """True only when there are harvested jobs and every one's payload records the pinned value.
+
+    ``population`` narrows the question to one population's jobs. A floor is fitted to one
+    population, so the pin it needs is that population's: a harvest whose window also reaches back
+    before BACKLOG #2013 holds older payloads that record nothing, and they say nothing about the
+    newer ones (BACKLOG #1415).
+    """
+    harvested = _harvested(result, population)
     return bool(harvested) and all(j.per_lane_wake == PINNED_PER_LANE_WAKE for j in harvested)
 
 
-def _pin_line(result: Harvest) -> str:
-    harvested = [j for j in result.jobs if j.status == HARVESTED]
-    if pin_verified(result):
+def _pin_line(result: Harvest, population: str | None = None) -> str:
+    harvested = _harvested(result, population)
+    scope = "" if population is None else f" ({population} only)"
+    if pin_verified(result, population):
         return (
-            f"MEFOR_PIPELINE_PER_LANE_WAKE pin: VERIFIED; all {len(harvested)} harvested job(s) "
-            f"record {PINNED_PER_LANE_WAKE}."
+            f"MEFOR_PIPELINE_PER_LANE_WAKE pin{scope}: VERIFIED; all {len(harvested)} harvested "
+            f"job(s) record {PINNED_PER_LANE_WAKE}."
         )
     if not harvested:
-        return "MEFOR_PIPELINE_PER_LANE_WAKE pin: NOT VERIFIED by this scan; no job was harvested."
+        return (
+            f"MEFOR_PIPELINE_PER_LANE_WAKE pin{scope}: NOT VERIFIED by this scan; no job was "
+            "harvested."
+        )
     recorded = sum(1 for j in harvested if j.per_lane_wake is not None)
     return (
-        f"MEFOR_PIPELINE_PER_LANE_WAKE pin: NOT VERIFIED by this scan; {recorded} of "
+        f"MEFOR_PIPELINE_PER_LANE_WAKE pin{scope}: NOT VERIFIED by this scan; {recorded} of "
         f"{len(harvested)} harvested job(s) record it. A payload records none when it predates "
         "BACKLOG #2013, came from a local run, or had a step that recorded none."
     )
@@ -831,9 +883,9 @@ def is_complete(result: Harvest) -> bool:
 def render_markdown(result: Harvest) -> str:
     cap = "none" if result.max_runs is None else str(result.max_runs)
     lines = [
-        "# connscale base-reading harvest (BACKLOG #1415, build 1: no gate)",
+        "# connscale base-reading harvest (BACKLOG #1415 instrument: a scan, it arms nothing)",
         "",
-        f"repo {result.repo}, workflow {result.workflow}, branch {result.branch}, "
+        f"repo {result.repo}, workflow {result.workflow}, branch {result.branch or 'any'}, "
         f"event {result.event or 'any'}",
         f"window {result.since} .. {result.until} (run creation time); "
         f"with-tail ceiling {result.with_tail_until or 'none'}",
@@ -848,6 +900,7 @@ def render_markdown(result: Harvest) -> str:
         f"carried-over job copies from re-run attempts, counted once: "
         f"{result.carried_over_job_copies}",
         _pin_line(result),
+        *(_pin_line(result, p) for p in POPULATIONS if _harvested(result, p)),
         "",
     ]
     if result.listing_may_be_truncated:
@@ -912,19 +965,74 @@ def to_json_dict(result: Harvest) -> dict[str, Any]:
         **asdict(result),
         "complete": is_complete(result),
         "per_lane_wake_pin_verified": pin_verified(result),
+        "per_lane_wake_pin_verified_by_population": {
+            p: pin_verified(result, p) for p in POPULATIONS
+        },
         "cells": [asdict(c) for c in summarise(result)],
     }
+
+
+#: The fields ``from_json_dict`` rebuilds. Everything else in a ``--json-out`` file is derived.
+_HARVEST_FIELDS = tuple(f for f in Harvest.__dataclass_fields__ if f not in ("jobs", "readings"))
+
+
+def from_json_dict(data: dict[str, Any]) -> Harvest:
+    """Rebuild a :class:`Harvest` from a ``--json-out`` file, so it renders without the API.
+
+    Only the recorded fields are read back. The derived ones (``cells``, ``complete``, the pin
+    verdicts) are recomputed, so a hand-edited summary in the file cannot survive a re-render.
+    """
+    result = Harvest(**{k: data[k] for k in _HARVEST_FIELDS if k in data})
+    result.jobs = [JobOutcome(**j) for j in data.get("jobs", [])]
+    result.readings = [BaseReading(**r) for r in data.get("readings", [])]
+    return result
+
+
+def write_csvs(result: Harvest, out_dir: Path) -> list[Path]:
+    """Every reading, every job and every unjoined artifact as CSV, one row each.
+
+    CSV because it is the form a reader checks a number in, and it is a fraction of the JSON's size
+    when committed beside a decision that rests on it (BACKLOG #1415 criterion 1.3).
+
+    EVERY CELL goes through the canonical ``spreadsheet_safe`` (ASVS 1.2.10). Text such as a lane
+    name or a reason comes from a CI artifact; numbers and ``None`` pass through it untouched, so a
+    negative reading stays a number. A reader that loads the CSV back as data gets the escaped text:
+    a text cell the rule quoted starts with an apostrophe that is not part of the value.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tables: list[tuple[str, list[str], list[dict[str, Any]]]] = [
+        (
+            "readings.csv",
+            list(BaseReading.__dataclass_fields__),
+            [asdict(r) for r in result.readings],
+        ),
+        ("jobs.csv", list(JobOutcome.__dataclass_fields__), [asdict(j) for j in result.jobs]),
+        ("unjoined.csv", list(_UNJOINED_FIELDS), list(result.unjoined_artifacts)),
+    ]
+    written: list[Path] = []
+    for name, header, rows in tables:
+        path = out_dir / name
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=header, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows({k: spreadsheet_safe(v) for k, v in row.items()} for row in rows)
+        written.append(path)
+    return written
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
-        "--since", required=True, type=parse_time, help="window start, ISO 8601 (run creation)"
+        "--since", type=parse_time, help="window start, ISO 8601 (run creation); required to scan"
     )
     parser.add_argument("--until", type=parse_time, help="window end, ISO 8601; default now")
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--workflow", default=DEFAULT_WORKFLOW)
-    parser.add_argument("--branch", default=DEFAULT_BRANCH)
+    parser.add_argument(
+        "--branch",
+        default=DEFAULT_BRANCH,
+        help="only runs whose head branch is this; default every branch, so every event",
+    )
     parser.add_argument("--event", help="only runs of this trigger event, such as push")
     parser.add_argument(
         "--max-runs", type=_positive_int, help="cap on completed runs scanned, newest first"
@@ -935,34 +1043,76 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="exclude a payload without rate_window from any run created after this instant",
     )
     parser.add_argument("--json-out", type=Path, help="also write every reading and job here")
+    parser.add_argument(
+        "--csv-dir", type=Path, help="also write readings.csv, jobs.csv and unjoined.csv here"
+    )
+    parser.add_argument(
+        "--from-json",
+        type=Path,
+        help="re-render a saved --json-out file instead of scanning; no API call is made",
+    )
     parser.add_argument("--quiet", action="store_true", help="no per-run progress on stderr")
     args = parser.parse_args(argv)
 
-    until = args.until or datetime.now(UTC)
-    if until < args.since:
-        parser.error("--until is before --since")
-    try:
-        result = harvest(
-            GhApi(),
-            repo=args.repo,
-            workflow=args.workflow,
-            branch=args.branch,
-            since=args.since,
-            until=until,
-            max_runs=args.max_runs,
-            event=args.event,
-            with_tail_until=args.with_tail_until,
-            progress=not args.quiet,
-        )
-    except HarvestError as exc:
-        print(f"harvest failed: {exc}", file=sys.stderr)
-        return 2
-    # The JSON first, so a console that cannot print the report does not lose the data.
+    if args.from_json:
+        # A re-render shows the saved selection, so a selection flag here would be silently ignored
+        # and its numbers read as the filtered view they are not.
+        selecting = [
+            flag
+            for flag, value in (
+                ("--since", args.since),
+                ("--until", args.until),
+                ("--branch", args.branch),
+                ("--event", args.event),
+                ("--max-runs", args.max_runs),
+                ("--with-tail-until", args.with_tail_until),
+                ("--repo", None if args.repo == DEFAULT_REPO else args.repo),
+                ("--workflow", None if args.workflow == DEFAULT_WORKFLOW else args.workflow),
+            )
+            if value is not None
+        ]
+        if selecting:
+            parser.error(f"{', '.join(selecting)} cannot narrow a --from-json re-render")
+        try:
+            result = from_json_dict(json.loads(args.from_json.read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            print(f"cannot read {args.from_json}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        if args.since is None:
+            parser.error("--since is required unless --from-json is given")
+        until = args.until or datetime.now(UTC)
+        if until < args.since:
+            parser.error("--until is before --since")
+        try:
+            result = harvest(
+                GhApi(),
+                repo=args.repo,
+                workflow=args.workflow,
+                branch=args.branch,
+                since=args.since,
+                until=until,
+                max_runs=args.max_runs,
+                event=args.event,
+                with_tail_until=args.with_tail_until,
+                progress=not args.quiet,
+            )
+        except HarvestError as exc:
+            print(f"harvest failed: {exc}", file=sys.stderr)
+            return 2
+    # The JSON first, so a console that cannot print the report, or a CSV directory that cannot be
+    # written, does not lose a scan that cost hundreds of API calls against expiring artifacts.
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
             json.dumps(to_json_dict(result), indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+    if args.csv_dir:
+        try:
+            write_csvs(result, args.csv_dir)
+        except (OSError, ValueError) as exc:  # ValueError: a saved row with a key off the header
+            print(f"cannot write CSVs to {args.csv_dir}: {exc}", file=sys.stderr)
+            return 2
     text = render_markdown(result) + "\n"
     encoding = sys.stdout.encoding or "utf-8"
     sys.stdout.write(text.encode(encoding, "replace").decode(encoding))

@@ -14,6 +14,7 @@ mix.
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import subprocess
@@ -81,9 +82,18 @@ def _artifact(art_id: int, os_name: str, created: str, *, expired: bool = False)
     }
 
 
-def _run(run_id: int, created: str, status: str = "completed") -> dict[str, Any]:
+def _run(
+    run_id: int,
+    created: str,
+    status: str = "completed",
+    *,
+    event: str = "push",
+    head_branch: str = "main",
+) -> dict[str, Any]:
     return {
         "id": run_id,
+        "event": event,
+        "head_branch": head_branch,
         "status": status,
         "conclusion": "success" if status == "completed" else None,
         "created_at": created,
@@ -118,7 +128,10 @@ class FakeApi:
         query = parse_qs(split.query)
         parts = split.path.split("/")
         if parts[-1] == "runs" and "workflows" in parts:
-            return {"workflow_runs": self._page(self.runs, query)}
+            # The listing's own branch filter matches a run's head branch and nothing else.
+            wanted = query.get("branch")
+            runs = [r for r in self.runs if wanted is None or r["head_branch"] in wanted]
+            return {"workflow_runs": self._page(runs, query)}
         run_id = int(parts[-2])
         if parts[-1] == "jobs":
             assert query["filter"] == ["all"], "every attempt must be listed, not only the latest"
@@ -144,7 +157,7 @@ def _harvest(api: FakeApi, **kw: Any) -> ch.Harvest:
         api,
         repo=_REPO,
         workflow="ci.yml",
-        branch="main",
+        branch=kw.pop("branch", None),
         since=kw.pop("since", _SINCE),
         until=kw.pop("until", _UNTIL),
         **kw,
@@ -570,7 +583,62 @@ def test_the_window_is_passed_to_the_api_as_given() -> None:
     _harvest(api, since=datetime(2026, 9, 3, tzinfo=UTC), until=datetime(2026, 9, 4, tzinfo=UTC))
     query = parse_qs(urlsplit(api.paths[0]).query)
     assert query["created"] == ["2026-09-03T00:00:00Z..2026-09-04T00:00:00Z"]
-    assert query["branch"] == ["main"]
+    assert "branch" not in query
+
+
+def _event_fixture() -> FakeApi:
+    """The rich fixture, plus a pull_request run and a merge_group run that each carry a reading."""
+    api = _fixture()
+    api.runs += [
+        _run(400, "2026-09-12T10:00:00Z", event="pull_request", head_branch="feature-x"),
+        _run(
+            500, "2026-09-12T11:00:00Z", event="merge_group", head_branch="gh-readonly-queue/main/x"
+        ),
+    ]
+    for run_id, art_id, start in ((400, 41, "2026-09-12T10"), (500, 51, "2026-09-12T11")):
+        api.jobs[run_id] = [
+            _job(run_id, "windows-2022", "success", f"{start}:01:00Z", f"{start}:30:00Z")
+        ]
+        api.artifacts[run_id] = [_artifact(art_id, "windows-2022", f"{start}:29:00Z")]
+        api.blobs[art_id] = _zip(_payload({"fixed_aggregate": 22.0}))
+    return api
+
+
+def test_the_default_harvest_reads_pull_request_and_merge_group_runs() -> None:
+    # BACKLOG #1415: a `branch=main` listing keeps only pushes, since neither of these two events
+    # carries `main` as its head branch. The default sends no branch filter, so both are scanned.
+    result = _harvest(_event_fixture())
+    assert {400, 500} <= set(result.runs_scanned)
+    harvested = {j.run_id for j in result.jobs if j.status == ch.HARVESTED}
+    assert {400, 500} <= harvested
+    assert "branch any" in ch.render_markdown(result)
+
+
+def test_an_explicit_branch_still_filters_and_says_so() -> None:
+    # The control arm: the same fixture with the old filter loses both runs, so the test above
+    # discriminates and is not passing on a fixture that never carried them.
+    api = _event_fixture()
+    result = _harvest(api, branch="main")
+    assert parse_qs(urlsplit(api.paths[0]).query)["branch"] == ["main"]
+    assert not {400, 500} & set(result.runs_scanned)
+    assert result.runs_scanned == [200, 100]
+    assert "branch main" in ch.render_markdown(result)
+
+
+def test_main_sends_no_branch_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    apis: list[FakeApi] = []
+
+    def make() -> FakeApi:
+        apis.append(_event_fixture())
+        return apis[-1]
+
+    monkeypatch.setattr(ch, "GhApi", make)
+    window = ["--since", "2026-09-01T00:00:00Z", "--until", "2026-09-30T00:00:00Z", "--quiet"]
+    ch.main(window)
+    ch.main([*window, "--branch", "main"])
+    first, second = (parse_qs(urlsplit(a.paths[0]).query) for a in apis)
+    assert "branch" not in first
+    assert second["branch"] == ["main"]
 
 
 def test_max_runs_caps_completed_runs_and_never_selects_on_artifacts() -> None:
@@ -859,3 +927,133 @@ def test_an_empty_harvest_does_not_claim_it_read_a_payload() -> None:
     api.runs = []
     text = ch.render_markdown(_harvest(api))
     assert "PER_LANE_WAKE pin: NOT VERIFIED by this scan; no job was harvested." in text
+
+
+def test_the_pin_is_judged_per_population_as_well_as_overall() -> None:
+    # BACKLOG #1415 fits a floor to ONE population, so the pin it needs is that population's. Here the
+    # post_2024 job records false and two older with-tail/post_1420 jobs record nothing: the whole
+    # scan is NOT VERIFIED, and the post_2024 population alone is VERIFIED.
+    api = _fixture()
+    api.blobs[12] = _with_context(
+        {"fixed_aggregate": 28.0}, rate_window=ch.POST_2024_RATE_WINDOW, per_lane_wake="false"
+    )
+    result = _harvest(api)
+    assert ch.pin_verified(result) is False
+    assert ch.pin_verified(result, ch.POST_2024) is True
+    assert ch.pin_verified(result, ch.WITH_TAIL) is False
+    text = ch.render_markdown(result)
+    assert "pin (post_2024 only): VERIFIED; all 1 harvested job(s) record false." in text
+    assert "pin (with_tail only): NOT VERIFIED by this scan; 0 of 2" in text
+    assert "pin (post_1420 only)" not in text  # no job in it, so no line about it
+    by_population = ch.to_json_dict(result)["per_lane_wake_pin_verified_by_population"]
+    assert by_population == {ch.POST_2024: True, ch.POST_1420: False, ch.WITH_TAIL: False}
+
+
+def test_a_saved_harvest_re_renders_identically_without_the_api() -> None:
+    result = _harvest(_pinned_fixture("false"))
+    saved = json.loads(json.dumps(ch.to_json_dict(result), sort_keys=True))
+    rebuilt = ch.from_json_dict(saved)
+    assert ch.render_markdown(rebuilt) == ch.render_markdown(result)
+    assert ch.to_json_dict(rebuilt) == saved
+
+
+def test_a_hand_edited_summary_does_not_survive_a_re_render() -> None:
+    saved = ch.to_json_dict(_harvest(_fixture()))
+    saved["cells"] = []
+    saved["per_lane_wake_pin_verified"] = True
+    rebuilt = ch.to_json_dict(ch.from_json_dict(saved))
+    assert rebuilt["cells"] and rebuilt["per_lane_wake_pin_verified"] is False
+
+
+def test_the_csvs_carry_one_row_per_reading_job_and_unjoined_artifact(tmp_path: Path) -> None:
+    result = _harvest(_fixture())
+    result.unjoined_artifacts.append({"run_id": 1, "artifact_id": 2, "name": "n", "reason": "r"})
+    paths = ch.write_csvs(result, tmp_path / "csv")
+    rows = {p.name: list(csv.DictReader(p.open(encoding="utf-8"))) for p in paths}
+    assert len(rows["readings.csv"]) == len(result.readings) > 0
+    assert len(rows["jobs.csv"]) == len(result.jobs) > 0
+    assert rows["unjoined.csv"] == [{"run_id": "1", "artifact_id": "2", "name": "n", "reason": "r"}]
+    assert {r["value"] for r in rows["readings.csv"]} >= {"13.12", "28.0", "40.0"}
+
+
+def test_an_empty_table_still_writes_its_header(tmp_path: Path) -> None:
+    ch.write_csvs(_result_with([]), tmp_path)
+    assert (tmp_path / "readings.csv").read_text(encoding="utf-8").startswith("population,leg,")
+    assert (tmp_path / "unjoined.csv").read_text(encoding="utf-8") == (
+        "run_id,artifact_id,name,reason\n"
+    )
+
+
+def test_main_re_renders_a_saved_harvest_and_needs_no_since(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    saved = tmp_path / "h.json"
+    saved.write_text(json.dumps(ch.to_json_dict(_harvest(_fixture()))), encoding="utf-8")
+
+    def no_api() -> FakeApi:
+        raise AssertionError("--from-json must not touch the API")
+
+    monkeypatch.setattr(ch, "GhApi", no_api)
+    rc = ch.main(["--from-json", str(saved), "--csv-dir", str(tmp_path / "csv")])
+    assert rc == 0
+    assert "connscale base-reading harvest" in capsys.readouterr().out
+    assert (tmp_path / "csv" / "jobs.csv").is_file()
+
+
+def test_main_without_since_or_a_saved_harvest_is_a_usage_error() -> None:
+    with pytest.raises(SystemExit) as exc:
+        ch.main(["--quiet"])
+    assert exc.value.code == 2
+
+
+def test_main_reports_an_unreadable_saved_harvest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert ch.main(["--from-json", str(bad)]) == 2
+    assert "cannot read" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--branch", "main"],
+        ["--since", "2026-09-01T00:00:00Z"],
+        ["--max-runs", "3"],
+        ["--repo", "o/r"],
+    ],
+)
+def test_a_selection_flag_cannot_narrow_a_re_render(tmp_path: Path, flag: list[str]) -> None:
+    saved = tmp_path / "h.json"
+    saved.write_text(json.dumps(ch.to_json_dict(_harvest(_fixture()))), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        ch.main(["--from-json", str(saved), *flag])
+    assert exc.value.code == 2
+
+
+def test_the_json_is_written_before_a_csv_directory_that_cannot_be(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(ch, "GhApi", _fixture)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    out = tmp_path / "h.json"
+    argv = ["--since", "2026-09-01T00:00:00Z", "--quiet", "--json-out", str(out)]
+    rc = ch.main([*argv, "--csv-dir", str(blocker)])
+    assert rc == 2
+    assert "cannot write CSVs" in capsys.readouterr().err
+    assert json.loads(out.read_text(encoding="utf-8"))["jobs"], "the scan must survive"
+
+
+def test_a_saved_row_off_the_csv_header_is_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    saved = ch.to_json_dict(_harvest(_fixture()))
+    saved["unjoined_artifacts"] = [
+        {"run_id": 1, "artifact_id": 2, "name": "n", "reason": "r", "x": 1}
+    ]
+    path = tmp_path / "h.json"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    assert ch.main(["--from-json", str(path), "--csv-dir", str(tmp_path / "csv")]) == 2
+    assert "cannot write CSVs" in capsys.readouterr().err

@@ -856,6 +856,12 @@ def test_logging_alert_sink_no_ops_are_disclosed() -> None:
 _LISTENER_LABELS = {"http_listener": "HTTP"}
 
 
+def _opens_a_socket_listener(source: str) -> bool:
+    """Whether a transport module opens a listening socket: asyncio's ``start_server``, or
+    pynetdicom's ``make_server``, which is how the DICOM SCP builds its server."""
+    return source_calls(source, "start_server") or source_calls(source, "make_server")
+
+
 def test_every_socket_listener_that_emits_nothing_is_named_in_row_7() -> None:
     """Row 7 states which listeners this stream actually covers — derive that, don't trust the prose.
 
@@ -867,8 +873,9 @@ def test_every_socket_listener_that_emits_nothing_is_named_in_row_7() -> None:
     kinds its raw-TCP twin emits, so the row's exception list is once again just the DICOM SCP — and
     this guard is what catches the next listener that arrives silent.
 
-    Scoped to modules that call a ``start_server`` in code: asyncio's, or pynetdicom's for the
-    DICOM SCP, which is a socket listener too. A poll/file source legitimately
+    Scoped to modules that open a socket listener in code: asyncio's ``start_server``, or
+    pynetdicom's ``make_server`` for the DICOM SCP, which builds its own server class and so
+    never calls ``start_server`` (vault BACKLOG #2583). A poll/file source legitimately
     never emits (``SourceConnector.on_connection_event`` defaults to ``None`` precisely so those stay
     byte-identical), so including them would assert something untrue.
     """
@@ -876,10 +883,12 @@ def test_every_socket_listener_that_emits_nothing_is_named_in_row_7() -> None:
     listeners: dict[str, bool] = {}
     for path in sorted(transports.glob("*.py")):
         source = path.read_text(encoding="utf-8")
-        if not source_calls(source, "start_server"):
+        if not _opens_a_socket_listener(source):
             continue
         listeners[path.stem] = source_calls(source, "_emit_event")
-    assert listeners, "no start_server listener found — the walk broke, not the doc"
+    assert listeners, "no socket listener found — the walk broke, not the doc"
+    # A set comparison on the module names, not a membership test on anything read from source.
+    assert {"dicom"} <= listeners.keys(), "the DICOM SCP left this guard: it is a listener too"
     assert any(listeners.values()), (
         f"no socket listener emits a connection_event at all: {sorted(listeners)}. Row 7 claims the "
         "stream covers several — re-derive the row, not this guard."
@@ -926,8 +935,9 @@ _CODE_PROBE_DELETIONS: tuple[tuple[str, str, str, Callable[[str], bool]], ...] =
         "transports/tcp.py",
         "asyncio.start_server(",
         "asyncio.sleep(",
-        lambda src: source_calls(src, "start_server"),
+        _opens_a_socket_listener,
     ),
+    ("transports/dicom.py", "ae.make_server(", "ae.other(", _opens_a_socket_listener),
 )
 
 

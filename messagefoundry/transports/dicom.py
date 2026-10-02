@@ -33,12 +33,14 @@ opposite case: nothing was committed, so the sender is told.
 
 **Security (§9):** the calling-AE allowlist (``require_calling_aet``, association-level) + a peer-IP
 allowlist (the per-connection ``source_ip_allowlist`` passed to ``inbound(...)`` — there is no
-``[inbound].source_ip_allowlist`` service key — checked before any commit) + ``require_called_aet`` +
+``[inbound].source_ip_allowlist`` service key — applied when the connection is accepted, before
+anything is read from it; see :func:`_admitting_server_class`) + ``require_called_aet`` +
 a ``max_object_bytes`` cap (charged against the **raw received Data Set, before it is decoded**, so an
 over-cap object is refused before any decode, re-encode or commit) + an **opt-in association-rate
 bound** (``max_associations_per_second``, ASVS 2.4.1 / BACKLOG #1114 — off by default, waits before the
 association request is read, and never drops or refuses; see :meth:`DicomScpSource._pace_association`
-for why the unit is an association and not a message) + DICOM-over-TLS. A non-loopback
+for why the unit is an association and not a message) + DICOM-over-TLS, whose inbound handshake is
+bounded and runs off the accept loop. A non-loopback
 cleartext SCP is refused at startup by the generalized bind-guard (see
 :func:`messagefoundry.pipeline.wiring_runner.check_dimse_tls_exposure`). All log lines carry only
 **routing-safe identifiers** (SOP class/instance UID, calling AE, peer IP) — **never** the dataset or
@@ -58,7 +60,11 @@ only). Egress is gated by ``[egress].allowed_tcp`` (a raw socket, like X12). The
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import logging
+import socket
+import socketserver
 import ssl
 import threading
 import time
@@ -106,7 +112,13 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
-from messagefoundry.transports.mllp import InsecureHopGuard, _MessagePacer
+from messagefoundry.transports.mllp import (
+    _TLS_HANDSHAKE_TIMEOUT,
+    DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_CONNECTIONS_PER_HOST,
+    InsecureHopGuard,
+    _MessagePacer,
+)
 
 __all__ = [
     "DicomScpSource",
@@ -158,7 +170,7 @@ _STATUS_CANNOT_UNDERSTAND = 0xC000  # final: this object will not be taken as se
 #: clear of the C-STORE codes pynetdicom answers on its own: 0xC001 and 0xC002 for a malformed handler
 #: status, and 0xC211 when the handler raises.
 _STATUS_REFUSED_OVER_CAP = 0xC010
-_STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist
+_STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist: the backstop in _on_c_store
 
 # A-ASSOCIATE-RJ fields for "busy, retry later" (DICOM PS3.8 section 9.3.4), sent while the engine's
 # intake is paused (BACKLOG #290): rejected-transient, from the service provider's presentation
@@ -172,6 +184,269 @@ _RJ_REASON_TEMPORARY_CONGESTION = 0x01
 #: imported) from :data:`messagefoundry.pipeline.wiring_runner._LOOPBACK_HOSTS` to keep the dependency
 #: direction one-way (transports never import pipeline).
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
+
+#: A refused peer address earns one WARNING per this many seconds, however often it is refused
+#: (vault BACKLOG #2583). A refused connection costs the peer nothing, so a line per refusal would let
+#: a peer the allowlist turns away fill the service log. See :meth:`DicomScpSource._log_refused_peer`.
+_REFUSAL_LOG_WINDOW_SECONDS = 60.0
+
+#: How often a pending inbound TLS handshake looks at whether the listener is stopping. It is a poll
+#: interval, not a bound: the bound is ``_TLS_HANDSHAKE_TIMEOUT``, the MLLP listener's constant,
+#: imported so the two listeners cannot drift apart. pynetdicom polls its own sockets at 0.5 s too.
+_HANDSHAKE_POLL_SECONDS = 0.5
+
+#: Connections that may be inside their inbound TLS handshake at once: on one SCP, and from one peer
+#: address. The handshake runs on the connection's own thread, so these are what bound how many such
+#: threads exist. A connection over either is closed before a thread is started. They are the MLLP
+#: listener's two shipped connection caps, read from it so the numbers cannot drift apart; its
+#: constants say why 256 and why an eighth of it. Here they count a connection only while it is in
+#: its handshake. Constants, not settings, for the reason ``_TLS_HANDSHAKE_TIMEOUT`` gives. A
+#: handshake takes milliseconds, so senders that share one address behind a NAT do not meet the
+#: per-address number in normal use.
+_MAX_PENDING_HANDSHAKES = DEFAULT_MAX_CONNECTIONS
+_MAX_PENDING_HANDSHAKES_PER_HOST = DEFAULT_MAX_CONNECTIONS_PER_HOST
+
+#: The most refusal lines one SCP writes per window over every address together. The per-address
+#: bound alone would still let many addresses earn a line each.
+_REFUSAL_LOG_MAX_PER_WINDOW = 20
+
+
+#: Why the allowlist refuses a peer. One wording for the accept gate and for the C-STORE backstop.
+_NOT_IN_ALLOWLIST = "peer IP not in source_ip_allowlist"
+
+
+def _address_host(client_address: Any) -> str:
+    """The host part of a socket peer address, as ``accept()`` returns it. ``"?"`` when there is none."""
+    if isinstance(client_address, tuple) and client_address:
+        return str(client_address[0])
+    return "?"
+
+
+def _require_socketserver_routing(stock: type[Any]) -> None:
+    """Refuse a pynetdicom whose threaded server no longer routes an accepted connection through the
+    ``socketserver`` hooks :func:`_admitting_server_class` overrides.
+
+    With a server that drove its own accept loop, the overrides would still be defined and would
+    never be called: the address check and the handshake bound would lapse with nothing to show
+    for it. So the SCP does not start on one. The pydicom deflate guard refuses a pydicom that
+    renamed a reader for the same reason (``parsing.dicom._deps.load_header_readers``)."""
+    routed = (
+        issubclass(stock, socketserver.ThreadingMixIn)
+        and issubclass(stock, socketserver.TCPServer)
+        and stock.serve_forever is socketserver.BaseServer.serve_forever
+        and stock.verify_request is socketserver.BaseServer.verify_request
+        and stock.process_request is socketserver.ThreadingMixIn.process_request
+        # The private method serve_forever calls for each connection, and the one that calls
+        # get_request, verify_request and process_request in that order.
+        and getattr(stock, "_handle_request_noblock", None)
+        is getattr(socketserver.BaseServer, "_handle_request_noblock", None)
+    )
+    if not routed:
+        raise RuntimeError(
+            "the installed pynetdicom does not route an accepted connection through the socketserver "
+            "hooks the DICOM server (SCP) applies its address allowlist and its handshake bound in; "
+            "refusing to start the SCP with it"
+        )
+
+
+@functools.cache
+def _admitting_server_class() -> type[Any]:
+    """The association server the SCP runs: pynetdicom's threaded server with its admission steps
+    moved ahead of the first read (vault BACKLOG #2583). Built on first use, because pynetdicom is the
+    optional ``[dicom]`` extra and is never imported at module top.
+
+    **Read against pynetdicom 3.0.4 and CPython's ``socketserver``; re-read both before raising the
+    ``[dicom]`` pin.** :func:`_require_socketserver_routing` refuses a pynetdicom that left this
+    routing, and ``tests/test_dicom_scp_admission.py`` pins the rest.
+
+    * ``AssociationServer.get_request`` accepts a connection and, on a TLS listener, runs the TLS
+      handshake in the same call. That call is on the accept loop, and the accepted socket has no
+      timeout, so one peer that connects and sends nothing would hold every other sender's handshake
+      for as long as it stayed connected. ``get_request`` here only accepts.
+    * ``socketserver`` calls ``verify_request`` on the accept loop, straight after ``get_request``
+      and before any thread is started, and closes the connection when it returns ``False``. That is
+      where the peer address is checked, so a peer outside ``source_ip_allowlist`` is closed before
+      an association thread exists for it and before a byte is read from it.
+    * ``ThreadingMixIn.process_request`` starts the connection's thread, still on the accept loop.
+      On a TLS listener the connection takes a handshake slot first, counted per listener and per
+      peer address against :data:`_MAX_PENDING_HANDSHAKES` and
+      :data:`_MAX_PENDING_HANDSHAKES_PER_HOST`. One over either is closed with no thread started.
+    * ``ThreadedAssociationServer.process_request_thread`` runs on the connection's own thread. The
+      handshake runs there, against a deadline of ``_TLS_HANDSHAKE_TIMEOUT`` for the whole handshake.
+      A peer that sends nothing, and one that sends its handshake slowly, are both dropped at it.
+      The slot is given back in a ``finally`` there, however the handshake ends.
+    * ``AE.start_server`` cannot start this class: its non-blocking branch names
+      ``ThreadedAssociationServer`` itself. ``AE.make_server`` takes ``server_class`` and passes extra
+      keywords to its constructor, and ``start_serving`` here does the rest of what that branch does.
+    """
+    from pynetdicom.transport import ThreadedAssociationServer
+    from pynetdicom.utils import make_target
+
+    _require_socketserver_routing(ThreadedAssociationServer)
+
+    class _AdmittingAssociationServer(ThreadedAssociationServer):
+        def __init__(
+            self,
+            *args: Any,
+            admit: Callable[[Any], bool],
+            refused: Callable[[str, str, str], None],
+            stopping: threading.Event,
+            **kwargs: Any,
+        ) -> None:
+            self._admit = admit
+            self._refused = refused
+            #: The SCP's own stop signal, set before it calls shutdown(). shutdown() joins every
+            #: connection thread, so a thread inside a handshake has to see this to end early.
+            self._stopping = stopping
+            #: Handshakes in flight per peer address. Its values sum to the listener's total.
+            self._pending: dict[str, int] = {}
+            self._pending_lock = threading.Lock()
+            #: When the next admission-check fault may be logged (monotonic). See verify_request.
+            self._gate_fault_log_after = 0.0
+            super().__init__(*args, **kwargs)
+
+        def start_serving(self) -> None:
+            """What ``AE.start_server(block=False)`` does once it has built its server: run the
+            accept loop on a daemon thread and record the server on the AE. The base ``shutdown()``
+            removes the server from that list, and raises if it is not there."""
+            threading.Thread(
+                target=make_target(self.serve_forever),
+                name=f"AcceptorServer@{self.ae_title}",
+                daemon=True,
+            ).start()
+            self.ae._servers.append(self)
+
+        def get_request(self) -> tuple[socket.socket, Any]:
+            return cast(socket.socket, self.socket).accept()
+
+        def verify_request(self, request: Any, client_address: Any) -> bool:
+            # On the accept loop. An exception here would end serve_forever, and with it the
+            # listener, so anything the check raises is a refusal.
+            try:
+                return self._admit(client_address)
+            except Exception as exc:  # noqa: BLE001 - fail closed, and keep the accept loop alive
+                now = time.monotonic()
+                if now >= self._gate_fault_log_after:
+                    # Once per window: this state refuses every connection, and a line for each
+                    # would be a way to fill the log. The line is best effort; the refusal is not.
+                    self._gate_fault_log_after = now + _REFUSAL_LOG_WINDOW_SECONDS
+                    with contextlib.suppress(Exception):
+                        logger.error(
+                            "DICOM server (SCP) %s: the admission check itself failed (%s). "
+                            "Connections it cannot check are refused. This is logged at most "
+                            "once every %gs.",
+                            self.ae_title,
+                            safe_exc(exc),
+                            _REFUSAL_LOG_WINDOW_SECONDS,
+                        )
+                return False
+
+        def process_request(self, request: Any, client_address: Any) -> None:
+            # On the accept loop, for a connection verify_request admitted. A TLS connection takes
+            # its handshake slot here, so one over a cap is closed before a thread exists for it.
+            if self.ssl_context is None:
+                super().process_request(request, client_address)
+                return
+            host = _address_host(client_address)
+            full = self._take_handshake_slot(host)
+            if full is not None:
+                try:
+                    self._refused(host, "a connection", full)
+                finally:
+                    self.shutdown_request(request)
+                return
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self._release_handshake_slot(host)  # no thread was started to give it back
+                raise
+
+        def process_request_thread(self, request: Any, client_address: Any) -> None:
+            context = self.ssl_context
+            if context is not None:
+                host = _address_host(client_address)
+                try:
+                    request = self._handshake(context, request, host)
+                finally:
+                    self._release_handshake_slot(host)
+                if request is None:
+                    return
+            super().process_request_thread(request, client_address)
+
+        def _take_handshake_slot(self, host: str) -> str | None:
+            """Count one more handshake in flight for ``host``. Returns ``None`` when the slot is
+            taken, else the reason there is none, and then nothing was counted."""
+            with self._pending_lock:
+                if sum(self._pending.values()) >= _MAX_PENDING_HANDSHAKES:
+                    return f"{_MAX_PENDING_HANDSHAKES} TLS handshakes are already in progress"
+                held = self._pending.get(host, 0)
+                if held >= _MAX_PENDING_HANDSHAKES_PER_HOST:
+                    return (
+                        f"{_MAX_PENDING_HANDSHAKES_PER_HOST} TLS handshakes from this address "
+                        "are already in progress"
+                    )
+                self._pending[host] = held + 1
+                return None
+
+        def _release_handshake_slot(self, host: str) -> None:
+            with self._pending_lock:
+                held = self._pending[host] - 1
+                if held:
+                    self._pending[host] = held
+                else:
+                    del self._pending[host]  # so the table holds only addresses in a handshake
+
+        def _handshake(
+            self, context: ssl.SSLContext, plain: socket.socket, host: str
+        ) -> ssl.SSLSocket | None:
+            """Run the server side of the TLS handshake within the bound. Returns the TLS socket
+            with the accepted socket's own timeout restored, or ``None`` after closing the connection.
+
+            The handshake runs in slices of :data:`_HANDSHAKE_POLL_SECONDS`, so that a stop is
+            noticed without closing a socket under the thread that is reading it. A slice that ends
+            with nothing to read raises a ``TimeoutError`` that carries no ``errno`` and leaves the
+            SSL object as it was, which is the state a non-blocking handshake is resumed from, so
+            the next slice resumes it. A ``TimeoutError`` that does carry one is the connection
+            itself timing out, and ends the handshake.
+
+            A handshake that fails is logged at DEBUG only. A peer can fail one as often as it can
+            connect, so a line at a higher level would be a way to fill the log."""
+            tls: ssl.SSLSocket | None = None
+            try:
+                restore = plain.gettimeout()  # None: accept() returns a blocking socket
+                # No I/O: without do_handshake_on_connect this only builds the SSL object.
+                tls = context.wrap_socket(plain, server_side=True, do_handshake_on_connect=False)
+                deadline = time.monotonic() + _TLS_HANDSHAKE_TIMEOUT
+                while True:
+                    if self._stopping.is_set():
+                        raise OSError("the listener is stopping")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("the handshake did not finish within its bound")
+                    tls.settimeout(min(remaining, _HANDSHAKE_POLL_SECONDS))
+                    try:
+                        tls.do_handshake()
+                    except TimeoutError as exc:
+                        if exc.errno is not None:
+                            raise
+                        continue
+                    break
+                if self._stopping.is_set():  # finished after the stop began: refuse it unread
+                    raise OSError("the listener is stopping")
+                tls.settimeout(restore)
+                return tls
+            except (OSError, ValueError) as exc:  # ssl.SSLError and a timeout are both OSError
+                logger.debug(
+                    "TLS handshake with DICOM peer %s did not complete (bound %gs): %s",
+                    host,
+                    _TLS_HANDSHAKE_TIMEOUT,
+                    safe_exc(exc),
+                )
+            with contextlib.suppress(OSError):
+                (plain if tls is None else tls).close()
+            return None
+
+    return _AdmittingAssociationServer
 
 
 def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext | None:
@@ -310,6 +585,13 @@ class DicomScpSource(SourceConnector):
         #: Whether this pause's first refused association was logged (BACKLOG #290). Written from
         #: association threads without a lock: a race costs at most one extra INFO line.
         self._pause_refusal_logged = False
+        #: Refusal lines written inside the current window, as address -> when; see
+        #: _log_refused_peer. The accept loop and the association threads both reach it, so it has
+        #: a lock.
+        self._refusal_logged: dict[str, float] = {}
+        self._refusal_log_lock = threading.Lock()
+        #: Every refusal since this SCP was built, logged or not. Each line that is written reports it.
+        self._refusals = 0
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
         self._ssl = _server_ssl_context(s, name=config.name or "")
         # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #316):
@@ -426,13 +708,21 @@ class DicomScpSource(SourceConnector):
             # pays for no pacing callback on its association path.
             handlers.append((evt.EVT_CONN_OPEN, self._pace_association))
             handlers.append((evt.EVT_ACCEPTED, self._charge_association))
-        self._ae = ae
-        self._server = ae.start_server(
+        # AE.start_server(block=False) names pynetdicom's own server class, so build the SCP's
+        # class through make_server, which binds, and let it start its accept loop.
+        # Any: make_server is typed for pynetdicom's own classes, and start_serving is not theirs.
+        server: Any = ae.make_server(
             (self._host, self._port),
-            block=False,
             ssl_context=self._ssl,
             evt_handlers=handlers,
+            server_class=_admitting_server_class(),
+            admit=self._admit_connection,
+            refused=self._log_refused_peer,
+            stopping=self._stopping,
         )
+        server.start_serving()
+        self._ae = ae
+        self._server = server
 
     @property
     def sockport(self) -> int:
@@ -440,6 +730,72 @@ class DicomScpSource(SourceConnector):
         assert self._server is not None
         port: int = self._server.socket.getsockname()[1]
         return port
+
+    def _admit_connection(self, client_address: Any) -> bool:
+        """Whether a connection the listener has just accepted may go on (vault BACKLOG #2583).
+
+        Runs on the accept loop, through ``verify_request`` of :func:`_admitting_server_class`, before
+        any thread is started for the connection and before anything is read from it. ``False``
+        closes the connection. So a peer outside ``source_ip_allowlist`` never reaches the TLS
+        handshake and never gets an association, so it sends the SCP no object.
+
+        The match is :func:`~messagefoundry.netaddr.peer_ip_allowed`, the one the other listeners
+        use, so an entry means the same thing here as on an MLLP listener. No allowlist admits
+        everyone, as it does there. A check that raises is a refusal.
+
+        The calling AE title is not part of this: it is not known until the association request is
+        read. ``calling_ae_allowlist`` is applied at that point, by pynetdicom, from
+        ``require_calling_aet``, and an unlisted title is rejected before any object is sent.
+        """
+        reason = _NOT_IN_ALLOWLIST
+        try:
+            if peer_ip_allowed(client_address, self._source_ip_allowlist):
+                return True
+        except Exception as exc:  # noqa: BLE001 - on the accept loop: fail closed, never raise
+            reason = f"the source_ip_allowlist check failed ({safe_exc(exc)})"
+        self._log_refused_peer(_address_host(client_address), "a connection", reason)
+        return False
+
+    def _log_refused_peer(self, peer_ip: str, what: str, reason: str) -> None:
+        """Log a refusal for ``peer_ip``, at most once per address per window.
+
+        A refused connection is free to the peer, so it can be repeated as fast as the peer can
+        connect, and the service's output is captured to files. One line per refusal would turn the
+        refusal into a way to fill that volume. So an address earns one WARNING per
+        :data:`_REFUSAL_LOG_WINDOW_SECONDS`, and every address together earns at most
+        :data:`_REFUSAL_LOG_MAX_PER_WINDOW`.
+
+        Each line carries the SCP's running count of refusals, logged or not, so the volume
+        behind a quiet log is visible in the next line that is written. It is a total for the
+        listener, not for the address the line names.
+
+        The table holds an entry only for a line written inside the current window, so it never
+        holds more than :data:`_REFUSAL_LOG_MAX_PER_WINDOW` addresses, whatever arrives. The MLLP
+        listener's once-per-episode line is not reusable here: it is tied to that listener's table
+        of live connections per host, and its episode ends when the host has none left. A refused
+        peer never holds a connection, so it has no episode to end.
+        """
+        now = time.monotonic()
+        with self._refusal_log_lock:
+            self._refusals += 1
+            total = self._refusals
+            logged = self._refusal_logged
+            cutoff = now - _REFUSAL_LOG_WINDOW_SECONDS
+            for aged in [address for address, at in logged.items() if at <= cutoff]:
+                del logged[aged]
+            if peer_ip in logged or len(logged) >= _REFUSAL_LOG_MAX_PER_WINDOW:
+                return
+            logged[peer_ip] = now
+        logger.warning(
+            "DICOM server (SCP) %s refused %s from %s: %s. An address is logged at most once every "
+            "%gs. %d refused in all since this server started.",
+            self._ae_title,
+            what,
+            peer_ip,
+            reason,
+            _REFUSAL_LOG_WINDOW_SECONDS,
+            total,
+        )
 
     def _pace_association(self, event: Any) -> None:
         """Wait off whatever the association budget owes, BEFORE this connection is read from.
@@ -502,9 +858,9 @@ class DicomScpSource(SourceConnector):
         **A peer the association checks would refuse gets that refusal instead.** An unlisted calling
         AE or a wrong called AE is left to pynetdicom, which refuses it permanently right after this
         handler, reading the same ``AE`` settings this does. So the pause neither tells such a peer to
-        retry nor reveals to it that intake is paused. ``source_ip_allowlist`` is not mirrored: the
-        SCP checks it per C-STORE, not per association, so a peer outside it is refused as busy too
-        rather than handed an association.
+        retry nor reveals to it that intake is paused. ``source_ip_allowlist`` needs no mirror here:
+        the SCP applies it when the connection is accepted (:meth:`_admit_connection`), so a peer
+        outside it is closed before it can send an association request.
 
         **An association already accepted is left alone.** It finishes normally, and every C-STORE on
         it is still committed before its Success status. The pause is checked only here, so it never
@@ -589,15 +945,18 @@ class DicomScpSource(SourceConnector):
             requestor = event.assoc.requestor
             peer_ip = str(getattr(requestor, "address", "") or "")
             calling_ae = str(getattr(requestor, "ae_title", "") or "")
-            # Peer-IP allowlist (defense-in-depth alongside the association-level AE-title allowlist):
-            # refuse BEFORE any commit so a non-allowlisted peer's object is never stored.
-            if self._source_ip_allowlist is not None and not peer_ip_allowed(
-                (peer_ip, 0), self._source_ip_allowlist
-            ):
+            # The peer-IP allowlist, a second time. _admit_connection applies it when the connection
+            # is accepted, so a peer outside it should never reach this callback. That gate rides on
+            # hooks in pynetdicom's server class, and this check does not: if the gate were ever not
+            # run, a non-allowlisted peer's object would still be refused BEFORE any commit.
+            if not peer_ip_allowed((peer_ip, 0), self._source_ip_allowlist):
+                # Not through the per-address throttle: this is an object the SCP received and
+                # refused, and every one of those is logged.
                 logger.warning(
-                    "DICOM C-STORE from %s (AE %r) refused: peer IP not in source_ip_allowlist",
+                    "DICOM C-STORE from %s (AE %r) refused: %s",
                     peer_ip,
                     calling_ae,
+                    _NOT_IN_ALLOWLIST,
                 )
                 return _STATUS_NOT_AUTHORIZED
             # BACKLOG #1727: charge max_object_bytes against the RAW received Data Set FIRST. The
