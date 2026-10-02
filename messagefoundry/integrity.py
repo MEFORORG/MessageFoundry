@@ -80,6 +80,7 @@ __all__ = [
     "IntegrityError",
     "AttestationResult",
     "DriftEntry",
+    "RecordVerdict",
     "UnattestedReason",
     "attest_console",
     "attest_engine",
@@ -508,11 +509,12 @@ def record_verdict(file: Path, install_root: Path) -> tuple[RecordVerdict, str |
     limit the module docstring gives: it sits in the install it describes, so whoever can write
     that install can write a matching row. Blocking file reads, like :func:`attest_engine`.
     """
-    try:
-        rel = file.relative_to(install_root).as_posix()
-    except ValueError:
+    rel = _record_relpath(file, install_root)
+    if rel is None:
         return "unrecorded", None
     modified_by: str | None = None
+    actual: bytes | None = None
+    hashed = False
     for dist in metadata.distributions(path=[str(install_root)]):
         try:
             record_text = dist.read_text("RECORD")
@@ -524,12 +526,17 @@ def record_verdict(file: Path, install_root: Path) -> tuple[RecordVerdict, str |
         expected = _parse_record(record_text).get(rel)
         if expected is None:
             continue
-        owner = str(dist.name)
         try:
-            actual = hashlib.sha256(file.read_bytes()).digest()
-        except OSError:
-            modified_by = owner
-            continue
+            owner = str(dist.name)
+        except (TypeError, KeyError, AttributeError, OSError):
+            # A dist-info directory with a RECORD and no readable METADATA has no name to give.
+            owner = "an unnamed distribution"
+        if not hashed:
+            hashed = True
+            try:
+                actual = hashlib.sha256(file.read_bytes()).digest()
+            except OSError:
+                actual = None  # unreadable: it matches no row
         if actual == expected:
             return "recorded", owner
         modified_by = owner

@@ -40,6 +40,39 @@ requirements (`docker/locks/*.lock`, kept in sync with `uv.lock` by the DEP-1 st
 an old checkout does not pick up newer Debian fixes; build from a current release. The slim default omits
 PySide6, dev tools, and ODBC; the SQL Server layer (a Microsoft-EULA apt repo) is only in the variant.
 
+## How the image starts the engine
+
+The entry point is `tini -- /opt/venv/bin/python -I -X disable-remote-debug -u -B -m messagefoundry`.
+The command you pass (`serve --config /config --env prod`) follows it. It is the interpreter and
+not the `messagefoundry` console script, because a console script cannot pass an option to the
+interpreter it starts.
+
+- **`-I` is isolated mode.** The interpreter ignores every `PYTHON*` environment variable, so a
+  `PYTHONPATH` set with `-e` or in an orchestrator's manifest cannot decide what the engine
+  imports. It also keeps the working directory off the import path. The working directory is the
+  writable store volume.
+- **`-X disable-remote-debug` turns off the interpreter's remote debugging** (PEP 768).
+- **`-u -B`** give unbuffered output and no bytecode files. The image also sets
+  `PYTHONUNBUFFERED` and `PYTHONDONTWRITEBYTECODE`; those now serve only the Python children the
+  engine starts, because the engine itself ignores them.
+- **The virtual environment is owned by root, and the engine runs as uid 10001.** So the engine's
+  own account cannot add a file to `site-packages`, even where the root file system is left
+  writable. Code planted there would run at every interpreter start. Uid 10001 owns only
+  `/var/lib/mefor` and `/config`.
+
+Two things undo this, and the engine reports both:
+
+- **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
+  in Kubernetes) starts the engine without the options. It then reports
+  `interpreter_not_isolated` and `remote_debug_enabled`.
+- **A derived image that leaves the venv owned by uid 10001.** Install extra packages as root and
+  switch back: `USER root`, then `RUN /opt/venv/bin/pip install ...`, then `USER 10001`. The engine
+  reports `site_packages_writable` when its account can write there.
+
+`GET /security/posture` carries the reading in its `interpreter` block. The `docker-smoke` CI leg
+reads it off a running container and tries the write. What each entry means is in
+[`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-site_packages_writable-what-runs-in-the-interpreter-before-the-engine-does).
+
 ## Configuration — bake it in (recommended) or mount it carefully
 
 The engine **executes your config `*.py` as its service account**, so `_assert_safe_config_source`
@@ -58,9 +91,15 @@ Deploy that image. This is the only clean path on Kubernetes — a ConfigMap/pro
 group/world-writable:
 ```sh
 chown -R 10001:10001 ./config && chmod -R go-w ./config
-docker run ... -v "$PWD/config:/config:ro" ...
+docker run --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+  -v "$PWD/config:/config:ro" -v mefor-store:/var/lib/mefor ... messagefoundry:<version> serve --config /config --env prod
 ```
 A **Docker-Desktop-on-Windows** bind mount surfaces as `0o777` and **will be refused** — bake instead.
+
+**Pass `--read-only` on a plain `docker run`.** [`compose.yaml`](compose.yaml) and both Kubernetes
+manifests set a read-only root file system; a bare `docker run` does not. The engine writes only
+`/var/lib/mefor` (a volume) and `/tmp` (a tmpfs). Without `--read-only` the image is still safe
+against one case that matters, described under *How the image starts the engine* below.
 
 `env()` value files resolve under `/config/environments/<env>.toml` (the image sets
 `MEFOR_ENVIRONMENTS_BASE_DIR=/config`), so mount/bake your whole config repo at `/config`.

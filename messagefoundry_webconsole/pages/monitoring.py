@@ -25,6 +25,7 @@ from messagefoundry.api.models import (
     DrStatus,
     GraphResponse,
     IntegrityResult,
+    InterpreterView,
     MetricsHistoryResponse,
     SecurityPosture,
     ServiceStatusInfo,
@@ -79,12 +80,12 @@ def _fips(value: bool | None) -> str:
     return "reported active" if value else "reported inactive"
 
 
-def _interpreter_rows(interpreter: object) -> list[list[object]]:
+def _interpreter_rows(interpreter: InterpreterView | None) -> list[list[object]]:
     """The status rows for how the engine process was started (vault BACKLOG #2701, #2700).
 
-    ``interpreter`` is the posture's ``InterpreterView``, or None when the posture was built
-    without the reading. None renders as a dash in every row, never as a hardened launch. Counts
-    only: the file names are in ``GET /security/posture`` and in the loosening list below."""
+    None is a posture built without the reading. It renders as a dash in every row, never as a
+    hardened launch. Counts only: the file names are in ``GET /security/posture`` and in the
+    loosening list below."""
     isolated, remote, startup = (
         "Interpreter: isolated mode (-I)",
         "Interpreter: remote debugging (PEP 768)",
@@ -92,22 +93,20 @@ def _interpreter_rows(interpreter: object) -> list[list[object]]:
     )
     if interpreter is None:
         return [[label, _opt(None)] for label in (isolated, remote, startup)]
-    startup_code = getattr(interpreter, "startup_code", [])
-    unexpected = sum(1 for item in startup_code if not item.expected)
-    writable = len(getattr(interpreter, "writable_site_dirs", []))
-    if not getattr(interpreter, "remote_debug_enabled", True):
+    unexpected = sum(1 for item in interpreter.startup_code if not item.expected)
+    if not interpreter.remote_debug_enabled:
         remote_state = "off"
-    elif getattr(interpreter, "remote_debug_guard_installed", False):
+    elif interpreter.remote_debug_guard_installed:
         remote_state = "on, injected scripts refused"
     else:
         remote_state = "ON, NOT GUARDED"
     return [
-        [isolated, _yn(getattr(interpreter, "isolated", None))],
+        [isolated, _yn(interpreter.isolated)],
         [remote, remote_state],
         [
             startup,
-            f"{len(startup_code)} found, {unexpected} not expected; "
-            f"{writable} site directories writable by the engine",
+            f"{len(interpreter.startup_code)} found, {unexpected} not expected; "
+            f"{len(interpreter.writable_site_dirs)} site directories writable by the engine",
         ],
     ]
 

@@ -183,7 +183,6 @@ from messagefoundry.api.models import (
     SecurityLoosening,
     SecurityPosture,
     ServiceStatusInfo,
-    StartupCodeItemView,
     StaticCredentialHopView,
     StatsResetRequest,
     StatsResetResult,
@@ -2258,10 +2257,11 @@ def create_app(
         # Vault BACKLOG #2700 / #2701: read off THIS process, which is the engine. Each is read
         # once here, so the loosening list and the `interpreter` block below report one reading.
         # An app built without `serve` never installed the remote-debugging hook, and the reading
-        # then says so. The start-up reading is the one `serve` took as it started; an app built
-        # without `serve` takes it now, off the event loop because it reads files.
+        # then says so. The start-up reading is the one `serve` took as it started, kept for the
+        # life of the process, so this call reads no file. An app built without `serve` takes it
+        # here, once.
         remote_debug = remote_debug_posture()
-        startup = await asyncio.to_thread(startup_posture)
+        startup = startup_posture()
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
             for name, risk in security_loosenings(
@@ -2285,28 +2285,7 @@ def create_app(
                 startup=startup,
             )
         ]
-        interpreter_view = InterpreterView(
-            isolated=startup.launch.isolated,
-            safe_path=startup.launch.safe_path,
-            ignore_environment=startup.launch.ignore_environment,
-            no_user_site=startup.launch.no_user_site,
-            remote_debug_enabled=remote_debug.interpreter_enabled,
-            remote_debug_guard_installed=remote_debug.guard_installed,
-            code_path_variables=list(startup.launch.code_path_variables),
-            startup_code=[
-                StartupCodeItemView(
-                    kind=item.kind,
-                    path=item.path,
-                    verdict=item.verdict,
-                    owner=item.owner,
-                    expected=item.expected,
-                )
-                for item in startup.items
-            ],
-            site_dirs=list(startup.site_dirs),
-            writable_site_dirs=list(startup.writable_site_dirs),
-            unchecked_site_dirs=list(startup.unchecked_site_dirs),
-        )
+        interpreter_view = InterpreterView.from_readings(startup, remote_debug)
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
         # read live off the running graph, like the loosenings above; the settings half from the resolved
         # service configuration `serve` stashed (`cred_settings`, read above with `security`, so the

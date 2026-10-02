@@ -816,22 +816,18 @@ function Get-CrashDumpImageName {
 
 # --- the service launch: the interpreter, isolated (vault BACKLOG #2701, #2700) ------------------------
 # The service runs `python.exe <options> -m messagefoundry serve ...`, not the console-script
-# launcher, because a launcher cannot pass an option to the interpreter it starts.
+# launcher, because a launcher cannot pass an option to the interpreter it starts. What each option
+# does is in docs/SERVICE.md, "The service launch". Two things are particular to this script:
 #
-#   -I                       isolated mode. The interpreter ignores every PYTHON* environment variable
-#                            (PYTHONPATH, PYTHONHOME), so one left in the service's environment cannot
-#                            decide what the engine imports. It also keeps the working directory and
-#                            the user's own site directory off the import path. That matters for
-#                            `-m`: without it the working directory, which is AppDirectory, would be
-#                            searched first.
-#   -X disable-remote-debug  turns off the interpreter's remote debugging (PEP 768). The environment
-#                            variable for this is one of the variables -I ignores, so only the option
-#                            works. Spelled with HYPHENS: the interpreter accepts the underscore
-#                            spelling and ignores it.
+#   - `-m` would search the working directory first, and that is AppDirectory, the repository. -I
+#     keeps it off the import path.
+#   - A MEFOR_* variable set through AppEnvironmentExtra still reaches the engine. -I ignores only
+#     the interpreter's own PYTHON* variables.
 #
-# A MEFOR_* variable set through AppEnvironmentExtra still reaches the engine: -I ignores only the
-# interpreter's own PYTHON* variables. tests/test_isolated_launch.py holds this line to the engine's
-# own list of options, and the Windows service smoke leg reads the result off the running service.
+# The second option is spelled with HYPHENS: the interpreter accepts the underscore spelling and
+# ignores it. tests/test_isolated_launch.py holds this line to the engine's own list of options
+# (messagefoundry/startupcode.py), and the Windows service smoke leg reads the result off the
+# running service.
 $EngineInterpreterOptions = "-I -X disable-remote-debug"
 
 function Get-EngineInterpreter {

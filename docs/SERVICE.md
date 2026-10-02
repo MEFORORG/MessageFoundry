@@ -25,7 +25,8 @@ venv interpreter) and the per-connection firewall openings the service needs.
    python -m venv .venv
    .venv\Scripts\python.exe -m pip install -e .
    ```
-   This puts `messagefoundry.exe` in `.venv\Scripts\` — the service points at it.
+   This puts `messagefoundry.exe` and `python.exe` in `.venv\Scripts\`. The service runs that
+   `python.exe`, in isolated mode; see [The service launch](#the-service-launch).
    For a **reproducible, pinned** deployment, install the locked, hash-verified dependency set
    first, then the package itself:
    ```powershell
@@ -78,7 +79,8 @@ Defaults:
 | Setting | Default |
 |---|---|
 | Service name | `MessageFoundry` |
-| Engine exe | `<repo>\.venv\Scripts\messagefoundry.exe` |
+| Engine launcher (`-AppExe`) | `<repo>\.venv\Scripts\messagefoundry.exe`. It names the install; the service does not run it |
+| Interpreter the service runs (`-PythonExe`) | the `python.exe` beside the launcher, or one folder up |
 | Config dir | `<repo>\samples\config` |
 | Active environment | *(required — `-Environment`)* |
 | Data dir | `C:\ProgramData\MessageFoundry` |
@@ -161,8 +163,9 @@ the service account and the operator can both open the store, in either order. T
 
 ## Update to a new build (restart vs reinstall)
 
-The service runs `<repo>\.venv\Scripts\messagefoundry.exe`. With the documented **editable**
-install (`pip install -e .`), that exe imports straight from the repo source — so a running
+The service runs `<repo>\.venv\Scripts\python.exe -I -X disable-remote-debug -m messagefoundry
+serve ...`. With the documented **editable**
+install (`pip install -e .`), that interpreter imports straight from the repo source — so a running
 service keeps the code it loaded **at process start**. To pick up new code (a pull, a branch
 switch, a merge), just **restart** it (elevated):
 
@@ -222,6 +225,10 @@ variable the service needs in one call, or the ones you leave out are gone at th
 the store key out of that list with the DPAPI key file (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)), so
 you never retype it on a command line.
+
+**A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
+interpreter in isolated mode, which ignores every one of them
+([The service launch](#the-service-launch)). The engine's own `MEFOR_*` variables work as before.
 
 For a one-click desktop alternative to these commands — engine status at a glance plus
 start/stop/restart, the console, and the log from the notification area — run the
@@ -369,6 +376,68 @@ write-restricted token whose only privilege was `SeChangeNotifyPrivilege`.
 Nobody has measured a change on a service that was already installed. If you re-run the installer
 over an existing service and need the new SID type in force, restart the host. The installer prints
 that reminder on every re-install.
+
+### The service launch
+
+The service runs the Python interpreter of the engine's install, not the `messagefoundry.exe`
+launcher:
+
+```
+<venv>\Scripts\python.exe -I -X disable-remote-debug -m messagefoundry serve --config ... --env ...
+```
+
+A launcher cannot pass an option to the interpreter it starts, and both options matter.
+
+- **`-I` is isolated mode.** The interpreter ignores every `PYTHON*` environment variable, so a
+  `PYTHONPATH` or `PYTHONHOME` in the service's environment cannot decide what the engine imports.
+  Another product's installer can leave one behind, machine-wide. It also keeps the working
+  directory and the user's own site directory off the import path. The service's working
+  directory is the repository, and `python -m` would otherwise search it first.
+- **`-X disable-remote-debug` turns off the interpreter's remote debugging** (PEP 768), which
+  would let another process running as the service account run Python inside the engine. The
+  environment variable for it is one of those `-I` ignores, so the option is the only form that
+  works here. It is spelled with hyphens; the interpreter accepts the underscore spelling and
+  ignores it.
+
+What that changes for you:
+
+- **`-AppExe` still names the launcher.** The installer takes the `python.exe` beside it, which
+  is where a virtual environment keeps it, or one folder up, which is where a system-wide
+  install keeps it. It refuses to install when it finds neither. Pass `-PythonExe` then.
+- **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
+  leaves the user's site directory out. Install into a virtual environment.
+- **`messagefoundry serve` from a prompt still works**, for development. It is not isolated, and
+  the engine says so at start (`interpreter_not_isolated`, `remote_debug_enabled`). To run by hand
+  what the service runs, use the command above.
+- **The engine's Python children are not isolated.** The sandbox worker and each engine shard
+  still read the `PYTHON*` variables the engine hands them. Keep those variables out of the
+  service's environment; the engine reports one it finds (`python_variables_reach_children`).
+
+**Read it back.** `GET /security/posture` carries an `interpreter` block: `isolated` should be
+`true` and `remote_debug_enabled` `false`. The status page of the web console shows the same two
+readings. The `windows-service-smoke` CI leg reads the registration, the running engine's command
+line and that block. Nobody has read a result from it yet: it runs on a schedule, on dispatch and
+in the merge queue, not on a pull request.
+
+**Keep the service account out of the install's `site-packages`.** Isolated mode does not stop
+start-up code. The interpreter runs every line of a `.pth` file that begins with `import`, and a
+module named `sitecustomize`, from the install's site directories, before any engine code. So
+whoever can write those directories runs code inside the engine at its next start.
+
+- The engine lists that start-up code at every start. Under `[security].enforcement = "enforce"`
+  it refuses to start on a file no installed package records, and names it. That check is
+  detection: code that already ran can defeat it.
+- The engine also reads whether its own account can add a file there, and reports
+  `site_packages_writable` when it can. On Windows the site directories are the virtual
+  environment's own folder and its `Lib\site-packages`.
+- **The installer does not change the virtual environment's permissions.** Check them yourself:
+  `icacls <venv>` and `icacls <venv>\Lib\site-packages`. Under the default account,
+  [Restrict the service token](#restrict-the-service-token) lists the entries that would let the
+  engine write. Under `-AllowLocalSystem` the engine runs as SYSTEM, which a directory's
+  permissions usually grant full control.
+
+What counts as expected start-up code, and what each entry leaves open, is in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-site_packages_writable-what-runs-in-the-interpreter-before-the-engine-does).
 
 ### Protect the store encryption key at rest (WP-11d)
 
@@ -541,10 +610,11 @@ it. Close it at install time:
 ```
 
 It is **opt-in** because it writes `HKLM` keys **by image name**, which affects every process of that
-name on the host — an explicit operator decision, not a side effect of installing. It registers both
-`messagefoundry.exe` and the venv `python.exe`: a pip console-script launcher starts the interpreter as
-a **child process**, so the process holding the PHI heap (and the one WER would dump) is `python.exe`,
-and naming only the launcher would produce a policy that looks applied and protects nothing.
+name on the host — an explicit operator decision, not a side effect of installing. It registers
+`python.exe`, the interpreter the service runs: that is the process holding the PHI heap, and so the
+one WER would dump. A virtual environment's `python.exe` starts the base interpreter as a **child
+process**, and both carry that one name. The `messagefoundry.exe` launcher is no longer registered,
+because the service does not run it ([The service launch](#the-service-launch)).
 
 **`LocalDumps` is only ever narrowed, never switched on.** WER local dump collection is **opt-in**: if
 the `LocalDumps` key does not exist, no local dumps are collected for anything on the host. Creating

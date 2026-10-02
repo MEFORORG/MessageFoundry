@@ -24,7 +24,7 @@ before moving a class between the two bases.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
@@ -51,6 +51,10 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     SecurityEnforcement,
 )
+
+if TYPE_CHECKING:
+    from messagefoundry.remotedebug import RemoteDebugPosture
+    from messagefoundry.startupcode import StartupPosture
 
 
 class ChannelInfo(BaseModel):
@@ -1388,6 +1392,29 @@ class InterpreterView(BaseModel):
     #: only while ``unchecked_site_dirs`` is empty too.
     writable_site_dirs: list[str] = Field(default_factory=list)
     unchecked_site_dirs: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_readings(
+        cls, startup: StartupPosture, remote_debug: RemoteDebugPosture
+    ) -> InterpreterView:
+        """The view of the two process readings ``GET /security/posture`` takes."""
+        launch = startup.launch
+        return cls(
+            isolated=launch.isolated,
+            safe_path=launch.safe_path,
+            ignore_environment=launch.ignore_environment,
+            no_user_site=launch.no_user_site,
+            remote_debug_enabled=remote_debug.interpreter_enabled,
+            remote_debug_guard_installed=remote_debug.guard_installed,
+            code_path_variables=list(launch.code_path_variables),
+            startup_code=[
+                StartupCodeItemView.model_validate(item, from_attributes=True)
+                for item in startup.items
+            ],
+            site_dirs=list(startup.site_dirs),
+            writable_site_dirs=list(startup.writable_site_dirs),
+            unchecked_site_dirs=list(startup.unchecked_site_dirs),
+        )
 
 
 #: ``SecurityPosture.static_credential_hops_scope`` when the inventory was not read at all.

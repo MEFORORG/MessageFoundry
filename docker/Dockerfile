@@ -141,17 +141,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # Default prints serve usage; real deployments override the command, e.g.:
 #     serve --config /config --env prod
 #
-# THE OPTIONS (vault BACKLOG #2701, #2700), kept in step with the Windows installer by
-# tests/test_isolated_launch.py:
-#   -I                       isolated mode: the interpreter ignores every PYTHON* variable (PYTHONPATH,
-#                            PYTHONHOME), and keeps the working directory and the user site off the
-#                            import path. WORKDIR is the writable store volume, so without it `-m`
-#                            would search that directory first.
-#   -X disable-remote-debug  the interpreter's remote debugging (PEP 768) is off. Hyphens: the
-#                            underscore spelling is accepted and ignored.
-#   -u -B                    unbuffered output and no bytecode files, which the two PYTHON* variables
-#                            above no longer give the engine itself.
-# The interpreter is named by its full path, so a PATH set at run time cannot choose another.
+# THE OPTIONS (vault BACKLOG #2701, #2700) are kept in step with the Windows installer by
+# tests/test_isolated_launch.py, and docker/README.md says what each does. Particular to the image:
+#   - `-m` would search the working directory first, and WORKDIR is the writable store volume. -I
+#     keeps it off the import path.
+#   - -u and -B stand in for the two PYTHON* variables above, which -I makes the engine ignore.
+#   - The interpreter is named by its full path, so a PATH set at run time cannot choose another.
 ENTRYPOINT ["tini", "--", "/opt/venv/bin/python", "-I", "-X", "disable-remote-debug", "-u", "-B", "-m", "messagefoundry"]
 CMD ["serve", "--help"]
 
@@ -182,7 +177,6 @@ USER 10001
 
 # ---- runtime (slim default) — LAST stage, so a bare `docker build` produces the slim image -------
 FROM runtime-base AS runtime
-# ROOT-OWNED (vault BACKLOG #2701). The engine runs as uid 10001 and only reads the venv. Owned by
-# that uid, site-packages was a directory the engine's own account could write, and code planted
-# there runs at every interpreter start. The files stay world-readable, as pip wrote them.
+# ROOT-OWNED (vault BACKLOG #2701): see the note at the useradd step. The files stay
+# world-readable, as pip wrote them, so uid 10001 still reads them.
 COPY --from=builder --chown=0:0 /opt/venv /opt/venv

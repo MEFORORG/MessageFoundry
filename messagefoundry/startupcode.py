@@ -75,6 +75,7 @@ from messagefoundry.controlchars import scrub_log_argument
 __all__ = [
     "ISOLATED_LAUNCH_OPTIONS",
     "InterpreterLaunch",
+    "Kind",
     "StartupCodeItem",
     "StartupPosture",
     "Verdict",
@@ -121,8 +122,11 @@ _EXPECTED: Final[frozenset[Verdict]] = frozenset({"recorded", "interpreter", "pa
 #: is expected only while its executable content is exactly this.
 _PACKAGING_TOOL_PTH: Final = {"_virtualenv.pth": "import _virtualenv"}
 
-#: The module names ``site`` imports at start, when it finds them.
-_CUSTOMIZE_MODULES: Final = ("sitecustomize", "usercustomize")
+#: What kind of start-up code a file is: a ``.pth`` file, or one of the two modules ``site``
+#: imports at start when it finds them.
+Kind = Literal["pth", "sitecustomize", "usercustomize"]
+
+_CUSTOMIZE_MODULES: Final[tuple[Kind, ...]] = ("sitecustomize", "usercustomize")
 
 #: A ``.pth`` file larger than this is not read for its lines. It is listed as start-up code
 #: without being parsed: no packaging tool writes one this size.
@@ -130,8 +134,6 @@ _PTH_READ_LIMIT: Final = 1024 * 1024
 
 #: The most file names one message carries. The count is always exact.
 _NAMES_IN_A_MESSAGE: Final = 8
-
-Kind = Literal["pth", "sitecustomize", "usercustomize"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +191,7 @@ def _norm(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
-def interpreter_launch() -> InterpreterLaunch:
+def _interpreter_launch() -> InterpreterLaunch:
     """The launch flags of THIS process. It says nothing about any other process."""
     flags = sys.flags
     present = {name.upper() for name in os.environ} if sys.platform == "win32" else set(os.environ)
@@ -265,10 +267,12 @@ def _pth_items(directory: Path) -> list[StartupCodeItem]:
         path = directory / name
         if _is_hidden(path) or not path.is_file():
             continue
+        # None is a file that was not read. It is neither of the two cases below, so it is
+        # listed, and judged by its RECORD row alone.
         lines = _executable_lines(path)
-        if lines is not None and not lines:
+        if lines == []:
             continue  # directories only: not start-up code (see the module docstring)
-        if lines is not None and [_PACKAGING_TOOL_PTH.get(name)] == lines:
+        if lines == [_PACKAGING_TOOL_PTH.get(name)]:
             items.append(StartupCodeItem("pth", str(path), "packaging_tool"))
             continue
         verdict, owner = _recorded(path, directory)
@@ -283,7 +287,7 @@ def _interpreter_dirs() -> frozenset[str]:
     return frozenset(_norm(path) for path in found if path)
 
 
-def _customize_items(site_dirs: list[Path]) -> list[StartupCodeItem]:
+def _customize_items() -> list[StartupCodeItem]:
     """Each ``sitecustomize`` and ``usercustomize`` module findable on the import path.
 
     Every entry is searched, not only the first that answers: a module on a later entry runs the
@@ -291,7 +295,6 @@ def _customize_items(site_dirs: list[Path]) -> list[StartupCodeItem]:
     after start-up, such as the working directory under ``python -m``, did not run at this start
     and is listed anyway."""
     interpreter_dirs = _interpreter_dirs()
-    site_keys = {_norm(str(directory)): directory for directory in site_dirs}
     items: list[StartupCodeItem] = []
     seen: set[str] = set()
     for entry in sys.path:
@@ -307,15 +310,13 @@ def _customize_items(site_dirs: list[Path]) -> list[StartupCodeItem]:
                 spec = None
             if spec is None or spec.origin is None or not spec.has_location:
                 continue  # nothing there, or a namespace package, which runs no code
-            origin = spec.origin
-            kind: Kind = "sitecustomize" if name == "sitecustomize" else "usercustomize"
             if key in interpreter_dirs:
-                items.append(StartupCodeItem(kind, origin, "interpreter"))
+                items.append(StartupCodeItem(name, spec.origin, "interpreter"))
                 continue
-            # A distribution can only record a file under the directory its metadata sits in.
-            directory = site_keys.get(key, Path(root))
-            verdict, owner = _recorded(Path(origin), directory)
-            items.append(StartupCodeItem(kind, origin, verdict, owner))
+            # A distribution can only record a file under the directory its metadata sits in,
+            # which is the entry the module was found on.
+            verdict, owner = _recorded(Path(spec.origin), Path(root))
+            items.append(StartupCodeItem(name, spec.origin, verdict, owner))
     return items
 
 
@@ -380,12 +381,12 @@ def read_startup_posture() -> StartupPosture:
     Blocking file reads: directory listings, and one hash for each ``.pth`` or customize module
     that needs a ``RECORD`` lookup. Never raises for a file it cannot read. An interpreter started
     with ``-S`` ran none of this, and reports no start-up code."""
-    launch = interpreter_launch()
+    launch = _interpreter_launch()
     if sys.flags.no_site:
         return StartupPosture(launch=launch)
     site_dirs = _site_dirs()
     items = [item for directory in site_dirs for item in _pth_items(directory)]
-    items.extend(_customize_items(site_dirs))
+    items.extend(_customize_items())
     writable: list[str] = []
     unchecked: list[str] = []
     for directory in site_dirs:
@@ -427,14 +428,15 @@ def _named(paths: tuple[str, ...]) -> str:
     return f"{shown} and {more} more" if more > 0 else shown
 
 
-def _named_items(items: tuple[StartupCodeItem, ...]) -> str:
-    return _named(tuple(f"{item.path} ({item.verdict})" for item in items))
-
-
-_WHAT_STARTUP_CODE_IS: Final = (
-    "A .pth line that begins with `import`, and a sitecustomize or usercustomize module, run each "
-    "time the interpreter starts, before any engine code and with everything the engine holds"
-)
+def _unexpected_summary(unexpected: tuple[StartupCodeItem, ...]) -> str:
+    """What the refusal and the loosening entry both open with, so they name the files alike."""
+    files = _named(tuple(f"{item.path} ({item.verdict})" for item in unexpected))
+    return (
+        "start-up code the engine does not know is installed in its interpreter "
+        f"({len(unexpected)}): {files}. A .pth line that begins with `import`, and a "
+        "sitecustomize or usercustomize module, run each time the interpreter starts, before any "
+        "engine code and with everything the engine holds"
+    )
 
 
 def startup_refusal(posture: StartupPosture) -> str | None:
@@ -443,16 +445,13 @@ def startup_refusal(posture: StartupPosture) -> str | None:
     Only start-up code that is not expected refuses. A launch that is not isolated and a writable
     site directory are reported and never refused: a plain ``messagefoundry serve`` from a
     developer's own environment is both, by construction."""
-    unexpected = posture.unexpected
-    if not unexpected:
+    if not posture.unexpected:
         return None
     return (
-        f"start-up code the engine does not know is installed in its interpreter "
-        f"({len(unexpected)}): {_named_items(unexpected)}. {_WHAT_STARTUP_CODE_IS}. `recorded` "
-        "files are the ones an installed package lists with a matching hash; these are not. "
-        "Remove each file, or install it as part of a package so that its distribution records "
-        'it. To start anyway with it reported, set [security].enforcement = "warn". See '
-        "docs/SECURITY-LOOSENING.md"
+        f"{_unexpected_summary(posture.unexpected)}. `recorded` files are the ones an installed "
+        "package lists with a matching hash; these are not. Remove each file, or install it as "
+        "part of a package so that its distribution records it. To start anyway with it "
+        'reported, set [security].enforcement = "warn". See docs/SECURITY-LOOSENING.md'
     )
 
 
@@ -481,7 +480,7 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
                 f"left in the service's environment decides what the engine imports.{honoured} "
                 f"{path} The shipped service launches pass -I. An engine shard that `supervise` "
                 "starts is not isolated: the supervisor starts it with -P and hands it the "
-                "variables. Start the engine as `python -I -X disable-remote-debug -m "
+                f"variables. Start the engine as `python {' '.join(ISOLATED_LAUNCH_OPTIONS)} -m "
                 "messagefoundry serve ...`",
             )
         )
@@ -499,10 +498,9 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
         out.append(
             (
                 "startup_code_unexpected",
-                f"start-up code the engine does not know is installed in its interpreter "
-                f"({len(posture.unexpected)}): {_named_items(posture.unexpected)}. "
-                f'{_WHAT_STARTUP_CODE_IS}. Under [security].enforcement = "enforce" the engine '
-                "refuses to start on it. Remove each file, or install it as part of a package",
+                f"{_unexpected_summary(posture.unexpected)}. Under [security].enforcement = "
+                '"enforce" the engine refuses to start on it. Remove each file, or install it as '
+                "part of a package",
             )
         )
     if posture.writable_site_dirs:

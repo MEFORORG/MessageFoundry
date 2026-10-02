@@ -14,8 +14,6 @@ planted. The launch reading is taken off real child interpreters, with and witho
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import importlib
 import json
 import os
@@ -36,6 +34,8 @@ from messagefoundry.startupcode import (
     startup_loosenings,
     startup_refusal,
 )
+from tests.test_isolated_launch import _decoy, _needs_install, _run
+from tests.test_startup_attestation import _record_hash
 
 _HARDENED = InterpreterLaunch(
     isolated=True, safe_path=True, ignore_environment=True, no_user_site=True
@@ -49,19 +49,19 @@ def _names(posture: StartupPosture) -> list[str]:
     return [name for name, _ in startup_loosenings(posture)]
 
 
-def _record_row(path: Path, root: Path) -> str:
-    digest = base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest()).rstrip(b"=")
-    return f"{path.relative_to(root).as_posix()},sha256={digest.decode()},{path.stat().st_size}"
-
-
 def _install_dist(site: Path, name: str, files: list[Path]) -> None:
-    """A minimal installed distribution in ``site`` whose RECORD lists ``files``."""
+    """A minimal installed distribution in ``site`` whose RECORD lists ``files``, which exist
+    already. (``_build_wheel_install`` in the attestation tests writes its own files.)"""
     info = site / f"{name}-1.0.dist-info"
     info.mkdir()
     (info / "METADATA").write_text(
         f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n", encoding="utf-8"
     )
-    rows = [_record_row(path, site) for path in files] + [f"{info.name}/RECORD,,"]
+    rows = [
+        f"{path.relative_to(site).as_posix()},{_record_hash(data)},{len(data)}"
+        for path in files
+        for data in [path.read_bytes()]
+    ] + [f"{info.name}/RECORD,,"]
     (info / "RECORD").write_text("\n".join(rows) + "\n", encoding="utf-8")
     # The metadata reader caches a directory listing against the directory's modification time,
     # and two writes inside one clock tick leave that time unchanged.
@@ -152,7 +152,7 @@ def test_a_sitecustomize_on_the_import_path_is_found_and_not_run(
         f"open({str(ran)!r}, 'w').close()\n", encoding="utf-8"
     )
     monkeypatch.setattr(sys, "path", [str(site_dir), str(elsewhere)])
-    items = startupcode._customize_items([site_dir])
+    items = startupcode._customize_items()
     assert [(i.kind, Path(i.path).parent.name, i.verdict) for i in items] == [
         ("sitecustomize", "on-pythonpath", "unrecorded")
     ]
@@ -167,7 +167,7 @@ def test_every_entry_is_searched_not_only_the_first_that_answers(
         directory.mkdir()
         (directory / "usercustomize.py").write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(first), str(second)])
-    found = [Path(i.path).parent.name for i in startupcode._customize_items([site_dir])]
+    found = [Path(i.path).parent.name for i in startupcode._customize_items()]
     assert found == ["first", "second"]
 
 
@@ -178,7 +178,7 @@ def test_a_namespace_package_named_sitecustomize_runs_nothing_and_is_not_listed(
     (tmp_path / "pkg" / "sitecustomize").mkdir(parents=True)
     (tmp_path / "pkg" / "sitecustomize" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(sys, "path", [str(tmp_path / "ns"), str(tmp_path / "pkg")])
-    found = [Path(i.path).parent.parent.name for i in startupcode._customize_items([site_dir])]
+    found = [Path(i.path).parent.parent.name for i in startupcode._customize_items()]
     # CONTROL: the package with an __init__ IS listed.
     assert found == ["pkg"]
 
@@ -193,18 +193,18 @@ def test_a_sitecustomize_in_the_interpreters_own_library_is_expected(
     monkeypatch.setattr(
         startupcode, "_interpreter_dirs", lambda: frozenset({startupcode._norm(str(stdlib))})
     )
-    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["interpreter"]
+    assert [i.verdict for i in startupcode._customize_items()] == ["interpreter"]
     # CONTROL: the same file where the interpreter's library is not.
     monkeypatch.setattr(startupcode, "_interpreter_dirs", lambda: frozenset())
-    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["unrecorded"]
+    assert [i.verdict for i in startupcode._customize_items()] == ["unrecorded"]
 
 
 def test_a_sitecustomize_a_package_records_is_expected(site_dir: Path) -> None:
     module = site_dir / "sitecustomize.py"
     module.write_text("x = 1\n", encoding="utf-8")
-    assert [i.verdict for i in startupcode._customize_items([site_dir])] == ["unrecorded"]
+    assert [i.verdict for i in startupcode._customize_items()] == ["unrecorded"]
     _install_dist(site_dir, "hooks", [module])
-    items = startupcode._customize_items([site_dir])
+    items = startupcode._customize_items()
     assert [(i.verdict, i.owner) for i in items] == [("recorded", "hooks")]
 
 
@@ -356,56 +356,33 @@ print(json.dumps({"names": names, "isolated": startup.launch.isolated,
 """
 
 
-def _child(tmp_path: Path, options: tuple[str, ...]) -> dict[str, object]:
-    decoy = tmp_path / "decoy"
-    (decoy / "messagefoundry").mkdir(parents=True, exist_ok=True)
-    (decoy / "messagefoundry" / "__init__.py").write_text("raise SystemExit('DECOY')\n", "utf-8")
-    env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHON_DISABLE_REMOTE_DEBUG"}
-    # The decoy is on PYTHONPATH AND is the working directory: an isolated child ignores both.
-    env["PYTHONPATH"] = str(decoy)
-    proc = subprocess.run(
-        [sys.executable, *options, "-c", _CHILD_REPORT],
-        capture_output=True,
-        text=True,
-        cwd=decoy,
-        env=env,
-        timeout=50,
-    )
-    return {"code": proc.returncode, "out": proc.stdout, "err": proc.stderr}
-
-
+@_needs_install
 def test_the_isolated_launch_drops_both_entries_and_a_plain_one_has_both(tmp_path: Path) -> None:
     """The shipped launches pass :data:`ISOLATED_LAUNCH_OPTIONS`. With them, neither
-    ``interpreter_not_isolated`` nor ``remote_debug_enabled`` is in the registry's list. The
-    control is the same child without them, which also proves the decoy on PYTHONPATH would have
-    won there: it exits before the report."""
-    hardened = _child(tmp_path, ISOLATED_LAUNCH_OPTIONS)
-    assert hardened["code"] == 0, hardened["err"]
-    report = json.loads(str(hardened["out"]))
+    ``interpreter_not_isolated`` nor ``remote_debug_enabled`` is in the registry's list. The decoy
+    package is on PYTHONPATH and is the working directory, and an isolated child ignores both. The
+    control is the same child without the options: the decoy wins there, before the report."""
+    decoy = _decoy(tmp_path)
+    hardened = _run(ISOLATED_LAUNCH_OPTIONS, "-c", _CHILD_REPORT, cwd=decoy, PYTHONPATH=str(decoy))
+    assert hardened.returncode == 0, hardened.stderr
+    report = json.loads(hardened.stdout)
     assert report["isolated"] is True and report["safe_path"] is True
     assert "interpreter_not_isolated" not in report["names"]
     assert "remote_debug_enabled" not in report["names"]
     assert not any("decoy" in str(p) for p in report["path"])
-    plain = _child(tmp_path, ())
-    assert plain["code"] != 0 and "DECOY" in str(plain["err"]), (
+    plain = _run((), "-c", _CHILD_REPORT, cwd=decoy, PYTHONPATH=str(decoy))
+    assert plain.returncode != 0 and "DECOY" in plain.stderr, (
         "CONTROL FAILED: the decoy on PYTHONPATH did not win in a plain child"
     )
 
 
+@_needs_install
 def test_a_plain_child_reports_both_entries(tmp_path: Path) -> None:
     """The other half of the control, without the decoy in the way: an interpreter started with
     no options names both."""
-    env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHON_DISABLE_REMOTE_DEBUG"}
-    env.pop("PYTHONPATH", None)
-    proc = subprocess.run(
-        [sys.executable, "-c", _CHILD_REPORT],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=50,
-    )
-    assert proc.returncode == 0, proc.stderr
-    names = json.loads(proc.stdout)["names"]
+    plain = _run((), "-c", _CHILD_REPORT, cwd=tmp_path)
+    assert plain.returncode == 0, plain.stderr
+    names = json.loads(plain.stdout)["names"]
     assert "interpreter_not_isolated" in names and "remote_debug_enabled" in names
 
 

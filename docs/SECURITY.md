@@ -4063,19 +4063,56 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-Two controls answer it, and they differ in strength:
+Three controls answer it, and they differ in strength:
 
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
-- **The engine process itself refuses the script.** `serve` and `supervise` start through a
-  console-script launcher, which cannot pass that option. So each installs an audit hook as its
-  first step (`messagefoundry/remotedebug.py`). The interpreter raises an event before it runs an
-  injected script, the hook raises on it, and the interpreter drops the script.
+- **The shipped service launches start the engine with the interface off.** The Windows installer
+  and the container image run the interpreter itself, with `-X disable-remote-debug`, and no
+  longer the console-script launcher, which cannot pass an option
+  ([the next section](#isolated-mode-and-start-up-code-of-the-engines-interpreter)).
+- **The engine process refuses the script where the interface is still on.** A start through the
+  console script, such as a developer's `messagefoundry serve`, leaves it on. So `serve` and
+  `supervise` each install an audit hook as their first step (`messagefoundry/remotedebug.py`).
+  The interpreter raises an event before it runs an injected script, the hook raises on it, and
+  the interpreter drops the script.
 
-The hook is the weaker of the two, so an engine that starts with the interface on reports it as
-the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported, what
-a default start reports and how to clear it are stated once, in
+The hook is the weakest of the three, so an engine that starts with the interface on reports it
+as the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported,
+which starts report it and how to clear it are stated once, in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
+
+### Isolated mode and start-up code of the engine's interpreter
+
+Two things put code inside a Python process before its first line runs: the `PYTHON*`
+environment variables, and the start-up code in the interpreter's site directories (a `.pth` line
+that begins with `import`, and a `sitecustomize` or `usercustomize` module). On a first
+deployment either would run inside the engine, with everything the engine holds.
+
+Three controls answer it:
+
+- **The shipped service launches are isolated.** The Windows installer registers the install's
+  `python.exe` with `-I -X disable-remote-debug -m messagefoundry serve ...`, and the container
+  image's entry point is the same command with `-u -B` added. Under `-I` the interpreter ignores
+  every `PYTHON*` variable and keeps the working directory and the user's site directory off the
+  import path. `tests/test_isolated_launch.py` holds both launches to one list of options, and
+  each smoke leg reads the flags off the running engine.
+- **`serve` and `supervise` inventory the start-up code** (`messagefoundry/startupcode.py`).
+  Isolated mode does not stop it. Under `[security].enforcement = "enforce"` they refuse to start
+  on a file no installed package records. This is detection: start-up code runs before the check.
+- **The site directories should not be writable by the service account.** That is the
+  prevention, and it is a deployment requirement the engine checks and reports. The container
+  image meets it: its virtual environment is owned by root and the engine runs as another user.
+
+What each control leaves open, what counts as expected start-up code, which entries a development
+start reports and how to clear each are stated once, in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-site_packages_writable-what-runs-in-the-interpreter-before-the-engine-does).
+
+**The engine's Python children are not isolated.** The sandbox worker and each engine shard start
+with `-P -X disable-remote-debug`, and the engine hands them the `PYTHON*` variables it holds,
+by name (`messagefoundry/childenv.py`). So a `PYTHONPATH` in the service's environment that the
+engine ignores would still reach an engine shard. The engine reports that case as
+`python_variables_reach_children`.
 
 ### HIPAA §164.312 alignment
 

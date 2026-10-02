@@ -1890,12 +1890,10 @@ def _serve(args: argparse.Namespace) -> int:
     # reflects a true property (the DEBUG-logging refusal below; the AI data-scope ceiling).
     enforcing = settings.security.enforcement is SecurityEnforcement.ENFORCE
 
-    # Vault BACKLOG #2701: what ran in this interpreter before the engine did. A .pth import line
-    # or a sitecustomize module that no installed package records refuses the start under enforce,
-    # and is reported under warn. The launch flags and a writable site directory are only ever
-    # reported, in the loosening list below. Read once and kept: GET /security/posture reports this
-    # same reading. The check is detection: start-up code runs before it and could defeat it
-    # (messagefoundry/startupcode.py says what it does not cover).
+    # Vault BACKLOG #2701: what ran in this interpreter before the engine did. Start-up code no
+    # installed package records refuses the start under enforce, and is reported under warn. The
+    # rest of the reading is only ever reported, in the loosening list below.
+    # messagefoundry/startupcode.py says what the check covers and what it cannot.
     from messagefoundry.startupcode import startup_posture, startup_refusal
 
     startup = startup_posture()

@@ -34,6 +34,12 @@ this line.**
   on. The message for a
   failed Windows SSO sign-in no longer points at a password form, which a directory account
   does not have. (vault BACKLOG #2609)
+- **The status page shows how the engine process was started.** Three new rows under the store
+  and security readings: whether the interpreter runs in isolated mode, whether its remote
+  debugging is off, and how much start-up code it found, with how much of that the engine did not
+  expect and how many site directories the engine's own account can write. They come from the new
+  `interpreter` block of the engine's security posture, which moves the supported engine UI seam.
+  The file names are in `GET /security/posture`. (vault BACKLOG #2701, #2700)
 
 ## [0.4.0] — 2026-10-01 — Early Access
 

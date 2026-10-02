@@ -154,6 +154,18 @@ def test_the_underscore_spelling_of_the_option_is_accepted_and_ignored(tmp_path:
     assert misspelt.stdout.split()[4] == "True"
 
 
+def test_the_children_and_the_shipped_launches_spell_the_remote_debug_option_alike() -> None:
+    """Two lists pass the option: the children's (``childenv``) and the shipped launches'. A
+    misspelling in either is accepted by the interpreter, so they are held to one spelling here."""
+    from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS
+
+    assert (
+        CHILD_INTERPRETER_FLAGS[-2:]
+        == ISOLATED_LAUNCH_OPTIONS[-2:]
+        == ("-X", "disable-remote-debug")
+    )
+
+
 # --- 2 and 3. the two shipped launches, read from their files -----------------------------------
 
 
@@ -267,18 +279,11 @@ def test_the_image_reader_objects_to_a_planted_violation(old: str, new: str) -> 
 
 
 def _step_script(job: str, name_starts: str) -> tuple[int, str]:
-    """The position and the run script of one step, without its comment lines. Read from the parsed
-    workflow, so a needle cannot be met by a comment. Imported here: without PyYAML that module
-    skips whoever imports it."""
-    from tests._workflow_contexts import jobs_of
+    """One ``ci.yml`` step's position and comment-free run script. Imported here: without PyYAML
+    that module skips whoever imports it."""
+    from tests._workflow_contexts import step_script
 
-    steps = jobs_of("ci.yml")[job]["steps"]
-    found = [i for i, s in enumerate(steps) if str(s.get("name", "")).startswith(name_starts)]
-    assert len(found) == 1, f"expected one {job} step named {name_starts!r}, found {len(found)}"
-    name = str(steps[found[0]]["name"])
-    assert name.count("(") == name.count(")"), f"the step name is cut short: {name!r}"
-    lines = str(steps[found[0]]["run"]).splitlines()
-    return found[0], "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+    return step_script("ci.yml", job, name_starts)
 
 
 def test_the_windows_smoke_leg_reads_the_launch_off_the_running_service() -> None:
