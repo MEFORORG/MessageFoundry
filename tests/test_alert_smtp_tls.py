@@ -223,6 +223,7 @@ def _names(**kw: Any) -> list[str]:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     ]
 
@@ -275,6 +276,7 @@ def test_an_unconfigured_alert_transport_reports_no_hop_deviation() -> None:
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
+            startup=None,
         )
     ]
     assert "email_use_tls" not in names

@@ -5683,8 +5683,8 @@ class RegistryRunner:
         except IngressBodyRejected as exc:
             # INGEST-4: dead-letter a NUL-bearing body BEFORE Peek.parse and any store write, so text
             # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
-            # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte past its
-            # start lands here too (ADR 0205 rule 4).
+            # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte inside the
+            # message, not in the whitespace at either end, lands here too (ADR 0205 rule 4).
             await self.store.record_received(
                 channel_id=ic.name,
                 raw=store_safe_raw(raw, ic.content_type.value, text=text),
@@ -5953,8 +5953,8 @@ class RegistryRunner:
             # at the first NUL). Dead-letter it here, BEFORE Peek.parse and any store write, so text (and
             # control_id/summary/strict-fail errors derived from it) is NUL-free for the rest of this
             # handler. NAK AR mirrors the decode/parse-error precedent for a malformed body. An HL7 v2
-            # body holding an MLLP frame byte past its start is refused the same way, with its own
-            # fixed MSA-3 text (ADR 0205 rule 4).
+            # body holding an MLLP frame byte inside the message, not in the whitespace at either end,
+            # is refused the same way, with its own fixed MSA-3 text (ADR 0205 rule 4).
             body_err = exc.reason
             mid = await self.store.record_received(
                 channel_id=ic.name,
@@ -6605,6 +6605,26 @@ class RegistryRunner:
                 # = None → mark_done → the message finalizes PROCESSED, and the would-send
                 # outbound payload is retained on the done row for parity comparison. (A
                 # capturing/reingress_to outbound therefore captures nothing in simulate.)
+                # ADR 0205 rule 1 lives in send(), which shadow skips, so run its check here: a
+                # payload a live MLLP/TCP send would dead-letter dead-letters in shadow too. On the
+                # hydrated payload, as a live send sees it: an explicit TCP codec may use a byte of
+                # the base64 alphabet a re-attached document carries. A connector that does not
+                # frame keeps the default no-op, so it pays no hydration.
+                # check_frame runs the same delimiter rewrite send() does, so a re-encode refusal
+                # (permanent, code "reencode": ADR 0204, ADR 0206) dead-letters in shadow as it
+                # would live. A hydration failure is neither, so it stays what shadow made it
+                # before, a completed delivery.
+                if _frames(connector):
+                    try:
+                        connector.check_frame(await self._hydrate_payload(item.payload))
+                    except NegativeAckError:
+                        raise
+                    except DeliveryError as exc:
+                        log.debug(
+                            "delivery worker %r: shadow frame check skipped (%s)",
+                            name,
+                            type(exc).__name__,
+                        )
                 response = None
             else:
                 # PHASE (a): the connector send->ACK round-trip. On a real cross-box outbound this is
@@ -6785,6 +6805,9 @@ class RegistryRunner:
         + complete all N in one store transaction. Mirrors the single-row disposition ladder over the whole
         batch: on success ``mark_batch_done`` all N; a transient/transport failure ``mark_batch_failed`` all
         N (re-claimed as the identical prefix); a permanent reject ``dead_letter_batch`` all N (decision #1).
+        The one exception (ADR 0205 rule 1): a member whose payload the frame cannot carry is taken out
+        before the envelope is built and dead-lettered alone, and "all N" above means the rest. The
+        envelope's head is then the first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
         ``seq`` order (``reset_stale_inflight``). The members are the lane's oldest contiguous rows in
@@ -6892,24 +6915,34 @@ class RegistryRunner:
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
+        refused: list[tuple[str, str]] = []
         try:
-            control_id = Message.parse(head.payload).control_id or head.id  # FIFO-aligned, stable
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
             # mfdoc:v1:ref: handle). Members with no handle are byte-identical; a missing attachment raises
             # a DeliveryError (caught below → the whole batch re-pends), so the peer never sees a handle.
-            hydrated: list[Message | str] = [
-                await self._hydrate_payload(it.payload) for it in items
-            ]
-            envelope = encode_batch(
-                hydrated,
-                control_id=control_id,
-                timestamp=_hl7_batch_timestamp(head.created_at),
-            )
-            if self._simulate.get(name, False):
-                pass  # shadow / parallel-run: suppress the real egress; still complete all N below.
+            hydrated = [await self._hydrate_payload(it.payload) for it in items]
+            # ADR 0205 rule 1, per member: one member the frame cannot carry is dead-lettered alone
+            # and the rest batch, rather than all N dying on one envelope offset. It runs before the
+            # shadow branch below, so a simulate outbound records the same dispositions. The split
+            # writes nothing; the refused members are dead-lettered after this try, on every path.
+            if _frames(connector):
+                kept, members, refused = self._split_unframeable_members(
+                    name, connector, items, hydrated
+                )
             else:
-                await connector.send(envelope)
+                kept, members = list(items), list[Message | str](hydrated)
+            ids = [it.id for it in kept]
+            if kept:
+                first = kept[0]  # the envelope's head is the first member that survived
+                control_id = Message.parse(first.payload).control_id or first.id  # stable
+                envelope = encode_batch(
+                    members,
+                    control_id=control_id,
+                    timestamp=_hl7_batch_timestamp(first.created_at),
+                )
+                if not self._simulate.get(name, False):  # shadow suppresses the real egress
+                    await connector.send(envelope)
         except NegativeAckError as exc:
             # #109 (ADR 0095), the batch twin of the single-row branch in
             # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is not a
@@ -6920,6 +6953,9 @@ class RegistryRunner:
             # exactly as the single row does.
             fault = self._lane_stopping_fault(exc)
             if fault is not None:
+                # Refused members first: a store fault here then escapes before the stop, not
+                # after a stop and alert are already recorded, so #109 cannot loop on re-auth.
+                await self._dead_letter_refused(refused)
                 await self._stop_lane_retaining(name, ids, exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
@@ -6932,7 +6968,7 @@ class RegistryRunner:
             retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
             await self._maybe_alert_buildup(name)
             await self._maybe_alert_stall(name)
-            self._note_lane_unhealthy(name, head.id, exc)
+            self._note_lane_unhealthy(name, ids[0] if ids else head.id, exc)
         except Exception as exc:
             # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
             # fault. The per-connection policy decides: STOP halts the lane (preserve the batch, alert);
@@ -6942,6 +6978,7 @@ class RegistryRunner:
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
             ):
+                await self._dead_letter_refused(refused)  # before the stop, as above
                 log.error(
                     "delivery worker %r: framing/internal error delivering a batch of %d (%s); STOPPING "
                     "connection (operator must fix + reload/restart to resume)",
@@ -6965,9 +7002,51 @@ class RegistryRunner:
             )
             await self.store.dead_letter_batch(ids, f"internal error: {safe_exc(exc)}")
         else:
-            self._note_lane_healthy(name)
-            await self.store.mark_batch_done(ids)
+            if ids:  # nothing was sent when every member was refused
+                self._note_lane_healthy(name)
+                await self.store.mark_batch_done(ids)
+        await self._dead_letter_refused(refused)
         return _ItemOutcome.PROCESSED, retry_until
+
+    def _split_unframeable_members(
+        self,
+        name: str,
+        connector: DestinationConnector,
+        items: Sequence[OutboxItem],
+        payloads: Sequence[str],
+    ) -> tuple[list[OutboxItem], list[Message | str], list[tuple[str, str]]]:
+        """Split the batch into the members ``connector``'s frame can carry, with their hydrated
+        payloads, and the ``(id, error)`` of each member it refuses permanently (ADR 0205 rule 1).
+        Pure: it writes nothing, so a store fault cannot strike between a refusal and the send, and
+        the caller dead-letters the refused members once the rest are resolved. A refusal that is
+        not permanent, or one that must stop the lane, is re-raised for the whole batch, as a send
+        would raise it. The error text names a byte and an offset in that member, never content."""
+        kept: list[OutboxItem] = []
+        kept_payloads: list[Message | str] = []
+        refused: list[tuple[str, str]] = []
+        for item, payload in zip(items, payloads, strict=True):
+            try:
+                connector.check_frame(payload, rewrite=False)
+            except NegativeAckError as exc:
+                if not exc.permanent or self._lane_stopping_fault(exc) is not None:
+                    raise
+                log.warning(
+                    "delivery worker %r: batch member %s cannot be framed (%s); dead-lettered "
+                    "alone, the rest of the batch goes on",
+                    name,
+                    item.id,
+                    exc.code,
+                )
+                refused.append((item.id, safe_exc(exc)))
+            else:
+                kept.append(item)
+                kept_payloads.append(payload)
+        return kept, kept_payloads, refused
+
+    async def _dead_letter_refused(self, refused: Sequence[tuple[str, str]]) -> None:
+        """Dead-letter each batch member :meth:`_split_unframeable_members` refused, alone."""
+        for outbox_id, error in refused:
+            await self.store.dead_letter_now(outbox_id, error)
 
     def _lane_stopping_fault(self, exc: NegativeAckError) -> _LaneFault | None:
         """Which connection fault ``exc`` is, when it must STOP the lane and keep the queue:
@@ -8558,6 +8637,15 @@ class RegistryRunner:
             return True
         except TimeoutError:
             return False
+
+
+def _frames(connector: object) -> bool:
+    """Whether ``connector`` overrides :meth:`DestinationConnector.check_frame`, that is, frames
+    its payload (MLLP, TCP). Read off the class, so a connector that does not frame costs the
+    delivery stage no hydration and no per-member pass, and a duck-typed test double that never
+    defined the hook counts as not framing."""
+    hook = getattr(type(connector), "check_frame", None)
+    return hook is not None and hook is not DestinationConnector.check_frame
 
 
 def _hl7_batch_timestamp(created_at: float | None) -> str:

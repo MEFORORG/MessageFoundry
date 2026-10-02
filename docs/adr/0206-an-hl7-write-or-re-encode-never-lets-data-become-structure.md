@@ -5,7 +5,7 @@
 - **Related:** vault BACKLOG #2558 (a decoded leaf copied into a whole field), #2559 (the outbound
   delimiter override), #2560 (a second `MSH` in one body), #2557 and
   [ADR 0205](0205-an-outbound-frame-holds-exactly-one-message.md) (the same family, for frame bytes),
-  ADR 0204 (the permanent failure class; on its own pull request), [ADR 0054](0054-low-allocation-builtins-hl7-parser.md)
+  [ADR 0204](0204-a-delivery-the-message-itself-makes-impossible-uses-the-permanent-failure-class.md) (the permanent failure class), [ADR 0054](0054-low-allocation-builtins-hl7-parser.md)
   (the built-in tolerant parser), [ADR 0076](0076-typed-action-vocabulary-action-list-lens.md) (the
   typed action vocabulary), [ADR 0089](0089-recognition-first-lens-native-idioms.md) (the lens's
   native idioms), [ADR 0144](0144-security-lint-gate-over-admin-authored-router-handler-config.md) (the advisory handler-security lint),
@@ -148,7 +148,11 @@ open points settled below.
   identically on every retry under either setting, so a retry only holds the lane. That is ADR
   0204's rule: a refusal the payload causes raises the existing permanent class, here with code
   `reencode`. `NegativeAckError` is a `DeliveryError`, so a caller catching the latter is
-  unaffected.
+  unaffected. *Added 2026-10-02, on merging ADR 0205's repair:* MLLP's `send()` and its
+  `check_frame` now share one rewrite step, `_rewrite_for_wire`, and the permanent refusal lives
+  there. So a simulate (shadow) outbound dead-letters a payload the rewrite refuses, as a live send
+  does. ADR 0205's note that shadow completes such a row, while a live send retries it, described
+  the retryable refusal this ADR replaced.
 - **RemoteFileSource (rule 5): it splits, like the File source.** It reads whole files, as the File
   source does, and a remote drop is where a partner's batch file arrives: several `MSH` messages, with
   or without an `FHS`/`BHS` envelope, the shape `samples/messages/adt_batch.hl7` holds. Refusing would
@@ -324,4 +328,4 @@ messages with no envelope, now gets an `AR`; the helper's usage text, `docs/USER
 **Out of scope** -- A delivery refusing a payload holding more than one `MSH`. Moving the File source
 onto `split_batch_bytes`. Pinning inbound separators per connection. The `FHS`/`BHS` header lines
 `encode_with_separators` rewrites, which keep their python-hl7-parity shape. The `escape_leaf` defect
-with a letter separator, which is fixed on ADR 0205's branch.
+with a letter separator, which ADR 0205 fixed and this branch now carries.

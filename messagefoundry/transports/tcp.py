@@ -47,6 +47,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.framing import (
     FrameCodec,
     FrameError,
+    check_frame_bytes,
     codec_for,
     frame_for_delivery,
     frame_reply,
@@ -209,6 +210,12 @@ class TcpDestination(DestinationConnector):
             connection=config.name,
         )
         self._hop_guard.enforce_construction()
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        """ADR 0205 rule 1 on ``payload`` without sending it, as :meth:`MLLPDestination.check_frame`
+        does, for a shadow outbound where :meth:`send` does not run. TCP has no delimiter rewrite,
+        so ``rewrite`` changes nothing."""
+        check_frame_bytes(self.codec, payload, self.encoding, transport="TCP")
 
     async def test_connection(self) -> None:
         # Reachability only: open + close a connection (no frame sent) so a test never delivers.

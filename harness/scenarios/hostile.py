@@ -10,13 +10,14 @@ non-ASCII text. The values are data in ``hostile_values.toml`` beside this modul
 into a generated ADT^A01 with the :class:`~messagefoundry.parsing.message.Message` API, and no
 field's content is ever sliced. Three places do touch the serialized text, each named where it
 happens: a bare line break is a segment terminator, so it is chosen when the encoded segments are
-joined; a raw MLLP frame byte or NUL is put back in place of a placeholder after the encode
-(:func:`_raw_placeholders`), because the model will not write one (ADR 0205); and
+joined; a raw control character the model will not write (a frame byte, NUL or any other C0
+character a leaf write hex-escapes, ADR 0205) is put back in place of a placeholder after the
+encode (:func:`_raw_placeholders`), so a value reaches the wire with it raw; and
 :func:`received_bytes` models the MLLP decoder cutting a frame at its end block.
 Nothing here prints or logs a payload; a report names a value by its label.
 
-Every scenario injects each value of its class through the MLLP and File drivers (``framing_bytes``
-through MLLP only) into the pass-through graph and asserts three things:
+Every scenario injects each value of its class through the MLLP and File drivers (the two framing
+scenarios through one driver each) into the pass-through graph and asserts three things:
 
 1. the DISPOSITION the API reports (``processed`` unless the value says otherwise);
 2. what the MLLP and File SINKS received: the delivered bytes equal the bytes the engine documents
@@ -35,7 +36,9 @@ Where the right answer is not "the same bytes", the class says why:
 * ``framing_bytes`` over MLLP: MLLP has no escape. A 0x1C ends the frame wherever it occurs, so the
   engine receives the bytes before it, and correctly so -- the sender framed it that way. What it
   receives still holds the value's 0x0B, and ingress refuses an HL7 v2 body with an MLLP frame
-  byte inside it (ADR 0205 rule 4): ERROR, and a NAK.
+  byte inside it (ADR 0205 rule 4): ERROR, and a NAK. ``framing_end_block`` has the end block
+  alone, so what the engine receives holds no frame byte: the prefix is PROCESSED, delivered as the
+  engine re-serializes that truncated message.
 * ``framing_bytes`` and ``framing_smuggle`` carried in by FILE: the File inbound carries the bytes
   intact, and the same ingress rule refuses them, so nothing reaches an MLLP outbound that cannot
   carry them. Before ADR 0205 this was a known defect: the MLLP outbound framed them and the peer
@@ -77,6 +80,7 @@ from messagefoundry.generators import (
     all_types,  # noqa: F401  (registers the built-in message types)
 )
 from messagefoundry.parsing import HL7PeekError, normalize
+from messagefoundry.parsing._builtin_hl7 import _HEX_ESCAPED_CONTROLS
 from messagefoundry.parsing.message import Message, reencode_with_separators
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
@@ -99,9 +103,10 @@ _SETTLE_SECONDS = 0.5
 _EXPECTS = frozenset({"processed", "error"})
 _END_BLOCK = 0x1C
 _LINE_BREAKS = ("\r\n", "\r", "\n")
-#: Characters the model will not write raw (ADR 0205 rules 2 and 3): a leaf write hex-escapes them
-#: and a whole-field write refuses them. A hostile value needs them raw on the wire.
-_RAW_ONLY = ("\x00", "\x0b", "\x1c")
+#: Characters the model will not write raw (ADR 0205 rules 2 and 3): a leaf write hex-escapes each
+#: one, and a whole-field write refuses the MLLP frame bytes and NUL among them. Read from the
+#: model's own table, so a widening there reaches here. A hostile value needs them raw on the wire.
+_RAW_ONLY = _HEX_ESCAPED_CONTROLS
 
 
 @dataclass(frozen=True)
@@ -558,16 +563,12 @@ def health_problems(client: EngineClient) -> list[str]:
 @dataclass(frozen=True)
 class HostileScenario(BaseScenario):
     """Inject every value of ``classes`` through each of ``drivers`` into the pass-through graph,
-    with an MLLP and a File sink listening, and assert disposition, delivered bytes and health.
-
-    ``mllp_refusal_ok`` also accepts a refused MLLP delivery as correct: the message ended ERROR
-    and nothing of it reached the MLLP sink. That is for a value MLLP cannot frame intact."""
+    with an MLLP and a File sink listening, and assert disposition, delivered bytes and health."""
 
     name: str
     description: str
     classes: tuple[str, ...]
     drivers: tuple[str, ...] = ("mllp", "file")
-    mllp_refusal_ok: bool = False
     values_file: Path = field(default=VALUES_FILE, compare=False)
 
     @property
@@ -641,12 +642,9 @@ class HostileScenario(BaseScenario):
         timeout: float,
     ) -> list[str]:
         problems: list[str] = []
-        refused: set[int] = set()
         for index, message in enumerate(messages):
             status = statuses.get(index, "not found")
-            if self.mllp_refusal_ok and message.value.expect == "processed" and status == "error":
-                refused.add(index)  # judged below by what reached the sinks
-            elif status != message.value.expect:
+            if status != message.value.expect:
                 problems.append(f"{message.where}: {status}, expected {message.value.expect}")
 
         # Records stay alive in their sink for the whole run, so their ids are stable keys.
@@ -662,8 +660,8 @@ class HostileScenario(BaseScenario):
             def done(records: list[sinks.Record]) -> bool:
                 return all(
                     delivery_problem(kind, m, records, cid_of) is None
-                    for index, m in enumerate(messages)
-                    if m.expected is not None and not (kind == "mllp" and index in refused)
+                    for m in messages
+                    if m.expected is not None
                 )
 
             return done
@@ -675,11 +673,7 @@ class HostileScenario(BaseScenario):
             # smuggled extra record or a copy that should not be there is seen, not raced.
             time.sleep(_SETTLE_SECONDS)
             records = sink.records()
-            for index, message in enumerate(messages):
-                if kind == "mllp" and index in refused:
-                    if any(cid_of(r) == message.control_id for r in records):
-                        problems.append(f"{message.where}: refused, yet a copy reached mllp")
-                    continue
+            for message in messages:
                 if (problem := delivery_problem(kind, message, records, cid_of)) is not None:
                     problems.append(problem)
             if (problem := foreign_problem(kind, messages, records, cid_of)) is not None:
@@ -710,10 +704,12 @@ SCENARIOS = (
         "redefined_delimiters",
         "non-default MSH-1/MSH-2 delimiters, default ones as data -> PROCESSED, bytes unchanged",
     ),
-    _scenario(
-        "framing_bytes",
+    HostileScenario(
+        "hostile_framing_bytes",
         "MLLP start/end-block bytes in a field, sent over MLLP: the end block delimits the frame "
-        "(MLLP has no escape) and the start block left inside it -> ERROR and a NAK (ADR 0205)",
+        "(MLLP has no escape) and the start block left inside it -> ERROR and a NAK (ADR 0205); "
+        "an end block alone -> the prefix before it PROCESSED",
+        ("framing_bytes", "framing_end_block"),
         drivers=("mllp",),
     ),
     HostileScenario(
@@ -767,8 +763,9 @@ class KnownDefect:
 
 
 #: Scenarios that fail against the engine today because of an engine defect, kept OUT of
-#: :data:`SCENARIOS` so the all-scenarios test stays green; ``tests/test_harness_hostile.py`` runs
-#: each as a strict xfail on the defect's own signature, so a fix fails it: promote it then.
-#: Not reachable from ``python -m harness --scenario``; run one with :func:`run_scenario`. Empty
-#: since ADR 0205 promoted ``hostile_framing_bytes_via_file`` into :data:`SCENARIOS`.
+#: :data:`SCENARIOS` so the all-scenarios test stays green. Not reachable from ``python -m harness
+#: --scenario``; run one with :func:`run_scenario`. Empty since ADR 0205 promoted
+#: ``hostile_framing_bytes_via_file`` into :data:`SCENARIOS`, and the strict-xfail runner that
+#: ran each entry left ``tests/test_harness_hostile.py`` with it: restore that runner, from git
+#: history, before adding an entry here. A test there fails while this is non-empty.
 KNOWN_DEFECTS: tuple[KnownDefect, ...] = ()

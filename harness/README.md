@@ -124,7 +124,7 @@ against the scenarios that cover it. It reads the engine's live connector regist
 kept here, and flags a scenario that claims a kind the engine does not register. It needs no
 running engine. `harness/coverage.py` is the one harness module allowed to import
 `messagefoundry.transports` (read-only; `_CLIENT_ALLOWED` in `tests/test_dependency_boundaries.py`
-names it), because the registries have no public listing.
+names it); its module docstring says what it may read.
 
 It is also a gate. Every registered (kind, direction) pair must have a scenario or an entry, with a
 reason, in `EXEMPT` in `harness/coverage.py`; `--coverage` prints a `GAP:` line and exits 1 when
@@ -160,6 +160,9 @@ python -m messagefoundry serve --config harness/config/load --db ./load.db   # s
 python -m harness --load fanout-baseline --engine URL --token T --report-json out/load/run.json
 ```
 
+The engine serves with sign-in on, and `--token` is a session for it. `python -m harness.load.rigadmin`
+provisions an Administrator for the run and signs in for you; the guide below shows the three steps.
+
 Full guide — profile schema, the env knobs, reading the report/SLOs, exit codes, baseline
 comparison, and the backend-comparison recipe — is in [docs/LOAD-TESTING.md](../docs/LOAD-TESTING.md).
 
@@ -174,20 +177,22 @@ line breaks, an oversize field and non-ASCII text under MSH-18. The values are d
 `harness/scenarios/hostile_values.toml`; each is placed with the `Message` API, never by slicing raw
 HL7, and a report names a value by its label, never its content.
 
-Each `hostile_<class>` scenario injects through the MLLP and File drivers (framing bytes through MLLP
-only) into the pass-through graph `harness/config/hostile.py` (ports 2628/2629,
-`./harness_io/hostile_*`). It asserts the disposition; the bytes the MLLP and File sinks received
-(identical to what was sent, except where the engine documents a change: line endings normalized to
-CR, and an MLLP frame ending at its first 0x1C); that every written file is a single name inside its
-directory, with nothing where an unconfined `{MSH-10}.hl7` would have landed outside it; and that
-`/health` answers with every hostile connection still running. A NUL, or a body that does not decode
-on the connection's charset, is a documented ERROR.
+Each `hostile_<class>` scenario injects through the MLLP and File drivers (`hostile_framing_bytes`
+through MLLP only, `hostile_framing_bytes_via_file` through File only) into the pass-through graph
+`harness/config/hostile.py` (ports 2628/2629, `./harness_io/hostile_*`). It asserts the disposition;
+the bytes the MLLP and File sinks received (identical to what was sent, except where the engine
+documents a change: line endings normalized to CR); that every written file is a single name inside
+its directory, with nothing where an unconfined `{MSH-10}.hl7` would have landed outside it; and
+that `/health` answers with every hostile connection still running. A NUL, or a body that does not
+decode on the connection's charset, is a documented ERROR.
 
-`KNOWN_DEFECTS` holds the scenarios an engine defect fails today, outside the registry (so not
-reachable from `--scenario`); `tests/test_harness_hostile.py` runs each as a strict xfail on the
-defect's own signature. Today that is MLLP framing bytes carried in by File and forwarded over
-MLLP, which the peer receives truncated at the end block, with any later start block read as a
-second message.
+MLLP frame bytes inside an HL7 v2 body are refused at ingress (ADR 0205), by any driver: ERROR,
+and a NAK over MLLP. The one exception is an end block alone sent over MLLP. It ends the frame, so
+the engine receives the message up to it, which holds no frame byte, and processes that prefix.
+
+`KNOWN_DEFECTS` is the place for a scenario an engine defect fails, kept outside the registry. It is
+empty since ADR 0205 fixed the last one, and its strict-xfail runner was removed with it; restore
+that runner from git history before adding an entry.
 
 ### Fuzzing a live engine
 

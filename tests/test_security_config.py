@@ -56,6 +56,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
+        startup=None,
     )
 
 
@@ -374,6 +375,55 @@ def test_local_access_only_refuses_nonloopback(
 
 
 # --- AC-4: loosening warns; a production-PHI weakening still refuses (ADR 0092 clamp intact) -------
+
+
+def test_require_mfa_scope_advisory_names_only_the_accounts_it_frees() -> None:
+    """Vault BACKLOG #2798. RED when the advisory again says a directory account is single-factor under
+    ``require_mfa_scope = "administrators"``.
+
+    The scope reaches only a LOCAL account without the Administrator role: ``_scope_covers`` keeps the
+    role in scope, and the directory floor in ``AuthService._unverified_session_owes_factor`` makes an
+    unstamped directory session owe a factor under either scope value. An OIDC session is stamped at
+    mint only on a checked amr/acr claim. Exact text, so a rewrite has to come past this test."""
+    loos = dict(_loosenings(SecuritySettings(require_mfa_scope="administrators")))
+    assert loos["require_mfa_scope"] == (
+        "a local account without the Administrator role is single-factor until it enrolls a "
+        "second factor. Administrators and directory accounts still owe one; an OIDC sign-in "
+        "meets it with an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
+    )
+
+
+def test_require_mfa_advisory_keeps_an_enrolled_factor_and_the_oidc_claim() -> None:
+    """Vault BACKLOG #2798. RED when the ``require_mfa = false`` advisory again says EVERY account is
+    single-factor.
+
+    With the requirement off, ``AuthService._mfa_required_for`` still holds an ENROLLED account to its
+    factor, and the OIDC claim gate (``auth/oidc/claims.py:_check_mfa_gate``) reads only
+    ``[auth].oidc_require_mfa_claim``. What the switch frees is an account with no factor enrolled,
+    which is where a Kerberos ticket that asserts no strength gets in on its own."""
+    loos = dict(_loosenings(SecuritySettings(require_mfa=False)))
+    assert loos["require_mfa"] == (
+        "an account with no second factor enrolled is single-factor, so a Kerberos session enters "
+        "on a ticket that asserts no strength. An enrolled account must still satisfy its factor, "
+        "and an OIDC sign-in still needs a checked amr/acr claim while "
+        "[auth].oidc_require_mfa_claim is on"
+    )
+
+
+def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
+    """Vault BACKLOG #2798 amendment. RED when the advisory again says "production-PHI bind".
+
+    The refusal it lifts (``__main__._serve``, the ``admin_exposed`` arm) reads exposure,
+    ``[security].enforcement`` and ``require_mfa``. It reads no production tier and no account kind,
+    and with ``require_mfa`` off every un-enrolled account is single-factor, not only an
+    Administrator."""
+    loos = dict(_loosenings(SecuritySettings(allow_single_factor_admin_when_exposed=True)))
+    assert loos["allow_single_factor_admin_when_exposed"] == (
+        "an EXPOSED instance under enforcement = enforce may start with [security].require_mfa "
+        "off, on an audited warning instead of the refusal. Every account with no second factor "
+        "enrolled is then single-factor over the network, unless an OIDC sign-in carries a "
+        "checked amr/acr claim"
+    )
 
 
 def test_loosening_warns_and_prod_phi_refuses(

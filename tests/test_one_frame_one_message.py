@@ -13,13 +13,22 @@ Control bytes are written as escapes, never literally, so a byte grep of this fi
 from __future__ import annotations
 
 import asyncio
+import random
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from messagefoundry import actions
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source, Validation
+from messagefoundry.config.models import (
+    ConnectorType,
+    ContentType,
+    Destination,
+    RetryPolicy,
+    Source,
+    Validation,
+)
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -29,11 +38,12 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.framing import MLLP_CODEC, STX_ETX_CODEC, FrameCodec
 from messagefoundry.parsing import _builtin_hl7
+from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.dicom.hl7_map import encode_segment
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run
-from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.framing import frame_for_delivery, frame_reply
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
@@ -84,26 +94,38 @@ def test_a_clean_payload_frames_exactly_as_before() -> None:
     )
 
 
+#: An explicit TCP codec whose end byte is above 0x7F. CLEAN holds neither byte, so only the
+#: added character can trip it: "É" encodes in UTF-8 as 0xC3 0x89, which a character check misses.
+EXPLICIT = FrameCodec(start=0x05, end=0xC3)
+
+
 @pytest.mark.parametrize(
-    ("codec", "payload"),
+    ("codec", "payload", "transport"),
     [
-        pytest.param(MLLP_CODEC, SMUGGLED, id="P1-mllp-end-and-start"),
-        pytest.param(STX_ETX_CODEC, SMUGGLED_STX, id="P1-reverse-stx-etx"),
-        pytest.param(MLLP_CODEC, EMBEDDED_SB, id="P15-start-byte-only"),
-        pytest.param(FrameCodec(start=0x7E, end=0x7F), CLEAN + "~", id="explicit-codec"),
+        pytest.param(MLLP_CODEC, SMUGGLED, "MLLP", id="P1-mllp-end-and-start"),
+        pytest.param(STX_ETX_CODEC, SMUGGLED_STX, "TCP", id="P1-reverse-stx-etx"),
+        pytest.param(MLLP_CODEC, EMBEDDED_SB, "MLLP", id="P15-start-byte-only"),
+        pytest.param(EXPLICIT, CLEAN.replace("JANE", "J" + chr(0xC9) + "NE"), "TCP", id="explicit"),
     ],
 )
 def test_a_frame_byte_in_the_payload_is_a_permanent_refusal(
-    codec: FrameCodec, payload: str
+    codec: FrameCodec, payload: str, transport: str
 ) -> None:
     # Before ADR 0205 the codec wrapped these as asked, and the decoder read two frames (or one
     # frame holding a second start byte). This is the shape the audit measured.
     with pytest.raises(NegativeAckError) as caught:
-        frame_for_delivery(codec, payload, "utf-8", transport="MLLP")
+        frame_for_delivery(codec, payload, "utf-8", transport=transport)
     assert caught.value.permanent is True
     assert caught.value.code == "framing"
+    assert str(caught.value).startswith(transport + ": payload holds the frame ")
     # The text names a byte and a position, never the content.
     assert "DOE" not in str(caught.value) and "FORGED" not in str(caught.value)
+
+
+def test_the_explicit_codec_control_frames_a_clean_payload() -> None:
+    # The control for the explicit case above: the same codec frames CLEAN, so that refusal is the
+    # added character's, not something CLEAN already held.
+    assert frame_for_delivery(EXPLICIT, CLEAN, "utf-8", transport="TCP") == EXPLICIT.frame(CLEAN)
 
 
 def test_an_unencodable_payload_is_the_content_free_permanent_refusal() -> None:
@@ -160,7 +182,7 @@ async def test_both_tcp_send_paths_refuse_before_any_dial(
             await dest.send(SMUGGLED_STX)
     finally:
         await dest.aclose()
-    assert caught.value.permanent is True
+    assert caught.value.permanent is True and str(caught.value).startswith("TCP: ")
 
 
 # --- rule 2: a leaf write never emits a raw control character -----------------------------------
@@ -231,6 +253,56 @@ def test_the_structural_escapes_are_unchanged() -> None:
     assert _builtin_hl7.escape_leaf("O^B|x~y&z" + BS, SEPS) == expected
 
 
+def test_a_separator_that_is_an_escape_letter_is_not_escaped_twice() -> None:
+    # MSH-2 "F~\&": the component separator is F, the letter of the field-separator escape. A
+    # chained replace rescanned the escape it had just written and turned \F\ into \\S\\. This pins
+    # the one-pass output only: a re-parse still splits \F\ on F, a residual ADR 0205 leaves open.
+    msh = "MSH|F~" + BS + "&|SND|FAC|RCV|FAC|20260101120000||ADTFA01|CTRL1|P|2.5"
+    msg = Message.parse(msh + CR + "PID|1||111||DOEFJANE" + CR)
+    msg.set("PID-5.1", "a|b")
+    assert _pid5(msg) == "a" + BS + "F" + BS + "bFJANE"
+    seps = ("|", "F", "~", "&", BS)
+    assert _builtin_hl7.escape_leaf("a|b", seps) == "a" + BS + "F" + BS + "b"
+    assert _builtin_hl7.unescape(_builtin_hl7.escape_leaf("a|bF", seps), seps) == "a|bF"
+
+
+def _reference_escape(value: str, seps: tuple[str, str, str, str, str]) -> str:
+    """An independent one-pass escaper: a regex alternation over every character to escape, with
+    the alphabet written out here rather than read from the module under test."""
+    field_sep, comp_sep, rep_sep, sub_sep, esc = seps
+    controls = [chr(cp) for cp in range(0x20) if cp not in (0x09, 0x0A, 0x0D)] + [chr(0x7F)]
+    table = {ch: f"{esc}X{ord(ch):02X}{esc}" for ch in controls}
+    for char, code in ((sub_sep, "T"), (rep_sep, "R"), (comp_sep, "S"), (field_sep, "F")):
+        table[char] = f"{esc}{code}{esc}"
+    table[esc] = f"{esc}E{esc}"
+    pattern = re.compile("[" + "".join(re.escape(ch) for ch in table) + "]")
+    return pattern.sub(lambda m: table[m.group()], value)
+
+
+#: Characters an escape body is made of. An escape character drawn from these cannot round-trip
+#: through ``unescape``, which closes a sequence at the next escape character, so the inverse
+#: check below draws its escape character from outside them.
+_ESCAPE_BODY = frozenset("EFSRTX0123456789ABCDEF")
+
+
+def test_escape_leaf_matches_a_reference_across_separator_sets() -> None:
+    rng = random.Random(2557)
+    letters = "EFSRTXHNabz"
+    digits = "0129"
+    punctuation = "|^~&" + BS + "#$*!@"
+    controls = "".join(chr(cp) for cp in (0x00, 0x01, 0x0B, 0x1B, 0x1C, 0x1F, 0x7F))
+    pool = letters + digits + punctuation + controls
+    data = pool + "\t " + chr(0xE9) + chr(0x738B)
+    for _ in range(3000):
+        field_sep, comp_sep, rep_sep, sub_sep, esc = rng.sample(pool, 5)
+        seps = (field_sep, comp_sep, rep_sep, sub_sep, esc)
+        value = "".join(rng.choice(data) for _ in range(rng.randrange(0, 12)))
+        escaped = _builtin_hl7.escape_leaf(value, seps)
+        assert escaped == _reference_escape(value, seps), (seps, value)
+        if esc not in _ESCAPE_BODY:
+            assert _builtin_hl7.unescape(escaped, seps) == value, (seps, value)
+
+
 # --- rule 3: a whole-field write, add_repetition and add_segment refuse 0x0B, 0x1C and NUL --------
 
 
@@ -244,6 +316,15 @@ def test_writes_that_take_structure_refuse_frame_bytes_and_nul(char: str) -> Non
     with pytest.raises(ValueError, match="frame byte or NUL"):
         msg.add_segment("ZXX|a" + char)
     assert msg.encode() == CLEAN  # nothing was written
+
+
+def test_the_three_frame_byte_tables_stay_in_step() -> None:
+    # parsing may not import the codec, so the model spells MLLP's bytes as literals; this pins them
+    # to the codec, to the ingress guard's copy, and to the leaf escaper's alphabet.
+    frame = {chr(MLLP_CODEC.start), chr(MLLP_CODEC.end)}
+    assert set(message_module._STRUCTURE_REFUSED) == frame | {NUL}
+    assert set(ingress_guards._MLLP_FRAME_CHARS) == frame
+    assert set(message_module._STRUCTURE_REFUSED) <= set(_builtin_hl7._HEX_ESCAPED_CONTROLS)
 
 
 def test_other_c0_characters_still_pass_a_whole_field_write() -> None:
@@ -344,6 +425,127 @@ async def test_a_leading_frame_byte_is_still_received(store: MessageStore) -> No
     await runner._handle_inbound(reg.inbound["in"], (SB + CLEAN).encode("utf-8"))
     cur = await store._db.execute("SELECT status FROM messages")
     assert [dict(r)["status"] for r in await cur.fetchall()] == [MessageStatus.RECEIVED.value]
+
+
+async def test_a_trailing_frame_byte_is_received_and_kept_in_the_stored_raw(
+    store: MessageStore,
+) -> None:
+    # The listener stores the decoded text as received, so the stored raw keeps a trailing 0x1C.
+    # The encode drops it, which is what pass-through sends; a path that sent the stored raw would
+    # meet rule 1 and dead-letter, as the last assertion shows.
+    reg = _registry()
+    runner = wiring_runner.RegistryRunner(reg, store)
+    await runner._handle_inbound(reg.inbound["in"], (CLEAN + EB).encode("utf-8"))
+    cur = await store._db.execute("SELECT id, status FROM messages")
+    ((mid, status),) = [tuple(r) for r in await cur.fetchall()]
+    assert status == MessageStatus.RECEIVED.value
+    stored = await store.get_message(mid)
+    assert stored is not None and stored["raw"].endswith(EB)
+    assert EB not in Message.parse(stored["raw"]).encode()
+    with pytest.raises(NegativeAckError):
+        frame_for_delivery(MLLP_CODEC, stored["raw"], "utf-8", transport="MLLP")
+
+
+# --- rule 1 at the delivery stage: a shadow (simulate) outbound ---------------------------------
+
+DEST = "OB_FRAME"
+DONE = (MessageStatus.PROCESSED.value, OutboxStatus.DONE.value)
+DEAD = (MessageStatus.ERROR.value, OutboxStatus.DEAD.value)
+
+
+class _SendRecorder(MLLPDestination):
+    """A real MLLP destination, so its ``check_frame`` is the real one, whose send only records."""
+
+    def __init__(self, **field: Any) -> None:
+        settings: dict[str, object] = {"host": "127.0.0.1", "port": 1}
+        config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
+        super().__init__(config)
+        self.sent: list[str] = []
+
+    async def send(self, payload: str, *, metadata: Any = None) -> None:
+        self.sent.append(payload)
+
+
+async def _enqueue(store: MessageStore, bodies: list[str]) -> list[str]:
+    return [
+        await store.enqueue_message(channel_id="c1", raw=b, deliveries=[(DEST, b)], now=100.0 + i)
+        for i, b in enumerate(bodies)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("setting", "field"),
+    [
+        pytest.param({}, {"hl7_raw_separators": True}, id="raw-separators"),
+        pytest.param({"encoding_characters": "|^~" + BS + "&"}, {}, id="encoding-characters"),
+    ],
+)
+def test_check_frame_sees_the_payload_after_the_send_rewrites(
+    setting: dict[str, object], field: dict[str, Any]
+) -> None:
+    # A delimiter rewrite re-serializes the message, which drops a frame byte at either end, so a
+    # live send of CLEAN + 0x1C goes out. check_frame must judge the same rewritten bytes, or a
+    # shadow outbound would dead-letter what a live one delivers.
+    settings: dict[str, object] = {"host": "127.0.0.1", "port": 1, **setting}
+    config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
+    rewriting = MLLPDestination(config)
+    rewriting.check_frame(CLEAN + EB)
+    with pytest.raises(NegativeAckError):
+        rewriting.check_frame(EMBEDDED_SB)  # an interior start byte survives any rewrite
+    with pytest.raises(NegativeAckError):
+        _SendRecorder().check_frame(CLEAN + EB)  # control: no rewrite, the byte reaches the frame
+
+
+def test_the_tcp_destination_check_frame_refuses_with_its_label() -> None:
+    settings: dict[str, object] = {"host": "127.0.0.1", "port": 1, "framing": "stx_etx"}
+    dest = TcpDestination(Destination(name=DEST, type=ConnectorType.TCP, settings=settings))
+    dest.check_frame(CLEAN)
+    with pytest.raises(NegativeAckError) as caught:
+        dest.check_frame(SMUGGLED_STX)
+    assert caught.value.permanent is True and str(caught.value).startswith("TCP: ")
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "field", "reason"),
+    [
+        pytest.param(SMUGGLED, DEAD, {}, "frame", id="smuggled"),
+        pytest.param(CLEAN, DONE, {}, "", id="clean-control"),
+        # A live send refuses a payload its rewrite cannot re-encode, permanently (ADR 0204,
+        # ADR 0206), and check_frame shares that rewrite, so shadow dead-letters it too.
+        pytest.param(
+            "plain text, no MSH",
+            DEAD,
+            {"hl7_raw_separators": True},
+            "emit failed",
+            id="unparseable",
+        ),
+    ],
+)
+async def test_a_shadow_outbound_records_what_a_live_send_would(
+    store: MessageStore,
+    body: str,
+    expected: tuple[str, str],
+    field: dict[str, Any],
+    reason: str,
+) -> None:
+    # Rule 1 runs inside connector.send(), which a simulate outbound skips. Before the fix shadow
+    # marked the smuggled row PROCESSED, where a live send would have dead-lettered it. The batch
+    # twin is in tests/test_outbound_batch.py, which runs on every store backend.
+    (mid,) = await _enqueue(store, [body])
+    dest = _SendRecorder(**field)
+    runner = wiring_runner.RegistryRunner(Registry(), store, poll_interval=0.02)
+    runner._destinations[DEST] = dest
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = True
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    await runner._process_delivery_item(DEST, item)
+    assert dest.sent == []
+    msg = await store.get_message(mid)
+    (row,) = await store.outbox_for(mid)
+    assert msg is not None and (msg["status"], row["status"]) == expected
+    error = str(row["last_error"] or "")
+    assert "DOE" not in error and reason in error
 
 
 # --- the reply path: a listener's reply is one frame, and framing it never raises ---------------

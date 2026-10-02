@@ -25,21 +25,36 @@ import hashlib  # noqa: F401 - crypto-inventory anchor: XML-DSig digests run via
 from dataclasses import dataclass
 from typing import Any
 
-from messagefoundry.parsing.xml._deps import load_signxml
+from messagefoundry.parsing.xml._deps import load_lxml, load_signxml
 from messagefoundry.parsing.xml.errors import XmlError
 from messagefoundry.parsing.xml.harden import parse_bytes
 
-__all__ = ["UNREADABLE_SIGNING_KEY", "WEAK_SIGNING_KEY", "XmlSignatureResult", "verify"]
+__all__ = [
+    "UNREADABLE_SIGNING_KEY",
+    "UNSIGNED_CONTENT",
+    "WEAK_SIGNING_KEY",
+    "XmlSignatureResult",
+    "verify",
+]
 
 
 @dataclass(frozen=True)
 class XmlSignatureResult:
-    """The outcome of an XML-DSig verification. ``verified`` is True iff the signature is valid against
-    the supplied certificate/CA AND its key clears the strength floor; ``reason`` is a PHI-safe
-    failure category when not (``None`` on success)."""
+    """The outcome of an XML-DSig verification.
+
+    ``verified`` is True iff the signature is valid against the supplied certificate/CA, its key
+    clears the strength floor, AND it covers the whole document (vault BACKLOG #2315). ``reason`` is a
+    PHI-safe failure category when not (``None`` on success).
+
+    ``signed_content`` is the content the signature covers, as the signer canonicalized it: the
+    document without its ``ds:Signature`` element. It is ``None`` unless ``verified``. **Read the
+    message from these bytes, not from the document you passed in.** A verified document matches
+    them, but these bytes are what the cryptography actually checked.
+    """
 
     verified: bool
     reason: str | None = None
+    signed_content: bytes | None = None
 
 
 def _approved_signature_config(signxml: Any) -> Any:
@@ -84,6 +99,7 @@ _MIN_RSA_BITS = 2048
 #: Fixed, PHI-safe ``reason`` values. Each names a category, never key or document content.
 WEAK_SIGNING_KEY = "WeakSigningKey"
 UNREADABLE_SIGNING_KEY = "UnreadableSigningKey"
+UNSIGNED_CONTENT = "UnsignedContent"
 
 
 def _signing_key_refusal(result: Any) -> str | None:
@@ -123,6 +139,166 @@ def _signing_key_refusal(result: Any) -> str | None:
     return None
 
 
+_DS_NS = "http://www.w3.org/2000/09/xmldsig#"
+_DSIG11_NS = "http://www.w3.org/2009/xmldsig11#"
+_KEY_INFO = f"{{{_DS_NS}}}KeyInfo"
+#: The elements ``ds:KeyInfo`` may hold: the X.509, key-value and key-name forms of XML-DSig 1.0 and
+#: 1.1. Named one by one because the schema checks an unknown element in either namespace loosely.
+#: ``RetrievalMethod``, ``PGPData``, ``SPKIData`` and ``ECParameters`` are left out; signxml reads
+#: none of them.
+_KEY_INFO_ELEMENTS = frozenset(
+    {
+        _KEY_INFO,
+        *(
+            f"{{{_DS_NS}}}{name}"
+            for name in (
+                "KeyName",
+                "MgmtData",
+                "X509Data",
+                "X509IssuerSerial",
+                "X509IssuerName",
+                "X509SerialNumber",
+                "X509SKI",
+                "X509SubjectName",
+                "X509Certificate",
+                "X509CRL",
+                "KeyValue",
+                "RSAKeyValue",
+                "Modulus",
+                "Exponent",
+                "DSAKeyValue",
+                "P",
+                "Q",
+                "G",
+                "Y",
+                "J",
+                "Seed",
+                "PgenCounter",
+            )
+        ),
+        *(
+            f"{{{_DSIG11_NS}}}{name}"
+            for name in (
+                "ECKeyValue",
+                "NamedCurve",
+                "PublicKey",
+                "DEREncodedKeyValue",
+                "KeyInfoReference",
+                "X509Digest",
+            )
+        ),
+    }
+)
+#: The attributes those elements define. Anything else could carry text a Handler might read.
+_KEY_INFO_ATTRIBUTES = frozenset({"Id", "URI", "Algorithm"})
+#: XML's own whitespace. ``str.strip()`` with no argument also strips Unicode spaces such as U+00A0.
+_XML_SPACE = " \t\r\n"
+_SIGNATURE = f"{{{_DS_NS}}}Signature"
+#: The ``ds:Signature`` children a whole-document signature may carry. ``ds:Object`` is left out on
+#: purpose: an enveloped signature has no use for one, and nothing signs what it holds.
+_SIGNATURE_CHILDREN = frozenset(
+    {f"{{{_DS_NS}}}SignedInfo", f"{{{_DS_NS}}}SignatureValue", _KEY_INFO}
+)
+
+
+def _drop_signature(signature: Any) -> None:
+    """Remove ``signature`` from its parent and keep its tail text, as the enveloped transform does.
+
+    A copy of ``signxml.util._remove_sig``, the removal the verifier runs, so the document side of
+    the comparison drops exactly what the digest side dropped. Copied rather than imported because
+    that name is private; keep the two in step. Dropping the tail too would refuse a pretty-printed
+    document.
+    """
+    parent = signature.getparent()
+    if signature.tail:
+        previous = signature.getprevious()
+        if previous is None:
+            parent.text = (parent.text or "") + signature.tail
+        else:
+            previous.tail = (previous.tail or "") + signature.tail
+    parent.remove(signature)
+
+
+def _signature_holds_unsigned_content(signature: Any) -> bool:
+    """True if the ``ds:Signature`` element carries anything a Handler could mistake for payload.
+
+    The enveloped transform removes the whole element before digesting, so nothing inside it is
+    signed except ``ds:SignedInfo``, which the signature value covers. The schema signxml enforces
+    still admits a ``ds:Object`` of any content, and a ``ds:KeyInfo`` that holds foreign-namespace
+    elements, unknown DSig-namespace elements, and free text between its children. So this allows
+    only the three standard children. Inside ``ds:KeyInfo`` it allows only the named key elements
+    and their attributes, and text only inside one with no children, such as a certificate or a key
+    name. It refuses a comment or processing instruction anywhere in the element, because no
+    signature covers one there.
+    """
+
+    def blank(text: str | None) -> bool:
+        return not (text or "").strip(_XML_SPACE)
+
+    if any(not isinstance(el.tag, str) for el in signature.iter()):
+        return True
+    for child in signature:
+        if child.tag not in _SIGNATURE_CHILDREN:
+            return True
+        if child.tag != _KEY_INFO:
+            continue
+        for el in child.iter():
+            if el.tag not in _KEY_INFO_ELEMENTS or not set(el.attrib) <= _KEY_INFO_ATTRIBUTES:
+                return True
+            if el is not child and not blank(el.tail):
+                return True
+            if (el is child or len(el)) and not blank(el.text):
+                return True
+    return False
+
+
+def _coverage_refusal(root: Any, result: Any, location: str) -> str | None:
+    """Return :data:`UNSIGNED_CONTENT` unless the signature covers the whole document (BACKLOG #2315).
+
+    signxml checks that the REFERENCED content is intact, wherever it sits, and returns that content.
+    It does not check that the reference is the document. A Handler that reads its own parse of the
+    document after ``verified=True`` would therefore act on whatever surrounds the signed element.
+    Returning ``signed_content`` alone would not stop a Handler that checks only ``verified``, so
+    this REFUSES such a document as well.
+
+    The accepted shape is one reference whose signed content equals the whole received document
+    minus its ``ds:Signature``. That admits both shapes an enveloped signer emits, ``URI=""`` and
+    ``URI="#id"`` naming the document element, without parsing the URI. Both sides are compared as
+    exclusive C14N WITH comments. So an unused namespace declaration does not cause a false refusal,
+    and a comment the signature excluded is refused: a comment can split a text node and change what
+    an element's ``.text`` reads. For the same reason a comment or processing instruction before or
+    after the document element is refused: no enveloped signature covers one. The ``ds:Signature``
+    element is checked on its own, because the comparison removes it.
+
+    It MUTATES ``root``: ``verify`` parsed that tree itself and reads nothing from it afterwards, and
+    signxml worked on copies of it, so no copy is made here.
+    """
+    etree = load_lxml()
+
+    # A list means more than one reference. The config keeps signxml's default of exactly one, so a
+    # list never arrives from the real call; refusing it keeps this function closed if that changes.
+    if isinstance(result, list) or result.signed_xml is None:
+        return UNSIGNED_CONTENT
+    # signxml also accepts a document element that IS the ds:Signature (an enveloping signature),
+    # where the signed content sits in a ds:Object. That shape never covers the whole document.
+    if root.tag == _SIGNATURE:
+        return UNSIGNED_CONTENT
+    if root.getprevious() is not None or root.getnext() is not None:
+        return UNSIGNED_CONTENT
+    # The lookup signxml's verifier ran, so this drops the element whose removal the digest assumed.
+    signature = root.find(f"{location}ds:Signature", namespaces={"ds": _DS_NS})
+    if signature is None or _signature_holds_unsigned_content(signature):
+        return UNSIGNED_CONTENT
+    _drop_signature(signature)
+
+    def c14n(element: Any) -> bytes:
+        return bytes(etree.tostring(element, method="c14n", exclusive=True, with_comments=True))
+
+    if c14n(root) != c14n(result.signed_xml):
+        return UNSIGNED_CONTENT
+    return None
+
+
 def verify(
     document: str | bytes,
     *,
@@ -139,7 +315,12 @@ def verify(
     failed verification is **data**, not an exception, so a Handler can route the message). A
     signature made with an RSA key under 2048 bits fails with ``reason`` :data:`WEAK_SIGNING_KEY`
     even when the cryptography checks out, and one whose key cannot be read fails with
-    :data:`UNREADABLE_SIGNING_KEY` (BACKLOG #1166). Raises
+    :data:`UNREADABLE_SIGNING_KEY` (BACKLOG #1166).
+
+    **Only a signature over the whole document verifies** (vault BACKLOG #2315). A document holding
+    anything the signature does not cover fails with :data:`UNSIGNED_CONTENT`: for example a signed
+    element under a new document element, content inside the ``ds:Signature`` element, or a comment
+    the signature excluded. On success, read the message from ``signed_content``. Raises
     :class:`ValueError` if no anchor is supplied,
     :class:`~messagefoundry.parsing.xml.errors.XmlError` if the input is unparseable, and
     :class:`RuntimeError` if the ``[xml]`` extra is absent."""
@@ -153,12 +334,13 @@ def verify(
     signxml = load_signxml()
     root = parse_bytes(document)
     verifier = signxml.XMLVerifier()
+    config = _approved_signature_config(signxml)
     try:
         result = verifier.verify(
             root,
             x509_cert=x509_cert,
             ca_pem_file=ca_pem_file,
-            expect_config=_approved_signature_config(signxml),
+            expect_config=config,
         )
     except signxml.exceptions.InvalidSignature as exc:
         return XmlSignatureResult(verified=False, reason=type(exc).__name__)
@@ -167,7 +349,7 @@ def verify(
         raise XmlError(
             f"document is not a verifiable XML-DSig payload: {type(exc).__name__}"
         ) from exc
-    refusal = _signing_key_refusal(result)
+    refusal = _signing_key_refusal(result) or _coverage_refusal(root, result, config.location)
     if refusal is not None:
         return XmlSignatureResult(verified=False, reason=refusal)
-    return XmlSignatureResult(verified=True)
+    return XmlSignatureResult(verified=True, signed_content=bytes(result.signed_data))

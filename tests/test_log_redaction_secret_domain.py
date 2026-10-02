@@ -1813,4 +1813,6 @@ def test_redactor_is_the_backstop_for_both_named_surfaces() -> None:
     bundle = (pkg / "support" / "bundle.py").read_text(encoding="utf-8")
     api = (pkg / "api" / "app.py").read_text(encoding="utf-8")
     assert "from messagefoundry.support.redact import redact_log_text" in bundle
-    assert "from messagefoundry.support.redact import redact_log_line" in api
+    # redact_log_record applies redact_log_line to each piece of a line (vault BACKLOG #2563);
+    # tests/test_log_tail_line_split.py pins that it redacts exactly what redact_log_line does.
+    assert "from messagefoundry.support.redact import redact_log_record" in api

@@ -442,10 +442,14 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
 - [ ] **Provision the first administrator** (§4.5) with `provision-admin --email`, then create a
       second administrator from the web console, so one lockout does not leave the instance with none.
 - [ ] **For Active Directory:** use **LDAPS** with a trusted CA, never set `MEFOR_ALLOW_INSECURE_TLS`
-      in production, and configure the directory's lockout/complexity policy (the engine's account
-      lockout covers local accounts only). AD/Entra MFA is enforced by your directory; **local
-      accounts** use the engine's **native TOTP MFA** (`[security].require_mfa`, WP-14, **on by default**) — keep it on for
-      an off-loopback PHI exposure.
+      in production, and configure the directory's lockout/complexity policy. The engine never takes
+      a directory password at sign-in, so it cannot count those guesses. Its own lockout still counts
+      a directory account's engine TOTP and recovery codes and its step-up re-binds. A locked
+      account cannot sign in by Windows SSO or OIDC ([the lockout rule](SECURITY.md#authentication-pathways--comparative-strength)).
+      Keep the engine's **native second factor**
+      (`[security].require_mfa`, WP-14, **on by default**) on. It covers directory accounts too:
+      a Kerberos session owes an engine factor even when your directory enforces its own MFA
+      ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)).
 - [ ] **Populate the fail-closed `[egress]` allowlist** (it defaults to unrestricted) for REST/Database
       destinations.
 - [ ] **Keep logging at `INFO` or above** and `expose_docs` off in production. Full payloads are never

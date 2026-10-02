@@ -69,13 +69,34 @@ as the accepted draft wrote them except where a point below says otherwise.
    - The encode goes through the existing `encode_wire_body`, so a payload the charset cannot hold
      is the same content-free permanent failure other destinations already raise. Before this change
      it escaped from `frame()` as a bare `UnicodeEncodeError`.
+   - *Added 2026-10-02, in review.* The check alone is `check_frame_bytes` in the same module, and
+     the MLLP and TCP destinations offer it as `check_frame`, a no-op hook on `DestinationConnector`
+     that only they override. The delivery stage calls it where no
+     single-payload `send()` runs: on each member of an MLLP batch before the envelope is built,
+     and on a simulate (shadow) outbound, which never calls `send()`. `send()` still checks the
+     bytes it frames. For a shadow single send, MLLP's `check_frame` judges the payload after the
+     same delimiter rewrites `send()` applies (`encoding_characters`, `hl7_raw_separators`),
+     which drop a frame byte at either end, and the shadow path re-attaches a detached document
+     first, so it sees the bytes a live send would frame. Shadow mirrors rule 1 only: a re-attach
+     or rewrite failure there is skipped and the row completes, as before this change, although a
+     live send would retry it. A batch member is judged as it sits in the envelope, with no rewrite
+     (`rewrite=False`), because `send()` rewrites the whole envelope and the envelope carries each
+     member as stored. A member's refusal is dead-lettered only after the rest of the batch is
+     resolved, or before a lane stop, so a store fault there cannot reach the clean members. A
+     refusal that is not permanent is the whole batch's, as from `send()`.
 2. **A leaf write through the HL7 model never emits a raw control character.** On a component or
    subcomponent write, each C0 control character and DEL except TAB is written as an HL7 hex escape
    (`\X0B\`, uppercase digits), so a value that arrived hex-escaped leaves hex-escaped. CR and LF
    keep today's refusal. The one implementation is `escape_leaf` in
-   `messagefoundry/parsing/_builtin_hl7.py`: the escape character first, so nothing inserted later
-   is escaped again, then the delimiters, then each control character present, each a C-level
-   `str.replace`. `Message._escape_leaf` and the DICOM mapper's `_escape_leaf` delegate to it, so
+   `messagefoundry/parsing/_builtin_hl7.py`: one `str.translate` pass over a table cached per
+   separator set, so nothing it inserts is scanned again. *Corrected 2026-10-02 in review:* the
+   build first chained one `str.replace` per character. That rescanned its own escapes, so with
+   MSH-2 `F~\&` (component separator `F`) a write of `a|b` came out `a\\S\\b` and read back
+   `aSb`. One residual stays open: when a separator is a letter or digit an escape is made of,
+   the escape that holds it (`\F\` under component separator `F`) is split on re-parse, because
+   the parser splits a field on its separators before it unescapes. So a write of `a|b` there
+   still changes structure at the receiver. A hex escape of the character, or refusing the write,
+   would close it; this build does neither, and MSH-2 is sender-controlled. `Message._escape_leaf` and the DICOM mapper's `_escape_leaf` delegate to it, so
    the three escapers the draft named cannot drift. The alphabet comes from
    `messagefoundry/controlchars.py`, scanned to U+00FF as the log scrub table is, so a deliberate
    widening there reaches this table too.
@@ -106,9 +127,11 @@ delivery. An MLLP frame saved whole to a file, start byte to trailer, is the rea
 is accepted. The two tests that pin the
 tolerance keep passing unchanged: `test_guard_admits_what_peek_parse_admits_and_the_sniff_refuses` in
 `tests/test_resend_ingress_guards.py` and `test_looks_like_hl7_accepts_valid_headers` in
-`tests/test_asvs_phase0.py`. The stored raw does keep the leading byte, because the listener stores
-the decoded text as received. That is safe because pass-through sends the encoded message, not the
-stored raw, and any path that did send the raw would meet rule 1 and dead-letter.
+`tests/test_asvs_phase0.py`. The stored raw does keep a frame byte at either end, because the
+listener stores the decoded text as received. That is safe because pass-through sends the encoded
+message, not the stored raw. A raw-forwarding path that sent the stored raw of a body ending in
+`0x1C` would dead-letter it at rule 1 (2026-10-02, in review:
+`test_a_trailing_frame_byte_is_received_and_kept_in_the_stored_raw` pins it).
 
 *Everything inside is refused, blank lines included.* On this build a frame byte on a blank line
 between segments survives the encode as data, so the line between tolerated and refused is exactly
@@ -189,9 +212,20 @@ separators raw).
   harness's hostile graph, THE SYSTEM SHALL record `ERROR` (with a NAK over MLLP) and deliver
   nothing. The harness scenario this promotes was a strict known-defect xfail before this change.
   -> `tests/test_harness_scenarios.py::test_every_registered_scenario_passes_against_the_real_graph`
+- **AC-12** (*added 2026-10-02, in review*) -- IF one member of an MLLP batch holds the codec's start
+  or end byte, THEN THE SYSTEM SHALL dead-letter that member alone, permanently and with
+  content-free text, and SHALL send the rest as one envelope.
+  -> `tests/test_outbound_batch.py::test_a_member_holding_a_frame_byte_is_dead_lettered_alone`,
+  `tests/test_outbound_batch.py::test_a_batch_whose_every_member_holds_a_frame_byte_sends_nothing`
+- **AC-13** (*added 2026-10-02, in review*) -- WHEN an MLLP or TCP outbound runs in simulate
+  (shadow) mode, THE SYSTEM SHALL record the disposition rule 1 would give a live send.
+  -> `tests/test_one_frame_one_message.py::test_a_shadow_outbound_records_what_a_live_send_would`,
+  `tests/test_outbound_batch.py::test_a_member_holding_a_frame_byte_is_dead_lettered_alone`
 
 Every criterion's test except AC-3 and the controls failed on the code before this change, measured
 by running them against `origin/main` `ed2b60bf89` with the new names stubbed to the old behaviour.
+The AC-12 and AC-13 tests, except the clean-payload control, failed on this branch at `94c0daaad9`,
+before the review round.
 
 ## Options considered
 
@@ -213,8 +247,13 @@ by running them against `origin/main` `ed2b60bf89` with the new names stubbed to
 
 ## Consequences
 
-**Positive** -- One outbound row is one frame holding one message, on every transport that frames.
-A hex-escaped control character survives a Handler edit unchanged where it used to be silently
+**Positive** -- Every frame a delivery writes holds exactly one message, on every transport that
+frames. For a single send that frame is one outbound row. For an MLLP batch (ADR 0082) it is one
+`BHS` envelope holding N rows, and each member is checked on its own first: a member that holds a
+frame byte is dead-lettered alone and the rest batch (*corrected 2026-10-02, in review:* this line
+read "one outbound row is one frame holding one message", which a batch never was, and the build
+first dead-lettered all N rows on one envelope offset). A shadow outbound records the same
+dispositions a live one would. A hex-escaped control character survives a Handler edit unchanged where it used to be silently
 decoded. A frame-byte refusal is visible at once in the dead-letter queue. A payload the charset
 cannot hold is now a content-free permanent failure on MLLP and TCP too.
 
@@ -234,13 +273,40 @@ cannot hold is now a content-free permanent failure on MLLP and TCP too.
   `hl7v2` body holding another codec's bytes, such as `0x03 0x02` toward an `stx_etx` outbound.
 - A partner that cannot decode a hex escape now sees `\Xhh\` where an edited value once carried a raw
   control character.
+- *2026-10-02, in review:* `internal_error = "stop"` no longer halts the lane for an MLLP or TCP
+  payload the destination's charset cannot hold. That payload is now a permanent
+  `NegativeAckError` with `code="encoding"` and is dead-lettered, as it already was on the other
+  connectors that encode through `encode_wire_body`. Before, the bare `UnicodeEncodeError` reached the internal-error
+  policy, and its text, with the character that failed, went into `last_error`; that leak is closed.
+- *2026-10-02, in review:* the loopback re-ingress of a captured reply
+  (`_process_response_item` in `pipeline/wiring_runner.py`) checks only the size, never
+  `check_decoded`, so rule 4 does not run there. Rule 1 still blocks the bytes at egress. The same
+  gap already held for NUL before this change.
+- *2026-10-02, in review:* a direct edit-and-resend with no inbound to guard for
+  (`admit_resubmitted_body(raw, None)`) skips rule 4, so a body with an embedded frame byte is
+  admitted there and would dead-letter at rule 1 on an MLLP or TCP outbound instead.
+- *2026-10-02, in review:* rule 4 refuses any `hl7v2` body with an interior `0x0B`, whatever the
+  destination, even a File or database outbound that could carry it. A likely real source is OBX-5
+  text pasted from Microsoft Word, whose soft line break (Shift+Enter) is `0x0B`. Such a message is
+  `ERROR` at ingress.
+- *2026-10-02, in review:* a File capture holding several saved MLLP frames back to back is not split
+  into messages: the batch splitter in `parsing/split.py` splits only where a CR is followed by
+  `MSH`, and a saved frame puts its start byte between them. Its interior frame bytes then make
+  rule 4 refuse it whole. Before this change it was accepted as one
+  merged message, silently.
 
 **Out of scope** --
 
 - The dry-run, `messagefoundry check` and the Test Bench do not run `frame_for_delivery`, so a
   payload a live MLLP or TCP outbound would refuse at rule 1 previews as a delivery. Rule 4 means an
-  `hl7v2` inbound toward an MLLP outbound previews correctly; the gap is a non-HL7 payload, or
-  another codec's bytes toward a TCP outbound. Left for its own item.
+  `hl7v2` inbound toward an MLLP outbound that sends the parsed message previews correctly. The gap
+  is a non-HL7 payload, another codec's bytes toward a TCP outbound, and (*qualified 2026-10-02, in
+  review*) a Handler that sends a `str` or a `RawMessage` it built holding a raw `0x0B` or `0x1C`:
+  that previews clean and dead-letters live. Filed as vault #2824.
+- *2026-10-02, in review:* a shadow (simulate) outbound and each member of an MLLP batch now run
+  rule 1's check too, through the destination's `check_frame` hook, so neither previews
+  or batches what a live single send would refuse. That is the delivery stage, not the dry-run, so
+  it does not close vault #2824.
 - On a persistent connection that a reload is closing, a payload refused at rule 1 dead-letters
   rather than retrying on the replacement connector, because the framing runs before the
   closed-connector check. Only a reload that changes the outbound's charset or framing could make

@@ -801,28 +801,37 @@ _HEX_ESCAPED_CONTROLS: tuple[str, ...] = tuple(
 )
 
 
+@lru_cache(maxsize=32)
+def _leaf_escape_table(seps: tuple[str, str, str, str, str]) -> dict[int, str]:
+    """The ``str.translate`` table :func:`escape_leaf` applies for one separator set."""
+    field_sep, comp_sep, rep_sep, sub_sep, esc = seps
+    table = {ord(ch): f"{esc}X{ord(ch):02X}{esc}" for ch in _HEX_ESCAPED_CONTROLS}
+    # The delimiters go in after the controls, so a separator that is itself a control character
+    # keeps its structural escape; the escape character goes in last for the same reason.
+    for char, code in ((sub_sep, "T"), (rep_sep, "R"), (comp_sep, "S"), (field_sep, "F")):
+        table[ord(char)] = f"{esc}{code}{esc}"
+    table[ord(esc)] = f"{esc}E{esc}"
+    return table
+
+
 def escape_leaf(value: str, seps: tuple[str, str, str, str, str]) -> str:
     """Escape the structural delimiters, the escape char and the control characters in ``value``.
 
     ``Message._escape_leaf`` delegates here (NOT to python-hl7's ``escape``, which hex-encodes
-    non-ASCII and corrupts CJK/accented names). The escape char goes first, so nothing inserted
-    later is escaped again, then the delimiters become ``\\F\\ \\S\\ \\R\\ \\T\\``, then each C0
-    control and DEL except TAB, CR and LF becomes a ``\\Xhh\\`` hex escape (ADR 0205 rule 2). CR and
-    LF pass through raw: a caller must refuse them first, as :meth:`Message.set` does. Everything
-    else passes through, and all of it round-trips via :func:`unescape`. Each step is a C-level
-    ``str.replace``, and a control character absent from the value costs one scan."""
-    field_sep, comp_sep, rep_sep, sub_sep, esc = seps
-    out = value.replace(esc, f"{esc}E{esc}")
-    out = out.replace(field_sep, f"{esc}F{esc}")
-    out = out.replace(comp_sep, f"{esc}S{esc}")
-    out = out.replace(rep_sep, f"{esc}R{esc}")
-    out = out.replace(sub_sep, f"{esc}T{esc}")
-    for ch in _HEX_ESCAPED_CONTROLS:
-        # A separator that is itself a control character already carries its structural escape,
-        # and every escape inserted so far holds only the escape char, letters and hex digits.
-        if ch in out and ch not in seps:
-            out = out.replace(ch, f"{esc}X{ord(ch):02X}{esc}")
-    return out
+    non-ASCII and corrupts CJK/accented names). The delimiters and the escape char become
+    ``\\F\\ \\S\\ \\R\\ \\T\\ \\E\\``, and each C0 control and DEL except TAB, CR and LF becomes a
+    ``\\Xhh\\`` hex escape (ADR 0205 rule 2). CR and LF pass through raw: a caller must refuse them
+    first, as :meth:`Message.set` does. Everything else passes through.
+
+    It is ONE ``str.translate`` pass, so nothing it inserts is scanned again. That matters when a
+    separator is a letter or digit an escape is made of: MSH-2 ``F~\\&`` makes ``F`` the component
+    separator, and a chained replace rewrote the ``F`` of a ``\\F\\`` it had just written. The output
+    round-trips through :func:`unescape` whenever the escape char is not itself one of the letters
+    or hex digits an escape holds. Separately, the parser splits a field on its separators before
+    it unescapes anything, so when a separator is such a letter, an escape this function writes
+    that holds it (``\\F\\`` under component separator ``F``) is split on re-parse. A hex escape of
+    the character, or refusing the write, would avoid that; this function does neither yet."""
+    return value.translate(_leaf_escape_table(seps))
 
 
 def unescape_separators(value: str, seps: tuple[str, str, str, str, str]) -> str:

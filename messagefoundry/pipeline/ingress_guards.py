@@ -3,7 +3,8 @@
 """The ingress decode + post-decode guards, in ONE place, so the gate and the engine cannot diverge.
 
 An inbound body is decoded and guarded *before* anything looks at it: decode with the connection's
-declared ``encoding`` at ``errors="strict"``, reject an embedded ``NUL``, and bound the size. The
+declared ``encoding`` at ``errors="strict"``, reject an embedded ``NUL``, reject an ``hl7v2`` body
+holding an MLLP frame byte inside the message (ADR 0205 rule 4), and bound the size. The
 live listener (:meth:`~messagefoundry.pipeline.wiring_runner.RegistryRunner._handle_inbound`) runs
 that sequence; :func:`~messagefoundry.pipeline.dryrun.dry_run` did **not**, so ``messagefoundry
 check`` and the Test Bench previewed ``RECEIVED`` for fixtures the engine would ``NAK`` — and
@@ -18,7 +19,7 @@ seam sits at "decoded text, or the reason it was refused".
 **Both listeners call it** (part B of #1689). ``_handle_inbound`` and ``_handle_inbound_http`` run
 :func:`decode_body` then :func:`check_decoded`, or :func:`check_binary_size` then
 :func:`carry_binary_ingress` for a binary type, and then :func:`check_declared_type` on a non-HL7
-body. The dry-run runs the decode, NUL and size guards through :func:`decode_ingress` and
+body. The dry-run runs the decode, NUL, frame-byte and size guards through :func:`decode_ingress` and
 :func:`carry_binary_ingress`. So the listener carries no copy of these guards, and
 ``tests/test_ingress_guard_parity.py`` fails if it grows one back.
 
@@ -492,7 +493,7 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
 
     :func:`decode_body` then :func:`check_decoded`, the same two calls the live listener makes, so the
     dry-run and the engine share the sequence rather than a copy of it. A ``str`` ``raw`` skips the
-    charset guard and still gets the NUL and size guards: the dry-run entry points accept text, and the
+    charset guard and still gets the NUL, frame-byte and size guards: the dry-run entry points accept text, and the
     transport-fed listener never does.
 
     **One deliberate difference from the listener, and it sits in the codec name, not the guards.**

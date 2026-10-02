@@ -2881,7 +2881,8 @@ jobs:
           # hard-asserts the host-independent CONFORMANCE invariants (zero acknowledged loss, per-lane FIFO,
           # no split-brain, bounded duplicates, a recovered + drained pipeline). Recovery *time* is reported,
           # not hard-gated (host-variable — see docs/LOAD-TESTING.md). This run guards the #285 claim-FIFO
-          # fix. The orchestrator spawns the nodes with auth off + the cluster env; they inherit MEFOR_STORE_*.
+          # fix. The orchestrator spawns the nodes with the cluster env, provisions their rig
+          # Administrator and signs in (harness/load/rigadmin.py); they inherit MEFOR_STORE_*.
           MEFOR_ALLOW_INSECURE_TLS: "1"
           # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
           PYTHONFAULTHANDLER: "1"
@@ -3139,8 +3140,9 @@ jobs:
           # Gate #3 capstone: two `serve` nodes share this container; the harness SIGKILLs the primary
           # mid-load and hard-asserts the host-independent CONFORMANCE invariants (zero acknowledged loss,
           # per-lane FIFO, no split-brain, bounded duplicates, a recovered + drained pipeline). Recovery
-          # time is reported, not hard-gated. The orchestrator spawns the nodes with auth off + the cluster
-          # env itself; they inherit MEFOR_STORE_* (incl. the plaintext-TLS escape) from here.
+          # time is reported, not hard-gated. The orchestrator spawns the nodes with the cluster env
+          # itself, provisions their rig Administrator and signs in (harness/load/rigadmin.py); they
+          # inherit MEFOR_STORE_* (incl. the plaintext-TLS escape) from here.
           MEFOR_STORE_ENCRYPT: "false"
           MEFOR_ALLOW_INSECURE_TLS: "1"
         run: pytest tests/test_load_failover_postgres.py -v
@@ -3283,8 +3285,8 @@ jobs:
           tests/test_store_privilege_preflight.py
           tests/test_store_privilege_schema_split.py
 
-  # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
-  # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
+  # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (signed
+  # in, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
   # asserting zero message loss + all SLOs (exit 0) and uploading the JSON/CSV report. Skipped on PRs
   # to save spend — the in-process load integration test (tests/test_load_runner.py, in the `test`
   # job) is the PR gate. Runs on push to main + on-demand (workflow_dispatch). Heavier profiles
@@ -3317,9 +3319,20 @@ jobs:
       - name: Install project (dev — engine + httpx client; no Qt needed for the headless load path)
         run: uv pip install --system --constraint constraints.lock -e ".[dev]"
 
-      - name: Serve the load config (auth off) and run the smoke profile
+      - name: Serve the load config, sign in, and run the smoke profile
         env:
-          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"  # the load CLI polls /stats etc. without a bearer token
+          # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
+          # block provisions one Administrator before the engine starts, and every API read after that
+          # carries that account's session (harness/load/rigadmin.py). Two settings follow:
+          #   require_mfa off -- provision-admin enrols an authenticator app at a terminal and offers
+          #     no other way, so the rig account has none. The bind is loopback.
+          #   an [alerts] channel -- with sign-in on, an enforcing start refuses without a way to send
+          #     account-security notices. The gate reads configuration only; nothing listens there.
+          MEFOR_SECURITY_REQUIRE_MFA: "false"
+          MEFOR_ALERTS_EMAIL_SMTP_HOST: 127.0.0.1
+          MEFOR_ALERTS_EMAIL_SMTP_PORT: "2525"
+          MEFOR_ALERTS_EMAIL_FROM: rig-operator@example.invalid
+          MEFOR_ALERTS_EMAIL_TO: rig-operator@example.invalid
           MEFOR_LOAD_FANOUT: "8"
           MEFOR_LOAD_RESULTS_FANOUT: "2"
           MEFOR_LOAD_TRANSFORM: edit
@@ -3329,7 +3342,7 @@ jobs:
           # provision the production posture rather than opting out to synthetic: a store encryption key
           # (minted at runtime below — never a committed literal), bounded PHI-body retention windows, and a
           # locked-down egress allowlisting the synthetic loopback sink the load graph delivers to. The
-          # security-notification gate is skipped because auth is off (no accounts to notify).
+          # security-notification gate is met by the [alerts] channel above.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"  # bound inbound PHI bodies at rest
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"  # bound dead-lettered PHI bodies at rest
           # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
@@ -3385,6 +3398,12 @@ jobs:
           # wait-for-a-file race tlsmat.py warns about cannot arise on this path.
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
           export MEFOR_HARNESS_TLS_KEY_FILE="$key"
+          # The rig Administrator, drawn for this run and masked before anything can echo it. Hex
+          # cannot spell a word on the engine's password deny-list. It is handed to each command
+          # that needs it and is never exported, so the engine's own environment never holds it.
+          rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+          echo "::add-mask::$rig_pw"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision --db ./load-ci.db
           python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
@@ -3396,7 +3415,11 @@ jobs:
           done
           set +e
           if [ -n "$ready" ]; then
-            python -m harness --load smoke --engine https://127.0.0.1:8765 --sink-port 2700 \
+            # `run` first checks the engine refuses a request with no session, then signs in and
+            # hands the session to the load CLI as --token. Its exit code is the load CLI's.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+              --engine https://127.0.0.1:8765 --cacert "$cert" -- \
+              python -m harness --load smoke --engine https://127.0.0.1:8765 --sink-port 2700 \
               --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
             rc=$?
           else
@@ -3521,9 +3544,15 @@ jobs:
       - name: Install project (dev + sqlserver extras)
         run: uv pip install --system --constraint constraints.lock -e ".[dev,sqlserver]"
 
-      - name: Serve on the SQL Server store and run the smoke-sqlserver profile
+      - name: Serve on the SQL Server store, sign in, and run the smoke-sqlserver profile
         env:
-          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"  # the load CLI polls /stats etc. without a bearer token
+          # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
+          # block provisions one Administrator before the engine starts, and the load CLI polls with
+          # that account's session (harness/load/rigadmin.py). require_mfa is off because
+          # provision-admin enrols an authenticator app at a terminal and offers no other way, so the
+          # rig account has none. This leg is at `warn` (below), where the notification gate that an
+          # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
+          MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_FANOUT: "8"
           MEFOR_LOAD_RESULTS_FANOUT: "2"
           MEFOR_LOAD_TRANSFORM: edit
@@ -3568,8 +3597,7 @@ jobs:
           # start, an unbounded retention window and an unlisted egress each have their own gate.
           MEFOR_SECURITY_ENFORCEMENT: "warn"
           # Bounded PHI-body retention windows + a locked-down egress allowlisting the loopback sink.
-          # The store key is minted at runtime below. The security-notification gate is skipped because
-          # auth is off (no accounts to notify).
+          # The store key is minted at runtime below. The security-notification gate only warns here.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
           # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
@@ -3602,6 +3630,13 @@ jobs:
           # two variables are the lever (harness/load/tlsmat.py inherited branch).
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
           export MEFOR_HARNESS_TLS_KEY_FILE="$key"
+          # No --db: the account goes into the SQL Server store MEFOR_STORE_* names, as serve opens it.
+          # The rig Administrator, drawn for this run and masked before anything can echo it. Hex
+          # cannot spell a word on the engine's password deny-list. It is handed to each command
+          # that needs it and is never exported, so the engine's own environment never holds it.
+          rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+          echo "::add-mask::$rig_pw"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision
           python -m messagefoundry serve --config harness/config/load --env dev \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
@@ -3611,7 +3646,10 @@ jobs:
           done
           set +e
           if [ -n "$ready" ]; then
-            python -m harness --load smoke-sqlserver --engine https://127.0.0.1:8765 --sink-port 2700 \
+            # Signed in, as the sqlite leg above: `run` hands the session to the load CLI as --token.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+              --engine https://127.0.0.1:8765 --cacert "$cert" -- \
+              python -m harness --load smoke-sqlserver --engine https://127.0.0.1:8765 --sink-port 2700 \
               --report-json out/load/smoke-sqlserver-ci.json --report-csv out/load/smoke-sqlserver-ci.csv
             rc=$?
           else
@@ -3723,6 +3761,20 @@ jobs:
           # in sync with the connectors used in samples/config.
           uv pip install --system --constraint constraints.lock -e ".[fhir,dicom]"
 
+      # RIGS SIGN IN (vault BACKLOG #2719). The service runs with sign-in on, as shipped, so this
+      # smoke provisions one Administrator before the first start and reads /messages and the
+      # security posture as that account (harness/load/rigadmin.py). The password is drawn here,
+      # masked before anything can echo it, and handed as a step output to the steps that sign in:
+      # at least the install, the /messages read and the launch read. Hex cannot spell a word on
+      # the engine's password deny-list.
+      - name: Draw the rig Administrator's password for this run
+        id: rig
+        run: |
+          $drawn = (& python -c "import secrets; print(secrets.token_hex(24))").Trim()
+          if (-not $drawn) { throw "could not draw the rig Administrator's password" }
+          "::add-mask::$drawn"
+          "password=$drawn" >> $env:GITHUB_OUTPUT
+
       # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
       # match what the console launches on an end-user machine — catches 5.1-only behaviour
       # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). On a cache hit the
@@ -3737,6 +3789,7 @@ jobs:
           # A lookup-only hit outside the queue restored nothing, so it counts as a miss here.
           NSSM_CACHE_HIT: ${{ github.event_name == 'merge_group' && steps.nssm-cache.outputs.cache-hit || 'false' }}
           NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
+          MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
         run: |
           $exe = (Get-Command messagefoundry).Source
           $cached = @{}
@@ -3809,10 +3862,23 @@ jobs:
           # whose inherited ACL lets the service account read it; RUNNER_TEMP may not.
           $syslogCa = (& python scripts\ci\make_syslog_ca_crl.py "C:\ProgramData\MessageFoundry\syslog-ca").Trim()
           if (-not (Test-Path $syslogCa)) { throw "make_syslog_ca_crl.py produced no CA+CRL bundle" }
-          # This smoke validates the Windows service + MLLP plumbing, not authentication (auth is
-          # covered by the pytest suite: test_api_auth / test_console_auth). Run with auth disabled so
-          # the /messages call below needs no bearer token, and supply the registry endpoint's secrets
-          # (cert/key/password + WS-Security creds) so the SOAP feed wires — placeholders, never used
+          # THE RIG SIGNS IN (see the step that drew the password). The operator provisions the
+          # Administrator in the service's own store BEFORE the first start, which is the order
+          # docs/SERVICE.md gives, with the key the service will run with in this shell and nowhere
+          # else. Through cmd, with stderr merged THERE: the command logs to stderr, and Windows
+          # PowerShell 5.1 turns a native stderr line into a terminating error (the openssl note
+          # above). The path is install-service.ps1's default -DataDir, as the /health step reads it.
+          $env:MEFOR_STORE_ENCRYPTION_KEY = $storeKey
+          cmd /c "python -m harness.load.rigadmin provision --db ""C:\ProgramData\MessageFoundry\messagefoundry.db"" 2>&1"
+          $provisioned = $LASTEXITCODE
+          Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY
+          if ($provisioned -ne 0) { throw "could not provision the rig Administrator (exit $provisioned)" }
+          # The service's own environment. With sign-in on it carries two things for the rig account:
+          # require_mfa off (provision-admin enrols an authenticator app at a terminal and offers no
+          # other way, so the account has none; the bind is loopback), and an [alerts] channel (an
+          # enforcing start refuses without a way to send account-security notices; the gate reads
+          # configuration only, and nothing listens there). It also supplies the registry endpoint's
+          # secrets (cert/key/password + WS-Security creds) so the SOAP feed wires — placeholders, never used
           # since no VXU is sent; the non-secret endpoints live in environments/prod.toml (selected by
           # the -Environment prod passed to install-service.ps1 above).
           # `prod` also FAIL-CLOSES on unrestricted egress (a transform could send PHI anywhere): lock it
@@ -3833,7 +3899,11 @@ jobs:
           # (30d) rather than setting [retention].allow_unbounded_phi=true: a real prod deployment configures
           # a window, so the smoke exercises the path it is meant to validate instead of opting out of it.
           & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry AppEnvironmentExtra `
-            "MEFOR_SECURITY_REQUIRE_SIGN_IN=false" `
+            "MEFOR_SECURITY_REQUIRE_MFA=false" `
+            "MEFOR_ALERTS_EMAIL_SMTP_HOST=127.0.0.1" `
+            "MEFOR_ALERTS_EMAIL_SMTP_PORT=2525" `
+            "MEFOR_ALERTS_EMAIL_FROM=rig-operator@example.invalid" `
+            "MEFOR_ALERTS_EMAIL_TO=rig-operator@example.invalid" `
             "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
             "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
             "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
@@ -3978,22 +4048,136 @@ jobs:
           "health: $ok"
 
       - name: Send an MLLP message and confirm it was recorded
+        env:
+          MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
         run: |
           # send_mllp.py is a raw MLLP socket send to the inbound listener -- it makes no HTTP call, so
-          # the always-TLS change does not touch it. The /messages poll below IS an API call and does;
-          # it is the same pinned python probe as the previous step, against the same minted certificate.
+          # the always-TLS change does not touch it. The /messages read below IS an API call and does;
+          # it pins the same minted certificate as the previous step.
+          #
+          # THE READ IS SIGNED IN (vault BACKLOG #2719). `rigadmin get` first checks that the service
+          # refuses /messages to a request with no session, then signs in ONCE as the Administrator the
+          # install step provisioned and asks again until a message shows, for up to 10 seconds. One
+          # sign-in, because the engine paces sign-ins per client address. It prints the count. It
+          # exits 1 when the count never reached 1, and 4 when the rig could not sign in or the
+          # service answered /messages with no session.
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
-          $probe = 'import json,ssl,sys,urllib.request;ctx=ssl.create_default_context(cafile=sys.argv[1]);print(json.dumps(json.load(urllib.request.urlopen(sys.argv[2],context=ctx,timeout=5))))'
           python samples\send_mllp.py samples\messages\adt_a01.hl7
-          $total = 0
-          foreach ($i in 1..20) {
-            $msgs = & python -c $probe $cert "https://127.0.0.1:8765/messages" | ConvertFrom-Json
-            $total = [int]$msgs.total
-            if ($total -ge 1) { break }
-            Start-Sleep -Milliseconds 500
-          }
-          if ($total -lt 1) { throw "message was not recorded by the engine" }
+          $total = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert --field total --at-least 1 --timeout 10 /messages
+          if ($LASTEXITCODE -eq 4) { throw "the rig could not sign in to the service, or the service answered /messages with no session" }
+          if ($LASTEXITCODE -ne 0) { throw "message was not recorded by the engine (messages.total = '$total')" }
           "messages.total = $total"
+
+      # vault BACKLOG #2701, #2700: install-service.ps1 registers the engine as the Python
+      # interpreter with `-I -X disable-remote-debug -m messagefoundry serve ...`, and no longer as
+      # the console-script launcher. The two steps above would be green with or without those
+      # options, so this step reads the launch three ways, each with a control.
+      #
+      # 1. The registration: the program and the parameters the service is set to start.
+      # 2. The command line of the RUNNING engine process, which is what the registration became.
+      #    Where Windows does not hand this job that command line, the step says so and goes on:
+      #    reading 3 does not depend on it.
+      # 3. The engine's own report, GET /security/posture, `interpreter`: the flags as the
+      #    interpreter holds them. A command line can carry an option the interpreter ignored. It
+      #    accepts the underscore spelling of the second option and does nothing with it. Only a
+      #    reading from inside shows that both options took effect.
+      #
+      # The matches are CASE-SENSITIVE: `-i` is a different interpreter option from `-I`.
+      # It runs BEFORE the token step, which puts a probe in the engine's place.
+      #
+      # THE READ IS SIGNED IN (vault BACKLOG #2719), as the rig Administrator the install step
+      # provisioned: `rigadmin get` first checks the service refuses the posture to a request
+      # with no session, then signs in once and reads it.
+      #
+      # THIS STEP STARTS NO ENGINE. It compares the launch the installer registered, so the launch
+      # is spelled here in two parts. tests/test_ci_rig_legs_sign_in.py takes a step whose script
+      # spells the serve command whole for one that starts an engine, and holds it to
+      # provision, serve, read. That order belongs to the install and start steps above.
+      #
+      # NOT PROVEN HERE: that the service account cannot write site-packages. The engine's reading
+      # is printed and not judged. This runner's Python is the hosted tool cache, whose permissions
+      # are the runner image's and say nothing about an install.
+      - name: "Verify the service runs isolated, remote debugging off (vault BACKLOG #2701)"
+        env:
+          MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
+          # The posture is printed whole, and nothing keeps its text to ASCII. Without this a
+          # Windows pipe is cp1252, and Python stops on the first character that code page lacks.
+          PYTHONUTF8: "1"
+        run: |
+          # Read that output as UTF-8 too. The readings below are ASCII either way, so a shell
+          # with no console to set is said and not fatal.
+          try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { "console output encoding left as it was" }
+          $options = "-I -X disable-remote-debug"
+          $module = " -m messagefoundry "
+          $command = "serve "
+          $tail = $module + $command
+          $launch = '^' + [regex]::Escape($options + $tail)
+          # CONTROL: launches that must NOT read as the hardened one.
+          foreach ($not in $command,
+                           ("-I" + $tail),
+                           ("-X disable-remote-debug" + $tail),
+                           ("-i -X disable-remote-debug" + $tail),
+                           ("-I -X disable_remote_debug" + $tail)) {
+            if (($not + "--port 1") -cmatch $launch) { throw "CONTROL FAILED: '$not' reads as the isolated launch, so the pattern proves nothing" }
+          }
+          # And the pattern can match: the launch itself reads as the launch.
+          if (($options + $tail + "--port 1") -cnotmatch $launch) { throw "CONTROL FAILED: the pattern does not match the launch it is built from" }
+
+          # --- 1. the registration -----------------------------------------------------------------
+          $registered = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters"
+          "Application   : $($registered.Application)"
+          "AppParameters : $($registered.AppParameters)"
+          if ((Split-Path -Leaf $registered.Application) -ne "python.exe") {
+            throw "the service's program is not the Python interpreter: $($registered.Application)"
+          }
+          if ($registered.AppParameters -cnotmatch $launch) {
+            throw "the registered parameters do not start with '$options$tail'"
+          }
+
+          # --- 2. the running engine's command line ------------------------------------------------
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MessageFoundry'"
+          if (-not $svc -or -not $svc.ProcessId) { throw "the service is not running, so there is no engine to read" }
+          # A child must be at least as new as its parent: a process whose parent id was only
+          # REUSED by the service's root is not the engine. The same rule as the token step's walk.
+          $root = Get-CimInstance Win32_Process -Filter "ProcessId=$($svc.ProcessId)"
+          $engine = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($svc.ProcessId)" |
+            Where-Object { $_.Name -eq "python.exe" -and $root -and $_.CreationDate -ge $root.CreationDate })
+          if ($engine.Count -lt 1) { throw "no python.exe was started by the service's own process" }
+          foreach ($process in $engine) {
+            if (-not $process.CommandLine) {
+              "CommandLine   : (not readable for process $($process.ProcessId); reading 3 stands on its own)"
+              continue
+            }
+            "CommandLine   : $($process.CommandLine)"
+            if ($process.CommandLine -cnotmatch ('\s' + [regex]::Escape($options + $tail))) {
+              throw "the running engine's command line does not carry '$options$tail'"
+            }
+          }
+
+          # --- 3. the engine's own report ----------------------------------------------------------
+          $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
+          $answer = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert /security/posture
+          if ($LASTEXITCODE -eq 4) { throw "rigadmin exit 4 on /security/posture: the service did not answer, refused the sign-in, or answered with no session. Its own line above says which" }
+          if ($LASTEXITCODE -ne 0) { throw "GET /security/posture did not answer (exit $LASTEXITCODE)" }
+          $posture = $answer | ConvertFrom-Json
+          if (-not $posture) { throw "GET /security/posture answered nothing that reads as JSON" }
+          # CONTROL: this is the posture, and the read can see a field of it.
+          if (-not $posture.enforcement) { throw "CONTROL FAILED: the answer has no enforcement field, so it is not the posture" }
+          $interpreter = $posture.interpreter
+          if ($null -eq $interpreter) { throw "the posture has no interpreter block" }
+          $interpreter | ConvertTo-Json -Depth 4
+          $loosened = @($posture.loosenings | ForEach-Object { $_.switch })
+          "loosenings    : $($loosened -join ', ')"
+          $wrong = @()
+          if ($interpreter.isolated -ne $true) { $wrong += "sys.flags.isolated is not set" }
+          if ($interpreter.safe_path -ne $true) { $wrong += "sys.flags.safe_path is not set" }
+          if ($interpreter.ignore_environment -ne $true) { $wrong += "the interpreter reads PYTHON* variables" }
+          if ($interpreter.remote_debug_enabled -ne $false) { $wrong += "remote debugging is enabled" }
+          foreach ($name in "interpreter_not_isolated", "remote_debug_enabled", "remote_debug_unguarded", "startup_code_unexpected") {
+            if ($loosened -contains $name) { $wrong += "the posture names the loosening $name" }
+          }
+          if ($wrong.Count -gt 0) { throw "the running engine is not on the hardened launch: $($wrong -join '; ')" }
+          "the service runs isolated, with remote debugging off"
 
       # vault BACKLOG #2702: install-service.ps1 sets a restricted service SID and a one-entry
       # RequiredPrivileges list. The two steps above show the engine still starts and still takes a
@@ -4085,8 +4269,10 @@ jobs:
             $tree += $frontier
           }
           $tree | Format-Table ProcessId, ParentProcessId, Name -AutoSize | Out-String
-          # The engine is the python.exe the launcher starts, so that is the token that matters.
-          # The service's root process and the launcher are read as well, and every one must pass.
+          # The engine is the python.exe the service starts, so that is the token that matters.
+          # The service's root process is read as well, and every one must pass. The launcher's
+          # name stays in the list: the service no longer runs it (vault BACKLOG #2701), and a
+          # process of that name under the service would be read too.
           $procs = @($tree[0]) + @($tree | Select-Object -Skip 1 | Where-Object {
             $_.Name -in @("messagefoundry.exe", "python.exe", "pythonw.exe")
           })
@@ -4138,7 +4324,7 @@ jobs:
               Kind = $key.GetValueKind($value)
             }
           }
-          if ($saved.AppParameters.Text -notmatch '^serve ') { throw "CONTROL FAILED: the saved parameters are not the engine's: $($saved.AppParameters.Text)" }
+          if ($saved.AppParameters.Text -cnotmatch ('^' + [regex]::Escape("-I -X disable-remote-debug -m messagefoundry ") + 'serve ')) { throw "CONTROL FAILED: the saved parameters are not the engine's: $($saved.AppParameters.Text)" }
           try {
             & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry Application $python
             Assert-Native "setting the probe as the service's program"
@@ -4224,7 +4410,8 @@ jobs:
           "no MessageFoundry service key is left, so no SID type and no privilege list is either"
 
       # --- ADR 0183 Amendment A, Wave 0 (BACKLOG #1136): the AUTH-ON arm ------------------------------
-      # Everything above runs with sign-in OFF, so it cannot see the question these two steps ask:
+      # Everything above runs on ONE data directory in ONE order, so it cannot answer the question
+      # these steps ask:
       # can the NSSM service account and the operator who runs `provision-admin` both open ONE SQLite
       # store, in either order? ADR 0163 reads MessageStore.open as re-securing the store trio to the
       # current user alone on every open, which would make whichever identity opens a fresh store
@@ -4242,7 +4429,7 @@ jobs:
       # the engine logged as failed prints GREEN (CONDITIONAL). The helper's header says how each arm reds.
       #
       # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
-      # the start-first arm still runs when the provision-first arm or the auth-off smoke went red.
+      # the start-first arm still runs when the provision-first arm or the service smoke went red.
       # Windows PowerShell 5.1, matching the install step above. timeout-minutes bounds a hung arm.
       - name: Store access, auth on -- provision first, then the service (ADR 0183 Wave 0)
         if: ${{ !cancelled() }}
@@ -4294,7 +4481,7 @@ jobs:
   # first today). Builds the slim engine image, builds a test-only image that bakes a minimal ADT->file
   # config + a self-contained MLLP sender (config baked, not mounted, so it is owned by the engine's UID
   # and not group/world-writable — _assert_safe_config_source refuses otherwise), serves it loopback +
-  # auth-off, sends one synthetic ADT^A01 over the in-container MLLP listener, and asserts it FINALIZES
+  # signed in, sends one synthetic ADT^A01 over the in-container MLLP listener, and asserts it FINALIZES
   # to PROCESSED (not merely RECEIVED — that distinguishes ACK-on-receipt from final disposition). Then
   # it verifies a graceful `docker stop`: tini forwards SIGTERM -> uvicorn lifespan -> engine.stop().
   # Runs NIGHTLY + on dispatch; on PRs only when the image/locks/packaging/this workflow change
@@ -4321,18 +4508,17 @@ jobs:
       - name: Build the test smoke image (baked minimal config + MLLP sender)
         run: docker build -f docker/smoke/Dockerfile --build-arg BASE=messagefoundry:ci -t messagefoundry:smoke .
 
-      - name: Serve (loopback, auth off) and assert an MLLP message reaches PROCESSED
+      - name: Serve (loopback, signed in) and assert an MLLP message reaches PROCESSED
         run: |
           set -euo pipefail
           # Bind the API + MLLP to loopback INSIDE the container and drive the test from inside it
-          # (docker exec). A non-loopback bind without TLS would be refused by the startup bind guard
-          # (and auth-off is refused off-loopback regardless of --allow-insecure-bind), so loopback +
-          # in-container traffic is the correct posture for an auth-disabled smoke — no insecure override.
+          # (docker exec). A non-loopback bind without TLS would be refused by the startup bind guard,
+          # so loopback + in-container traffic is the correct posture for this smoke — no insecure
+          # override.
           # GIVEN 1 (ADR 0148): `dev` now derives PHI, so `serve --env dev` runs the secure PHI posture.
           # This smoke validates PHI+enforce green (not a synthetic opt-out): provision a runtime-minted
           # store key (never a committed literal — gitleaks), bounded PHI-body retention windows, and a
           # locked-down egress allowlisting the smoke config's File archive dir (/var/lib/mefor/out/adt).
-          # The security-notification gate is skipped because auth is off (no accounts to notify).
           storeKey="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
           # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
           # non-loopback collector. Config-only gate, so `siem.invalid` never resolving is fine. The host
@@ -4340,9 +4526,37 @@ jobs:
           mkdir -p "$RUNNER_TEMP/syslog-ca" && chmod 755 "$RUNNER_TEMP/syslog-ca"
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" -v "$RUNNER_TEMP/syslog-ca:/out" \
             --entrypoint python messagefoundry:smoke /repo/scripts/ci/make_syslog_ca_crl.py /out
+          # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped, so
+          # one Administrator is provisioned before it starts and the /messages reads below carry that
+          # account's session. Both run INSIDE the image, on the image's interpreter and as the
+          # image's own user: harness/load/rigadmin.py imports only the standard library and the
+          # engine, so the one file is mounted read-only and nothing else of the checkout goes in.
+          #   * The store lives in a named volume, because the provisioning container exits before
+          #     the engine container starts and both must open the same store. Docker gives a new
+          #     named volume the ownership of the image directory it is mounted over.
+          #   * The password is drawn for this run and masked before anything can echo it. Hex cannot
+          #     spell a word on the engine's password deny-list. `-e NAME` with no value makes docker
+          #     read it from this shell, so it is on no command line.
+          #   * require_mfa is off because provision-admin enrols an authenticator app at a terminal
+          #     and offers no other way, so the rig account has none. The bind is loopback.
+          #   * The [alerts] channel is there because, with sign-in on, an enforcing start refuses
+          #     without a way to send account-security notices. The gate reads configuration only.
+          rig_pw="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+          echo "::add-mask::$rig_pw"
+          rig_mount="$PWD/harness/load/rigadmin.py:/rig/rigadmin.py:ro"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" docker run --rm \
+            -v mefor-data:/var/lib/mefor -v "$rig_mount" \
+            -e MEFOR_RIG_ADMIN_PASSWORD \
+            -e MEFOR_STORE_ENCRYPTION_KEY="$storeKey" \
+            --entrypoint python messagefoundry:smoke /rig/rigadmin.py provision
           docker run -d --name mefor \
             -v "$RUNNER_TEMP/syslog-ca:/syslog-ca:ro" \
-            -e MEFOR_SECURITY_REQUIRE_SIGN_IN=false \
+            -v mefor-data:/var/lib/mefor -v "$rig_mount" \
+            -e MEFOR_SECURITY_REQUIRE_MFA=false \
+            -e MEFOR_ALERTS_EMAIL_SMTP_HOST=127.0.0.1 \
+            -e MEFOR_ALERTS_EMAIL_SMTP_PORT=2525 \
+            -e MEFOR_ALERTS_EMAIL_FROM=rig-operator@example.invalid \
+            -e MEFOR_ALERTS_EMAIL_TO=rig-operator@example.invalid \
             -e MEFOR_STORE_ENCRYPTION_KEY="$storeKey" \
             -e MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30 \
             -e MEFOR_RETENTION_DEAD_LETTER_DAYS=30 \
@@ -4379,23 +4593,115 @@ jobs:
           docker exec mefor curl -fsS --cacert "$cert" https://127.0.0.1:8765/health
           # Send one synthetic ADT^A01 over the in-container MLLP listener (loopback:2575); fails on a non-AA ACK.
           docker exec mefor python /smoke/send_adt.py 127.0.0.1 2575
-          # Poll the disposition via the container's own python (stdlib urllib — no host python/jq needed).
-          # Same pin as the curl above: a default context would reject the self-signed certificate, and
-          # an unverified one would stop checking it.
-          total() { docker exec mefor python -c "import ssl,urllib.request,json;ctx=ssl.create_default_context(cafile='$cert');print(json.load(urllib.request.urlopen('https://127.0.0.1:8765/messages?status=$1',context=ctx))['total'])"; }
-          processed=0
-          for _ in $(seq 1 60); do
-            # `|| processed=0`: a transient non-zero before the row finalizes must NOT abort the loop under set -e.
-            processed=$(total processed) || processed=0
-            [ "$processed" -ge 1 ] && break || sleep 0.5
-          done
-          received=$(total received) || received=0
+          # Read the disposition via the container's own python, SIGNED IN (`rigadmin get`, stdlib
+          # only — no host python/jq needed). Same pin as the curl above: a default context would
+          # reject the self-signed certificate, and an unverified one would stop checking it. Each
+          # call first checks the engine refuses the read to a request with no session, then signs
+          # in ONCE and asks again until the count reaches --at-least, for up to --timeout seconds.
+          # One sign-in a call, because the engine paces sign-ins per client address. It prints the
+          # last count it read, or nothing when the engine refused. Exit 1 means the count was never
+          # reached; the `||` keeps that from aborting under set -e before the FAIL line below can
+          # say what was seen. Exit 4 means the rig could not sign in, or the engine answered with
+          # no session, and that is reported as what it is.
+          total() { MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" docker exec -e MEFOR_RIG_ADMIN_PASSWORD mefor \
+            python /rig/rigadmin.py get --engine https://127.0.0.1:8765 --cacert "$cert" --field total "$@"; }
+          rig_rc=0
+          processed=$(total --at-least 1 --timeout 30 "/messages?status=processed") || rig_rc=$?
+          if [ "$rig_rc" -eq 4 ]; then
+            echo "FAIL: the rig could not sign in to the engine, or the engine answered /messages with no session"
+            exit 1
+          fi
+          received=$(total "/messages?status=received") || true
+          processed="${processed:-0}"; received="${received:-0}"
           echo "processed=$processed received=$received"
           # The whole point of the assert: confirm it FINALIZED, not just that it was acknowledged-on-receipt.
           if [ "$processed" -lt 1 ]; then
             echo "FAIL: message did not finalize to PROCESSED (received=$received) — stuck at ACK-on-receipt"
             exit 1
           fi
+
+          # vault BACKLOG #2701, #2700: the image starts the engine as
+          # `python -I -X disable-remote-debug -u -B -m messagefoundry`, and copies its venv
+          # root-owned. Everything above is green with or without either, so both are read here,
+          # each with a control. It is in this step because the posture read is signed in, and
+          # the rig Administrator's password lives in this step's shell.
+          #
+          # 1. PID 1's command line: what the ENTRYPOINT became.
+          # 2. The engine's own report (GET /security/posture, `interpreter`), read signed in: the
+          #    flags as the interpreter holds them, the start-up code it found, and whether it can
+          #    write a start-up directory. The interpreter accepts and ignores a misspelt option,
+          #    so only this reading shows the options took effect.
+          # 3. A real write, as the engine's own uid: a file in site-packages must be refused, and
+          #    one in the store volume must be created. This container runs with NO --read-only,
+          #    which is the case the root-owned venv is for.
+          cmdline="$(docker exec mefor sh -c "tr '\0' ' ' < /proc/1/cmdline")"
+          echo "PID 1: $cmdline"
+          wanted="/opt/venv/bin/python -I -X disable-remote-debug -u -B -m messagefoundry serve "
+          # CONTROL: a launch with no -I must not read as the wanted one.
+          case "tini -- /opt/venv/bin/python -X disable-remote-debug -u -B -m messagefoundry serve x" in
+            *"$wanted"*) echo "CONTROL FAILED: the pattern matches a launch with no -I"; exit 1 ;;
+          esac
+          case "$cmdline" in
+            *"$wanted"*) ;;
+            *) echo "FAIL: PID 1 was not started as: $wanted"; exit 1 ;;
+          esac
+          # Signed in, like the counts above. Exit 4 is the engine not answering, refusing the
+          # sign-in, or answering the posture with no session, and rigadmin's own line says which.
+          # The `||` lets the step name the read that failed before it ends.
+          posture_rc=0
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" docker exec -e MEFOR_RIG_ADMIN_PASSWORD mefor \
+            python /rig/rigadmin.py get --engine https://127.0.0.1:8765 --cacert "$cert" \
+            /security/posture > "$RUNNER_TEMP/posture.json" || posture_rc=$?
+          if [ "$posture_rc" -ne 0 ]; then
+            echo "FAIL: the signed-in read of /security/posture did not answer (rigadmin exit $posture_rc; its own line above says why)"
+            exit 1
+          fi
+          python3 - "$RUNNER_TEMP/posture.json" <<'PY'
+          import json
+          import sys
+
+          posture = json.load(open(sys.argv[1], encoding="utf-8"))
+          # CONTROL: this is the posture, and the read can see a field of it.
+          assert "enforcement" in posture, "CONTROL FAILED: the answer is not the posture"
+          interpreter = posture.get("interpreter")
+          assert interpreter is not None, "the posture has no interpreter block"
+          print(json.dumps(interpreter, indent=2))
+          loosened = [entry["switch"] for entry in posture["loosenings"]]
+          print("loosenings:", ", ".join(loosened))
+          wrong = []
+          for flag in ("isolated", "safe_path", "ignore_environment"):
+              if interpreter[flag] is not True:
+                  wrong.append(f"sys.flags.{flag} is not set")
+          if interpreter["remote_debug_enabled"] is not False:
+              wrong.append("remote debugging is enabled")
+          # CONTROL: the reading saw site-packages, so an empty writable list means something.
+          if not any(d.endswith("site-packages") for d in interpreter["startup_dirs"]):
+              wrong.append("CONTROL FAILED: the engine did not report site-packages as a start-up directory")
+          if interpreter["writable_startup_dirs"] or interpreter["unchecked_startup_dirs"]:
+              wrong.append("the engine can write a start-up directory, or could not tell")
+          for name in (
+              "interpreter_not_isolated",
+              "remote_debug_enabled",
+              "remote_debug_unguarded",
+              "startup_code_unexpected",
+              "startup_directory_writable",
+              "startup_directory_unchecked",
+          ):
+              if name in loosened:
+                  wrong.append(f"the posture names the loosening {name}")
+          if wrong:
+              sys.exit("FAIL: the engine is not on the hardened launch: " + "; ".join(wrong))
+          print("the engine runs isolated, remote debugging off, venv not writable")
+          PY
+          site="$(docker exec mefor python -c 'import site; print(site.getsitepackages()[0])')"
+          echo "site-packages: $site"
+          # CONTROL first: the same write, as the same uid, where it must work.
+          docker exec mefor touch /var/lib/mefor/write-control
+          if docker exec mefor touch "$site/planted-by-smoke.pth"; then
+            echo "FAIL: the engine's uid created a file in $site"
+            exit 1
+          fi
+          echo "the engine's uid cannot create a file in $site"
 
       - name: Verify graceful shutdown (tini -> SIGTERM -> engine.stop drains)
         run: |
@@ -4426,7 +4732,9 @@ jobs:
 
       - name: Tear down
         if: always()
-        run: docker rm -f mefor || true
+        run: |
+          docker rm -f mefor || true
+          docker volume rm mefor-data || true
 
   packaging-build:
     # BUILD every distribution this repo publishes, then run the release gates over the REAL

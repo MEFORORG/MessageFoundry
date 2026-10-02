@@ -95,7 +95,12 @@ from messagefoundry.transports.base import (
     wait_for_intake,
 )
 from messagefoundry.transports.base import cap_setting as _cap_setting
-from messagefoundry.transports.framing import MLLP_CODEC, frame_for_delivery, frame_reply
+from messagefoundry.transports.framing import (
+    MLLP_CODEC,
+    check_frame_bytes,
+    frame_for_delivery,
+    frame_reply,
+)
 
 __all__ = [
     "SB",
@@ -890,6 +895,55 @@ class MLLPDestination(DestinationConnector):
         name = type(exc).__name__
         return f"{name}: {' '.join(extras)}" if extras else name
 
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        """ADR 0205 rule 1 on ``payload`` without sending it: raise the permanent
+        :class:`NegativeAckError` :meth:`send` would. With ``rewrite`` it checks the payload as
+        :meth:`send` frames it, after the same delimiter rewrites, which drop a frame byte at either
+        end; a payload those rewrites refuse raises their permanent ``reencode`` refusal, as
+        :meth:`send` does (ADR 0204, ADR 0206). Without it, the payload as given, which is how a
+        batch member sits inside its envelope."""
+        body = self._rewrite_for_wire(payload) if rewrite else payload
+        check_frame_bytes(MLLP_CODEC, body, self.encoding, transport="MLLP")
+
+    def _rewrite_for_wire(self, payload: str) -> str:
+        """``payload`` after this destination's delimiter rewrites, as :meth:`send` frames it. A
+        payload the rewrites refuse is a permanent :class:`NegativeAckError` with code
+        ``reencode``; :meth:`send` and :meth:`check_frame` share this, so a shadow outbound refuses
+        what a live send refuses."""
+        if self.encoding_characters is not None:
+            # Re-encode the body with this destination's delimiters before framing. A non-HL7/
+            # garbled payload can't be rewritten, nor can a value the target delimiters cannot
+            # carry as data (ADR 0206 rule 4). Either is a property of the payload, so a retry
+            # re-derives the same failure: it is permanent, and the worker dead-letters the row
+            # at once (ADR 0204) rather than hold the lane for the retry budget. The message
+            # reached neither the wire nor the peer.
+            try:
+                payload = reencode_delimiters(payload, self.encoding_characters)
+            except ValueError as exc:
+                raise NegativeAckError(
+                    f"MLLP encoding-character override failed: {exc}",
+                    code="reencode",
+                    permanent=True,
+                ) from exc
+        if self.hl7_raw_separators:
+            # BACKLOG #107: re-serialize emitting the reserved structural separators as raw bytes
+            # (composes after any delimiter rewrite above). A non-HL7 / unparseable payload can't be
+            # rewritten; like the override above that is a property of the payload, so it is a
+            # permanent failure (ADR 0204, ADR 0206) and the message reached neither wire nor peer.
+            try:
+                payload = emit_raw_separators(payload)
+            except (ValueError, IndexError) as exc:
+                # ValueError includes HL7PeekError (no leading MSH, or an over-budget escape
+                # expansion). IndexError: the same truncated-header shapes that
+                # reencode_delimiters maps to ValueError above (BACKLOG #1601).
+                raise NegativeAckError(
+                    "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
+                    f"{safe_exc(exc)}",
+                    code="reencode",
+                    permanent=True,
+                ) from exc
+        return payload
+
     def waiting_for_reply(self, now: float) -> bool:
         """#136 (ADR 0065 amendment): whether this outbound is currently AWAITING an MLLP ACK and at
         least ``waiting_display_delay`` has elapsed since the send began. DISPLAY ONLY — read off the
@@ -918,38 +972,7 @@ class MLLPDestination(DestinationConnector):
                 # before any payload byte leaves the box (defense in depth against a reload routing PHI
                 # around the construction-only gate).
                 self._hop_guard.assert_send()
-            if self.encoding_characters is not None:
-                # Re-encode the body with this destination's delimiters before framing. A non-HL7/
-                # garbled payload can't be rewritten, nor can a value the target delimiters cannot
-                # carry as data (ADR 0206 rule 4). Either is a property of the payload, so a retry
-                # re-derives the same failure: it is permanent, and the worker dead-letters the row
-                # at once (ADR 0204) rather than hold the lane for the retry budget. The message
-                # reached neither the wire nor the peer.
-                try:
-                    payload = reencode_delimiters(payload, self.encoding_characters)
-                except ValueError as exc:
-                    raise NegativeAckError(
-                        f"MLLP encoding-character override failed: {exc}",
-                        code="reencode",
-                        permanent=True,
-                    ) from exc
-            if self.hl7_raw_separators:
-                # BACKLOG #107: re-serialize emitting the reserved structural separators as raw bytes
-                # (composes after any delimiter rewrite above). A non-HL7 / unparseable payload can't be
-                # rewritten; like the override above that is a property of the payload, so it is a
-                # permanent failure (ADR 0204, ADR 0206) and the message reached neither wire nor peer.
-                try:
-                    payload = emit_raw_separators(payload)
-                except (ValueError, IndexError) as exc:
-                    # ValueError includes HL7PeekError (no leading MSH, or an over-budget escape
-                    # expansion). IndexError: the same truncated-header shapes that
-                    # reencode_delimiters maps to ValueError above (BACKLOG #1601).
-                    raise NegativeAckError(
-                        "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
-                        f"{safe_exc(exc)}",
-                        code="reencode",
-                        permanent=True,
-                    ) from exc
+            payload = self._rewrite_for_wire(payload)
             # ADR 0205 rule 1: frame once, before any dial; the four paths below only write bytes.
             wire = frame_for_delivery(MLLP_CODEC, payload, self.encoding, transport="MLLP")
             if self.no_ack:

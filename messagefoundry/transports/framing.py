@@ -32,6 +32,7 @@ __all__ = [
     "MLLP_CODEC",
     "STX_ETX_CODEC",
     "PRESETS",
+    "check_frame_bytes",
     "codec_for",
     "frame_for_delivery",
     "frame_reply",
@@ -54,6 +55,14 @@ def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transp
     payload the charset cannot hold is the same content-free permanent failure other destinations
     raise. Call this once per send, before any dial, so a refused payload opens no connection and
     never discards a healthy persistent one."""
+    return codec.frame(check_frame_bytes(codec, payload, encoding, transport=transport))
+
+
+def check_frame_bytes(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
+    """Rule 1's check alone: encode ``payload`` and refuse it as :func:`frame_for_delivery` does,
+    returning the encoded body unframed. The delivery stage calls it, through a destination's
+    ``check_frame``, where no single-payload send runs: on each member of an MLLP batch, and on a
+    shadow (simulate) outbound, so both record the disposition a live send would."""
     body = encode_wire_body(payload, encoding, transport=transport)
     for role, byte in (("start", codec.start), ("end", codec.end)):
         position = body.find(byte)
@@ -64,7 +73,7 @@ def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transp
                 code="framing",
                 permanent=True,
             )
-    return codec.frame(body)
+    return body
 
 
 def frame_reply(codec: FrameCodec, reply: str, encoding: str) -> bytes:

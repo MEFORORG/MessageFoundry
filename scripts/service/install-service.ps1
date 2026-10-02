@@ -25,7 +25,15 @@ param(
     # engine's own account has modify rights.
     [string]$NssmDir = "$env:ProgramFiles\MessageFoundry\nssm",
     [string]$ServiceName = "MessageFoundry",
+    # The engine's console-script launcher, e.g. <venv>\Scripts\messagefoundry.exe. It names the
+    # INSTALL the service runs from. The service does not run it: it runs the Python interpreter of
+    # that install directly, so the interpreter options below reach it (vault BACKLOG #2701).
     [string]$AppExe,
+    # The interpreter the service runs. Defaults to the python.exe of the install -AppExe is in:
+    # beside it for a virtual environment, one folder up for a system-wide install. Pass it when
+    # neither is right. It must be able to import messagefoundry in isolated mode, which leaves
+    # out the user's own site directory, so a `pip install --user` copy will not do.
+    [string]$PythonExe,
     [string]$Config,
     [string]$DbPath,
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
@@ -796,17 +804,50 @@ function Set-SecureConfigAcl {
 
 function Get-CrashDumpImageName {
     <#
-      The image names whose WER behaviour must be suppressed (ADR 0152 Phase 0). Returns BOTH the
-      launcher ($AppExe, e.g. messagefoundry.exe) and the venv interpreter, because a pip console-script
-      launcher on Windows starts the interpreter as a CHILD process - so the process that actually holds
-      the PHI heap, and therefore the one WER would dump, is python.exe, not messagefoundry.exe. Naming
-      only the launcher would produce a policy that looks applied and protects nothing.
+      The image names whose WER behaviour must be suppressed (ADR 0152 Phase 0): the interpreter the
+      service runs. That is the process that holds the PHI heap, and so the one WER would dump. A
+      virtual environment's python.exe starts the base interpreter as a child, and both carry this
+      one name. The console-script launcher is no longer named: the service does not run it (vault
+      BACKLOG #2701), and the keys are machine-wide by image name.
+    #>
+    param([Parameter(Mandatory)][string]$PythonExe)
+    return @([IO.Path]::GetFileName($PythonExe))
+}
+
+# --- the service launch: the interpreter, isolated (vault BACKLOG #2701, #2700) ------------------------
+# The service runs `python.exe <options> -m messagefoundry serve ...`, not the console-script
+# launcher, because a launcher cannot pass an option to the interpreter it starts. What each option
+# does is in docs/SERVICE.md, "The service launch". Two things are particular to this script:
+#
+#   - `-m` would search the working directory first, and that is AppDirectory, the repository. -I
+#     keeps it off the import path.
+#   - A MEFOR_* variable set through AppEnvironmentExtra still reaches the engine. -I ignores only
+#     the interpreter's own PYTHON* variables.
+#
+# The second option is spelled with HYPHENS: the interpreter accepts the underscore spelling and
+# ignores it. tests/test_isolated_launch.py holds this line to the engine's own list of options
+# (messagefoundry/startupcode.py), and the Windows service smoke leg reads the result off the
+# running service.
+$EngineInterpreterOptions = "-I -X disable-remote-debug"
+
+function Get-EngineInterpreter {
+    <#
+      The python.exe of the install the launcher $AppExe belongs to, or "" when none is found.
+
+      A virtual environment keeps both in one Scripts folder. A system-wide install keeps the
+      launcher in <prefix>\Scripts and the interpreter in <prefix>. Nothing else is guessed: a
+      launcher found anywhere else (a `pip install --user` copy, a tool shim) has no interpreter this
+      can name, and the caller refuses and asks for -PythonExe.
     #>
     param([Parameter(Mandatory)][string]$AppExe)
-    $names = @([IO.Path]::GetFileName($AppExe))
-    $interpreter = Join-Path (Split-Path -Parent $AppExe) "python.exe"
-    if (Test-Path $interpreter) { $names += [IO.Path]::GetFileName($interpreter) }
-    return ($names | Select-Object -Unique)
+    $scripts = Split-Path -Parent $AppExe
+    $candidates = @((Join-Path $scripts "python.exe"))
+    $prefix = Split-Path -Parent $scripts
+    if ($prefix) { $candidates += (Join-Path $prefix "python.exe") }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return ""
 }
 
 function Set-CrashDumpSuppression {
@@ -1227,6 +1268,10 @@ function Resolve-AbsolutePath {
 $DataDir = Resolve-AbsolutePath $DataDir
 if (-not $AppExe) { $AppExe = Join-Path $RepoRoot ".venv\Scripts\messagefoundry.exe" }
 else { $AppExe = Resolve-AbsolutePath $AppExe }
+# The interpreter the service runs (vault BACKLOG #2701). Named here, with the other paths, so it
+# is absolute before anything consumes it. Empty when none is found; refused below.
+if ($PythonExe) { $PythonExe = Resolve-AbsolutePath $PythonExe }
+else { $PythonExe = Get-EngineInterpreter -AppExe $AppExe }
 if (-not $Config) { $Config = Join-Path $RepoRoot "samples\config" }
 else { $Config = Resolve-AbsolutePath $Config }
 # Derived from the ALREADY-absolute $DataDir, so the default is absolute without a second pass.
@@ -1239,8 +1284,21 @@ $NssmDir = Resolve-AbsolutePath $NssmDir
 # with that path, so a relative one would be resolved against a different directory later.
 $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
 
-if (-not (Test-Path $AppExe)) {
-    throw "Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, or pass -AppExe."
+# The launcher only names the install, so it is required only while it is what finds the
+# interpreter. With -PythonExe the service's program is already named.
+if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path $AppExe)) {
+    throw ("Engine executable not found at: $AppExe`nRun 'pip install -e .' in the project venv, " +
+        "or pass -AppExe, or name the interpreter with -PythonExe.")
+}
+# NOT CHECKED: that this interpreter can import the engine. Finding out would mean running the
+# install's code from this elevated prompt. A wrong -PythonExe shows as ModuleNotFoundError in the
+# service's error log at its first start.
+if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+    throw ("The Python interpreter the service runs was not found" +
+        $(if ($PythonExe) { " at: $PythonExe" } else { " beside '$AppExe' or one folder up" }) +
+        ".`nThe service runs the interpreter directly, in isolated mode, and not the " +
+        "messagefoundry.exe launcher. Pass -PythonExe with the python.exe of the install the " +
+        "engine is in (docs/SERVICE.md 'The service launch').")
 }
 if (-not (Test-Path $Config)) { throw "Config directory not found at: $Config" }
 
@@ -1255,7 +1313,7 @@ New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
 
 $StdoutLog = Join-Path $LogDir "service.out.log"
 $StderrLog = Join-Path $LogDir "service.err.log"
-$AppParams = "serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
+$AppParams = "$EngineInterpreterOptions -m messagefoundry serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
 
 # --- install -----------------------------------------------------------------
 
@@ -1420,7 +1478,7 @@ if ($ServiceExisted) {
     }
 } else {
     Write-Host "Installing service '$ServiceName'..."
-    Invoke-Nssm install $ServiceName $AppExe
+    Invoke-Nssm install $ServiceName $PythonExe
 }
 
 # THE REGISTRATION IS POINTED AT THE CHECKED COPY, QUOTED, AND READ BACK (BACKLOG #2364). `nssm set`
@@ -1437,7 +1495,8 @@ try {
         "unchecked image. Remove it with .\uninstall-service.ps1 and re-run.")
 }
 
-Invoke-Nssm set $ServiceName Application $AppExe
+# The interpreter, with the options in $AppParams ahead of `-m messagefoundry` (vault BACKLOG #2701).
+Invoke-Nssm set $ServiceName Application $PythonExe
 Invoke-Nssm set $ServiceName AppParameters $AppParams
 Invoke-Nssm set $ServiceName AppDirectory $RepoRoot
 Invoke-Nssm set $ServiceName DisplayName "MessageFoundry Engine"
@@ -1642,7 +1701,7 @@ if ($ServiceAccount) {
 # half, which no process can set for itself; without it a LocalDumps-configured host can still write a
 # full-memory dump of the engine - plaintext PHI, on disk, outside the store's encryption and retention.
 if ($SuppressCrashDumps) {
-    Set-CrashDumpSuppression -ImageNames (Get-CrashDumpImageName -AppExe $AppExe)
+    Set-CrashDumpSuppression -ImageNames (Get-CrashDumpImageName -PythonExe $PythonExe)
 } else {
     Write-Host ("  Dumps  : WER crash-dump suppression NOT applied (pass -SuppressCrashDumps). The " +
         "engine suppresses what a process can suppress on its own, but if this host has WER LocalDumps " +
@@ -1651,7 +1710,7 @@ if ($SuppressCrashDumps) {
 
 Write-Host ""
 Write-Host "Installed '$ServiceName'." -ForegroundColor Green
-Write-Host "  Engine : $AppExe $AppParams"
+Write-Host "  Engine : $PythonExe $AppParams"
 Write-Host "  Logs   : $StdoutLog"
 Write-Host "           $StderrLog"
 Write-Host ""
