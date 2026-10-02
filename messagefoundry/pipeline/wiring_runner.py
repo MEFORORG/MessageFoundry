@@ -133,8 +133,8 @@ from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
+    IngressBodyRejected,
     IngressGuardError,
-    IngressNulRejected,
     carry_binary_ingress,
     check_binary_size,
     check_declared_type,
@@ -5680,10 +5680,11 @@ class RegistryRunner:
 
         try:
             check_decoded(text, ic)
-        except IngressNulRejected as exc:
+        except IngressBodyRejected as exc:
             # INGEST-4: dead-letter a NUL-bearing body BEFORE Peek.parse and any store write, so text
             # (and every value derived from it) is NUL-free for the rest of this handler. HTTP owns its
-            # own 202/4xx response — no HL7 ACK.
+            # own 202/4xx response — no HL7 ACK. An HL7 v2 body holding an MLLP frame byte past its
+            # start lands here too (ADR 0205 rule 4).
             await self.store.record_received(
                 channel_id=ic.name,
                 raw=store_safe_raw(raw, ic.content_type.value, text=text),
@@ -5944,14 +5945,16 @@ class RegistryRunner:
 
         try:
             check_decoded(text, ic)
-        except IngressNulRejected as exc:
+        except IngressBodyRejected as exc:
             # INGEST-4: the body decoded cleanly but carries a NUL (U+0000) — invalid in every text
             # payload we accept (HL7 v2 field data, JSON, XML 1.0, X12) and store-hostile (Postgres
             # rejects it at bind, which would unwind out of this handler into the transport and drop the
             # whole connection with no ERROR row — a count-and-log violation; SQLite/SQL Server truncate
             # at the first NUL). Dead-letter it here, BEFORE Peek.parse and any store write, so text (and
             # control_id/summary/strict-fail errors derived from it) is NUL-free for the rest of this
-            # handler. NAK AR mirrors the decode/parse-error precedent for a malformed body.
+            # handler. NAK AR mirrors the decode/parse-error precedent for a malformed body. An HL7 v2
+            # body holding an MLLP frame byte past its start is refused the same way, with its own
+            # fixed MSA-3 text (ADR 0205 rule 4).
             nul_err = exc.reason
             mid = await self.store.record_received(
                 channel_id=ic.name,
@@ -5962,7 +5965,7 @@ class RegistryRunner:
                 message_type=None if hl7v2 else ic.content_type.value,
             )
             ack = (
-                build_ack(raw, code="AR", text="invalid NUL in body", ack_mode=ack_mode)
+                build_ack(raw, code="AR", text=exc.ack_text, ack_mode=ack_mode)
                 if (hl7v2 and reply)
                 else None
             )

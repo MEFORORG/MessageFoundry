@@ -68,9 +68,12 @@ from messagefoundry.parsing.validate import validate
 from messagefoundry.redaction import safe_exc
 
 __all__ = [
+    "FRAME_BYTE_REJECTED_REASON",
     "INGRESS_MAX_BYTES",
     "NUL_REJECTED_REASON",
     "STRICT_VALIDATE_TIMEOUT_SECONDS",
+    "IngressBodyRejected",
+    "IngressFrameByteRejected",
     "IngressGuardError",
     "IngressNulRejected",
     "admit_resubmission",
@@ -330,15 +333,59 @@ def check_binary_size(data: bytes) -> None:
     _raise_if_oversize(len(data))
 
 
-class IngressNulRejected(IngressGuardError):
-    """The NUL guard's refusal (INGEST-4), told apart from a charset failure by its type alone.
+class IngressBodyRejected(IngressGuardError):
+    """A ``decode``-phase refusal of a character the decoded body may not hold, told apart from a
+    charset failure by its type alone.
 
-    Both are the ``decode`` phase, but the listener answers them differently: a different MSA-3 text
-    on the AR, and a different stored view of the rejected body. So the caller needs to know which one
-    fired without matching on the reason text."""
+    The listener answers it with an ``AR`` whose MSA-3 is :attr:`ack_text`, where a charset failure
+    gets ``decode error``, so the caller needs to know which one fired without matching on the
+    reason text."""
+
+    #: The MSA-3 text of the listener's ``AR``. Fixed, so nothing from the body reaches the sender.
+    ack_text: str = ""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason, phase="decode")
+
+
+class IngressNulRejected(IngressBodyRejected):
+    """The NUL guard's refusal (INGEST-4). The listener also stores its body differently: a
+    NUL-bearing view escalates to byte carriage."""
+
+    ack_text = "invalid NUL in body"
 
     def __init__(self) -> None:
-        super().__init__(NUL_REJECTED_REASON, phase="decode")
+        super().__init__(NUL_REJECTED_REASON)
+
+
+#: The stored reason for an ``hl7v2`` body holding an MLLP frame byte past its leading whitespace
+#: (ADR 0205 rule 4). Content-free: it names the byte, never where the body put it.
+FRAME_BYTE_REJECTED_REASON = (
+    "ingress HL7 v2 body contains an MLLP frame byte (0x0B or 0x1C) after its start, "
+    "which a conformant message never holds"
+)
+
+#: The leading run ``Peek.parse`` skips with ``str.lstrip()`` before it looks for ``MSH``. A frame byte
+#: there is tolerated (ADR 0205): the parser drops it on encode, so it never reaches a delivery.
+_LEADING_WHITESPACE = re.compile(r"\s*")
+
+
+class IngressFrameByteRejected(IngressBodyRejected):
+    """An ``hl7v2`` body holding ``0x0B`` or ``0x1C`` anywhere but its leading whitespace (ADR 0205
+    rule 4). MLLP reserves both bytes, so a conformant HL7 v2 body holds neither; one inside the body
+    is how a single inbound message would leave as two."""
+
+    ack_text = "MLLP frame byte in body"
+
+    def __init__(self) -> None:
+        super().__init__(FRAME_BYTE_REJECTED_REASON)
+
+
+def _holds_an_embedded_frame_byte(text: str) -> bool:
+    """Whether ``text`` holds ``0x0B`` or ``0x1C`` past the leading run ``Peek.parse`` strips."""
+    lead = _LEADING_WHITESPACE.match(text)
+    start = lead.end() if lead is not None else 0
+    return text.find("\x0b", start) >= 0 or text.find("\x1c", start) >= 0
 
 
 def decode_body(raw: str | bytes, ic: InboundConnection, *, encoding: str) -> str:
@@ -372,19 +419,24 @@ def _decode_refusal(encoding: str, exc: Exception) -> str:
 
 
 def check_decoded(text: str, ic: InboundConnection) -> None:
-    """The post-decode guards, in the listener's order: reject an embedded NUL, then bound the length.
+    """The post-decode guards, in the listener's order: reject an embedded NUL, then an embedded MLLP
+    frame byte in an HL7 v2 body, then bound the length.
 
-    Order is the load-bearing part, which is why the two share one function: the NUL check must run
+    Order is the load-bearing part, which is why they share one function: the NUL check must run
     on the DECODED text and BEFORE anything derives a control id, a summary or a stored raw from it,
     or those derived values carry the NUL onward into a store that cannot hold it.
 
-    The NUL refusal is :class:`IngressNulRejected`. The length bound is the ``size``-phase
-    :class:`IngressGuardError` and applies to a non-HL7 body only: the HL7 ceiling is ``Peek.parse``'s,
-    at :func:`peek_max_bytes`, which is where the per-connection cap lives."""
+    The NUL refusal is :class:`IngressNulRejected`; the frame-byte refusal is
+    :class:`IngressFrameByteRejected` (ADR 0205 rule 4), and both are :class:`IngressBodyRejected`.
+    The length bound is the ``size``-phase :class:`IngressGuardError` and applies to a non-HL7 body
+    only: the HL7 ceiling is ``Peek.parse``'s, at :func:`peek_max_bytes`, which is where the
+    per-connection cap lives."""
     if "\x00" in text:
         raise IngressNulRejected()
     if ic.content_type is not ContentType.HL7V2:
         _raise_if_oversize(len(text))
+    elif _holds_an_embedded_frame_byte(text):
+        raise IngressFrameByteRejected()
 
 
 def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
