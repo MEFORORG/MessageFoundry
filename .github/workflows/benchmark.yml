@@ -45,15 +45,26 @@ jobs:
         run: |
           mkdir -p out/load
           { echo "## sqlite"; uname -a; python --version; python -c "import sqlite3,sys; print('sqlite', sqlite3.sqlite_version)"; git rev-parse HEAD; } | tee out/load/env-sqlite.txt
-      - name: Serve (SQLite) + reference rate-steps
+      - name: Serve (SQLite), sign in + reference rate-steps
         env:
-          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
+          # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
+          # block provisions one Administrator before the engine starts, and every API read after that
+          # carries that account's session (harness/load/rigadmin.py). Two settings follow:
+          #   require_mfa off -- provision-admin enrols an authenticator app at a terminal and offers
+          #     no other way, so the rig account has none. The bind is loopback.
+          #   an [alerts] channel -- with sign-in on, an enforcing start refuses without a way to send
+          #     account-security notices. The gate reads configuration only; nothing listens there.
+          MEFOR_SECURITY_REQUIRE_MFA: "false"
+          MEFOR_ALERTS_EMAIL_SMTP_HOST: 127.0.0.1
+          MEFOR_ALERTS_EMAIL_SMTP_PORT: "2525"
+          MEFOR_ALERTS_EMAIL_FROM: rig-operator@example.invalid
+          MEFOR_ALERTS_EMAIL_TO: rig-operator@example.invalid
           MEFOR_LOAD_SINK_PORT: "2700"
           # THE PHI POSTURE'S GATES, provisioned the way ci.yml's `load test (smoke, sqlite)` leg does.
           # `serve --env dev` runs the secure PHI posture, so a keyless start, an unbounded retention
           # window and an unlisted egress each refuse at start. That leg's comment carries the reasoning;
           # this leg copies its provisions and adds nothing. The store key is minted in `run:` below.
-          # The security-notification gate is skipped because auth is off (no accounts to notify).
+          # The security-notification gate is met by the [alerts] channel above.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
           # BACKLOG #1967: each warn-only retention tier needs a window or its own ack under enforce.
@@ -91,6 +102,12 @@ jobs:
           # this; switch to `--cacert "$cert"` once it is on main.
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
           export MEFOR_HARNESS_TLS_KEY_FILE="$key"
+          # The rig Administrator, drawn for this run and masked before anything can echo it. Hex
+          # cannot spell a word on the engine's password deny-list. It is handed to each command
+          # that needs it and is never exported, so the engine's own environment never holds it.
+          rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+          echo "::add-mask::$rig_pw"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision --db ./bench.db
           python -m messagefoundry serve --config harness/config/load --env dev --db ./bench.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
@@ -101,7 +118,11 @@ jobs:
           done
           set +e
           if [ -n "$ready" ]; then
-            python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
+            # `run` first checks the engine refuses a request with no session, then signs in and
+            # hands the session to the load CLI as --token. Its exit code is the load CLI's.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+              --engine https://127.0.0.1:8765 --cacert "$cert" -- \
+              python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
               --db-backend sqlite --report-json out/load/reference-sqlite.json --report-csv out/load/reference-sqlite.csv
           else
             echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
@@ -195,9 +216,15 @@ jobs:
 
           asyncio.run(main())
           PY
-      - name: Serve (Postgres) + reference rate-steps
+      - name: Serve (Postgres), sign in + reference rate-steps
         env:
-          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
+          # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
+          # block provisions one Administrator before the engine starts, and the load CLI polls with
+          # that account's session (harness/load/rigadmin.py). require_mfa is off because
+          # provision-admin enrols an authenticator app at a terminal and offers no other way, so the
+          # rig account has none. This leg is at `warn` (below), where the notification gate that an
+          # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
+          MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
           # THE ENFORCEMENT DIAL, and why this leg needs it. The store hop to the Postgres container is
           # weakened TLS (job env above). Under the shipped `enforce`, the MEFOR_ALLOW_INSECURE_TLS
@@ -231,6 +258,13 @@ jobs:
           key="$GITHUB_WORKSPACE/api-generated-key.pem"
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
           export MEFOR_HARNESS_TLS_KEY_FILE="$key"
+          # No --db: the account goes into the server store MEFOR_STORE_* names, as serve opens it.
+          # The rig Administrator, drawn for this run and masked before anything can echo it. Hex
+          # cannot spell a word on the engine's password deny-list. It is handed to each command
+          # that needs it and is never exported, so the engine's own environment never holds it.
+          rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+          echo "::add-mask::$rig_pw"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision
           python -m messagefoundry serve --config harness/config/load --env dev \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
@@ -240,7 +274,10 @@ jobs:
           done
           set +e
           if [ -n "$ready" ]; then
-            python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
+            # Signed in, as the sqlite leg above: `run` hands the session to the load CLI as --token.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+              --engine https://127.0.0.1:8765 --cacert "$cert" -- \
+              python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
               --db-backend postgres --report-json out/load/reference-postgres.json --report-csv out/load/reference-postgres.csv
           else
             echo "::error::engine /health never answered over https verified against the pinned certificate $cert"
@@ -376,9 +413,15 @@ jobs:
         run: |
           /opt/mssql-tools18/bin/sqlcmd -b -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
             -Q "IF DB_ID('MessageFoundryFailover') IS NULL CREATE DATABASE MessageFoundryFailover; ALTER DATABASE MessageFoundryFailover SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE; ALTER DATABASE MessageFoundryFailover SET ALLOW_SNAPSHOT_ISOLATION ON;"
-      - name: Serve (SQL Server) + reference rate-steps
+      - name: Serve (SQL Server), sign in + reference rate-steps
         env:
-          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
+          # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
+          # block provisions one Administrator before the engine starts, and the load CLI polls with
+          # that account's session (harness/load/rigadmin.py). require_mfa is off because
+          # provision-admin enrols an authenticator app at a terminal and offers no other way, so the
+          # rig account has none. This leg is at `warn` (below), where the notification gate that an
+          # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
+          MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
           # THE ENFORCEMENT DIAL, and why this leg needs it. The store hop to the SQL Server container is
           # weakened TLS (job env above). Under the shipped `enforce`, the MEFOR_ALLOW_INSECURE_TLS
@@ -412,6 +455,13 @@ jobs:
           key="$GITHUB_WORKSPACE/api-generated-key.pem"
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
           export MEFOR_HARNESS_TLS_KEY_FILE="$key"
+          # No --db: the account goes into the server store MEFOR_STORE_* names, as serve opens it.
+          # The rig Administrator, drawn for this run and masked before anything can echo it. Hex
+          # cannot spell a word on the engine's password deny-list. It is handed to each command
+          # that needs it and is never exported, so the engine's own environment never holds it.
+          rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+          echo "::add-mask::$rig_pw"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision
           python -m messagefoundry serve --config harness/config/load --env dev \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
@@ -421,7 +471,10 @@ jobs:
           done
           set +e
           if [ -n "$ready" ]; then
-            python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
+            # Signed in, as the sqlite leg above: `run` hands the session to the load CLI as --token.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+              --engine https://127.0.0.1:8765 --cacert "$cert" -- \
+              python -m harness --load reference --engine https://127.0.0.1:8765 --sink-port 2700 \
               --db-backend sqlserver --report-json out/load/reference-sqlserver.json --report-csv out/load/reference-sqlserver.csv
           else
             echo "::error::engine /health never answered over https verified against the pinned certificate $cert"

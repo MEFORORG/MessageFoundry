@@ -45,21 +45,47 @@ Three measurement channels answer three different questions:
 ## Running
 
 The runner assumes an **already-running engine** (the harness never imports it — the `--db` backend
-choice is the whole point). Serve the synthetic high-fan-out system-under-test, then run a profile:
+choice is the whole point). The engine serves with sign-in on, so the run signs in: provision one
+Administrator, serve the synthetic high-fan-out system-under-test, then run a profile as that account.
 
 ```bash
-# 1) Serve the load config (its own ports, separate from harness/config). Tune via env (below).
+# 1) Draw a password for this run and provision the rig Administrator in the store.
+#    The password is read from the environment and is never an argument.
+export MEFOR_RIG_ADMIN_PASSWORD="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+python -m harness.load.rigadmin provision --db ./load.db
+
+# 2) Serve the load config (its own ports, separate from harness/config). Tune via env (below).
+MEFOR_SECURITY_REQUIRE_MFA=false \
 MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_TRANSFORM=edit MEFOR_LOAD_SINK_PORT=2700 \
   python -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 
-# 2) Drive it. --sink-port must match MEFOR_LOAD_SINK_PORT above.
-python -m harness --load fanout-baseline --engine https://127.0.0.1:8765 --cacert ./api-generated-cert.pem --token <T> \
+# 3) Drive it, signed in. `run` signs in and appends --token <session> to the command after `--`.
+#    --sink-port must match MEFOR_LOAD_SINK_PORT above.
+python -m harness.load.rigadmin run --engine https://127.0.0.1:8765 --cacert ./api-generated-cert.pem -- \
+  python -m harness --load fanout-baseline --engine https://127.0.0.1:8765 --cacert ./api-generated-cert.pem \
   --sink-port 2700 --report-json out/load/run.json --report-csv out/load/run.csv
 ```
 
 `python -m harness --list-profiles` lists the built-ins. `--load` accepts a built-in name **or** a
-path to a `.toml`. (If the engine enforces auth, pass `--token`; or serve with
-`MEFOR_SECURITY_REQUIRE_SIGN_IN=false` on a trusted dev box.)
+path to a `.toml`. To run as an account you already hold, skip `rigadmin` and pass its session as
+`--token`.
+
+### Rigs sign in
+
+Every rig that starts a real engine signs in to it. A rig is a CI leg or a harness runner
+(`--failover`, `--connscale`, `--estate`, `multishard`, `shardcert`). The helper is
+[`harness/load/rigadmin.py`](../harness/load/rigadmin.py). It is test tooling, and it adds no
+password input to any shipped command.
+
+A runner does the work itself. It provisions the rig Administrator in the store before it starts
+its nodes, and then signs in. You pass nothing.
+
+| When | What you do |
+|---|---|
+| You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it. `provision-admin` enrols an authenticator app at a terminal and offers no other way, so the rig account has none. |
+| That `serve` runs under `[security].enforcement = enforce` | Give it an `[alerts]` channel too. With sign-in on, an enforcing start refuses without a way to send account-security notices. The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) shows the settings. |
+| You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell. `provision-admin` declines when the store already has an Administrator, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs neither variable. |
+| The drive runs on a second box | Export the same two variables on both boxes. The drive signs in to engines another process started. |
 
 ### Engine load-config knobs (env, read at serve time)
 
@@ -195,10 +221,11 @@ python -m harness --failover failover --db-backend postgres --report-json out/lo
 What it does ([`harness/load/failover.py`](../harness/load/failover.py)):
 
 1. Spawns **two** `messagefoundry serve` subprocesses against the shared DB with `[cluster].enabled` and
-   tuned-short lease timings (from the profile's `[load.failover]` table), auth off, and the **same**
+   tuned-short lease timings (from the profile's `[load.failover]` table), sign-in on, and the **same**
    inbound MLLP ports — only the leader binds them, so the sender hits a fixed port and **reconnects
    through the rebind** (the floating-VIP collapsed to "one binder, one port" on a single host).
-2. Waits for one node to report `role = "primary"` (`GET /cluster/status`), then drives the profile's load.
+2. Waits for one node to report `role = "primary"` (`GET /cluster/status`, read as the rig Administrator
+   it provisioned in the shared store), then drives the profile's load.
 3. Partway through the measured phase (`kill_at_fraction`) it **SIGKILLs the current primary** — a faithful
    crash: uncommitted staged-handoff transactions roll back, committed-but-inflight rows are stranded for
    the survivor's on-promotion recovery, and the listen socket is released.
@@ -290,7 +317,7 @@ headroom denominator (in + out events, not messages). Exit codes match `--load`.
 - **PR gate:** the in-process load integration test (`tests/test_load_runner.py`) serves the engine,
   runs a tiny load, and asserts no-loss + exit 0 — it runs in the normal `test` job on every PR/OS.
 - **On-demand:** the `load-test` CI job (push-to-main + `workflow_dispatch`, Linux 1×) serves the load
-  config with auth off and drives the `smoke` profile through the real CLI, uploading the report.
+  config, signs in, and drives the `smoke` profile through the real CLI, uploading the report.
   Heavier `fanout-baseline` / `soak` runs and the backend comparison are run manually / locally.
 - **Failover (server DB):** `tests/test_load_failover_{postgres,sqlserver}.py` run the two-node primary-kill
   scenario against the real Postgres / SQL Server service containers, as steps in the `postgres store` and

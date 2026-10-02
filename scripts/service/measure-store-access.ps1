@@ -798,7 +798,7 @@ try {
         throw ("the service is configured to run as '$startName', not $ServiceIdentity; this arm " +
             "would not measure the default virtual account, so it measures nothing")
     }
-    # The key reaches the service the way the auth-off smoke above passes its own: NSSM's
+    # The key reaches the service the way the service smoke above passes its own: NSSM's
     # AppEnvironmentExtra, which docs/SERVICE.md documents. It is synthetic, per run, and masked.
     # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
     # non-loopback collector. The gate reads configuration only, so `siem.invalid` never resolving is
