@@ -205,6 +205,8 @@ from messagefoundry.api.multipart import (
 )
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
+    AuthenticatedBeforeBodyRoute,
+    answers_before_body,
     authorize_ws,
     client_ip,
     deadline_utc,
@@ -691,10 +693,14 @@ def _cookie_secure(request: Request) -> bool:
     )
 
 
+@answers_before_body
 async def _get_engine(request: Request) -> Engine:
     # ``async`` so FastAPI runs this provider on the event loop instead of taking a thread from the
     # shared AnyIO worker pool on every request (ASVS 15.4.4, BACKLOG #1195). It must stay
     # non-blocking: a blocking call here would stall the loop instead.
+    #
+    # Marked because it sits AHEAD of the gate on most routes, so its 503 is what a caller with no
+    # session gets from an app with no engine (vault BACKLOG #2739; see ``answers_before_body``).
     engine: Engine | None = getattr(request.app.state, "engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="engine not started")
@@ -1710,6 +1716,13 @@ def create_app(
         openapi_url="/openapi.json" if expose_docs else None,
         redirect_slashes=False,
     )
+    # Vault BACKLOG #2739: every route registered on this app from here on is built by this class,
+    # which refuses a caller with no identity BEFORE FastAPI reads the request body. Set before the
+    # first route is added, and on the router because ``FastAPI()`` takes no route class. The class
+    # says what it does not cover; a route reached through ``include_router`` is one. The engine
+    # includes no router. The route walk cannot see into one, so
+    # tests/test_preauth_malformed_body.py fails on the first that is added.
+    app.router.route_class = AuthenticatedBeforeBodyRoute
     if engine is not None:
         app.state.engine = engine
         # No notifier exists on this direct-construction path, so the gate's alerts log (its default).
