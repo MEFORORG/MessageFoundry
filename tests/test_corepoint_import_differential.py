@@ -2424,6 +2424,9 @@ def _label_statement_shapes() -> Iterator[Shape]:
         # A Catch must not swallow the refusal: main re-raises it ahead of every Catch.
         tried = Raw(f"<Try><List>{alone.xml}{catch}</List></Try>")
         yield Shape(f"2632-{tag}-send-main-refuses-in-a-try", "%ADT", (tried,))
+        # Where main DELIVERS it, main has no guard of its own to keep. The refusal needs one.
+        delivered = Raw(f"<Try><List>{carrying(tag, send).xml}{catch}</List></Try>")
+        yield Shape(f"2632-{tag}-send-in-a-try-main-delivers", "%ADT", (delivered,))
         yield Shape(f"2632-{tag}-send-naming-no-destination", "%ADT", (carrying(tag, unnamed),))
         yield Shape(
             f"2632-{tag}-flat-send-naming-no-destination",
@@ -2847,28 +2850,64 @@ def _handler_lines(src: str) -> list[str]:
     return [line for line in src.split("@handler")[-1].splitlines() if line]
 
 
-# A LOUD line: a live send, a refusal, or the guard that re-raises a refusal ahead of a Catch.
-_LOUD = re.compile(
-    r"^(\s*)(?:sends\.append\(Send\(|raise NotImplementedError\(|except NotImplementedError:)"
-)
+# The destination a refusal names, as the render writes it: ``to <name>``, or no name at all.
+_REFUSED_TO = re.compile(r'raise NotImplementedError\("Corepoint import: \S+ (?:to ([^:"]+)|\()')
+_TODO = re.compile(r"#\s*TODO: Corepoint (\S+)")
 
 
-def _loud(lines: Sequence[str]) -> Counter[int]:
-    """The loud lines among ``lines``, counted by indent. One at the handler's own level acts on
-    every message. The same line one level in is dead until someone writes the condition."""
-    return Counter(len(m.group(1)) for m in map(_LOUD.match, lines) if m is not None)
+def _loud(src: str) -> Counter[tuple[int, str]]:
+    """Every send and every refusal in ``src``, as ``(indent, destination)``. A refusal of a send
+    stands for that send, so the two share a key. One at the handler's own level acts on every
+    message; the same line one level in is dead until someone writes the condition. Keyed by the
+    destination too, so a send that goes cannot hide behind a refusal gained elsewhere."""
+    loud: Counter[tuple[int, str]] = Counter((indent, dest) for indent, dest, _ in _live_sends(src))
+    for line in src.splitlines():
+        if _REFUSAL.match(line):
+            named = _REFUSED_TO.search(line)
+            loud[(len(line) - len(line.lstrip()), named.group(1) or "" if named else "")] += 1
+    return loud
+
+
+def _swallowed(lines: Sequence[str]) -> int:
+    """How many ``try`` blocks hold a refusal and open on a handler other than the guard that
+    re-raises it. Every Catch renders as ``except Exception:``, which would catch the refusal and
+    run the Catch body in its place: a delivery, or a silent filter."""
+    count = 0
+    for at, line in enumerate(lines):
+        if line.strip() != "try:":
+            continue
+        indent = len(line) - len(line.lstrip())
+        body: list[str] = []
+        for later in lines[at + 1 :]:
+            if len(later) - len(later.lstrip()) <= indent:
+                count += any(map(_REFUSAL.match, body)) and not later.lstrip().startswith(
+                    "except NotImplementedError:"
+                )
+                break
+            body.append(later)
+    return count
+
+
+def _todos(lines: Sequence[str]) -> Counter[tuple[int, str]]:
+    """Every ``# TODO`` marker, as ``(indent, the word it names)``."""
+    return Counter(
+        (len(line) - len(line.lstrip()), m.group(1))
+        for line in lines
+        if (m := _TODO.search(line)) is not None
+    )
 
 
 def _quieter(was: _Out, now: _Out) -> list[str]:
     """Every way ``now`` is QUIETER than ``was``, which is main's tree as vendored. It must be
     none. The rule (ADR 0086 §2(b.4)):
 
-    (b) where main sends or refuses, ``now`` sends or refuses. No loud line goes, at any indent
-        (:func:`_loud`), and the handler's closing ``return`` is main's line. A refusal sends the
-        message to ERROR. With a comment in its place the handler returns an empty list or
+    (b) where main sends or refuses, ``now`` sends or refuses, at the same indent and to the same
+        destination (:func:`_loud`). No ``try`` swallows a refusal main's does not
+        (:func:`_swallowed`), and the handler's closing ``return`` is main's line. A refusal sends
+        the message to ERROR. With a comment in its place the handler returns an empty list or
         ``None``, and the message is FILTERED with nothing said.
-    (c) what main counted unmapped is still counted, name for name, and the handler holds at
-        least as many ``# TODO`` lines.
+    (c) what main counted unmapped is still counted, name for name, and every ``# TODO`` main
+        writes is still written, at its indent and naming the same word.
 
     LOUDER is allowed, and is the whole of what the amendment does: a delivery that becomes a
     refusal, a mapped step that becomes a counted TODO. Live code it must not add is clause (a),
@@ -2879,16 +2918,18 @@ def _quieter(was: _Out, now: _Out) -> list[str]:
         return []
     old, new = _handler_lines(was[0]), _handler_lines(now[0])
     found: list[str] = []
-    lost = _loud(old) - _loud(new)
+    lost = _loud(was[0]) - _loud(now[0])
     if lost:
-        found.append(f"(b) a send or a refusal of main's is gone, at indent {sorted(lost)}")
+        found.append(f"(b) a send or a refusal of main's is gone: {sorted(lost)}")
+    if _swallowed(new) > _swallowed(old):
+        found.append("(b) a Catch swallows a refusal")
     if new[-1] != old[-1]:
         found.append(f"(b) the handler ends on {new[-1]!r} where main ends on {old[-1]!r}")
     uncounted = Counter(_unmapped_names(was)) - Counter(_unmapped_names(now))
     if uncounted:
         found.append(f"(c) main counts {sorted(uncounted)} unmapped, and this does not")
-    if sum("# TODO" in line for line in new) < sum("# TODO" in line for line in old):
-        found.append("(c) a TODO line main writes is gone")
+    if _todos(old) - _todos(new):
+        found.append(f"(c) a TODO main writes is gone: {sorted(_todos(old) - _todos(new))}")
     return found
 
 
@@ -3142,6 +3183,20 @@ _QUIET_SEND = (
 )
 #: The fewest raw lists on which that control must turn the bound red.
 _QUIET_RAW_FLOOR = 300
+# Two more controls, each a mutant of the amended baseline: every handler takes the ``sends``
+# list, as the rule the Lander held did for a send off a Line; and a ``try`` never re-raises.
+_INLINE_FORM = "    inline_sends = _has_inline_send(h.steps)\n"
+_GUARDED = "        if _has_refused_send(ctrl.body):\n"
+_MUTANTS = {
+    "every-handler-takes-the-list": (_INLINE_FORM, "    inline_sends = True\n"),
+    "no-try-re-raises": (_GUARDED, "        if False:\n"),
+}
+
+
+def _mutant(name: str) -> Any:
+    return _load_step1(
+        f"_mefor_corepoint_import_step1_{name}", (*_STEP1_AMENDMENTS, _MUTANTS[name])
+    )
 
 
 def _quiet_baseline() -> Any:
@@ -3173,6 +3228,16 @@ def test_the_bound_sees_a_refusal_turned_into_a_quiet_filter() -> None:
         assert any(b.startswith(gone) for b in found), shape.name
     quieter = [name for name, xml in _RAW_LISTS if any(b[:3] == "(b)" for b in breaches(xml))]
     assert len(quieter) >= _QUIET_RAW_FLOOR
+    # Code review of this bound: a delivery that goes, beside a Try that gains a refusal and
+    # its guard. Counted by indent alone the two cancelled, and the bound stayed green.
+    later = _leaf_data(SendS(_ADT, "OB_B"), "%ADT")
+    assert later is not None
+    masked = (
+        '<Block Data="MsgSend %ADT [OB_A]"/><Try><List><If Data="If (x)"><List>'
+        + _line(later)
+        + '</List></If><Line Data="Catch"/></List></Try>'
+    )
+    assert any(b.startswith(gone) for b in breaches(masked))
     # Each clause of the rule, on one handler. main refuses this send and names no destination.
     lone = next(s for s in _label_statement_shapes() if s.name.endswith("-naming-no-destination"))
     was = _generate(step1_as_vendored, _render(lone.nodes, lone.inp))
@@ -3186,8 +3251,40 @@ def test_the_bound_sees_a_refusal_turned_into_a_quiet_filter() -> None:
     assert gone in said([*lines[:-2], lines[-1]])
     assert gone in said([*lines[:-2], "    " + lines[-2], lines[-1]])
     assert "(b) the handler ends on" in said([*lines[:-1], "    return sends"])
-    assert "(c) a TODO line main writes is gone" in said([*lines[:-3], *lines[-2:]])
+    assert "(c) a TODO main writes is gone" in said([*lines[:-3], *lines[-2:]])
     assert "(c) main counts ['MsgSend'] unmapped" in said(lines, ((0, [], 0),))
+    # A send that goes cannot hide behind a refusal gained at the same indent elsewhere.
+    elsewhere = lines[-2].replace("(no destination named)", "to OB_ELSEWHERE")
+    assert gone in said([*lines[:-2], elsewhere, lines[-1]])
+
+
+@pytest.mark.parametrize(
+    ("mutant", "seed", "breach"),
+    [
+        pytest.param(
+            "every-handler-takes-the-list",
+            "2632-Block-flat-send-naming-no-destination",
+            "(b) the handler ends on",
+            id="ending",
+        ),
+        pytest.param(
+            "no-try-re-raises",
+            "2632-Block-send-in-a-try-main-delivers",
+            "(b) a Catch swallows a refusal",
+            id="guard",
+        ),
+    ],
+)
+def test_the_bound_sees_each_mutant_of_the_ending_and_the_guard(
+    mutant: str, seed: str, breach: str
+) -> None:
+    """The bound's other two (b) checks can fail on generated code, not only on a hand-edited
+    string. Each mutant breaks one of them, and the bound is red on the seed written for it."""
+    shape = next(s for s in _label_statement_shapes() if s.name == seed)
+    xml = _render(shape.nodes, shape.inp)
+    assert not _breaches(xml, _generate(step1_as_vendored, xml), _generate(step1, xml))
+    found = _breaches(xml, _generate(step1_as_vendored, xml), _generate(_mutant(mutant), xml))
+    assert any(b.startswith(breach) for b in found), found
 
 
 def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:
