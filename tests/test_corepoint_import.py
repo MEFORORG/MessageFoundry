@@ -2121,6 +2121,28 @@ def test_a_demoted_label_changes_no_shape_around_it(
     assert marked.count(_ORPHAN) == control.count(_ORPHAN) == orphans
 
 
+def test_demoting_a_handlers_only_visible_send_adds_no_trailing_send() -> None:
+    """A handler with no send the render reaches ends on ``return Send(...)`` for every
+    destination in its tree, and main leaves one kind of send in the tree unrendered: a send in a
+    branch that another branch holds. So when a send label is the handler's only visible send,
+    demoting it must not move the handler to that form. It keeps its ``sends`` list, and delivers
+    nothing. The control is the same list with the label's send on a Line."""
+    hidden = (
+        '<Block Data="Matching &quot;M&quot;"><Line Data="Matching &quot;M&quot;"/>'
+        '<Line Data="MsgSend %ADT [OB_HIDDEN]"/></Block>'
+    )
+    marked, control = (
+        _handler_body(_handler_source(f"<Case>{hidden}{send}</Case>"))
+        for send in (
+            _labelled("Block", "MsgSend %ADT [OB_LABEL]"),
+            '<Line Data="MsgSend %ADT [OB_LABEL]"/>',
+        )
+    )
+    assert _LABEL_MARKER in marked and "Send(" not in marked
+    assert "    return sends" in marked and "    return sends" in control
+    assert 'Send("OB_HIDDEN"' not in control and 'Send("OB_LABEL", msg)' in control
+
+
 def test_a_wrappers_marker_stays_where_the_wrapper_sat() -> None:
     """Source order. A marker is not moved ahead of a construct it follows. Where that construct
     adopts a branch written after the wrapper, the marker follows the whole chain."""

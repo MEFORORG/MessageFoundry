@@ -1435,7 +1435,7 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
         if (
             isinstance(step, Control)
             and step.kind in _BRANCH_PARENT
-            and all(isinstance(held, LabelMarker) for held in step.body)
+            and all(isinstance(inner, LabelMarker) for inner in step.body)
         ):
             if marker is None:
                 body = tuple(steps[:i])
@@ -1645,10 +1645,11 @@ def _parse_statement(
         # neither counts as mapped. The label keeps the SHAPE the element had. It remembers its
         # kind for the branch-group test, and a send's body stays at the element's own level,
         # where a construct ending it may adopt a branch written after the element.
-        demoted = Control("block", tag, statement, body=tuple(marker), demoted_from=kind)
-        if kind == "send":
-            return [demoted, *body]
-        return [replace(demoted, body=(*marker, *body))]
+        beneath, after = ((), body) if kind == "send" else (body, [])
+        return [
+            Control("block", tag, statement, body=(*marker, *beneath), demoted_from=kind),
+            *after,
+        ]
 
     if not data and any(_structural_kind(s) == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
@@ -2796,8 +2797,15 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 
 
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
-    """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list."""
-    return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
+    """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list.
+
+    A send label demoted to a marker (BACKLOG #2632) still selects that form. Without it, taking
+    a handler's only visible send away would move the handler to the trailing ``return Send(...)``
+    form, which delivers every destination :func:`_collect_sends` finds, including a send the
+    render never reaches."""
+    return _any_live_control(
+        steps, lambda ctrl: (ctrl.kind == "send" and bool(ctrl.args)) or ctrl.demoted_from == "send"
+    )
 
 
 def _has_refused_send(steps: tuple[Step, ...]) -> bool:
