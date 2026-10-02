@@ -15,7 +15,13 @@ cover a CRL block placed inside a CA bundle, which ``load_verify_locations`` loa
 nothing here records. The monitor takes one :func:`snapshot` per pass, asks it for the copies live
 contexts still hold, and judges the soonest of those and the file. A held copy of a file no monitor
 row names, such as an inbound ``tls_crl_file`` given as a deferred ``env()`` value, gets its own row.
-So the alert stays up until every context holding the old copy is gone: a restart or a rebuild.
+So the alert stays up until every context holding the old copy is gone or has been brought current.
+
+**A held copy can be brought current without a restart.** :mod:`messagefoundry.pipeline.crl_reload`
+adds a replaced file to each context that holds an older copy, then calls :func:`replace_held_copy`,
+so the record describes what the context now checks against. It refuses a replacement it cannot
+apply exactly, and records why with :func:`record_reload_refusal`, so the monitor can say why the copy
+is still old.
 
 **The registry holds each context WEAKLY.** An entry lasts exactly as long as the context it describes.
 A throwaway context (a ``check`` dry run, a ``verify`` probe, a test) drops out when it is collected,
@@ -55,14 +61,20 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from messagefoundry.pki import CrlFacts
+    from messagefoundry.pki import CrlBlock, CrlFacts
 
 __all__ = [
     "HeldCrl",
     "HeldCrlSnapshot",
+    "ReloadRefusal",
+    "clear_reload_refusal",
     "crl_fingerprint",
+    "held_contexts",
     "held_crl_copies",
     "record_crl_load",
+    "record_reload_refusal",
+    "reload_refusal",
+    "replace_held_copy",
     "snapshot",
 ]
 
@@ -82,6 +94,23 @@ class HeldCrl:
     fingerprint: tuple[int, int]
     facts: CrlFacts
     setting: str | None = None
+    #: Every CRL block of that load. A reload needs them to prove the replacement supersedes each
+    #: one; empty means unknown, and a reload then refuses rather than guess.
+    blocks: tuple[CrlBlock, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReloadRefusal:
+    """Why the file now at a held path was not applied to a running context (BACKLOG #299).
+
+    ``fingerprint`` is the refused file's :func:`crl_fingerprint`, so a refusal stops applying the
+    moment the file changes again. ``restart_applies`` says whether a restart would load the file:
+    True when only the live context is in the way, such as a replacement no newer than the copy it
+    holds; False when the engine would refuse to start on the file too."""
+
+    fingerprint: tuple[int, int]
+    reason: str
+    restart_applies: bool
 
 
 # Keyed by context, held weakly: an entry lives exactly as long as its context. A context may load
@@ -90,6 +119,8 @@ class HeldCrl:
 # event loop) racing a monitor read on another; the copy below is taken under it, so the monitor
 # never iterates the live mapping.
 _HELD: weakref.WeakKeyDictionary[ssl.SSLContext, tuple[HeldCrl, ...]] = weakref.WeakKeyDictionary()
+# The latest refusal per path key. Keys are configured CRL paths, so this stays small.
+_REFUSED: dict[str, ReloadRefusal] = {}
 _LOCK = threading.Lock()
 
 
@@ -104,13 +135,75 @@ def crl_fingerprint(pem: bytes) -> tuple[int, int]:
 
 
 def record_crl_load(
-    ctx: ssl.SSLContext, crl_file: str, pem: bytes, facts: CrlFacts, *, setting: str | None = None
+    ctx: ssl.SSLContext,
+    crl_file: str,
+    pem: bytes,
+    facts: CrlFacts,
+    *,
+    setting: str | None = None,
+    blocks: tuple[CrlBlock, ...] = (),
 ) -> None:
-    """Record that ``ctx`` now holds the CRL file ``crl_file``, whose judged bytes were ``pem`` and
-    whose soonest-expiring block is ``facts``. Called by ``harden_crl_check`` after a load succeeds."""
-    held = HeldCrl(_path_key(crl_file), crl_fingerprint(pem), facts, setting)
+    """Record that ``ctx`` now holds the CRL file ``crl_file``, whose judged bytes were ``pem``,
+    whose soonest-expiring block is ``facts`` and whose blocks are ``blocks``. Called by
+    ``harden_crl_check`` after a load succeeds."""
+    held = HeldCrl(_path_key(crl_file), crl_fingerprint(pem), facts, setting, blocks)
     with _LOCK:
         _HELD[ctx] = (*_HELD.get(ctx, ()), held)
+
+
+def _copy_items() -> list[tuple[ssl.SSLContext, tuple[HeldCrl, ...]]]:
+    """A copy of the registry, taken under the lock.
+
+    A context collected while the copy is taken can make ``WeakKeyDictionary`` raise
+    ``RuntimeError``, since its removal callback does not take this lock. The copy is retried rather
+    than letting one pass fall back to the file alone, which is the gap this module closes."""
+    for _ in range(3):
+        try:
+            with _LOCK:
+                return list(_HELD.items())
+        except RuntimeError:
+            continue
+    with _LOCK:
+        return list(_HELD.items())
+
+
+def held_contexts() -> list[tuple[ssl.SSLContext, HeldCrl]]:
+    """Every live context and each CRL load it holds, one pair per load.
+
+    The pairs hold the contexts STRONGLY, so a caller keeps the list for one pass only."""
+    return [(ctx, held) for ctx, loads in _copy_items() for held in loads]
+
+
+def replace_held_copy(ctx: ssl.SSLContext, old: HeldCrl, new: HeldCrl) -> bool:
+    """Record that ``ctx`` now checks against ``new`` where it held ``old``. Returns False, changing
+    nothing, when ``ctx`` no longer holds ``old``."""
+    with _LOCK:
+        loads = _HELD.get(ctx)
+        if loads is None or not any(load is old for load in loads):
+            return False
+        _HELD[ctx] = tuple(new if load is old else load for load in loads)
+        return True
+
+
+def record_reload_refusal(path: str | os.PathLike[str], refusal: ReloadRefusal) -> None:
+    """Record why the file now at ``path`` was not applied to a running context."""
+    with _LOCK:
+        _REFUSED[_path_key(path)] = refusal
+
+
+def reload_refusal(
+    path: str | os.PathLike[str], fingerprint: tuple[int, int]
+) -> ReloadRefusal | None:
+    """The refusal recorded for the file at ``path`` whose bytes have ``fingerprint``, if any."""
+    with _LOCK:
+        refusal = _REFUSED.get(_path_key(path))
+    return refusal if refusal is not None and refusal.fingerprint == fingerprint else None
+
+
+def clear_reload_refusal(path: str | os.PathLike[str]) -> None:
+    """Forget any refusal for ``path``, because every context holding it is now current."""
+    with _LOCK:
+        _REFUSED.pop(_path_key(path), None)
 
 
 class HeldCrlSnapshot:
@@ -119,10 +212,13 @@ class HeldCrlSnapshot:
     One snapshot per pass keeps the pass linear in the number of held copies. A lookup per row
     against the live registry would take the lock and copy every entry once per row."""
 
-    def __init__(self, copies: Iterable[HeldCrl]) -> None:
+    def __init__(
+        self, copies: Iterable[HeldCrl], refusals: dict[str, ReloadRefusal] | None = None
+    ) -> None:
         self._by_path: dict[str, list[HeldCrl]] = {}
         for held in copies:
             self._by_path.setdefault(held.path_key, []).append(held)
+        self._refusals = dict(refusals or {})
 
     def copies(self, path: str | os.PathLike[str]) -> list[HeldCrl]:
         """Every copy of the CRL file at ``path`` held at the snapshot, one per load.
@@ -130,6 +226,14 @@ class HeldCrlSnapshot:
         Two settings that name one file share its copies, because the key is the file: a stale copy
         held by either hop is a stale copy of that file."""
         return list(self._by_path.get(_path_key(path), ()))
+
+    def refusal(
+        self, path: str | os.PathLike[str], fingerprint: tuple[int, int]
+    ) -> ReloadRefusal | None:
+        """Why the file at ``path``, whose bytes have ``fingerprint``, was not applied to a running
+        context, or ``None`` when no reload refused those bytes."""
+        refusal = self._refusals.get(_path_key(path))
+        return refusal if refusal is not None and refusal.fingerprint == fingerprint else None
 
     def unwatched(self, watched: Iterable[str | os.PathLike[str]]) -> list[str]:
         """The held paths that no entry of ``watched`` names, sorted, each once, in key form
@@ -139,19 +243,11 @@ class HeldCrlSnapshot:
 
 
 def snapshot() -> HeldCrlSnapshot:
-    """The copies live contexts hold now.
-
-    A context collected while the copy is taken can make ``WeakKeyDictionary`` raise
-    ``RuntimeError``, since its removal callback does not take this lock. The copy is retried
-    rather than letting one pass fall back to the file alone, which is the gap this module closes."""
-    for _ in range(3):
-        try:
-            with _LOCK:
-                return HeldCrlSnapshot([held for loads in list(_HELD.values()) for held in loads])
-        except RuntimeError:
-            continue
+    """The copies live contexts hold now, and the reload refusals that explain any still old."""
+    items = _copy_items()
     with _LOCK:
-        return HeldCrlSnapshot([held for loads in list(_HELD.values()) for held in loads])
+        refusals = dict(_REFUSED)
+    return HeldCrlSnapshot([held for _, loads in items for held in loads], refusals)
 
 
 def held_crl_copies(path: str | os.PathLike[str]) -> list[HeldCrl]:

@@ -438,8 +438,9 @@ def _judge_crl(
     differs from the file is judged too, and the soonest ``nextUpdate`` of the file and those copies
     decides, by the rule the file's own blocks follow (:func:`~messagefoundry.pki.soonest_crl`).
 
-    The alert therefore stays up until every context holding the old copy is gone: a restart, or a
-    rebuild of that hop. A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
+    The alert therefore stays up until no context holds the old copy: the reload pass applied the file
+    to it (:mod:`messagefoundry.pipeline.crl_reload`), or a restart or a rebuild of that hop replaced
+    it. A copy the reload refused names the refusal in the log line. A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
     silences the check while a hop still holds a copy of it. ``None`` only when nothing can be judged.
     A failure judging the held copies is logged and leaves the file's own verdict standing."""
     stale: list[CrlFacts] = []
@@ -463,7 +464,17 @@ def _judge_crl(
                     "Restore a valid CRL file before restarting: the engine refuses to start "
                     "on one it cannot parse",
                 )
+            elif (refused := held.refusal(cert.path, crl_fingerprint(pem))) is not None:
+                # BACKLOG #299: the reload pass tried the file on the running hop and refused it.
+                why = "that differs from the file, which the engine refused to apply to it"
+                remedy = f"Reason: {refused.reason}. " + (
+                    "Restart the engine to apply the file"
+                    if refused.restart_applies
+                    else "Fix the file: the engine would refuse to start on it too"
+                )
             else:
+                # The reload pass applies a replaced file to the running hop within about a minute
+                # (pipeline/crl_reload.py); a restart applies it at once.
                 why, remedy = "that differs from the file", "Restart the engine to apply the file"
             holders = sorted({copy.setting or "a connection's tls_crl_file" for copy in copies})
             log.warning(

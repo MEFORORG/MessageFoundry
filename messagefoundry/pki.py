@@ -32,7 +32,9 @@ from messagefoundry.keywrap import refuse_weak_pkcs12
 
 __all__ = [
     "CertFacts",
+    "CrlBlock",
     "CrlFacts",
+    "read_crl_blocks",
     "read_crl_facts",
     "read_every_crl_facts",
     "read_soonest_crl_facts",
@@ -253,6 +255,45 @@ def _is_delta_crl(block: bytes) -> bool:
     except x509.DuplicateExtension as exc:
         raise ValueError(f"the CRL carries a duplicate extension: {exc}") from exc
     return True
+
+
+@dataclass(frozen=True)
+class CrlBlock:
+    """One CRL in a file, in the terms OpenSSL uses to choose between CRLs (BACKLOG #299).
+
+    A running context can only gain CRLs. Among the CRLs it holds for one issuer, OpenSSL uses a
+    current one with the latest ``thisUpdate``. So whether a replacement file can be added to a live
+    context, and leave that context judging exactly what the file says, turns on these fields.
+    ``fingerprint`` is the SHA-256 of the CRL's DER, so an unchanged CRL is recognised however its
+    PEM is wrapped."""
+
+    issuer: str
+    this_update: datetime.datetime
+    next_update: datetime.datetime
+    fingerprint: bytes
+
+
+def read_crl_blocks(pem: bytes) -> list[CrlBlock]:
+    """Every CRL in ``pem``, in file order, as :class:`CrlBlock` (BACKLOG #299).
+
+    Call it on bytes :func:`read_every_crl_facts` has already accepted. It raises ``ValueError`` on a
+    block with no ``nextUpdate`` and lets a parse error through, so it is no substitute for that
+    function's checks."""
+    blocks: list[CrlBlock] = []
+    for block in _crl_blocks(pem):
+        crl = x509.load_pem_x509_crl(block)
+        nxt = crl.next_update_utc
+        if nxt is None:
+            raise ValueError("the CRL carries no nextUpdate, so its freshness cannot be checked")
+        blocks.append(
+            CrlBlock(
+                issuer=crl.issuer.rfc4514_string(),
+                this_update=crl.last_update_utc,
+                next_update=nxt,
+                fingerprint=crl.fingerprint(hashes.SHA256()),
+            )
+        )
+    return blocks
 
 
 def soonest_crl(facts: list[CrlFacts]) -> CrlFacts:
