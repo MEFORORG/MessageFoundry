@@ -38,9 +38,9 @@ from harness.scenarios.hostile import (
 )
 from harness.sinks import Record
 from messagefoundry.apiclient import EngineClient
+from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.pipeline import ingress_guards
 
 # The shared fixture, imported rather than copied, so the readiness test that drives the
 # test_harness_scenarios copy covers this one too.
@@ -242,11 +242,11 @@ def test_expected_delivery_follows_the_documented_rules() -> None:
 
 
 def test_the_raw_only_alphabet_holds_every_byte_the_engine_refuses_to_write() -> None:
-    # The harness puts these back raw after the encode, so it must cover the model's refusal set
-    # and the frame bytes ingress refuses; it reads the model's tables, and this pins the ingress
-    # guard's copy in step with them.
+    # The harness puts these back raw after the encode, so it must cover what a whole-field write
+    # refuses and what a leaf write escapes. The engine-side tables are pinned to each other in
+    # tests/test_one_frame_one_message.py.
     raw_only = set(hostile._RAW_ONLY)
-    assert set(ingress_guards._MLLP_FRAME_CHARS) | {chr(0)} <= raw_only
+    assert set(message_module._STRUCTURE_REFUSED) <= raw_only
     assert {chr(cp) for cp in range(0x20) if cp not in (0x09, 0x0A, 0x0D)} <= raw_only
     assert {"\t", "\r", "\n"}.isdisjoint(raw_only)
 

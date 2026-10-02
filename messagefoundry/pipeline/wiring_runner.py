@@ -6606,9 +6606,10 @@ class RegistryRunner:
                 # outbound payload is retained on the done row for parity comparison. (A
                 # capturing/reingress_to outbound therefore captures nothing in simulate.)
                 # ADR 0205 rule 1 lives in send(), which shadow skips, so run its check here: a
-                # payload a live MLLP/TCP send would dead-letter dead-letters in shadow too.
-                if (check := _frame_check(connector)) is not None:
-                    check(await self._hydrate_payload(item.payload))
+                # payload a live MLLP/TCP send would dead-letter dead-letters in shadow too. The
+                # stored payload, not the hydrated one: hydration splices back only base64, which
+                # holds no frame byte, so the store read would buy nothing.
+                connector.check_frame(item.payload)
                 response = None
             else:
                 # PHASE (a): the connector send->ACK round-trip. On a real cross-box outbound this is
@@ -6905,13 +6906,14 @@ class RegistryRunner:
             # ADR 0205 rule 1, per member: one member the frame cannot carry is dead-lettered alone
             # and the rest batch, rather than all N dying on one envelope offset. It runs before the
             # shadow branch below, so a simulate outbound records the same dispositions.
-            kept = await self._dead_letter_unframeable_members(name, connector, items, hydrated)
+            kept, members = await self._dead_letter_unframeable_members(
+                name, connector, items, hydrated
+            )
             if not kept:
                 return _ItemOutcome.PROCESSED, None  # every member dead-lettered; nothing to send
-            ids = [it.id for it, _ in kept]
-            first = kept[0][0]  # the envelope's head is the first member that survived
+            ids = [it.id for it in kept]
+            first = kept[0]  # the envelope's head is the first member that survived
             control_id = Message.parse(first.payload).control_id or first.id  # FIFO-aligned, stable
-            members: list[Message | str] = [payload for _, payload in kept]
             envelope = encode_batch(
                 members,
                 control_id=control_id,
@@ -6981,19 +6983,21 @@ class RegistryRunner:
         return _ItemOutcome.PROCESSED, retry_until
 
     async def _dead_letter_unframeable_members(
-        self, name: str, connector: object, items: Sequence[OutboxItem], payloads: Sequence[str]
-    ) -> list[tuple[OutboxItem, str]]:
-        """The batch members ``connector``'s frame can carry, each with its hydrated payload; every
-        other member is dead-lettered here, alone (ADR 0205 rule 1). A connector with no
-        ``check_frame`` keeps every member. The refusal text names a byte and an offset in that
-        member, never content, and the dead-letter is permanent like the single-row refusal."""
-        check = _frame_check(connector)
-        if check is None:
-            return list(zip(items, payloads, strict=True))
-        kept: list[tuple[OutboxItem, str]] = []
+        self,
+        name: str,
+        connector: DestinationConnector,
+        items: Sequence[OutboxItem],
+        payloads: Sequence[str],
+    ) -> tuple[list[OutboxItem], list[Message | str]]:
+        """The batch members ``connector``'s frame can carry, and their hydrated payloads; every
+        other member is dead-lettered here, alone (ADR 0205 rule 1). The refusal text names a byte
+        and an offset in that member, never content, and the dead-letter is permanent like the
+        single-row refusal."""
+        kept: list[OutboxItem] = []
+        kept_payloads: list[Message | str] = []
         for item, payload in zip(items, payloads, strict=True):
             try:
-                check(payload)
+                connector.check_frame(payload)
             except NegativeAckError as exc:
                 log.warning(
                     "delivery worker %r: batch member %s cannot be framed (%s); dead-lettered "
@@ -7004,8 +7008,9 @@ class RegistryRunner:
                 )
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
             else:
-                kept.append((item, payload))
-        return kept
+                kept.append(item)
+                kept_payloads.append(payload)
+        return kept, kept_payloads
 
     def _lane_stopping_fault(self, exc: NegativeAckError) -> _LaneFault | None:
         """Which connection fault ``exc`` is, when it must STOP the lane and keep the queue:
@@ -8596,16 +8601,6 @@ class RegistryRunner:
             return True
         except TimeoutError:
             return False
-
-
-def _frame_check(connector: object) -> Callable[[str], None] | None:
-    """The connector's ADR 0205 rule 1 check, or ``None`` for a connector that does not frame.
-
-    MLLP and TCP destinations run the check inside ``send()``; the delivery stage calls it directly
-    where no single-payload send runs (a batch member, a shadow outbound). Looked up by name so a
-    connector need not inherit anything to offer it, as ``consumes_metadata`` is."""
-    check = getattr(connector, "check_frame", None)
-    return cast("Callable[[str], None]", check) if callable(check) else None
 
 
 def _hl7_batch_timestamp(created_at: float | None) -> str:

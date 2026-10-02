@@ -80,7 +80,7 @@ from messagefoundry.generators import (
 )
 from messagefoundry.parsing import HL7PeekError, normalize
 from messagefoundry.parsing._builtin_hl7 import _HEX_ESCAPED_CONTROLS
-from messagefoundry.parsing.message import _STRUCTURE_REFUSED, Message, reencode_with_separators
+from messagefoundry.parsing.message import Message, reencode_with_separators
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
 #: The data file of hostile values, loaded at run time.
@@ -103,10 +103,9 @@ _EXPECTS = frozenset({"processed", "error"})
 _END_BLOCK = 0x1C
 _LINE_BREAKS = ("\r\n", "\r", "\n")
 #: Characters the model will not write raw (ADR 0205 rules 2 and 3): a leaf write hex-escapes each
-#: of the first set, and a whole-field write refuses each of the second (MLLP's two frame bytes and
-#: NUL). Read from the model's own tables, so a widening there reaches here. A hostile value needs
-#: them raw on the wire.
-_RAW_ONLY = tuple(sorted(set(_HEX_ESCAPED_CONTROLS) | set(_STRUCTURE_REFUSED)))
+#: one, and a whole-field write refuses the MLLP frame bytes and NUL among them. Read from the
+#: model's own table, so a widening there reaches here. A hostile value needs them raw on the wire.
+_RAW_ONLY = _HEX_ESCAPED_CONTROLS
 
 
 @dataclass(frozen=True)

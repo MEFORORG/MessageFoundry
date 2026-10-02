@@ -70,10 +70,12 @@ as the accepted draft wrote them except where a point below says otherwise.
      is the same content-free permanent failure other destinations already raise. Before this change
      it escaped from `frame()` as a bare `UnicodeEncodeError`.
    - *Added 2026-10-02, in review.* The check alone is `check_frame_bytes` in the same module, and
-     the MLLP and TCP destinations offer it as `check_frame`. The delivery stage calls it where no
+     the MLLP and TCP destinations offer it as `check_frame`, a no-op hook on `DestinationConnector`
+     that only they override. The delivery stage calls it where no
      single-payload `send()` runs: on each member of an MLLP batch before the envelope is built,
      and on a simulate (shadow) outbound, which never calls `send()`. `send()` still checks the
-     bytes it frames.
+     bytes it frames. A shadow single send checks the stored payload without re-attaching a
+     detached document, since the re-attach splices back only base64, which holds no frame byte.
 2. **A leaf write through the HL7 model never emits a raw control character.** On a component or
    subcomponent write, each C0 control character and DEL except TAB is written as an HL7 hex escape
    (`\X0B\`, uppercase digits), so a value that arrived hex-escaped leaves hex-escaped. CR and LF
@@ -203,12 +205,12 @@ separators raw).
 - **AC-12** (*added 2026-10-02, in review*) -- IF one member of an MLLP batch holds the codec's start
   or end byte, THEN THE SYSTEM SHALL dead-letter that member alone, permanently and with
   content-free text, and SHALL send the rest as one envelope.
-  -> `tests/test_one_frame_one_message.py::test_a_bad_batch_member_is_dead_lettered_alone`,
-  `tests/test_one_frame_one_message.py::test_a_batch_whose_every_member_is_bad_sends_nothing`
+  -> `tests/test_outbound_batch.py::test_a_member_holding_a_frame_byte_is_dead_lettered_alone`,
+  `tests/test_outbound_batch.py::test_a_batch_whose_every_member_holds_a_frame_byte_sends_nothing`
 - **AC-13** (*added 2026-10-02, in review*) -- WHEN an MLLP or TCP outbound runs in simulate
   (shadow) mode, THE SYSTEM SHALL record the disposition rule 1 would give a live send.
-  -> `tests/test_one_frame_one_message.py::test_a_shadow_outbound_dead_letters_what_live_would`,
-  `tests/test_one_frame_one_message.py::test_a_bad_batch_member_is_dead_lettered_alone`
+  -> `tests/test_one_frame_one_message.py::test_a_shadow_outbound_records_what_a_live_send_would`,
+  `tests/test_outbound_batch.py::test_a_member_holding_a_frame_byte_is_dead_lettered_alone`
 
 Every criterion's test except AC-3 and the controls failed on the code before this change, measured
 by running them against `origin/main` `ed2b60bf89` with the new names stubbed to the old behaviour.
@@ -292,7 +294,7 @@ cannot hold is now a content-free permanent failure on MLLP and TCP too.
   review*) a Handler that sends a `str` or a `RawMessage` it built holding a raw `0x0B` or `0x1C`:
   that previews clean and dead-letters live. Filed as vault #2824.
 - *2026-10-02, in review:* a shadow (simulate) outbound and each member of an MLLP batch now run
-  rule 1's check too, through `check_frame` on the MLLP and TCP destinations, so neither previews
+  rule 1's check too, through the destination's `check_frame` hook, so neither previews
   or batches what a live single send would refuse. That is the delivery stage, not the dry-run, so
   it does not close vault #2824.
 - On a persistent connection that a reload is closing, a payload refused at rule 1 dead-letters
