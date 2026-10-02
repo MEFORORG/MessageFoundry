@@ -679,9 +679,10 @@ def test_the_dicom_extra_admits_only_the_pynetdicom_line_the_server_was_read_aga
 
     ``_admitting_server_class`` was read against pynetdicom 3.0.4. The routing guard above refuses a
     release that left the hooks, but only when the listener starts. The cap in ``pyproject.toml``
-    stops one at install time (vault BACKLOG #2713). RED when someone widens that cap. Before you
-    change the versions below, re-read ``_admitting_server_class`` against the new release; the
-    comment above the extra in ``pyproject.toml`` has the steps.
+    stops a 3.1 or later at install time (vault BACKLOG #2713). RED when someone widens that cap or
+    lowers the floor. A 3.0.x patch above 3.0.4 is still admitted, and the routing guard is what
+    covers one. Before you change the versions below, re-read ``_admitting_server_class`` against
+    the new release; the comment above the extra in ``pyproject.toml`` has the steps.
     """
     import tomllib
     from importlib.metadata import version
@@ -706,8 +707,9 @@ def test_the_dicom_extra_admits_only_the_pynetdicom_line_the_server_was_read_aga
     assert spec.contains(version("pynetdicom"), prereleases=True), (
         f"these tests ran on pynetdicom {version('pynetdicom')}, which [dicom] ({spec}) refuses"
     )
-    # 3.1.0.dev0 is a real development release on PyPI, so pre-releases are checked too.
-    for unread in ("3.1.0.dev0", "3.1.0", "4.0.0"):
+    # 3.0.3 is the release below the one read. 3.1.0.dev0 is a real development release on PyPI, so
+    # pre-releases are checked too.
+    for unread in ("3.0.3", "3.1.0.dev0", "3.1.0", "4.0.0"):
         assert not spec.contains(unread, prereleases=True), (
             f"[dicom] ({spec}) admits pynetdicom {unread}, which the admitting server was never "
             "read against"

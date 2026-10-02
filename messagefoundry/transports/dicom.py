@@ -257,10 +257,10 @@ def _admitting_server_class() -> type[Any]:
 
     **Read against pynetdicom 3.0.4 and CPython's ``socketserver``; re-read both before raising the
     pynetdicom cap in the ``[dicom]`` extra.** ``pyproject.toml`` holds that cap at the release line
-    this was read against, so a newer pynetdicom is stopped at install time; the comment above the
-    extra there gives the bound and the steps to raise it. :func:`_require_socketserver_routing`
-    refuses a pynetdicom that left this routing, and ``tests/test_dicom_scp_admission.py`` pins the
-    rest.
+    this was read against, so a later line is stopped at install time. A patch release of the same
+    line can still arrive unread. The comment above the extra there gives the bound and the steps to
+    raise it. :func:`_require_socketserver_routing` refuses a pynetdicom that left this routing, and
+    ``tests/test_dicom_scp_admission.py`` pins the rest.
 
     * ``AssociationServer.get_request`` accepts a connection and, on a TLS listener, runs the TLS
       handshake in the same call. That call is on the accept loop, and the accepted socket has no
