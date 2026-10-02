@@ -51,7 +51,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a provider module by name | Two provider seams | Off unless you name an external provider |
 | 4 | Starting processes | 11 modules | Varies, see below |
-| 5 | Calling native libraries | 17 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 18 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -155,7 +155,7 @@ de-identification leak check only, and is not on the message path.
 | `service.py` | `sc.exe`, and elevated `cmd.exe` and `powershell.exe` | Service status, start, stop, restart and install | argument list, ShellExecute |
 | `service_status.py` | `sc.exe query` | Reading the service's state | argument list |
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
-| `store/store.py` | `icacls.exe` | Setting owner-only permissions on store and key files | argument list |
+| `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
 | `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
 | `tray/app.py` | The default editor | Opening `tray.toml` from the tray | os.startfile |
@@ -240,12 +240,17 @@ reach one:
 
 ## 5. Native library calls
 
-17 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+18 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- Key file creation: `restricted_file.py`, which on Windows calls `kernel32`'s `CreateFileW` with
+  the file's access list attached and `CREATE_NEW`, so a file that holds a key is restricted in
+  the call that creates it and an existing file or link is refused. It asks `advapi32` to build
+  that list and to resolve an account name to its SID. POSIX needs no `ctypes` for this; it
+  creates the file with `O_CREAT | O_EXCL` and mode `0o600`
 - Log path check: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether View Log's
   drive letter is a mapped network drive, so it can refuse one before opening the file
 - Process and job control: `pipeline/sandbox.py`

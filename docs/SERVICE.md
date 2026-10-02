@@ -311,8 +311,9 @@ The key is a base64 32-byte secret. Two ways to supply it:
 
   ```powershell
   # mint + protect a fresh key (machine scope, so the service account can read it at startup).
-  # SYSTEM is granted read automatically (covers a LocalSystem service); for a virtual / gMSA service
-  # account add --grant-account '<that account>' so the service — not just you — can read the key:
+  # SYSTEM can always read the file (covers a LocalSystem service); for a virtual / gMSA service
+  # account add --grant-account '<that account>' so the service — not just you — can read the key.
+  # --out must be a NEW path: protect-key never replaces a file.
   messagefoundry protect-key --generate --out "C:\ProgramData\MessageFoundry\store.key.dpapi"
   #   (virtual account example: ... --grant-account "NT SERVICE\MessageFoundry")
   #   -> prints the base64 key ONCE to stderr; back it up offline (the file is machine-bound and
@@ -324,12 +325,18 @@ The key is a base64 32-byte secret. Two ways to supply it:
   ```
   Then **unset** `MEFOR_STORE_ENCRYPTION_KEY` (the env key takes precedence when both are set). The
   service account `CryptUnprotectData`s the file at startup; a missing/foreign/unreadable file makes
-  `serve` fail closed rather than store PHI unencrypted. `protect-key` locks the file to the minting
-  admin **plus** the service principal it grants read — SYSTEM by default, or `--grant-account` for a
-  virtual / gMSA account. It sets an explicit DACL with inheritance **disabled**, so the file does
-  **not** inherit the data-dir ACL — grant the right service account at mint time (above) rather than
-  relying on the directory. To rotate, `protect-key` a new key to the file and run `messagefoundry
-  rotate-key` with the prior key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3).
+  `serve` fail closed rather than store PHI unencrypted. `protect-key` creates the file
+  already restricted, with read for the one account `--grant-account` names (a virtual / gMSA
+  account). The file does **not** inherit the data-dir ACL, so grant the right service account at
+  mint time (above) rather than relying on the directory. If the file cannot be created restricted,
+  or `--out` already exists, the command exits non-zero and writes nothing. `serve` checks the file
+  before it uses it. Who the file is restricted to, what that check covers and what it does not are
+  stated once, in [PHI.md](PHI.md), "Key files". To rotate, `protect-key` the new key to a **new** path, point
+  `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
+  the rotation, once nothing still needs its key.
+  **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
+  after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:

@@ -544,8 +544,8 @@ def _let_local_users_read_cert(cert_path: Path) -> None:
     the service account, and the pair is minted there. The tray runs as the logged-on user with a
     filtered token, so without this it cannot read the file it has to pin, and it reads a running
     engine as down. The certificate is public: every client that connects receives it in the TLS
-    handshake, so letting local users read it discloses nothing. The key stays owner-only
-    (:func:`_write_private_key`).
+    handshake, so letting local users read it discloses nothing. The key stays restricted, as
+    :func:`_write_private_key` created it.
 
     Windows only, because the tray is. Best-effort, like ``store._secure_file``: a failed grant is
     logged and never stops the engine. The grant is ADDITIVE and names only this file; the

@@ -6,8 +6,8 @@ The store encryption key is normally supplied as base64 via ``MEFOR_STORE_ENCRYP
 cross-platform default). On Windows an operator may instead keep it in a **DPAPI-protected key file**
 (``[store].encryption_key_file``): ``CryptProtectData`` binds the ciphertext to this machine
 (``LOCAL_MACHINE`` scope), so a copied file is useless off the protecting host and the plaintext key
-never sits in the service's environment block (readable by any local admin). At startup the service
-account ``CryptUnprotectData``s the file back to the base64 key.
+never sits in the service's environment block (readable by any local user: docs/SERVICE.md). At
+startup the service account ``CryptUnprotectData``s the file back to the base64 key.
 
 DPAPI is **Windows-only**. Every entry point raises :class:`DpapiUnavailable` elsewhere so callers
 degrade gracefully to the env-var key — this module never imports anything Windows-specific at module
@@ -19,8 +19,15 @@ load, so it imports cleanly on Linux/macOS (CI lint leg) too. The ``ctypes.windl
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
+from collections.abc import Sequence
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
+#: Key files whose access this process has already checked, so a process that reads the key
+#: many times (each DR backup pass does) checks, and warns, once.
+_checked_key_files: set[str] = set()
 
 # CryptProtectData flags. LOCAL_MACHINE: any principal on THIS machine can unprotect — required so the
 # low-privilege *service account* (not just the installing admin) can read the key. UI_FORBIDDEN: never
@@ -110,22 +117,50 @@ def dpapi_unprotect(blob: bytes) -> bytes:
         kernel32.LocalFree(out_blob.pbData)
 
 
-def protect_key_to_file(key_b64: str, path: Path, *, machine_scope: bool = True) -> None:
-    """DPAPI-protect a base64 store key and write the ciphertext to ``path`` (raises on non-Windows
-    or a write failure). The caller should restrict the file's ACL afterwards (``_secure_file``)."""
+def protect_key_to_file(
+    key_b64: str, path: Path, *, machine_scope: bool = True, read_grants: Sequence[str] = ()
+) -> None:
+    """DPAPI-protect a base64 store key and write the ciphertext to a NEW, restricted ``path``.
+
+    The file is created restricted in the call that creates it, with read for each account in
+    ``read_grants`` (``restricted_file.write_restricted_file`` states the access list). Machine
+    scope lets any account on the host unprotect the blob, so the file's access list is what keeps
+    the key from the others, and it must hold from the file's first moment (vault BACKLOG #2601).
+
+    Raises :class:`DpapiUnavailable` off Windows and :class:`DpapiError` when the protect call
+    fails. The write raises what :func:`write_restricted_file` raises: ``FileExistsError`` when
+    ``path`` already exists (it is left untouched), and another ``OSError`` when the file cannot be
+    created restricted or the write fails. After a failure there is no new file."""
+    from messagefoundry.restricted_file import write_restricted_file
+
     blob = dpapi_protect(key_b64.strip().encode("ascii"), machine_scope=machine_scope)
-    try:
-        path.write_bytes(blob)
-    except OSError as exc:
-        raise DpapiError(f"cannot write protected key file {path}: {exc}") from exc
+    write_restricted_file(path, blob, read_grants=read_grants)
 
 
 def load_protected_key(path: str | Path) -> str:
     """Read and DPAPI-decrypt a key file into its base64 store key. Raises :class:`DpapiUnavailable`
-    off Windows or :class:`DpapiError` if the file is missing/unreadable/not decryptable here."""
+    off Windows or :class:`DpapiError` if the file is missing/unreadable/not decryptable here.
+
+    Every command that opens the store reads the key here, so this is where a key file a broad
+    group can read or change is WARNED about, whatever the command (vault BACKLOG #2601). Each file
+    is checked once in a process, after the key has unprotected. ``serve`` and ``supervise`` know
+    ``[security].enforcement``, so under ``enforce`` they refuse such a file before they open the
+    store."""
+    from messagefoundry.restricted_file import broad_access_problem
+
     p = Path(path)
     try:
         blob = p.read_bytes()
     except OSError as exc:
         raise DpapiError(f"cannot read encryption_key_file {p}: {exc}") from exc
-    return dpapi_unprotect(blob).decode("ascii").strip()
+    key = dpapi_unprotect(blob).decode("ascii").strip()
+    if str(p) not in _checked_key_files:
+        _checked_key_files.add(str(p))
+        problem = broad_access_problem(p)
+        if problem is not None:
+            _log.warning(
+                "the store key file named by [store].encryption_key_file is not restricted: %s. "
+                "Restrict it to the account the engine runs as, SYSTEM and Administrators.",
+                problem,
+            )
+    return key
