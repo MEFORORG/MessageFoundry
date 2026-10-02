@@ -51,7 +51,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time the tray starts and can build its branded launcher |
 | 4 | Starting processes | 11 modules | Varies, see below |
-| 5 | Calling native libraries | 18 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 19 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -293,7 +293,7 @@ reach one:
 
 ## 5. Native library calls
 
-18 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+19 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
@@ -317,6 +317,13 @@ pure-Python equivalent:
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`
+- Start-up code check: `startupcode.py`, which on Windows opens each directory the interpreter
+  reads start-up code from with `kernel32`'s `CreateFileW`, asking only for the right to add a
+  file or a folder. Those are the site directories and every directory on the import path, the
+  engine's own and the absolute `PYTHONPATH` entries it hands its Python children. Windows runs
+  its own access check against the engine's token, so the engine learns whether its account
+  could plant start-up code there. Nothing is created or changed. POSIX needs no `ctypes` for
+  this; it asks `os.access` (vault BACKLOG #2701)
 - Alternate file credentials: `transports/wincred.py`, covered in section 6
 
 **What holds them.** Every library whose code runs is loaded by a name fixed in the code, never by a
