@@ -106,8 +106,8 @@ def test_the_harness_entry_module_imports_without_the_engine() -> None:
 def test_the_probe_refuses_a_module_that_imports_the_engine() -> None:
     """Positive control: the same probe must fail on a harness module with a top-level engine
     import. Without this, a blocker that refuses nothing would pass the test above forever."""
-    control = "harness.scenarios"
-    source = (_ROOT / "harness" / "scenarios.py").read_text(encoding="utf-8")
+    control = "harness.scenarios._core"
+    source = (_ROOT / "harness" / "scenarios" / "_core.py").read_text(encoding="utf-8")
     assert "\nfrom messagefoundry" in source, f"{control} no longer imports the engine at top level"
     proc = _probe(control)
     assert proc.returncode != 0, proc.stdout

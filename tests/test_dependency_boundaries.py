@@ -525,6 +525,11 @@ _CLIENT_ALLOWED: Mapping[str, _Allowance] = MappingProxyType(
             frozenset({"messagefoundry.config"}),
             "engine config modules the loader runs via --config; they are the engine's input",
         ),
+        "harness/coverage.py": _Allowance(
+            frozenset({"messagefoundry.transports"}),
+            "reads the live connector registries, read-only, to report which connector kinds the "
+            "scenarios cover; the registries have no public listing (vault BACKLOG #2672)",
+        ),
         "harness/load/shardcert.py": _Allowance(
             frozenset({"messagefoundry.config", "messagefoundry.pipeline", "messagefoundry.store"}),
             "certifies an engine-shard plan by running the loader and the sharding planner itself",

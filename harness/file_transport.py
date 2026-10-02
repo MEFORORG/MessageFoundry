@@ -15,7 +15,6 @@ only live arrivals).
 from __future__ import annotations
 
 import logging
-import os
 import stat
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,6 +22,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
 
+from harness.drivers.file import drop_atomic
 from harness.mllp import Received, SendItem
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -39,19 +39,6 @@ class DropResult:
     item: SendItem
     filename: str
     error: str
-
-
-def _unique(target: Path) -> Path:
-    """``target`` if free, else ``stem-1.hl7``, ``stem-2.hl7``, … (don't clobber a prior drop)."""
-    if not target.exists():
-        return target
-    stem, suffix = target.stem, target.suffix
-    n = 1
-    while True:
-        candidate = target.with_name(f"{stem}-{n}{suffix}")
-        if not candidate.exists():
-            return candidate
-        n += 1
 
 
 class FileDropWorker(QObject):
@@ -94,12 +81,9 @@ class FileDropWorker(QObject):
 
     def _write_one(self, item: SendItem) -> DropResult:
         try:
-            target = _unique(Path(self._directory) / f"{item.control_id}.hl7")
-            tmp = target.with_name(
-                f".{target.name}.part"
-            )  # hidden + not *.hl7 → engine won't poll it
-            tmp.write_bytes(item.payload.encode("utf-8"))
-            os.replace(tmp, target)  # atomic publish
+            target = drop_atomic(
+                Path(self._directory), f"{item.control_id}.hl7", item.payload.encode("utf-8")
+            )
             return DropResult(item, target.name, "")
         except OSError as exc:
             return DropResult(item, "", str(exc))
