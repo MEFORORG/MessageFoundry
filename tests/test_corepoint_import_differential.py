@@ -63,7 +63,7 @@ import re
 import sys
 import types
 import unicodedata
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -2110,18 +2110,34 @@ def _generate_text(module: Any, text: str) -> tuple[str, tuple[object, ...]]:
 
 _SUB = _render((Create(_OUT, 4), SendS(_OUT, "OB_OUT")), "%ADT")
 _CALL = _line(f"{_kw('ActionListCall')} {_lit('Sub')}")
+# The three spellings of Lander QA on f0a62ef70a: the attribute, as the XML parser returns it, does
+# not spell the verb, and step 1 reads it all the same.
+_QA_CALLS = {
+    "a-decimal-reference": 'ActionList&#67;all "Sub"',
+    "a-hex-reference": 'ActionList&#x43;all "Sub"',
+    "an-empty-tag": 'ActionList<b></b>Call "Sub"',
+}
+
+
+def _calling(call: str, condition: str = "If (x)", sub: str = _SUB) -> str:
+    """A package whose list ``Main`` holds ``call`` under an ``If``, and whose list ``Sub`` is fully
+    understood when it stands alone."""
+    return (
+        f'<Package Name="A"><ActionList Name="Main"><List><If Data="{_esc(condition)}"><List>'
+        + call
+        + '</List></If></List></ActionList><ActionList Name="Sub"><List>'
+        + sub
+        + "</List></ActionList></Package>"
+    )
 
 
 @pytest.mark.parametrize(
     "package",
     [
-        pytest.param(
-            '<Package Name="A"><ActionList Name="Main"><List><If Data="If (x)"><List>'
-            + _CALL
-            + '</List></If></List></ActionList><ActionList Name="Sub"><List>'
-            + _SUB
-            + "</List></ActionList></Package>",
-            id="a-list-another-list-calls",
+        pytest.param(_calling(_CALL), id="a-list-another-list-calls"),
+        *(
+            pytest.param(_calling(_line(data)), id=f"a-call-spelled-with-{name}")
+            for name, data in _QA_CALLS.items()
         ),
         pytest.param(
             '<Package Name="A"><ActionList Name="Main"><List><Call Data="Sub"><Actions/></Call>'
@@ -2150,6 +2166,16 @@ _CALL = _line(f"{_kw('ActionListCall')} {_lit('Sub')}")
             + "</List></ActionList></Package>",
             id="an-unread-attribute-on-the-package",
         ),
+        pytest.param(
+            f'<Package Name="A"><actionlist Name="Sub"><List>{_SUB}</List></actionlist></Package>',
+            id="a-list-tag-in-another-case",
+        ),
+        pytest.param(
+            '<Package Name="A" xmlns:q="urn:q"><q:ActionList Name="Sub"><List>'
+            + _SUB
+            + "</List></q:ActionList></Package>",
+            id="a-namespaced-list-tag",
+        ),
     ],
 )
 def test_the_package_around_a_list_can_close_its_gate(package: str) -> None:
@@ -2160,6 +2186,161 @@ def test_the_package_around_a_list_can_close_its_gate(package: str) -> None:
     assert _generate_text(head, package) == _generate_text(step1, package)
     plain = f'<Package Name="A"><ActionList Name="Sub"><List>{_SUB}</List></ActionList></Package>'
     assert _generate_text(head, plain) != _generate_text(step1, plain)
+
+
+# --- a call the attribute does not spell ----------------------------------------------------------
+#
+# Step 1 reads a verb with the markup stripped, so the attribute need not spell ``ActionListCall``
+# for step 1 to read a call (Lander QA on f0a62ef70a; ADR 0086 has the readings). The seeds below
+# write ONE character of the verb another way, at every position, in every frame a verb can sit in,
+# and a second arm writes several at once. Which of them hide a call is decided by step 1's OWN
+# parse of the package: never by the head's gate, and never by a list of spellings.
+
+_CALL_VERBS = ("ActionListCall", "actionlistcall", "ACTIONLISTCALL")
+#: One character of a verb, written so that the attribute no longer spells the verb.
+_HIDES: dict[str, Callable[[str], str]] = {
+    "decimal": lambda ch: f"&#{ord(ch)};",
+    "decimal-padded": lambda ch: f"&#{ord(ch):05d};",
+    "decimal-open": lambda ch: f"&#{ord(ch)}",
+    "hex": lambda ch: f"&#x{ord(ch):x};",
+    "hex-upper": lambda ch: f"&#X{ord(ch):X};",
+    "hex-open": lambda ch: f"&#x{ord(ch):x}",
+    "empty-tag": lambda ch: f"<b></b>{ch}",
+    "void-tag": lambda ch: f"<br/>{ch}",
+    "wrapping-tag": lambda ch: f"<i>{ch}</i>",
+    "tag-with-attributes": lambda ch: f"<font color='red'>{ch}</font>",
+}
+#: Where a verb can sit in ``@Data``.
+_FRAMES: dict[str, Callable[[str], str]] = {
+    "flat": lambda verb: f'{verb} "Sub"',
+    "keyword": lambda verb: f"{_kw(verb)} {_lit('Sub')}",
+    "keyword-double-quoted": lambda verb: f'<span class="keyword">{verb}</span> {_lit("Sub")}',
+    "keyword-after-prose": lambda verb: f"{_span('comment', 'note')} {_kw(verb)} {_lit('Sub')}",
+    "keyword-in-a-span": lambda verb: f"{_span('block', _kw(verb))} {_lit('Sub')}",
+    # Read whole, ``&#xAc`` is one reference and the verb is gone. Read span by span, it is there.
+    "keyword-after-an-open-reference": lambda verb: f"&#x{_kw(verb)} {_lit('Sub')}",
+}
+#: Calls no cell of the table above reaches: step 1 reads each from the whole value only, because no
+#: ``keyword`` span holds a verb. A span cuts the verb, or cuts one reference in two.
+_WHOLE_VALUE_CALLS = {
+    "a-span-inside-a-flat-verb": "ActionList<span class='x'>C</span>all \"Sub\"",
+    "a-reference-a-span-cuts-in-two": "ActionList&#6<span class='x'>7;</span>all \"Sub\"",
+}
+#: Values that spell the verb in the raw attribute alone: stripping the markup removes it, so step 1
+#: reads no call. The gate closed on these before it read anything but the raw value.
+_RAW_ONLY_CALLS = {
+    "after-an-open-reference": '&#xActionListCall "Sub"',
+    "inside-a-tag": "<b title='ActionListCall'>note</b>",
+}
+
+
+def _step1_reads_a_call(data: str) -> bool:
+    """Whether step 1's own parse of a package holding ``data`` finds a call: the baseline's
+    reading."""
+    try:
+        channel = step1.parse_package(_calling(_line(data)))[0]
+    except step1.CorepointImportError:
+        return False
+    stack = [step for handler in channel.handlers for step in handler.steps]
+    while stack:
+        step = stack.pop()
+        if isinstance(step, step1.Control):
+            if step.kind == "call":
+                return True
+            stack.extend((*step.body, *step.branches))
+    return False
+
+
+def _hides_a_call(data: str) -> bool:
+    """Whether ``data`` does not spell the verb, and step 1 reads a call from it all the same."""
+    return "actionlistcall" not in data.lower() and _step1_reads_a_call(data)
+
+
+def _fails_open(data: str) -> bool:
+    package = _calling(_line(data))
+    return _generate_text(head, package) != _generate_text(step1, package)
+
+
+def _one_hidden(frame: str, hide: str) -> list[str]:
+    """Each ``@Data`` in ``frame`` with one character of the verb written as ``hide`` writes it."""
+    return [
+        _FRAMES[frame](verb[:at] + _HIDES[hide](verb[at]) + verb[at + 1 :])
+        for verb in _CALL_VERBS
+        for at in range(len(verb))
+    ]
+
+
+def _several_hidden(seed: int, count: int) -> list[str]:
+    """``count`` values with two to five characters of the verb each written another way."""
+    rng = random.Random(seed)
+    hides, frames = list(_HIDES.values()), list(_FRAMES.values())
+    found: list[str] = []
+    for _ in range(count):
+        verb = rng.choice(_CALL_VERBS)
+        at = set(rng.sample(range(len(verb)), rng.randint(2, 5)))
+        hidden = "".join(rng.choice(hides)(ch) if i in at else ch for i, ch in enumerate(verb))
+        found.append(rng.choice(frames)(hidden))
+    return found
+
+
+@pytest.mark.parametrize("hide", _HIDES)
+@pytest.mark.parametrize("frame", _FRAMES)
+def test_a_call_the_attribute_does_not_spell_closes_the_gate(frame: str, hide: str) -> None:
+    """Wherever step 1 reads a call the attribute does not spell, the head renders the package as
+    step 1 does. Every frame and every way of writing a character hides at least one call, so no
+    cell of this table passes by testing nothing."""
+    hidden = [data for data in _one_hidden(frame, hide) if _hides_a_call(data)]
+    assert hidden, "nothing here hides a call from the attribute, so this cell tests nothing"
+    failures = [data for data in hidden if _fails_open(data)]
+    assert not failures, "\n".join(failures[:10]) + f"\n... {len(failures)} of {len(hidden)}"
+
+
+@pytest.mark.parametrize("data", _WHOLE_VALUE_CALLS.values(), ids=list(_WHOLE_VALUE_CALLS))
+def test_a_call_only_the_whole_value_spells_closes_the_gate(data: str) -> None:
+    assert _hides_a_call(data)
+    assert not _fails_open(data)
+
+
+@pytest.mark.parametrize("data", _RAW_ONLY_CALLS.values(), ids=list(_RAW_ONLY_CALLS))
+def test_a_call_only_the_raw_attribute_spells_still_closes_the_gate(data: str) -> None:
+    """Reading what step 1 reads must not stop the gate reading the raw value: it is no less
+    eager than it was."""
+    assert "actionlistcall" in data.lower()
+    assert not _step1_reads_a_call(data)
+    assert not _fails_open(data)
+
+
+def test_a_call_hidden_at_several_characters_closes_the_gate() -> None:
+    hidden = [data for data in _several_hidden(_SEED, 600) if _hides_a_call(data)]
+    assert len(hidden) >= 200
+    failures = [data for data in hidden if _fails_open(data)]
+    assert not failures, "\n".join(failures[:10]) + f"\n... {len(failures)} of {len(hidden)}"
+
+
+def test_a_reference_outside_a_call_leaves_the_gate_open() -> None:
+    """The control for the tests above: the same package holding a reference or a tag in a verb
+    that is no call still opens the gate for ``Sub``. So those tests pass because the head saw the
+    call, and not because any reference or tag closes every gate."""
+    for data in (
+        "MsgLo&#103; %ADT",
+        "MsgLo<b></b>g %ADT",
+        f"&#x{_kw('MsgLog')} {_hs(_ADT, '%ADT')}",
+    ):
+        assert not _step1_reads_a_call(data)
+        assert _fails_open(data), data
+
+
+@pytest.mark.parametrize("spelling", _QA_CALLS.values(), ids=list(_QA_CALLS))
+def test_the_f0a62ef70a_markup_call_repro_does_not_fail_open(spelling: str) -> None:
+    """Lander QA on f0a62ef70a, as filed: one list calls another under an ``If``, with the verb
+    spelled so the attribute does not hold it. The called list builds a message and sends it. Step 1
+    refuses that send, and the head must not turn it into a send made for every message."""
+    built = _render((Create(_NEW, 4), SendS(_NEW, "OB_NEW")), "%ADT")
+    package = _calling(_line(spelling), 'If $FLAG = "1"', built)
+    head_src, step1_src = _generate_text(head, package)[0], _generate_text(step1, package)[0]
+    assert "raise NotImplementedError" in step1_src
+    assert 'Send("OB_NEW", new_msg)' not in head_src
+    assert head_src == step1_src
 
 
 def test_the_walker_tells_the_gate_apart_on_its_own_seeds() -> None:

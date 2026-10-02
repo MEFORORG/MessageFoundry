@@ -1692,6 +1692,10 @@ _DISABLED_SURE = frozenset({"1", "true", "yes"})
 # the type is read: ``ADT_A01`` is also how HL7 spells a message STRUCTURE (MSH-9.3).
 _MESSAGE_TYPE = re.compile(r"([A-Z0-9]{3})\^([A-Z0-9]{3})(?:\^([A-Z0-9_]{3,7}))?")
 _HL7_VERSION = re.compile(r"2\.[1-9](?:\.[1-9])?")
+# What step 1 reads as a call, taken from its own tables so the package-wide check cannot fall
+# behind them: the verbs (``actionlistcall``) and the tags (``call``).
+_CALL_VERBS = tuple(verb for verb, kind in _KIND_BY_VERB.items() if kind == "call")
+_CALL_TAGS = frozenset(tag for tag, kind in _CONTAINER_KIND_BY_TAG.items() if kind == "call")
 
 
 @dataclass(frozen=True)
@@ -1723,12 +1727,14 @@ def _understood_list(
 ) -> tuple[str, tuple[_Understood, ...]] | None:
     """``(input handle, elements)`` when the whole list is fully understood, else ``None``.
 
-    Every element enclosing the list is a ``<Package>``, and the list and each of those carry only
-    ``Name`` and ``Desc``. Beyond each element's
+    The list's own tag is exactly ``ActionList``, every element enclosing it is a ``<Package>``, and
+    the list and each of those carry only ``Name`` and ``Desc``. Beyond each element's
     own shape (see :func:`_understood_body`), the list as a whole must name its handles
     unambiguously: no two spellings that differ only in case (whether Corepoint folds case is
     unverified), each handle styled the same way everywhere, at most one input handle, and no clone or
     ``MsgCreate`` into the input, which would replace ``msg``."""
+    if action_list.tag != "ActionList":
+        return None
     node: Element | None = action_list
     while node is not None:
         if not set(node.attrib) <= {"Name", "Desc"}:
@@ -2004,6 +2010,22 @@ class _Binder:
         return Control("send", st.verb, st.text, args=args, message=local)
 
 
+def _names_a_call(value: str) -> bool:
+    """Whether any reading of one attribute value names an ``ActionListCall``.
+
+    Step 1 never reads a verb from the raw value. It reads it through :func:`strip_markup`, which
+    removes tags and resolves character references: from a ``keyword`` span, read span by span
+    (:func:`parse_roles`), or else from the head of the whole value. So ``ActionList&#67;all`` and
+    ``ActionList<b></b>Call`` are both calls to step 1, and the two readings can differ from each
+    other: after an unclosed ``&#x``, only the span still holds the verb.
+
+    The gate therefore looks in all three texts, and anywhere in each. Every verb step 1 can read is a
+    run of one of them, so this is true wherever step 1 reads a call. It is also true of a value that
+    only mentions one, which closes the gate and costs nothing but a hand-finish."""
+    readings = (value, strip_markup(value), *(token.text for token in parse_roles(value)))
+    return any(verb in text.lower() for text in readings for verb in _CALL_VERBS)
+
+
 def _hardened_fromstring(text: str) -> Element:
     """THE XML parse surface of this module — ``defusedxml`` with every hardening flag ON.
 
@@ -2061,8 +2083,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
     # A list another list may call runs when and as often as its caller runs it, which the router
     # cannot express: so in a package that may call any list, no list is fully understood.
     calls = any(
-        _local(elem.tag).lower() == "call"
-        or any("actionlistcall" in value.lower() for value in elem.attrib.values())
+        _local(elem.tag).lower() in _CALL_TAGS or any(map(_names_a_call, elem.attrib.values()))
         for elem in root.iter()
     )
 
