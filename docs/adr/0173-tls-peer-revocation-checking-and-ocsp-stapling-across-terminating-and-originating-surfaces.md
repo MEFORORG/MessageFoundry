@@ -943,8 +943,13 @@ the peer, refuses the peer in either load order. Locate it by symbol: `reload_re
 
 **It fails closed.** A replacement must pass the start rules (`judge_crl_bytes`), carry no certificate
 the hop does not already trust (proved on a scratch context first, because a load cannot be undone),
-and supersede every CRL the hop holds. Otherwise the hop keeps its copy, an ERROR names the reason,
-and the expiry monitor keeps judging the held copy. Nothing is fetched: this reads the configured file
+have each CRL's signature verify against a CA certificate the hop lists for its issuer (OpenSSL
+checks it only at the handshake, so a badly signed CRL would load and then fail every handshake), and
+supersede every CRL the hop holds. Otherwise the hop keeps its copy, an ERROR names the reason, and
+the expiry monitor keeps judging the held copy. The start rules now also refuse a file whose only CRL
+for some issuer is not in effect yet, at a start and at a reload, because OpenSSL would pick it and
+refuse every peer. A context only gains CRLs, so `[cert_monitor].crl_max_reloads` (default 10,000)
+caps the reloads one context takes for one file; past it, a restart applies the file. Nothing is fetched: this reads the configured file
 only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are untouched.
 
 **What this does to §6 trigger 4.** Its second clause names *"an in-engine CRL refresh that does not

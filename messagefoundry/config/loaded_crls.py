@@ -93,6 +93,9 @@ class HeldCrl:
     path_key: str
     fingerprint: tuple[int, int]
     facts: CrlFacts
+    #: The absolute path as configured, case kept, which the reload reads. ``path_key`` is
+    #: case-folded on Windows, so it may not open the file on a case-sensitive folder.
+    file_path: str
     setting: str | None = None
     #: Every CRL block of that load. A reload needs them to prove the replacement supersedes each
     #: one; empty means unknown, and a reload then refuses rather than guess.
@@ -152,7 +155,15 @@ def record_crl_load(
     """Record that ``ctx`` now holds the CRL file ``crl_file``, whose judged bytes were ``pem``,
     whose soonest-expiring block is ``facts`` and whose blocks are ``blocks``. Called by
     ``harden_crl_check`` after a load succeeds."""
-    held = HeldCrl(_path_key(crl_file), crl_fingerprint(pem), facts, setting, blocks, crl_file)
+    held = HeldCrl(
+        path_key=_path_key(crl_file),
+        fingerprint=crl_fingerprint(pem),
+        facts=facts,
+        file_path=os.path.abspath(crl_file),
+        setting=setting,
+        blocks=blocks,
+        configured_path=crl_file,
+    )
     with _LOCK:
         _HELD[ctx] = (*_HELD.get(ctx, ()), held)
 

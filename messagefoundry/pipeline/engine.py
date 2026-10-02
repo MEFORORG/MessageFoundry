@@ -1348,8 +1348,11 @@ class Engine:
             self._cert_expiry_runner.start()
         # BACKLOG #299: apply a replaced CRL file to the running hops that hold the old copy. Not
         # gated on [cert_monitor]: turning the expiry alert off must not also stop a revocation
-        # reaching a running hop. Not leader-gated: each process holds its own TLS contexts.
-        self._crl_reload_runner = CrlReloadRunner()
+        # reaching a running hop. Not leader-gated: each process holds its own TLS contexts. Its cap
+        # is a [cert_monitor] setting all the same, read whatever warn_days is.
+        self._crl_reload_runner = CrlReloadRunner(
+            max_reloads=(self._cert_monitor_settings or CertMonitorSettings()).crl_max_reloads
+        )
         self._crl_reload_runner.start()
         # ASVS 11.3.4: checkpoint the store cipher's PERSISTED per-key AES-GCM invocation reserve and
         # alarm at 2**31 (half the fail-closed 2**32 birthday ceiling). A no-op when the store carries no

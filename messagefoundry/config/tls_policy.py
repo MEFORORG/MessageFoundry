@@ -73,6 +73,8 @@ TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 MIRRORED_CONNECTION_SETTING = "connection_name"
 
 if TYPE_CHECKING:
+    import datetime
+
     from messagefoundry.pki import CrlBlock, CrlFacts
 
 __all__ = [
@@ -104,6 +106,7 @@ __all__ = [
     "context_checks_revocation",
     "current_hop_posture",
     "enforce_insecure_hop",
+    "CrlNotInEffect",
     "crl_label",
     "harden_cipher_suites",
     "harden_kex_groups",
@@ -411,7 +414,8 @@ def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> tuple[CrlFacts, tu
     loads every CRL in the file; that is the expiry monitor's rule too. Unlike the monitor, a block
     that cannot be judged, or a delta CRL, refuses rather than being skipped, because this decides a
     load. An expired CRL refuses, because past ``nextUpdate`` it fails every peer, not only revoked
-    ones. Raises ``ValueError`` led by ``label``."""
+    ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`). Raises
+    ``ValueError`` led by ``label``."""
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:
@@ -426,7 +430,43 @@ def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> tuple[CrlFacts, tu
             "refuses EVERY peer certificate it judges, not only revoked ones. Refresh it, or "
             "remove it if a newer CRL for that issuer is already in the file"
         )
-    return facts, tuple(block for _, block in judged)
+    blocks = tuple(block for _, block in judged)
+    _refuse_crl_not_in_effect(blocks, label=label, now=now)
+    return facts, blocks
+
+
+class CrlNotInEffect(ValueError):
+    """A CRL file whose only CRLs for some issuer take effect later (BACKLOG #299).
+
+    OpenSSL prefers a CRL that is in effect, so a future CRL beside a current one from the same
+    issuer is harmless. Alone, it is the one OpenSSL picks, and it refuses every peer that issuer's
+    CRL judges with ``CRL is not yet valid``. A start refuses it with this error's message. The
+    running-hop reload reads ``issuer`` and ``takes_effect`` to say whether waiting is safe."""
+
+    def __init__(self, message: str, *, issuer: str, takes_effect: datetime.datetime) -> None:
+        super().__init__(message)
+        self.issuer = issuer
+        self.takes_effect = takes_effect
+
+
+def _refuse_crl_not_in_effect(blocks: Sequence[CrlBlock], *, label: str, now: float) -> None:
+    """Raise :class:`CrlNotInEffect` when some issuer in ``blocks`` has no CRL in effect at ``now``."""
+    import datetime
+
+    when = datetime.datetime.fromtimestamp(now, tz=datetime.UTC)
+    in_effect = {block.issuer for block in blocks if block.this_update <= when}
+    pending = [block for block in blocks if block.issuer not in in_effect]
+    if not pending:
+        return
+    first = min(pending, key=lambda block: block.this_update)
+    raise CrlNotInEffect(
+        f"{label} holds a CRL (issuer {first.issuer!r}) that does not take effect until "
+        f"{first.this_update.isoformat()}, and no CRL from that issuer that is in effect now. "
+        "Loaded now, it would refuse EVERY peer certificate it judges with 'CRL is not yet valid'. "
+        "Give a CRL that is in effect now, or wait until then",
+        issuer=first.issuer,
+        takes_effect=first.this_update,
+    )
 
 
 def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:

@@ -1327,32 +1327,42 @@ line reads `crl_expiry`. A file holding several CRLs is judged by the one that e
 The engine reads a CRL when it builds a hop's TLS context and keeps that copy. About once a minute it
 checks each CRL file a running hop holds, and when the file has been replaced it adds the new CRL to
 that hop's context, with no restart (BACKLOG #299). OpenSSL then uses the newest CRL it holds for each
-issuer. The engine applies a replaced file only when both of these hold:
+issuer. The engine applies a replaced file only when all three of these hold:
 
 1. The file passes the rules a start applies: every CRL parses, has a `nextUpdate`, is not a delta CRL
    and has not expired, and the file carries no certificate the hop does not already trust.
-2. For each CRL the hop holds, the file carries the same CRL or a newer one from the same issuer.
+2. Each CRL's signature verifies against a CA certificate the hop trusts for its issuer. OpenSSL checks
+   that signature only during a handshake, so a badly signed CRL would load and then fail every
+   handshake it judges.
+3. For each CRL the hop holds, the file carries the same CRL or a newer one from the same issuer.
    The newer CRL was issued later, is already in effect and runs at least as long. It also has the
    same scope, signing key and critical extensions.
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
 what to do. A file failing rule 1 would also stop the engine starting, so fix the file. A file failing
-only rule 2 needs a restart to apply. Examples are a rollback to an older CRL, a file that drops an
-issuer, and a CRL signed under a new key. **A CRL that is not in effect yet is the exception: wait.** The engine
-applies it once it takes effect, and a restart before then would make the hop refuse every peer.
+rule 2 loads at a start but fails every handshake it judges, so fix that too. A file failing only rule
+3 needs a restart to apply. Examples are a rollback to an older CRL, a file that drops an issuer, and a
+CRL signed under a new key.
+
+**A CRL that is not in effect yet is the exception: wait.** The engine applies it once it takes effect.
+Do not restart before then. A start refuses a file whose only CRL for some issuer is not in effect yet,
+because a hop would refuse every peer with it. One exception to the wait: if the hop's copy lapses
+before the new CRL takes effect, waiting leaves a gap in which every peer is refused, so the engine
+says to fix the file with a CRL that is in effect now.
+
 A reload changes what the next full TLS handshake checks. An established connection, or a session
 resumed from an earlier handshake, is not checked again, so a newly revoked partner that stays
 connected stays connected until it reconnects or you restart. Every reload stays in the hop's trust
-store, so after 256 reloads of one file a hop refuses the next and asks for a restart. Until a hop
-is current, the scan judges the copy it holds as well as the new file. So the alert does not clear on
-the file alone, and the alert's date can be the held copy's rather than the new file's. A replaced
-file that is not near expiry raises no alert, but each scan logs a warning that a running hop holds an
-older copy, and why. If the file cannot be read, the scan judges the held copy instead of skipping it.
-At least two cases still need a restart: a CRL placed inside a CA bundle, which the engine does not
-track, and a replacement refused under rule 2. A hop may hold a CRL from a path no setting above names,
-such as an inbound `tls_crl_file` given through `env()`. The scan then adds a row for it, labelled
-`held-crl:` and the path. The `[store].ssl_crl_file` hop builds a fresh context for every new pool
-connection and records no held copy. If another setting names the same file, that file's row still
+store, so after `crl_max_reloads` reloads of one file a hop refuses the next and asks for a restart.
+Until a hop is current, the scan judges the copy it holds as well as the new file. So the alert does
+not clear on the file alone, and the alert's date can be the held copy's rather than the new file's. A
+replaced file that is not near expiry raises no alert, but each scan logs a warning that a running hop
+holds an older copy, and why. If the file cannot be read, the scan judges the held copy instead of
+skipping it. At least two cases still need a restart: a CRL placed inside a CA bundle, which the engine
+does not track, and a replacement refused under rule 3. A hop may hold a CRL from a path no setting
+above names, such as an inbound `tls_crl_file` given through `env()`. The scan then adds a row for it,
+labelled `held-crl:` and the path. The `[store].ssl_crl_file` hop builds a fresh context for every new
+pool connection and records no held copy. If another setting names the same file, that file's row still
 reports those hops' copies. CRLs share `warn_days` with certificates, so a CRL reissued more often than
 `warn_days` sits inside the window and alerts on every scan.
 
@@ -1360,6 +1370,7 @@ reports those hops' copies. CRLs share `warn_days` with certificates, so a CRL r
 |---|---|---|---|
 | `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor |
 | `check_interval_seconds` | num | 43200 | rescan cadence (default 12h); the per-cert re-alert throttle is `[alerts].realert_seconds` |
+| `crl_max_reloads` | int | 10000 | how many replaced copies of one CRL file a running hop takes before it refuses the next and asks for a restart (BACKLOG #299). Must be above 0. The CRL reload reads it even when `warn_days` is `0`. The default outlasts a year of hourly CRLs (8,760). Each copy a hop holds costs memory and handshake time, measured on CPython 3.14 / OpenSSL 3.5.7: about four times the CRL file's size plus about 1.5 KB of memory, and about 2 microseconds per handshake. So 10,000 copies of a 1 KB CRL hold about 40 MB and add about 20 ms to each handshake. Lower it for a large CRL that is reissued often. |
 
 ```toml
 [cert_monitor]

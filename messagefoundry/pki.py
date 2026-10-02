@@ -34,6 +34,7 @@ __all__ = [
     "CertFacts",
     "CrlBlock",
     "CrlFacts",
+    "crl_signature_refusal",
     "judge_every_crl",
     "read_crl_facts",
     "read_soonest_crl_facts",
@@ -302,8 +303,81 @@ def _selection(
         if isinstance(ext.value, x509.IssuingDistributionPoint):
             scope = ext.value.public_bytes()
         elif isinstance(ext.value, x509.AuthorityKeyIdentifier):
-            key_id = ext.value.key_identifier
+            # The whole AKID: OpenSSL matches its issuer and serial to the CA too, when present.
+            key_id = ext.value.public_bytes()
     return scope, key_id, frozenset(critical)
+
+
+def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
+    """Why some CRL in ``pem`` is not signed by a CA in ``ca_ders``, or ``None`` when each one is.
+
+    The flag is True when a CA for the CRL's issuer was found and its key does not verify the CRL,
+    and False when no such CA was found. OpenSSL checks a CRL's signature at the handshake, not at
+    the load. So a CRL with the right issuer name and Authority Key Identifier but a bad signature
+    loads cleanly, and then every handshake it judges fails with ``CRL signature failure``. The
+    running-hop reload calls this before a live load, because a load cannot be undone (BACKLOG #299).
+
+    A CA counts as a CRL's issuer when its subject equals the CRL's issuer name exactly, it fits the
+    CRL's AKID, and its key verifies the CRL. A CA that does not parse is ignored. ``pem`` must be
+    bytes :func:`judge_every_crl` accepted; a block that does not parse raises ``ValueError``."""
+    cas: list[x509.Certificate] = []
+    for der in ca_ders:
+        try:
+            cas.append(x509.load_der_x509_certificate(der))
+        except ValueError:
+            continue
+    blocks = list(_crl_blocks(pem))
+    for index, block in enumerate(blocks, start=1):
+        crl = x509.load_pem_x509_crl(block)
+        where = f"CRL block {index} of {len(blocks)} (issuer {crl.issuer.rfc4514_string()!r})"
+        issuers = [ca for ca in cas if ca.subject == crl.issuer and _fits_akid(crl, ca)]
+        if not issuers:
+            return f"{where} names no CA certificate this hop lists as its issuer", False
+        if not any(_signed_by(crl, ca) for ca in issuers):
+            return (
+                f"{where} does not verify against the key of the CA certificate this hop trusts "
+                "for that issuer. Loaded, it would make every handshake it judges fail with "
+                "'CRL signature failure'",
+                True,
+            )
+    return None
+
+
+def _fits_akid(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:
+    """Whether ``ca`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's
+    ``X509_check_akid`` matches one: each part the AKID carries must match the CA."""
+    try:
+        akid = crl.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+    except x509.ExtensionNotFound:
+        return True
+    except x509.DuplicateExtension:
+        return False
+    if akid.key_identifier is not None:
+        try:
+            ski = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
+        except x509.ExtensionNotFound:
+            ski = None
+        except (x509.DuplicateExtension, ValueError):
+            return False
+        if ski is not None and ski != akid.key_identifier:
+            return False
+    serial = akid.authority_cert_serial_number
+    if serial is not None and serial != ca.serial_number:
+        return False
+    names = [
+        name.value
+        for name in akid.authority_cert_issuer or ()
+        if isinstance(name, x509.DirectoryName)
+    ]
+    return not names or ca.issuer in names
+
+
+def _signed_by(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:
+    """Whether ``ca``'s key verifies ``crl``. A key type the CRL cannot be checked with is False."""
+    try:
+        return crl.is_signature_valid(ca.public_key())  # type: ignore[arg-type]
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        return False
 
 
 def _is_delta_crl(crl: x509.CertificateRevocationList) -> bool:

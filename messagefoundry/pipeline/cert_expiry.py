@@ -36,6 +36,7 @@ from messagefoundry.config.loaded_crls import HeldCrlSnapshot, crl_fingerprint
 from messagefoundry.config.loaded_crls import snapshot as held_crl_snapshot
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.crl_reload import RELOAD_INTERVAL_SECONDS
 from messagefoundry.pki import (
     CertFacts,
     CrlFacts,
@@ -469,9 +470,13 @@ def _judge_crl(
                 why = "that differs from the file, which the engine refused to apply to it"
                 remedy = f"Reason: {refused.reason}. {refused.remedy}"
             else:
-                # The reload pass applies a replaced file to the running hop within about a minute
-                # (pipeline/crl_reload.py); a restart applies it at once.
-                why, remedy = "that differs from the file", "Restart the engine to apply the file"
+                # No refusal recorded: the reload pass (pipeline/crl_reload.py) has not judged
+                # these bytes yet, and will within its interval.
+                why, remedy = (
+                    "that differs from the file",
+                    "A reload is pending: the engine applies the file to the running hop within "
+                    f"{RELOAD_INTERVAL_SECONDS:g} seconds, unless it refuses the file and logs why",
+                )
             holders = sorted({copy.setting or "a connection's tls_crl_file" for copy in copies})
             log.warning(
                 "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s), "

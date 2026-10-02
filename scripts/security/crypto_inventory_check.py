@@ -424,8 +424,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #299: applies a replaced CRL file to the live TLS contexts that hold an older copy. It
     # loads CRL bytes into a scratch ssl.SSLContext to find any certificate before the live load, then
     # adds them to the live context with load_verify_locations(cafile=). It judges the bytes with
-    # tls_policy.judge_crl_bytes, which reads the CRL fields. No key material, no new trust:
-    # a certificate the hop does not already trust refuses the reload.
+    # tls_policy.judge_crl_bytes, which reads the CRL fields, and checks each CRL's signature against
+    # the hop's own CA certificates through pki.crl_signature_refusal (a public-key verify). No key
+    # material, no new trust: a certificate the hop does not already trust refuses the reload.
     "messagefoundry/pipeline/crl_reload.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ASVS 11.3.4 (#301): the periodic AES-GCM invocation-reserve refill runner reads the live
     # cipher's key_id + per-key bound through the store.crypto seam — no direct stdlib crypto import.
@@ -1142,6 +1143,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/crl_reload.py": frozenset(
         {
             "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.pki",
             "tls_context:.load_verify_locations()",
             "tls_context:ssl.SSLContext",
         }

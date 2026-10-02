@@ -25,9 +25,12 @@ import datetime
 import gc
 import logging
 import re
+import shutil
 import ssl
+import tempfile
 import threading
 import time
+import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -37,13 +40,16 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from messagefoundry.config import loaded_crls
 from messagefoundry.config.loaded_crls import (
     crl_fingerprint,
     held_crl_copies,
     record_crl_load,
     reload_refusal,
 )
+from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.config.tls_policy import (
+    CrlNotInEffect,
     TrustAnchor,
     build_verifying_client_context,
     harden_crl_check,
@@ -51,7 +57,10 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.crl_reload import (
+    BAD_SIGNATURE,
     FIX,
+    LAPSES_FIRST,
+    MAX_RELOADS,
     RESTART,
     WAIT,
     CrlReloadRunner,
@@ -90,6 +99,8 @@ class _Pki:
         revoke: bool = False,
         delta: bool = False,
         scope: bool = False,
+        signer: ec.EllipticCurvePrivateKey | None = None,
+        aki: x509.AuthorityKeyIdentifier | None = None,
     ) -> bytes:
         """A CRL issued ``issued`` ago (negative is in the future) that runs ``lasts`` from now."""
         builder = (
@@ -97,7 +108,7 @@ class _Pki:
             .issuer_name(self.name)
             .last_update(_NOW - issued)
             .next_update(_NOW + lasts)
-            .add_extension(self.aki, False)
+            .add_extension(aki or self.aki, False)
             .add_extension(x509.CRLNumber(int(time.time() * 1000)), False)
         )
         if revoke:
@@ -123,7 +134,8 @@ class _Pki:
                 ),
                 critical=True,
             )
-        return builder.sign(self.key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+        signed = builder.sign(signer or self.key, hashes.SHA256())
+        return signed.public_bytes(serialization.Encoding.PEM)
 
     def outbound_hop(self) -> ssl.SSLContext:
         """An outbound hop context, built the way ``[tls].crl_file`` reaches every outbound hop."""
@@ -219,6 +231,17 @@ def _make_pki(d: Path, cn: str) -> _Pki:
     return made
 
 
+@pytest.fixture(autouse=True)
+def _fresh_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts with no held copies, no refusals and no pass state, so no test sees another's
+    contexts or a refusal recorded for a path it reuses. Restored after the test."""
+    monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary())
+    monkeypatch.setattr(loaded_crls, "_REFUSED", {})
+    monkeypatch.setattr(crl_reload, "_SEEN", {})
+    monkeypatch.setattr(crl_reload, "_UNREADABLE", set())
+    monkeypatch.setattr(crl_reload, "_FAILED", {})
+
+
 @pytest.fixture
 def pki(tmp_path: Path) -> _Pki:
     return _make_pki(tmp_path, "mefor-299-reload-ca")
@@ -233,11 +256,12 @@ def _accepts(client: ssl.SSLContext, server: ssl.SSLContext) -> bool:
     return True
 
 
-def _reload(pki: _Pki) -> ReloadOutcome | None:
-    """One pass, reduced to this test's file. The registry is process-wide, so other tests' contexts
-    may still be held; collecting first drops the ones that are gone."""
+def _reload(pki: _Pki, *, max_reloads: int = MAX_RELOADS) -> ReloadOutcome | None:
+    """One pass, reduced to this test's file. The fixture empties the registry per test, and
+    collecting first drops this test's own contexts that are gone."""
     gc.collect()
-    mine = [o for o in reload_replaced_crls() if Path(o.path) == pki.crl.resolve()]
+    outcomes = reload_replaced_crls(max_reloads=max_reloads)
+    mine = [o for o in outcomes if Path(o.path) == pki.crl.resolve()]
     return mine[0] if mine else None
 
 
@@ -399,7 +423,7 @@ def test_a_bad_replacement_is_refused_and_the_old_copy_kept(
 
     assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
     assert outcome.refusal.remedy == remedy
-    assert outcome.refusal.sticky is (remedy != WAIT)
+    assert outcome.refusal.sticky is (remedy not in (WAIT, LAPSES_FIRST))
     assert re.search(says, outcome.refusal.reason), outcome.refusal.reason
     assert hop.cert_store_stats() == stats  # nothing reached the live context
     assert _accepts(hop, pki.server())  # and it still checks against the old copy
@@ -441,7 +465,7 @@ def test_the_superseding_rule() -> None:
     def waits(new: list[CrlBlock], against: list[CrlBlock] = held) -> bool:
         verdict = supersede_refusal(against, new, now=now)
         assert verdict is not None
-        return verdict[1]
+        return verdict[1] in (WAIT, LAPSES_FIRST)
 
     assert not waits([_block("CN=b", 1, 30, b"new")])  # issuer dropped
     assert not waits([_block("CN=a", 1, 4, b"new")])  # ends sooner
@@ -449,6 +473,9 @@ def test_the_superseding_rule() -> None:
     assert not waits([rescoped])  # same timing, a scope OpenSSL scores differently
     assert not waits([_block("CN=a", 1, 30, b"new")], against=[])  # held copy unknown
     assert waits([_block("CN=a", -1, 30, b"new")])  # not in effect yet: only time is missing
+    # Not in effect until after the held copy lapses: waiting leaves a gap, so the file must change.
+    late = supersede_refusal(held, [_block("CN=a", -7, 30, b"new")], now=now)
+    assert late is not None and late[1] == LAPSES_FIRST
 
 
 def test_judge_every_crl_names_each_block(pki: _Pki) -> None:
@@ -484,17 +511,14 @@ def test_the_runner_reloads_off_the_loop_and_stops() -> None:
     assert threading.main_thread().name not in seen
 
 
-def test_a_context_stops_taking_reloads_at_the_cap(
-    pki: _Pki, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_context_stops_taking_reloads_at_the_cap(pki: _Pki) -> None:
     # Every reload stays in the trust store, so the count is bounded and a restart compacts it.
-    monkeypatch.setattr(crl_reload, "MAX_RELOADS", 1)
     hop = pki.outbound_hop()
     pki.crl.write_bytes(_fresher(pki, revoke=False))
-    assert (first := _reload(pki)) is not None and first.reloaded == 1
+    assert (first := _reload(pki, max_reloads=1)) is not None and first.reloaded == 1
 
     pki.crl.write_bytes(pki.crl_pem(issued=0.5 * _DAY, lasts=90 * _DAY, revoke=True))
-    second = _reload(pki)
+    second = _reload(pki, max_reloads=1)
 
     assert second is not None and second.reloaded == 0 and second.refusal is not None
     assert second.refusal.remedy == RESTART and "reloads" in second.refusal.reason
@@ -508,3 +532,187 @@ def test_a_refusal_names_the_configured_path(pki: _Pki) -> None:
     assert outcome is not None and outcome.refusal is not None
     assert repr(str(pki.crl)) in outcome.refusal.reason
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+# --- round-two review findings ----------------------------------------------------------------------
+
+
+def test_a_crl_with_a_bad_signature_is_refused_and_handshakes_still_succeed(pki: _Pki) -> None:
+    # Right issuer name and AKID, signed by a key that is not the CA's.
+    forged = pki.crl_pem(
+        issued=_DAY, lasts=60 * _DAY, revoke=True, signer=ec.generate_private_key(ec.SECP256R1())
+    )
+    hop = pki.outbound_hop()
+    stats = hop.cert_store_stats()
+    # Control: a context given these bytes fails every handshake, which is what the check prevents.
+    broken = pki.outbound_hop()
+    pki.crl.write_bytes(forged)
+    broken.load_verify_locations(cafile=str(pki.crl))
+    with pytest.raises(ssl.SSLError, match="signature"):
+        _handshake(broken, pki.server())
+    del broken
+
+    outcome = _reload(pki)
+
+    assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
+    assert outcome.refusal.remedy == BAD_SIGNATURE and outcome.refusal.sticky
+    assert "does not verify" in outcome.refusal.reason
+    assert hop.cert_store_stats() == stats
+    assert _accepts(hop, pki.server())  # the old copy is kept, and the hop still works
+
+
+def test_a_file_whose_crl_takes_effect_after_the_held_copy_lapses_is_not_told_to_wait(
+    pki: _Pki,
+) -> None:
+    hop = pki.outbound_hop()  # its copy lapses in about five and a half days
+    pki.crl.write_bytes(pki.crl_pem(issued=-7 * _DAY, lasts=60 * _DAY, revoke=True))
+
+    outcome = _reload(pki)
+
+    assert outcome is not None and outcome.refusal is not None
+    assert outcome.refusal.remedy == LAPSES_FIRST and not outcome.refusal.sticky
+    assert "lapses earlier" in outcome.refusal.reason
+    assert _accepts(hop, pki.server())
+
+
+def test_a_start_refuses_a_crl_not_in_effect_yet(pki: _Pki) -> None:
+    pki.crl.write_bytes(pki.crl_pem(issued=-_DAY, lasts=60 * _DAY))
+    with pytest.raises(CrlNotInEffect, match="does not take effect until"):
+        pki.outbound_hop()
+
+
+def test_a_start_accepts_a_future_crl_beside_a_current_one(pki: _Pki) -> None:
+    # OpenSSL prefers the CRL in effect, so the future one beside it is harmless until it starts.
+    pki.crl.write_bytes(pki.crl.read_bytes() + pki.crl_pem(issued=-_DAY, lasts=60 * _DAY))
+    assert _accepts(pki.outbound_hop(), pki.server())
+
+
+def test_a_crl_whose_akid_names_the_ca_by_issuer_and_serial_does_not_supersede(pki: _Pki) -> None:
+    # Same key identifier, plus an issuer and serial: OpenSSL matches those too, so it scores apart.
+    hop = pki.outbound_hop()
+    fuller = x509.AuthorityKeyIdentifier(
+        key_identifier=pki.aki.key_identifier,
+        authority_cert_issuer=[x509.DirectoryName(pki.name)],
+        authority_cert_serial_number=1,
+    )
+    pki.crl.write_bytes(pki.crl_pem(issued=_DAY, lasts=60 * _DAY, revoke=True, aki=fuller))
+
+    outcome = _reload(pki)
+
+    assert outcome is not None and outcome.refusal is not None
+    assert outcome.refusal.remedy == RESTART and "same scope" in outcome.refusal.reason
+    assert _accepts(hop, pki.server())
+
+
+def test_the_reload_reads_the_path_as_configured(pki: _Pki) -> None:
+    hop = pki.outbound_hop()
+    (held,) = held_crl_copies(pki.crl)
+    assert held.file_path == str(pki.crl.absolute())  # case kept; path_key may be case-folded
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_an_unchanged_file_is_not_read_again(pki: _Pki, monkeypatch: pytest.MonkeyPatch) -> None:
+    hop = pki.outbound_hop()
+    assert _reload(pki) is None  # the first pass reads the file once and remembers its stamp
+    reads: list[str] = []
+    real = crl_reload._read
+
+    def spy(
+        key: str, path: str, stamp: tuple[int, int, int] | None = None
+    ) -> tuple[bytes, tuple[int, int]] | None:
+        reads.append(path)
+        return real(key, path, stamp)
+
+    monkeypatch.setattr(crl_reload, "_read", spy)
+
+    assert _reload(pki) is None
+    assert reads == []
+    pki.crl.write_bytes(_fresher(pki))
+    assert (outcome := _reload(pki)) is not None and outcome.reloaded == 1
+    assert reads  # a changed file is read
+    assert not _accepts(hop, pki.server())
+
+
+def test_a_cleanup_failure_after_a_reload_is_not_a_refusal(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki))
+
+    def fail(path: str) -> None:
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(shutil, "rmtree", fail)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        outcome = _reload(pki)
+
+    assert outcome is not None and (outcome.reloaded, outcome.refusal) == (1, None)
+    assert "could not remove" in caplog.text
+    assert not _accepts(hop, pki.server())
+
+
+def test_a_staging_failure_is_logged_once_though_each_temp_path_differs(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki))
+    calls = iter(range(100))
+
+    def fail(prefix: str) -> str:
+        raise PermissionError(13, "Permission denied", f"C:/tmp/{prefix}{next(calls)}")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", fail)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        first, second = _reload(pki), _reload(pki)
+
+    assert first is not None and first.refusal is not None and not first.refusal.sticky
+    assert second is not None and second.refusal == first.refusal
+    assert sum("refused to apply" in r.getMessage() for r in caplog.records) == 1
+    assert _accepts(hop, pki.server())
+
+
+def test_an_unexpected_failure_is_logged_once_with_its_traceback(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki))
+
+    def boom(pem: bytes, ca_ders: object) -> None:
+        raise RuntimeError("a defect")
+
+    monkeypatch.setattr(crl_reload, "crl_signature_refusal", boom)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        first, second = _reload(pki), _reload(pki)
+
+    assert first is not None and first.refusal is not None
+    assert "RuntimeError" in first.refusal.reason and not first.refusal.sticky
+    assert second is not None and second.refusal == first.refusal
+    logged = [r for r in caplog.records if "refused to apply" in r.getMessage()]
+    assert len(logged) == 1 and logged[0].exc_info is not None
+    assert _accepts(hop, pki.server())
+
+
+def test_stop_does_not_wait_for_a_hung_pass() -> None:
+    release = threading.Event()
+
+    def hung() -> None:
+        release.wait(10)
+
+    async def drive() -> float:
+        runner = CrlReloadRunner(interval_seconds=0.01, reload=hung, stop_timeout_seconds=0.1)
+        runner.start()
+        await asyncio.sleep(0.1)  # the pass is now blocked in its worker thread
+        started = time.monotonic()
+        try:
+            await runner.stop()
+            return time.monotonic() - started
+        finally:
+            release.set()  # so asyncio.run's executor shutdown does not wait on the thread
+
+    assert asyncio.run(drive()) < 5
+
+
+def test_the_cap_is_a_cert_monitor_setting() -> None:
+    assert CertMonitorSettings().crl_max_reloads == MAX_RELOADS
+    with pytest.raises(ValueError, match="crl_max_reloads"):
+        CertMonitorSettings(crl_max_reloads=0)
