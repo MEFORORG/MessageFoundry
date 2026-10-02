@@ -298,7 +298,14 @@ The key is a base64 32-byte secret. Two ways to supply it:
   environment (`& "$env:ProgramFiles\MessageFoundry\nssm\nssm.exe" set MessageFoundry AppEnvironmentExtra MEFOR_STORE_ENCRYPTION_KEY=...`,
   the copy the installer checked). That `set` replaces the whole list, so add every other
   variable the service needs to the same call; see [Start / stop / status](#start--stop--status). Simple,
-  but the plaintext key sits in the service environment block, readable by any local administrator.
+  but the plaintext key then sits in the service's NSSM settings, which NSSM keeps in the service's
+  registry key. Treat any secret placed there as readable by **any local user** of the host, not
+  only by an administrator. On a default Windows install that key grants local users read by
+  inheritance, and the installer does not change it. That was measured on one Windows 11 machine,
+  so check who can read that key on your own host. Prefer the DPAPI key file below for the store
+  key. It keeps that one key out of the list. It covers no other secret you put there, and that
+  includes a retired store key during a rotation.
+  **CORRECTED 2026-10-01:** this read "readable by any local administrator".
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
 

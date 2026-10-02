@@ -261,7 +261,8 @@ def _proxy_hop(
 
     A proxy the connection never dials is not a hop either. ``targets`` are the addresses it sends
     through the proxy (:func:`_proxy_targets`); when ``proxy_no_proxy`` bypasses every one of them the
-    credential never leaves the engine. The bypass list is the connection's own, else the inherited
+    credential never leaves the engine. A loopback address always bypasses it, with no entry in the
+    list (vault BACKLOG #2579). The bypass list is the connection's own, else the inherited
     ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
     ``targets`` the hop is reported, because nothing says it is bypassed.
 

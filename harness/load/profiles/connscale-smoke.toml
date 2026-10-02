@@ -63,10 +63,12 @@ fd_monotonic = true
 # oversight. BACKLOG #1211 measured the retired vs-N gate against a large CI harvest and found it
 # broken five ways at once; the harvest is recorded there, once, and is not restated here.
 #
-# THE PREDICTED HERD FLOOR IS RECORDED, NOT GRADED. Both emitters compute it and write it to
-# out/connscale/ and the CI step summary on every run, pass or fail, and no verdict rides on it.
-# Arming this flag does not arm the floor. Turning the floor into a threshold waits on its own
-# harvested distribution, and is a filed follow-up item linked from #1211.
+# THE PREDICTED HERD FLOOR IS RECORDED, NOT GRADED, IN THIS FILE. Both emitters compute it and write
+# it to out/connscale/ and the CI step summary on every run, pass or fail. Arming this flag does not
+# arm the floor; `empty_claims_herd_floor_legs` does, per CI leg (BACKLOG #1415). It is armed in the
+# inline N=12/24 profile CI runs, on the one leg whose harvest cleared #1415's rule, and NOT here: this
+# file's base count is N=50 at different rates, no harvest exists at that point, and nothing runs it.
+# The per-cell table and the decision are in README.md beside this file, section dated 2026-10-01.
 #
 # WHETHER ANY OF THIS CARRIES TO N=50/100 IS UNMEASURED. Every reading behind #1211 came from the
 # N=12/24 inline profile named at the top of this file, not from this one. Read fresh readings at

@@ -386,21 +386,10 @@ messagefoundry serve --config ./mefor-config/config --env prod # the engine just
 
 The built-in HA model is **active-passive failover** (the Corepoint/Rhapsody model): run N identical engine processes against one shared server database; exactly one — the leader — runs the whole graph, and the rest are warm standbys that take over on failure. Single-node is the byte-identical default; a cluster is opt-in. **Active-active HA** — the same graph running concurrently on every node — is not part of the product (dropped 2026-06-18, code removed). That is a decision about *availability*, not about capacity: adding capacity is a separate, built axis, and it is §15. Full guide: docs/CLUSTERING.md.
 
-```
-              floating VIP / load balancer
-   (health check = TCP connect to the listener port;
-    only the PRIMARY binds it, so traffic lands on the primary)
-                          |
-              +-----------+-----------+
-              |                       |
-        node A: PRIMARY         node B: STANDBY (warm)
-        graph running           no listeners; contends for leadership only
-              |                       |
-              +-----------+-----------+
-                          |
-         shared server DB (leader lease + durable queue)
-         DB-tier HA: PostgreSQL replication / SQL Server Always On
-```
+The diagram of this topology is in [CLUSTERING.md](CLUSTERING.md), under the heading "Deployment
+topology (active-passive)". It shows the floating VIP or load balancer, the primary that alone
+binds the listeners, the warm standby, and the shared server database that holds the leader lease
+and the durable queue.
 
 ### How it works
 
@@ -465,6 +454,69 @@ messagefoundry supervise --config ./config --base-port 8765   # one subprocess p
 ```
 
 **What’s measured, and what isn’t.** On a consumer 8-core test box, supervise scaled roughly linearly — 1 → 2 → 4 shards at ~50 → 88.7 → 165.5 msg/s aggregate, about η ≈ 0.85 of a core per added shard. The portable result is that **speedup shape**, not the absolute rate: multiply η by *your* measured single-shard rate. Two honest caveats — that run used the since-deprecated per-shard SQLite store, and N shards actively sharing one server DB, while built and invariant-tested, is **not yet certified as a supported production topology** (it awaits a clean multi-engine no-loss bench). Until it is, size production multi-engine deployments as active-passive (§14). Detail: docs/SYSTEM-REQUIREMENTS.md and docs/benchmarks/TUNING-BASELINE.md.
+
+### Engine shards split the inbound Connections and share one message store
+
+This diagram shows how MessageFoundry scales past one process. `messagefoundry supervise` starts one
+engine process for each engine shard id, each with `serve --shard <id>` and its own API port. Each
+inbound Connection belongs to exactly one engine shard. Every engine shard reads and writes ONE
+shared message store.
+
+```mermaid
+flowchart TB
+  classDef io fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef deploy fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+
+  SUPERVISE["messagefoundry supervise<br/>finds the engine shard ids in the config<br/>restarts a process that exits"]:::deploy
+
+  subgraph ES_A["Engine shard a"]
+    IN_A["Inbound Connections tagged a"]:::io
+    PROC_A["Engine process: serve --shard a<br/>API port: base"]:::core
+  end
+
+  subgraph ES_B["Engine shard b"]
+    IN_B["Inbound Connections tagged b"]:::io
+    PROC_B["Engine process: serve --shard b<br/>API port: base + 1"]:::core
+  end
+
+  subgraph ES_DEFAULT["Engine shard default"]
+    IN_DEFAULT["Inbound Connections with no tag"]:::io
+    PROC_DEFAULT["Engine process: serve --shard default<br/>API port: base + 2"]:::core
+  end
+
+  UNIFIED_STORE[("ONE message store<br/>one PostgreSQL or SQL Server database")]:::store
+  OUTBOUND(["Outbound Connections, the same set in every engine process<br/>each has one owning engine shard, which delivers for it"]):::io
+
+  SUPERVISE -.->|"starts"| PROC_A
+  SUPERVISE -.->|"starts"| PROC_B
+  SUPERVISE -.->|"starts"| PROC_DEFAULT
+  IN_A ==> PROC_A
+  IN_B ==> PROC_B
+  IN_DEFAULT ==> PROC_DEFAULT
+  PROC_A ==>|"reads and writes"| UNIFIED_STORE
+  PROC_B ==>|"reads and writes"| UNIFIED_STORE
+  PROC_DEFAULT ==>|"reads and writes"| UNIFIED_STORE
+  PROC_A ==>|"delivers what it owns"| OUTBOUND
+  PROC_B ==>|"delivers what it owns"| OUTBOUND
+  PROC_DEFAULT ==>|"delivers what it owns"| OUTBOUND
+```
+
+**Legend.** Thick arrows carry messages. Dotted arrows are process control. The cylinder is the
+message store. API ports follow the sorted order of the engine shard ids. A message can arrive on
+one engine shard and leave from another. The queued row waits in the shared store for the engine
+shard that owns its outbound Connection.
+
+This is **engine sharding**. [ADR 0037](adr/0037-multi-process-sharding-l3.md) defines it,
+[ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md) requires the one shared store, and
+[ADR 0073](adr/0073-ownership-scoped-recovery-single-consumer-lanes.md) gives each outbound
+Connection one delivering engine shard. **Database sharding** is a different idea: it would split
+the message store across several databases. [ADR 0039](adr/0039-database-tier-sharding-l5.md)
+proposed it, and its status is declined.
+
+Before sizing a deployment from this picture, read the paragraph on what is measured, above this
+heading. It names the store that the measured run used and the support status of this topology.
 
 ## 16. Dependencies & supply chain
 
