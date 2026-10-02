@@ -113,6 +113,11 @@ _LABEL_STATEMENT_WHY = (
 )
 
 
+@dataclass(frozen=True)
+class LabelMarker(UnmappedAction):
+    pass
+
+
 def _label_statement(elem: Element) -> str:
     tag = _local(elem.tag).lower()
     if tag == "line":
@@ -132,12 +137,12 @@ def _label_statement(elem: Element) -> str:
     return verb if lowered in _STATEMENT_VERBS or styled else ""
 
 
-def _label_marker(elem: Element) -> list[UnmappedAction]:
+def _label_marker(elem: Element) -> list[LabelMarker]:
     carried = _label_statement(elem)
     if not carried:
         return []
     statement = strip_markup(_attr(elem, "Data"))
-    return [UnmappedAction(carried, f"{_LABEL_STATEMENT_WHY}: {statement}")]
+    return [LabelMarker(carried, f"{_LABEL_STATEMENT_WHY}: {statement}")]
 
 
 """
@@ -148,6 +153,10 @@ _SCAN_SKIP = (
 _WRAPPER_FLATTEN = (
     "            steps.extend(_parse_list(child, subject, held, in_control, depth + 1))\n"
 )
+_SIBLING_PARSE = (
+    "        produced = _parse_statement(child, subject, held, in_control, depth + 1)\n"
+)
+_SIBLING_KEPT = "            continue\n        steps.extend(produced)\n"
 _UNKNOWN_ARM = "    if tag.lower() not in _STATEMENT_TAGS:\n"
 _UNKNOWN_RETURN = '        return [Control("unknown", tag, statement or note, body=tuple(body))]\n'
 _BLOCK_RETURN = "return [Control(kind, source, statement or note or tag, body=tuple(body))]\n"
@@ -161,17 +170,25 @@ _STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
         "        if _label_statement(elem):\n            return frozenset(), frozenset()\n"
         + _SCAN_SKIP,
     ),
-    # The render, a ``<List>`` wrapper: the marker ahead of the flattened body, and ahead of a
-    # construct that may still adopt a sibling branch marker after the wrapper.
+    # The render, a ``<List>`` wrapper: the marker where the wrapper sits, ahead of its
+    # flattened body.
+    (_WRAPPER_FLATTEN, "            steps.extend(_label_marker(child))\n" + _WRAPPER_FLATTEN),
+    # The adoption of a sibling branch never sees a marker, at any depth. Written apart from the
+    # head, which holds the markers back from the list until a statement position follows them.
+    # Here the markers are lifted off the end of the list, main's own adoption runs untouched on
+    # what is left, and they go back after whatever it did.
     (
-        _WRAPPER_FLATTEN,
-        "            adopting = (\n"
-        "                bool(steps)\n"
-        "                and isinstance(steps[-1], Control)\n"
-        "                and steps[-1].kind in _BRANCH_PARENT.values()\n"
-        "            )\n"
-        "            at = len(steps) - 1 if adopting else len(steps)\n"
-        "            steps[at:at] = _label_marker(child)\n" + _WRAPPER_FLATTEN,
+        _SIBLING_PARSE,
+        _SIBLING_PARSE + "        lifted: list[Step] = []\n"
+        "        while steps and isinstance(steps[-1], LabelMarker):\n"
+        "            lifted.insert(0, steps.pop())\n",
+    ),
+    (
+        _SIBLING_KEPT,
+        "            steps.extend(lifted)\n"
+        "            continue\n"
+        "        steps.extend(lifted)\n"
+        "        steps.extend(produced)\n",
     ),
     # The render, an unmodelled tag: the statement is named in the marker that tag already has.
     (_UNKNOWN_ARM, "    marker = _label_marker(elem)\n" + _UNKNOWN_ARM),
@@ -179,9 +196,13 @@ _STEP1_AMENDMENTS: tuple[tuple[str, str], ...] = (
         _UNKNOWN_RETURN,
         "        detail = marker[0].detail if marker else statement or note\n"
         '        return [Control("unknown", tag, detail, body=tuple(body))]\n'
-        # A send in a Block's or a Call's ``@Data`` is never a live send.
+        # A send in a Block's or a Call's ``@Data`` is never a live send: a label, its marker,
+        # and then its body where a send's body always went. A Call carrying any other
+        # statement is a plain label too, and no call.
         '    if marker and kind == "send":\n'
-        '        kind, source = "block", tag\n',
+        '        return [Control("block", tag, statement, body=tuple(marker)), *body]\n'
+        '    if marker and kind == "call":\n'
+        '        kind = "block"\n',
     ),
     # The render, a container: the marker ahead of its body, or ahead of the construct.
     (_BLOCK_RETURN, _BLOCK_RETURN.replace("body=tuple(body)", "body=(*marker, *body)")),
@@ -2175,6 +2196,26 @@ def _gate_review_shapes() -> Iterator[Shape]:
         yield Shape(f"gate-review-nested-{depth}", "%ADT", (nested,))
 
 
+#: A construct, and a branch marker a ``<Line>`` after it carries as its sibling.
+_SIBLING_PAIRS = (
+    ("if-else", '<If Data="If (x)"><List/></If>', "Else"),
+    ("if-elseif", '<If Data="If (x)"><List/></If>', "ElseIf (y)"),
+    ("try-catch", "<Try><List/></Try>", "Catch"),
+    ("case-matching", '<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M0"'),
+)
+_FILLED = '<Line Data="ItemClear %ADT/PID-20"/>'
+#: Wrappers between such a pair, nested. ``{S}`` is where one carries a statement. A ``filled``
+#: wrapper holds a statement of its own, which orphans the branch on main already.
+_NESTED_WRAPPERS = {
+    "inner-of-2": "<List><List{S}/></List>",
+    "both-of-2": "<List{S}><List{S}/></List>",
+    "innermost-of-3": "<List><List><List{S}/></List></List>",
+    "middle-of-3": "<List><List{S}><List/></List></List>",
+    "outermost-of-3": "<Actions{S}><List><List/></List></Actions>",
+    "filled-inner-of-2": f"<List><List{{S}}>{_FILLED}</List></List>",
+    "filled-outer-of-2": f"<List{{S}}><List>{_FILLED}</List></List>",
+    "filled-beside-the-inner-of-2": f"<List>{_FILLED}<List{{S}}/></List>",
+}
 _CONTAINER_TAGS = ("Block", "Call", "Case", "Foreach", "If", "Loop", "Try")
 #: Every tag the #2632 seeds put a statement on: each container, an unmodelled tag, a list wrapper.
 _CARRIER_TAGS = (*_CONTAINER_TAGS, "Switch", "Actions")
@@ -2227,19 +2268,41 @@ def _label_statement_shapes() -> Iterator[Shape]:
                     (carrying(tag, f"{spelling} %NEW/ to %ADT/"), SendS(_ADT, "OB_IN")),
                 )
     # A wrapper holding a statement, between a construct and the branch marker written after it
-    # as a sibling. The marker must not come between the two: an orphaned branch renders live.
-    arm = (Write(_ADT, "W5Z", markup=False), SendS(_ADT, "OB_ARM", markup=False))
-    for name, construct, branch in (
-        ("if-else", '<If Data="If (x)"><List/></If>', "Else"),
-        ("if-elseif", '<If Data="If (x)"><List/></If>', "ElseIf (y)"),
-        ("try-catch", "<Try><List/></Try>", "Catch"),
-        ("case-matching", '<Case Data="ChooseFrom (x)"><List/></Case>', 'Matching "M0"'),
-    ):
+    # as a sibling. The adoption must not see the marker: an orphaned branch renders live.
+    arm = _render((Write(_ADT, "W5Z", markup=False), SendS(_ADT, "OB_ARM", markup=False)), "%ADT")
+    for name, construct, branch in _SIBLING_PAIRS:
         for label, data in (("log", "MsgLog %ADT"), ("clone", clone)):
-            between = Raw(
-                construct + carrying("List", data).xml + _line(branch, _render(arm, "%ADT"))
-            )
+            between = Raw(construct + carrying("List", data).xml + _line(branch, arm))
             yield Shape(f"2632-List-{label}-before-a-sibling-{name}", "%ADT", (between,))
+            # The Lander's hold on PR 1938: the same, with the wrapper nested in others, to a
+            # depth of two and three, and the statement on the inner one, the outer, or each.
+            for nesting, template in _NESTED_WRAPPERS.items():
+                wrappers = template.replace("{S}", f' Data="{_esc(data)}"')
+                nested = Raw(construct + wrappers + _line(branch, arm))
+                yield Shape(
+                    f"2632-List-{label}-{nesting}-before-a-sibling-{name}", "%ADT", (nested,)
+                )
+    # The other routes by which a marker comes last in a list a branch is adopted in: a body
+    # flattened to that level. And a send label over a construct, whose body main left there.
+    if_x, else_arm = _SIBLING_PAIRS[0][1], _line("Else", arm)
+    for nesting, template in (("one", "<List{S}/>"), ("two", _NESTED_WRAPPERS["inner-of-2"])):
+        wrappers = template.replace("{S}", ' Data="MsgLog %ADT"')
+        for route, xml in (
+            ("a-branch-group", f"<If>{_line('If (x)', '')}{wrappers}</If>"),
+            ("a-line-body", _line("ItemClear %ADT/PID-18", if_x + wrappers)),
+            ("a-wrapper-around-the-construct", f"<List>{if_x}{wrappers}</List>"),
+        ):
+            yield Shape(
+                f"2632-List-log-{nesting}-deep-at-the-end-of-{route}",
+                "%ADT",
+                (Raw(xml + else_arm),),
+            )
+    for tag in ("Block", "Call"):
+        over = carrying(tag, "MsgSend %ADT [OB_LABEL]", (Raw(if_x),))
+        yield Shape(f"2632-{tag}-send-over-a-construct", "%ADT", (Raw(over.xml + else_arm),))
+    # A construct carrying a statement still adopts its own sibling branch.
+    carrier = carrying("If", "MsgLog %ADT")
+    yield Shape("2632-If-log-before-its-own-sibling-else", "%ADT", (Raw(carrier.xml + else_arm),))
     # A keyword span that does not lead a Block's label, and a table verb that does not lead it:
     # both still read as a label.
     connective = f"Copy patient {_kw('to')} output"
@@ -2689,8 +2752,9 @@ def test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line(chunk:
 def test_the_amendment_reaches_every_seed_written_for_it() -> None:
     """The bound above is not vacuous: the seed that recorded the defect changes, and so does every
     statement on every carrier tag. Three kinds of seed must NOT change, or the rule is wider than
-    it says: a keyword-styled verb outside the table anywhere but on a ``<Block>``, a keyword span
-    that does not lead a Block's label, and a table verb that does not lead it."""
+    it says: a keyword-styled verb outside the table anywhere but on a ``<Block>`` or a list
+    wrapper, a keyword span that does not lead a Block's label, and a table verb that does not
+    lead it."""
     assert {tag.lower() for tag in _CONTAINER_TAGS} == set(head._CONTAINER_KIND_BY_TAG)
     assert {verb.lower() for verb in _STATEMENT_VERBS} == head._STATEMENT_VERBS
     recorded = next(s for s in _SHAPES if s.name == "d26545d6f-open-1-block-label")
@@ -2699,6 +2763,84 @@ def test_the_amendment_reaches_every_seed_written_for_it() -> None:
         _, tag, kind = shape.name.split("-", 2)
         expected = tag in ("Block", "Actions") if kind == "keyword" else tag != "not"
         assert _amendment_changes(shape) is expected, shape.name
+
+
+_Branches = tuple[Counter[tuple[str, str, str]], Counter[tuple[str, str]]]
+
+
+def _branches(module: Any, xml: str) -> _Branches | None:
+    """Every branch marker in the parsed list, as ``(adopted, orphaned)``, or ``None`` where the
+    import refuses. Adopted: ``(construct kind, branch kind, branch text)`` for each branch a
+    construct holds. Orphaned: ``(kind, text)`` for each marker standing as a step of its own,
+    which the render lifts to that level with its body live."""
+    try:
+        channel = module.parse_package(_package(xml))[0]
+    except module.CorepointImportError:
+        return None
+    adopted: Counter[tuple[str, str, str]] = Counter()
+    orphaned: Counter[tuple[str, str]] = Counter()
+
+    def walk(steps: Sequence[Any]) -> None:
+        for step in steps:
+            if not isinstance(step, module.Control):
+                continue
+            if step.kind in module._BRANCH_PARENT:
+                orphaned[step.kind, step.detail] += 1
+            hold(step)
+
+    def hold(construct: Any) -> None:
+        walk(construct.body)
+        for branch in construct.branches:
+            adopted[construct.kind, branch.kind, branch.detail] += 1
+            hold(branch)
+
+    for handler in channel.handlers:
+        walk(handler.steps)
+    return adopted, orphaned
+
+
+def _branches_moved(shape: Shape) -> list[str]:
+    """What the amendment, or the head, changes about which construct holds which branch, against
+    the tree exactly as vendored. It must change nothing: a statement off a ``<Line>`` is marked,
+    and a marker is no statement position. So no branch main adopts is orphaned, at any depth of
+    wrapper, and none it orphans is adopted. A gate-open list holds no construct at all."""
+    xml = _render(shape.nodes, shape.inp)
+    was = _branches(step1_as_vendored, xml)
+    return [
+        f"{shape.name}: {name} holds {now} where main holds {was}"
+        for name, module in (("the amended baseline", step1), ("the head", head))
+        if (now := _branches(module, xml)) != was
+    ]
+
+
+@pytest.mark.parametrize("chunk", range(_CHUNKS))
+def test_no_branch_main_adopts_is_orphaned(chunk: int) -> None:
+    """The acceptance rule of the repair to PR 1938, over the whole battery and not only where
+    the rendered text shows it: see :func:`_branches_moved`."""
+    moved = [line for shape in _SHAPES[chunk::_CHUNKS] for line in _branches_moved(shape)]
+    assert not moved, "\n".join(moved[:20]) + f"\n... {len(moved)} in all"
+
+
+def test_the_branch_check_sees_an_orphan_and_an_adoption() -> None:
+    """The control for the test above: the reading tells an adopted branch from an orphaned one, on
+    the vendored tree itself. A ``<List>`` holding a statement between an If and its Else orphans
+    the Else on main; an empty one does not."""
+    if_x, arm = _SIBLING_PAIRS[0][1], _line("Else", _line("MsgLog %ADT"))
+    adopted = _branches(step1_as_vendored, if_x + "<List/>" + arm)
+    orphaned = _branches(step1_as_vendored, if_x + "<List>" + _FILLED + "</List>" + arm)
+    assert adopted == (Counter({("if", "else", ""): 1}), Counter())
+    assert orphaned == (Counter(), Counter({("else", ""): 1}))
+    # And every nested seed that main adopts is one the bound sees change.
+    nested = [s for s in _label_statement_shapes() if "-before-a-sibling-" in s.name]
+    held = [
+        s
+        for s in nested
+        if (found := _branches(step1_as_vendored, _render(s.nodes, s.inp))) and found[0]
+    ]
+    filled = sum(name.startswith("filled") for name in _NESTED_WRAPPERS)
+    assert len(nested) == len(_SIBLING_PAIRS) * 2 * (1 + len(_NESTED_WRAPPERS))
+    assert len(held) == len(nested) - len(_SIBLING_PAIRS) * 2 * filled > 0
+    assert all(_amendment_changes(s) for s in held)
 
 
 @pytest.mark.parametrize("chunk", range(_CHUNKS))
