@@ -1098,10 +1098,11 @@ _LXML_PARSE_CALLS = frozenset(
 )
 #: Methods of a parsed lxml tree that transform it or pull further documents into it. The receiver
 #: is whatever ``harden.py`` returned, which no static walk can type, so these match on any receiver.
-#: NOT COVERED, at least: a tree's own ``parse`` and a parser's ``feed``, which also read a new
-#: document. Either name on any receiver would match ``ast.parse`` and every other parser in the
-#: tree, so the walk does not look for them.
-_LXML_TREE_METHODS = frozenset({"xslt", "xinclude"})
+#: ``xmlschema`` and ``relaxng`` are here because the schema they are handed can include another
+#: document. NOT COVERED, at least: a tree's own ``parse`` and a parser's ``feed``, which also read
+#: a new document. Either name on any receiver would match ``ast.parse`` and every other parser in
+#: the tree, so the walk does not look for them.
+_LXML_TREE_METHODS = frozenset({"xslt", "xinclude", "xmlschema", "relaxng"})
 #: lxml's own modules. A read of one off an lxml binding is a hop to that module, and the name read
 #: off the hop is the one reported.
 _LXML_SUBMODULES = frozenset({"etree", "html", "objectify"})
@@ -1248,14 +1249,16 @@ def _lxml_reads(source: str) -> set[str]:
     receiver: an attribute a binding was assigned to (``self._lx = load_lxml()`` makes ``c._lx``
     lxml too), a name bound in a class body, and a decorated function that returns a binding, which
     is how a property looks. A function that returns a binding counts as a loader when it is called
-    on any receiver, for the same reason.
+    on any receiver, for the same reason, and so does a loader kept on an attribute. The name
+    ``etree`` is the exception: ``xml.etree`` is the stdlib's, so an attribute called ``etree``
+    matches only on the receiver it was assigned through.
 
     The name reported is the first one read off the binding. A hop through
     :data:`_LXML_SUBMODULES` is not a read (``lxml.etree.parse`` reports ``parse``), and neither is
     anything further down the chain (``etree.XPathError.__name__`` reports ``XPathError``). A read
     counts whether or not it is called. Three more shapes are reported under their own names: a
-    :data:`_LXML_TREE_METHODS` call on any receiver, ``getattr`` on a binding, and a star import
-    from an lxml module.
+    :data:`_LXML_TREE_METHODS` name read off any receiver, ``getattr`` on a binding, and a star
+    import from an lxml module.
 
     THIS ERRS TOWARDS ACCUSING, AND IT STILL MISSES THINGS. It reads one file and ignores scope, so
     a name bound to lxml anywhere in the file counts everywhere in it, and a method that shares its
@@ -1321,12 +1324,15 @@ def _lxml_reads(source: str) -> set[str]:
                         found.add(alias.name)
         elif isinstance(node, ast.Return) and node.value is not None:
             returned.append(node.value)
-        elif isinstance(node, ast.Assign):
-            assigned.append((node.targets, node.value))
-        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
-            assigned.append(([node.target], node.value))
+        elif (assignment := _assignment(node)) is not None:
+            assigned.append(assignment)
         elif isinstance(node, ast.ClassDef):
-            class_level |= {id(target) for stmt in node.body for target in _assigned_names(stmt)}
+            class_level |= {
+                id(target)
+                for stmt in node.body
+                if (in_body := _assignment(stmt)) is not None
+                for target in in_body[0]
+            }
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             if not isinstance(node, ast.Lambda):
                 functions.append(node)
@@ -1374,29 +1380,35 @@ def _lxml_reads(source: str) -> set[str]:
                         on_any_receiver.add(name)
             elif is_loader(value) or (isinstance(value, ast.Lambda) and is_lxml(value.body)):
                 loaders |= {name for target in targets if (name := _dotted(target)) is not None}
+                # A loader kept on an attribute is called through any receiver, like a method.
+                loaders |= {target.attr for target in targets if isinstance(target, ast.Attribute)}
         grew = len(bindings) + len(on_any_receiver) + len(loaders) > before
 
     for node in nodes:
         if isinstance(node, ast.Attribute):
-            # A hop to a submodule, or to another binding, is not itself a read.
-            if is_lxml(node.value) and not is_lxml(node):
+            # A hop to a submodule is not itself a read. A tree method counts on any receiver,
+            # called or not, like every other name here.
+            if node.attr in _LXML_TREE_METHODS or (
+                node.attr not in _LXML_SUBMODULES and is_lxml(node.value)
+            ):
                 found.add(node.attr)
-        elif isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Attribute) and func.attr in _LXML_TREE_METHODS:
-                found.add(func.attr)
-            elif _dotted(func) == "getattr" and node.args and is_lxml(node.args[0]):
-                found.add(_LXML_GETATTR)
+        elif (
+            isinstance(node, ast.Call)
+            and _dotted(node.func) == "getattr"
+            and node.args
+            and is_lxml(node.args[0])
+        ):
+            found.add(_LXML_GETATTR)
     return found
 
 
-def _assigned_names(stmt: ast.stmt) -> list[ast.expr]:
-    """The targets of an assignment statement, or nothing for any other statement."""
-    if isinstance(stmt, ast.Assign):
-        return stmt.targets
-    if isinstance(stmt, ast.AnnAssign):
-        return [stmt.target]
-    return []
+def _assignment(node: ast.AST) -> tuple[list[ast.expr], ast.expr] | None:
+    """``(targets, value)`` for an assignment, an annotated one or a ``:=``, else ``None``."""
+    if isinstance(node, ast.Assign):
+        return node.targets, node.value
+    if isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+        return [node.target], node.value
+    return None
 
 
 def _lxml_parse_call_sites(source: str) -> set[str]:
@@ -1415,12 +1427,11 @@ def test_lxml_parsing_really_is_hardened_in_exactly_one_place() -> None:
     # harden.py". That was a comment; this makes it a fact. An lxml parse entry point reached from
     # anywhere else is an unhardened parse, whatever the file calls the module.
     reads = {
-        rel: found
+        rel: _lxml_reads(path.read_text(encoding="utf-8"))
         for path in _py_files(*_XML_ROOTS)
-        if (found := _lxml_reads(path.read_text(encoding="utf-8")))
-        and (rel := path.relative_to(_REPO).as_posix()) != _LXML_PARSE_HOME
+        if (rel := path.relative_to(_REPO).as_posix()) != _LXML_PARSE_HOME
     }
-    assert reads, "no file outside harden.py reads anything off lxml; the walk has gone blind"
+    assert reads, f"no python files under {_XML_ROOTS}; the walk would pass over nothing"
     offenders = sorted(
         f"{rel}: {sorted(found & _LXML_REPORTED)}"
         for rel, found in reads.items()
@@ -1535,31 +1546,36 @@ _LXML_PLANTED_SHAPES: tuple[tuple[str, set[str]], ...] = (
     # Read but not called on that line, and looked up by a name the walk cannot see.
     ("etree = load_lxml()\nmake = etree.XMLParser\np = make()\n", {"XMLParser"}),
     ("etree = load_lxml()\nr = getattr(etree, name)(body)\n", {_LXML_GETATTR}),
-    # A transform or an inclusion run as a method of an already-parsed tree.
+    # A transform, an inclusion or a schema run as a method of an already-parsed tree, and the
+    # same method read first and called later.
     ("out = tree.xslt(sheet)\n", {"xslt"}),
     ("tree.xinclude()\n", {"xinclude"}),
+    ("ok = tree.xmlschema(schema)\n", {"xmlschema"}),
+    ("ok = tree.relaxng(grammar)\n", {"relaxng"}),
+    ("run = tree.xslt\nout = run(sheet)\n", {"xslt"}),
+    # An entry point read off the module where the file also keeps a binding under that name.
+    (
+        "etree = load_lxml()\nns.iterparse = etree\nfor _ in etree.iterparse(src):\n    pass\n",
+        {"iterparse"},
+    ),
+    # The loader itself kept on an attribute, and called through another receiver.
+    (
+        "class C:\n"
+        "    def __init__(self):\n"
+        "        self._load = load_lxml\n\n\n"
+        "def go(c, body):\n"
+        "    return c._load().fromstring(body)\n",
+        {"fromstring"},
+    ),
 )
 
-#: Sources the walk must stay silent on: the lxml calls the four other ``_deps.py`` consumers do
-#: make, and the same entry point names on a binding that is not lxml.
-_LXML_PLANTED_CLEAN = (
-    "etree = load_lxml()\nout = etree.tostring(root, encoding='utf-8')\n",
-    "etree = load_lxml()\ntry:\n    pass\nexcept etree.XPathError:\n    pass\n",
-    "import ast\ntree = ast.parse(source)\n",
-    "import json\nvalue = json.loads(text)\n",
-    "from html.parser import HTMLParser\np = HTMLParser()\n",
-    "from xml.sax import make_parser\np = make_parser()\n",
-    "from messagefoundry.parsing.xml import harden\nroot = harden.parse_xml(body)\n",
-    "value = getattr(settings, name)\n",
-    # The stdlib's ElementTree under the name every lxml consumer uses. The import allow-list
-    # above is what holds a stdlib parser, so this walk must not call it lxml.
-    "import xml.etree.ElementTree as etree\nroot = etree.fromstring(body)\n",
-    "import xml.etree.ElementTree\nroot = xml.etree.ElementTree.fromstring(body)\n",
-)
-
-#: What the allow-list sees: every name read off a binding, parse entry point or not. One name
-#: per chain, and a hop through an lxml module is not a read.
-_LXML_PLANTED_READS: tuple[tuple[str, set[str]], ...] = (
+#: Sources the deny-list must stay silent on, each with every name the walk reads off an lxml
+#: binding in it. That second half is what the allow-list sees: one name per chain, a hop through
+#: an lxml module is not a read, and a binding that is not lxml reads nothing.
+_LXML_PLANTED_CLEAN: tuple[tuple[str, set[str]], ...] = (
+    # What the four other ``_deps.py`` consumers do with the module.
+    ("etree = load_lxml()\nout = etree.tostring(root, encoding='utf-8')\n", {"tostring"}),
+    ("etree = load_lxml()\ntry:\n    pass\nexcept etree.XPathError:\n    pass\n", {"XPathError"}),
     ("etree = load_lxml()\nroot = etree.Element('probe')\n", {"Element"}),
     ("etree = load_lxml()\nname = etree.XPathError.__name__\n", {"XPathError"}),
     ("import lxml.etree\nout = lxml.etree.tostring(root)\n", {"tostring"}),
@@ -1569,6 +1585,17 @@ _LXML_PLANTED_READS: tuple[tuple[str, set[str]], ...] = (
         "etree = load_lxml()\nserialise = etree.tostring\nout = serialise.__call__(root)\n",
         {"tostring"},
     ),
+    # The same entry point names on a binding that is not lxml.
+    ("import ast\ntree = ast.parse(source)\n", set()),
+    ("import json\nvalue = json.loads(text)\n", set()),
+    ("from html.parser import HTMLParser\np = HTMLParser()\n", set()),
+    ("from xml.sax import make_parser\np = make_parser()\n", set()),
+    ("from messagefoundry.parsing.xml import harden\nroot = harden.parse_xml(body)\n", set()),
+    ("value = getattr(settings, name)\n", set()),
+    # The stdlib's ElementTree under the name every lxml consumer uses. The import allow-list
+    # above is what holds a stdlib parser, so this walk must not call it lxml.
+    ("import xml.etree.ElementTree as etree\nroot = etree.fromstring(body)\n", set()),
+    ("import xml.etree.ElementTree\nroot = xml.etree.ElementTree.fromstring(body)\n", set()),
 )
 
 
@@ -1577,14 +1604,11 @@ def test_the_lxml_guard_sees_every_planted_shape(source: str, expected: set[str]
     assert _lxml_parse_call_sites(source) == expected, source
 
 
-@pytest.mark.parametrize(("source", "expected"), _LXML_PLANTED_READS)
-def test_the_lxml_walk_reports_one_read_per_chain(source: str, expected: set[str]) -> None:
-    assert _lxml_reads(source) == expected, source
-
-
-@pytest.mark.parametrize("source", _LXML_PLANTED_CLEAN)
-def test_the_lxml_guard_stays_silent_on_a_non_parsing_use(source: str) -> None:
-    assert _lxml_parse_call_sites(source) == set(), source
+@pytest.mark.parametrize(("source", "expected"), _LXML_PLANTED_CLEAN)
+def test_the_lxml_guard_stays_silent_on_a_non_parsing_use(source: str, expected: set[str]) -> None:
+    reads = _lxml_reads(source)
+    assert reads == expected, source
+    assert not reads & _LXML_REPORTED, source
 
 
 def test_the_planted_lxml_shapes_cover_the_names_the_guard_was_widened_for() -> None:

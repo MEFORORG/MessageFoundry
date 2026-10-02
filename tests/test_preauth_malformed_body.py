@@ -6,15 +6,20 @@ THIS FILE PINS WHAT WAS MEASURED. IT DOES NOT SAY WHAT THE ANSWER SHOULD BE. The
 (``tests/test_dast_auth_sweep.py``) sends an empty body, which covers a body that parsed. Nothing
 covered a body that fails to parse, so a change that parsed more of a request before the login check
 could land with every test green. Each status below was read off the live app and written down, so
-that such a change now reds a test and has to be looked at.
+a change to what a class of route answers now reds a test and has to be looked at.
+
+WHAT IS NOT PINNED IS WHICH ROUTES ARE IN A CLASS. A new gated JSON route that declares a body
+joins the class below and answers as that class does, with every case here green. Only a floor
+holds each class's size. Pinning the membership would red every change that adds such a route, and
+whether that is wanted is part of the open ruling.
 
 ONE CLASS IS A MEASURED, UNRULED BEHAVIOUR. A JSON route behind an API gate that declares a body
 gives an unauthenticated caller a parser answer, and not the 401 it gives every other
-unauthenticated request. There are at least two such answers: 422 for bytes that are not valid
-JSON, and 400 for bytes that are not text at all. FastAPI reads and decodes a declared JSON body
-before it solves the route's dependencies, and the login check is a dependency. The owner has not
-ruled on whether that order is acceptable. Do not "fix" it here in either direction: change a
-pinned status only together with the engine change that moves it, under an owner ruling.
+unauthenticated request. There are at least two such answers: 422 from the JSON decoder, and 400
+when reading the body raises anything else. FastAPI reads and decodes a declared JSON body before
+it solves the route's dependencies, and the login check is a dependency. The owner has not ruled
+on whether that order is acceptable. Do not "fix" it here in either direction: change a pinned
+status only together with the engine change that moves it, under an owner ruling.
 
 HOW THE WALK IS BUILT. Every operation comes from the live route table through
 ``scripts/security/route_gates.py``, the one derivation of a route's gate. Nothing here is a list
@@ -36,6 +41,8 @@ WHAT THIS DOES NOT SEE, at least:
 * A GET handler that reads a body by hand. No GET operation declares one today.
 * ``/ws/stats`` and the ``/ui/static`` mount. Neither takes a request body. The walk fails if any
   other route joins them, so a mounted app or an included router cannot hide operations from it.
+  A route that declares only OPTIONS or HEAD gets no row from ``route_gates``, so it is counted
+  among them and fails the walk too.
 * Form and multipart bodies. No arm sends one. No route declares one: FastAPI refuses to register
   such a route without ``python-multipart``, which the engine does not install. The console reads
   its forms by hand inside the handler.
@@ -64,8 +71,9 @@ from scripts.security.dast_auth_sweep import DEFAULT_POLICY, _key, load_policy
 #: The four probes, in the order every status tuple below is written. The first is not valid JSON:
 #: an object that never closes. The second is the same bytes with no content type. The third is
 #: valid JSON of the wrong shape, a bare string, and is the contrast that shows the first answer
-#: comes from the bytes and not from the route. The fourth is not UTF-8, so it fails before the
-#: JSON decoder sees it.
+#: comes from the bytes and not from the route. The fourth cannot be turned into text: its first
+#: two bytes read as a UTF-16 mark and the third is half a character. Reading it raises an error
+#: that is not a JSON decode error, which is the path the fourth answer comes from.
 _JSON = {"Content-Type": "application/json"}
 _ARMS: dict[str, tuple[bytes, dict[str, str]]] = {
     "malformed JSON": (b'{"probe": ', _JSON),
@@ -210,9 +218,16 @@ async def sweep(tmp_path_factory: pytest.TempPathFactory) -> _Sweep:
                         for body, headers in _ARMS.values()
                     ]
                 )
+        # ``route_rows`` drops the two methods FastAPI can add by itself, so a route that declares
+        # nothing else has no row. It is reported here, or it would be walked by nobody.
+        rowless = {
+            ("/".join(sorted(route.methods or ())), route.path)
+            for route in app.routes
+            if isinstance(route, APIRoute) and not set(route.methods or ()) - {"HEAD", "OPTIONS"}
+        }
         return _Sweep(
             not_probed=frozenset(
-                (row.method, row.path) for row in rows if row.method in unprobeable
+                {(row.method, row.path) for row in rows if row.method in unprobeable} | rowless
             ),
             answers=answers,
         )
@@ -240,8 +255,12 @@ async def test_the_walk_reaches_every_body_taking_operation(sweep: _Sweep) -> No
     )
     assert not unclassed, (
         "a gated operation is of a class no status is pinned for. Measure what it answers and add "
-        f"the class to _GATED: {unclassed}"
+        f"the class to _GATED and to _FLOORS: {unclassed}"
     )
+    # Every class with a pin is held to it here, so a class added to _GATED cannot go unchecked.
+    assert set(_GATED) == set(_FLOORS)
+    for gate_class in _GATED:
+        sweep.pinned(gate_class)
 
 
 async def test_authentication_refuses_first_where_no_body_is_declared(sweep: _Sweep) -> None:
@@ -252,11 +271,14 @@ async def test_authentication_refuses_first_where_no_body_is_declared(sweep: _Sw
         "the control route is not among the API-gated operations with no declared body: the walk "
         f"found {len(operations)} of those, and {len(sweep.answers)} operation(s) in all"
     )
-    assert all(
-        response.json() == _REFUSED
+    assert operations
+    other_body = {
+        f"{operation}, {arm}": response.text
         for operation in operations
-        for response in sweep.answers[operation]
-    )
+        for arm, response in zip(_ARMS, sweep.answers[operation], strict=True)
+        if response.json() != _REFUSED
+    }
+    assert not other_body, other_body
 
 
 async def test_a_gated_json_route_answers_a_malformed_body_before_it_authenticates(
@@ -270,7 +292,8 @@ async def test_a_gated_json_route_answers_a_malformed_body_before_it_authenticat
         assert set(error) == {"type", "loc", "msg"}, (str(operation), error)
         assert error["type"] == "json_invalid", (str(operation), error)
         assert undecodable.json() == _UNREADABLE, str(operation)
-        # The same route refuses the same caller once the bytes are not handed to the decoder.
+        # The same route refuses the same caller where the decoder is not run (no content type)
+        # and where it runs and succeeds (the wrong shape).
         assert no_content_type.json() == wrong_shape.json() == _REFUSED, str(operation)
 
 
