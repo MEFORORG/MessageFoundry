@@ -5,7 +5,7 @@
 Every registered hostile scenario already runs against the real served graph in
 ``tests/test_harness_scenarios.py``. This file covers what that cannot: the data file and the
 message builder, the controls that prove the traversal-escape check and the round-trip byte check
-can each FAIL (in isolation and inside a live run), and the known-defect scenarios as strict xfails.
+can each FAIL (in isolation and inside a live run), and the known-defect matcher.
 Test ids are scenario or class names, never payloads. A comparison that involves a payload is taken
 into a bool first, so a failure names a label and never prints the payload.
 """
@@ -38,6 +38,7 @@ from harness.scenarios.hostile import (
 )
 from harness.sinks import Record
 from messagefoundry.apiclient import EngineClient
+from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
@@ -216,7 +217,9 @@ def test_a_multibyte_fill_is_sized_in_bytes() -> None:
 
 
 def test_expected_delivery_follows_the_documented_rules() -> None:
-    framing = build_injection(_value("framing_bytes", "start_and_end_block"), "mllp")
+    # An end block alone, the data file's live check that an MLLP 0x1C ends the frame (ADR 0205).
+    framing = build_injection(_value("framing_end_block", "end_block_only"), "mllp")
+    assert framing.value.expect == "processed"
     end_block = framing.payload.index(0x1C)
     # Over MLLP the end block delimits the frame: only the bytes before it arrive.
     assert framing.expected is not None
@@ -233,6 +236,19 @@ def test_expected_delivery_follows_the_documented_rules() -> None:
     assert identical
     refused = build_injection(_value("non_ascii", "latin1_on_a_utf8_connection"), "mllp")
     assert refused.expected is None
+    # The data file's framing value arrives raw, though the model would escape it (ADR 0205).
+    framed = build_injection(_value("framing_bytes", "start_and_end_block"), "mllp")
+    assert b"\x0b" in framed.payload and framed.expected is None
+
+
+def test_the_raw_only_alphabet_holds_every_byte_the_engine_refuses_to_write() -> None:
+    # The harness puts these back raw after the encode, so it must cover what a whole-field write
+    # refuses and what a leaf write escapes. The engine-side tables are pinned to each other in
+    # tests/test_one_frame_one_message.py.
+    raw_only = set(hostile._RAW_ONLY)
+    assert set(message_module._STRUCTURE_REFUSED) <= raw_only
+    assert {chr(cp) for cp in range(0x20) if cp not in (0x09, 0x0A, 0x0D)} <= raw_only
+    assert {"\t", "\r", "\n"}.isdisjoint(raw_only)
 
 
 def test_the_control_id_is_read_from_what_the_engine_receives() -> None:
@@ -426,15 +442,14 @@ def test_a_bad_data_file_is_a_failed_result_not_a_traceback(tmp_path: Path) -> N
 # --- known engine defects -----------------------------------------------------------------------
 
 
-class KnownDefectReproduced(AssertionError):
-    """Raised only when a run fails with its defect's own signature and nothing else. The xfail
-    below expects this type alone, so a run failing for any other reason -- a broken rig, a
-    timeout, a second problem beside the defect -- is a real failure, not a quiet xfail."""
-
-
 def test_a_defect_signature_does_not_absorb_another_failure() -> None:
-    (defect,) = KNOWN_DEFECTS
-    scenario = defect.scenario
+    # KNOWN_DEFECTS is empty since ADR 0205, so the matcher is pinned on a defect built here.
+    scenario = HostileScenario("hostile_example", "an example", ("markup",), drivers=("file",))
+    defect = KnownDefect(
+        scenario,
+        reason="example",
+        signature=("the mllp sink got", "unexpected record(s) reached the mllp sink"),
+    )
     head = "2 hostile message(s) across file: "
     alone = "a via file: the mllp sink got 1 bytes that differ; 1 unexpected record(s) reached"
     assert defect.reproduced_by(ScenarioResult(scenario, False, head + alone + " the mllp sink"))
@@ -444,26 +459,8 @@ def test_a_defect_signature_does_not_absorb_another_failure() -> None:
     assert not defect.reproduced_by(ScenarioResult(scenario, False, "API error: 500"))
 
 
-@pytest.mark.parametrize(
-    "defect",
-    [
-        pytest.param(
-            d,
-            marks=pytest.mark.xfail(strict=True, raises=KnownDefectReproduced, reason=d.reason),
-        )
-        for d in KNOWN_DEFECTS
-    ],
-    ids=[d.scenario.name for d in KNOWN_DEFECTS],
-)
-def test_known_defect_scenarios(
-    server: tuple[str, Endpoints],  # noqa: F811
-    defect: KnownDefect,
-) -> None:
-    api_url, eps = server
-    with EngineClient(api_url) as client:
-        result = run_scenario(defect.scenario, client, timeout=8.0, endpoints=eps)
-    if result.ok:
-        return  # fixed: strict xfail turns this into a failure, which says promote the scenario
-    if defect.reproduced_by(result):
-        raise KnownDefectReproduced(defect.scenario.name)
-    pytest.fail(f"failed, but not with the known defect's signature alone: {result.detail}")
+def test_no_known_defect_is_registered_while_nothing_runs_one() -> None:
+    # The strict-xfail runner over KNOWN_DEFECTS was removed while the tuple is empty, because an
+    # empty parametrization reports a skip that reads like a test. A defect added to the tuple would
+    # run nowhere, so this fails until that runner is restored (from git history, ADR 0205).
+    assert KNOWN_DEFECTS == ()
