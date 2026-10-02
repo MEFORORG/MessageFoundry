@@ -88,6 +88,7 @@ def _pairs(
         api=api or ApiSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
+        remote_debug=None,
     )
 
 
@@ -138,6 +139,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "aad_bind" in named
@@ -168,6 +170,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "no effect without a store key" in named["aad_bind"]
@@ -195,6 +198,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "ad_session_recheck_seconds" in named
@@ -243,6 +247,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "admin_new_ip_step_up" in named
@@ -390,6 +395,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     ).get(switch)
 
@@ -961,6 +967,7 @@ def test_ranges_whose_union_covers_a_family_are_a_named_loosening(entries: list[
             api=_proxied(*entries),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     ).get("trusted_proxies")
     assert risk is not None
@@ -990,6 +997,7 @@ def test_a_repeated_trust_every_peer_entry_is_named_once() -> None:
             api=_proxied("::/0", "::/0"),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )["trusted_proxies"]
     assert risk.count("::/0") == 1
@@ -1051,6 +1059,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             api=_terminated(ack=True),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     risk = named["plaintext_upstream_hop_acknowledged"]
@@ -1678,6 +1687,7 @@ async def test_posture_route_reports_the_auth_deviation(engine: Engine) -> None:
     assert "ad_session_recheck_seconds" in switches
 
 
+@pytest.mark.usefixtures("remote_debugging_off")  # the process reading, pinned: see the fixture
 async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: Engine) -> None:
     """BACKLOG #1179: the route reads [api] off the resolved settings serve stashes (#1989)."""
     body = await _posture_body(
@@ -1692,8 +1702,13 @@ async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: E
     assert quiet["loosenings"] == []
 
 
+@pytest.mark.usefixtures("remote_debugging_off")
 async def test_posture_route_reports_nothing_at_the_shipped_defaults(engine: Engine) -> None:
-    """The route must be quiet on a default instance, or its signal is worthless."""
+    """The route must be quiet on a default instance, or its signal is worthless.
+
+    Default SETTINGS, on an interpreter started with remote debugging off. A default launch through
+    the console script leaves it on, and the route then names it: see
+    ``tests/test_remote_debug_guard.py``."""
     body = await _posture_body(engine)
     assert body["loosenings"] == []
 
@@ -1722,6 +1737,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "cleartext_accepted" in named
@@ -1764,6 +1780,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "tls_allow_expired" in named
@@ -1797,6 +1814,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "generic_odbc_tls_unenforced" in named
@@ -1827,6 +1845,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "tls_revocation_attested" in named

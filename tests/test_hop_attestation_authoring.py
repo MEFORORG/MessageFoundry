@@ -368,6 +368,7 @@ def _loosening_names(attested_hops: tuple[str, ...]) -> list[str]:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     ]
 

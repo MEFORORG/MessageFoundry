@@ -4056,6 +4056,27 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   entry rather than enforced by the engine. 11.7.2's encrypt-after-use guarantee is active only on a
   keyed instance (a key must be configured), which is already the case for any PHI-bearing deployment.
 
+### Remote debugging of the engine process (PEP 768)
+
+Python 3.14 lets another process run a script inside a running interpreter, if the operating
+system lets that process write the target's memory. On a first deployment, code running as the
+service account could be such a process. It would then run Python inside the engine, with
+everything the engine holds.
+
+Two controls answer it, and they differ in strength:
+
+- **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
+  the one place that says which children and how.
+- **The engine process itself refuses the script.** `serve` and `supervise` start through a
+  console-script launcher, which cannot pass that option. So each installs an audit hook as its
+  first step (`messagefoundry/remotedebug.py`). The interpreter raises an event before it runs an
+  injected script, the hook raises on it, and the interpreter drops the script.
+
+The hook is the weaker of the two, so an engine that starts with the interface on reports it as
+the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported, what
+a default start reports and how to clear it are stated once, in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
+
 ### HIPAA §164.312 alignment
 
 - **Unique user identification** (required) — every user is a distinct account; no shared logins.

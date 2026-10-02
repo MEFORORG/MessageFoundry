@@ -632,6 +632,7 @@ def _loosening_names(sec: SecuritySettings | None = None) -> list[str]:
         api=ApiSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
+        remote_debug=None,
     )
     return [name for name, _ in pairs]
 

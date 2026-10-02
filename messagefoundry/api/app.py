@@ -361,6 +361,7 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
+from messagefoundry.remotedebug import remote_debug_posture
 from messagefoundry.service_status import query_service_state
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
@@ -2270,6 +2271,9 @@ def create_app(
                 store_privilege=store_privilege,
                 # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
                 audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
+                # Vault BACKLOG #2700: read off THIS process, which is the engine. An app built
+                # without `serve` never installed the hook, and the reading then says so.
+                remote_debug=remote_debug_posture(),
             )
         ]
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
