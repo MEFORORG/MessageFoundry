@@ -260,12 +260,21 @@ def test_coverage_pins_the_mllp_and_file_rows(capsys: pytest.CaptureFixture[str]
         assert len(hits) == 1, (direction, kind, lines)
         return hits[0]
 
-    assert row("inbound", "mllp").split(None, 2)[2] == (
-        "dead_letter, error, filtered, mllp_echo_delivered, processed, unrouted"
-    )
-    assert row("outbound", "mllp").split(None, 2)[2] == "mllp_echo_delivered"
-    assert row("inbound", "file").split(None, 2)[2] == "file_roundtrip"
-    assert row("outbound", "file").split(None, 2)[2] == "file_roundtrip"
+    def names(direction: str, kind: str) -> set[str]:
+        return set(row(direction, kind).split(None, 2)[2].split(", "))
+
+    # At least these: a later family may add its own scenarios to a row, never remove these.
+    assert names("inbound", "mllp") >= {
+        "dead_letter",
+        "error",
+        "filtered",
+        "mllp_echo_delivered",
+        "processed",
+        "unrouted",
+    }
+    assert names("outbound", "mllp") >= {"mllp_echo_delivered"}
+    assert names("inbound", "file") >= {"file_roundtrip"}
+    assert names("outbound", "file") >= {"file_roundtrip"}
 
 
 def test_coverage_reads_the_live_registries_not_a_list() -> None:
