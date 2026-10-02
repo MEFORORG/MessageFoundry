@@ -51,7 +51,7 @@ from tests._restricted_token import (
     WRITE_RESTRICTED_SID,
     spawn_restricted,
 )
-from tests.test_service_install_manifest import _extract, _ok, _preflight_facts, _psq
+from tests.test_service_install_manifest import _extract, _notice, _ok, _preflight_facts, _psq
 
 _SCRIPT = svc.install_script_path()
 _UNINSTALL = svc.uninstall_script_path()
@@ -75,39 +75,16 @@ def _last_json(stdout: str) -> Any:
 
 
 # --- 1. which accounts get the restricted SID ------------------------------------------------------
+# The cases run in the `token_report` fixture below, in the one pwsh process section 2 uses.
 
 
-def _sid_choices(tmp_path: Path) -> dict[str, dict[str, str]]:
-    assert _SCRIPT is not None
-    body = r"""
-  $out = [ordered]@{}
-  $cases = [ordered]@{
-    'default'       = @{ ServiceAccount = 'NT SERVICE\MessageFoundry' }
-    'default-case'  = @{ ServiceAccount = 'nt service\messagefoundry' }
-    'skip'          = @{ ServiceAccount = 'NT SERVICE\MessageFoundry'; Skip = $true }
-    'localsystem'   = @{ ServiceAccount = '' }
-    'gmsa'          = @{ ServiceAccount = 'CORP\mefor-svc$' }
-    'user'          = @{ ServiceAccount = '.\mefor' }
-    'other-virtual' = @{ ServiceAccount = 'NT SERVICE\SomethingElse' }
-    'other-skip'    = @{ ServiceAccount = 'CORP\mefor-svc$'; Skip = $true }
-  }
-  foreach ($name in $cases.Keys) {
-    $params = $cases[$name]
-    $out[$name] = Get-ServiceSidTypeChoice -ServiceName 'MessageFoundry' @params
-  }
-  $out | ConvertTo-Json -Depth 4 -Compress
-"""
-    got: dict[str, dict[str, str]] = _last_json(
-        _ok(_extract(_SCRIPT, ["Get-ServiceSidTypeChoice"], body), tmp_path)
-    )
-    return got
-
-
-def test_only_the_services_own_virtual_account_gets_the_restricted_sid(tmp_path: Path) -> None:
+def test_only_the_services_own_virtual_account_gets_the_restricted_sid(
+    token_report: dict[str, Any],
+) -> None:
     """The default account is restricted. LocalSystem, a gMSA, a named user and some OTHER service's
     virtual account are not, and each says why: their grants name a SID the restricted token does
     not count. The opt-out switch is the only way the default account is left unrestricted."""
-    got = _sid_choices(tmp_path)
+    got = token_report["choices"]
     assert got["default"] == {"SidType": "restricted", "Reason": ""}
     assert got["default-case"]["SidType"] == "restricted", (
         "an account name is not case-sensitive; a lower-case spelling of the service's own virtual "
@@ -120,7 +97,7 @@ def test_only_the_services_own_virtual_account_gets_the_restricted_sid(tmp_path:
 
 # --- 2. set through the SCM, and read back ---------------------------------------------------------
 
-_TOKEN_FNS = ["Get-ServiceTokenProblem", "Set-ServiceTokenHardening"]
+_TOKEN_FNS = ["Get-ServiceSidTypeChoice", "Get-ServiceTokenProblem", "Set-ServiceTokenHardening"]
 
 # Defined AFTER the lifted functions, so they win. `sc.exe` is a function here: PowerShell resolves a
 # function before an application, on every host, so no real sc.exe runs and nothing is registered.
@@ -171,8 +148,10 @@ _TOKEN_STUBS = r"""
 
 _TOKEN_CASES = r"""
   $res = [ordered]@{}
-  $harden = { Set-ServiceTokenHardening -ServiceName MessageFoundry -SidType restricted -Privileges SeChangeNotifyPrivilege }
-  $relax = { Set-ServiceTokenHardening -ServiceName MessageFoundry -SidType none -Privileges SeChangeNotifyPrivilege }
+  $ask = @{ ServiceName = 'MessageFoundry'; SidType = 'restricted'; Privileges = 'SeChangeNotifyPrivilege' }
+  $askNone = @{ ServiceName = 'MessageFoundry'; SidType = 'none'; Privileges = 'SeChangeNotifyPrivilege' }
+  $harden = { Set-ServiceTokenHardening @ask }
+  $relax = { Set-ServiceTokenHardening @askNone }
   Invoke-Arm 'fresh' @{} $harden
   # A rerun that moves the service off its own virtual account: restricted must not be left behind.
   Invoke-Arm 'relax' @{ ServiceSidType = 3; RequiredPrivileges = @('SeChangeNotifyPrivilege') } $relax
@@ -185,24 +164,41 @@ _TOKEN_CASES = r"""
   $scSetsExit = $true
   # --- the read-back by itself
   $registry = @{ MessageFoundry = @{ ServiceSidType = 3; RequiredPrivileges = @('SeChangeNotifyPrivilege') } }
-  $res['read-good'] = Get-ServiceTokenProblem -ServiceName MessageFoundry -SidType restricted -Privileges SeChangeNotifyPrivilege
+  $res['read-good'] = Get-ServiceTokenProblem @ask
   $registry.MessageFoundry.RequiredPrivileges = @('SeChangeNotifyPrivilege', 'SeImpersonatePrivilege')
-  $res['read-extra'] = Get-ServiceTokenProblem -ServiceName MessageFoundry -SidType restricted -Privileges SeChangeNotifyPrivilege
+  $res['read-extra'] = Get-ServiceTokenProblem @ask
   $registry.MessageFoundry = @{ ServiceSidType = 1; RequiredPrivileges = @('SeChangeNotifyPrivilege') }
-  $res['read-unrestricted'] = Get-ServiceTokenProblem -ServiceName MessageFoundry -SidType restricted -Privileges SeChangeNotifyPrivilege
+  $res['read-unrestricted'] = Get-ServiceTokenProblem @ask
   $registry.MessageFoundry = @{ ServiceSidType = 0; RequiredPrivileges = @('SeChangeNotifyPrivilege') }
-  $res['read-none-zero'] = Get-ServiceTokenProblem -ServiceName MessageFoundry -SidType none -Privileges SeChangeNotifyPrivilege
+  $res['read-none-zero'] = Get-ServiceTokenProblem @askNone
   $registry.MessageFoundry = @{ ServiceSidType = 3 }
-  $res['read-no-list'] = Get-ServiceTokenProblem -ServiceName MessageFoundry -SidType restricted -Privileges SeChangeNotifyPrivilege
+  $res['read-no-list'] = Get-ServiceTokenProblem @ask
   $registry = @{}
-  $res['read-missing'] = Get-ServiceTokenProblem -ServiceName MessageFoundry -SidType restricted -Privileges SeChangeNotifyPrivilege
-  $res | ConvertTo-Json -Depth 5 -Compress
+  $res['read-missing'] = Get-ServiceTokenProblem @ask
+  # --- which accounts get the restricted SID (section 1)
+  $choices = [ordered]@{}
+  $accounts = [ordered]@{
+    'default'       = @{ ServiceAccount = 'NT SERVICE\MessageFoundry' }
+    'default-case'  = @{ ServiceAccount = 'nt service\messagefoundry' }
+    'skip'          = @{ ServiceAccount = 'NT SERVICE\MessageFoundry'; Skip = $true }
+    'localsystem'   = @{ ServiceAccount = '' }
+    'gmsa'          = @{ ServiceAccount = 'CORP\mefor-svc$' }
+    'user'          = @{ ServiceAccount = '.\mefor' }
+    'other-virtual' = @{ ServiceAccount = 'NT SERVICE\SomethingElse' }
+    'other-skip'    = @{ ServiceAccount = 'CORP\mefor-svc$'; Skip = $true }
+  }
+  foreach ($case in $accounts.Keys) {
+    $params = $accounts[$case]
+    $choices[$case] = Get-ServiceSidTypeChoice -ServiceName 'MessageFoundry' @params
+  }
+  $res['choices'] = $choices
+  $res | ConvertTo-Json -Depth 6 -Compress
 """
 
 
 @pytest.fixture(scope="module")
 def token_report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
-    """Every Set-ServiceTokenHardening arm, in ONE pwsh process (each spawn costs about a second)."""
+    """Every arm of sections 1 and 2, in ONE pwsh process (each spawn costs about a second)."""
     assert _SCRIPT is not None
     tmp_path = tmp_path_factory.mktemp("token")
     got: dict[str, Any] = _last_json(
@@ -340,7 +336,7 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
     ids=["call-removed", "switch-unwired", "privilege-added", "grant-not-read"],
 )
 def test_the_wiring_guard_fails_when_a_piece_is_changed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old: str, new: str, expect: str
+    tmp_path: Path, old: str, new: str, expect: str
 ) -> None:
     """THE CONTROL. Each piece the guard above depends on is changed in a copy of the script, and
     the guard must then name it. A guard that cannot fail would pass on a script that sets nothing."""
@@ -349,8 +345,7 @@ def test_the_wiring_guard_fails_when_a_piece_is_changed(
     assert source.count(old) == 1, f"CONTROL FAILED: {old!r} is not in the script exactly once"
     mutated = tmp_path / "install-service.ps1"
     mutated.write_text(source.replace(old, new), encoding="utf-8")
-    monkeypatch.setattr("tests.test_service_install_manifest._SCRIPT", mutated)
-    problems = _wiring_problems(_preflight_facts(tmp_path))
+    problems = _wiring_problems(_preflight_facts(tmp_path, script=mutated))
     assert any(expect in p for p in problems), problems
 
 
@@ -468,14 +463,6 @@ def test_an_ordinary_process_does_not_pass_as_hardened() -> None:
     assert any("not write-restricted" in p for p in problems), problems
 
 
-def _acl(directory: Path, *grants: str) -> None:
-    subprocess.run(
-        ["icacls", str(directory), "/inheritance:r", "/grant:r", *grants],
-        check=True,
-        capture_output=True,
-    )
-
-
 @_windows_only
 def test_a_restricted_token_is_refused_where_only_a_group_grants_it(tmp_path: Path) -> None:
     """The ``inside`` mode, run under a stand-in for the hardened token, and then under an ordinary
@@ -486,6 +473,11 @@ def test_a_restricted_token_is_refused_where_only_a_group_grants_it(tmp_path: Pa
     ordinary run writes BOTH, and the rule must fail it: that is what shows the refusal comes from
     the restriction and not from the directory.
     """
+    # Imported here: that module is a test file too, and only this Windows-only test needs it. Its
+    # helper also removes an explicit OWNER RIGHTS entry, which a hosted runner's temp directory can
+    # carry and which would let the child write as the owner of the directory.
+    from tests.test_store_trio_acl import _build_dir_dacl
+
     probe = _probe()
     service_sid, restricting = _stand_in_sids(probe)
     granted, denied = tmp_path / "granted", tmp_path / "denied"
@@ -493,18 +485,24 @@ def test_a_restricted_token_is_refused_where_only_a_group_grants_it(tmp_path: Pa
     denied.mkdir()
     rule = {"service_sid": service_sid, "privileges": [_PRIVILEGE]}
     try:
-        _acl(granted, f"*{service_sid}:(OI)(CI)M", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
-        _acl(denied, "*S-1-5-32-545:(OI)(CI)M", "*S-1-5-11:(OI)(CI)M", "*S-1-5-18:(OI)(CI)F")
+        _build_dir_dacl(
+            granted, f"*{service_sid}:(OI)(CI)M", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"
+        )
+        _build_dir_dacl(
+            denied, *(f"*{sid}:(OI)(CI)M" for sid in probe.BROAD_GROUPS), "*S-1-5-18:(OI)(CI)F"
+        )
         argv = [sys.executable, str(_PROBE), "inside", "--granted-dir", str(granted)]
         argv += ["--denied-dir", str(denied), "--report"]
 
-        hardened_report = granted / "hardened.json"
+        # The two runs write different files, so the ordinary one runs while the hardened one does.
+        hardened_report, ordinary_report = granted / "hardened.json", granted / "ordinary.json"
         child = spawn_restricted([*argv, str(hardened_report)], restricting_sids=restricting)
-        assert child.wait(120) == 0
+        try:
+            subprocess.run([*argv, str(ordinary_report)], check=True, timeout=120)
+        finally:
+            exit_code = child.wait(120)
+        assert exit_code == 0
         hardened = json.loads(hardened_report.read_text(encoding="utf-8"))
-
-        ordinary_report = granted / "ordinary.json"
-        subprocess.run([*argv, str(ordinary_report)], check=True, timeout=120)
         ordinary = json.loads(ordinary_report.read_text(encoding="utf-8"))
     finally:
         for d in (granted, denied):
@@ -591,6 +589,36 @@ def test_the_rule_fails_each_way_a_report_can_be_wrong(
     assert any(expect in p for p in problems), problems
 
 
+def test_a_report_with_a_step_missing_is_not_a_pass() -> None:
+    """A step that never ran left nothing to judge. Each one is named, and an empty report fails on
+    all of them, so a probe that died at once cannot read as a service that passed."""
+    probe = _probe()
+    rule = {"service_sid": "S-1-5-80-1", "privileges": [_PRIVILEGE]}
+    assert len(probe.inside_problems({}, **rule)) == len(probe.INSIDE_STEPS)
+    for step in probe.INSIDE_STEPS:
+        report = _passing_report()
+        del report[step]
+        assert probe.inside_problems(report, **rule) == [f"the report has no {step} reading"]
+
+
+def test_the_smoke_leg_grants_every_directory_the_samples_graph_writes() -> None:
+    """The leg grants the service by name on the directories the samples graph's File connections
+    use, because a restricted token does not count a grant to Users. The list in ci.yml is a hand
+    copy of those connections, so a new one would fail far from its cause. This ties the two."""
+    found = set()
+    for module in sorted((_ROOT / "samples" / "config").glob("*.py")):
+        for line in module.read_text(encoding="utf-8").splitlines():
+            if "File(directory=" in line and not line.lstrip().startswith("#"):
+                path = line.split("File(directory=", 1)[1].split('"')[1]
+                found.add(path.removeprefix("./").split("/")[0])
+    assert found, "CONTROL FAILED: no File connection was found in samples/config"
+    ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    listed = ci.split("foreach ($d in ", 1)[1].split(")", 1)[0]
+    assert {d.strip().strip('"') for d in listed.split(",")} == found, (
+        f"the smoke leg grants [{listed}], and the samples graph's File connections use {sorted(found)}"
+    )
+
+
 def test_the_smoke_leg_reads_the_token_it_asked_for() -> None:
     """The leg must read the registration back, read the running engine's token, and run the probe
     as the service. This checks the steps are there; the leg's own result is the reading.
@@ -604,13 +632,17 @@ def test_the_smoke_leg_reads_the_token_it_asked_for() -> None:
     for needle in (
         "sc.exe qsidtype",
         "sc.exe qprivs",
-        "service_token_probe.py check-read",
+        # The leg names the privilege itself and does not read it from the installer: a list the
+        # installer widened would otherwise pass its own check.
+        f'$privilege = "{_PRIVILEGE}"',
+        "service_token_probe.py",
+        "$probe check-read",
         "python.exe",
-        "service_token_probe.py check-inside",
-        "--control-pid",
+        "$probe check-inside",
+        "--control-pid $PID",
     ):
         assert needle in job, f"windows-service-smoke no longer runs {needle!r}"
-    assert "service_token_probe.py check-read" not in ci.replace(job, ""), (
+    assert "$probe check-read" not in ci.replace(job, ""), (
         "CONTROL FAILED: the needle is found outside the job, so finding it proves nothing"
     )
 
@@ -622,34 +654,19 @@ def test_the_uninstaller_reports_a_registration_that_outlived_the_removal(tmp_pa
     """The SID type and the privilege list live on the registration. When Windows has only marked
     the service for deletion they are still there, and the inventory says so. When the key is gone
     there is nothing to report, and the line must be absent."""
-    assert _UNINSTALL is not None
-    body = r"""
-  $common = @{ ServiceName = 'MessageFoundry'; DataDir = 'C:\ProgramData\MessageFoundry' }
-  [pscustomobject]@{
-    pending = @(Get-UninstallResidueNotice @common -RegistrationPending)
-    gone = @(Get-UninstallResidueNotice @common)
-  } | ConvertTo-Json -Depth 4 -Compress
-"""
-    fns = ["Get-AccountResidueSpec", "Get-UninstallResidueNotice"]
-    got = _last_json(_ok(_extract(_UNINSTALL, fns, body), tmp_path))
-    pending = "\n".join(got["pending"])
+    facts: dict[str, object] = {"ServiceName": "MessageFoundry", "DataDir": "C:\\mefor-data"}
+    pending = _notice(tmp_path, {**facts, "RegistrationPending": True})
+    gone = _notice(tmp_path, facts)
     assert "marked for deletion" in pending and "privilege list" in pending, pending
-    assert "marked for deletion" not in "\n".join(got["gone"])
-    assert "Data directory" in "\n".join(got["gone"]), "CONTROL FAILED: the notice printed nothing"
+    assert "marked for deletion" not in gone
+    assert "Data directory" in gone, "CONTROL FAILED: the notice printed nothing"
 
 
 def test_the_uninstaller_looks_for_the_key_after_it_removes_the_service(tmp_path: Path) -> None:
     """Read from the AST: the key is tested AFTER sc.exe delete, and that reading is what the
     inventory is given. Tested before the removal, the key is always there."""
     assert _UNINSTALL is not None
-    body = """
-  $cmds = @($ast.FindAll({ $args[0] -is
-      [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object {
-    [pscustomobject]@{ name = $_.GetCommandName(); start = $_.Extent.StartOffset
-                       text = $_.Extent.Text } })
-  @($cmds) | ConvertTo-Json -Depth 3 -Compress
-"""
-    cmds = _last_json(_ok(_extract(_UNINSTALL, [], body), tmp_path))
+    cmds = _preflight_facts(tmp_path, script=_UNINSTALL)["commands"]
     delete = [c for c in cmds if c["name"] == "sc.exe" and "delete" in c["text"]]
     probe = [c for c in cmds if c["name"] == "Test-Path" and "$svcKey" in c["text"]]
     notice = [c for c in cmds if c["name"] == "Get-UninstallResidueNotice"]

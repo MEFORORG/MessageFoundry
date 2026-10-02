@@ -1126,10 +1126,11 @@ function Get-WriteGrantProblem {
     <#
       Why $Principal has no entry of its own granting Modify on the folder $Path, or "" when it has.
 
-      Under a restricted service SID a write counts only when a permission names the service SID
-      itself (or the logon session, Everyone or WRITE RESTRICTED). So "the service can write its
-      data directory" is read from the DACL here and not assumed from the icacls call that was meant
-      to write it: that call is best-effort and only warns when it fails.
+      Set-SecureDataDirAcl leaves a named account one way to write the data directory, its own
+      grant. Under a restricted service SID that is the only kind of grant that counts anywhere (with
+      the logon session, Everyone and WRITE RESTRICTED). So "the service can write its data
+      directory" is read from the DACL here and not assumed from the icacls call that was meant to
+      write it: that call is best-effort and only warns when it fails.
 
       An entry marked inherit-only does not apply to the folder itself, so it does not count. The
       generic-all bit counts: an entry written that way shows no named right.
@@ -1552,17 +1553,18 @@ if ($SidChoice.SidType -eq "restricted") {
 Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount
 # The owner too, not only the DACL: the engine's store rule reads it (ADR 0183 Wave 0b).
 Set-DataDirOwner -Path $DataDir
-# Under the restricted service SID only a grant that names the service counts, so that grant is read
-# back on the two directories the service must write (vault BACKLOG #2702). A warning, like the rest
-# of the lockdown: the operator is told what would stop the first start, and how to fix it.
-if ($SidChoice.SidType -eq "restricted") {
+# The lockdown above removes Users and Authenticated Users, so a named account writes the data
+# directory only through its own grant, and under the restricted service SID nothing else counts at
+# all. That grant is read back on the two directories the service must write (vault BACKLOG #2702).
+# LocalSystem has no named grant: it writes through the SYSTEM entry. A warning, like the rest of the
+# lockdown: the operator is told what would stop the first start, and how to fix it.
+if ($ServiceAccount) {
     foreach ($dir in @($DataDir, $LogDir)) {
         $problem = Get-WriteGrantProblem -Path $dir -Principal $ServiceAccount
         if ($problem) {
-            Write-Warning ("The service has a restricted token and $problem. It would not be able " +
-                "to write its store or its logs there. Grant it with " +
-                "'icacls ""$dir"" /grant ""${ServiceAccount}:(OI)(CI)M""', or re-run with " +
-                "-SkipRestrictedServiceSid.")
+            Write-Warning ("The service would not be able to write its store or its logs: " +
+                "$problem. Grant it with " +
+                "'icacls ""$dir"" /grant ""${ServiceAccount}:(OI)(CI)M""'.")
         }
     }
 }

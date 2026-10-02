@@ -28,11 +28,9 @@ WRITE_RESTRICTED = 0x8
 
 EVERYONE = "S-1-1-0"
 WRITE_RESTRICTED_SID = "S-1-5-33"
-USERS = "S-1-5-32-545"
 
 _TOKEN_ALL_ACCESS = 0xF01FF
 _CREATE_NO_WINDOW = 0x08000000
-_INFINITE = 0xFFFFFFFF
 
 
 class _STARTUPINFOW(ctypes.Structure):
@@ -100,7 +98,6 @@ def spawn_restricted(
     *,
     restricting_sids: list[str],
     flags: int = WRITE_RESTRICTED | DISABLE_MAX_PRIVILEGE,
-    cwd: str | None = None,
 ) -> RestrictedChild:
     """Start ``argv`` under a restricted copy of this process's token.
 
@@ -193,7 +190,7 @@ def spawn_restricted(
             False,
             _CREATE_NO_WINDOW,
             None,
-            cwd,
+            None,
             ctypes.byref(startup),
             ctypes.byref(info),
         ):

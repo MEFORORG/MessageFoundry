@@ -51,12 +51,12 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
-# winnt.h. The TOKEN_INFORMATION_CLASS numbers are the _CLASS_ names below. TokenAccessInformation carries the token flags; the two below are the ones a restricted
-# service SID sets. A token can carry restricting SIDs and still not be write-restricted: a fully
-# restricted token checks them on every access, a write-restricted one on write access only.
+# winnt.h. TokenAccessInformation carries the token flags, and TOKEN_WRITE_RESTRICTED is the one a
+# restricted service SID sets. A token can carry restricting SIDs and still not be
+# write-restricted: a fully restricted token checks them on every access, a write-restricted one on
+# write access only. The _CLASS_ names are TOKEN_INFORMATION_CLASS numbers.
 TOKEN_QUERY = 0x0008
 TOKEN_WRITE_RESTRICTED = 0x0008
-TOKEN_IS_RESTRICTED = 0x0010
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SE_PRIVILEGE_ENABLED = 0x00000002
 SE_PRIVILEGE_REMOVED = 0x00000004
@@ -72,7 +72,6 @@ _CLASS_IMPERSONATION_LEVEL = 9
 _CLASS_RESTRICTED_SIDS = 11
 _CLASS_ACCESS_INFORMATION = 22
 
-_ERROR_INSUFFICIENT_BUFFER = 122
 _ERROR_NO_TOKEN = 1008
 
 
@@ -219,20 +218,19 @@ def _describe_token(advapi32: Any, kernel32: Any, token: Any) -> dict[str, Any]:
     entries = (_LUID_AND_ATTRIBUTES * priv_count).from_buffer(
         priv_buf, ctypes.sizeof(wintypes.DWORD)
     )
+    # A privilege that is only switched off is still held, and the process can switch it back on,
+    # so it is listed. One marked removed is gone for good, so it is not.
     privileges = []
     for entry in entries:
+        if entry.Attributes & SE_PRIVILEGE_REMOVED:
+            continue
         size = wintypes.DWORD(128)
         name = ctypes.create_unicode_buffer(size.value)
-        luid = _LUID(entry.Luid.LowPart, entry.Luid.HighPart)
-        if not advapi32.LookupPrivilegeNameW(None, ctypes.byref(luid), name, ctypes.byref(size)):
+        if not advapi32.LookupPrivilegeNameW(
+            None, ctypes.byref(entry.Luid), name, ctypes.byref(size)
+        ):
             raise _win_error("LookupPrivilegeNameW")
-        privileges.append(
-            {
-                "name": name.value,
-                "enabled": bool(entry.Attributes & SE_PRIVILEGE_ENABLED),
-                "removed": bool(entry.Attributes & SE_PRIVILEGE_REMOVED),
-            }
-        )
+        privileges.append(name.value)
     flags = _TOKEN_ACCESS_INFORMATION.from_buffer(
         _token_info(advapi32, token, _CLASS_ACCESS_INFORMATION)
     ).Flags
@@ -247,45 +245,37 @@ def _describe_token(advapi32: Any, kernel32: Any, token: Any) -> dict[str, Any]:
             }
             for g in groups
         ],
-        # A privilege the Service Control Manager stripped is gone from the list. One that is only
-        # disabled is still held, and the process can switch it back on, so both are reported.
-        "privileges": sorted(p["name"] for p in privileges if not p["removed"]),
-        "privileges_enabled": sorted(
-            p["name"] for p in privileges if p["enabled"] and not p["removed"]
-        ),
+        "privileges": sorted(privileges),
         "restricting_sids": [r["sid"] for r in restricting],
+        # The raw flags are kept for the log. TOKEN_IS_RESTRICTED (0x10) without the bit below is a
+        # FULLY restricted token, which is a different thing and must not pass as this one.
         "flags": int(flags),
         "write_restricted": bool(flags & TOKEN_WRITE_RESTRICTED),
-        "fully_restricted": bool(flags & TOKEN_IS_RESTRICTED)
-        and not bool(flags & TOKEN_WRITE_RESTRICTED),
     }
 
 
-def _enable_debug_privilege(advapi32: Any, kernel32: Any) -> bool:
-    """Switch SeDebugPrivilege on for this process when it is held. True when it is now enabled.
+def _enable_debug_privilege(advapi32: Any, kernel32: Any) -> None:
+    """Switch SeDebugPrivilege on for this process when it is held. Best-effort.
 
     An elevated administrator holds it disabled. Without it, OpenProcess on a service that runs as
-    another account is refused by the process's own permissions.
+    another account is refused by the process's own permissions. Nothing is returned: when this did
+    not work, the OpenProcess that follows fails and says so.
     """
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(
         kernel32.GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, ctypes.byref(token)
     ):
-        return False
+        return
     try:
         luid = _LUID()
         if not advapi32.LookupPrivilegeValueW(None, "SeDebugPrivilege", ctypes.byref(luid)):
-            return False
+            return
 
         class _TOKEN_PRIVILEGES_ONE(ctypes.Structure):
             _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", _LUID_AND_ATTRIBUTES)]
 
         state = _TOKEN_PRIVILEGES_ONE(1, _LUID_AND_ATTRIBUTES(luid, SE_PRIVILEGE_ENABLED))
-        ctypes.set_last_error(0)
-        if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(state), 0, None, None):
-            return False
-        # AdjustTokenPrivileges succeeds with ERROR_NOT_ALL_ASSIGNED when the privilege is not held.
-        return bool(ctypes.get_last_error() == 0)
+        advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(state), 0, None, None)
     finally:
         kernel32.CloseHandle(token)
 
@@ -296,13 +286,11 @@ def read_token(pid: int | None = None) -> dict[str, Any]:
     advapi32, kernel32 = _dlls()
     if pid is None:
         process = kernel32.GetCurrentProcess()
-        opened = False
     else:
         _enable_debug_privilege(advapi32, kernel32)
         process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not process:
             raise _win_error(f"OpenProcess({pid})")
-        opened = True
     try:
         token = wintypes.HANDLE()
         if not advapi32.OpenProcessToken(process, TOKEN_QUERY, ctypes.byref(token)):
@@ -312,7 +300,7 @@ def read_token(pid: int | None = None) -> dict[str, Any]:
         finally:
             kernel32.CloseHandle(token)
     finally:
-        if opened:
+        if pid is not None:  # GetCurrentProcess is a pseudo-handle and is not closed
             kernel32.CloseHandle(process)
     described["pid"] = os.getpid() if pid is None else pid
     return described
@@ -345,6 +333,16 @@ def read_thread_token() -> dict[str, Any] | None:
         kernel32.CloseHandle(token)
 
 
+def _write_result(directory: Path | None, exc: OSError | None = None) -> dict[str, Any]:
+    """One write attempt as a report entry: ``wrote`` is true exactly when nothing was raised."""
+    return {
+        "directory": None if directory is None else str(directory),
+        "wrote": exc is None,
+        "errno": None if exc is None else exc.errno,
+        "error": None if exc is None else f"{type(exc).__name__}: {exc}",
+    }
+
+
 def try_write(directory: Path) -> dict[str, Any]:
     """Create and delete one file in ``directory``. Reports what happened; never raises."""
     target = directory / f"token-probe-{os.getpid()}.tmp"
@@ -352,22 +350,10 @@ def try_write(directory: Path) -> dict[str, Any]:
         with open(target, "xb") as handle:
             handle.write(b"probe")
     except OSError as exc:
-        return {
-            "directory": str(directory),
-            "wrote": False,
-            "errno": exc.errno,
-            "winerror": getattr(exc, "winerror", None),
-            "error": type(exc).__name__,
-        }
+        return _write_result(directory, exc)
     with contextlib.suppress(OSError):
         target.unlink()
-    return {
-        "directory": str(directory),
-        "wrote": True,
-        "errno": None,
-        "winerror": None,
-        "error": None,
-    }
+    return _write_result(directory)
 
 
 def try_alternate_credential(granted: Path, denied: Path) -> dict[str, Any]:
@@ -419,13 +405,11 @@ def try_temp_write() -> dict[str, Any]:
     try:
         return try_write(Path(tempfile.gettempdir()))
     except OSError as exc:
-        return {
-            "directory": None,
-            "wrote": False,
-            "errno": exc.errno,
-            "winerror": getattr(exc, "winerror", None),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return _write_result(None, exc)
+
+
+#: The readings an ``inside`` report holds. A report without one of them is not a pass.
+INSIDE_STEPS = ("token", "granted", "denied", "temp", "wincred")
 
 
 def _inside(args: argparse.Namespace) -> int:
@@ -438,10 +422,10 @@ def _inside(args: argparse.Namespace) -> int:
         "temp": try_temp_write,
         "wincred": lambda: try_alternate_credential(granted, denied),
     }
-    for name, step in steps.items():
+    for name in INSIDE_STEPS:
         # One step's failure must not cost the others, so each is caught and named on its own.
         try:
-            report[name] = step()
+            report[name] = steps[name]()
         except Exception as exc:
             report[name] = None
             report.setdefault("probe_errors", {})[name] = f"{type(exc).__name__}: {exc}"
@@ -490,8 +474,14 @@ def token_problems(token: dict[str, Any], *, service_sid: str, privileges: list[
 def inside_problems(
     report: dict[str, Any], *, service_sid: str, privileges: list[str]
 ) -> list[str]:
-    """Why the report ``inside`` wrote does not show a hardened service that still works."""
+    """Why the report ``inside`` wrote does not show a hardened service that still works.
+
+    Every step must be in the report. One that is missing was never run, and is not a pass.
+    """
     problems = [
+        f"the report has no {step} reading" for step in INSIDE_STEPS if not report.get(step)
+    ]
+    problems += [
         f"the {step} step failed: {why}" for step, why in report.get("probe_errors", {}).items()
     ]
     token = report.get("token")
@@ -575,12 +565,6 @@ def _check_inside(args: argparse.Namespace) -> int:
     report = json.loads(Path(args.report).read_text(encoding="utf-8"))
     print(json.dumps(report, indent=2))
     problems = inside_problems(report, service_sid=args.service_sid, privileges=args.privilege)
-    # Every step must be in the report. One that is missing was never run, and is not a pass.
-    problems += [
-        f"the report has no {step} reading"
-        for step in ("token", "granted", "denied", "temp", "wincred")
-        if not report.get(step)
-    ]
     _report_problems("the service", problems)
     if not problems:
         cred = report["wincred"]

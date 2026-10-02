@@ -4022,17 +4022,17 @@ jobs:
       # green reading 1 would be that case, and is not to be turned green by dropping reading 2.
       - name: Verify the service token is restricted (vault BACKLOG #2702)
         run: |
-          $name = "MessageFoundry"
           $privilege = "SeChangeNotifyPrivilege"
+          $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
           function Assert-Native([string]$What) {
             if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
           }
 
           # --- 1. the registration -----------------------------------------------------------------
-          $sidType = (& sc.exe qsidtype $name | Out-String); Assert-Native "sc.exe qsidtype $name"
-          $privs = (& sc.exe qprivs $name | Out-String); Assert-Native "sc.exe qprivs $name"
-          "===== sc.exe qsidtype $name ====="; $sidType
-          "===== sc.exe qprivs $name ====="; $privs
+          $sidType = (& sc.exe qsidtype MessageFoundry | Out-String); Assert-Native "sc.exe qsidtype MessageFoundry"
+          $privs = (& sc.exe qprivs MessageFoundry | Out-String); Assert-Native "sc.exe qprivs MessageFoundry"
+          "===== sc.exe qsidtype MessageFoundry ====="; $sidType
+          "===== sc.exe qprivs MessageFoundry ====="; $privs
           $restricted = '(?m)SID_TYPE\s*:\s*RESTRICTED\s*$'
           # CONTROL: the other two values must NOT match, or the pattern matches everything.
           # UNRESTRICTED ends in the same letters, which is the one a loose pattern lets through.
@@ -4046,9 +4046,9 @@ jobs:
           }
 
           # --- 2. the running engine's token -------------------------------------------------------
-          $serviceSid = ([Security.Principal.NTAccount]"NT SERVICE\$name").Translate(
+          $serviceSid = ([Security.Principal.NTAccount]"NT SERVICE\MessageFoundry").Translate(
             [Security.Principal.SecurityIdentifier]).Value
-          $svc = Get-CimInstance Win32_Service -Filter "Name='$name'"
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MessageFoundry'"
           if (-not $svc -or -not $svc.ProcessId) { throw "the service is not running, so there is no token to read" }
           # Every process under the service's root. A child must be at least as new as its parent:
           # a process whose parent id was only REUSED by the root is not under it. The same walk
@@ -4076,20 +4076,23 @@ jobs:
             throw "no python.exe runs under the service, so the engine's own token was not read"
           }
           $pids = @($procs | ForEach-Object { "--pid"; "$($_.ProcessId)" })
-          & python scripts\ci\service_token_probe.py check-read --service-sid $serviceSid --privilege $privilege --control-pid $PID @pids
+          & python $probe check-read --service-sid $serviceSid --privilege $privilege --control-pid $PID @pids
           Assert-Native "the token check on the running service"
 
           # --- 3. what the token can do ------------------------------------------------------------
           $data = "C:\ProgramData\MessageFoundry"
           $denied = "C:\mefor-token-probe-denied"
           $report = Join-Path $data "token-probe.json"
-          $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
           $python = (Get-Command python).Source
           # The parameters are stored as one string, unquoted, so no path in it may hold a space.
           if ("$probe$report$data$denied" -match '\s') { throw "a probe path holds a space: $probe $report $denied" }
           New-Item -ItemType Directory -Force -Path $denied | Out-Null
           & icacls $denied /inheritance:r /grant:r "*S-1-5-32-545:(OI)(CI)M" "*S-1-5-11:(OI)(CI)M" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
           Assert-Native "icacls on $denied"
+          # An explicit OWNER RIGHTS or CREATOR OWNER entry would survive the call above and could let the
+          # service write as the owner of what it creates. Removing one that is not there is a no-op.
+          & icacls $denied /remove:g "*S-1-3-4" "*S-1-3-0" | Out-Null
+          Assert-Native "icacls /remove:g on $denied"
           Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
           & "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry
           Assert-Native "stopping the engine"
@@ -4104,7 +4107,7 @@ jobs:
             Start-Sleep -Milliseconds 500
           }
           if (-not (Test-Path -LiteralPath $report)) { throw "the probe wrote no report as the service; see the service logs below" }
-          & python scripts\ci\service_token_probe.py check-inside --report $report --service-sid $serviceSid --privilege $privilege
+          & python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege
           Assert-Native "the check on what the service token can do"
 
       - name: Stop the service (graceful)
