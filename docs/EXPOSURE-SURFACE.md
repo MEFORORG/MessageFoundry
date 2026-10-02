@@ -30,8 +30,8 @@ At least these open a listening socket. Each one binds loopback (`127.0.0.1`) by
 | The operator API, the web console at `/ui` and the stats WebSocket, all on one socket | `127.0.0.1` while `[security].local_access_only` is true, the default. Otherwise `[security].listen_address` | `[api].port`, default `8765` | [Control-plane listeners](ASVS-L2-PHASE0-CHANGES.md#52-control-plane-listeners) |
 | Each inbound Connection of type MLLP, raw TCP, X12, HTTP or DICOM C-STORE SCP | `[inbound].bind_host`, default `127.0.0.1`. A Connection can override it with `bind_address` | Set on the Connection | [Message-plane connectors](ASVS-L2-PHASE0-CHANGES.md#51-message-plane-connectors) |
 
-**The settings file is not the last word on a bind.** `serve --host` and `serve --port` override it,
-and so do `MEFOR_*` environment variables. Read the service's command line and environment too.
+`serve --host` and `serve --port` override the settings file, and so do `MEFOR_*` environment
+variables. Read the service's command line and environment too.
 
 At least these inbound types open no listening socket. A File Connection reads a directory. On a UNC
 path that directory is on another host, reached over SMB. A database-poll or remote-file (SFTP,
@@ -129,8 +129,8 @@ has the detail.
 It filters requests by client address, with exemptions. It is empty by default, which means no
 restriction. The check has limits, so keep a host firewall as the first layer.
 [ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)
-describes the exemptions and names the topologies where the check has no effect.
-[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says what turning a protective switch off costs.
+has the detail. [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says what turning a protective
+switch off costs.
 
 ## What sits on disk is listed in PHI.md
 
