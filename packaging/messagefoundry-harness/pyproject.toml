@@ -47,7 +47,7 @@ dependencies = [
     #
     # PINNED EXACTLY, AND THE VERSION IS NOT FREE (BACKLOG #1585). This table used to read a bare
     # `messagefoundry[harness]`, which lets a resolver satisfy the harness with ANY engine on the index.
-    # harness/monitor.py and harness/scenarios.py import `messagefoundry.apiclient` (the Qt-free engine
+    # harness/monitor.py and harness/scenarios/ import `messagefoundry.apiclient` (the Qt-free engine
     # client extracted under ADR 0088) at MODULE level, so an install resolved against an engine without
     # that module succeeds and then dies on ImportError at the operator's first command -- a resolution
     # question answered at run time.
@@ -99,21 +99,26 @@ Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTIN
 [tool.hatch.build.targets.wheel.force-include]
 "../../harness/acceptance" = "harness/acceptance"
 "../../harness/config" = "harness/config"
+"../../harness/drivers" = "harness/drivers"
+"../../harness/endpoints" = "harness/endpoints"
 "../../harness/load" = "harness/load"
 "../../harness/reconcile" = "harness/reconcile"
+"../../harness/scenarios" = "harness/scenarios"
+"../../harness/sinks" = "harness/sinks"
 "../../harness/README.md" = "harness/README.md"
 "../../harness/__main__.py" = "harness/__main__.py"
 "../../harness/_async.py" = "harness/_async.py"
 "../../harness/_console_widgets.py" = "harness/_console_widgets.py"
+"../../harness/_discover.py" = "harness/_discover.py"
 "../../harness/_login.py" = "harness/_login.py"
 "../../harness/_spreadsheet.py" = "harness/_spreadsheet.py"
 "../../harness/compose.py" = "harness/compose.py"
+"../../harness/coverage.py" = "harness/coverage.py"
 "../../harness/file_panel.py" = "harness/file_panel.py"
 "../../harness/file_transport.py" = "harness/file_transport.py"
 "../../harness/frame_cap.py" = "harness/frame_cap.py"
 "../../harness/mllp.py" = "harness/mllp.py"
 "../../harness/monitor.py" = "harness/monitor.py"
 "../../harness/receive.py" = "harness/receive.py"
-"../../harness/scenarios.py" = "harness/scenarios.py"
 "../../harness/send.py" = "harness/send.py"
 "../../harness/window.py" = "harness/window.py"

@@ -6,6 +6,9 @@
 ``python -m harness --list-scenarios``→ list the built-in scenarios.
 ``python -m harness --scenario NAME`` → run one scenario headless against a running engine
                                                 and exit 0 (pass) / 1 (fail) — for CI.
+``python -m harness --coverage``      → print every registered connector kind, by direction,
+                                                against the scenarios that cover it (no engine
+                                                needed).
 ``python -m harness --list-profiles`` → list the built-in load profiles.
 ``python -m harness --load NAME``     → run a load profile headless against a running engine and exit
                                                 0 (SLOs met) / 1 (SLO violation, incl. zero_loss when
@@ -179,6 +182,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--list-scenarios", action="store_true", help="list built-in scenarios")
     parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="print each registered connector kind and direction against the scenarios covering it",
+    )
+    parser.add_argument(
+        "--endpoint",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="scenario: override one harness endpoint (a port or directory; see "
+        "harness/endpoints/). Repeatable. MEFOR_HARNESS_<KEY> in the environment does the same.",
+    )
+    parser.add_argument(
         "--load", help="run this load profile (built-in name or path to a .toml) and exit"
     )
     parser.add_argument(
@@ -285,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_scenarios:
         return _list_scenarios()
+    if args.coverage:
+        return _print_coverage()
     if args.list_profiles:
         return _list_profiles()
     if args.list_connscale_profiles:
@@ -309,7 +327,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.load:
         return _run_load(args)
     if args.scenario:
-        return _run_scenario(args.scenario, args.engine, args.token, args.timeout, args.cacert)
+        return _run_scenario(
+            args.scenario, args.engine, args.token, args.timeout, args.cacert, args.endpoint
+        )
     return _launch_gui()
 
 
@@ -317,13 +337,27 @@ def _list_scenarios() -> int:
     from harness.scenarios import SCENARIOS
 
     for name, scenario in SCENARIOS.items():
-        print(f"  {name:<12} {scenario.description}")
+        print(f"  {name:<20} {scenario.description}")
+    return 0
+
+
+def _print_coverage() -> int:
+    from harness.coverage import coverage_rows, format_report, registered_kinds
+    from harness.scenarios import SCENARIOS
+
+    print(format_report(coverage_rows(registered_kinds(), SCENARIOS.values())))
     return 0
 
 
 def _run_scenario(
-    name: str, engine_url: str, token: str | None, timeout: float, cacert: str | None
+    name: str,
+    engine_url: str,
+    token: str | None,
+    timeout: float,
+    cacert: str | None,
+    endpoint_args: list[str] | None = None,
 ) -> int:
+    from harness.endpoints import Endpoints
     from harness.scenarios import SCENARIOS, run_scenario
     from messagefoundry.apiclient import ApiError, EngineClient
 
@@ -332,15 +366,28 @@ def _run_scenario(
         print(f"unknown scenario {name!r}; choices: {', '.join(SCENARIOS)}", file=sys.stderr)
         return 2
     try:
+        overrides = dict(_split_endpoint(arg) for arg in endpoint_args or [])
+        endpoints = Endpoints(overrides)
+    except (KeyError, ValueError) as exc:
+        print(f"bad --endpoint: {exc}", file=sys.stderr)
+        return 2
+    try:
         with EngineClient(engine_url, cacert=cacert) as client:
             if token:
                 client.set_token(token)
-            result = run_scenario(scenario, client, timeout=timeout)
+            result = run_scenario(scenario, client, timeout=timeout, endpoints=endpoints)
     except ApiError as exc:
         print(f"FAIL  {name}: {exc}", file=sys.stderr)
         return 1
     print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {result.detail}")
     return 0 if result.ok else 1
+
+
+def _split_endpoint(arg: str) -> tuple[str, str]:
+    key, sep, value = arg.partition("=")
+    if not sep or not key or not value:
+        raise ValueError(f"{arg!r} is not KEY=VALUE")
+    return key, value
 
 
 def _list_profiles() -> int:
