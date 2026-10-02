@@ -343,11 +343,8 @@ def relaunch_branded() -> bool:
     if branded is None:
         return False
     try:
-        # Started like every other Python child (vault BACKLOG #2801): the interpreter flags keep
-        # the working directory off the child's import path. A bare ``-P -m`` cannot find this
-        # package from a checkout that is not installed, so the bootstrap names its location. The
-        # tray needs the user's whole environment; engine_environment is that, less any PYTHONPATH
-        # entry that would put the working directory back.
+        # Started like the engine's Python children (vault BACKLOG #2801); childenv says what the
+        # command line and the environment do. The tray keeps the user's whole environment.
         child = subprocess.Popen(  # nosec B603 - fixed argv (our own branded launcher, the child interpreter flags, our own bootstrap script, a module name), shell=False
             python_child_argv("messagefoundry.tray", executable=str(branded)),
             env=engine_environment(),

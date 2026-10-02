@@ -387,7 +387,7 @@ The **Must never import** list is unchanged.
 
 `tray/branding.py` started the branded launcher as `MessageFoundryTray.exe -m messagefoundry.tray`, with no
 `-P`. So the child's import path began with the working directory, and a file planted there could stand in
-for a module the tray imports. Every engine child already starts with `-P` through
+for a module the tray imports. Every Python child the engine starts already has `-P` through
 `messagefoundry.childenv` (vault BACKLOG #2587). A bare `-P -m` is not enough here: from a checkout that is
 not installed, the child cannot find `messagefoundry` at all. Measured: with an interpreter that does not
 have the package installed, `-P -X disable-remote-debug -m messagefoundry.childenv` fails with
@@ -398,6 +398,10 @@ So the relaunch now builds its command line with `childenv.python_child_argv`, a
 `childenv.engine_environment`. That is the user's whole environment, as the tray needs, less any
 `PYTHONPATH` entry naming the working directory. Measured: an inherited `PYTHONPATH=.` puts the working
 directory back under `-P`.
+
+This covers the relaunched child only. The first tray process starts however its launcher started it,
+and autostart writes `pythonw -m messagefoundry.tray`, so that process still has the working directory
+on its import path.
 
 This adds `messagefoundry.childenv` to the tray-importable list, on the same terms as the modules above. It
 is accepted because `childenv` imports only the standard library, so it brings none of the packages the

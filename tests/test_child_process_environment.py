@@ -688,13 +688,14 @@ def test_the_guard_sees_the_calls_it_is_about() -> None:
 
 def test_one_function_builds_the_command_line_of_a_python_child() -> None:
     """``python_child_argv`` is where the interpreter flags are added, so a Python child started any
-    other way would start without them. Outside the tray, which is the desktop user's own process,
-    it is the only code in the shipped packages that names this interpreter's executable."""
+    other way would start without them. It is the only code in the shipped packages that names this
+    interpreter's executable, apart from two tray modules that read it for another purpose:
+    ``tray/autostart.py`` writes the login command, and ``tray/branding.py`` finds where to put the
+    branded launcher and whether this process is it (vault BACKLOG #2801)."""
     names_the_interpreter = {
         rel
         for rel, source in _scanned_sources().items()
-        if not rel.startswith("tray/")
-        and any(
+        if any(
             isinstance(node, ast.Attribute)
             and node.attr == "executable"
             and isinstance(node.value, ast.Name)
@@ -702,7 +703,7 @@ def test_one_function_builds_the_command_line_of_a_python_child() -> None:
             for node in ast.walk(ast.parse(source))
         )
     }
-    assert names_the_interpreter == {"childenv.py"}
+    assert names_the_interpreter == {"childenv.py", "tray/autostart.py", "tray/branding.py"}
 
 
 def test_the_guard_reads_every_module_the_process_start_inventory_names() -> None:
