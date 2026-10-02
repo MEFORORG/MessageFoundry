@@ -424,11 +424,14 @@ def resolved_secret_refs(settings: ServiceSettings) -> list[str]:
     and the least-privilege table in ``privilege_check`` both call it."""
     auth, alerts = settings.auth, settings.alerts
     ad_on, oidc_on = _auth_features_on(settings)
-    pkjwt = auth.oidc_private_key_jwt
+    oidc_ref = (
+        auth.oidc_client_private_key_ref
+        if auth.oidc_private_key_jwt
+        else auth.oidc_client_secret_ref
+    )
     candidates = (
         auth.ad_bind_password_secret if ad_on else None,
-        auth.oidc_client_secret_ref if oidc_on and not pkjwt else None,
-        auth.oidc_client_private_key_ref if oidc_on and pkjwt else None,
+        oidc_ref if oidc_on else None,
         alerts.email_password_secret,
     )
     return [ref for ref in candidates if ref]

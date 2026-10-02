@@ -194,7 +194,9 @@ _FILE_SECRET_KEYS = (
 )
 
 #: (section, key) fields that take inline PEM or a path to a PEM file. Only inline PEM in the config
-#: file warns; a path there is the [api].tls_key_file pattern (see _warn_file_secrets).
+#: file warns; a path there is the [api].tls_key_file pattern (see _warn_file_secrets). "Inline" is
+#: the signer's own test, a "-----BEGIN" header (transports/signing.py `_read_key_material`); config
+#: cannot import transports, so the test is restated there and here.
 _FILE_INLINE_PEM_KEYS = (("auth", "oidc_client_private_key"),)  # BACKLOG #296
 
 
@@ -3453,51 +3455,48 @@ class AuthSettings(_Section):
         # understand. `if not value` is already the emptiness test used by the `missing` list ten lines
         # above; this line was the only one in the validator that disagreed. Whitespace is stripped for the
         # test only — the value itself is never rewritten.
-        has_secret = bool(
-            (self.oidc_client_secret or "").strip() or (self.oidc_client_secret_ref or "").strip()
-        )
-        if self.oidc_private_key_jwt:
-            # BACKLOG #296. Blank counts as missing here too, for the reason the secret test gives.
-            if (
-                not (self.oidc_client_private_key or "").strip()
-                and not (self.oidc_client_private_key_ref or "").strip()
-            ):
-                raise ValueError(
-                    "oidc_token_endpoint_auth_method='private_key_jwt' requires a NON-EMPTY signing "
-                    "key: set oidc_client_private_key (inline PEM via "
-                    "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY, or a path to a PEM file) or "
-                    "oidc_client_private_key_ref (a [secrets].provider reference)"
-                )
-            # A secret this method never sends is a live credential nobody uses. Refused rather
-            # than ignored, so the configuration says exactly what goes on the wire.
-            if has_secret:
-                raise ValueError(
-                    "oidc_token_endpoint_auth_method='private_key_jwt' never sends the client "
-                    "secret: remove oidc_client_secret / oidc_client_secret_ref"
-                )
-        else:
-            if not has_secret:
-                raise ValueError(
-                    "oidc_enabled requires a NON-EMPTY client secret: set oidc_client_secret (via "
-                    "MEFOR_AUTH_OIDC_CLIENT_SECRET) or oidc_client_secret_ref (a [secrets].provider "
-                    "reference). An env var exported with no value counts as missing."
-                )
-            stray = [
-                name
-                for name, value in (
-                    ("oidc_client_private_key", self.oidc_client_private_key),
-                    ("oidc_client_private_key_ref", self.oidc_client_private_key_ref),
-                    ("oidc_client_private_key_password", self.oidc_client_private_key_password),
-                    ("oidc_client_assertion_key_id", self.oidc_client_assertion_key_id),
-                )
-                if value is not None
-            ]
-            if stray:
-                raise ValueError(
-                    f"{', '.join(stray)} apply only with "
-                    "oidc_token_endpoint_auth_method='private_key_jwt'; the configured method is "
-                    "'client_secret_post', which sends the client secret and no assertion"
-                )
+        def given(*values: str | None) -> bool:
+            return any((v or "").strip() for v in values)
+
+        has_secret = given(self.oidc_client_secret, self.oidc_client_secret_ref)
+        # BACKLOG #296. The same blank-is-missing rule for the signing key.
+        has_key = given(self.oidc_client_private_key, self.oidc_client_private_key_ref)
+        if self.oidc_private_key_jwt and not has_key:
+            raise ValueError(
+                "oidc_token_endpoint_auth_method='private_key_jwt' requires a NON-EMPTY signing "
+                "key: set oidc_client_private_key (inline PEM via "
+                "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY, or a path to a PEM file) or "
+                "oidc_client_private_key_ref (a [secrets].provider reference)"
+            )
+        # A credential the configured method never sends is a live credential nobody uses. Refused
+        # rather than ignored, so the configuration says exactly what goes on the wire.
+        if self.oidc_private_key_jwt and has_secret:
+            raise ValueError(
+                "oidc_token_endpoint_auth_method='private_key_jwt' never sends the client "
+                "secret: remove oidc_client_secret / oidc_client_secret_ref"
+            )
+        if not self.oidc_private_key_jwt and not has_secret:
+            raise ValueError(
+                "oidc_enabled requires a NON-EMPTY client secret: set oidc_client_secret (via "
+                "MEFOR_AUTH_OIDC_CLIENT_SECRET) or oidc_client_secret_ref (a [secrets].provider "
+                "reference). An env var exported with no value counts as missing."
+            )
+        stray = [
+            name
+            for name in (
+                "oidc_client_private_key",
+                "oidc_client_private_key_ref",
+                "oidc_client_private_key_password",
+                "oidc_client_assertion_key_id",
+            )
+            if given(getattr(self, name))
+        ]
+        if not self.oidc_private_key_jwt and stray:
+            raise ValueError(
+                f"{', '.join(stray)} apply only with "
+                "oidc_token_endpoint_auth_method='private_key_jwt'; the configured method is "
+                "'client_secret_post', which sends the client secret and no assertion"
+            )
 
         # Every pinned URL must be https (no dev escape — this is an off-box trust boundary) and its
         # host must appear in the allow-list, which must itself be non-empty.

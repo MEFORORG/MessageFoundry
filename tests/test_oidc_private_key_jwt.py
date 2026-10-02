@@ -29,7 +29,7 @@ from pydantic import ValidationError
 from messagefoundry.auth import oidc
 from messagefoundry.auth.oidc.client_auth import (
     CLIENT_ASSERTION_TTL_SECONDS,
-    CLIENT_ASSERTION_TYPE,
+    ClientSecretPost,
     PrivateKeyJwtClientAuth,
     client_auth_from_settings,
 )
@@ -38,7 +38,12 @@ from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import AuthSettings, ServiceSettings, _warn_file_secrets
 from messagefoundry.config.static_credentials import resolved_secret_refs, static_credential_hops
 from messagefoundry.store.store import MessageStore
-from messagefoundry.transports.signing import SigningError, verify_compact_jws
+from messagefoundry.transports.signing import (
+    CLIENT_ASSERTION_TYPE,
+    SigningError,
+    client_assertion_claims,
+    verify_compact_jws,
+)
 from messagefoundry.verify.federation import run_federation_checks
 from messagefoundry.verify.model import Status
 
@@ -149,7 +154,6 @@ def test_the_assertion_carries_the_rfc7523_claims_and_verifies(
         audience=TOKEN_ENDPOINT,
         private_key=_pem(key),
         algorithm=SignatureAlgorithm(alg),
-        setting="oidc_client_private_key",
         key_id="kid-1",
     )
     before = int(time.time())
@@ -173,7 +177,6 @@ def test_each_assertion_is_fresh(ec_key: ec.EllipticCurvePrivateKey) -> None:
         audience=TOKEN_ENDPOINT,
         private_key=_pem(ec_key),
         algorithm=SignatureAlgorithm.ES256,
-        setting="oidc_client_private_key",
     )
     jtis = {
         verify_compact_jws(
@@ -186,6 +189,14 @@ def test_each_assertion_is_fresh(ec_key: ec.EllipticCurvePrivateKey) -> None:
     assert len(jtis) == 5
 
 
+def test_the_shared_claim_builder_keeps_smart_without_iat() -> None:
+    """SMART reuses the builder with ``include_iat`` off, so its wire format did not move."""
+    smart = client_assertion_claims("cid", TOKEN_ENDPOINT, ttl_seconds=240)
+    assert set(smart) == {"iss", "sub", "aud", "exp", "jti"}
+    oidc_claims = client_assertion_claims("cid", TOKEN_ENDPOINT, ttl_seconds=120, include_iat=True)
+    assert set(oidc_claims) == set(smart) | {"iat"}
+
+
 def test_a_wrong_curve_or_weak_key_is_refused_at_construction(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
@@ -195,7 +206,6 @@ def test_a_wrong_curve_or_weak_key_is_refused_at_construction(
             audience=TOKEN_ENDPOINT,
             private_key=_pem(rsa_key),
             algorithm=SignatureAlgorithm.ES256,
-            setting="oidc_client_private_key",
         )
     weak = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     with pytest.raises(SigningError, match="3072"):
@@ -204,7 +214,6 @@ def test_a_wrong_curve_or_weak_key_is_refused_at_construction(
             audience=TOKEN_ENDPOINT,
             private_key=_pem(weak),
             algorithm=SignatureAlgorithm.RS256,
-            setting="oidc_client_private_key",
         )
 
 
@@ -217,7 +226,7 @@ def test_private_key_jwt_sends_the_assertion_and_no_secret(
     client = client_auth_from_settings(AuthSettings(**_pkjwt(_pem(ec_key))), None)
     assert client is not None
     opener = _FakeOpener()
-    _exchange(opener, client_secret=None, client_auth=client)
+    _exchange(opener, client_auth=client)
     form = opener.form()
     assert "client_secret" not in form
     assert form["client_assertion_type"] == [CLIENT_ASSERTION_TYPE]
@@ -233,20 +242,15 @@ def test_private_key_jwt_sends_the_assertion_and_no_secret(
     assert "Authorization" not in dict(opener.requests[-1].header_items())
 
 
-def test_a_secret_and_an_assertion_together_are_refused_before_any_post(
-    ec_key: ec.EllipticCurvePrivateKey,
-) -> None:
-    client = client_auth_from_settings(AuthSettings(**_pkjwt(_pem(ec_key))), None)
-    opener = _FakeOpener()
-    with pytest.raises(oidc.FlowError, match="not both"):
-        _exchange(opener, client_secret=SECRET, client_auth=client)
-    assert opener.requests == []
-
-
 def test_the_default_client_secret_post_request_is_unchanged() -> None:
     """The control: with no ``client_auth`` the form holds exactly the pre-#296 fields."""
     opener = _FakeOpener()
-    _exchange(opener, client_secret=SECRET)
+    _exchange(
+        opener,
+        client_auth=client_auth_from_settings(
+            AuthSettings(**_auth(oidc_client_secret=SECRET)), None
+        ),
+    )
     assert opener.form() == {
         "grant_type": ["authorization_code"],
         "code": ["the-code"],
@@ -263,7 +267,7 @@ def test_the_issuer_audience_option_addresses_the_pinned_issuer(
     client = client_auth_from_settings(
         AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_assertion_audience="issuer")), None
     )
-    assert client is not None and client.audience == ISSUER
+    assert isinstance(client, PrivateKeyJwtClientAuth) and client.audience == ISSUER
 
 
 # --- configuration -----------------------------------------------------------------------------
@@ -272,7 +276,9 @@ def test_the_issuer_audience_option_addresses_the_pinned_issuer(
 def test_the_default_method_is_client_secret_post() -> None:
     settings = AuthSettings(**_auth(oidc_client_secret=SECRET))
     assert settings.oidc_token_endpoint_auth_method == "client_secret_post"
-    assert client_auth_from_settings(settings, None) is None
+    credential = client_auth_from_settings(settings, None)
+    assert isinstance(credential, ClientSecretPost)
+    assert SECRET not in repr(credential)
 
 
 @pytest.mark.parametrize("key", [None, "", "   "])
@@ -357,13 +363,13 @@ async def test_the_service_sends_the_assertion_and_resolves_no_secret(
         )
         with pytest.raises(_Stop):
             service._exchange_and_validate("code", flow, "https://ops.example/ui/oidc/callback")
-        assert calls[0]["client_secret"] is None
+        assert "client_secret" not in calls[0]
         assert isinstance(calls[0]["client_auth"], PrivateKeyJwtClientAuth)
     finally:
         await store.close()
 
 
-async def test_the_default_service_passes_no_client_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_the_default_service_sends_the_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     store = await MessageStore.open(":memory:")
     try:
         settings = AuthSettings(**_auth(oidc_client_secret=SECRET))
@@ -385,8 +391,7 @@ async def test_the_default_service_passes_no_client_auth(monkeypatch: pytest.Mon
         )
         with pytest.raises(oidc.FlowError):
             service._exchange_and_validate("code", flow, "https://ops.example/ui/oidc/callback")
-        assert calls[0]["client_secret"] == SECRET
-        assert calls[0]["client_auth"] is None
+        assert calls[0]["client_auth"].form_fields() == {"client_secret": SECRET}
     finally:
         await store.close()
 

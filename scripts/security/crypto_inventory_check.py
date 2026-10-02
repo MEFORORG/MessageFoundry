@@ -320,11 +320,9 @@ INVENTORY: dict[str, frozenset[str]] = {
         {"cryptography", "hmac", "messagefoundry.transports.signing"}
     ),
     "messagefoundry/auth/oidc/flow.py": frozenset({"hashlib", "hmac", "secrets"}),
-    # BACKLOG #296: the private_key_jwt client assertion. The signing is the shared signer's
-    # (transports/signing.py); secrets draws each assertion's jti.
-    "messagefoundry/auth/oidc/client_auth.py": frozenset(
-        {"messagefoundry.transports.signing", "secrets"}
-    ),
+    # BACKLOG #296: the private_key_jwt client assertion. Its claims, its jti and its signature are
+    # all the shared signing module's (transports/signing.py).
+    "messagefoundry/auth/oidc/client_auth.py": frozenset({"messagefoundry.transports.signing"}),
     "messagefoundry/auth/oidc/jwks.py": frozenset(
         {"cryptography", "messagefoundry.transports.signing"}
     ),
@@ -584,11 +582,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/rest.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
     ),
-    "messagefoundry/transports/signing.py": frozenset({"cryptography"}),
-    # ADR 0024: a random `jti` for the SMART Backend Services client_assertion JWT (the JWT signing
-    # itself reuses signing.py's `cryptography`).
+    # BACKLOG #296: `secrets` draws the random `jti` in client_assertion_claims, the one RFC 7523
+    # claim builder the SMART client and the OIDC private_key_jwt client share.
+    "messagefoundry/transports/signing.py": frozenset({"cryptography", "secrets"}),
+    # ADR 0024: the SMART Backend Services client_assertion JWT. Its claims (and their random `jti`)
+    # and its signature both come from signing.py since BACKLOG #296.
     "messagefoundry/transports/smart.py": frozenset(
-        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "secrets"}
+        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing"}
     ),
     # BACKLOG #1171 retired ws_password_type='digest', which was this file's only hashlib use (the
     # WS-Security PasswordDigest SHA-1 construction). The row is bidirectional, so the token had to go
@@ -976,7 +976,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {"compare:hmac.compare_digest", "csprng:secrets.token_bytes", "hash:hashlib.sha256"}
     ),
     "messagefoundry/auth/oidc/client_auth.py": frozenset(
-        {"csprng:secrets.token_urlsafe", "sign_verify:.sign()"}
+        {"csprng:via messagefoundry.transports.signing", "sign_verify:.sign()"}
     ),
     "messagefoundry/auth/oidc/jwks.py": frozenset(
         {
@@ -1406,6 +1406,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/transports/signing.py": frozenset(
         {
+            "csprng:secrets.token_urlsafe",
             "key_cert:.public_key()",
             "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
             "key_cert:messagefoundry.keywrap.key_wrap_refusal",
@@ -1416,7 +1417,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/transports/smart.py": frozenset(
         {
-            "csprng:secrets.token_urlsafe",
+            "csprng:via messagefoundry.transports.signing",
             "key_cert:via messagefoundry.transports.rest",
             "sign_verify:.sign()",
             "tls_context:via messagefoundry.transports.rest",

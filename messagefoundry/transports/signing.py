@@ -39,6 +39,8 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import secrets
+import time
 from typing import TYPE_CHECKING, Any
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -65,11 +67,13 @@ if (
     from messagefoundry.config.wiring import ConnectionSpec
 
 __all__ = [
+    "CLIENT_ASSERTION_TYPE",
     "CompactJwtSigner",
     "MessageSigner",
     "SigningError",
     "b64u_decode",
     "b64u_encode",
+    "client_assertion_claims",
     "require_public_key_for_alg",
     "signer_from_destination",
     "unverified_jws_header",
@@ -422,6 +426,31 @@ class MessageSigner:
     def verify(self, jws: str, payload: bytes) -> None:
         """Verify a JWS this signer produced against ``payload`` (the self-verify / round-trip path)."""
         verify_detached_jws(jws, payload, self.public_key, allowed_algorithms=(self.algorithm,))
+
+
+#: RFC 7523 section 2.2: the ``client_assertion_type`` that names a JWT client assertion.
+CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+
+
+def client_assertion_claims(
+    client_id: str, audience: str, *, ttl_seconds: int, include_iat: bool = False
+) -> dict[str, object]:
+    """The RFC 7523 client-assertion claim set, the ONE builder both assertion clients share.
+
+    ``iss`` = ``sub`` = ``client_id``, ``aud``, ``exp`` = now + ``ttl_seconds``, and a 256-bit ``jti``
+    from the OS CSPRNG, fresh on every call. ``include_iat`` adds ``iat``. The OIDC relying party
+    sends it (BACKLOG #296); the SMART client does not, and keeps its wire format."""
+    now = int(time.time())
+    claims: dict[str, object] = {
+        "iss": client_id,
+        "sub": client_id,
+        "aud": audience,
+        "exp": now + ttl_seconds,
+        "jti": secrets.token_urlsafe(32),
+    }
+    if include_iat:
+        claims["iat"] = now
+    return claims
 
 
 class CompactJwtSigner:

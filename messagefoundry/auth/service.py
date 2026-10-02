@@ -98,7 +98,7 @@ from messagefoundry.auth.policy import (
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
-from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
+from messagefoundry.config.secretprovider import SecretProvider
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.controlchars import scrub_log_argument
@@ -1940,8 +1940,7 @@ class AuthService:
         self._reconcile_unkeyed_reported: set[str] = set()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
-        self._oidc_client_secret: str | None = None
-        self._oidc_client_auth: oidc.PrivateKeyJwtClientAuth | None = None
+        self._oidc_client_auth: oidc.ClientAuthentication | None = None
         self._oidc_jwks: oidc.JwksCache | None = None
         self._oidc_flows: oidc.FlowCache | None = None
         if settings.oidc_enabled:
@@ -1952,13 +1951,6 @@ class AuthService:
             # sends. Under private_key_jwt the key is read and checked here, so a missing,
             # unreadable, weak or wrong-curve key refuses startup like an unresolvable secret.
             self._oidc_client_auth = oidc.client_auth_from_settings(settings, secret_provider)
-            if self._oidc_client_auth is None:
-                self._oidc_client_secret = resolve_connector_secret(
-                    secret_provider,
-                    ref=settings.oidc_client_secret_ref,
-                    literal=settings.oidc_client_secret,
-                    label="[auth].oidc_client_secret",
-                )
             # Eager: a bad CA path or an unresolvable secret must refuse startup, exactly as the AD
             # bind password does. NO network I/O happens here — JwksCache opens no socket until its
             # first get_key — so an UNREACHABLE IdP still constructs cleanly (AC-8).
@@ -3202,7 +3194,6 @@ class AuthService:
         payload = oidc.exchange_code(
             token_endpoint=self._settings.oidc_token_endpoint or "",
             client_id=self._settings.oidc_client_id or "",
-            client_secret=self._oidc_client_secret,
             client_auth=self._oidc_client_auth,
             code=code,
             redirect_uri=redirect_uri,

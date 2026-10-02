@@ -21,6 +21,8 @@ from messagefoundry.auth.oidc.claims import (
     validate_id_token,
 )
 from messagefoundry.auth.oidc.client_auth import (
+    ClientAuthentication,
+    ClientSecretPost,
     PrivateKeyJwtClientAuth,
     client_auth_from_settings,
 )
@@ -56,6 +58,8 @@ __all__ = [
     "DEFAULT_JWKS_TTL_SECONDS",
     "REASONS",
     "ClaimsError",
+    "ClientAuthentication",
+    "ClientSecretPost",
     "FederatedPrincipal",
     "FlowCache",
     "FlowCacheFullError",
