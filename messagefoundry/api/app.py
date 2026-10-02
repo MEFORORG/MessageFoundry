@@ -654,7 +654,7 @@ def _read_log_tail(
     and the page boundaries do not count them either (BACKLOG #1131; see
     :func:`~messagefoundry.auth.audit_visibility.reads_audit_copies_in_the_log`)."""
     from messagefoundry.auth.audit_visibility import is_audit_copy_line
-    from messagefoundry.support.redact import redact_log_line
+    from messagefoundry.support.redact import redact_log_record, split_log_lines
 
     if not log_dir:
         return [], 0, False
@@ -671,14 +671,14 @@ def _read_log_tail(
         text = newest.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return [], 0, False
-    all_lines = text.splitlines()
+    all_lines = split_log_lines(text)
     if not audit_copies:
         all_lines = [line for line in all_lines if not is_audit_copy_line(line)]
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
     page = all_lines[start:end]
-    return [redact_log_line(line) for line in page], total, True
+    return [redact_log_record(line) for line in page], total, True
 
 
 def _cookie_secure(request: Request) -> bool:
