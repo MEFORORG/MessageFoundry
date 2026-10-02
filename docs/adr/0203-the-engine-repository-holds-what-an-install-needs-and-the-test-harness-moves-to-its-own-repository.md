@@ -31,7 +31,7 @@ reading. The table says what this ADR found for each.
 
 | The reading | Finding |
 |---|---|
-| The whole of `harness/` leaves, the load rig included | Holds, on one condition. The engine's merge gate runs the load rig today, so the gate needs decision D below first. |
+| The whole of `harness/` leaves, the load rig included | Holds for the load rig, on one condition: the engine's merge gate runs it today, so the gate needs decision D first. It does not hold for `harness/acceptance/`, 6 files, which runs the engine's own test files on a target host. See B. |
 | Rows #2672 to #2683 are built in the new repository after the move | Holds for #2672 to #2682. It does not hold for #2683, which touches only `fuzz/` and one engine test, and `fuzz/` stays. |
 
 ### Every number below names its instrument
@@ -59,10 +59,10 @@ breaks the same way when the package is gone.
 
 ## Decision
 
-**Recommended, for the owner to rule on:** move the whole of `harness/` and its distribution to one
-new repository, keep the engine's load, failover and engine-shard certification legs in the
-engine's merge gate by running that repository's code at a pinned commit, and move nothing else in
-the same step.
+**Recommended, for the owner to rule on:** move `harness/` and its distribution to one new
+repository, all but the acceptance matrix in `harness/acceptance/`. Keep the engine's load,
+failover and engine-shard certification runs in the engine's merge gate by running that
+repository's code at a pinned commit. Move nothing else in the same step.
 
 The ten sections below each answer one question the row asked. Each gives the evidence and a
 recommendation.
@@ -110,6 +110,7 @@ measure of how often a move would turn one change into two.
 | `messagefoundry_webconsole/`, `packaging/messagefoundry-webconsole/` | 40, 47 | IN | The operator console a site installs. |
 | `messagefoundry_toolkit/`, `packaging/messagefoundry-toolkit/` | 3, 4 | IN, and an owner question | `docs/INSTALL-GUIDE.md` names it for authoring commands. ADR 0201 placed it here two days before this ADR, in lockstep, because it calls engine internals. The owner's sentence may reach it. This ADR does not reopen 0201's layout. It does change slice 7; see I. |
 | `harness/`, `packaging/messagefoundry-harness/` | 99, 4 | **OUT, now** | A separate tool with its own command and its own distribution. The engine wheel does not carry it. No tree outside `tests/` imports it (0 files). Co-change: 36, of which 20. |
+| `harness/acceptance/` | 6 of the 99 | IN, under another name | The on-server acceptance matrix. It sets its root two levels above itself, runs the engine's own `tests/` files through `pytest` from there, and reads `requirements.lock` and `messagefoundry/service.py` by path. Its matrix names engine test files on 46 lines. Its subject is the installed product, and it cannot run without an engine source checkout. It leaves `harness/` and stays in this repository, with its two tests. |
 | `tee/` | 18 | OUT, later | A standalone relay for a parallel-run cutover. Its docstring says it imports nothing from the engine. It vendors `anon/`, which ADR 0201 slices 5 and 6 are moving, so it waits for them. 13 test files import it. Co-change: 6, of which 6. |
 | `fuzz/` | 4 | IN | Its subject is the engine's own parsers. One engine test and `scripts/security/dast_ingress_sweep.py` import it. It is a test of the product, like `tests/`. |
 | `ide/` | 180 | OUT in principle, not in this move | An authoring extension. A site does not need it to install. Its coupling was only partly measured: 25 test files name `ide/`, and co-change is 28, of which 17. It needs its own decision. |
@@ -121,9 +122,10 @@ measure of how often a move would turn one change into two.
 | `scripts/coord/`, `worktree/`, `hooks/` | 31, 16, 21 | OUT in principle, not in this move | Their subject is the working method, not the product, and korus is their upstream home. Co-change: 64 touches, of which 2. They are also the commit gate, so they leave only by being vendored back from korus. That is its own decision. |
 | `scripts/connscale_harvest.py` | 1 | OUT, with the harness | It harvests the harness's connscale readings from this repository's CI artifacts. Four test files import it. One, `tests/test_connscale_harvest.py`, imports nothing from `harness`, so it is outside the 82 in E and must be moved by name. The script imports `messagefoundry.spreadsheet`. |
 | `scripts/dev/`, `bench/`, `telemetry/`, `codex/`, `tray/`, and four more top-level scripts | 15 | unmeasured | Not read for this ADR. |
-| `docs/` outside the four rows below | 82 | IN | Operator and design documents. |
+| `docs/` outside the five rows below | 81 | IN | Operator and design documents. |
 | `docs/adr/` | 193 | IN | Design records of the product. |
-| `docs/benchmarks/` | 216 | IN | The harness produced these records, and the engine's design rests on them: 29 files under `docs/` outside this tree cite it, 19 of them under `docs/adr/`. Moving it breaks that evidence chain and the link check. |
+| `docs/benchmarks/` | 216 | IN | The harness produced these records, and the engine's design rests on them: 29 files under `docs/` outside this tree cite it, 19 of them under `docs/adr/`. Moving it breaks that evidence chain and the link check. Two things would cross the new boundary: `tests/test_connscale_fuse_replay.py`, which moves, replays a record from here, and `scripts/connscale_harvest.py`, which moves, produces readings a record here holds. |
+| `docs/LOAD-TESTING.md` | 1 | OUT, with the harness | It documents the harness's load commands. At least six documents that stay link to it, so the cut must repoint them or the link check goes red. |
 | `docs/roles/` | 7 | OUT in principle, with the coordination scripts | Seat cards. Same reason, same later decision. |
 | `docs/backlog-proposals/` | 10 | unmeasured | Not read for this ADR. |
 | `docker/` | 12 | IN | The container install. |
@@ -166,7 +168,7 @@ harness through `pytest`. The table reads each job's non-comment lines.
 | `ci.yml` `sqlserver-store` | Runs `tests/test_load_failover_sqlserver.py` and `tests/test_shard_cert_sqlserver.py`. | Only when the server-database paths change. Always in the queue. | Through `CI gate`. |
 | `ci.yml` `postgres-store` | Runs `tests/test_load_failover_postgres.py` and `tests/test_connscale_postgres.py`. | The same. | Through `CI gate`. |
 | `ci.yml` `packaging-build` | Builds the harness wheel and runs the member gate over it. | Only when the packaging paths change. | Through `CI gate`. |
-| `ci.yml` `webconsole`, `tooling` | Install the `harness` extra. No harness code was found in their steps. | Yes; `tooling` only when its paths change. | Through `CI gate`. |
+| `ci.yml` `webconsole`, `tooling` | Install the `harness` extra. `tooling` needs it because `-m tooling` filters after collection, so the job imports every test module, the PySide6 ones included. Its manifest, `tests/tooling_manifest.txt`, lists `tests/test_connscale_harvest.py`, which moves. Why `webconsole` installs it was not read. | Yes; `tooling` only when its paths change. | Through `CI gate`. |
 | `benchmark.yml`, three `baseline-*` jobs | `python -m harness --load reference` and `--failover failover`. | No. `workflow_dispatch` only. | No. |
 | `ingress-rate-probe.yml` `probe` | `python -m harness.load.ingress_probe`. | No. `workflow_dispatch` only. | No. |
 | `quality-advisory.yml` `coverage`, `mutation` | Install the `harness` extra. | Not read. | No. Advisory. |
@@ -214,16 +216,17 @@ deployments may never be cited to relax one. Option 3 buys a copy that drifts.
   `tests/_failover_load_support.py`. And `benchmark.yml` runs `--failover` under `set +e`, so no
   job gates on that exit code today.
 
-### E. The 82 test files: 62 move as the harness's own, 9 move and stay in the gate, 11 are split
+### E. The 82 test files: 59 move as the harness's own, 9 move and stay in the gate, 12 are split, 2 stay
 
 Two helper modules are counted among the 82. Classes were assigned by reading each file's
 docstring and its imports.
 
 | Class | Files | Disposition |
 |---|---|---|
-| 1. Tests of the harness | 61 test files and `tests/_connscale_ports.py` | Move with it. The engine gate stops running them. |
-| 2. Engine tests that use the harness | 11 test files | Split first, inside the engine repository. Listed below. |
+| 1. Tests of the harness | 58 test files and `tests/_connscale_ports.py` | Move with it. The engine gate stops running them. |
+| 2. Engine tests that use the harness | 12 test files | Split first, inside the engine repository. Listed below. |
 | 3. Runs that certify the engine through the harness | 8 test files and `tests/_failover_load_support.py` | Move with it. The engine gate keeps running them at the pin (section D). |
+| 4. Tests of the acceptance matrix | `test_acceptance_framework.py`, `test_win2025_acceptance.py` | Stay, with `harness/acceptance/` (section B). |
 
 **Class 3, by name.** Database-gated: `test_load_failover_postgres.py`,
 `test_load_failover_sqlserver.py`, `test_shard_cert_sqlserver.py`, `test_connscale_postgres.py`.
@@ -239,10 +242,15 @@ leave. Whether the engine's own API tests cover the same ground was not measured
 `EngineNode(` or a `run_*` entry point in at least ten more, several of them behind stubs. Step 3
 of the migration must read each before it leaves the gate.
 
-**The moved tests need two fixtures from `tests/conftest.py`.** They are session-wide and
-automatic: `_allow_insecure_config_source_in_tests` and `_warn_posture_for_the_server_db_legs`.
-The database runs open a store under the posture the second one sets. The new repository's own
-`conftest.py` must carry both.
+**One helper is outside the 82 and must move by name.** `tests/_mllp_over_cap.py` imports
+nothing from `harness`. Three class 1 files import it, and a search found no other user.
+
+**The moved tests run under `tests/conftest.py`, and need at least two of its fixtures.** Those
+two are session-wide and automatic: `_allow_insecure_config_source_in_tests` and
+`_warn_posture_for_the_server_db_legs`. The database runs open a store under the posture the
+second one sets. The file holds ten automatic fixtures and some import-time setup, at least a
+port-base variable that `test_multishard_smoke.py` reads. Two is a floor, not the list. Step 3
+must read the whole file against the moving tests.
 
 **Class 2, by name.** Each is an engine test today. Each has a part that is really a harness test.
 
@@ -259,6 +267,7 @@ The database runs open a store under the posture the second one sets. The new re
 | `test_csv_formula_consistency.py` | One formula-injection rule across every writer, engine and harness. | Engine writers stay. Harness writers move, with a test that compares `harness/_spreadsheet.py` to the pinned engine's `spreadsheet.py`. |
 | `test_console_streams.py` | The engine's console hardening, proved by driving the `harness.reconcile` command. | Stay, driving an engine command instead. The harness keeps its own copy for its command. |
 | `test_anon_integration.py` | `anon/`, the tee subcommand and the harness capture sink. | Follows ADR 0201 slices 5 and 6. The capture-sink and corpus parts move. |
+| `test_connscale_herd_floor.py` | The armed empty-claims herd floor. It reads the engine's `ci.yml` for the `MEFOR_CONNSCALE_LEG` export, and recomputes the armed legs from a `docs/benchmarks/` record. | The `ci.yml` guard stays. Without it the new `pytest` step in D could lose the export and nothing would notice. The recomputation follows its record. Not read closely enough to draw the line. |
 
 **Three more files name the harness by path and import nothing from it.**
 
@@ -311,6 +320,12 @@ first. A harness pull request then moves `ENGINE_REF` and the metadata pin, and 
 follows. Between the two, the newest harness on PyPI names the previous engine, and installing
 both newest versions fails at resolution. That is loud, and section 0 says nobody is running
 either.
+
+**Two rules keep the pins honest.** A harness release may be cut only when `ENGINE_REF` names
+the tagged commit of the engine version its metadata pins. Otherwise CI tested a commit and
+the wheel names a version, which is the #1585 failure again. And `ci/harness.pin` must name a
+commit reachable from the harness repository's `main`. A 40-character name alone would also
+accept an unmerged branch commit, or a fork's.
 
 **The `harness` extra leaves the engine.** `messagefoundry[harness]` is PySide6 and nothing else.
 It becomes the harness's own dependency, and the engine wheel's metadata stops naming a test tool.
@@ -383,6 +398,12 @@ two files.
 import one of the four forbidden packages. The client rule does not walk `tests/` today. The new
 repository must decide whether its tests may.
 
+**The tables above count `harness/` only.** The supported list must also cover what the moved
+tests and script import. That is at least `messagefoundry.spreadsheet`, in the harvest script,
+and in the class 3 files `api.create_managed_app`, `store.postgres`, `store.sqlserver` and
+`config.settings`. The class 3 files matter most: the engine gate runs them, so an engine
+refactor of one of these names breaks a required leg at the engine's own merge.
+
 ### H. A new repository needs the leak gate, a commit gate, CI and a coordination install on day one
 
 **The two precedents, read with `git ls-tree` at their `origin/main` on 2026-10-01**: the vault
@@ -415,9 +436,9 @@ refuse to run inside a session.
 | Branch protection with required contexts | Otherwise CI gates nothing. |
 | The coordination kit from korus, a worktree gate that covers the new clone, and seat cards | Sessions collide without it. |
 | The harness's own test for the client import rule | The engine's copy stops seeing the tree. |
-| The crypto inventory gate, and the ASVS file-surface and absence-proof coverage, for the harness's files | `scripts/security/crypto_inventory_check.py` registers harness files and runs in a required leg. `scripts/asvs/scorecard.py` walks `harness` as a shipped root, because it ships on PyPI. If the cut removes those entries and the new repository has no such gate, coverage narrows while the wheel still ships. |
-| A `conftest.py` with the two fixtures section E names | The database runs fail closed without them. |
-| A check that `import harness` resolves to this checkout | Until the cut, every engine commit still holds `harness/`, and it is a namespace package. If the engine checkout is on the import path, the old copy can win and the runs pass against the wrong code. Install the engine as a built wheel, and assert the path. |
+| The engine's security gates that walk `harness/`, rebuilt for the harness's files: at least the crypto inventory, the ASVS file-surface and absence-proof coverage, the static security scan, and the keyless-chain, key-lifecycle and subprocess-encoding checks | `scripts/security/crypto_inventory_check.py` registers harness files and runs in a required leg. `scripts/asvs/scorecard.py` walks `harness` as a shipped root, because it ships on PyPI. `tests/test_security_static.py` and at least three more tests name harness files. If the cut removes those entries and the new repository has no such gates, coverage narrows while the wheel still ships. |
+| A `conftest.py` with at least the two fixtures section E names | The database runs fail closed without them. |
+| A check that `harness`, `tests` and `scripts` each resolve to this checkout | None of the three has an `__init__.py`, so each is a namespace package, and the moved code imports all three by name. Every engine commit before the cut holds a copy of each. If an engine checkout is on the import path, the old copy can win and the runs pass against the wrong code. Install the engine as a built wheel, and assert the paths. |
 
 **Can wait.**
 
@@ -438,19 +459,24 @@ Steps marked **OWNER** are the owner's alone.
 1. **OWNER.** Rule on this ADR, on gate option 1, and on the names in C.
 2. Narrow the import surface in the engine repository, one pull request per row of G. This is
    worth doing even if the move is declined.
-3. Split the 11 class 2 files (section E), in the engine repository. Read each class 1 file
-   that starts an engine, and check the two graph tests have engine equivalents. After this
-   every test file is wholly engine or wholly harness. `tests/conftest.py` is the one shared
-   file: both repositories end with their own.
+3. Split the 12 class 2 files (section E), in the engine repository. Move `harness/acceptance/`
+   to its new home here. Read each class 1 file that starts an engine, and check the two graph
+   tests have engine equivalents. After this every test file is wholly engine or wholly
+   harness. `tests/conftest.py` is the one shared file: both repositories end with their own.
 4. Give the class 3 files their own directory and their own `pytest` step in each job that
    runs them (section D), with the harness still in tree. The events and the operating
    systems do not change. The gate is now shaped for a pin.
 5. Land or close every open pull request that touches `harness/`. At 2026-10-02 02:50 UTC,
-   `gh pr list` showed 7 open pull requests and none touched it.
+   `gh pr list` showed 7 open pull requests and none touched it. **From here to step 10 the
+   moving paths are frozen in the engine.** A commit that lands on them after the extraction is
+   deleted by the cut and is not in the new repository, and `harness/` took 36 commits in 16
+   days. Before the cut, `git log <extraction commit>..origin/main -- <the path list>` must
+   print nothing. If it prints, extract again.
 6. **OWNER.** Create the repository: name, public visibility, licence.
 7. Extract the history on a fresh **full** clone, since the working clones are shallow. Use
-   `git filter-repo` with a path list: `harness/`, `packaging/messagefoundry-harness/`, the class 1
-   and class 3 test files, the three graph tests, `scripts/connscale_harvest.py` with
+   `git filter-repo` with a path list: `harness/` less `harness/acceptance/`,
+   `packaging/messagefoundry-harness/`, the class 1 and class 3 test files, the three graph
+   tests, `tests/_mllp_over_cap.py`, `scripts/connscale_harvest.py` with
    `tests/test_connscale_harvest.py`, and `docs/LOAD-TESTING.md`.
    `git subtree split` takes one prefix and the move has many paths. Commit subjects keep their
    `(#N)` suffix, which names an engine pull request; the new README says so. Run the leak gate
@@ -463,7 +489,7 @@ Steps marked **OWNER** are the owner's alone.
 10. One engine pull request, "the cut", on its own. It must be one pull request, because the
     gates that walk the tree refuse one that is half gone. It does at least this:
     - deletes `harness/`, its packaging directory and the moved tests;
-    - adds `ci/harness.pin`, its checkout step and the test for AC-2 and AC-3;
+    - adds `ci/harness.pin`, its checkout step and the test for AC-2 to AC-4;
     - removes the `harness` extra and the `release-harness` job;
     - edits the test gates that walk the tree, at least 32 files;
     - edits the gates that are not tests: at least `scripts/security/crypto_inventory_check.py`,
@@ -471,7 +497,8 @@ Steps marked **OWNER** are the owner's alone.
       `.pre-commit-config.yaml`, `.dockerignore` and `.gitattributes`;
     - repoints `benchmark.yml` and `ingress-rate-probe.yml`, which run the harness and serve
       `harness/config/load`;
-    - updates `CLAUDE.md` and the documents that name `python -m harness`;
+    - updates `CLAUDE.md` and the documents that name `python -m harness`, repoints the links
+      to `docs/LOAD-TESTING.md`, and removes the moved test from `tests/tooling_manifest.txt`;
     - **amends ADR 0201.** Its slice 7 edits five `harness/` files and the harness packaging
       table, and its AC-7 keeps the harness's toolkit pin under an engine test. After the cut
       both live in the other repository, so the amendment is recorded here, not left implied.
@@ -507,9 +534,10 @@ Steps marked **OWNER** are the owner's alone.
 
 **Better after the split.**
 
-- The engine repository sheds 34,719 lines of harness Python and most of the 33,273 lines in
-  the 82 test files (newline counts over tracked files). The 11 class 2 files hold 5,052 of
-  those lines and mostly stay. How much CI time that saves was not measured.
+- The engine repository sheds 33,506 lines of harness Python, which is 34,719 less the 1,213
+  in the acceptance matrix, and most of the 33,273 lines in the 82 test files (newline counts
+  over tracked files). The 12 class 2 files hold 5,569 of those lines and mostly stay. How much
+  CI time that saves was not measured.
 - The harness gets a type gate. `ci.yml` says `harness/` is outside every mypy step today.
 - The force-include map and the `harness` extra go away. The namespace-package trap goes away
   only after the cut; section H names the check that covers the weeks before it.
@@ -530,34 +558,41 @@ of those legs from the engine's merge gate, even for one pull request.
 
 ## Acceptance Criteria
 
-These hold after the move. No test for them exists yet, except where one is named.
+These hold after the move. **None has a test today.** Each "Verified by" line names where the
+test will live. `adr-analyze` reads a named file as coverage, so its report for this ADR
+overstates.
 
 - **AC-1** -- THE engine repository SHALL contain no `harness/` directory and no
   `packaging/messagefoundry-harness/` directory.
   Verified by: `tests/test_dependency_boundaries.py` and `tests/test_packaging.py`, edited in step 10
-- **AC-2** -- WHEN an engine job runs a class 3 file or a load leg, THE SYSTEM SHALL run it
-  against the engine under test, from the harness commit named in `ci/harness.pin`, on the same
-  events and operating systems as before the move.
-  Verified by: a new workflow test, step 10, beside `tests/test_required_contexts.py`
-- **AC-3** -- IF `ci/harness.pin` does not hold a full 40-character commit SHA, THEN THE SYSTEM
-  SHALL fail the leg before it runs any harness code.
+- **AC-2** -- THE engine's gate SHALL run every class 3 file and both load legs, in the jobs, on
+  the events and on the operating systems that run them before the move.
+  Verified by: a new workflow test, step 10, beside `tests/test_required_contexts.py`. It lists the
+  files and the legs by name, so a missing one fails.
+- **AC-3** -- WHEN an engine job runs a class 3 file or a load leg, THE SYSTEM SHALL run it
+  against the engine under test, from the harness commit named in `ci/harness.pin`.
   Verified by: the same new workflow test
-- **AC-4** -- THE engine SHALL import nothing from the harness.
+- **AC-4** -- IF `ci/harness.pin` does not hold a full 40-character commit SHA that is reachable
+  from the harness repository's `main`, THEN THE SYSTEM SHALL fail the job before it runs any
+  harness code.
+  Verified by: the same new workflow test, and a step in the job itself
+- **AC-5** -- THE engine SHALL import nothing from the harness.
   Verified by: `tests/test_dependency_boundaries.py`, a new arm with a planted control. The arm
   reads import statements only: 28 files under `messagefoundry/` use the word "harness" in
   prose today, and `harness` is an ordinary word.
-- **AC-5** -- THE harness SHALL import no engine module outside the supported list section G
-  settles.
+- **AC-6** -- THE harness SHALL import no engine module outside the supported list section G
+  settles, in its package, its tests or its scripts.
   Verified by: the harness repository's own copy of the client import walk, step 8
-- **AC-7** -- WHILE an engine commit still holds `harness/`, THE harness repository's CI SHALL
-  fail a run in which `import harness` resolves outside its own checkout.
-  Verified by: a new test in the harness repository, step 8
-- **AC-6** -- THE engine wheel's metadata SHALL declare no `harness` extra.
+- **AC-7** -- THE engine wheel's metadata SHALL declare no `harness` extra.
   Verified by: `tests/test_packaging.py`, edited in step 10
+- **AC-8** -- THE harness repository's CI SHALL fail a run in which `harness`, `tests` or
+  `scripts` resolves outside its own checkout.
+  Verified by: a new test in the harness repository, step 8
 
 ## Options considered
 
-1. **Move the whole harness to one new repository, and keep the gate legs at a pin.** **CHOSEN
+1. **Move the harness, less its acceptance matrix, to one new repository, and keep the gate runs
+   at a pin.** **CHOSEN
    (recommended).** It applies the owner's test to the one tree that clearly fails it, and it
    keeps every leg in the merge gate.
 2. **Keep `harness/load/` and move the rest.** The Manager's first reading, later withdrawn. It
@@ -591,6 +626,9 @@ surface section G asks for; any change to what the engine wheel ships.
 - [ ] The owner confirms the repository name, its visibility and its licence (section C).
 - [ ] The owner says whether the test reaches `messagefoundry_toolkit/` (section B).
 - [ ] The owner says whether `docs/benchmarks/` stays, as recommended, or moves with the harness.
+      One moving test and the moving harvest script depend on it either way.
+- [ ] Whether `harness/acceptance/` stays in the engine repository, as recommended, and under
+      what name.
 - [ ] Section G's seven internal imports: a toolkit surface, or "tracked, not supported".
 - [ ] Whether the two measurement hooks inside the engine wheel pass the owner's test.
 - [ ] The harness's version line and how its metadata pins the engine (section F).
