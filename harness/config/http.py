@@ -33,7 +33,7 @@ All data is synthetic; never point a real PHI feed at a sample config.
 """
 
 import json
-from xml.sax.saxutils import escape
+from html import escape
 
 from messagefoundry import (
     FHIR,
@@ -155,7 +155,9 @@ def to_rest(msg):  # type: ignore[no-untyped-def]
 def _xml_text(value: object) -> str:
     """``value`` as XML 1.0 character data: escaped, with the C0 controls XML forbids dropped."""
     text = "" if value is None else str(value)
-    return escape("".join(c for c in text if c >= " " or c in "\t\n\r"))
+    # html.escape with quote=False escapes exactly &, < and >, as xml.sax.saxutils.escape does, without
+    # importing the xml package (tests/test_security_static.py confines XML parse surfaces).
+    return escape("".join(c for c in text if c >= " " or c in "\t\n\r"), quote=False)
 
 
 @handler("http_soap")

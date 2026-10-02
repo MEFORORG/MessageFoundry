@@ -359,6 +359,7 @@ def test_every_http_scenario_passes_under_the_serve_egress_posture(
             run_scenario(SCENARIOS[name], client, timeout=20.0, endpoints=eps)
             for name in _HTTP_SCENARIOS
         ]
+    assert results, "no HTTP scenario ran"  # the absence check below must not pass on none
     failed = [f"{r.scenario.name}: {r.detail}" for r in results if not r.ok]
     assert not failed, failed
 
