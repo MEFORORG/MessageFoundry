@@ -31,6 +31,35 @@
 
 ---
 
+## Amendment 2026-10-02: the recipients are gated, by domain, and the gate is deny-by-default
+
+D4 below gates the SMTP **host** and nothing else. That bounds the relay hop, not where the mail goes:
+a listed relay forwards to whatever address `recipients` names, so a typing mistake in that list would
+send the Handler's body outside the organisation through a permitted relay.
+[vault BACKLOG #2616](../BACKLOG.md) adds a second EMAIL arm to the same check.
+
+- **`[egress].allowed_recipient_domains: list[str] = []`** in `EgressSettings`, wired into `_split_list`
+  (`MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS=a.example,b.example`). Each entry is a bare domain. A
+  validator lowercases each entry at load and refuses one that could never match: an address, a URL,
+  a port or a wildcard.
+- **`check_egress_allowed` runs it for every EMAIL destination**, after the host arm. It reads the
+  addresses through the transport's own `envelope_recipients`: the entries are joined into one `To:`
+  header and parsed with the stdlib address parser, so an entry holding two addresses yields two. Every address must have a domain
+  that matches a listed entry exactly, without regard to case. A subdomain needs its own entry. An
+  address with no readable domain is refused.
+- **Deny-by-default on its own terms.** An empty list refuses every EMAIL destination, whatever
+  `[security].block_unlisted_outbound` says. This is the `allowed_proxy` shape, not D4's opt-in shape: a
+  permissive-when-empty recipient list would leave the gate off on exactly the default posture.
+- **DIRECT is out of scope.** [ADR 0085](0085-direct-hisp-smime-connector.md) encrypts to one partner
+  certificate that must chain to `trust_anchor`, so a wrong address there receives ciphertext it cannot
+  read. The list does not gate it.
+- **Not counted by the open-egress startup gate**, like `allowed_smtp` itself.
+
+An `[egress].allowed_http` path prefix and an `[egress].allowed_db` database name were proposed beside
+this. They are a separate, larger change and were not made here.
+
+---
+
 ## Amendment 2026-08-02 — the SMTP TLS posture this ADR describes is now VERIFIED on all three cells
 
 D3 below says the connector takes "the same posture `send_plain_email` already takes". That sentence was
@@ -182,6 +211,9 @@ beside `allowed_mllp`/`allowed_http`/`allowed_db`/…), wire it into the `_split
   the list — the `_mllp_egress_allowed(host, port, egress.allowed_smtp)` host[:port] matching the MLLP/TCP/DB
   branches already use. Empty list = unrestricted (today's opt-in default), checked against the resolved
   (`env()`-substituted) destination at config load/reload/start.
+
+*(Amended 2026-10-02: this gates the host only. The recipients are gated by the deny-by-default
+`[egress].allowed_recipient_domains`; see the amendment at the top of this ADR.)*
 
 This makes EMAIL a **first-class egress citizen**: an SMTP destination is bounded by the same fail-closed,
 opt-in, deny-by-default-aware allowlist as MLLP/HTTP/DB egress, so a fat-fingered or hostile mail host can't

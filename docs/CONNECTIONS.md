@@ -1955,6 +1955,16 @@ relay populates `allowed_smtp`, declares its one destination — and still **exi
 egress is UNRESTRICTED … refusing to start"*. A mail-only deployment must set
 **`[security].block_unlisted_outbound = true`**; that is the arm of the gate it can actually satisfy.
 The same is true of `allowed_direct` for a Direct-only instance.
+
+**The recipients are gated too, by `[egress].allowed_recipient_domains`, and that list is
+deny-by-default.** `allowed_smtp` gates only the relay hop, and a relay forwards to whatever address
+the connection names. So every address in `recipients` must sit in a listed domain, or the
+destination is refused at config load/reload. An **empty** list refuses every `Email()` destination,
+on every instance, whatever `[security].block_unlisted_outbound` says. Each entry is a bare domain,
+matched exactly and without regard to case, so `mail.example.org` needs its own entry beside
+`example.org`. The list does not gate `Direct()`, which encrypts to one partner certificate
+(vault BACKLOG #2616).
+
 Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox has no idempotency key a rare
 duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does
 connect/EHLO/NOOP only (reachability — it never sends `MAIL FROM`/`DATA`).
@@ -1979,6 +1989,7 @@ outbound(
 # in the --config dir is never read):
 #   [egress]
 #   allowed_smtp = ["smtp.example.org"]
+#   allowed_recipient_domains = ["example.org"]   # deny-by-default: required for any Email()
 # ...and note allowed_smtp alone does NOT satisfy the open-egress startup gate on a PHI instance —
 # see CONFIGURATION.md §[egress].
 ```
