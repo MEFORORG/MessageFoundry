@@ -53,7 +53,7 @@ export const FIELDS: Field[] = [
     desc: "Authenticate every request.",
     insecure: false, risk: "authentication is DISABLED (loopback-only; a non-loopback bind refuses)" },
   { key: "require_mfa", label: "Require MFA", type: "bool", group: "Sign-in & identity",
-    desc: "Require an engine second factor at sign-in, from every account by default (TOTP first; a passkey can be added after). An OIDC sign-in with a checked amr/acr claim meets it; require_mfa_scope can free a local account without the Administrator role.",
+    desc: "Require an engine second factor at sign-in, from every account by default; a covered local account enrols TOTP before it adds a passkey. An OIDC sign-in meets it with an amr/acr claim checked while [auth].oidc_require_mfa_claim is on; require_mfa_scope can free a local account without the Administrator role.",
     insecure: false, risk: "an account with no second factor enrolled is single-factor, so a Kerberos session enters on a ticket that asserts no strength. An enrolled account owes its factor only while it keeps one, and its holder may remove the last. Where an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on, that claim stands in for the enrolled factor" },
   { key: "allow_single_factor_admin_when_exposed", label: "Allow single-factor admin when exposed", type: "bool", group: "Sign-in & identity",
     desc: "Audited ack (ADR 0140): lifts the start refusal that an exposed instance with Require MFA off meets under strict enforcement.",

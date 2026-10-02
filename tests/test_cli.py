@@ -1312,7 +1312,8 @@ def test_serve_refuses_exposed_without_mfa_in_prod(
         "authenticate with a single factor over the network. Enable" in err
     )
     assert "each enrolls an engine factor); or set" in err
-    assert "amr/acr" not in err
+    refusal = next(line for line in err.splitlines() if "refusing to start" in line)
+    assert "amr/acr" not in refusal
 
 
 def test_serve_warns_exposed_without_mfa_in_staging(

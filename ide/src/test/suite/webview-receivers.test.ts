@@ -360,7 +360,9 @@ const home: Receiver = {
 // --- Security Settings ---------------------------------------------------------------------------
 
 /** Recorded 2026-09-29 from `messagefoundry security show --json` over a settings file with one
- *  loosened switch (require_mfa = false), which is what securityEditor.ts refresh() posts. */
+ *  loosened switch (require_mfa = false), which is what securityEditor.ts refresh() posts. The
+ *  require_mfa risk string was edited by hand on 2026-10-02 to the engine's corrected text (vault
+ *  BACKLOG 1133); the rest is as recorded. */
 const SECURITY_SHOW: Payload = {
   "values": {
     "local_access_only": true,
