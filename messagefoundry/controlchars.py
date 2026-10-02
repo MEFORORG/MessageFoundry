@@ -69,6 +69,10 @@ from __future__ import annotations
 #: screens values destined for byte-oriented sinks -- a request line, a header, a path -- where C0
 #: and DEL are the injection alphabet. Widening it is a behaviour change at seven call sites at
 #: once, which is exactly the leverage this module exists to provide; make it deliberately.
+#: The log file is a sink read back as text, and a separator passing the scrub reaches it raw. The
+#: engine's own log tail readers end a line at LF, CR and CRLF only (``support.redact.split_log_lines``,
+#: vault BACKLOG #2563), so there it stays inside one record; a new reader should split there too. A
+#: tool outside the engine that opens the raw file may still break the line at it.
 def _is_control_char(ch: str) -> bool:
     """THE ONE DEFINITION of the alphabet this module screens for (BACKLOG #1273).
 

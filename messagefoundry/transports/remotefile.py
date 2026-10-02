@@ -115,11 +115,14 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.file import (
+    _FALLBACK_NAME,
     DEFAULT_MAX_FILE_BYTES,
+    FILENAME_MAX_BYTES,
     LEAVE_SEEN_CACHE_MAX,
     SETTLE_MISS_LIMIT,
     SETTLE_SEEN_MAX,
     ScanRejected,
+    _check_template_fits,
     _content_matches_declared,
     render_filename,
     scan_inbound_file,
@@ -1865,6 +1868,9 @@ class RemoteFileDestination(DestinationConnector):
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._filename_template = str(s.get("filename", "{MSH-10}.hl7"))
+        # ADR 0204: a template whose fixed text alone is over the cap would name every upload by
+        # the fallback, so it is refused here.
+        _check_template_fits(self._filename_template, "", FILENAME_MAX_BYTES)
         self._overwrite = bool(s.get("overwrite", False))
         self._encoding: str = s.get("encoding", "utf-8")
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
@@ -1953,7 +1959,10 @@ class RemoteFileDestination(DestinationConnector):
             ) from exc
 
     def _upload(self, payload: str) -> None:
-        name = render_filename(self._filename_template, payload, fallback="message.hl7")
+        # The default byte cap applies (ADR 0204): a long field falls back rather than reaching the
+        # server. The remote path limit is the partner's and is not known here, so there is no
+        # directory budget; a server refusal is classified by its own reply.
+        name = render_filename(self._filename_template, payload, fallback=_FALLBACK_NAME)
         data = payload.encode(self._encoding)
         self._prepare_remote_dir()
         # With overwrite off, list for free names BEFORE anything is written (the #1936 rule).
