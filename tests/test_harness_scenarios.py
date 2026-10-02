@@ -71,6 +71,9 @@ def test_the_registry_still_holds_the_original_five_scenarios() -> None:
 def test_every_registered_scenario_passes_against_the_real_graph(
     server: tuple[str, Endpoints], name: str
 ) -> None:
+    reason = SCENARIOS[name].unavailable()
+    if reason:
+        pytest.skip(reason)  # a missing optional extra is reported, never passed
     api_url, eps = server
     with EngineClient(api_url) as client:
         # Generous: dead_letter rides the real graph's retry policy (3 attempts, 1s and 2s backoff),
