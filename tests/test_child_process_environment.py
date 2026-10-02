@@ -621,10 +621,6 @@ _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
     ("tray/actions.py", "_open_path", "webbrowser.open"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/actions.py", "open_console", "webbrowser.open" + _AS_A_VALUE): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/app.py", "TrayApp._edit_settings", "os.startfile"): _TRAY_OPENS_FOR_ITS_USER,
-    ("tray/branding.py", "relaunch_branded", "subprocess.Popen"): (
-        "the tray starting itself again under its branded launcher: the same program, as the same "
-        "desktop user, so it needs the environment it already has"
-    ),
 }
 
 #: Listed sites that hold more than one start, with the number.
@@ -641,6 +637,8 @@ _MUST_CHOOSE = frozenset(
         ("pipeline/dr.py", "_run_command", "create_subprocess_shell"),
         ("pipeline/supervisor.py", "_default_spawn", "create_subprocess_exec"),
         ("pipeline/supervisor.py", "preflight_shard_config", "create_subprocess_exec"),
+        # The tray starting itself again under its branded launcher (vault BACKLOG #2801).
+        ("tray/branding.py", "relaunch_branded", "subprocess.Popen"),
     }
 )
 
@@ -794,13 +792,14 @@ def test_the_guard_sees_the_calls_it_is_about() -> None:
 
 def test_one_function_builds_the_command_line_of_a_python_child() -> None:
     """``python_child_argv`` is where the interpreter flags are added, so a Python child started any
-    other way would start without them. Outside the tray, which is the desktop user's own process,
-    it is the only code in the shipped packages that names this interpreter's executable."""
+    other way would start without them. Two tray modules also name the executable.
+    ``tray/branding.py`` reads it to place the branded launcher and to tell whether it is running
+    under it. ``tray/autostart.py`` writes the login command, which starts the first tray process
+    WITHOUT these flags; the ADR 0113 amendment of 2026-10-02 names that limit (vault BACKLOG #2801)."""
     names_the_interpreter = {
         rel
         for rel, source in _scanned_sources().items()
-        if not rel.startswith("tray/")
-        and any(
+        if any(
             isinstance(node, ast.Attribute)
             and node.attr == "executable"
             and isinstance(node.value, ast.Name)
@@ -808,7 +807,7 @@ def test_one_function_builds_the_command_line_of_a_python_child() -> None:
             for node in ast.walk(ast.parse(source))
         )
     }
-    assert names_the_interpreter == {"childenv.py"}
+    assert names_the_interpreter == {"childenv.py", "tray/autostart.py", "tray/branding.py"}
 
 
 def test_the_guard_reads_every_module_the_process_start_inventory_names() -> None:

@@ -218,7 +218,10 @@ Two argument-list starts are not pinned that way:
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
 environment for the sandbox worker, the disaster-recovery hook, the engine shards and the child
-that loads the config before any shard starts. Its docstring says what each one gets, and why that is not an isolation boundary by itself. The other
+that loads the config before any shard starts. Its docstring says what each one gets, and why that
+is not an isolation boundary by itself. The tray's relaunch under its branded launcher takes its
+command line from the same module, so it starts with `-P` like the engine's Python children. It
+still gets the user's whole environment, less any empty or relative `PYTHONPATH` entry. The other
 starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
 that module.
