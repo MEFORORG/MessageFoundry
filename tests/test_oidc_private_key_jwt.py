@@ -242,7 +242,7 @@ def test_private_key_jwt_sends_the_assertion_and_no_secret(
 
 
 def test_the_default_client_secret_post_request_is_unchanged() -> None:
-    """The control: with no ``client_auth`` the form holds exactly the pre-#296 fields."""
+    """The control: under the default method the form holds exactly the pre-#296 fields."""
     opener = _FakeOpener()
     _exchange(
         opener,
@@ -637,3 +637,160 @@ def test_provision_admin_gives_a_refused_key_its_fixed_text(
         )
     assert str(caught.value) == cli._PROVISION_AUTH_REFUSALS["client_key"]
     assert "synthetic" not in str(caught.value)
+
+
+def test_a_public_client_sends_no_client_credential() -> None:
+    """``client_auth=None`` is the PKCE-only shape: neither a secret nor an assertion is sent."""
+    opener = _FakeOpener()
+    _exchange(opener, client_auth=None)
+    form = opener.form()
+    assert not {"client_secret", "client_assertion", "client_assertion_type"} & set(form)
+    assert form["code_verifier"] == ["the-verifier"]
+
+
+# --- PR 1956 hold: a refusal must not echo the [auth] mapping ------------------------------------
+
+_KEY_SENTINEL = _BEGIN + "\nSENTINELKEYBODY0123456789\n-----END PRIVATE KEY-----"
+_PASS_SENTINEL = "SENTINEL-PASSPHRASE-0123456789abcdef"
+_SECRET_SENTINEL = "SENTINEL-CLIENT-SECRET-0123456789abcdef"
+_CERT_SENTINEL = (
+    "-----BEGIN CERTIFICATE-----\nSENTINELCERTBODY0123456789\n-----END CERTIFICATE-----"
+)
+_SENTINELS = (
+    "SENTINELKEYBODY",
+    "SENTINEL-PASSPHRASE",
+    "SENTINEL-CLIENT-SECRET",
+    "SENTINELCERTBODY",
+)
+
+_PKJWT: dict[str, Any] = {"oidc_token_endpoint_auth_method": "private_key_jwt"}
+
+#: One case per credential refusal in ``_require_oidc_fields``, each carrying every secret-bearing
+#: field the refusal's place in the validator allows, so a leak of any of them would show.
+_LEAK_CASES: dict[str, dict[str, Any]] = {
+    "no_key": {
+        **_PKJWT,
+        "oidc_client_private_key_password": _PASS_SENTINEL,
+        "oidc_client_certificate": _CERT_SENTINEL,
+        "oidc_client_secret": _SECRET_SENTINEL,
+    },
+    "blank_kid": {
+        **_PKJWT,
+        "oidc_client_private_key": _KEY_SENTINEL,
+        "oidc_client_private_key_password": _PASS_SENTINEL,
+        "oidc_client_certificate": _CERT_SENTINEL,
+        "oidc_client_secret": _SECRET_SENTINEL,
+        "oidc_client_assertion_key_id": " ",
+    },
+    "blank_certificate": {
+        **_PKJWT,
+        "oidc_client_private_key": _KEY_SENTINEL,
+        "oidc_client_private_key_password": _PASS_SENTINEL,
+        "oidc_client_secret": _SECRET_SENTINEL,
+        "oidc_client_certificate": "   ",
+    },
+    "blank_key_ref": {
+        **_PKJWT,
+        "oidc_client_private_key": _KEY_SENTINEL,
+        "oidc_client_private_key_ref": "   ",
+        "oidc_client_private_key_password": _PASS_SENTINEL,
+        "oidc_client_certificate": _CERT_SENTINEL,
+        "oidc_client_secret": _SECRET_SENTINEL,
+    },
+    "key_and_ref": {
+        **_PKJWT,
+        "oidc_client_private_key": _KEY_SENTINEL,
+        "oidc_client_private_key_ref": "kv/mf#oidc-key",
+        "oidc_client_private_key_password": _PASS_SENTINEL,
+        "oidc_client_certificate": _CERT_SENTINEL,
+        "oidc_client_secret": _SECRET_SENTINEL,
+    },
+    "secret_beside_key": {
+        **_PKJWT,
+        "oidc_client_private_key": _KEY_SENTINEL,
+        "oidc_client_private_key_password": _PASS_SENTINEL,
+        "oidc_client_certificate": _CERT_SENTINEL,
+        "oidc_client_secret": _SECRET_SENTINEL,
+    },
+    "missing_secret": {
+        "oidc_client_private_key": _KEY_SENTINEL,
+        "oidc_client_private_key_password": _PASS_SENTINEL,
+        "oidc_client_certificate": _CERT_SENTINEL,
+    },
+    "stray_assertion_settings": {
+        "oidc_client_secret": _SECRET_SENTINEL,
+        "oidc_client_private_key": _KEY_SENTINEL,
+        "oidc_client_private_key_password": _PASS_SENTINEL,
+        "oidc_client_certificate": _CERT_SENTINEL,
+    },
+}
+
+#: The message each case must produce, so a case that fails for some other reason cannot pass.
+_LEAK_CASE_MESSAGES = {
+    "no_key": "NON-EMPTY signing key",
+    "blank_kid": "oidc_client_assertion_key_id is blank",
+    "blank_certificate": "oidc_client_certificate is set but blank",
+    "blank_key_ref": "oidc_client_private_key_ref is set but blank",
+    "key_and_ref": "not both",
+    "secret_beside_key": "never sends the client secret",
+    "missing_secret": "NON-EMPTY client secret",
+    "stray_assertion_settings": "apply only with",
+}
+
+
+def _renderings(exc: ValidationError) -> list[str]:
+    """Every way a caller renders the error: ``serve`` prints ``str(exc)``; others log the list."""
+    return [str(exc), repr(exc), repr(exc.errors()), exc.json()]
+
+
+@pytest.mark.parametrize("case", sorted(_LEAK_CASES))
+def test_a_credential_refusal_echoes_no_secret(case: str) -> None:
+    fields = _LEAK_CASES[case]
+    with pytest.raises(ValidationError, match=_LEAK_CASE_MESSAGES[case]) as direct:
+        AuthSettings(**_auth(**fields))
+    with pytest.raises(ValidationError, match=_LEAK_CASE_MESSAGES[case]) as nested:
+        _service_settings(_auth(**fields))
+    for exc in (direct.value, nested.value):
+        for text in _renderings(exc):
+            for sentinel in _SENTINELS:
+                assert sentinel not in text, (case, sentinel)
+
+
+def test_the_no_echo_check_can_fail() -> None:
+    """The control: an ordinary ValueError from the same validator DOES echo the mapping, so the
+    sentinel scan above is live and the input-free refusal is what makes it pass."""
+    with pytest.raises(ValidationError) as caught:
+        # Missing endpoints refuse with a plain ValueError earlier in the same validator.
+        AuthSettings(**_auth(oidc_token_endpoint=None, oidc_client_secret=_SECRET_SENTINEL))
+    assert any("SENTINEL-CLIENT-SECRET" in text for text in _renderings(caught.value))
+
+
+def test_a_credential_refusal_through_load_settings_echoes_no_secret() -> None:
+    """The ``serve`` path: env vars, as NSSM passes them, through ``load_settings``."""
+    from messagefoundry.config.settings import load_settings
+
+    env = {
+        "MEFOR_AUTH_AD_ENABLED": "true",
+        "MEFOR_AUTH_AD_SERVER": "ldaps://dc.corp.example",
+        "MEFOR_AUTH_AD_USER_SEARCH_BASE": "DC=corp,DC=example",
+        "MEFOR_AUTH_AD_BIND_DN": "CN=svc,DC=corp,DC=example",
+        "MEFOR_AUTH_AD_BIND_PASSWORD": "x",
+        "MEFOR_AUTH_AD_DOMAIN": "corp.example",
+        "MEFOR_AUTH_OIDC_ENABLED": "true",
+        "MEFOR_AUTH_OIDC_ISSUER": ISSUER,
+        "MEFOR_AUTH_OIDC_CLIENT_ID": CLIENT_ID,
+        "MEFOR_AUTH_OIDC_AUTHORIZATION_ENDPOINT": "https://idp.example/authorize",
+        "MEFOR_AUTH_OIDC_TOKEN_ENDPOINT": TOKEN_ENDPOINT,
+        "MEFOR_AUTH_OIDC_JWKS_URI": "https://idp.example/jwks",
+        "MEFOR_AUTH_OIDC_ALLOWED_ENDPOINTS": "idp.example",
+        "MEFOR_AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD": "private_key_jwt",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY": _KEY_SENTINEL,
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD": _PASS_SENTINEL,
+        "MEFOR_AUTH_OIDC_CLIENT_ASSERTION_KEY_ID": " ",
+        "MEFOR_SECURITY_WEB_CONSOLE_PUBLIC_ADDRESS": "https://ops.example",
+    }
+    with pytest.raises(ValidationError, match="oidc_client_assertion_key_id is blank") as caught:
+        load_settings(environ=env)
+    for text in _renderings(caught.value):
+        for sentinel in _SENTINELS:
+            assert sentinel not in text, sentinel

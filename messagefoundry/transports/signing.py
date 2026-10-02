@@ -202,7 +202,7 @@ def _read_key_material(setting: str, private_key: str, *, kind: str = "signing-k
     if len(material) > _MAX_KEY_FILE_BYTES:
         raise SigningError(
             f"the {kind} file named by {setting!r} is over the {_MAX_KEY_FILE_BYTES}-byte "
-            "bound; a PEM private key is a few kilobytes -- check the path"
+            f"bound; a PEM {kind.replace('-', ' ')} is a few kilobytes -- check the path"
         )
     return material
 

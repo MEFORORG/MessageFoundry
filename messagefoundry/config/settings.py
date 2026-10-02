@@ -45,13 +45,14 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationError,
     ValidationInfo,
     field_validator,
     model_validator,
@@ -2607,6 +2608,34 @@ EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
 
+def _refuse_oidc_credential(field: str, message: str) -> NoReturn:
+    """Refuse an ``[auth]`` OIDC client-credential setting WITHOUT echoing any configured value.
+
+    A plain ``ValueError`` from an ``after``-mode model validator becomes a ``ValidationError`` whose
+    ``input`` is the whole ``[auth]`` mapping, and both ``str(exc)`` and ``exc.errors()`` render it.
+    That mapping holds the client secret, the signing key and its passphrase, so ``serve`` printing
+    the error would put a secret into the NSSM log (BACKLOG #296; pydantic abbreviates a long
+    ``input_value`` from the middle, so it leaks a tail, which is no safer). A ``ValidationError``
+    raised here is passed through with only the line error built below, so the field and the
+    message reach the operator and the input is a fixed placeholder. ``message`` must name settings,
+    never a value: it rides the error as its ``ctx``.
+
+    ``settings_error_detail`` is still the renderer to reach for; this makes the error safe for the
+    callers that do not reach for it.
+    """
+    raise ValidationError.from_exception_data(
+        "AuthSettings",
+        [
+            {
+                "type": "value_error",
+                "loc": (field,),
+                "input": "[not shown]",
+                "ctx": {"error": message},
+            }
+        ],
+    )
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
 
@@ -3467,11 +3496,12 @@ class AuthSettings(_Section):
         # BACKLOG #296. The same blank-is-missing rule for the signing key.
         has_key = given(self.oidc_client_private_key, self.oidc_client_private_key_ref)
         if self.oidc_private_key_jwt and not has_key:
-            raise ValueError(
+            _refuse_oidc_credential(
+                "oidc_client_private_key",
                 "oidc_token_endpoint_auth_method='private_key_jwt' requires a NON-EMPTY signing "
                 "key: set oidc_client_private_key (inline PEM via "
                 "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY, or a path to a PEM file) or "
-                "oidc_client_private_key_ref (a [secrets].provider reference)"
+                "oidc_client_private_key_ref (a [secrets].provider reference)",
             )
         # The signer sends any non-empty `kid` verbatim, so a blank or space-padded one would reach
         # the IdP as a key id that matches nothing. Refused rather than trimmed. A blank certificate
@@ -3482,38 +3512,49 @@ class AuthSettings(_Section):
             and kid is not None
             and (not kid.strip() or kid != kid.strip())
         ):
-            raise ValueError(
-                "oidc_client_assertion_key_id is blank or has leading or trailing whitespace"
+            _refuse_oidc_credential(
+                "oidc_client_assertion_key_id",
+                "oidc_client_assertion_key_id is blank or has leading or trailing whitespace",
             )
+        # The key reference too: the resolver treats a whitespace-only reference as set.
         blank = [
             name
-            for name in ("oidc_client_certificate", "oidc_client_private_key_password")
+            for name in (
+                "oidc_client_certificate",
+                "oidc_client_private_key_password",
+                "oidc_client_private_key_ref",
+            )
             if getattr(self, name) is not None and not given(getattr(self, name))
         ]
         if self.oidc_private_key_jwt and blank:
-            raise ValueError(f"{', '.join(blank)} is set but blank; remove it or give a value")
+            _refuse_oidc_credential(
+                blank[0], f"{', '.join(blank)} is set but blank; remove it or give a value"
+            )
         # The provider reference would win silently over the literal, so both is refused.
         if (
             self.oidc_private_key_jwt
             and given(self.oidc_client_private_key)
             and given(self.oidc_client_private_key_ref)
         ):
-            raise ValueError(
+            _refuse_oidc_credential(
+                "oidc_client_private_key_ref",
                 "set oidc_client_private_key or oidc_client_private_key_ref, not both: the "
-                "reference would be used and the other ignored"
+                "reference would be used and the other ignored",
             )
         # A credential the configured method never sends is a live credential nobody uses. Refused
         # rather than ignored, so the configuration says exactly what goes on the wire.
         if self.oidc_private_key_jwt and has_secret:
-            raise ValueError(
+            _refuse_oidc_credential(
+                "oidc_client_secret",
                 "oidc_token_endpoint_auth_method='private_key_jwt' never sends the client "
-                "secret: remove oidc_client_secret / oidc_client_secret_ref"
+                "secret: remove oidc_client_secret / oidc_client_secret_ref",
             )
         if not self.oidc_private_key_jwt and not has_secret:
-            raise ValueError(
+            _refuse_oidc_credential(
+                "oidc_client_secret",
                 "oidc_enabled requires a NON-EMPTY client secret: set oidc_client_secret (via "
                 "MEFOR_AUTH_OIDC_CLIENT_SECRET) or oidc_client_secret_ref (a [secrets].provider "
-                "reference). An env var exported with no value counts as missing."
+                "reference). An env var exported with no value counts as missing.",
             )
         stray = [
             name
@@ -3532,10 +3573,11 @@ class AuthSettings(_Section):
         if self.oidc_client_assertion_audience != "token_endpoint":
             stray.append("oidc_client_assertion_audience")
         if not self.oidc_private_key_jwt and stray:
-            raise ValueError(
+            _refuse_oidc_credential(
+                stray[0],
                 f"{', '.join(stray)} apply only with "
                 "oidc_token_endpoint_auth_method='private_key_jwt'; the configured method is "
-                "'client_secret_post', which sends the client secret and no assertion"
+                "'client_secret_post', which sends the client secret and no assertion",
             )
 
         # Every pinned URL must be https (no dev escape — this is an off-box trust boundary) and its
