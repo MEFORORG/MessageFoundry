@@ -1832,7 +1832,7 @@ def audit_row_hash(
 
 
 #: What the store logs, at ERROR, when a handle that holds a keying secret opens onto an audit chain
-#: whose first row is not a genesis row (vault BACKLOG #2594). A store that holds a key requires every
+#: with rows but no genesis row at sequence number 1 (vault BACKLOG #2594). A store that holds a key requires every
 #: audit row keyed, so this chain is one ``audit-verify`` reports as broken. No command converts it in
 #: place: a row that was written without a key cannot be made to carry one without rewriting it, and
 #: rewriting would bless whatever the row says today. The same state is reported by
@@ -2275,7 +2275,11 @@ def audit_next_link(head: Sequence[Any] | None, expect_prev: str | None) -> tupl
     than a forked chain.
 
     ``expect_prev`` is :class:`AuditHeadMovedError`'s seam: the append is refused when the head is not
-    the one the caller sealed. ``""`` means the caller requires an EMPTY log."""
+    the one the caller sealed. ``""`` means the caller requires an EMPTY log, and that is tested
+    before the head's sequence number is read: a log that holds any row refuses the genesis append
+    the same way whatever that row's number is, so the open reports the chain and does not raise."""
+    if expect_prev == "" and head is not None:
+        raise AuditHeadMovedError(head[1] if isinstance(head[1], str) else "")
     if head is None:
         seq, prev = 1, ""
     else:
@@ -2286,9 +2290,7 @@ def audit_next_link(head: Sequence[Any] | None, expect_prev: str | None) -> tupl
                 "it. Run `messagefoundry audit-verify`"
             )
         seq, prev = head_seq + 1, (head[1] or "")
-    if expect_prev is not None and (
-        prev != expect_prev or (expect_prev == "" and head is not None)
-    ):
+    if expect_prev is not None and prev != expect_prev:
         raise AuditHeadMovedError(prev)
     return seq, prev
 
@@ -2492,7 +2494,7 @@ def _audit_tag_ok(
     return hmac.compare_digest(audit_mac_bytes(handover), audit_mac_bytes(expected))
 
 
-#: Why a keyed process reports a chain whose first row is not a genesis row.
+#: Why a keyed process reports a chain with no genesis row at sequence number 1.
 _AUDIT_NO_GENESIS: Final = (
     "the chain does not open with a genesis row naming its key; a store that holds a key requires "
     "every audit row keyed"
@@ -2535,19 +2537,20 @@ def verify_audit_rows(
     :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, the walk always runs to completion, and
     the first divergent position is reported after it. A structural break is reported at its own
     position, with the reason."""
-    genesis_key = _audit_genesis_key(rows[0]) if rows else None
-    if not capable:
-        # The row AT seq 1, not the row that sorts first: a row planted below it must not make a
-        # keyed chain read as keyless to a handle with no key.
-        named = next((_audit_genesis_key(r) for r in rows if _strict_int(r["seq"]) == 1), None)
-        if named is not None:
-            # A keyed chain and no key/MAC in hand (opened without the DEK or the vault):
-            # unverifiable. Report honestly rather than mis-flag every keyed row as tampered.
-            return (
-                False,
-                f"audit chain is keyed (its genesis row names audit key {named!r}) but no store "
-                "encryption key/MAC is configured to verify it",
-            )
+    # The row AT seq 1 when there is one, and only otherwise the row that sorts first. A row added
+    # below the genesis row must not change what the chain is: with a key in hand it would leave
+    # every row's MAC uncompared, and with none it would make a keyed chain read as keyless. The
+    # fallback keeps a chain whose numbers were all shifted compared under the key it names.
+    opening = next((r for r in rows if _strict_int(r["seq"]) == 1), rows[0] if rows else None)
+    genesis_key = _audit_genesis_key(opening) if opening is not None else None
+    if not capable and genesis_key is not None:
+        # A keyed chain and no key/MAC in hand (opened without the DEK or the vault):
+        # unverifiable. Report honestly rather than mis-flag every keyed row as tampered.
+        return (
+            False,
+            f"audit chain is keyed (its genesis row names audit key {genesis_key!r}) but no store "
+            "encryption key/MAC is configured to verify it",
+        )
     #: (walk position, row id, reason). The position is the sequence number that row should hold.
     breaks: list[tuple[int, Any, str | None]] = []
     prev: Any = ""
@@ -2762,8 +2765,9 @@ async def load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     """At open: learn the chain's state from the chain itself, and start it when it is empty (vault
     BACKLOG #2594). Shared by all three backends.
 
-    The first row decides. A genesis row means the chain is keyed, and names its first key. Any other
-    first row means the chain holds keyless rows.
+    The row AT sequence number 1 decides, read by position and not by sort order
+    (``_audit_genesis_row``). A genesis row there means the chain is keyed, and names its first
+    key. Rows in the log with no genesis row there mean the chain holds keyless rows.
 
     * **A handle that holds a keying secret, on an EMPTY log, writes the genesis row** -- MAC'd under
       the active key, as row 1 -- unless it is read-only. The append requires the log to be empty, so
@@ -2975,16 +2979,17 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         if current == active_id:
             return False, f"the audit chain is under the active key but does not verify: {msg}"
         return False, f"refusing to roll a broken audit chain: {msg}"
-    if current == active_id:
-        return True, f"audit chain already under the active key (range from seq={current_from})"
     if len(rows) < current_from:
         # The log is shorter than the range this handle read at open: rows went missing while it
         # was open. A shorter chain still verifies, so this is the one place the roll can see it.
+        # Tested before the no-op below, whose OK an operator reads as "the rotation is done".
         return False, (
             f"the audit log holds {len(rows)} row(s) but its current range opened at seq="
             f"{current_from}; rows are missing, so nothing was written. Run `messagefoundry "
             "audit-verify`"
         )
+    if current == active_id:
+        return True, f"audit chain already under the active key (range from seq={current_from})"
     # The verify passed, so every row's sequence number is its position: row N sits at index N - 1.
     split = current_from - 1
     closes = audit_range_closing(
@@ -4551,8 +4556,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     -- The row's position in the hash chain: 1 for the first row, then rising by one, with no gap.
     -- It is inside the row's MAC, and it is the number an anchor and the off-box tee name a row by.
-    -- `id` is only the surrogate key. UNIQUE, so two appends can never take one position.
-    seq         INTEGER NOT NULL UNIQUE,
+    -- `id` is only the surrogate key. UNIQUE, so two appends can never take one position. The
+    -- CHECK refuses a position below 1 and a value that is not an integer, which SQLite would
+    -- otherwise store in any column. It binds a writer that goes through SQL. A writer that opens
+    -- the file can switch it off, so every reader of `seq` still treats the value as untrusted.
+    seq         INTEGER NOT NULL UNIQUE CHECK (typeof(seq) = 'integer' AND seq >= 1),
     ts          REAL NOT NULL,
     actor       TEXT,                 -- who: a username or 'system' (auth is built; always populated)
     action      TEXT NOT NULL,        -- e.g. summary_search_display, message_view, export
@@ -4568,7 +4576,7 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 
 -- There is no table beside audit_log that says where its keying starts. Whether a chain is keyed is
 -- decided by the process that holds the key, and the first range's key is named by the chain's own
--- first row (the genesis row). See `load_audit_chain`.
+-- row at sequence number 1 (the genesis row). See `load_audit_chain`.
 
 -- Per-key AES-GCM invocation bound (ASVS 11.3.4). One row per `key_id`, the one-way SHA-256
 -- fingerprint of the AES key values are SEALED under: the store data sub-key for the cell-bound writer,
@@ -4936,8 +4944,9 @@ class MessageStore:
         # Whether the chain on disk opens with a genesis row, so is keyed. Read from the chain at
         # open by `load_audit_chain`; it is what makes a handle with no key refuse to append.
         self._audit_chain_keyed = False
-        # A handle that holds a key opened onto a chain whose first row is not a genesis row. Set
-        # only by `load_audit_chain`; reported by `security_loosenings()` (BACKLOG #1905).
+        # A handle that holds a key opened onto a chain with rows but no genesis row at sequence
+        # number 1. Set only by `load_audit_chain`; reported by `security_loosenings()` (BACKLOG
+        # #1905).
         self._audit_chain_unkeyed = False
         # BACKLOG #1904 (ADR 0193): every audit key this store can verify with (active AND retired)
         # and the CURRENT range -- the one new rows join. See `settle_audit_ranges` for how the
@@ -11175,10 +11184,11 @@ class MessageStore:
             if row is None:
                 return 0, ""
             seq, head = _strict_int(row["seq"]), row["row_hash"]
-            if seq is None:
-                # SQLite stores any type in any column, and text sorts above every integer, so a
-                # tampered row can be the head. The anchor stays total: it falls back to the row
-                # count, which no verify of that chain will match.
+            if seq is None or seq < 1:
+                # A file a writer opened directly can hold any type in any column, and text sorts
+                # above every integer, so a tampered row can be the head; so can a row numbered
+                # below 1. The anchor stays total and never reads a log that holds rows as empty:
+                # it falls back to the row count, which no verify of that chain will match.
                 cur = await db.execute("SELECT COUNT(*) AS n FROM audit_log")
                 counted = await cur.fetchone()
                 seq = int(counted["n"]) if counted is not None else 0

@@ -23,6 +23,7 @@ import pytest
 
 from messagefoundry.__main__ import _build_parser
 from messagefoundry.store import MessageStore
+from messagefoundry.store import store as store_module
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.privilege import AUDIT_APPEND_ONLY_TABLES
 from messagefoundry.store.store import (
@@ -58,6 +59,9 @@ def _sqlite_backend(path: Path) -> ChainBackend:
             conn.commit()
         conn.close()
 
+    async def execute_unchecked(sql: str) -> None:
+        _unchecked(path, sql)
+
     async def fetch(sql: str) -> Sequence[Mapping[str, Any]]:
         conn = sqlite3.connect(path, timeout=10)
         conn.row_factory = sqlite3.Row
@@ -78,7 +82,18 @@ def _sqlite_backend(path: Path) -> ChainBackend:
         execute=execute,
         fetch=fetch,
         reset=reset,
+        execute_unchecked=execute_unchecked,
     )
+
+
+def _unchecked(path: Path, sql: str, params: tuple[Any, ...] = ()) -> None:
+    """Run one statement as a writer that opened the file directly and switched the CHECK
+    constraints off. No key is involved: the pragma is the connection's own."""
+    with sqlite3.connect(path, timeout=10) as conn:
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+        conn.execute(sql, params)
+        conn.commit()
+    conn.close()
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.__name__)
@@ -120,6 +135,42 @@ def test_no_backend_schema_or_statement_names_the_removed_table(module: str) -> 
         if "audit_chain_meta" in line and not line.lstrip().startswith(("#", "--"))
     ]
     assert not statements, statements
+
+
+@pytest.mark.parametrize("value", [0, -1, "zzz", 7.5], ids=repr)
+async def test_the_schema_refuses_a_position_that_is_not_a_whole_number_from_one(
+    tmp_path: Path, value: object
+) -> None:
+    """The CHECK on ``audit_log.seq``. The control is the same statement with a usable number,
+    which the table takes."""
+    path = tmp_path / "floor.db"
+    store = await MessageStore.open(path)
+    try:
+        await store.record_audit("act", actor="u")
+    finally:
+        await store.close()
+    conn = sqlite3.connect(path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            conn.execute("UPDATE audit_log SET seq = ? WHERE seq = 1", (value,))
+        conn.execute("UPDATE audit_log SET seq = 50 WHERE seq = 1")
+        assert conn.execute("SELECT seq FROM audit_log").fetchall() == [(50,)]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("module", ["postgres", "sqlserver"])
+def test_the_server_schemas_refuse_a_position_below_one(module: str) -> None:
+    """From the source, so the server arms are pinned without a live server. The live refusal is the
+    shared case ``a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is``."""
+    source = (
+        Path(__file__).resolve().parent.parent / "messagefoundry" / "store" / f"{module}.py"
+    ).read_text(encoding="utf-8")
+    declared = [
+        line for line in source.splitlines() if "seq" in line and "CHECK (seq >= 1)" in line
+    ]
+    assert len(declared) == 1, declared
+    assert "BIGINT NOT NULL UNIQUE CHECK (seq >= 1)" in declared[0]
 
 
 def test_the_append_only_table_list_is_the_audit_log_alone() -> None:
@@ -166,6 +217,18 @@ def test_the_next_link_refuses_a_head_the_caller_did_not_seal() -> None:
     with pytest.raises(AuditHeadMovedError):
         audit_next_link((1, ""), "")
     assert audit_next_link(None, "") == (1, "")
+
+
+@pytest.mark.parametrize("head_seq", ["7", 7.5, -1, 2**63 - 1], ids=repr)
+def test_the_next_link_requires_an_empty_log_before_it_reads_the_heads_number(
+    head_seq: object,
+) -> None:
+    """A log that holds any row refuses the genesis append the same way, whatever number that row
+    carries. The control is the same head with no such requirement, which is the other refusal."""
+    with pytest.raises(AuditHeadMovedError):
+        audit_next_link((head_seq, "abc"), "")
+    with pytest.raises(RuntimeError, match="no usable sequence number"):
+        audit_next_link((head_seq, "abc"), None)
 
 
 @pytest.mark.parametrize("head_seq", [None, "7", 7.0, True])
@@ -313,10 +376,10 @@ def test_the_mac_comparison_is_total_over_every_stored_type() -> None:
     assert audit_mac_bytes("ab") == b"ab"  # the control: text is its own bytes
 
 
-@pytest.mark.parametrize("seq", [1, 3], ids=["genesis-row", "later-row"])
+@pytest.mark.parametrize("seq", [1, 3, 4], ids=["genesis-row", "later-row", "head-row"])
 async def test_a_row_hash_stored_as_a_blob_is_a_reported_break(tmp_path: Path, seq: int) -> None:
-    """The store still opens, and the verify reports the row. Neither raises. The control is the
-    untouched chain, which verifies."""
+    """The store still opens, the verify reports the row, and the anchor still answers. None of
+    them raises. The control is the untouched chain, which verifies, and its anchor."""
     path = tmp_path / "blob.db"
     key = generate_key()
     store = await _keyed(path, key)
@@ -325,6 +388,8 @@ async def test_a_row_hash_stored_as_a_blob_is_a_reported_break(tmp_path: Path, s
             await store.record_audit("act", actor="u", detail=str(i))
         ok, message = await store.verify_audit_chain()
         assert ok, message
+        position, head = await store.audit_anchor()
+        assert position == 4 and len(head) == 64
     finally:
         await store.close()
     with sqlite3.connect(path) as conn:
@@ -335,7 +400,9 @@ async def test_a_row_hash_stored_as_a_blob_is_a_reported_break(tmp_path: Path, s
     try:
         ok, message = await store.verify_audit_chain()  # must not raise
         assert not ok and f"seq={seq}" in (message or ""), message
-        await store.audit_anchor()  # must not raise either
+        # The anchor reads the head row. A head hash that is not text is reported as no hash,
+        # which no recorded anchor matches; any other row leaves the anchor as it was.
+        assert await store.audit_anchor() == (4, "" if seq == 4 else head)
     finally:
         await store.close()
 
@@ -345,21 +412,103 @@ async def test_the_anchor_is_total_over_a_head_whose_sequence_number_is_not_an_i
 ) -> None:
     """Text sorts above every integer in SQLite, so such a row is the head. The anchor falls back to
     the row count rather than raising, and an append on that head is the designed refusal. The
-    control is the anchor before the edit: the newest row's sequence number."""
+    numbers are chosen so the fallback is told apart from its neighbours: 3 rows remain, the highest
+    integer left is 2, and the anchor before the edit was 4."""
     path = tmp_path / "text-seq.db"
     store = await MessageStore.open(path)
     try:
-        for i in range(3):
+        for i in range(4):
             await store.record_audit("act", actor="u", detail=str(i))
-        assert (await store.audit_anchor())[0] == 3
-        await store._db.execute("UPDATE audit_log SET seq = 'zzz' WHERE seq = 2")
-        await store._db.commit()
+        assert (await store.audit_anchor())[0] == 4  # the control
+        _unchecked(path, "DELETE FROM audit_log WHERE seq = 1")
+        _unchecked(path, "UPDATE audit_log SET seq = 'zzy' WHERE seq = 3")
+        _unchecked(path, "UPDATE audit_log SET seq = 'zzz' WHERE seq = 4")
         seq, head = await store.audit_anchor()
-        assert seq == 3 and isinstance(head, str)
+        assert seq == 3 and len(head) == 64
         with pytest.raises(RuntimeError, match="no usable sequence number"):
             await store.record_audit("next", actor="u")
         ok, message = await store.verify_audit_chain()
         assert not ok, message
+    finally:
+        await store.close()
+
+
+async def test_the_anchor_never_reads_a_log_that_holds_rows_as_empty(tmp_path: Path) -> None:
+    """An anchor of 0 means an empty log to every caller. A log whose only row was renumbered below
+    1 still holds a row, so its anchor is the row count. The control is the anchor of a log that
+    really is empty."""
+    path = tmp_path / "zero.db"
+    store = await MessageStore.open(path)
+    try:
+        assert await store.audit_anchor() == (0, "")  # the control
+        await store.record_audit("act", actor="u")
+        _unchecked(path, "UPDATE audit_log SET seq = 0")
+        seq, head = await store.audit_anchor()
+        assert seq == 1 and len(head) == 64
+    finally:
+        await store.close()
+
+
+async def test_a_keyed_store_opens_and_reports_a_log_with_no_row_at_position_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The genesis row renumbered to a value that is not a position, which then sorts as the head.
+    The open finds rows and no genesis row: it reports the chain and sets the posture flag. It does
+    not raise, so the engine still starts and says what it found. The control is the same store
+    before the edit, which opens with the flag clear."""
+    path = tmp_path / "no-genesis.db"
+    key = generate_key()
+    store = await _keyed(path, key)
+    try:
+        for i in range(3):
+            await store.record_audit("act", actor="u", detail=str(i))
+        assert store.audit_chain_unkeyed() is False
+    finally:
+        await store.close()
+    _unchecked(path, "UPDATE audit_log SET seq = 7.5 WHERE seq = 1")
+    with caplog.at_level("ERROR"):
+        store = await _keyed(path, key)  # must not raise
+    try:
+        assert store.audit_chain_unkeyed() is True
+        assert any("genesis row" in r.getMessage() for r in caplog.records)
+        ok, message = await store.verify_audit_chain()
+        assert not ok, message
+    finally:
+        await store.close()
+
+
+async def test_every_row_is_compared_when_a_row_sits_below_the_genesis_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk compares every row's MAC whatever else it finds (ASVS 11.2.4). A row added below
+    the genesis row must not leave the walk with no key to compare under. Counted at the one
+    function that computes a row's expected MAC. The control is the untouched chain: one
+    computation per row."""
+    path = tmp_path / "below.db"
+    store = await _keyed(path, generate_key())
+    computed: list[object] = []
+    real = store_module._audit_row_mac
+
+    def counting(row: Any, prev: Any, key: Any, mac: Any) -> Any:
+        computed.append(row["seq"])
+        return real(row, prev, key, mac)
+
+    monkeypatch.setattr(store_module, "_audit_row_mac", counting)
+    try:
+        for i in range(3):
+            await store.record_audit("act", actor="u", detail=str(i))
+        ok, message = await store.verify_audit_chain()
+        assert ok, message
+        assert computed == [1, 2, 3, 4]  # the control
+        _unchecked(
+            path,
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (0, 1.0, 'someone', 'added', NULL, NULL, NULL, 'deadbeef')",
+        )
+        computed.clear()
+        ok, message = await store.verify_audit_chain()
+        assert not ok and "seq=1" in (message or ""), message
+        assert computed == [0, 1, 2, 3, 4]
     finally:
         await store.close()
 

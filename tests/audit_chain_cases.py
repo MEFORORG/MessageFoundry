@@ -62,6 +62,10 @@ class ChainBackend:
     fetch: Callable[[str], Awaitable[Sequence[Mapping[str, Any]]]]
     #: Empty ``audit_log``.
     reset: Callable[[], Awaitable[None]]
+    #: Run one statement with the table's CHECK constraints switched off, or ``None`` where no
+    #: writer can do that. A SQLite file can be opened directly by anyone who can write it; a
+    #: server database enforces the constraint on every role.
+    execute_unchecked: Callable[[str], Awaitable[None]] | None = None
     #: Whether two handles may open the same fresh store at the same moment. The server backends
     #: serialise that in the database; a test's SQLite file is opened one handle at a time.
     concurrent_open: bool = False
@@ -117,26 +121,49 @@ async def _chain(b: ChainBackend) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def _keyless_hash(prev: str, row: Mapping[str, Any], seq: int) -> str:
+    """The digest a handle with no key gives ``row`` at position ``seq``, chained from ``prev``."""
+    return audit_row_hash(
+        prev,
+        seq=seq,
+        ts=row["ts"],
+        actor=row["actor"],
+        action=row["action"],
+        channel_id=row["channel_id"],
+        detail=row["detail"],
+        client=row["client"],
+    )
+
+
 async def _recompute_without_a_key(b: ChainBackend) -> None:
     """Renumber the rows from 1 and recompute every ``row_hash`` as plain SHA-256: the most a writer
     with no key can do to make a changed chain look whole."""
     rows = await _chain(b)
-    await b.execute("UPDATE audit_log SET seq = -seq")  # step aside from the UNIQUE constraint
+    # Step aside from the UNIQUE constraint, staying above the floor the CHECK sets.
+    await b.execute("UPDATE audit_log SET seq = seq + 1000000")
     prev = ""
     for position, r in enumerate(rows, start=1):
-        prev = audit_row_hash(
-            prev,
-            seq=position,
-            ts=r["ts"],
-            actor=r["actor"],
-            action=r["action"],
-            channel_id=r["channel_id"],
-            detail=r["detail"],
-            client=r["client"],
-        )
+        prev = _keyless_hash(prev, r, position)
         await b.execute(
             f"UPDATE audit_log SET seq = {position}, row_hash = '{prev}' WHERE id = {int(r['id'])}"
         )
+
+
+async def _the_recomputation_reproduces_a_keyless_chain(b: ChainBackend) -> None:
+    """The control for :func:`_recompute_without_a_key`. Run over a chain that a handle with no key
+    really wrote, it must leave every row exactly as it was. A recomputation that drifted from the
+    engine's own field list would change them, and a case that leans on it would then pass for the
+    wrong reason."""
+    await b.reset()
+    keyless = await b.open_keyless()
+    try:
+        await _seed(keyless, "plain", 3)
+    finally:
+        await keyless.close()
+    before = await _chain(b)
+    assert len(before) == 3, f"{b.name}: {len(before)} row(s)"
+    await _recompute_without_a_key(b)
+    assert await _chain(b) == before, f"{b.name}: the recomputation is not the keyless digest"
 
 
 async def an_untouched_keyed_chain_verifies(b: ChainBackend) -> None:
@@ -173,6 +200,7 @@ async def an_untouched_keyed_chain_verifies(b: ChainBackend) -> None:
 async def a_chain_recomputed_without_the_key_is_reported(b: ChainBackend) -> None:
     """A row altered, a row removed, and the whole chain renumbered and recomputed with no key. A
     keyed store reports it, and holds no state a writer could change to make it pass."""
+    await _the_recomputation_reproduces_a_keyless_chain(b)
     await b.reset()
     key = generate_key()
     store = await b.open_keyed(key, ())
@@ -210,6 +238,9 @@ async def keyless_rows_on_a_keyed_store_are_a_reported_break(b: ChainBackend) ->
     finally:
         await keyless.close()
     before = await _chain(b)
+    # The control for the digest computed by hand below: the same call reproduces a row the handle
+    # with no key really wrote.
+    assert before[1]["row_hash"] == _keyless_hash(before[0]["row_hash"], before[1], 2), b.name
     store = await b.open_keyed(generate_key(), ())
     try:
         assert store.audit_chain_unkeyed() is True, f"{b.name}: the posture flag must be set"
@@ -219,15 +250,8 @@ async def keyless_rows_on_a_keyed_store_are_a_reported_break(b: ChainBackend) ->
         await store.record_audit("late", actor="u", now=9.0)
         rows = await _chain(b)
         assert [r["seq"] for r in rows] == [1, 2, 3]
-        unkeyed = audit_row_hash(
-            rows[1]["row_hash"],
-            seq=3,
-            ts=9.0,
-            actor="u",
-            action="late",
-            channel_id=None,
-            detail=None,
-        )
+        assert (rows[2]["action"], rows[2]["ts"]) == ("late", 9.0)
+        unkeyed = _keyless_hash(rows[1]["row_hash"], rows[2], 3)
         assert rows[2]["row_hash"] != unkeyed, f"{b.name}: a keyed handle appended a keyless row"
         ok, message = await store.verify_audit_chain()
         assert not ok, f"{b.name}: a keyed row after keyless rows made the chain verify"
@@ -249,6 +273,14 @@ async def a_chain_with_its_genesis_row_removed_is_reported(b: ChainBackend) -> N
         await store.close()
     await b.execute("DELETE FROM audit_log WHERE seq = 1")
     await _recompute_without_a_key(b)
+    # The control: with no key in hand, the recomputed chain is one the keyless walk passes. So
+    # the report below comes from the key the store holds and not from a malformed recomputation.
+    keyless = await b.open_keyless()
+    try:
+        ok, message = await keyless.verify_audit_chain()
+        assert ok, f"{b.name}: the recomputed chain must pass with no key in hand: {message}"
+    finally:
+        await keyless.close()
     store = await b.open_keyed(key, ())
     try:
         assert store.audit_chain_unkeyed() is True
@@ -409,11 +441,13 @@ async def two_opens_of_a_fresh_keyed_store_share_one_genesis_row(b: ChainBackend
 async def a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is(
     b: ChainBackend,
 ) -> None:
-    """Whether a chain is keyed is read from the row AT sequence number 1, a position the UNIQUE
-    constraint lets nobody take twice, and not from whichever row sorts first. So one row added
-    with a lower number is a reported break and nothing more: the keyed handle still treats the
-    chain as keyed, and a handle with no key still refuses to append. The control is the same
-    chain before the row is added."""
+    """A row numbered below 1 is refused by the table's CHECK constraint, on every backend.
+
+    Where a writer can switch that constraint off (a SQLite file opened directly), the row is a
+    reported break and nothing more. Whether a chain is keyed is read from the row AT sequence
+    number 1, a position the UNIQUE constraint lets nobody take twice, and not from whichever row
+    sorts first: the keyed handle still treats the chain as keyed, and a handle with no key still
+    refuses to append. The control is the same chain before the row is added."""
     await b.reset()
     key = generate_key()
     store = await b.open_keyed(key, ())
@@ -423,10 +457,22 @@ async def a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is(
         assert ok, f"{b.name}: the control must verify: {message}"
     finally:
         await store.close()
-    await b.execute(
+    insert = (
         "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
         " VALUES (0, 1.0, 'someone', 'added', NULL, NULL, NULL, 'deadbeef')"
     )
+    before = await _chain(b)
+    try:
+        await b.execute(insert)
+    except Exception:  # each driver has its own name for a refused constraint
+        pass
+    else:
+        raise AssertionError(f"{b.name}: the database took a row numbered below 1")
+    assert await _chain(b) == before, f"{b.name}: the refused statement changed the log"
+    if b.execute_unchecked is None:
+        return
+    await b.execute_unchecked(insert)
+    assert len(await _chain(b)) == len(before) + 1, f"{b.name}: the row was never added"
     store = await b.open_keyed(key, ())
     try:
         assert store.audit_chain_unkeyed() is False, f"{b.name}: the chain still opens keyed"
@@ -483,6 +529,26 @@ async def a_genesis_row_rewritten_to_name_another_held_key_routes_no_append_to_i
         await store.close()
 
 
+async def a_rotation_reports_rows_that_went_missing_under_its_open_handle(
+    b: ChainBackend,
+) -> None:
+    """``rotate-key``'s audit step answers OK only over the chain its handle opened on. A log that
+    lost its rows underneath that handle still verifies, being shorter, so the step compares the
+    log's length with the range it read at open and refuses. The control is the same call before
+    the rows go, which reports the chain already under the active key."""
+    await b.reset()
+    store = await b.open_keyed(generate_key(), ())
+    try:
+        await _seed(store, "act", 2)
+        ok, message = await store.roll_audit_key_epoch()
+        assert ok and "already" in message, f"{b.name}: {message}"
+        await b.execute("DELETE FROM audit_log")
+        ok, message = await store.roll_audit_key_epoch()
+        assert not ok and "rows are missing" in message, f"{b.name}: {message}"
+    finally:
+        await store.close()
+
+
 #: Every case, for a backend's test module to parametrise over.
 CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     an_untouched_keyed_chain_verifies,
@@ -496,4 +562,5 @@ CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     two_opens_of_a_fresh_keyed_store_share_one_genesis_row,
     a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is,
     a_genesis_row_rewritten_to_name_another_held_key_routes_no_append_to_it,
+    a_rotation_reports_rows_that_went_missing_under_its_open_handle,
 )

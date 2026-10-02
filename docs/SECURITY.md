@@ -3835,7 +3835,7 @@ rises by one, so a missing, repeated or renumbered row is a reported break. Noth
 says where keying starts, so nothing there can be changed to move it. A row written without a key
 is a reported break on a keyed store, and no command re-keys one (ADR 0193 and ADR 0194, both
 amended 2026-10-01). [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit
-chain* row, says the same. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless
+chain* row, describes the digest and the key it uses. **CORRECTED 2026-10-01:** this read "(SHA-256)", which is the keyless
 digest only, and it said any such change is detectable without that condition. It then read *"A
 store that has a key can still hold a keyless chain, or one keyed only from a later row on"*; that
 was true until the keyed-from mark was removed. Verify the chain with

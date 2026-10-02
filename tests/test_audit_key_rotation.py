@@ -610,14 +610,17 @@ async def test_both_server_backends_verify_across_a_rotation_with_the_old_key_dr
 
 
 async def test_a_row_with_a_negative_sequence_number_is_still_walked(tmp_path: Path) -> None:
-    """The walk reads every row. A lower bound of 0 would silently drop a row a writer inserted
-    with a negative sequence number; the walk starts at the column's floor and reports it."""
+    """The walk reads every row. A lower bound of 0 would silently drop a row numbered below it;
+    the walk has no lower bound and reports the row. The table's CHECK refuses such a row to a
+    writer that goes through SQL, so it is added here the way a writer that opened the file
+    directly would: with the constraint switched off on its own connection."""
     path, a = tmp_path / "neg.db", generate_key()
     store = await _open(path, a)
     try:
         await _seed(store, "a", 2)
         ok, msg = await store.verify_audit_chain()
         assert ok, msg  # the control
+        await store._db.execute("PRAGMA ignore_check_constraints = ON")
         await store._db.execute(
             "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
             " VALUES (-5, 1.0, 'admin', 'auth.login', NULL, NULL, NULL, 'deadbeef')"

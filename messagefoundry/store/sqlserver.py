@@ -1773,11 +1773,11 @@ _SCHEMA: list[str] = [
     # column as NULLable for stores written before hash-chaining, a population that does not exist.
     # `seq` is the row's position in the hash chain: 1, then rising by one, with no gap. It is inside
     # the row's MAC and is what an anchor and the off-box tee name a row by. `id` is only the surrogate
-    # key: IDENTITY can skip values. UNIQUE, so two appends can never take one position. `seq` is the
-    # CLUSTERED key because the chain is read in `seq` order: the verify walk is then one ordered scan
-    # with no sort, and the append's head read is a seek to the end of the table.
+    # key: IDENTITY can skip values. UNIQUE, so two appends can never take one position. CHECK, so no
+    # role can put a row below position 1. `id` stays the clustered key: the audit listings read
+    # newest-first by `id`, and the append's head read is one seek on the UNIQUE index.
     """IF OBJECT_ID('audit_log','U') IS NULL CREATE TABLE audit_log (
-        id INT IDENTITY(1,1) PRIMARY KEY NONCLUSTERED, seq BIGINT NOT NULL UNIQUE CLUSTERED,
+        id INT IDENTITY(1,1) PRIMARY KEY, seq BIGINT NOT NULL UNIQUE CHECK (seq >= 1),
         ts FLOAT NOT NULL, actor NVARCHAR(256) NULL,
         action NVARCHAR(128) NOT NULL, channel_id NVARCHAR(256) NULL, detail NVARCHAR(MAX) NULL,
         client NVARCHAR(256) NULL, row_hash NVARCHAR(64) NOT NULL)""",
@@ -1786,7 +1786,7 @@ _SCHEMA: list[str] = [
     """IF INDEXPROPERTY(OBJECT_ID('audit_log'),'ix_audit_ts','IndexID') IS NULL
         CREATE INDEX ix_audit_ts ON audit_log(ts)""",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
-    # and the chain's own first row (the genesis row) names the first range's key.
+    # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
     # reserve-then-spend rationale and which key a row counts (the sealing key, ADR 0196). One row
     # per key_id; non-secret (a one-way fingerprint plus a counter). BIN2 collation matches the
@@ -10639,7 +10639,7 @@ class SqlServerStore:
                         # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
                         # `@LockOwner='Transaction'`, which requires one already open. The
                         # autocommit=False pool begins a transaction on the first statement that
-                        # touches a table, so this is a real one-row read of audit_log's PK index
+                        # touches a table, so this is a real one-row read of audit_log's `seq` index
                         # rather than a bare `SELECT 1`: under the driver's implicit-transactions
                         # mode a SELECT with no FROM begins nothing, and the applock would then be
                         # scoped to a transaction that does not exist. Nor `BEGIN TRANSACTION`,

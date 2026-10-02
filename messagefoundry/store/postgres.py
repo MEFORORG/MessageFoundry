@@ -594,8 +594,8 @@ _SCHEMA: list[str] = [
         -- The row's position in the hash chain: 1, then rising by one, with no gap. It is inside the
         -- row's MAC and is what an anchor and the off-box tee name a row by. `id` is only the
         -- surrogate key: a rolled-back INSERT burns a BIGSERIAL value, so `id` can skip. UNIQUE, so
-        -- two appends can never take one position.
-        seq        BIGINT NOT NULL UNIQUE,
+        -- two appends can never take one position. CHECK, so no role can put a row below position 1.
+        seq        BIGINT NOT NULL UNIQUE CHECK (seq >= 1),
         ts         DOUBLE PRECISION NOT NULL,
         actor      TEXT,
         action     TEXT NOT NULL,
@@ -608,7 +608,7 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts)",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
-    # and the chain's own first row (the genesis row) names the first range's key.
+    # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
     # reserve-then-spend rationale and which key a row counts (the sealing key, ADR 0196). One row
     # per key_id; non-secret (a one-way fingerprint plus a counter).

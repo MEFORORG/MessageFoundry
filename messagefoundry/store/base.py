@@ -1767,7 +1767,8 @@ class AuditStore(Protocol):
         rows (BACKLOG #1905, vault BACKLOG #2594).
 
         Observed once, at open, by ``load_audit_chain``: a key or isolated-module MAC is in hand,
-        ``audit_log`` already has rows, and the first of them is not a genesis row naming its key.
+        ``audit_log`` already has rows, and the row at sequence number 1 is not a genesis row
+        naming its key.
         A store that holds a key requires every audit row keyed, so ``verify_audit_chain`` reports
         that chain as broken. The open does not re-key the rows -- that would bless whatever they
         say today -- and no command does. New rows on this handle are keyed under the active key. A
@@ -1778,10 +1779,12 @@ class AuditStore(Protocol):
     def audit_append_refusal(self) -> str | None:
         """Why an audit append on this handle would be refused now, or ``None`` (BACKLOG #1916).
 
-        Answered without appending, from the same check every append makes, so a command that writes
-        other rows before its audit row can refuse before its first write instead of leaving that
-        write unaudited. The case that needed it is a keyed chain opened with no key in hand: its
-        genesis row names a key, so the handle refuses to add a keyless row to it."""
+        Answered without appending and without reading the log: it is the KEY check every append
+        makes, so a command that writes other rows before its audit row can refuse before its first
+        write instead of leaving that write unaudited. The case that needed it is a keyed chain
+        opened with no key in hand: its genesis row names a key, so the handle refuses to add a
+        keyless row to it. An append makes one more check this does not: it reads the newest row,
+        and refuses when that row's sequence number has no successor."""
         ...
 
     async def has_prior_backup_history(self) -> bool:

@@ -1047,12 +1047,12 @@ This section is kept rather than deleted, because the claim it used to make is t
 ### `audit_chain_unkeyed` — the store has a key, but its audit chain is keyless
 
 > **An OBSERVATION, not a switch.** Nobody sets this. The store reports it when it opens with a key
-> (or an isolated-module MAC) onto an audit chain whose first row is not a genesis row naming its
-> key, so the chain holds keyless rows. BACKLOG #1905.
+> (or an isolated-module MAC) onto an audit chain that has rows but no genesis row at sequence
+> number 1, so the chain holds keyless rows. BACKLOG #1905.
 - **What you lose:** tamper evidence against forgery for those rows. A keyless audit row is plain
-  SHA-256, so anyone who can write `audit_log` could have rewritten it and recomputed the chain. A
-  store that holds a key requires every audit row keyed, so `audit-verify` reports this chain as
-  broken at its first row.
+  SHA-256, so anyone who can write `audit_log` could have rewritten it and recomputed the chain.
+  `audit-verify` reports this chain as broken at its first row. The rule it applies is stated
+  once, in [SECURITY.md](SECURITY.md) under *Tamper-evidence*.
 - **How it happens:** rows were written while no key was in hand, then a key was added. Opening with
   a key starts a keyed chain only when `audit_log` is empty, and never re-keys rows that already
   exist, because that would bless whatever they say today. Running `provision-admin` with the key
