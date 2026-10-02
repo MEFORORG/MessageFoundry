@@ -699,10 +699,8 @@ async def _get_engine(request: Request) -> Engine:
     # shared AnyIO worker pool on every request (ASVS 15.4.4, BACKLOG #1195). It must stay
     # non-blocking: a blocking call here would stall the loop instead.
     #
-    # Marked ``answers_before_body`` because it sits AHEAD of the gate on most routes, so its 503
-    # is what a caller with no session gets from an app with no engine. The check that runs
-    # before the body is read asks it first, to keep that answer (vault BACKLOG #2739). It reads
-    # ``app.state`` and nothing else, so being asked twice in one request costs nothing.
+    # Marked because it sits AHEAD of the gate on most routes, so its 503 is what a caller with no
+    # session gets from an app with no engine (vault BACKLOG #2739; see ``answers_before_body``).
     engine: Engine | None = getattr(request.app.state, "engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="engine not started")

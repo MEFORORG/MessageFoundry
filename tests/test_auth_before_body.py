@@ -30,8 +30,6 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
-import inspect
-import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,29 +52,24 @@ from messagefoundry.api.security import (
     require_service_cert,
     steps_before_body,
 )
-from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
-from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, SecuritySettings
 from messagefoundry.config.tls_policy import HopDisposition
-from messagefoundry.credential import VERIFIED_ISSUER_KEY
 from messagefoundry.pipeline import Engine
 from scripts.security import route_gates
 from tests._admin_account import create_local_user_chosen
+from tests.test_api_tls import _ISSUER, _peercert, _wrap_with_cert
+from tests.test_directory_login_step_up_seed import _service as _directory_service
+from tests.test_preauth_malformed_body import _ARMS as _PROBES
+from tests.test_preauth_malformed_body import _JSON
 
 PW = "a-strong-test-passphrase"
-_JSON = {"Content-Type": "application/json"}
 _PEER = ("127.0.0.1", 123)
 
-#: The four probes tests/test_preauth_malformed_body.py sends, in its order and with its bytes.
-_PROBES: dict[str, tuple[bytes, dict[str, str]]] = {
-    "malformed JSON": (b'{"probe": ', _JSON),
-    "malformed, no content type": (b'{"probe": ', {}),
-    "valid JSON, wrong shape": (b'"wrong-shape"', _JSON),
-    "undecodable bytes": (b"\xff\xfe{", _JSON),
-}
+# ``_PROBES`` is the four probes tests/test_preauth_malformed_body.py sends, imported and not
+# copied, so the two files cannot come to measure different bytes.
 #: A request with no body problem: nothing for FastAPI to parse, so the gate is what answers.
 _NO_BODY: tuple[bytes, dict[str, str]] = (b"", {})
 
@@ -167,6 +160,11 @@ def _served_by_fastapi_alone(app: FastAPI) -> FastAPI:
         if isinstance(route, APIRoute):
             route.app = request_response(APIRoute.get_route_handler(route))
     return app
+
+
+def _live_and_control(build: Callable[[], FastAPI]) -> tuple[FastAPI, FastAPI]:
+    """Two apps from one recipe: the live one, and the control served by FastAPI alone."""
+    return build(), _served_by_fastapi_alone(build())
 
 
 def _api_gate(route: APIRoute) -> Callable[..., Any] | None:
@@ -357,17 +355,13 @@ async def test_the_early_refusal_is_the_gates_own_answer_byte_for_byte(
     control app's answer to a request with no body, down to the status, every header and every
     byte. So the early check gives the answer the route's own gate flow gives, and nothing in it
     says whether the body parsed or whether the route takes one."""
-    service = await _service(engine)
+    service = None if state == "no auth service attached" else await _service(engine)
 
     def build() -> FastAPI:
-        if state == "no engine attached":
-            return create_app(None, auth=service)
-        if state == "no auth service attached":
-            return create_app(engine)
-        app = create_app(engine, auth=service)
+        app = create_app(None if state == "no engine attached" else engine, auth=service)
         return _refuse_phi_reads(app) if state.startswith("PHI") else app
 
-    live, control = build(), _served_by_fastapi_alone(build())
+    live, control = _live_and_control(build)
     operations = [
         (row.method, row.path)
         for row in route_gates.gated_http_rows(live)
@@ -399,6 +393,23 @@ async def test_the_early_refusal_is_the_gates_own_answer_byte_for_byte(
             if answer != reference[method, path, "no body"]
         }
         assert len(told_apart) >= 30, len(told_apart)
+
+
+async def test_an_overridden_gate_decides_in_place_of_the_early_check(engine: Engine) -> None:
+    """``dependency_overrides`` replaces a dependency where FastAPI runs it. The early check
+    stands aside for an overridden one, or a gate an embedder replaced would still refuse first.
+    An override is set in process, so it is no way in from the wire."""
+    app = create_app(engine, auth=await _service(engine))
+    route = next(r for r in app.routes if isinstance(r, APIRoute) and r.path == _CHAT)
+    gate = _api_gate(route)
+    assert gate is not None
+    async with _client(app) as client:
+        refused = await client.post(_CHAT, content=_CHAT_BODY, headers=_JSON)
+        assert (refused.status_code, refused.content) == (401, _REFUSED)
+        app.dependency_overrides[gate] = lambda: api_security._SYSTEM_IDENTITY
+        ran = await client.post(_CHAT, content=_CHAT_BODY, headers=_JSON)
+        parsed = await client.post(_CHAT, content=_PROBES["malformed JSON"][0], headers=_JSON)
+    assert (ran.status_code, parsed.status_code) == (_HANDLER_RAN, 422)
 
 
 # --- 3. Nothing is charged twice ------------------------------------------------------------------
@@ -443,20 +454,13 @@ def _count_calls(monkeypatch: pytest.MonkeyPatch, service: AuthService) -> colle
 
     def counted(target: object, name: str) -> None:
         original = getattr(target, name)
-        if inspect.iscoroutinefunction(original):
 
-            async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                tally[name] += 1
-                return await original(*args, **kwargs)
+        # Counts at the call. For an async method the caller awaits what this returns.
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            tally[name] += 1
+            return original(*args, **kwargs)
 
-            monkeypatch.setattr(target, name, wrapper)
-        else:
-
-            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                tally[name] += 1
-                return original(*args, **kwargs)
-
-            monkeypatch.setattr(target, name, sync_wrapper)
+        monkeypatch.setattr(target, name, wrapper)
 
     for name in _SERVICE_CALLS:
         counted(service, name)
@@ -523,8 +527,7 @@ async def test_one_request_charges_each_side_effect_once(
     assert pending is not None and setup.token is not None
     secret = (await service.begin_mfa_enrollment(pending)).secret
     assert (await service.confirm_mfa_enrollment(pending, fresh_totp(secret), token=setup.token)).ok
-    live = create_app(engine, auth=service)
-    control = _served_by_fastapi_alone(create_app(engine, auth=service))
+    live, control = _live_and_control(lambda: create_app(engine, auth=service))
     twice = _gate_twice(create_app(engine, auth=service))
     who = {
         "nobody": {},
@@ -535,8 +538,10 @@ async def test_one_request_charges_each_side_effect_once(
     }
     tally = _count_calls(monkeypatch, service)
 
-    async def one_request(app: FastAPI, scenario: int) -> tuple[int, dict[str, int]]:
-        _what, method, path, (body, headers), caller = _SCENARIOS[scenario]
+    async def one_request(
+        app: FastAPI, scenario: tuple[str, str, str, tuple[bytes, dict[str, str]], str]
+    ) -> tuple[int, dict[str, int]]:
+        _what, method, path, (body, headers), caller = scenario
         tally.clear()
         async with _client(app) as client:
             response = await client.request(
@@ -546,14 +551,15 @@ async def test_one_request_charges_each_side_effect_once(
 
     seen: collections.Counter[str] = collections.Counter()
     doubled: collections.Counter[str] = collections.Counter()
-    for index, (what, *_rest) in enumerate(_SCENARIOS):
-        before = await one_request(control, index)
-        after = await one_request(live, index)
+    for scenario in _SCENARIOS:
+        what = scenario[0]
+        before = await one_request(control, scenario)
+        after = await one_request(live, scenario)
         assert after == before, (what, after, before)
         over = {name: count for name, count in after[1].items() if name in _ONCE and count > 1}
         assert not over, (what, over)
         seen.update(after[1])
-        wrong_status, wrong = await one_request(twice, index)
+        wrong_status, wrong = await one_request(twice, scenario)
         assert wrong_status == after[0], what
         doubled.update({name: n for name, n in wrong.items() if n == 2 * after[1].get(name, 0)})
 
@@ -573,8 +579,7 @@ async def test_a_signed_in_caller_pays_one_session_lookup_whatever_the_body(
     its idle clock moves as it does for any request. No row, no charge and no grant goes with it."""
     service = await _service(engine)
     await _add(service, "admin", Role.ADMINISTRATOR)
-    live = create_app(engine, auth=service)
-    control = _served_by_fastapi_alone(create_app(engine, auth=service))
+    live, control = _live_and_control(lambda: create_app(engine, auth=service))
     bearer = await _sign_in(live, "admin")
     tally = _count_calls(monkeypatch, service)
 
@@ -606,8 +611,7 @@ async def test_a_signed_in_caller_gets_what_it_got_before_on_every_body_route(
     422 and the 400 the parser gives a signed-in caller are among them."""
     service = await _service(engine)
     await _add(service, "admin", Role.ADMINISTRATOR)
-    live = create_app(engine, auth=service)
-    control = _served_by_fastapi_alone(create_app(engine, auth=service))
+    live, control = _live_and_control(lambda: create_app(engine, auth=service))
     bearer = await _sign_in(live, "admin")
     declared = {
         (method, route.path)
@@ -739,63 +743,25 @@ async def _assert_accepted(live: Any, control: Any, headers: dict[str, str], **k
 async def test_a_local_session_token_is_accepted(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "admin", Role.ADMINISTRATOR)
-    live = create_app(engine, auth=service)
-    control = _served_by_fastapi_alone(create_app(engine, auth=service))
-    await _assert_accepted(live, control, await _sign_in(live, "admin"))
+    live, control = _live_and_control(lambda: create_app(engine, auth=service))
+    bearer = await _sign_in(live, "admin")
+    await _assert_accepted(live, control, bearer)
     # The same token where the JSON gate does not read it is no credential, before and after.
-    token = (await _sign_in(live, "admin"))["Authorization"].removeprefix("Bearer ")
+    token = bearer["Authorization"].removeprefix("Bearer ")
     for cookie in ("mf_session", "__Host-mf_session", "__Secure-mf_session"):
         answers = await _post_chat(live, {"Cookie": f"{cookie}={token}"})
         assert [(status, body) for status, _headers, body in answers] == [(401, _REFUSED)] * 2
         assert answers[0] == (await _post_chat(control, {"Cookie": f"{cookie}={token}"}))[0]
 
 
-_ADMINS = "cn=mf-admins,dc=x"
-
-
-class _Directory:
-    """The mock seam tests/test_directory_login_step_up_seed.py uses for a directory account."""
-
-    @staticmethod
-    def _principal(username: str) -> AdPrincipal:
-        return AdPrincipal(
-            username=username,
-            display_name="J Doe",
-            email=None,
-            dn=f"CN={username},DC=x",
-            groups=frozenset({_ADMINS}),
-            directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, username)),
-        )
-
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return None
-
-    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
-        return self._principal(username)
-
-
 async def test_a_kerberos_negotiate_session_token_is_accepted(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The mock seam is the one tests/test_directory_login_step_up_seed.py drives: a fake
+    directory whose group maps to Administrator, and a patched ticket check."""
     monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda t, s: "jdoe")
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            ad_enabled=True,
-            kerberos_enabled=True,
-            ad_server="ldaps://x",
-            ad_user_search_base="DC=x",
-            ad_bind_dn="CN=svc,DC=x",
-            ad_bind_password="x",
-            login_rate_limit_enabled=False,
-            require_mfa=False,
-        ),
-        ldap=_Directory(),  # type: ignore[arg-type]
-    )
-    await service.initialize()
-    await engine.store.set_ad_group_role_map([(_ADMINS, Role.ADMINISTRATOR.value)])
-    live = create_app(engine, auth=service)
-    control = _served_by_fastapi_alone(create_app(engine, auth=service))
+    service = await _directory_service(engine)
+    live, control = _live_and_control(lambda: create_app(engine, auth=service))
     negotiate = {"Authorization": "Negotiate " + base64.b64encode(b"tok").decode()}
     async with _client(live) as client:
         # Sign-in itself has no gate, so the early check is not in front of it.
@@ -809,8 +775,7 @@ async def test_a_kerberos_negotiate_session_token_is_accepted(
 
 
 async def test_the_no_auth_embedding_opt_in_is_accepted(engine: Engine) -> None:
-    live = create_app(engine, allow_no_auth=True)
-    control = _served_by_fastapi_alone(create_app(engine, allow_no_auth=True))
+    live, control = _live_and_control(lambda: create_app(engine, allow_no_auth=True))
     await _assert_accepted(live, control, {})
 
 
@@ -818,8 +783,9 @@ async def test_a_caller_inside_the_source_network_allow_list_is_accepted(engine:
     service = await _service(engine)
     await _add(service, "admin", Role.ADMINISTRATOR)
     networks = SecuritySettings(allowed_client_networks=["10.0.0.0/8"])
-    live = create_app(engine, auth=service, security_settings=networks)
-    control = _served_by_fastapi_alone(create_app(engine, auth=service, security_settings=networks))
+    live, control = _live_and_control(
+        lambda: create_app(engine, auth=service, security_settings=networks)
+    )
     bearer = await _sign_in(live, "admin")  # from loopback, which the allow-list always admits
     inside, outside = ("10.1.2.3", 4000), ("192.0.2.9", 4000)
     await _assert_accepted(live, control, bearer, peer=inside)
@@ -832,7 +798,6 @@ async def test_a_caller_inside_the_source_network_allow_list_is_accepted(engine:
     assert [(s, b) for s, _h, b in await _post_chat(live, {}, peer=inside)] == [(401, _REFUSED)] * 2
 
 
-_ISSUER = "CN=Svc CA,O=Acme,C=US"
 _SERVICE_ROUTE = "/planted/service-body"
 
 
@@ -841,19 +806,6 @@ _CERT_GATE = require_service_cert(Permission.MONITORING_READ)
 
 async def _service_body(body: _Body, identity: Identity = Depends(_CERT_GATE)) -> dict[str, str]:
     return {"username": identity.username}
-
-
-def _with_client_cert(app: Any, common_name: str | None) -> Any:
-    """Stand in for the mTLS shim, as tests/test_api_tls.py does: stash a verified peer cert."""
-
-    async def wrapped(scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] == "http" and common_name is not None:
-            cert = {"subject": ((("commonName", common_name),),), VERIFIED_ISSUER_KEY: _ISSUER}
-            state = {**(scope.get("state") or {}), MF_CLIENT_PEERCERT_STATE_KEY: cert}
-            scope = {**scope, "state": state}
-        await app(scope, receive, send)
-
-    return wrapped
 
 
 async def test_a_mapped_client_certificate_is_accepted(
@@ -875,13 +827,15 @@ async def test_a_mapped_client_certificate_is_accepted(
         app.post(_SERVICE_ROUTE)(_service_body)
         return app
 
-    live, control = build(), _served_by_fastapi_alone(build())
+    live, control = _live_and_control(build)
     assert _uncovered(live) == []
     tally = _count_calls(monkeypatch, service)
 
     async def post(app: FastAPI, common_name: str | None, body: bytes, **headers: str) -> Any:
         tally.clear()
-        async with _client(_with_client_cert(app, common_name)) as client:
+        # ``_wrap_with_cert`` stands in for the mTLS shim: it stashes a verified peer cert.
+        cert = _peercert(common_name) if common_name is not None else None
+        async with _client(_wrap_with_cert(app, cert)) as client:
             response = await client.post(_SERVICE_ROUTE, content=body, headers={**_JSON, **headers})
         return response.status_code, response.content
 

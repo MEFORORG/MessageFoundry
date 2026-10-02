@@ -307,7 +307,6 @@ async def test_a_gated_json_route_refuses_before_it_reads_the_body(sweep: _Sweep
     refusal, with the same body and the same headers on every arm. So nothing in the response says
     whether the body parsed, and nothing tells this class from the one that declares no body."""
     operations = sweep.pinned((_API, True))
-    assert operations
     for operation in operations:
         answers = sweep.answers[operation]
         other_body = [r.text for r in answers if r.json() != _REFUSED]

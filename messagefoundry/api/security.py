@@ -440,7 +440,10 @@ def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
     """Mark a ``require*()`` closure with the step that authenticates its caller.
 
     Returns the SAME function object. The route-gate walk reads a gate's ``__qualname__`` and its
-    closure cells (see :func:`require`), and an attribute changes neither."""
+    closure cells (see :func:`require`), and an attribute changes neither.
+
+    A factory whose gate refuses AHEAD of its base's sign-in check must put that refusal in its
+    step too, in the same order, as :func:`require_phi_read` does with the hop refusal."""
     setattr(dependency, _BEFORE_BODY_ATTR, BeforeBody(authenticate, authenticates=True))
     return dependency
 
