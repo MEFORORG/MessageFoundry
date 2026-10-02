@@ -191,9 +191,14 @@ class _Sweep:
 async def _engine_and_app(directory: Path) -> tuple[Engine, FastAPI]:
     """The app every case here walks: the console mounted and federated sign-in on."""
     engine = await Engine.create(directory / "preauth.db", poll_interval=0.05)
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
-    await service.initialize()
-    return engine, create_app(engine, auth=service, serve_ui=True, oidc_enabled=True)
+    try:
+        service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+        await service.initialize()
+        return engine, create_app(engine, auth=service, serve_ui=True, oidc_enabled=True)
+    except BaseException:
+        # The caller stops the engine it is handed. One that never reached it is stopped here.
+        await engine.stop()
+        raise
 
 
 async def _walk(app: FastAPI, *, only: frozenset[tuple[str, str]] | None = None) -> _Sweep:

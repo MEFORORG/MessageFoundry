@@ -17,10 +17,7 @@ same answer as the gate gave" is measured against the gate and not against a cop
 
 WHAT THIS DOES NOT SEE, at least:
 
-* A gate reached through ``include_router`` with router-level dependencies. The engine includes no
-  router. A route on one would be served by that router's route class.
-* A gate that is a sub-dependency of another dependency. ``scripts/security/route_gates.py`` reads
-  top-level dependencies only, and so does the route class.
+* The route shapes the class does not cover. Its docstring lists them, and the engine has none.
 * A federated (OIDC) sign-in. Its session is the same bearer token the local and Kerberos cases
   below carry, so it is not driven separately.
 * The listener. Requests go through ``httpx.ASGITransport``, so no uvicorn answer is measured.
@@ -31,6 +28,7 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
+import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -181,7 +179,11 @@ def _api_gate(route: APIRoute) -> Callable[..., Any] | None:
 
 
 def _fastapi_own_handler(route: APIRoute) -> bool:
-    """Whether the route would be served by FastAPI's handler with nothing in front of it."""
+    """Whether the route class builds FastAPI's own handler for this route, with nothing in front.
+
+    It asks the class what it WOULD build. It does not read ``route.app``, the handler that is
+    serving, so it cannot tell that a handler was swapped after the route was made. The cases that
+    send requests are what hold that."""
     name = route.get_route_handler().__qualname__
     return name == APIRoute.get_route_handler(route).__qualname__
 
@@ -459,8 +461,10 @@ async def test_an_overridden_gate_decides_in_place_of_the_early_check(engine: En
 
 # --- 3. Nothing is charged twice ------------------------------------------------------------------
 
-#: Every call the gates make that reads or writes something countable, on the service and on the
-#: store. ``_audit`` is the one writer of an audit row, so it counts rows whichever method asked.
+#: Every call the gates make on the service that reads or writes something countable. ``_audit``
+#: is the one writer of an audit row, so it counts rows whichever method asked. On the store,
+#: EVERY public coroutine method is counted, under ``store.<name>``, so a store call the early
+#: check adds cannot go unseen for want of a name on a list.
 _SERVICE_CALLS = (
     "identity_for_token",
     "identity_for_cert_user_id",
@@ -478,10 +482,9 @@ _SERVICE_CALLS = (
     "has_action_step_up",
     "_audit",
 )
-_STORE_CALLS = ("get_session", "touch_session", "revoke_session")
 #: The calls that are a charge, a row or a spent grant. One request makes each at most once.
 _ONCE = (
-    "touch_session",
+    "store.touch_session",
     "audit_mfa_denied",
     "audit_permission_denied",
     "audit_permission_granted",
@@ -493,23 +496,35 @@ _ONCE = (
 )
 
 
+#: What the early check costs a signed-in caller on a route with a body: one more identity
+#: lookup, which reads the session, its user and the user's roles, and writes nothing.
+_SECOND_LOOKUP = {
+    "identity_for_token": 1,
+    "store.get_session": 1,
+    "store.get_user": 1,
+    "store.get_user_role_ids": 1,
+}
+
+
 def _count_calls(monkeypatch: pytest.MonkeyPatch, service: AuthService) -> collections.Counter[str]:
     tally: collections.Counter[str] = collections.Counter()
 
-    def counted(target: object, name: str) -> None:
+    def counted(target: object, name: str, label: str) -> None:
         original = getattr(target, name)
 
         # Counts at the call. For an async method the caller awaits what this returns.
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            tally[name] += 1
+            tally[label] += 1
             return original(*args, **kwargs)
 
         monkeypatch.setattr(target, name, wrapper)
 
     for name in _SERVICE_CALLS:
-        counted(service, name)
-    for name in _STORE_CALLS:
-        counted(service.store, name)
+        counted(service, name, name)
+    store = service.store
+    for name in dir(store):
+        if not name.startswith("_") and inspect.iscoroutinefunction(getattr(store, name)):
+            counted(store, name, f"store.{name}")
     return tally
 
 
@@ -595,7 +610,7 @@ async def test_one_request_charges_each_side_effect_once(
         return response.status_code, dict(tally)
 
     signed_in = {"admin", "viewer", "pending"}
-    second_read = collections.Counter({"identity_for_token": 1, "get_session": 1})
+    second_read = collections.Counter(_SECOND_LOOKUP)
     seen: collections.Counter[str] = collections.Counter()
     doubled: collections.Counter[str] = collections.Counter()
     for scenario in _SCENARIOS:
@@ -641,16 +656,16 @@ async def test_a_signed_in_caller_pays_a_second_session_read_only_where_a_body_i
             response = await client.request(method, path, content=body, headers={**_JSON, **bearer})
         return response.status_code, dict(tally)
 
-    second_read = {"identity_for_token": 1, "get_session": 1}
     malformed = _PROBES["malformed JSON"][0]
     assert await send(control, "POST", _CHAT, malformed) == (422, {})
-    assert await send(live, "POST", _CHAT, malformed) == (422, second_read)
+    assert await send(live, "POST", _CHAT, malformed) == (422, _SECOND_LOOKUP)
 
     status, old = await send(control, "POST", _CHAT, _CHAT_BODY)
-    assert status == _HANDLER_RAN and old["identity_for_token"] == old["touch_session"] == 1
+    assert status == _HANDLER_RAN
+    assert old["identity_for_token"] == old["store.touch_session"] == 1
     assert await send(live, "POST", _CHAT, _CHAT_BODY) == (
         status,
-        dict(collections.Counter(old) + collections.Counter(second_read)),
+        dict(collections.Counter(old) + collections.Counter(_SECOND_LOOKUP)),
     )
 
     # THE CONTROL: a gated route with no body costs what it cost before.
@@ -845,7 +860,8 @@ async def test_a_mapped_client_certificate_is_accepted(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No shipped route on the cert gate takes a body, so one is planted. The cert plane gets the
-    same early check from the same class, with its own refusal and its own carried identity."""
+    same early check from the same class, with its own refusal. Nothing is handed to its gate
+    either, so the certificate is resolved before the body and again after it."""
     service = await _service(engine)
     user_id = await _add(service, "svc", Role.VIEWER)
     bearer_app = create_app(engine, auth=service)

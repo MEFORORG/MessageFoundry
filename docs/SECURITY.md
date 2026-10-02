@@ -160,25 +160,28 @@ unauthenticated full access — or to silently void the loopback assumption by c
 **Sign-in is checked before the request body is read (vault BACKLOG #2739).** FastAPI reads and
 decodes a declared request body before it runs a route's dependencies, and the `require*()` gate
 is a dependency. Left alone, a gated JSON route that declares a body would answer a caller with no
-session from the body parser: **422** for JSON that does not parse, or **400** for bytes that
-cannot be read. The engine's route class, `AuthenticatedBeforeBodyRoute`
-(`messagefoundry/api/security.py`), stops that. On a gated route that declares a body it runs the
-gate's authentication step before FastAPI reads the body, and ahead of it the guards that sit
-before the gate, in the order FastAPI would run them. So a caller with no identity gets the gate's
+session from the body parser. The answer would be **422** for JSON that does not parse, or **400**
+for bytes that cannot be read. The engine's route class, `AuthenticatedBeforeBodyRoute`
+(`messagefoundry/api/security.py`), stops that. On a gated route that declares a body, it runs
+the gate's authentication step before FastAPI reads the body. The guards that sit ahead of the
+gate run first, in the order FastAPI would run them. So a caller with no identity gets the gate's
 own refusal whatever the body holds. The response does not say whether the body parsed, or whether
 the route takes a body.
 
-- `create_app` sets the class on the app's router, so each route registered on the app gets the
-  check with nothing to remember, and no list of routes is kept. At least two shapes are not
-  covered, and the engine has neither: a route added through `include_router`, and a gate nested
-  inside another dependency. An embedder who adds routes either way must check them.
+- `create_app` sets the class on the app's router. Each route registered on the app gets the
+  check with nothing to remember, and no list of routes is kept.
+- Some route shapes are not covered, and the engine has none of them. The class docstring is the
+  one list. It names at least a route added through `include_router`, a gate nested inside
+  another dependency, and an unmarked dependency ahead of a gate. An embedder who adds routes in
+  one of those ways must check them.
 - The gate itself does not change. After the body is read it runs in full, as before: sign-in
   again, then the password and factor checks, the permission check and its audit rows, pacing and
   step-up. So a signed-in caller that the gate then refuses still gets the parser's answer first
   for a body that does not parse.
 - Nothing is handed from the early check to the gate. A session that ends while the body is
-  arriving is refused by the gate. The price is one more session read for a signed-in request
-  to a route with a body. That read does not move the session's idle clock.
+  arriving is refused by the gate. The price is one more identity lookup for a signed-in
+  request to a route with a body. That lookup reads the session, its user and the user's roles.
+  It writes nothing, so it does not move the session's idle clock.
 - A route with no gate is not touched. `POST /auth/login` has to parse a body from a caller with
   no session. A gated route that declares no body is not touched either, because FastAPI already
   runs its gate first. That includes the web console's `/ui` routes, which read their forms

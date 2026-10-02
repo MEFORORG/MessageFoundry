@@ -375,11 +375,12 @@ def _password_change_required(deadline: float | None) -> str:
 # alone.
 #
 # THE GATE ITSELF IS UNCHANGED, AND NOTHING IS HANDED TO IT. After the body is read FastAPI runs the
-# gate as the dependency it always was, and the gate looks the session up again. So a session
+# gate as the dependency it always was, and the gate resolves the caller again. So a session
 # revoked while the body was arriving is refused, as it was before. Handing the gate the identity
 # resolved before the body would save that second lookup, and was tried: it let a session revoked
-# mid-upload through the routes the factor gate exempts. The second lookup is the price, and only
-# a signed-in request to a route with a body pays it.
+# mid-upload through the routes the factor gate exempts. The second lookup is the price: it reads
+# the session, its user and the user's roles, and only a signed-in request to a route with a body
+# pays it.
 #
 # Everything else a gate does still runs once, after the body: must-change, the factor gate, the
 # permission loop and its audit rows, pacing and step-up. So a signed-in caller the gate then
@@ -445,8 +446,7 @@ def steps_before_body(dependant: Dependant) -> tuple[tuple[Callable[..., Any], _
     up to and including its first gate. Empty when the route has no gate: a route with none parses
     its body for a caller with no session by design (sign-in itself is one).
 
-    Top-level dependencies only, which is also all ``scripts/security/route_gates.py`` reads. A
-    gate nested inside another dependency is not found."""
+    :class:`AuthenticatedBeforeBodyRoute` lists what this does not find."""
     steps: list[tuple[Callable[..., Any], _Step]] = []
     for dependency in dependant.dependencies:
         call = dependency.call
@@ -468,10 +468,17 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     already runs the gate before it reads anything; one with no gate; and one whose gate is not
     this module's (the web console's ``require_ui*``, whose routes declare no body).
 
-    AT LEAST TWO SHAPES ARE NOT COVERED, and the engine has neither. A route added through
-    ``include_router`` is served by that router's own route class, and a gate that router adds
-    for all its routes is not in the route's own dependencies, which is all this reads. A gate
-    nested inside another dependency is not found either.
+    WHAT IT DOES NOT COVER, at least. The engine has none of these, and this list is the one
+    place they are stated:
+
+    * A route reached through ``include_router``. It is served by that router's route class,
+      and FastAPI serves it from the include's own context. So a gate that the include call
+      itself adds is not among the route's own dependencies, which is all this reads, and an
+      override set on the app is not seen for it.
+    * A gate nested inside another dependency. Only a route's top-level dependencies are read,
+      which is also all ``scripts/security/route_gates.py`` reads.
+    * A dependency that sits ahead of the gate and carries no mark. The gate's refusal answers
+      before it, so a caller with no identity never reaches it.
 
     The refusal is not a copy of the gate's. The step raises the same ``HTTPException`` from the
     same function the gate calls, and it travels through the same exception handlers and the same
