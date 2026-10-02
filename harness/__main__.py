@@ -9,6 +9,12 @@
 ``python -m harness --coverage``      -> print every registered connector kind, by direction,
                                                 against the scenarios that cover it (no engine
                                                 needed).
+``python -m harness --fuzz``          -> fuzz a running engine: seeded byte, field and MLLP-frame
+                                                mutations of generated HL7 through a harness driver,
+                                                checking health, ACK-implies-stored, reply shape and no
+                                                5xx after each batch. Exits 0 (held) / 1 (an invariant
+                                                broke; the seed and a replay file are printed) / 2
+                                                (setup). ``--fuzz-replay FILE`` resends a kept case.
 ``python -m harness --list-profiles`` → list the built-in load profiles.
 ``python -m harness --load NAME``     → run a load profile headless against a running engine and exit
                                                 0 (SLOs met) / 1 (SLO violation, incl. zero_loss when
@@ -195,6 +201,44 @@ def main(argv: list[str] | None = None) -> int:
         "harness/endpoints/). Repeatable. MEFOR_HARNESS_<KEY> in the environment does the same.",
     )
     parser.add_argument(
+        "--fuzz",
+        action="store_true",
+        help="fuzz a running engine with seeded mutations through a harness driver and exit "
+        "(see the fuzz section of harness/README.md)",
+    )
+    parser.add_argument("--fuzz-seed", type=int, default=0, help="fuzz: campaign seed (>= 0)")
+    parser.add_argument(
+        "--fuzz-iterations", type=int, default=200, help="fuzz: how many cases to send"
+    )
+    parser.add_argument(
+        "--fuzz-seconds", type=float, help="fuzz: time budget; stop after this many seconds"
+    )
+    parser.add_argument(
+        "--fuzz-batch", type=int, default=10, help="fuzz: cases between invariant checks"
+    )
+    parser.add_argument(
+        "--fuzz-driver",
+        default="mllp",
+        help="fuzz: driver kind (a harness/drivers/ KIND; mllp also mutates the framing)",
+    )
+    parser.add_argument(
+        "--fuzz-endpoint",
+        help="fuzz: the harness endpoint key the driver sends to (see harness/endpoints/); "
+        "mllp defaults to mllp_in, any other driver must name one",
+    )
+    parser.add_argument(
+        "--fuzz-out",
+        help="fuzz: directory a failing case's exact bytes are written to (default: a "
+        "messagefoundry-harness-fuzz directory under the system temp directory)",
+    )
+    parser.add_argument(
+        "--fuzz-replay",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="fuzz: resend this kept case file and check the invariants (repeatable; implies --fuzz)",
+    )
+    parser.add_argument(
         "--load", help="run this load profile (built-in name or path to a .toml) and exit"
     )
     parser.add_argument(
@@ -253,7 +297,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--token", help="bearer token for an auth-enabled engine")
     parser.add_argument(
-        "--timeout", type=float, default=30.0, help="scenario: seconds to wait for the outcome"
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="scenario: seconds to wait for the outcome; fuzz: seconds to wait for one reply",
     )
     # Load-run options.
     parser.add_argument(
@@ -309,15 +356,17 @@ def main(argv: list[str] | None = None) -> int:
         return _list_connscale_profiles()
     if args.list_estate_profiles:
         return _list_estate_profiles()
-    if (
-        sum(bool(x) for x in (args.load, args.scenario, args.failover, args.connscale, args.estate))
-        > 1
-    ):
+    fuzz = bool(args.fuzz or args.fuzz_replay)
+    modes = (args.load, args.scenario, args.failover, args.connscale, args.estate, fuzz)
+    if sum(bool(x) for x in modes) > 1:
         print(
-            "--load, --failover, --connscale, --estate, and --scenario are mutually exclusive",
+            "--load, --failover, --connscale, --estate, --scenario, and --fuzz are mutually "
+            "exclusive",
             file=sys.stderr,
         )
         return 2
+    if fuzz:
+        return _run_fuzz(args)
     if args.failover:
         return _run_failover(args)
     if args.connscale:
@@ -389,6 +438,32 @@ def _run_scenario(
         return 2
     print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {result.detail}")
     return 0 if result.ok else 1
+
+
+def _run_fuzz(args: argparse.Namespace) -> int:
+    from harness.fuzz.cli import EXIT_SETUP
+    from harness.fuzz.cli import main as fuzz_main
+
+    try:
+        overrides = dict(_split_endpoint(arg) for arg in args.endpoint)
+    except ValueError as exc:
+        print(f"bad endpoint: {exc}", file=sys.stderr)
+        return EXIT_SETUP
+    return fuzz_main(
+        engine_url=args.engine,
+        token=args.token,
+        cacert=args.cacert,
+        endpoint_overrides=overrides,
+        driver=args.fuzz_driver,
+        endpoint=args.fuzz_endpoint,
+        seed=args.fuzz_seed,
+        iterations=args.fuzz_iterations,
+        seconds=args.fuzz_seconds,
+        batch=args.fuzz_batch,
+        out_dir=args.fuzz_out,
+        reply_timeout=args.timeout,
+        replay_files=args.fuzz_replay,
+    )
 
 
 def _split_endpoint(arg: str) -> tuple[str, str]:

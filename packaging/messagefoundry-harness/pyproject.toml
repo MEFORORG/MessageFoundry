@@ -101,6 +101,7 @@ Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTIN
 "../../harness/config" = "harness/config"
 "../../harness/drivers" = "harness/drivers"
 "../../harness/endpoints" = "harness/endpoints"
+"../../harness/fuzz" = "harness/fuzz"
 "../../harness/load" = "harness/load"
 "../../harness/reconcile" = "harness/reconcile"
 "../../harness/scenarios" = "harness/scenarios"
