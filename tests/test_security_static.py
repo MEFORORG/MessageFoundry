@@ -1054,7 +1054,57 @@ _XML_DEPS_CONSUMERS = frozenset(
 #: The lxml entry points that construct or run a parser. They must appear in ``harden.py`` ONLY —
 #: that is the allowlist's own recorded rationale for the ``_deps.py`` entry ("lxml parsing is
 #: hardened once in harden.py"), turned into a checked fact instead of a comment.
-_LXML_PARSE_CALLS = frozenset({"XMLParser", "fromstring", "parse", "XML"})
+#:
+#: At least these, across ``lxml.etree``, ``lxml.html`` and ``lxml.objectify``. The set held four
+#: names until vault BACKLOG #2703, so a streaming parse, a pull parser, an HTML parser or an XSLT
+#: transform built beside the hardened parser read as no parse at all. It is a deny-list, so an entry
+#: point lxml adds later is outside it until someone names it here.
+_LXML_PARSE_CALLS = frozenset(
+    {
+        # Parser classes, and the functions that hand one out or make one the process default.
+        "XMLParser",
+        "ETCompatXMLParser",
+        "HTMLParser",
+        "XHTMLParser",
+        "XMLPullParser",
+        "HTMLPullParser",
+        "makeparser",
+        "get_default_parser",
+        "set_default_parser",
+        # Functions that parse a document, a fragment or a stream.
+        "fromstring",
+        "fromstringlist",
+        "parse",
+        "parseid",
+        "iterparse",
+        "XML",
+        "HTML",
+        "XMLID",
+        "XMLDTDID",
+        "document_fromstring",
+        "fragment_fromstring",
+        "fragments_fromstring",
+        # ``ElementTree(file=...)`` and the validators parse the file they are handed.
+        "ElementTree",
+        "DTD",
+        "XMLSchema",
+        "RelaxNG",
+        "Schematron",
+        # A transform compiles a stylesheet that can read files and the network, and XInclude pulls
+        # other documents in.
+        "XSLT",
+        "XInclude",
+    }
+)
+#: Methods of a parsed lxml tree that transform it or pull further documents into it. The receiver
+#: is whatever ``harden.py`` returned, which no static walk can type, so these match on any receiver.
+_LXML_TREE_METHODS = frozenset({"xslt", "xinclude"})
+#: What :func:`_lxml_parse_call_sites` reports for an lxml star import and for a ``getattr`` on an
+#: lxml binding. Neither names an entry point, and either one reaches every entry point.
+_LXML_STAR_IMPORT = "import *"
+_LXML_GETATTR = "getattr"
+#: The ``_deps.py`` loader that returns the ``lxml.etree`` module.
+_LXML_LOADERS = frozenset({"load_lxml"})
 _LXML_PARSE_HOME = "messagefoundry/parsing/xml/harden.py"
 
 
@@ -1158,23 +1208,123 @@ def test_the_deps_loader_route_to_a_raw_parser_is_confined_too() -> None:
     assert _deps_loader_users("import os\nload_config()\n") == set()
 
 
+def _dotted(node: ast.AST) -> str | None:
+    """``a.b.c`` for a ``Name`` or an ``Attribute`` chain that ends in one, else ``None``."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    return ".".join(reversed([*parts, node.id]))
+
+
 def _lxml_parse_call_sites(source: str) -> set[str]:
-    """``etree.<parse-entry-point>`` attribute calls in ``source``."""
-    return {
-        node.func.attr
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _LXML_PARSE_CALLS
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "etree"
-    }
+    """The lxml parse entry points ``source`` reaches, by name.
+
+    A name in :data:`_LXML_PARSE_CALLS` counts when it is read off an lxml binding, called or not,
+    and when it is imported from an lxml module. A binding is any of:
+
+    * the name ``etree``, which is what every consumer in this tree calls the module;
+    * a name an ``import lxml...`` or a ``from lxml... import`` binds, under any alias;
+    * what a :data:`_LXML_LOADERS` call returns: called in place, assigned to a name or to an
+      attribute such as ``self._lx``, bound by ``:=``, or returned by a function or a lambda
+      defined in the file;
+    * a name assigned from another binding.
+
+    Three more shapes are reported under their own names: a :data:`_LXML_TREE_METHODS` call on any
+    receiver, ``getattr`` on a binding, and a star import from an lxml module.
+
+    The walk reads one file and ignores scope, so a name bound to lxml anywhere in the file counts
+    everywhere in it. It does not follow a binding passed as an argument, unpacked from a tuple,
+    bound by ``with`` or ``for``, stored in a container, or imported from another first-party
+    module. Only the bare name ``etree`` survives those.
+    """
+    nodes = list(ast.walk(ast.parse(source)))
+    bindings = {"etree"}
+    loaders = set(_LXML_LOADERS)
+    found: set[str] = set()
+
+    def is_loader(node: ast.AST) -> bool:
+        if isinstance(node, ast.Attribute) and node.attr in loaders:
+            return True
+        return _dotted(node) in loaders
+
+    def is_lxml(node: ast.AST) -> bool:
+        if isinstance(node, ast.NamedExpr):
+            return is_lxml(node.value)
+        if isinstance(node, ast.Call):
+            return is_loader(node.func)
+        if _dotted(node) in bindings:
+            return True
+        return isinstance(node, ast.Attribute) and is_lxml(node.value)
+
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            bindings |= {
+                alias.asname or "lxml"
+                for alias in node.names
+                if alias.name == "lxml" or alias.name.startswith("lxml.")
+            }
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            from_lxml = not node.level and (module == "lxml" or module.startswith("lxml."))
+            for alias in node.names:
+                if not from_lxml:
+                    if alias.name in _LXML_LOADERS:
+                        loaders.add(alias.asname or alias.name)
+                elif alias.name == "*":
+                    found.add(_LXML_STAR_IMPORT)
+                elif alias.name in _LXML_PARSE_CALLS:
+                    found.add(alias.name)
+                else:
+                    bindings.add(alias.asname or alias.name)
+
+    # To a fixed point, because `E = etree` can sit above the line that binds `etree`.
+    grew = True
+    while grew:
+        before = len(bindings) + len(loaders)
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any(
+                    isinstance(inner, ast.Return)
+                    and inner.value is not None
+                    and is_lxml(inner.value)
+                    for inner in ast.walk(node)
+                ):
+                    loaders.add(node.name)
+                continue
+            targets: list[ast.expr]
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+                targets, value = [node.target], node.value
+            else:
+                continue
+            names = {name for target in targets if (name := _dotted(target)) is not None}
+            if is_lxml(value):
+                bindings |= names
+            elif is_loader(value) or (isinstance(value, ast.Lambda) and is_lxml(value.body)):
+                loaders |= names
+        grew = len(bindings) + len(loaders) > before
+
+    for node in nodes:
+        if isinstance(node, ast.Attribute):
+            if node.attr in _LXML_PARSE_CALLS and is_lxml(node.value):
+                found.add(node.attr)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in _LXML_TREE_METHODS:
+                found.add(func.attr)
+            elif _dotted(func) == "getattr" and node.args and is_lxml(node.args[0]):
+                found.add(_LXML_GETATTR)
+    return found
 
 
 def test_lxml_parsing_really_is_hardened_in_exactly_one_place() -> None:
     # _XML_PARSER_ALLOWLIST's rationale for the _deps.py entry is "lxml parsing is hardened once in
-    # harden.py". That was a comment; this makes it a fact. Every consumer resolves the module as
-    # `etree`, so an `etree.fromstring(...)` anywhere else is an unhardened parse.
+    # harden.py". That was a comment; this makes it a fact. An lxml parse entry point reached from
+    # anywhere else is an unhardened parse, whatever the file calls the module.
     offenders = sorted(
         f"{rel}: {sorted(calls)}"
         for path in _py_files(*_XML_ROOTS)
@@ -1191,6 +1341,108 @@ def test_lxml_parsing_really_is_hardened_in_exactly_one_place() -> None:
     assert _lxml_parse_call_sites("etree = load_lxml()\nr = etree.fromstring(body)\n") == {
         "fromstring"
     }
+
+
+#: The one shape the guard caught before vault BACKLOG #2703: a four-name set, matched as a call on
+#: a binding named ``etree``. It is the baseline the planted shapes below are measured against.
+_LXML_PLANTED_BASELINE = ("etree = load_lxml()\nr = etree.fromstring(body)\n", {"fromstring"})
+
+#: Shapes that guard returned nothing for, each with what the walk must now report. Measured by
+#: running the old matcher over these same sources before it was widened: it missed every one.
+_LXML_PLANTED_SHAPES: tuple[tuple[str, set[str]], ...] = (
+    # An entry point outside the old four-name set, on the binding the old guard did key on.
+    ("etree = load_lxml()\nfor _ in etree.iterparse(src):\n    pass\n", {"iterparse"}),
+    ("etree = load_lxml()\np = etree.XMLPullParser()\n", {"XMLPullParser"}),
+    ("etree = load_lxml()\np = etree.HTMLParser()\n", {"HTMLParser"}),
+    ("etree = load_lxml()\nt = etree.XSLT(doc)\n", {"XSLT"}),
+    # The access control argument changes nothing: the transform is still built outside harden.py.
+    (
+        "etree = load_lxml()\nt = etree.XSLT(doc, access_control=etree.XSLTAccessControl.DENY_ALL)\n",
+        {"XSLT"},
+    ),
+    ("etree = load_lxml()\ns = etree.XMLSchema(file=path)\n", {"XMLSchema"}),
+    # One of the old four names, on a binding that is not called `etree`.
+    ("import lxml.etree as ET\nr = ET.fromstring(body)\n", {"fromstring"}),
+    ("from lxml import etree as E\nr = E.parse(src)\n", {"parse"}),
+    ("import lxml.etree\nr = lxml.etree.XML(body)\n", {"XML"}),
+    ("from lxml import html\nr = html.document_fromstring(body)\n", {"document_fromstring"}),
+    ("lx = load_lxml()\nr = lx.fromstring(body)\n", {"fromstring"}),
+    ("lx = _deps.load_lxml()\np = lx.XMLParser()\n", {"XMLParser"}),
+    ("r = load_lxml().XML(body)\n", {"XML"}),
+    ("r = (lx := load_lxml()).fromstring(body)\n", {"fromstring"}),
+    ("from ._deps import load_lxml as ll\nr = ll().fromstring(body)\n", {"fromstring"}),
+    ("def _lx():\n    return load_lxml()\n\n\nr = _lx().fromstring(body)\n", {"fromstring"}),
+    ("mk = lambda: load_lxml()\nr = mk().fromstring(body)\n", {"fromstring"}),
+    (
+        "class C:\n"
+        "    def __init__(self):\n"
+        "        self._lx = load_lxml()\n"
+        "    def go(self, body):\n"
+        "        return self._lx.fromstring(body)\n",
+        {"fromstring"},
+    ),
+    # A second-order alias, written above the line that binds the name it copies.
+    ("def go(body):\n    return E.fromstring(body)\n\n\nE = etree\n", {"fromstring"}),
+    # The entry point imported by name, so no attribute access is left to match.
+    ("from lxml.etree import iterparse\nr = iterparse(src)\n", {"iterparse"}),
+    ("from lxml.etree import fromstring as fs\nr = fs(body)\n", {"fromstring"}),
+    ("from lxml.etree import *\nr = fromstring(body)\n", {_LXML_STAR_IMPORT}),
+    # Read but not called on that line, and looked up by a name the walk cannot see.
+    ("etree = load_lxml()\nmake = etree.XMLParser\np = make()\n", {"XMLParser"}),
+    ("etree = load_lxml()\nr = getattr(etree, name)(body)\n", {_LXML_GETATTR}),
+    # A transform or an inclusion run as a method of an already-parsed tree.
+    ("out = tree.xslt(sheet)\n", {"xslt"}),
+    ("tree.xinclude()\n", {"xinclude"}),
+)
+
+#: Sources the walk must stay silent on: the lxml calls the four other ``_deps.py`` consumers do
+#: make, and the same entry point names on a binding that is not lxml.
+_LXML_PLANTED_CLEAN = (
+    "etree = load_lxml()\nout = etree.tostring(root, encoding='utf-8')\n",
+    "etree = load_lxml()\ntry:\n    pass\nexcept etree.XPathError:\n    pass\n",
+    "import ast\ntree = ast.parse(source)\n",
+    "import json\nvalue = json.loads(text)\n",
+    "from html.parser import HTMLParser\np = HTMLParser()\n",
+    "from xml.sax import make_parser\np = make_parser()\n",
+    "from messagefoundry.parsing.xml import harden\nroot = harden.parse_xml(body)\n",
+    "value = getattr(settings, name)\n",
+)
+
+
+@pytest.mark.parametrize(("source", "expected"), [_LXML_PLANTED_BASELINE, *_LXML_PLANTED_SHAPES])
+def test_the_lxml_guard_sees_every_planted_shape(source: str, expected: set[str]) -> None:
+    assert _lxml_parse_call_sites(source) == expected, source
+
+
+@pytest.mark.parametrize("source", _LXML_PLANTED_CLEAN)
+def test_the_lxml_guard_stays_silent_on_a_non_parsing_use(source: str) -> None:
+    assert _lxml_parse_call_sites(source) == set(), source
+
+
+def test_the_lxml_entry_point_set_kept_its_four_names_and_plants_the_new_ones() -> None:
+    # Every name the planted shapes expect is one the walk can report, and the four names the old
+    # guard knew are still in the set, so the widening dropped nothing.
+    reportable = _LXML_PARSE_CALLS | _LXML_TREE_METHODS | {_LXML_STAR_IMPORT, _LXML_GETATTR}
+    planted = set().union(*(expected for _source, expected in _LXML_PLANTED_SHAPES))
+    assert planted <= reportable, sorted(planted - reportable)
+    assert {"XMLParser", "fromstring", "parse", "XML"} <= _LXML_PARSE_CALLS
+    assert {"iterparse", "XMLPullParser", "XSLT", "HTMLParser"} <= planted
+
+
+def test_every_lxml_entry_point_name_exists_in_lxml() -> None:
+    # A misspelt name in a deny-list matches nothing and reads as coverage. Each name must be an
+    # attribute of the installed lxml, or the guard is watching for a call nobody can make.
+    etree = pytest.importorskip("lxml.etree")
+    lxml_html = pytest.importorskip("lxml.html")
+    objectify = pytest.importorskip("lxml.objectify")
+    missing = sorted(
+        name
+        for name in _LXML_PARSE_CALLS
+        if not any(hasattr(module, name) for module in (etree, lxml_html, objectify))
+    )
+    assert not missing, f"not an lxml.etree, lxml.html or lxml.objectify attribute: {missing}"
+    tree = etree.ElementTree(etree.Element("probe"))
+    assert all(hasattr(tree, name) for name in _LXML_TREE_METHODS), sorted(_LXML_TREE_METHODS)
 
 
 def test_xml_allowlist_has_no_stale_entries() -> None:
