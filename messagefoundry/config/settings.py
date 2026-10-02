@@ -4853,10 +4853,9 @@ class CertMonitorSettings(_Section):
     check_interval_seconds: float = 43_200.0  # rescan cadence (default 12h)
     #: BACKLOG #299: how many replaced copies of one CRL file a running hop's TLS context takes
     #: before the reload refuses the next and asks for a restart. A context can only add CRLs, so
-    #: each reload stays in it. 10,000 outlasts a year of hourly CRLs (8,760). Measured on CPython
-    #: 3.14 / OpenSSL 3.5.7: each held copy costs about four times the CRL file's size in memory
-    #: plus about 1.5 KB, and each handshake about 2 microseconds per copy held for its issuer.
-    #: Read by the reload, which runs whatever ``warn_days`` is.
+    #: each reload stays in it. 10,000 outlasts a year of hourly CRLs (8,760). What each held copy
+    #: costs, measured, is in docs/CONFIGURATION.md under this key. Read by the reload, which runs
+    #: whatever ``warn_days`` is.
     crl_max_reloads: int = 10_000
 
     @field_validator("warn_days")

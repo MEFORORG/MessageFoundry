@@ -69,8 +69,10 @@ __all__ = [
     "ReloadRefusal",
     "clear_reload_refusal",
     "crl_fingerprint",
+    "has_held_copies",
     "held_contexts",
     "held_crl_copies",
+    "prune_reload_refusals",
     "record_crl_load",
     "record_reload_refusal",
     "reload_refusal",
@@ -165,7 +167,36 @@ def record_crl_load(
         configured_path=crl_file,
     )
     with _LOCK:
-        _HELD[ctx] = (*_HELD.get(ctx, ()), held)
+        loads = _HELD.get(ctx, ())
+        again = next((load for load in loads if load.path_key == held.path_key), None)
+        if again is None:
+            _HELD[ctx] = (*loads, held)
+        else:
+            # The same file loaded into one context twice, such as two settings naming it. One
+            # record per file per context, or a reload would load it twice and count two hops.
+            _HELD[ctx] = tuple(_merged(again, held) if load is again else load for load in loads)
+
+
+def _merged(old: HeldCrl, new: HeldCrl) -> HeldCrl:
+    """One record for a context that loaded one file twice: it holds the CRLs of both loads.
+
+    The file as last read is ``new``'s, so its fingerprint stands. The soonest lapse of the two
+    counts, as across the blocks of one file. The blocks are both loads', since a reload must
+    supersede every CRL the context holds; if either load's are unknown, so are the union's."""
+    from messagefoundry.pki import soonest_crl
+
+    known = old.blocks and new.blocks
+    blocks = (*old.blocks, *(b for b in new.blocks if b not in old.blocks)) if known else ()
+    return HeldCrl(
+        path_key=new.path_key,
+        fingerprint=new.fingerprint,
+        facts=soonest_crl([old.facts, new.facts]),
+        file_path=new.file_path,
+        setting=old.setting or new.setting,
+        blocks=blocks,
+        configured_path=old.configured_path or new.configured_path,
+        reloads=old.reloads,
+    )
 
 
 def _copy() -> tuple[list[tuple[ssl.SSLContext, tuple[HeldCrl, ...]]], dict[str, ReloadRefusal]]:
@@ -183,6 +214,12 @@ def _copy() -> tuple[list[tuple[ssl.SSLContext, tuple[HeldCrl, ...]]], dict[str,
             if attempt == attempts - 1:
                 raise
     raise AssertionError("unreachable")
+
+
+def has_held_copies() -> bool:
+    """Whether any context, live or awaiting collection, has recorded a CRL load."""
+    with _LOCK:
+        return len(_HELD) > 0
 
 
 def held_contexts() -> list[tuple[ssl.SSLContext, HeldCrl]]:
@@ -227,6 +264,14 @@ def clear_reload_refusal(path: str | os.PathLike[str]) -> None:
     """Forget any refusal for ``path``, because every context holding it is now current."""
     with _LOCK:
         _REFUSED.pop(_path_key(path), None)
+
+
+def prune_reload_refusals(held: Iterable[str]) -> None:
+    """Forget the refusals for every path key not in ``held``: no context holds that file now."""
+    keep = set(held)
+    with _LOCK:
+        for gone in [key for key in _REFUSED if key not in keep]:
+            del _REFUSED[gone]
 
 
 class HeldCrlSnapshot:

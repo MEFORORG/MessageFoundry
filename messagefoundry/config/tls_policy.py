@@ -106,7 +106,9 @@ __all__ = [
     "context_checks_revocation",
     "current_hop_posture",
     "enforce_insecure_hop",
+    "CRL_CLOCK_SKEW_SECONDS",
     "CrlNotInEffect",
+    "crl_in_effect",
     "crl_label",
     "harden_cipher_suites",
     "harden_kex_groups",
@@ -431,8 +433,17 @@ def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> tuple[CrlFacts, tu
             "remove it if a newer CRL for that issuer is already in the file"
         )
     blocks = tuple(block for _, block in judged)
-    _refuse_crl_not_in_effect(blocks, label=label, now=now)
+    _refuse_crl_not_in_effect(facts, blocks, label=label, now=now)
     return facts, blocks
+
+
+#: How far ahead of this host's clock a CRL's ``thisUpdate`` may sit and still count as in effect,
+#: at a start and at a running-hop reload (BACKLOG #299). A CA whose clock runs a little ahead
+#: issues a CRL that is "not yet valid" here for that long. Refusing it would fail a start, or hold
+#: a reload back, over ordinary clock skew. The cost: OpenSSL itself allows no skew, so a lone CRL
+#: inside this window refuses every peer it judges until its ``thisUpdate`` passes. A reload is
+#: spared that, because the copy it adds to stays in effect and OpenSSL keeps choosing it until then.
+CRL_CLOCK_SKEW_SECONDS = 300.0
 
 
 class CrlNotInEffect(ValueError):
@@ -441,20 +452,36 @@ class CrlNotInEffect(ValueError):
     OpenSSL prefers a CRL that is in effect, so a future CRL beside a current one from the same
     issuer is harmless. Alone, it is the one OpenSSL picks, and it refuses every peer that issuer's
     CRL judges with ``CRL is not yet valid``. A start refuses it with this error's message. The
-    running-hop reload reads ``issuer`` and ``takes_effect`` to say whether waiting is safe."""
+    running-hop reload reads ``issuer`` and ``takes_effect`` to say whether waiting is safe, and
+    ``facts`` and ``blocks`` (what :func:`judge_crl_bytes` would have returned) to go on checking
+    what else is wrong with the file, since a file to fix outranks a file to wait for."""
 
-    def __init__(self, message: str, *, issuer: str, takes_effect: datetime.datetime) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        issuer: str,
+        takes_effect: datetime.datetime,
+        facts: CrlFacts,
+        blocks: tuple[CrlBlock, ...],
+    ) -> None:
         super().__init__(message)
         self.issuer = issuer
         self.takes_effect = takes_effect
+        self.facts = facts
+        self.blocks = blocks
 
 
-def _refuse_crl_not_in_effect(blocks: Sequence[CrlBlock], *, label: str, now: float) -> None:
+def crl_in_effect(block: CrlBlock, *, now: float) -> bool:
+    """Whether ``block`` is in effect at ``now``, allowing :data:`CRL_CLOCK_SKEW_SECONDS`."""
+    return block.this_update.timestamp() <= now + CRL_CLOCK_SKEW_SECONDS
+
+
+def _refuse_crl_not_in_effect(
+    facts: CrlFacts, blocks: tuple[CrlBlock, ...], *, label: str, now: float
+) -> None:
     """Raise :class:`CrlNotInEffect` when some issuer in ``blocks`` has no CRL in effect at ``now``."""
-    import datetime
-
-    when = datetime.datetime.fromtimestamp(now, tz=datetime.UTC)
-    in_effect = {block.issuer for block in blocks if block.this_update <= when}
+    in_effect = {block.issuer for block in blocks if crl_in_effect(block, now=now)}
     pending = [block for block in blocks if block.issuer not in in_effect]
     if not pending:
         return
@@ -466,6 +493,8 @@ def _refuse_crl_not_in_effect(blocks: Sequence[CrlBlock], *, label: str, now: fl
         "Give a CRL that is in effect now, or wait until then",
         issuer=first.issuer,
         takes_effect=first.this_update,
+        facts=facts,
+        blocks=blocks,
     )
 
 

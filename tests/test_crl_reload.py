@@ -49,6 +49,7 @@ from messagefoundry.config.loaded_crls import (
 )
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.config.tls_policy import (
+    CRL_CLOCK_SKEW_SECONDS,
     CrlNotInEffect,
     TrustAnchor,
     build_verifying_client_context,
@@ -61,7 +62,9 @@ from messagefoundry.pipeline.crl_reload import (
     FIX,
     LAPSES_FIRST,
     MAX_RELOADS,
+    NO_ISSUER,
     RESTART,
+    RETRY,
     WAIT,
     CrlReloadRunner,
     ReloadOutcome,
@@ -716,3 +719,251 @@ def test_the_cap_is_a_cert_monitor_setting() -> None:
     assert CertMonitorSettings().crl_max_reloads == MAX_RELOADS
     with pytest.raises(ValueError, match="crl_max_reloads"):
         CertMonitorSettings(crl_max_reloads=0)
+
+
+# --- round-three review findings --------------------------------------------------------------------
+
+
+def _ca_cert(
+    name: x509.Name,
+    key: ec.EllipticCurvePrivateKey,
+    issuer: x509.Name,
+    signer: ec.EllipticCurvePrivateKey,
+) -> x509.Certificate:
+    return (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - _DAY)
+        .not_valid_after(_NOW + 365 * _DAY)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), False
+        )
+        .add_extension(_ku(ca=True), critical=True)
+        .sign(signer, hashes.SHA256())
+    )
+
+
+def _make_intermediate_pki(d: Path) -> tuple[_Pki, Path]:
+    """A root, an intermediate it signed, and a leaf the intermediate signed. The CRL is the
+    intermediate's. The hop's CA file holds the root alone, as a partner's PKI often has it, and
+    the server sends the intermediate in its chain. Also returns a CA file holding both."""
+    pem = serialization.Encoding.PEM
+    root_key = ec.generate_private_key(ec.SECP256R1())
+    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-299-root")])
+    root = _ca_cert(root_name, root_key, root_name, root_key)
+    mid_key = ec.generate_private_key(ec.SECP256R1())
+    mid_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-299-intermediate")])
+    mid = _ca_cert(mid_name, mid_key, root_name, root_key)
+    mid_aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(mid_key.public_key())
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    serial = x509.random_serial_number()
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+        .issuer_name(mid_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(serial)
+        .not_valid_before(_NOW - _DAY)
+        .not_valid_after(_NOW + 90 * _DAY)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), False)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(mid_aki, False)
+        .add_extension(_ku(ca=False), critical=True)
+        .sign(mid_key, hashes.SHA256())
+    )
+    (d / "root.pem").write_bytes(root.public_bytes(pem))
+    (d / "root-and-intermediate.pem").write_bytes(root.public_bytes(pem) + mid.public_bytes(pem))
+    (d / "chain.pem").write_bytes(leaf.public_bytes(pem) + mid.public_bytes(pem))
+    (d / "leaf-key.pem").write_bytes(
+        leaf_key.private_bytes(pem, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    )
+    made = _Pki(
+        mid_key,
+        mid_name,
+        mid_aki,
+        root.public_bytes(pem),
+        d / "root.pem",
+        serial,
+        d / "chain.pem",
+        d / "leaf-key.pem",
+        d / "intermediate-crl.pem",
+    )
+    made.crl.write_bytes(made.crl_pem(issued=2 * _DAY, lasts=5.5 * _DAY))
+    return made, d / "root-and-intermediate.pem"
+
+
+def test_a_crl_from_an_intermediate_the_hop_does_not_list_is_retried_and_names_the_fix(
+    tmp_path: Path,
+) -> None:
+    pki, both = _make_intermediate_pki(tmp_path)
+    hop = pki.outbound_hop()  # root only: the server sends the intermediate
+    listed = build_verifying_client_context(
+        TrustAnchor(cafile=str(both), load_system_roots=False, crl_file=str(pki.crl))
+    )
+    assert _accepts(hop, pki.server()) and _accepts(listed, pki.server())
+
+    pki.crl.write_bytes(_fresher(pki))
+    outcome = _reload(pki)
+
+    # The hop that lists the intermediate takes the file. The other cannot verify the signature.
+    assert outcome is not None and outcome.reloaded == 1 and outcome.refusal is not None
+    assert outcome.refusal.remedy == NO_ISSUER and not outcome.refusal.sticky
+    assert "intermediate" in outcome.refusal.remedy and "CA file" in outcome.refusal.remedy
+    assert not _accepts(listed, pki.server())
+    assert _accepts(hop, pki.server())  # kept its copy, and was not told the refusal is final
+    # Retried on the next pass rather than refused for good.
+    again = _reload(pki)
+    assert again is not None and again.refusal == outcome.refusal
+    # Control: a restart applies the same file to a root-only hop, so the remedy is true.
+    assert not _accepts(pki.outbound_hop(), pki.server())
+
+
+def test_one_context_failing_does_not_stop_the_rest_or_stick(
+    pki: _Pki, caplog: pytest.LogCaptureFixture
+) -> None:
+    failing, other = pki.outbound_hop(), pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki))
+
+    def boom(binary_form: bool = False) -> list[bytes]:
+        raise RuntimeError("a defect in one context")
+
+    failing.get_ca_certs = boom  # type: ignore[method-assign, assignment]
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        outcome = _reload(pki)
+
+    assert outcome is not None and outcome.reloaded == 1 and outcome.refusal is not None
+    assert outcome.refusal.remedy == RETRY and not outcome.refusal.sticky
+    assert not _accepts(other, pki.server())  # loaded although the context before it failed
+    assert "to 1 running TLS context(s)" in caplog.text  # only the failed one is reported
+    del failing.get_ca_certs
+    retried = _reload(pki)
+    assert retried is not None and (retried.reloaded, retried.refusal) == (1, None)
+    assert not _accepts(failing, pki.server())
+
+
+def _in_minutes(minutes: float) -> datetime.timedelta:
+    """The ``issued`` that puts a CRL's thisUpdate ``minutes`` from the real now, not ``_NOW``."""
+    return _NOW - datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=minutes)
+
+
+def test_a_wait_never_outranks_a_context_at_the_cap(pki: _Pki) -> None:
+    capped = pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+    assert (first := _reload(pki, max_reloads=1)) is not None and first.reloaded == 1
+    fresh = pki.outbound_hop()  # built from that file, no reloads yet
+    pki.crl.write_bytes(pki.crl_pem(issued=-_DAY, lasts=90 * _DAY, revoke=True))  # not in effect
+
+    outcome = _reload(pki, max_reloads=1)
+
+    # Waiting would never apply the file to the capped hop, so the restart is what is reported.
+    assert outcome is not None and outcome.refusal is not None
+    assert outcome.refusal.remedy == RESTART and "reloads" in outcome.refusal.reason
+    assert not outcome.refusal.sticky  # the other hop's wait is still retried
+    assert _accepts(capped, pki.server()) and _accepts(fresh, pki.server())
+
+
+def test_a_wait_never_outranks_a_file_to_fix(pki: _Pki, tmp_path: Path) -> None:
+    hop = pki.outbound_hop()
+    (tmp_path / "planted").mkdir()
+    planted = _make_pki(tmp_path / "planted", "mefor-299-planted-ca")
+    future = pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True)
+    pki.crl.write_bytes(planted.ca_pem + future)
+
+    outcome = _reload(pki)
+
+    assert outcome is not None and outcome.refusal is not None
+    assert outcome.refusal.remedy == FIX and "does not already trust" in outcome.refusal.reason
+    assert _accepts(hop, pki.server())
+
+
+def test_the_superseding_rule_reports_a_restart_over_a_wait_and_the_last_lapse() -> None:
+    now = _NOW.timestamp()
+    # One held CRL is only waiting, another has no successor: the restart is the answer.
+    held = [_block("CN=a", 2, 5, b"a"), _block("CN=b", 2, 5, b"b")]
+    verdict = supersede_refusal(held, [_block("CN=a", -1, 30, b"a2")], now=now)
+    assert verdict is not None and verdict[1] == RESTART and "CN=b" in verdict[0]
+    # The hop holds an older CRL lapsing in 3 days beside a newer one lapsing in 30. Every peer is
+    # refused only once both lapse, so a successor in effect in 7 days is a plain wait.
+    overlap = [_block("CN=a", 4, 3, b"older"), _block("CN=a", 2, 30, b"newer")]
+    verdict = supersede_refusal(overlap, [_block("CN=a", -7, 30, b"next")], now=now)
+    assert verdict is not None and verdict[1] == WAIT
+
+
+@pytest.mark.parametrize(("minutes", "starts"), [(2, True), (10, False)])
+def test_a_start_allows_five_minutes_of_clock_skew(pki: _Pki, minutes: int, starts: bool) -> None:
+    assert CRL_CLOCK_SKEW_SECONDS == 300
+    pki.crl.write_bytes(pki.crl_pem(issued=_in_minutes(minutes), lasts=60 * _DAY))
+    if starts:
+        assert pki.outbound_hop().verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    else:
+        with pytest.raises(CrlNotInEffect, match="does not take effect until"):
+            pki.outbound_hop()
+
+
+@pytest.mark.parametrize(("minutes", "applied"), [(2, True), (10, False)])
+def test_a_reload_allows_five_minutes_of_clock_skew(pki: _Pki, minutes: int, applied: bool) -> None:
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(pki.crl_pem(issued=_in_minutes(minutes), lasts=60 * _DAY, revoke=True))
+
+    outcome = _reload(pki)
+
+    assert outcome is not None
+    if applied:
+        assert (outcome.reloaded, outcome.refusal) == (1, None)
+    else:
+        assert outcome.reloaded == 0 and outcome.refusal is not None
+        assert outcome.refusal.remedy == WAIT
+    # Either way the hop still admits the server now: OpenSSL keeps choosing the copy in effect.
+    assert _accepts(hop, pki.server())
+
+
+def test_one_context_loading_one_file_twice_is_one_record_and_one_reload(pki: _Pki) -> None:
+    hop = pki.outbound_hop()
+    harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
+    (held,) = held_crl_copies(pki.crl)
+    pki.crl.write_bytes(_fresher(pki))
+
+    outcome = _reload(pki)
+
+    assert outcome is not None and (outcome.reloaded, outcome.refusal) == (1, None)
+    assert len(held_crl_copies(pki.crl)) == 1
+    assert not _accepts(hop, pki.server())
+
+
+def test_a_refusal_is_forgotten_once_no_hop_holds_the_file(pki: _Pki) -> None:
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(pki.crl_pem(issued=10 * _DAY, lasts=-_DAY))
+    assert (refused := _reload(pki)) is not None and refused.refusal is not None
+    fingerprint = crl_fingerprint(pki.crl.read_bytes())
+    assert reload_refusal(pki.crl, fingerprint) is not None
+
+    del hop
+    assert _reload(pki) is None
+
+    assert reload_refusal(pki.crl, fingerprint) is None
+
+
+def test_the_runner_starts_no_thread_while_no_crl_is_held(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(crl_reload, "reload_replaced_crls", lambda **_: calls.append(1))
+
+    async def drive(hold: bool) -> None:
+        runner = CrlReloadRunner(interval_seconds=0.01)
+        held = pki.outbound_hop() if hold else None
+        runner.start()
+        await asyncio.sleep(0.2)
+        await runner.stop()
+        del held
+
+    asyncio.run(drive(hold=False))
+    assert calls == []
+    asyncio.run(drive(hold=True))
+    assert calls  # control: the same runner works once a CRL is held

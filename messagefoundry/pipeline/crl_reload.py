@@ -33,16 +33,29 @@ undone, so that is proved on a scratch context BEFORE the live one sees the byte
 signature must also verify against a CA certificate the hop lists for its issuer
 (:func:`~messagefoundry.pki.crl_signature_refusal`). OpenSSL checks that signature only at the
 handshake, so a badly signed CRL would otherwise load cleanly and then fail every handshake it judges.
-The live context then loads a private copy of the judged bytes in a directory only this account can
+The hop's list holds only its own trust store. An intermediate CA the peer sends in its handshake is
+not in it, so a CRL that intermediate issued is refused with :data:`NO_ISSUER`, which says to add the
+intermediate to the hop's CA file. That refusal is retried every pass, because a CA directory adds a
+CA to the store only when a handshake first needs it. The live context then loads a private copy of the judged bytes in a directory only this account can
 write, never the operator's file a second time. There is no check after the live load: a certificate
 count read then races the lazy loading of a hashed root directory, and nothing found there could be
 undone anyway. A refusal is logged at ERROR once per file version and recorded, so the expiry monitor
 says why the hop's copy is still old. The old copy keeps its ``crl_expiry`` alert.
 
+**One refusal is reported per file, the strongest.** Hops holding one file can need different things.
+A file to fix outranks a restart, and both outrank a wait (:data:`_PRECEDENCE`), because waiting would
+not apply the file. So a file not yet in effect is still checked for everything else. A failure inside
+one context is that context's refusal alone: the others are still tried, and it is retried next pass.
+
+**A CRL up to five minutes ahead counts as in effect**
+(:data:`~messagefoundry.config.tls_policy.CRL_CLOCK_SKEW_SECONDS`), at a start and here alike, so a
+CA's clock running a little fast does not hold a reload back.
+
 **A context's trust store only grows.** Each reload adds the file's CRLs and nothing removes the old
 ones, so memory and per-handshake CRL scoring grow with every reload. ``[cert_monitor].crl_max_reloads``
 bounds it (default :data:`MAX_RELOADS`): a context that has taken that many reloads for one file
-refuses the next, and a restart starts it afresh. The setting's comment gives the measured cost.
+refuses the next, and a restart starts it afresh. ``docs/CONFIGURATION.md`` gives the measured cost
+under that key.
 
 **What this does not reach.** At least these. Each needs a restart, or for the first, a reconnect:
 
@@ -58,8 +71,9 @@ live load mutates a context the loop may be handshaking with. OpenSSL takes the 
 to add a CRL and to look one up, so a handshake sees the store before or after the add, never torn.
 One lock serialises passes, so a pass left running by a stopped runner never overlaps the next.
 
-**A pass is cheap when nothing changed.** It reads each held file's size, modification time and file
-id, and reads the bytes only when one of those changed. It collects garbage only when some file needs
+**A pass is cheap when nothing changed.** With no CRL load recorded, the runner starts no thread. It
+reads each held file's size, modification time and file id, and reads the bytes only when one of
+those changed. It collects garbage only when some file needs
 a reload, so a context that is gone but caught in a reference cycle is not reloaded.
 
 Engine-side and stdlib plus ``cryptography`` (through :mod:`messagefoundry.pki`). It reads CRLs and
@@ -89,12 +103,19 @@ from messagefoundry.config.loaded_crls import (
     ReloadRefusal,
     clear_reload_refusal,
     crl_fingerprint,
+    has_held_copies,
     held_contexts,
+    prune_reload_refusals,
     record_reload_refusal,
     reload_refusal,
     replace_held_copy,
 )
-from messagefoundry.config.tls_policy import CrlNotInEffect, crl_label, judge_crl_bytes
+from messagefoundry.config.tls_policy import (
+    CrlNotInEffect,
+    crl_in_effect,
+    crl_label,
+    judge_crl_bytes,
+)
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
 
 __all__ = [
@@ -144,16 +165,25 @@ BAD_SIGNATURE = (
     "judges would then fail"
 )
 NO_ISSUER = (
-    "Fix the file: give a CRL from a CA this hop trusts. If the hop trusts that CA through a CA "
-    "directory, which the reload cannot list, a restart applies the file"
+    "Add the CA that issued the CRL, such as an intermediate CA the peer sends, to the hop's CA "
+    "file and restart the engine. The restart applies the file, and later reloads can then verify "
+    "the CRL's signature. If the hop trusts that CA through a CA directory or the system store, "
+    "which the reload cannot list, a restart alone applies the file"
 )
 RETRY = "The engine tries again every pass. Restart the engine to apply the file now"
 _NOT_PROVABLE = (
     "Give this setting a bare CRL. A restart applies the file only if the hop already trusts that "
     "certificate"
 )
-#: The refusals time can lift, so the reload judges the same bytes again on the next pass.
-_RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY})
+#: The refusals the reload judges again on the next pass, for the same bytes. Time can lift a
+#: WAIT. A CA directory adds a CA to the trust store only when a handshake first needs it, so a
+#: CA the reload could not list can appear later, which is why :data:`NO_ISSUER` is here too.
+_RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY, NO_ISSUER})
+#: Which remedy a refusal names when the contexts of one file disagree: the earliest here. A file
+#: to fix, then a restart, outrank a wait, because waiting would not apply the file.
+_PRECEDENCE = (FIX, BAD_SIGNATURE, _NOT_PROVABLE, RESTART, NO_ISSUER, LAPSES_FIRST, RETRY, WAIT)
+#: The remedies that say only time is missing.
+_TIME_ONLY = frozenset({WAIT, LAPSES_FIRST})
 
 
 @dataclass(frozen=True)
@@ -173,9 +203,11 @@ def _waiting(
     """The reason and remedy for a file whose CRL from ``issuer`` takes effect at ``takes_effect``.
 
     Waiting is right only when the hop's own copy for that issuer lasts until then. When it lapses
-    first, the hop refuses every peer in between, so the file must change instead."""
+    first, the hop refuses every peer in between, so the file must change instead. The hop lapses
+    when its LAST CRL for the issuer does: OpenSSL uses any CRL still in time, so an older held
+    block lapsing earlier refuses nobody."""
     reason = f"its CRL from issuer {issuer!r} is not in effect until {takes_effect.isoformat()}"
-    lapses = min((block.next_update for block in held if block.issuer == issuer), default=None)
+    lapses = max((block.next_update for block in held if block.issuer == issuer), default=None)
     if lapses is not None and lapses < takes_effect:
         return f"{reason}, and the copy the hop holds lapses earlier, at {lapses.isoformat()}", (
             LAPSES_FIRST
@@ -189,15 +221,16 @@ def supersede_refusal(
     """Why adding ``new`` to a context holding ``held`` would NOT leave it checking exactly ``new``,
     and the remedy, or ``None`` when it would. The module docstring gives the rule. The remedy is
     :data:`WAIT` or :data:`LAPSES_FIRST` when the only thing missing is time: the file has a
-    superseding CRL that is not in effect yet."""
+    superseding CRL that is not in effect yet. A held CRL nothing supersedes outranks one that is
+    only waiting, since waiting would not apply the file."""
     if not held:
         reason = (
             "the CRLs of the running copy were not recorded, so the engine cannot prove the file "
             "supersedes them"
         )
         return reason, RESTART
-    when = datetime.datetime.fromtimestamp(now, tz=datetime.UTC)
     same = {block.fingerprint for block in new}
+    waits: list[tuple[str, str]] = []
     for old in held:
         if old.fingerprint in same:
             continue
@@ -209,10 +242,11 @@ def supersede_refusal(
             and block.this_update > old.this_update
             and block.next_update >= old.next_update
         ]
-        if any(block.this_update <= when for block in candidates):
+        if any(crl_in_effect(block, now=now) for block in candidates):
             continue
         if candidates:
-            return _waiting(held, old.issuer, min(b.this_update for b in candidates))
+            waits.append(_waiting(held, old.issuer, min(b.this_update for b in candidates)))
+            continue
         reason = (
             f"it carries no CRL from issuer {old.issuer!r} that OpenSSL would choose over the one "
             f"the running hop holds (thisUpdate {old.this_update.isoformat()}, nextUpdate "
@@ -221,7 +255,7 @@ def supersede_refusal(
             "running hop can only add CRLs"
         )
         return reason, RESTART
-    return None
+    return min(waits, key=lambda wait: _PRECEDENCE.index(wait[1]), default=None)
 
 
 def _certificates_in(copy: Path, *, label: str) -> set[bytes]:
@@ -250,7 +284,8 @@ class _NotProvable(ValueError):
 
 
 class _Refusals:
-    """The first refusal of a pass for one file, kept whole, and whether every one was sticky."""
+    """The refusal of a pass for one file that outranks the rest (:data:`_PRECEDENCE`, the first
+    among equals), kept whole, and whether every one was sticky."""
 
     def __init__(self) -> None:
         self.first: tuple[str, str] | None = None
@@ -259,7 +294,8 @@ class _Refusals:
         self.error: BaseException | None = None
 
     def add(self, reason: str, remedy: str) -> None:
-        self.first = self.first or (reason, remedy)
+        if self.first is None or _PRECEDENCE.index(remedy) < _PRECEDENCE.index(self.first[1]):
+            self.first = (reason, remedy)
         self.sticky = self.sticky and remedy not in _RETRIED
 
 
@@ -379,10 +415,16 @@ def _reload_path(
     refusals = _Refusals()
     reloaded = 0
     try:
-        facts, blocks = judge_crl_bytes(pem, label=label, now=now)
+        not_yet: CrlNotInEffect | None = None
+        try:
+            facts, blocks = judge_crl_bytes(pem, label=label, now=now)
+        except CrlNotInEffect as exc:
+            # Only time is missing, so far. Go on: a context at the cap, a held CRL nothing
+            # supersedes, or a file to fix each outranks a wait, and must be the one reported.
+            facts, blocks, not_yet = exc.facts, exc.blocks, exc
         # The cheap rules first: a rollback refuses every context without touching a file.
         verdicts: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
-        ready: list[tuple[ssl.SSLContext, HeldCrl]] = []
+        ready: list[tuple[ssl.SSLContext, HeldCrl, tuple[str, str] | None]] = []
         for ctx, held in stale:
             if held.reloads >= max_reloads:
                 refusals.add(
@@ -393,18 +435,15 @@ def _reload_path(
                 continue
             if held.blocks not in verdicts:
                 verdicts[held.blocks] = supersede_refusal(held.blocks, blocks, now=now)
-            verdict = verdicts[held.blocks]
-            if verdict is None:
-                ready.append((ctx, held))
-            else:
-                why, remedy = verdict
-                refusals.add(f"{label}: {why}", remedy)
+            wait = verdicts[held.blocks]
+            if wait is not None and wait[1] not in _TIME_ONLY:
+                refusals.add(f"{label}: {wait[0]}", wait[1])
+                continue
+            if wait is None and not_yet is not None:
+                wait = _waiting(held.blocks, not_yet.issuer, not_yet.takes_effect)
+            ready.append((ctx, held, wait))
         if ready:
             reloaded = _load(pem, label, ready, refusals, fingerprint, facts, blocks)
-    except CrlNotInEffect as exc:
-        for _, held in stale:
-            why, remedy = _waiting(held.blocks, exc.issuer, exc.takes_effect)
-            refusals.add(f"{label}: {why}", remedy)
     except _NotProvable as exc:
         refusals.add(str(exc), _NOT_PROVABLE)
     except (ValueError, ssl.SSLError) as exc:
@@ -428,13 +467,18 @@ def _reload_path(
 def _load(
     pem: bytes,
     label: str,
-    ready: list[tuple[ssl.SSLContext, HeldCrl]],
+    ready: list[tuple[ssl.SSLContext, HeldCrl, tuple[str, str] | None]],
     refusals: _Refusals,
     fingerprint: tuple[int, int],
     facts: CrlFacts,
     blocks: tuple[CrlBlock, ...],
 ) -> int:
-    """Load the judged bytes into each context in ``ready`` that passes the per-context checks."""
+    """Load the judged bytes into each context in ``ready`` that passes the per-context checks.
+
+    A context paired with a wait gets the checks and then the wait, so a file to fix is reported
+    as one even before it takes effect. Returns how many contexts now hold the file. A failure in
+    one context is that context's refusal alone, retried next pass: the contexts already loaded
+    stay counted, and the rest are still tried."""
     reloaded = 0
     private = tempfile.mkdtemp(prefix="mefor-crl-")  # mode 0o700: only this account writes it
     try:
@@ -444,33 +488,46 @@ def _load(
         copy.write_bytes(pem)
         certificates = _certificates_in(copy, label=label)
         signatures: dict[frozenset[bytes], tuple[str, bool] | None] = {}
-        for ctx, held in ready:
-            anchors = frozenset(ctx.get_ca_certs(binary_form=True))
-            if certificates - anchors:
-                refusals.add(
-                    f"{label} carries a certificate this hop does not already trust; loading it "
-                    "would make it a trust anchor. Give this setting a bare CRL (BACKLOG #1890)",
-                    FIX,
-                )
-                continue
-            if anchors not in signatures:
-                signatures[anchors] = crl_signature_refusal(pem, anchors)
-            if (unsigned := signatures[anchors]) is not None:
-                why, found = unsigned
-                refusals.add(f"{label}: {why}", BAD_SIGNATURE if found else NO_ISSUER)
-                continue
-            ctx.load_verify_locations(cafile=str(copy))  # cafile= ONLY: cadata= loads no CRL
-            reloaded += replace_held_copy(
-                ctx,
-                held,
-                replace(
+        for ctx, held, wait in ready:
+            try:
+                anchors = frozenset(ctx.get_ca_certs(binary_form=True))
+                if certificates - anchors:
+                    refusals.add(
+                        f"{label} carries a certificate this hop does not already trust; loading "
+                        "it would make it a trust anchor. Give this setting a bare CRL (BACKLOG "
+                        "#1890)",
+                        FIX,
+                    )
+                    continue
+                if anchors not in signatures:
+                    signatures[anchors] = crl_signature_refusal(pem, anchors)
+                if (unsigned := signatures[anchors]) is not None:
+                    why, found = unsigned
+                    refusals.add(f"{label}: {why}", BAD_SIGNATURE if found else NO_ISSUER)
+                    continue
+                if wait is not None:
+                    refusals.add(f"{label}: {wait[0]}", wait[1])
+                    continue
+                ctx.load_verify_locations(cafile=str(copy))  # cafile= ONLY: cadata= loads no CRL
+                reloaded += replace_held_copy(
+                    ctx,
                     held,
-                    fingerprint=fingerprint,
-                    facts=facts,
-                    blocks=blocks,
-                    reloads=held.reloads + 1,
-                ),
-            )
+                    replace(
+                        held,
+                        fingerprint=fingerprint,
+                        facts=facts,
+                        blocks=blocks,
+                        reloads=held.reloads + 1,
+                    ),
+                )
+            except Exception as exc:
+                # Not a verdict on the file: the scratch context loaded these same bytes. So it
+                # is never sticky, and one context's failure does not stop the others.
+                refusals.add(
+                    f"{label}: the reload failed for a running context ({type(exc).__name__})",
+                    RETRY,
+                )
+                refusals.error = refusals.error or exc
     finally:
         try:
             shutil.rmtree(private)
@@ -538,6 +595,7 @@ def _pending() -> tuple[dict[str, _Change], list[ReloadOutcome]]:
         for gone in [key for key in state if key not in by_path]:
             del state[gone]
     _UNREADABLE.intersection_update(by_path)
+    prune_reload_refusals(by_path)
     pending: dict[str, _Change] = {}
     refused: list[ReloadOutcome] = []
     for key, pairs in by_path.items():
@@ -603,6 +661,10 @@ class CrlReloadRunner:
     ) -> None:
         self._interval = interval_seconds
         self._reload = reload or functools.partial(reload_replaced_crls, max_reloads=max_reloads)
+        # With no CRL load recorded there is nothing to reload, so no worker thread is started.
+        self._idle: Callable[[], bool] = (
+            (lambda: False) if reload else (lambda: not has_held_copies())
+        )
         self._stop_timeout = stop_timeout_seconds
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -647,6 +709,8 @@ class CrlReloadRunner:
                 await asyncio.wait_for(self._stop.wait(), self._interval)
             if self._stop.is_set():
                 return
+            if self._idle():
+                continue
             try:
                 await asyncio.to_thread(self._reload)
             except Exception:
