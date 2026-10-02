@@ -66,51 +66,9 @@ WebSocket API (FastAPI/uvicorn). The same API serves three deployments without c
 We deliberately did **not** start with two separate processes + hand-rolled IPC. The
 logical boundary (library API) comes first; physical split is a deployment choice.
 
-The same topology as a rendered diagram — clients are separate processes (or a browser) that reach
-the engine only through the API, and the engine packages never import `api`:
-
-```mermaid
-flowchart TB
-  classDef client fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
-  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
-  classDef engine fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
-  classDef deploy fill:#eceff1,stroke:#546e7a,color:#1c2429;
-
-  CON["Web console /ui<br/>(browser)"]:::client
-  IDE["VS Code extension"]:::client
-  HARNESS["Test harness<br/>(PySide6)"]:::client
-
-  subgraph API_BND["API — localhost 127.0.0.1 · auth + RBAC · the only external surface"]
-    API["api/ — FastAPI + uvicorn<br/>HTTP + WebSocket"]:::api
-    AUTH["auth/ — authn + RBAC<br/>deny-by-default · hash-chained audit"]:::api
-  end
-
-  subgraph ENGINE["Engine — headless asyncio service (no GUI imports)"]
-    PIPE["pipeline/ — RegistryRunner<br/>listener · router · transform · delivery workers"]:::engine
-    TRANS["transports/ — connector registry<br/>MLLP · File · X12 · DICOM C-STORE SCP (TCP/HTTP/DB planned)"]:::engine
-    PARSE["parsing/ — pure HL7/X12/DICOM library<br/>built-in HL7 parser · hl7apy · X12 codec · DICOM codec · base64 binary codec"]:::engine
-    STORE[("store/ — staged queue<br/>SQLite WAL · SQL Server · AES-256-GCM")]:::engine
-    CFG["config/ — code-first wiring<br/>Connections · Routers · Handlers · environments/"]:::engine
-  end
-
-  NSSM["NSSM Windows service<br/>(messagefoundry serve)"]:::deploy
-
-  CON -.->|"HTTP/WS API client"| API
-  IDE -.->|"HTTP"| API
-  HARNESS -.->|"MLLP send/receive"| TRANS
-  CON -.->|"may import (pure lib)"| PARSE
-
-  API --> AUTH
-  API ==>|"depends on engine"| PIPE
-
-  PIPE --> TRANS
-  PIPE --> PARSE
-  PIPE --> STORE
-  PIPE --> CFG
-  TRANS --> PARSE
-
-  NSSM ==> ENGINE
-```
+The topology diagram is in the System topology section of
+[architecture-diagram.md](architecture-diagram.md): clients are separate processes (or a browser)
+that reach the engine only through the API, and the engine packages never import `api`.
 
 ## The message store *is* the queue
 
@@ -176,51 +134,8 @@ transactions/message for a single-handler message; +1 per extra handler) — rec
 per-inbound `ack_after=delivered` (defer the ACK until delivery succeeds) is planned but not built —
 the pipeline is ACK-on-receipt only.
 
-The same staged flow as a rendered diagram:
-
-```mermaid
-flowchart TB
-  classDef stage fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
-  classDef worker fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
-  classDef disp fill:#ede7f6,stroke:#5e35b1,color:#22103f;
-  classDef io fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
-
-  SRC(["Inbound connection<br/>MLLP / File"]):::io
-  LISTEN["Listener<br/>decode · parse · (strict-validate)"]:::worker
-  NAK["NAK (AR/AE) + ERROR<br/>synchronous, pre-ingress"]:::disp
-
-  ING[("ingress stage<br/>raw committed")]:::stage
-  ACK(["ACK (AA) — on receipt"]):::io
-  RW["Router worker (per inbound)<br/>run @router — pure"]:::worker
-  ROUTED[("routed stage<br/>one row per selected handler")]:::stage
-  TW["Transform worker (per inbound)<br/>run @handler transform — pure"]:::worker
-  OUT[("outbound stage<br/>one row per destination")]:::stage
-  DW["Delivery worker (per outbound)<br/>idempotent send · retry · dead-letter"]:::worker
-  DEST(["Outbound connection(s)"]):::io
-
-  FIN{{"Store finalizer<br/>single disposition authority"}}:::disp
-  D1["RECEIVED"]:::disp
-  D2["ROUTED / UNROUTED"]:::disp
-  D3["PROCESSED / FILTERED<br/>NOT_DEPLOYED / ERROR"]:::disp
-
-  SRC --> LISTEN
-  LISTEN -->|"decode/parse/validate fail"| NAK
-  LISTEN -->|"ok"| ING
-  ING --> ACK
-  ING ==>|"committed txn"| RW
-  RW ==>|"committed txn"| ROUTED
-  ROUTED ==>|"committed txn"| TW
-  TW ==>|"committed txn"| OUT
-  OUT --> DW
-  DW --> DEST
-
-  ING -.->|"records"| D1
-  RW -.->|"records"| D2
-  DW -.->|"records"| D3
-  D1 -.-> FIN
-  D2 -.-> FIN
-  D3 -.-> FIN
-```
+The staged flow diagram is in the Runtime message flow section of
+[architecture-diagram.md](architecture-diagram.md).
 
 ## Concurrency
 
@@ -266,27 +181,9 @@ Connections/Routers/Handlers are authored against the `messagefoundry` surface
 (`inbound`/`outbound`/`@router`/`@handler`/`Send`/`MLLP`/`File`/`Message`); a directory of such
 modules loads via `load_config` into a `Registry` that the engine's `RegistryRunner` runs.
 
-The configuration graph wired by name (no enclosing "channel" object) as a rendered diagram:
-
-```mermaid
-flowchart LR
-  classDef conn fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
-  classDef router fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
-  classDef handler fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
-
-  IB["inbound: IB_ACME_ADT<br/>(MLLP)"]:::conn
-  R(["@router<br/>sees every message · filters · forwards by name"]):::router
-  H1["@handler: to_EHR<br/>filter → transform"]:::handler
-  H2["@handler: to_archive<br/>filter → transform"]:::handler
-  OB1["outbound: OB_EHR_ADT<br/>(MLLP)"]:::conn
-  OB2["outbound: OB_ARCHIVE<br/>(File)"]:::conn
-
-  IB -->|"names a router"| R
-  R -->|"forward to handler(s)"| H1
-  R --> H2
-  H1 -->|"Send → outbound"| OB1
-  H2 -->|"Send → outbound"| OB2
-```
+The configuration graph diagram is in the Config wiring graph section of
+[architecture-diagram.md](architecture-diagram.md): the graph is wired by name, with no enclosing
+"channel" object.
 
 ## PHI / security
 

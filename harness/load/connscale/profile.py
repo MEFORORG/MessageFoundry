@@ -19,6 +19,7 @@ so a broken profile is rejected before any engine is spawned. All numbers are ge
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -124,6 +125,7 @@ _SLO_KEYS = frozenset(
         "max_drain_seconds",
         "fd_monotonic",
         "empty_claims_base_reading",
+        "empty_claims_herd_floor_legs",
     }
 )
 
@@ -143,9 +145,14 @@ class ConnScaleSlo:
     # `empty_claims_base_reading` is NOT a slope -- it asserts that each per_lane lane produced a
     # STRICTLY POSITIVE empty-claims-per-message reading at the BASE connection count. The vs-N form it
     # replaced asserted a rise the healthy population does not have. The harvest that measured that is
-    # recorded ONCE, in BACKLOG #1211, and is deliberately not restated here. The predicted herd floor
-    # that would restore a real expectation is computed and recorded on every run but is NOT enforced,
-    # pending BACKLOG #1415.
+    # recorded ONCE, in BACKLOG #1211, and is deliberately not restated here.
+    #
+    # `empty_claims_herd_floor_legs` ARMS THE PREDICTED HERD FLOOR, AND ONLY ON THE CI LEGS IT NAMES
+    # (BACKLOG #1415). A leg is `<matrix os>-py<python version>`, as ci.yml's `Tests (pytest)` step
+    # exports it in MEFOR_CONNSCALE_LEG; on any other leg, and on every local run, the floor stays
+    # recorded and not graded. A leg is named only once its own harvest cleared #1415's arming rule
+    # at THIS profile's base count and rates; the floor's evidence is per leg, so it is never pooled.
+    # Empty is the default and means recorded-only everywhere.
     #
     # `empty_claims_base_reading` GRADES ONLY `per_lane` LANES: the herd prediction behind it assumes
     # one worker set per lane per stage, which a pooled dispatcher does not satisfy. So a profile that
@@ -153,6 +160,7 @@ class ConnScaleSlo:
     # check that grades nothing and passes every time.
     fd_monotonic: bool = False
     empty_claims_base_reading: bool = False
+    empty_claims_herd_floor_legs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -395,14 +403,68 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
     # Those two rules compose into a gate that CANNOT FAIL: a pooled-only profile that armed this check
     # would report a green wall #3 on every run while measuring nothing, and nothing downstream would
     # report a problem. Reject it at PARSE time instead. This is structural, decided from the profile
-    # alone before any engine is spawned, so it cannot flake on a runner.
-    if profile.slo.empty_claims_base_reading and PER_LANE not in profile.claim_modes:
+    # alone before any engine is spawned, so it cannot flake on a runner. The armed herd floor reads
+    # the same per_lane base readings, so the same argument applies to it (BACKLOG #1415).
+    per_lane_only = {
+        "empty_claims_base_reading": profile.slo.empty_claims_base_reading,
+        "empty_claims_herd_floor_legs": bool(profile.slo.empty_claims_herd_floor_legs),
+    }
+    # The floor grades the FIRST record at the base count in each lane (`herd_floor_readings`), so a
+    # repeat trial would be recorded and never graded: refuse the pairing rather than grade one of N.
+    if profile.slo.empty_claims_herd_floor_legs and profile.trials > 1:
         raise ConnScaleProfileError(
-            f"{where}: slo.empty_claims_base_reading = true needs {PER_LANE!r} in claim_modes -- the "
-            f"check grades only per_lane lanes, so with claim_modes={list(profile.claim_modes)} it "
-            f"would grade zero lanes and pass on every run; add {PER_LANE!r} to claim_modes, or set "
-            f"empty_claims_base_reading = false"
+            f"{where}: slo.empty_claims_herd_floor_legs grades one base reading per lane, so it "
+            f"cannot be armed with trials = {profile.trials}"
         )
+    for key, armed in per_lane_only.items():
+        if armed and PER_LANE not in profile.claim_modes:
+            raise ConnScaleProfileError(
+                f"{where}: slo.{key} needs {PER_LANE!r} in claim_modes -- the check grades only "
+                f"per_lane lanes, so with claim_modes={list(profile.claim_modes)} it would grade "
+                f"zero lanes and pass on every run; add {PER_LANE!r} to claim_modes, or unset {key}"
+            )
+
+
+def _legs_from(raw: Any, where: str) -> tuple[str, ...]:
+    """Parse ``empty_claims_herd_floor_legs``: absent -> ``()``; else a list of CI legs.
+
+    Each entry must match :data:`_LEG` after stripping surrounding space, ASCII only; anything else
+    is refused with the shape error, never kept. Duplicates collapse, first-seen order kept.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConnScaleProfileError(f"{where}: 'empty_claims_herd_floor_legs' must be a list")
+    # A dict keeps first-seen order and dedupes in one pass, so many entries cost linear time too.
+    out: dict[str, None] = {}
+    for item in raw:
+        leg = item.strip() if isinstance(item, str) else None
+        # The shape is checked, not just non-emptiness: the harvest report prints a leg with a SPACE
+        # ("ubuntu-latest py3.14"), and a leg copied from it would parse, never match, and disarm the
+        # floor with nothing reporting it.
+        if leg is None or not _LEG.fullmatch(leg):
+            # ascii(), so a full-width digit shows as its escape rather than as a look-alike.
+            raise ConnScaleProfileError(
+                f"{where}: every 'empty_claims_herd_floor_legs' entry must name a CI leg as "
+                f"'<os>-py<version>' in ASCII letters, digits, '.', '_' and '-', with no spaces, "
+                f"e.g. 'ubuntu-latest-py3.14'; got {ascii(item)}"
+            )
+        out.setdefault(leg, None)
+    return tuple(out)
+
+
+#: A CI leg in the ``<matrix os>-py<python version>`` shape ci.yml exports in MEFOR_CONNSCALE_LEG.
+#: A shape check only: it cannot tell a real leg from a well-formed one the matrix never runs.
+#:
+#: ASCII ONLY, twice over: ``[0-9]`` and never ``\d``, and compiled with ``re.ASCII`` so a later
+#: ``\d`` or ``\w`` cannot quietly widen it. A ``str`` pattern's ``\d`` also matches full-width and
+#: other Unicode digits, and a leg spelled with them would parse, never equal the ASCII value ci.yml
+#: exports, and silently disarm the floor: a fail-open on a gate.
+#:
+#: The version group is POSSESSIVE (``*+``): nothing follows it under ``fullmatch``, so it changes no
+#: decision, and it never gives characters back, which is the mitigation
+#: ``tests/test_security_static.py``'s nested-quantifier gate recognises.
+_LEG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*-py[0-9]+(?:\.[0-9]+)*+", re.ASCII)
 
 
 def _claim_modes_from(raw: Any, where: str) -> tuple[str, ...]:
@@ -498,6 +560,7 @@ def _slo_from(raw: Any, where: str) -> ConnScaleSlo:
         max_drain_seconds=_opt_float_or_none(raw, "max_drain_seconds", where, minimum=0.0),
         fd_monotonic=_opt_bool(raw, "fd_monotonic", where, default=False),
         empty_claims_base_reading=_opt_bool(raw, "empty_claims_base_reading", where, default=False),
+        empty_claims_herd_floor_legs=_legs_from(raw.get("empty_claims_herd_floor_legs"), where),
     )
 
 

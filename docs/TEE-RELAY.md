@@ -16,12 +16,47 @@ cut over — with rollback being "just stop the relay."
 
 ## What it does
 
-```
-                      ┌───────────────────────────► Corepoint   (production — unchanged)
-   Epic ──MLLP──►  tee relay  (always ACK on receipt)
-                      └───────────────────────────► MEFOR        (shadow — egress suppressed)
+### The relay forwards to production and copies to the shadow
 
-   Corepoint ──(duplicate-send copy)──► tee relay ──► MEFOR       (the reverse feed, for comparison)
+This diagram shows where each copy of a message goes during a parallel run. The source sends MLLP to
+the tee relay, which always ACKs on receipt and forwards the unchanged bytes to Corepoint, the
+production path. Once Corepoint answers, the relay queues a copy for MEFOR, the shadow instance,
+whose own outbound Connections are set to `simulate` mode so that its egress is suppressed. An
+optional second listener takes the copies Corepoint sends of its own output, the reverse feed, for
+comparison.
+
+**Legend.** A dotted arrow is an MLLP hop between processes. A solid arrow stays inside the relay
+process and its SQLite file: a queued copy, a log row, or a captured body. The tee relay is one
+process and imports no engine code. Grey is a system outside MessageFoundry, pink is the tee relay,
+green is the shadow MessageFoundry instance, and orange is a store.
+
+```mermaid
+flowchart LR
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef standalone fill:#fce4ec,stroke:#c2185b,color:#3d0a1f;
+
+  EPIC(["Epic<br/>the upstream source"]):::ext
+  COREPOINT(["Corepoint<br/>production, unchanged"]):::ext
+  MEFOR["MEFOR, the shadow instance<br/>outbound Connections in simulate mode<br/>egress suppressed"]:::core
+
+  subgraph TEE["Tee relay, python -m tee"]
+    TEE_A["Listener A, the tee<br/>always ACKs AA on receipt"]:::standalone
+    TEE_B["Listener B, the copy feed, optional<br/>ACKs AA on receipt"]:::standalone
+    TEE_QUEUE["Shadow queue and worker<br/>bounded, in memory"]:::standalone
+    TEE_DB[("SQLite database<br/>the only store the relay has")]:::store
+  end
+
+  EPIC -.->|"MLLP"| TEE_A
+  TEE_A -.->|"MLLP, unchanged bytes<br/>the production leg"| COREPOINT
+  TEE_A -->|"copy, once the production leg answers"| TEE_QUEUE
+  COREPOINT -.->|"MLLP, duplicate-send copy<br/>the reverse feed, for comparison"| TEE_B
+  TEE_B -->|"copy"| TEE_QUEUE
+  TEE_QUEUE -.->|"MLLP, unchanged bytes<br/>the shadow leg"| MEFOR
+  TEE_A -->|"logs the corepoint leg<br/>captures the body when switched on"| TEE_DB
+  TEE_B -->|"captures the body when switched on"| TEE_DB
+  TEE_QUEUE -->|"logs the mefor leg"| TEE_DB
 ```
 
 * **Listener A — the tee (`--listen-epic`).** Repoint Epic's outbound at the relay. For every message it
