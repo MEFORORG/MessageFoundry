@@ -4068,9 +4068,10 @@ Two controls answer it, and they differ in strength:
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
 - **The engine process itself refuses the script.** `serve` and `supervise` start through a
-  console-script launcher, which cannot pass that option. So each installs an audit hook as its
-  first step (`messagefoundry/remotedebug.py`). The interpreter raises an event before it runs an
-  injected script, the hook raises on it, and the interpreter drops the script.
+  console-script launcher, which cannot pass that option. So the command line installs an audit
+  hook as it starts, for every command (`messagefoundry/remotedebug.py`). The interpreter raises
+  an event before it runs an injected script, the hook raises on it, and the interpreter drops
+  the script.
 
 The hook is the weaker of the two, so an engine that starts with the interface on reports it as
 the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported, what

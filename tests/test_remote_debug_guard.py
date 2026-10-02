@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The engine process refuses a script injected through the interpreter's remote debugging, and
-reports the interpreter setting (vault BACKLOG #2700).
+reports the interpreter setting (vault BACKLOG #2700, #2742).
 
 Python 3.14 lets another process run a script inside a running interpreter (PEP 768,
 ``sys.remote_exec``). ``messagefoundry/remotedebug.py`` installs an audit hook that raises on the
@@ -103,6 +103,15 @@ pathlib.Path(final).write_text(str(remote_debug_posture().refused_scripts), enco
 """
 
 
+def _child_env() -> dict[str, str]:
+    """The environment for a child interpreter that must accept injected scripts and must import
+    the tree under test, ahead of whatever copy is installed."""
+    env = dict(os.environ)
+    env.pop("PYTHON_DISABLE_REMOTE_DEBUG", None)
+    env["PYTHONPATH"] = str(_REPO)
+    return env
+
+
 def _wait_for(condition: Callable[[], object], what: str) -> None:
     deadline = time.monotonic() + _WAIT
     while not condition():
@@ -132,11 +141,6 @@ class _Target:
         )
         target = directory / "target.py"
         target.write_text(_TARGET, encoding="utf-8")
-        env = dict(os.environ)
-        # The target must accept injected scripts, or neither arm measures anything.
-        env.pop("PYTHON_DISABLE_REMOTE_DEBUG", None)
-        # The tree under test, ahead of whatever copy is installed.
-        env["PYTHONPATH"] = str(_REPO)
         with open(self.stderr, "wb") as stderr:
             self.process = subprocess.Popen(
                 [
@@ -148,7 +152,8 @@ class _Target:
                     str(self.stop),
                     str(self.final),
                 ],
-                env=env,
+                # The target must accept injected scripts, or neither arm measures anything.
+                env=_child_env(),
                 stderr=stderr,
             )
 
@@ -357,6 +362,15 @@ def test_a_long_file_name_is_cut(reports: queue.SimpleQueue[str]) -> None:
     assert len(reports.get_nowait()) == remotedebug._FILE_NAME_LIMIT
 
 
+def test_the_logged_name_keeps_its_bound_once_escaped(caplog: pytest.LogCaptureFixture) -> None:
+    """Each of these characters is ten characters long as an escape, so a name the hook cut to
+    the limit would otherwise be logged at ten times it."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.remotedebug"):
+        remotedebug._report("\U0001f600" * remotedebug._FILE_NAME_LIMIT)
+    logged = caplog.records[-1].getMessage().split("script file name ")[1].split(")")[0]
+    assert len(logged) == remotedebug._FILE_NAME_LIMIT
+
+
 # --- the refusal line and the log sinks (vault BACKLOG #2742) -----------------------------------
 
 #: File names the injecting process could choose, and how the log must spell each. Written as
@@ -390,7 +404,6 @@ class _Sinks:
     socket this object holds."""
 
     def __init__(self, directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.directory = directory
         self.log = directory / "engine.log"
         self._stdout = io.BytesIO()
         # Held here: dropping the wrapper would close the buffer under it.
@@ -416,18 +429,18 @@ class _Sinks:
         return self.log.read_text("utf-8")
 
     def rolled_aside(self) -> list[str]:
-        return sorted(p.name for p in self.directory.iterdir() if ".broken-" in p.name)
+        return sorted(p.name for p in self.log.parent.iterdir() if ".broken-" in p.name)
 
     def states(self) -> dict[str, str]:
         guard = active_guard()
         assert guard is not None
         return {status.sink: status.state for status in guard.status()}
 
-    def forwarded(self, wait: float) -> str:
-        """Every datagram that arrives within ``wait`` seconds, or up to the refusal line."""
+    def forwarded(self, until: str) -> str:
+        """Every datagram the collector receives, up to the one that holds ``until``."""
         received = ""
-        deadline = time.monotonic() + wait
-        while REMOTE_SCRIPT_EVENT not in received and time.monotonic() < deadline:
+        deadline = time.monotonic() + _WAIT
+        while until not in received and time.monotonic() < deadline:
             try:
                 received += self.collector.recvfrom(65535)[0].decode("utf-8")
             except TimeoutError:
@@ -463,7 +476,7 @@ def test_the_refusal_line_reaches_every_sink_whatever_the_file_name(
     assert REMOTE_SCRIPT_EVENT in sinks.in_file() and wanted in sinks.in_file()
     assert wanted in sinks.on_stdout()
     # The forwarder renders JSON, so a backslash in the name arrives doubled.
-    assert json.dumps(wanted)[1:-1] in sinks.forwarded(_WAIT)
+    assert json.dumps(wanted)[1:-1] in sinks.forwarded(REMOTE_SCRIPT_EVENT)
     assert sinks.rolled_aside() == []
     assert sinks.states() == {"stdout": "healthy", "file": "healthy"}
 
@@ -483,9 +496,13 @@ def test_without_the_escape_a_lone_surrogate_keeps_the_line_out_of_every_sink(
     remotedebug._report("pay\udcffload.py")
     assert REMOTE_SCRIPT_EVENT not in sinks.in_file()
     assert REMOTE_SCRIPT_EVENT not in sinks.on_stdout()
-    assert REMOTE_SCRIPT_EVENT not in sinks.forwarded(1.0)
     assert len(sinks.rolled_aside()) == 1
     assert sinks.states() == {"stdout": "unwritable", "file": "unwritable"}
+    # The forwarder sends in order. A later line that arrives with no refusal line ahead of it
+    # shows the refusal line was not sent, without waiting out a timeout to prove an absence.
+    logging.getLogger("tests.remote_debug_guard").warning("a later line")
+    forwarded = sinks.forwarded("a later line")
+    assert "a later line" in forwarded and REMOTE_SCRIPT_EVENT not in forwarded
 
 
 # --- installing --------------------------------------------------------------------------------
@@ -755,7 +772,139 @@ async def test_the_posture_route_reads_the_live_process_when_nothing_is_pinned(
     assert await _route_names(engine) == ([] if entry is None else [entry[0]])
 
 
-# --- serve and supervise install it before anything else ---------------------------------------
+# --- the command line installs it before anything else (vault BACKLOG #2742) --------------------
+
+# Run in a fresh interpreter, because this process imported the command line long ago. It records
+# which engine modules were loaded at the moment the guard's hook was added.
+_INSTALL_PROBE = """\
+import json
+import sys
+
+from messagefoundry.remotedebug import remote_debug_posture
+
+out, mode = sys.argv[1:3]
+real = sys.addaudithook
+loaded_at_install = []
+
+
+def recording(hook):
+    loaded_at_install.append(sorted(m for m in sys.modules if m.startswith("messagefoundry")))
+    real(hook)
+
+
+sys.addaudithook = recording
+before = remote_debug_posture().guard_installed
+try:
+    if mode == "import":
+        import messagefoundry.__main__
+    elif mode == "run":
+        import runpy
+
+        sys.argv = ["messagefoundry", "--version"]
+        runpy.run_module("messagefoundry", run_name="__main__")
+except SystemExit:
+    pass
+finally:
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "enabled": sys.is_remote_debug_enabled(),
+                "before": before,
+                "after": remote_debug_posture().guard_installed,
+                "loaded_at_install": loaded_at_install,
+            },
+            fh,
+        )
+"""
+
+#: What the guard itself needs. Anything more at the moment of the install is an import that ran
+#: ahead of it, and a longer window for a script injected at start-up.
+_GUARD_NEEDS = {"messagefoundry", "messagefoundry.controlchars", "messagefoundry.remotedebug"}
+
+
+def _install_probe(tmp_path: Path, mode: str) -> dict[str, object]:
+    script = tmp_path / "install_probe.py"
+    script.write_text(_INSTALL_PROBE, encoding="utf-8")
+    out = tmp_path / f"{mode}.json"
+    proc = subprocess.run(
+        [sys.executable, str(script), str(out), mode],
+        env=_child_env(),
+        capture_output=True,
+        text=True,
+        timeout=50,  # under the suite's per-test watchdog, so a hung probe still reports stderr
+    )
+    assert proc.returncode == 0 and out.exists(), proc.stderr[-2000:]
+    reading: dict[str, object] = json.loads(out.read_text(encoding="utf-8"))
+    return reading
+
+
+@pytest.mark.parametrize(
+    ("mode", "own_module"),
+    [
+        # The console-script launcher imports `main` from the module.
+        pytest.param("import", {"messagefoundry.__main__"}, id="imported"),
+        # `python -m messagefoundry --version`: a command that is not `serve`.
+        pytest.param("run", set(), id="run-as-a-module"),
+    ],
+)
+def test_the_command_line_installs_the_guard_ahead_of_its_other_imports(
+    tmp_path: Path, mode: str, own_module: set[str]
+) -> None:
+    reading = _install_probe(tmp_path, mode)
+    assert reading["enabled"] is True, "the probe was started with remote debugging off"
+    assert reading["before"] is False and reading["after"] is True
+    # Added once, and with nothing of the engine loaded but what the guard itself imports.
+    assert reading["loaded_at_install"] == [sorted(_GUARD_NEEDS | own_module)]
+
+
+def test_the_probe_alone_installs_nothing(tmp_path: Path) -> None:
+    """CONTROL for the test above: the same probe, which imports the guard's own module, without
+    the command line. The guard is not there, so the True above came from importing the
+    command-line module and from nowhere else."""
+    reading = _install_probe(tmp_path, "library")
+    assert reading["enabled"] is True
+    assert reading["before"] is False and reading["after"] is False
+    assert reading["loaded_at_install"] == []
+
+
+def _ahead_of_the_install(source: str) -> list[str]:
+    """One entry for each module-level statement of ``source`` that stands ahead of the bare
+    ``install_remote_debug_guard()`` call."""
+    ahead: list[str] = []
+    for node in parse_source(source).body:
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and callee_name(node.value, bare_only=True) == "install_remote_debug_guard"
+        ):
+            return ahead
+        if isinstance(node, ast.ImportFrom):
+            ahead.append(f"from {node.module}")
+        elif isinstance(node, ast.Import):
+            ahead.extend(f"import {alias.name}" for alias in node.names)
+        elif ast.get_docstring(ast.Module(body=[node], type_ignores=[])) is not None:
+            ahead.append("docstring")
+        else:
+            ahead.append(type(node).__name__)
+    raise AssertionError("no module-level call to install_remote_debug_guard()")
+
+
+def test_nothing_but_the_guard_import_stands_ahead_of_the_install() -> None:
+    """The child probe above counts engine modules only. Any other import placed above the call
+    would lengthen the start-up window unseen, so the source is read as well."""
+    source = (_REPO / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    guard_only = ["docstring", "from __future__", "from messagefoundry.remotedebug"]
+    assert _ahead_of_the_install(source) == guard_only
+    # CONTROL: an import placed above the call is seen, so the check above could have failed.
+    late = (
+        '"""Doc."""\nfrom __future__ import annotations\nimport argparse\n'
+        "from messagefoundry.remotedebug import install_remote_debug_guard\n"
+        "install_remote_debug_guard()\nimport json\n"
+    )
+    assert _ahead_of_the_install(late) == [*guard_only[:2], "import argparse", guard_only[2]]
+
+
+# --- serve and supervise still make the call first ----------------------------------------------
 
 
 def _first_statement_installs_the_guard(source: str, function: str) -> bool:
@@ -774,7 +923,8 @@ def _first_statement_installs_the_guard(source: str, function: str) -> bool:
 
 @pytest.mark.parametrize("function", ["_serve", "_supervise"])
 def test_serve_and_supervise_install_the_guard_first(function: str) -> None:
-    """Before the imports and before config: a script injected ahead of the hook runs."""
+    """Before the imports and before config. The command line has installed it by then, so this
+    call normally adds nothing. It predates the install at import and is still in place."""
     source = (_REPO / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
     assert _first_statement_installs_the_guard(source, function)
 

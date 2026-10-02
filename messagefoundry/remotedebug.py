@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Refuse a script injected into the engine through the interpreter's remote debugging (vault
-BACKLOG #2700).
+BACKLOG #2700, #2742).
 
 **What this is about.** Python 3.14 (PEP 768) lets another process ask a running interpreter to
 execute a script file: ``sys.remote_exec(pid, path)``. The caller needs the right to write the
@@ -11,7 +11,7 @@ Ubuntu ships it, only a parent process or one with ``CAP_SYS_PTRACE`` has it. Th
 on unless the interpreter was started with ``-X disable-remote-debug`` or
 ``PYTHON_DISABLE_REMOTE_DEBUG=1``. The engine's children are started with the option
 (``messagefoundry/childenv.py``). The engine itself is started through a console-script launcher,
-which cannot pass an interpreter option, so ``serve`` and ``supervise`` would start with it on.
+which cannot pass an interpreter option, so every ``messagefoundry`` command would start with it on.
 
 **What this does.** Before it runs an injected script, the target interpreter raises the audit
 event ``cpython.remote_debugger_script``, and it does not run the script when an audit hook raises.
@@ -23,10 +23,13 @@ the interpreter's and could change under this module.
 **What this is not.** The hook closes the interpreter's own injection interface, from the moment
 it is installed. At least two things stay open. A script injected earlier in start-up runs: the
 process has to import this module and reach the install call first, and a caller that can restart
-the engine can aim for that window. And the capability underneath is untouched: a process that
-can write this process's memory can run code in it some other way, and can remove a hook. So an
-enabled interface with the hook in place is reported as a residual
-(:func:`remote_debug_loosening`), and turning the interface off at launch is separate work.
+the engine can aim for that window. The command line makes the call when
+``messagefoundry/__main__.py`` is imported, ahead of that module's other imports and for every
+command. What is left is the interpreter's own start-up, loading that module, and this module's
+imports. And the capability underneath is untouched: a process that can write this process's
+memory can run code in it some other way, and can remove a hook. So an enabled interface with the
+hook in place is reported as a residual (:func:`remote_debug_loosening`), and turning the
+interface off at launch is separate work.
 ``docs/SECURITY-LOOSENING.md`` carries the operator's account of what stays open.
 
 **Why the hook does so little.** The interpreter calls it on the main thread between two bytecodes
@@ -34,7 +37,7 @@ of whatever was running, which is the position a signal handler is in. The engin
 take locks that are not reentrant, and the interrupted code may hold one, so a log call made here
 could wait on its own thread forever. The hook therefore only counts, queues the file name on a
 ``queue.SimpleQueue`` (whose ``put`` is documented as reentrant) and raises. A daemon thread
-writes the WARNING, with the script's file name only.
+writes the WARNING, with the script's file name only, spelled in ASCII (:func:`_ascii`).
 
 **The interpreter's own report of the refusal is dropped.** The interpreter hands the hook's
 exception to ``sys.unraisablehook``, which by default writes four lines to standard error for
@@ -85,8 +88,9 @@ REMOTE_SCRIPT_EVENT: Final = "cpython.remote_debugger_script"
 #: when one already installed objects, so asking is the only way to know.
 _PROBE_EVENT: Final = "messagefoundry.remotedebug.probe"
 
-#: The injecting process chooses the script's name, so the logged copy is bounded: this many
-#: characters of the name, and at most ten times that once :func:`_ascii` has escaped them.
+#: The injecting process chooses the script's name, so the logged copy is bounded. The hook cuts
+#: the name to this length for the queue, and :func:`_report` cuts it again once it is escaped to
+#: ASCII, because an escape is up to ten characters long.
 _FILE_NAME_LIMIT: Final = 120
 
 #: Refusals waiting for the reporter thread. Past this the refusal is still counted and still
@@ -155,7 +159,7 @@ def _report(name: str) -> None:
         "refused a script that another process injected through the interpreter's remote "
         "debugging (audit event %s, script file name %s). Nothing in it ran.",
         REMOTE_SCRIPT_EVENT,
-        scrub_log_argument(_ascii(name)),
+        scrub_log_argument(_ascii(name)[:_FILE_NAME_LIMIT]),
     )
 
 
@@ -251,9 +255,9 @@ def remote_debug_loosening(posture: RemoteDebugPosture) -> tuple[str, str] | Non
             "engine's refusal hook is NOT installed. A process the operating system lets attach "
             "to this one, which on Windows includes one running as the same account, could run "
             "Python inside it with sys.remote_exec, with everything it holds (the store key, "
-            "connection secrets, messages in flight). `serve` and `supervise` install the hook "
-            "at start. Start the interpreter with -X disable-remote-debug to turn the interface "
-            "off",
+            "connection secrets, messages in flight). Every `messagefoundry` command installs "
+            "the hook as it starts. Start the interpreter with -X disable-remote-debug to turn "
+            "the interface off",
         )
     refused = (
         f" It has refused {posture.refused_scripts} since this process started."
