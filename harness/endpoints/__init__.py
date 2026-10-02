@@ -7,7 +7,7 @@ reads the same names to know where to inject and where to listen. Keeping both e
 what stops a graph and its scenarios drifting apart.
 
 Each value resolves in this order: an explicit override (a scenario run's ``--endpoint KEY=VALUE``,
-or a test's own mapping), then the environment variable ``MEFOR_HARNESS_<KEY>``, then the default.
+or a test's own mapping), then the environment variable ``MEFOR_VALUE_HARNESS_<KEY>``, then the default.
 The defaults are the fixed ports and directories the harness has always documented, so
 ``python -m messagefoundry serve --config harness/config`` behaves as before. Tests set the
 environment variables to ephemeral ports and temporary directories, so the REAL graph runs under
@@ -15,7 +15,9 @@ test rather than a copy of it.
 
 One module per family (``coverage.py``, and later ``tcp.py`` and so on) declares its own endpoints
 in ``ENDPOINTS``; they are discovered, so a new family adds a file rather than editing this one.
-Stdlib only: a config graph imports this at engine load time.
+A graph does NOT import this package (see ``harness/config/coverage.py``): it reads the same values
+through the engine's ``env()``, and ``tests/test_harness_scenarios.py`` holds each graph default
+equal to the default declared here. Stdlib only.
 """
 
 from __future__ import annotations
@@ -24,11 +26,15 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
+from types import MappingProxyType
 
 from harness._discover import family_modules
 
-#: The prefix every endpoint's environment variable carries.
-ENV_PREFIX = "MEFOR_HARNESS_"
+#: The prefix every endpoint's environment variable carries. A graph reads the same value as the
+#: engine environment key ``harness_<key>`` (``env("harness_mllp_in", ...)``), which the engine
+#: overlays from ``MEFOR_VALUE_HARNESS_<KEY>``. Using the engine's own name is what lets one variable
+#: move both ends, and it keeps these out of the ``MEFOR_<SECTION>_<KEY>`` service-settings namespace.
+ENV_PREFIX = "MEFOR_VALUE_HARNESS_"
 
 
 #: The three shapes an endpoint value takes. A test rig gives every ``port`` an ephemeral port and
@@ -65,7 +71,7 @@ def registry() -> Mapping[str, Endpoint]:
             if endpoint.key in found:
                 raise ValueError(f"harness endpoint {endpoint.key!r} is declared twice")
             found[endpoint.key] = endpoint
-    return found
+    return MappingProxyType(found)
 
 
 class Endpoints:
@@ -104,6 +110,16 @@ class Endpoints:
     @property
     def host(self) -> str:
         return self.value("host")
+
+    def validate(self) -> None:
+        """Resolve every declared endpoint now and raise :class:`ValueError` on a malformed one, so a
+        bad override or environment value is a setup error before any traffic, not a traceback
+        halfway through a run."""
+        for key, endpoint in registry().items():
+            if endpoint.shape == PORT:
+                self.port(key)
+            elif not self.value(key):
+                raise ValueError(f"harness endpoint {key!r} is empty")
 
 
 def value(key: str) -> str:

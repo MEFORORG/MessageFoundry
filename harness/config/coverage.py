@@ -8,8 +8,8 @@ so don't load both)::
 
 Then point the harness at it: Send → 127.0.0.1:2575, Receive listening on 2576, Monitor → the
 engine API. Those are the defaults in ``harness/endpoints/coverage.py``; a
-``MEFOR_HARNESS_<KEY>`` environment variable moves one (``MEFOR_HARNESS_MLLP_IN=3575``), and the
-headless scenarios read the same variables, so both ends move together. Every disposition and
+``MEFOR_VALUE_HARNESS_<KEY>`` environment variable moves one (``MEFOR_VALUE_HARNESS_MLLP_IN=3575``),
+and the headless scenarios read the same variables, so both ends move together. Every disposition and
 delivery path is reachable by choosing the message you send:
 
 | Send this                       | Router/Handler decision                  | Disposition (Monitor) |
@@ -31,27 +31,36 @@ and replayable from there. The File round-trip is covered by ``FILE-IN_Coverage`
 All data is synthetic; never point a real PHI feed at a sample config.
 """
 
-from harness import endpoints
-from messagefoundry import MLLP, File, Send, handler, inbound, outbound, router
+from messagefoundry import MLLP, File, Send, env, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 
-# Ports and directories come from harness/endpoints/coverage.py: its documented defaults, unless a
-# MEFOR_HARNESS_<KEY> environment variable overrides one (the tests use ephemeral ports).
-_HOST = endpoints.value("host")
+# Ports and directories are engine environment values, so an operator or a test moves one with
+# MEFOR_VALUE_HARNESS_<KEY> (or a key in environments/<env>.toml) and the harness reads the same name.
+# Each default here must equal its entry in harness/endpoints/coverage.py; a test holds them equal.
+# This module deliberately imports nothing from `harness`: an engine serving it from its own install
+# need not have the harness importable, and `messagefoundry check` refuses an unvetted import.
 
 # Inbounds: tolerant MLLP (the harness Send default), a strict-validation MLLP, and a file poller —
 # all share one router so the disposition map above holds no matter how a message arrives.
-inbound("IB_Coverage_MLLP", MLLP(port=endpoints.port("mllp_in")), router="coverage_router")
+inbound(
+    "IB_Coverage_MLLP",
+    MLLP(port=env("harness_mllp_in", default=2575, cast=int)),
+    router="coverage_router",
+)
 inbound(
     "IB_Coverage_Strict",
-    MLLP(port=endpoints.port("mllp_strict")),
+    MLLP(port=env("harness_mllp_strict", default=2577, cast=int)),
     router="coverage_router",
     strict=True,
     hl7_version="2.5.1",
 )
 inbound(
     "FILE-IN_Coverage",
-    File(directory=endpoints.value("file_in"), pattern="*.hl7", poll_seconds=0.5),
+    File(
+        directory=env("harness_file_in", default="./harness_io/in"),
+        pattern="*.hl7",
+        poll_seconds=0.5,
+    ),
     router="coverage_router",
 )
 
@@ -60,12 +69,20 @@ inbound(
 # fails).
 outbound(
     "OB_Coverage_Echo",
-    MLLP(host=_HOST, port=endpoints.port("mllp_echo"), connect_timeout=3.0, timeout_seconds=5.0),
+    MLLP(
+        host=env("harness_host", default="127.0.0.1"),
+        port=env("harness_mllp_echo", default=2576, cast=int),
+        connect_timeout=3.0,
+        timeout_seconds=5.0,
+    ),
     retry=RetryPolicy(
         max_attempts=3, backoff_seconds=1.0, backoff_multiplier=2.0, max_backoff_seconds=5.0
     ),
 )
-outbound("FILE-OUT_Coverage", File(directory=endpoints.value("file_out"), filename="{MSH-10}.hl7"))
+outbound(
+    "FILE-OUT_Coverage",
+    File(directory=env("harness_file_out", default="./harness_io/out"), filename="{MSH-10}.hl7"),
+)
 
 
 @router("coverage_router")

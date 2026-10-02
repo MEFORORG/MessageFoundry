@@ -32,6 +32,7 @@ from messagefoundry.generators import (
 )
 from messagefoundry.parsing import HL7PeekError, Peek
 from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.peek import PEEK_READ_FAULTS
 
 INBOUND = "inbound"
 OUTBOUND = "outbound"
@@ -96,6 +97,8 @@ class Scenario(BaseScenario):
     sink_endpoint: str | None = None
 
     def __post_init__(self) -> None:
+        if self.count < 1:
+            raise ValueError(f"scenario {self.name!r} must send at least one message")
         if self.expect == "dead_letter" and not self.dead_letter_destination:
             raise ValueError(f"scenario {self.name!r} expects dead_letter but names no destination")
         if (self.sink is None) != (self.sink_endpoint is None):
@@ -138,10 +141,12 @@ class Scenario(BaseScenario):
         driver = drivers.build(self.driver, ctx.endpoints, self.inbound)
         send_errors = [i.error for i in driver.inject(payloads) if i.error]
         if len(send_errors) == self.count:
+            target = ctx.endpoints.value(self.inbound)
             return ScenarioResult(
                 self,
                 False,
-                f"could not send to {self.driver} endpoint {self.inbound!r}: {send_errors[0]}",
+                f"could not send to {self.driver} endpoint {self.inbound!r} ({target}): "
+                f"{send_errors[0]}",
             )
         if self.expect == "dead_letter":
             return _verify_dead_letter(self, ctx.client, control_ids, ctx.timeout, send_errors)
@@ -165,6 +170,8 @@ def control_id_of(payload: bytes) -> str | None:
     try:
         return Peek.parse(payload.decode("utf-8", errors="replace")).control_id or None
     except HL7PeekError:
+        return None
+    except PEEK_READ_FAULTS:
         return None
 
 

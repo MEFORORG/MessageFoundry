@@ -7,7 +7,12 @@ from __future__ import annotations
 from harness.endpoints import HOST, PATH, PORT, Endpoint
 
 ENDPOINTS = (
-    Endpoint("host", HOST, "127.0.0.1", "the loopback host every harness peer binds and dials"),
+    Endpoint(
+        "host",
+        HOST,
+        "127.0.0.1",
+        "the host drivers and engine outbounds dial (a sink always binds loopback)",
+    ),
     Endpoint("mllp_in", PORT, "2575", "IB_Coverage_MLLP: the tolerant MLLP inbound"),
     Endpoint(
         "mllp_echo", PORT, "2576", "OB_Coverage_Echo: the MLLP outbound's peer (the harness sink)"

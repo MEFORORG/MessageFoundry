@@ -18,6 +18,7 @@ import abc
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache
+from types import MappingProxyType
 from typing import ClassVar
 
 from harness._discover import family_modules
@@ -55,7 +56,7 @@ def registry() -> Mapping[str, DriverFactory]:
         if kind in found:
             raise ValueError(f"two harness drivers claim connector kind {kind!r}")
         found[kind] = module.build
-    return found
+    return MappingProxyType(found)
 
 
 def build(kind: str, endpoints: Endpoints, key: str) -> Driver:

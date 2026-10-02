@@ -2,14 +2,16 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """File driver: drop each payload into the directory an engine File inbound polls.
 
-Writes are atomic -- a hidden ``.part`` temp, then ``os.replace`` -- so the engine never polls a
-half-written file. That is the same guarantee the engine's own File destination gives, and the GUI's
-File tab drops through :func:`drop_atomic` too.
+Writes are atomic -- a hidden ``.part`` temp, then one link or rename onto the final name -- so the
+engine never polls a half-written file. That is the same guarantee the engine's own File
+destination gives, and the GUI's File tab drops through :func:`drop_atomic` too.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from uuid import uuid4
@@ -34,13 +36,35 @@ def unique_path(target: Path) -> Path:
 
 
 def drop_atomic(directory: Path, name: str, data: bytes) -> Path:
-    """Publish ``data`` as ``directory/name`` (uniquified) in one rename. Raises :class:`OSError`."""
-    target = unique_path(directory / name)
-    # Hidden and not *.hl7, so the engine's poll pattern cannot pick up the half-written temp.
-    tmp = target.with_name(f".{target.name}.part")
-    tmp.write_bytes(data)
-    os.replace(tmp, target)
-    return target
+    """Publish ``data`` as ``directory/name`` (or ``name-1``, ``name-2``, ... when taken), complete,
+    in one step. Raises :class:`OSError`.
+
+    The bytes go to a uniquely named hidden temp first (``.*.part`` matches no poll pattern), which is
+    then HARD-LINKED to the first free name. ``os.link`` refuses a name that exists, so there is no
+    window between checking a name is free and taking it -- the race the engine's own File destination
+    retired (``_claim_unique``). A filesystem without hard links falls back to a rename onto a name
+    checked free, which is the best that filesystem allows. The temp is removed either way."""
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".", suffix=".part")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        target = directory / name
+        n = 0
+        while True:
+            candidate = target if n == 0 else target.with_name(f"{target.stem}-{n}{target.suffix}")
+            try:
+                os.link(tmp, candidate)
+                return candidate
+            except FileExistsError:
+                n += 1
+            except OSError:
+                candidate = unique_path(target)
+                os.replace(tmp, candidate)
+                return candidate
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 class FileDriver(Driver):
