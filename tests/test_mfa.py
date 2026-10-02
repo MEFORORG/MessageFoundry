@@ -1377,7 +1377,7 @@ async def test_AC5_the_second_step_lock_refuses_every_leg(
         assert not (await service.login(ADMIN_USERNAME, password)).ok
         assert not (await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())).ok
         assert not (await service.verify_mfa(pending.token, steps.next_code())).ok
-        assert _directory_login_refusal(before, time.time()) == "locked"
+        assert _directory_login_refusal(before, time.time(), federated=False) == "locked"
         after = await store.get_user(identity.user_id)
         assert after is not None
         assert after.second_step_locked_until == before.second_step_locked_until

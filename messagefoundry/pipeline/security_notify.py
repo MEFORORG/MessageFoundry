@@ -94,7 +94,7 @@ _DESCRIPTIONS = {
     EMAIL_CHANGED: "Your account's email address was changed.",
     ROLES_CHANGED: "Your account's roles were changed by an administrator.",
     USERNAME_CHANGED: "Your account's username was changed.",
-    FEDERATED_IDENTITY_BOUND: "An external identity provider sign-in was linked to your account. From now on that provider can sign you in.",
+    FEDERATED_IDENTITY_BOUND: "An administrator linked an external identity provider sign-in to your account, and your sessions were ended. Windows single sign-on no longer signs you in. Sign in through that provider; if it is not offered, ask your administrator.",
     FEDERATED_IDENTITY_UNBOUND: "An administrator removed the external identity provider sign-in from your account, and your sessions were ended. That provider can no longer sign you in.",
     # BACKLOG #2019. Names the command because the reader has no console action to trace it to: it
     # ran at the host, against the store, while the install had no enabled Administrator.
@@ -347,6 +347,12 @@ def _build_body(event: SecurityEvent) -> str:
             else:
                 lines.append("The notification address for this account was changed.")
             lines.append("Notices about later changes go to the new address, not to this one.")
+    if event.event_type == FEDERATED_IDENTITY_BOUND:
+        # vault BACKLOG #2609: the bind ended the holder's sessions. The count lets a holder who
+        # was signed in on several devices see that all of them went.
+        ended = event.detail.get("sessions_revoked")
+        if isinstance(ended, int) and not isinstance(ended, bool):
+            lines.append(f"Sessions ended: {ended}")
     if event.event_type == MFA_ENABLED and event.detail.get("issued_credential"):
         # ADR 0197 Amendment A: this account still held the password it was issued. An
         # authenticator is now enrolled before that password is replaced, so an enrolment the
@@ -391,8 +397,20 @@ def _build_body(event: SecurityEvent) -> str:
         # The takeover runs only when the install has no enabled Administrator, so "contact your
         # administrator" would name nobody, or the person who ran it.
         closing = "If you did not expect this, tell whoever operates the MessageFoundry host."
-    elif moved_by_admin or set_by_admin or event.event_type in (ACCOUNT_CREATED, USERNAME_CHANGED):
+    elif (
+        moved_by_admin
+        or set_by_admin
+        or event.event_type
+        in (
+            ACCOUNT_CREATED,
+            USERNAME_CHANGED,
+            FEDERATED_IDENTITY_BOUND,
+            FEDERATED_IDENTITY_UNBOUND,
+        )
+    ):
         # A directory rename is an administrator's act, so "if this was you" cannot apply to it.
+        # Nor to a federated link or unlink: both routes refuse an administrator changing their
+        # own account's binding.
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

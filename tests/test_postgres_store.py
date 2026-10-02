@@ -1051,6 +1051,22 @@ async def test_session_binding_guard_store_contract(store) -> None:
     await _assert_session_binding_guard_contract(store)
 
 
+async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
+    """vault BACKLOG #2609 on the real Postgres backend: a bind ends the account's sessions in the
+    transaction that writes the pair, and ``create_session`` refuses an insert that requires an
+    unbound row once the row is bound.
+
+    The shared body is the one the SQLite suite runs. What this leg executes that no other does:
+    the two ``UPDATE`` statements inside one ``conn.transaction()``, and the ``(None, None)``
+    pair through the ``FOR UPDATE`` guard.
+    """
+    from tests._federated_unbind_store_contract import (
+        _assert_bind_sweeps_and_unbound_guard_contract,
+    )
+
+    await _assert_bind_sweeps_and_unbound_guard_contract(store)
+
+
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
     """Postgres compares ``directory_object_id`` byte-for-byte, so case is significant.
 

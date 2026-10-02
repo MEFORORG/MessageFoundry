@@ -563,7 +563,7 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
         for n in ast.walk(verify_tree)
     ), "verify_mfa no longer feeds the lockout; the rows say a wrong TOTP code does."
     locked = SimpleNamespace(disabled=False, locked_until=float("inf"))
-    assert _directory_login_refusal(locked, 0.0) == "locked", (  # type: ignore[arg-type]
+    assert _directory_login_refusal(locked, 0.0, federated=False) == "locked", (  # type: ignore[arg-type]
         "a directory sign-in no longer refuses a locked row; the Kerberos and OIDC rows say it does."
     )
     for sign_in_path in (AuthService._complete_ad_login, AuthService._upsert_ad_user):

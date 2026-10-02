@@ -8093,8 +8093,15 @@ class PostgresStore:
         *,
         now: float | None = None,
         expect_unbound: bool = False,
-    ) -> bool:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015); see ``AuthStore``."""
+    ) -> int | None:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015) and revoke the
+        account's live sessions in the same transaction (vault BACKLOG #2609); see ``AuthStore``.
+        This leg is CI-only, so a divergence from the SQLite and SQL Server bodies surfaces
+        first in CI.
+
+        The ``UPDATE users`` takes the row lock that a guarded ``create_session`` asks for with
+        ``FOR UPDATE``, and both take it before they touch ``sessions``. So an in-flight insert
+        either commits first and is swept below, or waits and then reads the row bound."""
         now = time.time() if now is None else now
         sql = (
             "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4"
@@ -8102,7 +8109,7 @@ class PostgresStore:
             if expect_unbound
             else "UPDATE users SET oidc_issuer=$1, oidc_subject=$2, updated_at=$3 WHERE id=$4"
         )
-        async with self._timed_acquire(record=False) as conn:
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
             result = await conn.execute(
                 sql,
                 issuer,
@@ -8110,7 +8117,14 @@ class PostgresStore:
                 now,
                 user_id,
             )
-        return _rowcount(result) > 0
+            if _rowcount(result) <= 0:
+                return None  # nothing written, so nothing is revoked
+            revoked = await conn.execute(
+                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
+                now,
+                user_id,
+            )
+        return _rowcount(revoked)
 
     async def clear_user_federated_subject(
         self,
@@ -8232,7 +8246,7 @@ class PostgresStore:
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-        require_federated_subject: tuple[str, str] | None = None,
+        require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
     ) -> bool:
         now = time.time() if now is None else now

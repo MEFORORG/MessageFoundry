@@ -1448,6 +1448,10 @@ _SET_FEDERATED_IF_UNBOUND_SQL: Final = (
     "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
     " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
 )
+#: The session sweep a bind and an unbind each run inside their own transaction.
+_REVOKE_USER_SESSIONS_SQL: Final = (
+    "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+)
 
 
 @dataclass(frozen=True)
@@ -11893,9 +11897,11 @@ class MessageStore:
         *,
         now: float | None = None,
         expect_unbound: bool = False,
-    ) -> bool:
-        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Written only by the
-        administrative bind since BACKLOG #1143; see :meth:`AuthStore.set_user_federated_subject`."""
+    ) -> int | None:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015) and revoke the
+        account's live sessions in the same transaction (vault BACKLOG #2609). Written only by
+        the administrative bind since BACKLOG #1143; see
+        :meth:`AuthStore.set_user_federated_subject`."""
         now = time.time() if now is None else now
         # ux_users_federated_subject refusing this UPDATE is EXPECTED (the #1256 race loser), and the
         # unwind rolls it back (BACKLOG #1801).
@@ -11906,8 +11912,13 @@ class MessageStore:
                 )
             else:
                 cur = await self._db.execute(_SET_FEDERATED_SQL, (issuer, subject, now, user_id))
+            if int(cur.rowcount) <= 0:
+                # Nothing written, so nothing is revoked. The commit ends the empty transaction.
+                await self._commit()
+                return None
+            revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
-            return int(cur.rowcount) > 0
+            return int(revoked.rowcount)
 
     async def clear_user_federated_subject(
         self,
@@ -11954,10 +11965,7 @@ class MessageStore:
                 "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
                 (now, user_id),
             )
-            revoked = await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
-                (now, user_id),
-            )
+            revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return FederatedUnbind(
                 username=row["username"],
@@ -12040,7 +12048,7 @@ class MessageStore:
         client: str | None = None,
         seed_reauth: bool = True,
         now: float | None = None,
-        require_federated_subject: tuple[str, str] | None = None,
+        require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
     ) -> bool:
         now = time.time() if now is None else now
@@ -12169,7 +12177,7 @@ class MessageStore:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
         caller's current session — "sign out everywhere else"). Returns the number revoked."""
         now = time.time() if now is None else now
-        sql = "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+        sql = _REVOKE_USER_SESSIONS_SQL
         params: list[object] = [now, user_id]
         if except_token_hash is not None:
             sql += " AND token_hash != ?"

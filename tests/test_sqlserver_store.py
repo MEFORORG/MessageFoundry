@@ -888,6 +888,23 @@ async def test_session_binding_guard_store_contract(store) -> None:
     await _assert_session_binding_guard_contract(store)
 
 
+async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
+    """vault BACKLOG #2609 on the real SQL Server backend: a bind ends the account's sessions in the
+    transaction that writes the pair, and ``create_session`` refuses an insert that requires an
+    unbound row once the row is bound.
+
+    The shared body is the one the SQLite suite runs. What this leg executes that no other does:
+    the two ``UPDATE`` statements on one cursor under ``autocommit=False``, the rollback on
+    a write that changes nothing, and the ``(None, None)`` pair through the ``UPDLOCK, ROWLOCK``
+    guard.
+    """
+    from tests._federated_unbind_store_contract import (
+        _assert_bind_sweeps_and_unbound_guard_contract,
+    )
+
+    await _assert_bind_sweeps_and_unbound_guard_contract(store)
+
+
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
     """The layer under the lookup, on the real SQL Server backend.
 

@@ -27,6 +27,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.auth import channel_scope, reconcile
+from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe, LdapError
 from messagefoundry.auth.notifications import USERNAME_CHANGED
 from messagefoundry.auth.permissions import Role
@@ -158,6 +159,17 @@ async def _signed_in_ad_user(
     ldap = service._ldap
     principal = ldap.resolve_principal(username)  # type: ignore[union-attr]
     assert principal is not None, f"the fake directory holds no principal for {username!r}"
+    # A row that holds a federated binding signs in the federated way: Windows SSO refuses it,
+    # and a bind ends the sessions it held (vault BACKLOG #2609). Same shared tail, minted as the
+    # federated caller mints it.
+    row = await store.get_user_by_username(username)
+    how: dict[str, Any] = {}
+    if row is not None and row.oidc_issuer is not None and row.oidc_subject is not None:
+        how = {
+            "session_mechanism": SessionMechanism.OIDC,
+            "mech": "oidc",
+            "federated_subject": (row.oidc_issuer, row.oidc_subject),
+        }
     if principal.directory_object_id is None:
         # BACKLOG #2027: a sign-in no longer mints a row with no id, so a principal with none is
         # refused. The id-less row these tests need is one made before that refusal, or planted in
@@ -170,11 +182,11 @@ async def _signed_in_ad_user(
         )
         await store._db.commit()
         keyed = replace(principal, directory_object_id=object_id)
-        token = (await service._complete_ad_login(keyed, None, mfa_verified=True)).token
+        token = (await service._complete_ad_login(keyed, None, mfa_verified=True, **how)).token
         await _clear_directory_object_id(store, username)
         ldap.probes.clear()  # type: ignore[union-attr]
         return token
-    token = (await service._complete_ad_login(principal, None, mfa_verified=True)).token
+    token = (await service._complete_ad_login(principal, None, mfa_verified=True, **how)).token
     # Forget the SETUP probe. Several tests assert on `probes` to prove the reconciler did or did
     # not reach the directory, and a fixture that leaves its own round trip in that list makes the
     # instrument read the fixture instead of the subject.
@@ -892,6 +904,8 @@ async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id(
             )
         except DirectoryObjectIdMissing:
             refused = True
+        # The bind ended jdoe's session, and the pass asks only about accounts that hold one.
+        assert await _signed_in_ad_user(service, store, "jdoe") is not None
 
         ldap.probe_keys.clear()
         await service.reconcile_directory_sessions()
@@ -936,7 +950,7 @@ async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> Non
         await service.initialize()
         await _signed_in_ad_user(service, store, "jdoe")
         await _signed_in_ad_user(service, store, "nobody")
-        token = await _signed_in_ad_user(service, store, "legacy")
+        await _signed_in_ad_user(service, store, "legacy")
         jdoe = await store.get_user_by_username("jdoe")
         legacy = await store.get_user_by_username("legacy")
         assert jdoe is not None and legacy is not None and legacy.directory_object_id is None
@@ -947,9 +961,15 @@ async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> Non
             await service.bind_federated_subject(
                 legacy.id, "S-1-legacy", expected_issuer=None, expected_subject=None, actor="admin"
             )
-        assert await store.set_user_federated_subject(
-            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        assert (
+            await store.set_user_federated_subject(
+                legacy.id, "https://idp.test.invalid", "S-1-legacy"
+            )
+            is not None
         )
+        # Each bind ended its account's session, so both sign in again, as bound accounts do.
+        assert await _signed_in_ad_user(service, store, "jdoe") is not None
+        token = await _signed_in_ad_user(service, store, "legacy")
         ldap.present.pop("legacy")  # gone from the directory: a name probe would strike it
 
         ldap.probe_keys.clear()
@@ -989,9 +1009,14 @@ async def test_a_pass_whose_only_candidate_is_a_bound_id_less_row_is_not_an_outa
         await _signed_in_ad_user(service, store, "legacy")
         legacy = await store.get_user_by_username("legacy")
         assert legacy is not None
-        assert await store.set_user_federated_subject(
-            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        assert (
+            await store.set_user_federated_subject(
+                legacy.id, "https://idp.test.invalid", "S-1-legacy"
+            )
+            is not None
         )
+        # The bind ended the session above, so the bound row signs in again.
+        assert await _signed_in_ad_user(service, store, "legacy") is not None
         ldap.probe_keys.clear()
 
         plan = await service.reconcile_directory_sessions()
@@ -1025,9 +1050,14 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
         await _signed_in_ad_user(service, store, "legacy")
         legacy = await store.get_user_by_username("legacy")
         assert legacy is not None
-        assert await store.set_user_federated_subject(
-            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        assert (
+            await store.set_user_federated_subject(
+                legacy.id, "https://idp.test.invalid", "S-1-legacy"
+            )
+            is not None
         )
+        # The bind ended the session above, so the bound row signs in again.
+        assert await _signed_in_ad_user(service, store, "legacy") is not None
 
         async def reported() -> int:
             return sum(
@@ -1037,7 +1067,7 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
         await service.reconcile_directory_sessions()
         await store.revoke_user_sessions(legacy.id)
         await service.reconcile_directory_sessions()  # no session: not a candidate at all
-        await _signed_in_ad_user(service, store, "legacy")
+        assert await _signed_in_ad_user(service, store, "legacy") is not None
         await service.reconcile_directory_sessions()
         assert await reported() == 1, "the account was reported again after a sign-in"
 
@@ -1079,9 +1109,14 @@ async def test_a_failed_skip_report_neither_stops_the_pass_nor_is_forgotten(
         await _signed_in_ad_user(service, store, "legacy")
         legacy = await store.get_user_by_username("legacy")
         assert legacy is not None
-        assert await store.set_user_federated_subject(
-            legacy.id, "https://idp.test.invalid", "S-1-legacy"
+        assert (
+            await store.set_user_federated_subject(
+                legacy.id, "https://idp.test.invalid", "S-1-legacy"
+            )
+            is not None
         )
+        # The bind ended the session above, so the bound row signs in again.
+        assert await _signed_in_ad_user(service, store, "legacy") is not None
         real_record = store.record_audit
 
         async def failing(action: str, **kwargs: Any) -> None:
