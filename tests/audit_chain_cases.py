@@ -36,9 +36,10 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import audit_key_id, generate_key, make_cipher
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
+    audit_genesis_detail,
     audit_row_hash,
     parse_audit_genesis,
 )
@@ -405,6 +406,83 @@ async def two_opens_of_a_fresh_keyed_store_share_one_genesis_row(b: ChainBackend
     assert [r["action"] for r in rows].count(AUDIT_KEY_EPOCH_ACTION) == 1
 
 
+async def a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is(
+    b: ChainBackend,
+) -> None:
+    """Whether a chain is keyed is read from the row AT sequence number 1, a position the UNIQUE
+    constraint lets nobody take twice, and not from whichever row sorts first. So one row added
+    with a lower number is a reported break and nothing more: the keyed handle still treats the
+    chain as keyed, and a handle with no key still refuses to append. The control is the same
+    chain before the row is added."""
+    await b.reset()
+    key = generate_key()
+    store = await b.open_keyed(key, ())
+    try:
+        await _seed(store, "act", 2)
+        ok, message = await store.verify_audit_chain()
+        assert ok, f"{b.name}: the control must verify: {message}"
+    finally:
+        await store.close()
+    await b.execute(
+        "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+        " VALUES (0, 1.0, 'someone', 'added', NULL, NULL, NULL, 'deadbeef')"
+    )
+    store = await b.open_keyed(key, ())
+    try:
+        assert store.audit_chain_unkeyed() is False, f"{b.name}: the chain still opens keyed"
+        await store.record_audit("after", actor="u")  # the current range still takes appends
+        ok, message = await store.verify_audit_chain()
+        assert not ok, f"{b.name}: the added row must be reported: {message}"
+    finally:
+        await store.close()
+    keyless = await b.open_keyless()
+    try:
+        refusal = keyless.audit_append_refusal()
+        assert refusal is not None, f"{b.name}: a handle with no key read the chain as keyless"
+        ok, message = await keyless.verify_audit_chain()
+        assert not ok and "no store encryption key/MAC" in (message or ""), f"{b.name}: {message}"
+    finally:
+        await keyless.close()
+
+
+async def a_genesis_row_rewritten_to_name_another_held_key_routes_no_append_to_it(
+    b: ChainBackend,
+) -> None:
+    """The genesis row routes every append, so the open authenticates it. Rewritten to name a
+    second key the store also holds, it no longer verifies, and new rows go under the ACTIVE key,
+    never the key the rewritten row names. The control is the same open before the rewrite, where
+    the current range is the active key's for the honest reason."""
+    await b.reset()
+    active, other = generate_key(), generate_key()
+
+    def key_id(key: str) -> str:
+        mac = make_cipher(key).audit_mac_key()
+        assert mac is not None
+        return audit_key_id(mac)
+
+    store = await b.open_keyed(active, (other,))
+    try:
+        await _seed(store, "act", 2)
+        assert store._audit_range_key_id == key_id(active) and store._audit_ranges_trusted
+    finally:
+        await store.close()
+    detail = audit_genesis_detail(key_id(other))
+    assert "'" not in detail  # it is embedded in a SQL string literal below
+    await b.execute(f"UPDATE audit_log SET detail = '{detail}' WHERE seq = 1")
+    store = await b.open_keyed(active, (other,))
+    try:
+        assert store._audit_range_key_id == key_id(active), (
+            f"{b.name}: new rows were routed to the key the rewritten genesis row names"
+        )
+        assert store._audit_ranges_trusted is False
+        ok, message = await store.roll_audit_key_epoch()
+        assert not ok, f"{b.name}: {message}"
+        ok, message = await store.verify_audit_chain()
+        assert not ok, f"{b.name}: {message}"
+    finally:
+        await store.close()
+
+
 #: Every case, for a backend's test module to parametrise over.
 CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     an_untouched_keyed_chain_verifies,
@@ -416,4 +494,6 @@ CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     a_handle_with_no_key_refuses_to_append_to_a_keyed_chain,
     a_key_rotation_opens_a_range_inside_the_chain,
     two_opens_of_a_fresh_keyed_store_share_one_genesis_row,
+    a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is,
+    a_genesis_row_rewritten_to_name_another_held_key_routes_no_append_to_it,
 )

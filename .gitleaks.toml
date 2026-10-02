@@ -11,9 +11,12 @@ regexes = [
   '''Str0ng_P@ssw0rd!''',
   # Fake test-fixture passphrase (admin-reset rotation test, tests/test_api_auth.py, WP-L3-12).
   '''rotated-strong-passphrase-7''',
-  # Frozen audit-chain digest fixture (tests/test_audit_integrity.py, #190, vault BACKLOG #2594):
+  # Frozen audit-chain digest fixtures (tests/test_audit_integrity.py, #190, vault BACKLOG #2594):
   # the SHA-256 digest of a fixed SYNTHETIC audit row — a hash pinned to detect drift, not a secret.
+  # The first is the current fixture. The second is the one it replaced: no file holds it now, but
+  # the history scan reads every commit with THIS config, and earlier commits still carry it.
   '''42aeab9417f5ad28918dfeb162e7e4be62fbfcb6081867fd5a4d6671d51f6566''',
+  '''f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e''',
   # SOAP body-secret PLACEHOLDER tokens (ADR 0015 amendment / #236). By design these are NOT secrets:
   # the Handler emits the token in the <Body> and the transport swaps in the real env() credential at
   # send time, so an `MF_IIS_<ROLE>_<hex>` token is public (it lives in committed sample/test source).

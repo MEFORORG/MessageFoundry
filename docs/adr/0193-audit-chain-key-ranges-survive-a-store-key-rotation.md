@@ -1,8 +1,9 @@
 # 0193 — Audit chain key ranges survive a store key rotation
 
 - **Status:** Accepted (2026-09-23) -- built with the change. **Amended 2026-10-01** by owner
-  ruling: see *Amendment 2026-10-01* at the end. Decision items 2 and 8, and the first sentence
-  of *Negative / risks*, are superseded there. The text below is kept as it was decided.
+  ruling: see *Amendment 2026-10-01* at the end. Decision items 2 and 8, the field names in item
+  3's closing record, and the first sentence of *Negative / risks* are superseded there. The text
+  below is kept as it was decided.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the
   keyed chain and its watermark), [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)
@@ -163,8 +164,9 @@ records a KEY per range, and the range row's `detail` is JSON so a later field c
 ## Amendment 2026-10-01 -- the first range is named inside the chain, and every row carries a sequence number
 
 - **Status:** Accepted by owner ruling (2026-10-01) -- built with the change (vault BACKLOG #2594).
-- **Supersedes:** Decision items 2 and 8, the keyless-prefix reasoning in item 4, and the first
-  sentence of *Negative / risks*. Everything else above stands.
+- **Supersedes:** Decision items 2 and 8; the field names in item 3's closing record, which now
+  counts in sequence numbers (item 6 below); the keyless-prefix reasoning in item 4; and the first
+  sentence of *Negative / risks*. Item 7 gains the genesis row (item 9 below). The rest stands.
 
 ### Why
 
@@ -220,8 +222,12 @@ authenticated.
    ([DEPLOY-SERVER-DB.md](../DEPLOY-SERVER-DB.md), owner ruling R16); it would give a key to
    whatever each row says on the day it runs; and it would break every recorded anchor.
 9. **The open authenticates the genesis row** (item 7): its MAC must verify under the key it names
-   whenever that key is held. If it does not, new rows go under the active key, the store logs an
-   ERROR, and `rotate-key` refuses, as item 7 already says for a range row.
+   whenever that key is held. If it does not, new rows go under the active key, never the key
+   that row names, the store logs an ERROR, and `rotate-key` refuses. Item 7 and AC-5 say the
+   same of a range row that fails, in the words *new rows go under the ACTIVE key*. The code has
+   always been narrower there, and this amendment leaves it so: after a failed range row, new
+   rows stay under the last range that did authenticate when its key is held, and go under the
+   active key only when it is not.
 10. **A store that holds a key and opens onto keyless rows** logs an ERROR, sets the
     `audit_chain_unkeyed` posture entry, keys every row it appends, and fails `audit-verify`. No
     command converts those rows.

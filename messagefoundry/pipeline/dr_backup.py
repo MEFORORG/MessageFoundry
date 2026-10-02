@@ -2356,8 +2356,10 @@ def _full_open_check(
         # unreachable key provider — must surface ITS OWN cause, not a NameError from a finally closing
         # a store that was never created. A handle left open here would also hold the extracted store
         # on Windows and send the staging teardown to its fail-safe (see _discard_verify_staging).
-        # A throwaway snapshot copy, integrity-checked and deleted: it appends no audit row, so it
-        # cannot start a chain (BACKLOG #1916).
+        # A throwaway snapshot copy, integrity-checked and deleted, so nothing it writes outlives
+        # the check (BACKLOG #1916). A keyed open of a snapshot whose audit_log is EMPTY writes that
+        # copy's genesis row, like any keyed open of an empty log, and tees it; a snapshot of a
+        # store that holds a key already has one.
         store = await open_store(snap_settings, keyless_chain_refusal=None)
         try:
             return await store.integrity_check()

@@ -117,6 +117,8 @@ def serve_rows(store: Any, rows: list[dict[str, Any]]) -> None:
     async def _fetchall(sql: str, *args: Any, **_kw: Any) -> list[dict[str, Any]]:
         if "WHERE action" in sql:
             return [r for r in rows if r["action"] == AUDIT_KEY_EPOCH_ACTION and int(r["seq"]) > 1]
+        if "WHERE seq = 1" in sql:
+            return [r for r in rows if r["seq"] == 1]
         return rows
 
     async def record_audit(

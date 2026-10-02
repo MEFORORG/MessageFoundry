@@ -1222,8 +1222,9 @@ class _GenesisPgConn:
 
 
 def _keyed_postgres_store(conn: _GenesisPgConn, chain: list[list[dict[str, Any]]]) -> Any:
-    """A keyed PostgresStore over ``conn``. ``chain`` is what successive reads of the whole chain
-    return, in order: the open reads it, and reads it again after its genesis attempt."""
+    """A keyed PostgresStore over ``conn``. ``chain`` is what successive reads of the chain return,
+    in order: the open reads the row at seq 1, and reads it again after its genesis attempt. Past
+    the end of the list the log reads empty."""
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.store import build_audit_mac_keys
 
@@ -1240,7 +1241,7 @@ def _keyed_postgres_store(conn: _GenesisPgConn, chain: list[list[dict[str, Any]]
 
     async def _fetchall(sql: str, *args: Any) -> list[dict[str, Any]]:
         conn.statements.append(sql)
-        return [] if "WHERE action" in sql else chain.pop(0)
+        return chain.pop(0) if chain and "WHERE action" not in sql else []
 
     store._timed_acquire = _timed_acquire  # type: ignore[method-assign]
     store._advisory_lock = _no_lock  # type: ignore[method-assign]
@@ -1387,7 +1388,7 @@ async def test_sqlserver_starts_a_fresh_chain_with_insert_alone(
         return None
 
     async def _fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-        return [] if "WHERE action" in sql else chain.pop(0)
+        return chain.pop(0) if chain and "WHERE action" not in sql else []
 
     monkeypatch.setattr(store, "_acquire", _acquire)
     monkeypatch.setattr(store, "_cursor", _cursor)

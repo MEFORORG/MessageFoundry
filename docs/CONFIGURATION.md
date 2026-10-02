@@ -1750,12 +1750,9 @@ HKDF-derived subkey (`mefor/audit-chain/v1`), which that actor cannot forge with
 `cipher_provider = "vault_transit"` the MAC is computed **inside** Transit instead (`audit_mac_key()` is
 `None` there **by design** — that is not the keyless case).
 
-**A store that holds a key requires every audit row keyed.** A store first opened with a store key
-writes a genesis row as row 1, which names the key the chain begins under, and every row after it
-is keyed and numbered. A chain that began keyless stays keyless: adding a key later re-keys
-nothing, and no command does. The keyed store then reports that chain as broken, because a row it
-cannot check under a key is a row a writer with no key could have recomputed. The rule is stated
-once, in [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, and
+**Having a key today does not make an existing keyless chain keyed.** Which rows are keyed, and
+what a store that holds a key does with a row that is not, is stated once, in
+[ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) section 4, the *Audit chain* row, and
 [ADR 0194](adr/0194-refuse-to-start-a-keyless-audit-chain-at-the-store-open-seam.md) records how every
 command refuses to start one without the opt-out. A store that has a key but opens onto keyless rows
 logs an ERROR at open, fails `audit-verify`, and `GET /security/posture` lists it as the loosening

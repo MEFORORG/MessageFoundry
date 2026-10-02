@@ -30,8 +30,10 @@ from messagefoundry.store.store import (
     AuditHeadMovedError,
     audit_append_secret,
     audit_genesis_detail,
+    audit_mac_bytes,
     audit_next_link,
     build_audit_mac_keys,
+    load_audit_chain,
     parse_audit_epoch,
     parse_audit_genesis,
 )
@@ -110,9 +112,11 @@ def test_no_backend_schema_or_statement_names_the_removed_table(module: str) -> 
         Path(__file__).resolve().parent.parent / "messagefoundry" / "store" / f"{module}.py"
     ).read_text(encoding="utf-8")
     assert "INSERT INTO audit_log" in source
+    lines = source.splitlines()
+    assert len(lines) > 1000  # the walk below has a population
     statements = [
         line
-        for line in source.splitlines()
+        for line in lines
         if "audit_chain_meta" in line and not line.lstrip().startswith(("#", "--"))
     ]
     assert not statements, statements
@@ -168,6 +172,196 @@ def test_the_next_link_refuses_a_head_the_caller_did_not_seal() -> None:
 def test_the_next_link_refuses_a_head_with_no_usable_sequence_number(head_seq: object) -> None:
     with pytest.raises(RuntimeError, match="no usable sequence number"):
         audit_next_link((head_seq, "abc"), None)
+
+
+def test_the_next_link_refuses_a_head_it_cannot_count_on_from() -> None:
+    """The column's highest value has no successor, and a negative head is not a chain position.
+    Each is the designed refusal, naming ``audit-verify``, and never an overflow from the driver."""
+    for head_seq in (2**63 - 1, 2**63, -1):
+        with pytest.raises(RuntimeError, match="no usable sequence number"):
+            audit_next_link((head_seq, "abc"), None)
+    assert audit_next_link((2**63 - 2, "abc"), None) == (2**63 - 1, "abc")  # the control
+
+
+# --- SQLite: a second connection to the same file ---------------------------------------------------
+
+
+async def _keyed(path: Path, key: str) -> MessageStore:
+    cipher = make_cipher(key)
+    return await MessageStore.open(path, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+
+
+def _add_a_row_from_another_connection(path: Path, seq: int) -> None:
+    """What a second process appending at the same moment does to this handle: the position this
+    handle just read as free is taken, and committed, before its own INSERT."""
+    with sqlite3.connect(path, timeout=10) as conn:
+        conn.execute(
+            "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+            " VALUES (?, 1.0, 'peer', 'peer.row', NULL, NULL, NULL, 'feedface')",
+            (seq,),
+        )
+        conn.commit()
+    conn.close()
+
+
+async def test_an_append_that_loses_its_position_to_another_connection_takes_the_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SQLite's writer lock belongs to one handle. A second connection that appends between this
+    handle's head read and its INSERT takes the position; the UNIQUE constraint refuses the INSERT,
+    and the append reads the head again under the write lock the refused INSERT took. The control
+    is the same append with no second connection, which takes the next position at once."""
+    path = tmp_path / "race.db"
+    store = await _keyed(path, generate_key())
+    try:
+        await store.record_audit("first", actor="u")  # seq 2, after the genesis row
+        real = store._audit_append_mac
+        fired: list[int] = []
+
+        def mac_after_a_peer_append() -> Any:
+            # Called between the head read and the INSERT, which is the window under test.
+            if not fired:
+                fired.append(1)
+                _add_a_row_from_another_connection(path, 3)
+            return real()
+
+        monkeypatch.setattr(store, "_audit_append_mac", mac_after_a_peer_append)
+        await store.record_audit("second", actor="u")
+        assert fired, "the window was never entered, so the pass below would prove nothing"
+        cur = await store._db.execute("SELECT seq, action FROM audit_log ORDER BY seq")
+        assert [tuple(r) for r in await cur.fetchall()] == [
+            (1, AUDIT_KEY_EPOCH_ACTION),
+            (2, "first"),
+            (3, "peer.row"),
+            (4, "second"),
+        ]
+    finally:
+        await store.close()
+
+
+async def test_an_append_that_named_its_head_is_refused_when_another_connection_moved_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same window, for an append that sealed the head first (a key rotation's range row). The
+    second read finds a different head, so the append is refused and writes nothing."""
+    path = tmp_path / "race-sealed.db"
+    store = await _keyed(path, generate_key())
+    try:
+        _seq, head = await store.audit_anchor()
+        real = store._audit_append_mac
+        fired: list[int] = []
+
+        def mac_after_a_peer_append() -> Any:
+            if not fired:
+                fired.append(1)
+                _add_a_row_from_another_connection(path, 2)
+            return real()
+
+        monkeypatch.setattr(store, "_audit_append_mac", mac_after_a_peer_append)
+        with pytest.raises(AuditHeadMovedError):
+            await store.record_audit("sealed", actor="u", expect_prev=head)
+        assert fired
+        cur = await store._db.execute("SELECT seq, action FROM audit_log ORDER BY seq")
+        assert [tuple(r) for r in await cur.fetchall()] == [
+            (1, AUDIT_KEY_EPOCH_ACTION),
+            (2, "peer.row"),
+        ]
+    finally:
+        await store.close()
+
+
+async def test_a_second_handle_that_loses_the_genesis_write_adopts_the_row_already_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two keyed handles reach an empty log together. The second one's genesis append finds a row
+    there and is refused; the load suppresses that and adopts the first handle's row. Forced here by
+    making the second handle's first read see the empty log it would have seen a moment earlier.
+    The control is the genesis row count before the second load: one."""
+    path = tmp_path / "two.db"
+    key = generate_key()
+    first = await _keyed(path, key)
+    second = await _keyed(path, key)
+    try:
+        real = second._audit_genesis_row
+        reads: list[int] = []
+
+        async def empty_once() -> Any:
+            reads.append(1)
+            return None if len(reads) == 1 else await real()
+
+        monkeypatch.setattr(second, "_audit_genesis_row", empty_once)
+        await load_audit_chain(second, read_only=False)
+        assert len(reads) == 2, "the load must read again after its refused append"
+        assert second._audit_chain_keyed is True and second._audit_ranges_trusted
+        cur = await first._db.execute("SELECT seq, action FROM audit_log")
+        assert [tuple(r) for r in await cur.fetchall()] == [(1, AUDIT_KEY_EPOCH_ACTION)]
+    finally:
+        await first.close()
+        await second.close()
+
+
+# --- SQLite stores any type in any column: nothing a column holds may raise --------------------------
+
+
+def test_the_mac_comparison_is_total_over_every_stored_type() -> None:
+    """A value no engine build writes maps to bytes no digest can equal, and to different bytes
+    from the text it resembles."""
+    digest = "ab" * 32
+    for stored in (b"ab" * 32, 7, 7.5, None, ""):
+        assert audit_mac_bytes(stored) != audit_mac_bytes(digest)
+    assert audit_mac_bytes(b"ab") != audit_mac_bytes("ab")
+    assert audit_mac_bytes("ab") == b"ab"  # the control: text is its own bytes
+
+
+@pytest.mark.parametrize("seq", [1, 3], ids=["genesis-row", "later-row"])
+async def test_a_row_hash_stored_as_a_blob_is_a_reported_break(tmp_path: Path, seq: int) -> None:
+    """The store still opens, and the verify reports the row. Neither raises. The control is the
+    untouched chain, which verifies."""
+    path = tmp_path / "blob.db"
+    key = generate_key()
+    store = await _keyed(path, key)
+    try:
+        for i in range(3):
+            await store.record_audit("act", actor="u", detail=str(i))
+        ok, message = await store.verify_audit_chain()
+        assert ok, message
+    finally:
+        await store.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE audit_log SET row_hash = X'6162' WHERE seq = ?", (seq,))
+        conn.commit()
+    conn.close()
+    store = await _keyed(path, key)  # must not raise
+    try:
+        ok, message = await store.verify_audit_chain()  # must not raise
+        assert not ok and f"seq={seq}" in (message or ""), message
+        await store.audit_anchor()  # must not raise either
+    finally:
+        await store.close()
+
+
+async def test_the_anchor_is_total_over_a_head_whose_sequence_number_is_not_an_integer(
+    tmp_path: Path,
+) -> None:
+    """Text sorts above every integer in SQLite, so such a row is the head. The anchor falls back to
+    the row count rather than raising, and an append on that head is the designed refusal. The
+    control is the anchor before the edit: the newest row's sequence number."""
+    path = tmp_path / "text-seq.db"
+    store = await MessageStore.open(path)
+    try:
+        for i in range(3):
+            await store.record_audit("act", actor="u", detail=str(i))
+        assert (await store.audit_anchor())[0] == 3
+        await store._db.execute("UPDATE audit_log SET seq = 'zzz' WHERE seq = 2")
+        await store._db.commit()
+        seq, head = await store.audit_anchor()
+        assert seq == 3 and isinstance(head, str)
+        with pytest.raises(RuntimeError, match="no usable sequence number"):
+            await store.record_audit("next", actor="u")
+        ok, message = await store.verify_audit_chain()
+        assert not ok, message
+    finally:
+        await store.close()
 
 
 # --- the genesis record ------------------------------------------------------------------------------

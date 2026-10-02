@@ -3198,6 +3198,16 @@ class SqlServerStore:
         )
         return rows
 
+    async def _audit_genesis_row(self) -> Mapping[str, Any] | None:
+        """``AuditRangeHost`` primitive: the row at ``seq = 1``, or ``None``."""
+        rows: list[Mapping[str, Any]] = list(
+            await self._fetchall(
+                "SELECT id, seq, ts, actor, action, channel_id, detail, client, row_hash"
+                " FROM audit_log WHERE seq = 1"
+            )
+        )
+        return rows[0] if rows else None
+
     async def _audit_range_rows(self) -> list[Mapping[str, Any]]:
         """``AuditRangeHost`` primitive: every range row after the genesis row, in ``seq`` order.
 

@@ -1656,8 +1656,8 @@ class AuditStore(Protocol):
         carrier (ContextVar) was rejected precisely because it inherits into ``asyncio.create_task``
         workers and would stamp an unrelated operator's address onto ``system`` rows.
 
-        The address is folded into the tamper-evident hash chain as a conditional trailing element, so
-        rows written before this column existed (``client`` NULL) still verify byte-identically — see
+        The address is inside the tamper-evident hash chain, as one of the fixed, typed fields each
+        row's digest covers, so NULL and an empty address are different rows -- see
         :func:`~messagefoundry.store.store.audit_row_hash`."""
         ...
 
