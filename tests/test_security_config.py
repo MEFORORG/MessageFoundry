@@ -394,18 +394,22 @@ def test_require_mfa_scope_advisory_names_only_the_accounts_it_frees() -> None:
 
 def test_require_mfa_advisory_keeps_an_enrolled_factor_and_the_oidc_claim() -> None:
     """Vault BACKLOG #2798. RED when the ``require_mfa = false`` advisory again says EVERY account is
-    single-factor.
+    single-factor, or again says an enrolled account must ALWAYS satisfy its factor.
 
     With the requirement off, ``AuthService._mfa_required_for`` still holds an ENROLLED account to its
-    factor, and the OIDC claim gate (``auth/oidc/claims.py:_check_mfa_gate``) reads only
-    ``[auth].oidc_require_mfa_claim``. What the switch frees is an account with no factor enrolled,
-    which is where a Kerberos ticket that asserts no strength gets in on its own."""
+    factor, but only while it keeps one: the last-factor removal guards ask the same helper with
+    ``second_factor_enrolled=False``, which answers False here, so the holder may remove the last. The
+    OIDC claim gate (``auth/oidc/claims.py:_check_mfa_gate``) reads only
+    ``[auth].oidc_require_mfa_claim``, and the OIDC mint stamps the session verified on that setting,
+    so the claim stands in for an enrolled factor. What the switch frees is an account with no factor
+    enrolled, which is where a Kerberos ticket that asserts no strength gets in on its own."""
     loos = dict(_loosenings(SecuritySettings(require_mfa=False)))
     assert loos["require_mfa"] == (
         "an account with no second factor enrolled is single-factor, so a Kerberos session enters "
-        "on a ticket that asserts no strength. An enrolled account must still satisfy its factor, "
-        "and an OIDC sign-in still needs a checked amr/acr claim while "
-        "[auth].oidc_require_mfa_claim is on"
+        "on a ticket that asserts no strength. An enrolled account owes its factor only while it "
+        "keeps one, and its holder may remove the last. An OIDC sign-in needs an amr/acr claim "
+        "checked while [auth].oidc_require_mfa_claim is on, and that claim stands in for the "
+        "enrolled factor"
     )
 
 
@@ -420,8 +424,8 @@ def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
     assert loos["allow_single_factor_admin_when_exposed"] == (
         "an EXPOSED instance under enforcement = enforce may start with [security].require_mfa "
         "off, on an audited warning instead of the refusal. Every account with no second factor "
-        "enrolled is then single-factor over the network, unless an OIDC sign-in carries a "
-        "checked amr/acr claim"
+        "enrolled is then single-factor over the network, unless an OIDC sign-in carries an "
+        "amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
     )
 
 

@@ -440,7 +440,7 @@ const SECURITY_SHOW: Payload = {
   "loosenings": [
     {
       "switch": "require_mfa",
-      "risk": "every account is single-factor \u2014 no engine second factor is required, and a directory session is admitted on a ticket that asserts no strength"
+      "risk": "an account with no second factor enrolled is single-factor, so a Kerberos session enters on a ticket that asserts no strength. An enrolled account owes its factor only while it keeps one, and its holder may remove the last. An OIDC sign-in needs an amr/acr claim checked while [auth].oidc_require_mfa_claim is on, and that claim stands in for the enrolled factor"
     }
   ],
   "loosenings_partial": false,

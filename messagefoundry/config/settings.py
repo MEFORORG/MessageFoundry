@@ -7016,9 +7016,10 @@ def security_loosenings(
             (
                 "require_mfa",
                 "an account with no second factor enrolled is single-factor, so a Kerberos session "
-                "enters on a ticket that asserts no strength. An enrolled account must still "
-                "satisfy its factor, and an OIDC sign-in still needs a checked amr/acr claim while "
-                "[auth].oidc_require_mfa_claim is on",
+                "enters on a ticket that asserts no strength. An enrolled account owes its factor "
+                "only while it keeps one, and its holder may remove the last. An OIDC sign-in needs "
+                "an amr/acr claim checked while [auth].oidc_require_mfa_claim is on, and that claim "
+                "stands in for the enrolled factor",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7040,7 +7041,8 @@ def security_loosenings(
                 "an EXPOSED instance under enforcement = enforce may start with "
                 "[security].require_mfa off, on an audited warning instead of the refusal. Every "
                 "account with no second factor enrolled is then single-factor over the network, "
-                "unless an OIDC sign-in carries a checked amr/acr claim",
+                "unless an OIDC sign-in carries an amr/acr claim checked while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     if not sec.encrypt_stored_data:

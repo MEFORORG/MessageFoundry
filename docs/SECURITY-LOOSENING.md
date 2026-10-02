@@ -266,9 +266,12 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   accept the risk" away, at any posture.
 
 ### `require_mfa = false` — single-factor admin
-- **What you lose:** the Administrator role authenticates with a password only (no native TOTP second
-  factor). Directory accounts lose it too (BACKLOG #1144): a Kerberos session mints MFA-pending, and
-  this knob is the only thing that lets it through the gate without an engine factor.
+- **What you lose:** every account with no second factor enrolled, Administrators included,
+  authenticates with a single factor, unless an OIDC sign-in carries an amr/acr claim checked while
+  `[auth].oidc_require_mfa_claim` is on. Directory accounts lose it too (BACKLOG #1144): a Kerberos
+  session mints MFA-pending, and this knob is the only thing that lets it through the gate without an
+  engine factor. An enrolled account owes its factor only while it keeps one, and its holder may
+  remove the last.
 - **When acceptable:** a loopback single-operator box where the second factor adds friction without a
   network exposure.
 - **Compensating controls:** keep the bind loopback; enable `admin_new_ip_step_up` if exposed.
@@ -337,8 +340,9 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 ### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-admin refusal
 - **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)
   whose admin surface is exposed (off-loopback bind or a declared reverse proxy) with `require_mfa` off,
-  MessageFoundry normally **refuses to start** — the Administrator role would authenticate with a single
-  factor over the network. This ack **downgrades that refusal to a loud, audited warning** (the same
+  MessageFoundry normally **refuses to start**: every account with no second factor enrolled,
+  Administrators included, would authenticate with a single factor over the network, unless an OIDC
+  sign-in carries an amr/acr claim checked while `[auth].oidc_require_mfa_claim` is on. This ack **downgrades that refusal to a loud, audited warning** (the same
   warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
   single-factor while staying at `enforce`.
 - **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means exactly
@@ -349,7 +353,7 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   already the intended scope; the code now matches it, and the ack itself is unchanged. An **undeclared**
   proxy (a set `web_console_public_address` with no `tls_terminated_upstream`) stays outside the predicate
   — nothing was declared, so exposure there is an inference, and an inference must not refuse. It has its
-  own startup **warning**, which names single-factor admin directly on a PHI instance with `require_mfa`
+  own startup **warning**, which names single-factor sign-in directly on a PHI instance with `require_mfa`
   off; read that arm, not the ADR 0068 §8 undeclared-proxy warning, as the control for this case (§8 is
   about the `/ui` cookie and HSTS, and the ADR 0143 auto-degrade suppresses it in the same posture).
 - **When acceptable:** a production exposure where the second factor is supplied by a **compensating control
