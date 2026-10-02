@@ -8,7 +8,9 @@ off-loopback plaintext-MLLP exposure gate (ADR 0002 §0) and is REFUSED at start
 ``--allow-insecure-bind``. Both node start methods — ``EngineNode.start`` (reused by failover +
 batch-engine) and ``ShardCertNode.start`` — must add that dev override when, and ONLY when, the bind
 host is non-loopback; a co-located loopback bind keeps a byte-identical argv. These fake
-``create_subprocess_exec`` so no real engine spawns.
+``create_subprocess_exec`` so no real engine spawns. They start with ``provision=False``: the account
+step runs the real ``provision-admin`` in a child, and these cases are about the argv alone
+(``tests/test_rig_admin.py`` covers that step).
 """
 
 from __future__ import annotations
@@ -71,7 +73,7 @@ async def test_engine_node_adds_flag_for_nonloopback(monkeypatch: pytest.MonkeyP
     node = EngineNode(
         "n", 9000, env={"MEFOR_INBOUND_BIND_HOST": "0.0.0.0"}, config_dir="cfg", cwd=Path(".")
     )
-    await node.start()
+    await node.start(provision=False)
     await node.stop()
     assert "--allow-insecure-bind" in captured["argv"]
 
@@ -81,7 +83,7 @@ async def test_engine_node_no_flag_for_loopback(monkeypatch: pytest.MonkeyPatch)
     node = EngineNode(
         "n", 9000, env={"MEFOR_INBOUND_BIND_HOST": "127.0.0.1"}, config_dir="cfg", cwd=Path(".")
     )
-    await node.start()
+    await node.start(provision=False)
     await node.stop()
     assert "--allow-insecure-bind" not in captured["argv"]
 
@@ -91,7 +93,7 @@ async def test_engine_node_no_flag_when_bind_host_unset(monkeypatch: pytest.Monk
     # argv stays byte-identical to before this fix.
     captured = _capture_exec(monkeypatch)
     node = EngineNode("n", 9000, env={}, config_dir="cfg", cwd=Path("."))
-    await node.start()
+    await node.start(provision=False)
     await node.stop()
     assert "--allow-insecure-bind" not in captured["argv"]
 
@@ -101,7 +103,7 @@ async def test_shardcert_node_adds_flag_for_nonloopback(monkeypatch: pytest.Monk
     node = ShardCertNode(
         "0", 9000, env={"MEFOR_INBOUND_BIND_HOST": "0.0.0.0"}, config_dir="cfg", cwd=Path(".")
     )
-    await node.start()
+    await node.start(provision=False)
     await node.stop()
     assert "--allow-insecure-bind" in captured["argv"]
     # The shard flag is still injected alongside the override.
@@ -113,7 +115,7 @@ async def test_shardcert_node_no_flag_for_loopback(monkeypatch: pytest.MonkeyPat
     node = ShardCertNode(
         "0", 9000, env={"MEFOR_INBOUND_BIND_HOST": "127.0.0.1"}, config_dir="cfg", cwd=Path(".")
     )
-    await node.start()
+    await node.start(provision=False)
     await node.stop()
     assert "--allow-insecure-bind" not in captured["argv"]
     assert (

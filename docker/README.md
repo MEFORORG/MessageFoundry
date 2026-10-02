@@ -149,6 +149,6 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
 ## CI
 
 The `docker-smoke` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds the slim image
-and a baked test image ([`smoke/`](smoke/)), serves it loopback + auth-off, sends one synthetic ADT^A01
+and a baked test image ([`smoke/`](smoke/)), serves it loopback + signed in, sends one synthetic ADT^A01
 over MLLP, asserts it finalizes to **PROCESSED** (not merely RECEIVED), and verifies a graceful
 `docker stop`. It is the engine's first non-Windows runtime gate.
