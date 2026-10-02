@@ -70,23 +70,31 @@ open points settled below.
    use* section says to write a value read from a message with `set_data`, and why. The advisory
    handler-security lint (`_check_handler_security` in `messagefoundry/checks.py`, ADR 0144) gains a
    sixth rule, `leaf-to-whole-field`. It flags a `<name>.set("<field>", v)` call or a
-   `<name>["<field>"] = v` assignment whose value holds a `<name>.field("<leaf>")` call or a
-   `<name>["<leaf>"]` read, directly or through a name bound in the same scope. Both paths must be
-   string literals for the AST to know their level. It is advisory, as the lint is.
-4. **`encode_with_separators` escapes a target delimiter found in a leaf**, with the target escape
-   character: the target field, component, repetition, subcomponent and escape characters become
-   `F`, `S`, `R`, `T` and `E` escapes. A value the target set cannot represent raises
-   `DelimiterRewriteRefused`: an escape sequence, or an escape character nothing closes, whose text
-   holds such a character, and a segment id holding the target field separator. The MLLP override
-   raises it as `NegativeAckError(permanent=True)`, code `reencode`, so the delivery fails at once.
+   `<name>["<field>"] = v` assignment whose value a `<name>.field("<leaf>")` call or a
+   `<name>["<leaf>"]` read flows into, directly or through a name bound in the same scope. Both paths
+   must be string literals for the AST to know their level. It is advisory, as the lint is.
+4. **`encode_with_separators` keeps every leaf reading the same under the target set.** A target
+   delimiter sitting literally in a leaf is escaped with the target escape character: the target
+   field, component, repetition, subcomponent and escape characters become `F`, `S`, `R`, `T` and
+   `E` escapes. A separator escape (`F`, `S`, `R`, `T`, `E`) is decoded against the source set and
+   re-escaped against the target set, because its letter names a different character there. An
+   escape character nothing closes is data, as the parser reads it, so it and the text after it are
+   written as data under the target set. Any other escape sequence keeps its text under the target
+   escape character. Two values the target set cannot represent raise `DelimiterRewriteRefused`: an
+   escape sequence other than the five separator escapes whose text holds a target delimiter, and a
+   segment id holding the target field separator. The MLLP override raises it as
+   `NegativeAckError(permanent=True)`, code `reencode`, so the delivery fails at once.
 5. **A source that does not split refuses a body with more than one `MSH`.** The check sits in
    `check_decoded`, the shared post-decode guard, as `IngressMultipleMessagesRejected`, an
    `IngressBodyRejected` like ADR 0205's frame-byte refusal. The MLLP, TCP and HTTP listeners record
    `ERROR`; a listener with an ACK channel answers `AR` with MSA-3 `more than one MSH in body`. The
-   dry-run and the resubmission paths run the same guard, so they refuse the same body. It counts
-   `MSH` the way the parser does: every line whose first three characters are `MSH`, after the
-   whitespace around the body is stripped. The File source is unchanged: `split_batch` splits it
-   first, so each message reaches the guard alone.
+   dry-run runs the same guard, so it refuses the same body. The resubmission paths run it whenever
+   they know the inbound connection. `admit_resubmitted_body` with no connection (`ic=None`: the
+   edit-resend direct path, or a re-route whose inbound is gone) runs only the engine-wide NUL and
+   size rules, so it does not refuse a second `MSH`; ADR 0205 documents the same skip for its frame
+   bytes. The guard counts `MSH` the way the parser does: every line whose first three characters are
+   `MSH`, after the whitespace around the body is stripped. The File and remote-file sources split a
+   file first, so each message reaches the guard alone.
 
 ### The open points, settled
 
@@ -100,20 +108,39 @@ open points settled below.
   literal component or subcomponent path, and the recognizer reads both `msg.set` and `msg.set_data`
   copies back as `copy_field`. A source given as an expression cannot be classified there and keeps
   `msg.set`; the lint cannot see that one either. A `msg.set_data` call that is not a copy reads as a
-  `code` row, because `set_field` means `set`. ADR 0106's palette table still shows the old shape as
+  `code` row, because `set_field` means `set`. An edit of a copy row's `src` or `dst` re-picks the
+  write the same way, so a source edited from a leaf to a whole field goes back to `set`, and one
+  edited the other way goes to `set_data`. At a literal leaf destination the two writes are the same,
+  so there the method is left as written. ADR 0106's palette table still shows the old shape as
   the record of that decision; `docs/STEPS-PALETTE.md` shows the new one.
-- **The lint's reach (rule 3).** It follows a name through every binding in the write's own scope,
-  as `unsafe-db-lookup` does (BACKLOG #1658), and over-reports rather than miss a branch. A read
-  from any plain name counts, not only the message the write targets: a decoded leaf from another
-  message is as much data. It does not follow a value through a function call into another scope,
-  and it does not see a dynamic path.
-- **What a target delimiter in a leaf becomes (rule 4).** Escaped, not refused. The draft allowed
+- **The lint's reach (rule 3).** It follows the value's data flow: the written expression, and
+  every binding in the write's own scope of a name that flows into it, as `unsafe-db-lookup`
+  follows a name (BACKLOG #1658). A conditional's test, a comprehension's filter, a subscript or
+  mapping key, and the argument of a call that returns a length, a truth value or a number select or
+  measure the value and are not followed, so `msg.set("PID-3", mr)` in
+  `samples/results_relay/results_relay.py`, whose only leaf read is a generator filter, is clean.
+  Every binding of a name counts, so it over-reports rather than miss a branch, and the names are
+  solved as one fixed point per scope, so a long chain costs a pass per link rather than doubling at
+  each. A read from any plain name counts, not only the message the write targets: a decoded leaf
+  from another message is as much data. It does not follow a value through a function call into
+  another scope, and it does not see a dynamic path. **Known blind spots**, each a shape it does not
+  flag: a loop target (`for rep in msg.repetitions(...)`, whose items are then written whole); a
+  walrus target bound inside an expression; a value passed by keyword (`msg.set("PV1-19",
+  value=v)`); an augmented subscript write (`msg["PV1-19"] += v`); and decoded leaves joined into a
+  line handed to `add_segment`. It also reads `"~".join(...)` and other method calls by their
+  receiver and arguments, so it flags a join of leaves but cannot tell what a join it does not
+  follow produced. It is advisory, so these are recorded rather than closed.
+- **What a value under the target set becomes (rule 4).** Escaped, not refused. The draft allowed
   either. Escaping keeps the message deliverable and is what the target set's own escape mechanism
-  exists for. Refusal is kept for the values escaping cannot fix: text inside an escape sequence has
-  no escape of its own, and a segment id is not a leaf. A field holding no such character takes the
-  single `str.translate` it took before, after a substring scan per character that needs escaping.
-  An override that only renames separators needs none: the field separator never appears inside a
-  field's text, so the escape set is empty and the rewrite is the old single translate.
+  exists for. The test is what the receiver reads: a separator escape keeps its letter only when that
+  letter names the same character under both sets, and is otherwise decoded and re-escaped, so
+  `SMITH \T\ SONS` sent under a target subcomponent `#` still reads `SMITH & SONS`. Refusal is kept
+  for the one leaf value escaping cannot fix: text inside an escape sequence such as `\Z..\` has no
+  escape of its own. A segment id is not a leaf and is refused too. A field holding no source escape
+  character takes one `str.translate`, whose table maps the separators and escapes each data
+  character that needs it; only a field holding an escape sequence is walked character by
+  character. When the target set equals the source set, every field takes the plain translate it
+  took before.
 - **Which re-encode failures are permanent.** All of them on the MLLP override, not only rule 4's,
   and the sibling `hl7_raw_separators` re-encode too. A payload that is not parseable HL7 fails
   identically on every retry under either setting, so a retry only holds the lane. That is ADR
@@ -129,11 +156,22 @@ open points settled below.
   splitting on a listener: a file source answers nobody, and each message gets its own disposition.
   The split goes through a new `split_batch_bytes` in `messagefoundry/parsing/split.py`, which decodes
   with the declared charset, splits with `split_batch`, and re-encodes each message; a single-message
-  or undecodable file is handed over as its original bytes, as the File source does. A stop part-way
-  through a batch leaves the whole file for the next start, and a store failure on hand-off K leaves
-  it for the next poll; both re-emit the first K messages, the at-least-once behaviour the File source
-  already has. The File source keeps its own inline copy of the same logic in this change, because a
-  concurrent pull request is editing `transports/file.py`; moving it onto the helper is a follow-up.
+  or undecodable file is handed over as its original bytes, as the File source does. In a charset
+  whose ASCII bytes always mean ASCII (UTF-8, ASCII, ISO 8859, Windows-125x), a file with no `MSH`
+  after a line break is one message, so it is handed over after one byte scan, with no decode or
+  split. The stop is checked before every hand-off, the first included: a stop part-way leaves the
+  whole file for the next start, and a store failure on hand-off K leaves it for the next poll; both
+  re-emit the first K messages, the at-least-once behaviour the File source already has. The File
+  source keeps its own inline copy of the same logic in this change, because a concurrent pull
+  request is editing `transports/file.py`; moving it onto the helper is a follow-up.
+- **No leading message is dropped by the split.** `split_batch` used to keep only chunks that began
+  with `MSH`, so a file starting with a byte order mark, a space or a tab lost its first message
+  when it held three or more, and with two the whole file went over as one `ERROR`. Now the first
+  chunk is read past whitespace and a byte order mark (U+FEFF): an `MSH`-led one is a message, an
+  `FHS` or `BHS` envelope header is dropped, and anything else is kept so the parser records its
+  `ERROR`. The File source calls `split_batch` too, so it is fixed by the same change. A file holding
+  one message with a leading byte order mark is still handed over whole, and the parser still
+  refuses it; that is unchanged here.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.
@@ -172,23 +210,39 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_set_data_reads_the_messages_own_separators`
   -> `tests/test_data_never_becomes_structure.py::test_set_data_scopes_to_one_repetition_and_leaves_the_others`
   -> `tests/test_data_never_becomes_structure.py::test_set_data_still_refuses_a_segment_separator`
-- **AC-5** -- WHERE a config module writes a literal leaf read into a literal whole-field path with
-  `set`, THE SYSTEM SHALL report a `leaf-to-whole-field` advisory finding, and SHALL NOT report one
-  for `set_data`, a leaf destination, a whole-field source or a dynamic path.
+- **AC-5** -- WHERE a config module writes into a literal whole-field path with `set` a value that a
+  literal leaf read flows into, THE SYSTEM SHALL report a `leaf-to-whole-field` advisory finding, and
+  SHALL NOT report one for `set_data`, a leaf destination, a whole-field source, a dynamic path, or a
+  leaf read that only selects or measures the value (a test, a filter, a key, a length).
   -> `tests/test_data_never_becomes_structure.py::test_the_lint_flags_a_decoded_leaf_written_to_a_whole_field`
   -> `tests/test_data_never_becomes_structure.py::test_the_lint_follows_a_name_bound_in_the_same_scope`
   -> `tests/test_data_never_becomes_structure.py::test_the_lint_does_not_flag_safe_or_unknowable_shapes`
+  -> `tests/test_data_never_becomes_structure.py::test_the_lint_ignores_a_leaf_that_does_not_flow_into_the_value`
+  -> `tests/test_data_never_becomes_structure.py::test_the_lint_still_flags_a_leaf_that_flows_into_the_value`
+  -> `tests/test_data_never_becomes_structure.py::test_the_lint_follows_a_name_only_through_its_value`
+  -> `tests/test_data_never_becomes_structure.py::test_the_shipped_results_relay_sample_is_clean`
+  -> `tests/test_data_never_becomes_structure.py::test_the_lint_resolves_a_deep_doubling_chain_quickly`
 - **AC-6** -- WHEN the Steps view inserts a Copy Field from a literal leaf, THE SYSTEM SHALL emit
-  `set_data` and read the line back as the same `copy_field` row.
+  `set_data` and read the line back as the same `copy_field` row; and WHEN an edit moves a copy's
+  source or destination across that line, THE SYSTEM SHALL re-pick `set` or `set_data`.
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_inserts_a_copy_from_a_leaf_with_set_data_and_reads_it_back`
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_keeps_set_for_a_whole_field_or_an_expression_source`
-- **AC-7** -- WHEN the delimiter override meets a target delimiter inside a leaf, THE SYSTEM SHALL
-  escape it with the target escape character, so the downstream parse reads the fields the engine
-  saw.
+  -> `tests/test_data_never_becomes_structure.py::test_a_copy_edited_from_a_leaf_to_a_whole_field_source_writes_with_set`
+  -> `tests/test_data_never_becomes_structure.py::test_a_copy_edited_from_a_whole_field_to_a_leaf_source_writes_with_set_data`
+  -> `tests/test_data_never_becomes_structure.py::test_a_copy_whose_destination_is_edited_to_a_whole_field_writes_with_set_data`
+- **AC-7** -- WHEN the delimiter override rewrites a message, THE SYSTEM SHALL keep every leaf reading
+  the same under the target set: a target delimiter inside a leaf is escaped with the target escape
+  character, a separator escape is decoded against the source set and re-escaped against the target
+  set, and an escape character nothing closes is carried as data, so the downstream parse reads the
+  fields and values the engine saw.
   -> `tests/test_data_never_becomes_structure.py::test_P3_a_literal_target_field_separator_stays_inside_its_field`
   -> `tests/test_data_never_becomes_structure.py::test_every_target_delimiter_found_in_a_leaf_is_escaped`
   -> `tests/test_data_never_becomes_structure.py::test_escapes_and_structure_survive_the_slow_path`
   -> `tests/test_data_never_becomes_structure.py::test_an_override_that_only_renames_separators_takes_the_plain_translate`
+  -> `tests/test_data_never_becomes_structure.py::test_a_separator_escape_reads_the_same_after_the_rewrite`
+  -> `tests/test_data_never_becomes_structure.py::test_an_escaped_and_a_literal_component_stay_distinct_under_the_target`
+  -> `tests/test_data_never_becomes_structure.py::test_an_unclosed_escape_holding_a_target_delimiter_is_carried`
+  -> `tests/test_mllp_encoding_override.py::test_reencode_decodes_separator_escapes_so_they_read_the_same`
 - **AC-8** -- IF the target delimiters cannot carry a value as data, THEN THE SYSTEM SHALL refuse the
   rewrite with content-free text, and the MLLP delivery SHALL fail permanently before any dial.
   -> `tests/test_data_never_becomes_structure.py::test_a_value_the_target_set_cannot_carry_is_refused`
@@ -207,12 +261,21 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_ingress_admits_one_message`
   -> `tests/test_data_never_becomes_structure.py::test_the_second_msh_refusal_is_hl7v2_only`
 - **AC-11** -- WHEN a remote-file source retrieves an HL7 v2 batch file, THE SYSTEM SHALL hand each
-  message over on its own, in file order, and SHALL leave the file in place when a stop arrives
-  part-way.
+  message over on its own, in file order, give each its own disposition, and SHALL leave the file in
+  place, handing nothing more over, when a stop arrives before its last message.
   -> `tests/test_data_never_becomes_structure.py::test_the_remote_file_source_splits_a_batch_like_the_file_source`
   -> `tests/test_data_never_becomes_structure.py::test_a_stop_part_way_through_a_remote_batch_leaves_the_file`
+  -> `tests/test_data_never_becomes_structure.py::test_a_stop_before_the_first_message_hands_nothing_over_and_still_prunes`
   -> `tests/test_data_never_becomes_structure.py::test_split_batch_bytes_splits_a_batch_and_hands_one_message_over_untouched`
-- **AC-12** -- THE SYSTEM SHALL leave the File source's batch split unchanged.
+  -> `tests/test_data_never_becomes_structure.py::test_split_batch_bytes_hands_a_single_message_over_without_decoding`
+  -> `tests/test_data_never_becomes_structure.py::test_split_batch_bytes_still_splits_an_encoding_the_byte_check_cannot_read`
+- **AC-12** -- WHEN a batch file starts with whitespace or a byte order mark, THE SYSTEM SHALL keep its
+  first message, on the File and the remote-file source alike, and SHALL otherwise leave the File
+  source's batch split unchanged.
+  -> `tests/test_data_never_becomes_structure.py::test_every_message_of_a_noise_led_remote_file_gets_a_disposition`
+  -> `tests/test_data_never_becomes_structure.py::test_split_batch_keeps_a_first_message_led_by_noise`
+  -> `tests/test_data_never_becomes_structure.py::test_a_first_chunk_that_is_not_an_envelope_is_kept_for_the_parser`
+  -> `tests/test_data_never_becomes_structure.py::test_the_file_source_keeps_a_bom_led_first_message`
   -> `tests/test_message_split.py`
 
 ## Options considered
@@ -241,12 +304,16 @@ than one `MSH` is left to its own item.
 unusual separators can no longer set a field through the override. A sender that packs two messages
 into one MLLP frame or one HTTP request is told so, with an `AR` where it can be. A remote batch file
 is processed as the File source processes one, and an enveloped remote batch is no longer one
-`ERROR`.
+`ERROR`. A batch file led by whitespace or a byte order mark keeps its first message on both file
+sources.
 
 **Negative / risks** -- Rule 3 is advisory: a Handler author can still write the unsafe form, and
-the lint sees only literal paths. A partner that reads a target-set escape it did not expect would see
-the escape rather than a split field, which is the point. A Handler can still send two messages in one
-payload; see the `encode_batch` finding.
+the lint sees only literal paths and has the blind spots listed above. A partner that reads a
+target-set escape it did not expect would see the escape rather than a split field, which is the
+point. A Handler can still send two messages in one payload; see the `encode_batch` finding.
+`samples/send_mllp.py` sends a whole file as one frame, so `samples/messages/adt_batch.hl7`, five
+messages with no envelope, now gets an `AR`; the helper's usage text, `docs/USER-GUIDE.md` and
+`docs/CONNECTIONS.md` say so.
 
 **Out of scope** -- A delivery refusing a payload holding more than one `MSH`. Moving the File source
 onto `split_batch_bytes`. Pinning inbound separators per connection. The `FHS`/`BHS` header lines

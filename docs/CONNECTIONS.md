@@ -1256,7 +1256,9 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   not split, refuses an HL7 v2 body holding more than one `MSH` segment: it records `ERROR`, and a
   listener with an ACK channel answers `AR` with MSA-3 `more than one MSH in body` (ADR 0206 rule 5). A
   sender with a batch sends one message per frame or request, or drops the file where a `File(...)` or
-  remote-file source splits it.
+  remote-file source splits it. That includes the shipped helper: `samples/send_mllp.py` sends a whole
+  file as one frame, so `samples/send_mllp.py samples/messages/adt_batch.hl7` (five messages, no
+  envelope) gets an `AR`.
 - **Leader-gated.** The remote directory is a *shared* external resource, so in a cluster only the leader
   lists, downloads, or moves its files — otherwise two nodes would double-ingest the drop.
 - **No timeout knob.** Neither factory exposes one. The bounds these connections do have are hard-coded

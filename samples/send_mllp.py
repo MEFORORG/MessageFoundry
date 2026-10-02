@@ -10,6 +10,11 @@ A tiny manual-testing helper for a running engine. With the sample channel
 
 It reuses the engine's own (tested) MLLP framing, so it frames the message correctly
 (``0x0B … 0x1C 0x0D``) and decodes the framed ACK before printing it.
+
+It sends the whole file as ONE frame. A listener takes one message per frame and answers ``AR``
+(MSA-3 ``more than one MSH in body``) to a frame holding several (ADR 0206), so
+``samples/messages/adt_batch.hl7``, five messages with no envelope, is refused here. Drop a batch
+file in a ``File(...)`` inbox instead, which splits it into one message each.
 """
 
 from __future__ import annotations

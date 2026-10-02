@@ -246,6 +246,8 @@ python samples/send_mllp.py samples/messages/adt_a01.hl7 --host 127.0.0.1 --port
 
 The file it sends, [samples/messages/adt_a01.hl7](../samples/messages/adt_a01.hl7), is synthetic — never substitute real PHI here.
 
+`send_mllp.py` sends the whole file as one frame, and an MLLP listener takes one message per frame. A file holding several messages, such as [samples/messages/adt_batch.hl7](../samples/messages/adt_batch.hl7), gets an `MSA|AR` with `more than one MSH in body` and is recorded `ERROR` ([ADR 0206](adr/0206-an-hl7-write-or-re-encode-never-lets-data-become-structure.md) rule 5). Drop a batch file in a `File(...)` inbox instead, which splits it into one message each.
+
 ### 3. What to expect
 
 `send_mllp.py` reuses the engine's MLLP framing, waits for the framed ACK, and prints it:
