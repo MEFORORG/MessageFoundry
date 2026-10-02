@@ -23,18 +23,21 @@ restate it.
 
 from __future__ import annotations
 
+import gzip
 import inspect
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Never
+from typing import Any, Never
 
 import pytest
 
+import fuzz.targets as fuzz_targets
 from fuzz.targets import (
     _HL7_ROUTING_PROPERTIES,
+    _STREAM_CAP,
     _X12_ISA_PROPERTIES,
     BLANK_SEGMENT_HL7,
     DEFAULT_MAX_LEN,
@@ -44,13 +47,20 @@ from fuzz.targets import (
     WORK_DIR_ENV,
     FuzzTarget,
     HarnessRefusal,
+    _separators_undeterminable,
     libfuzzer_argv,
     work_paths,
     work_root,
     write_seed_corpus,
 )
+from messagefoundry.framing import FrameDecoder
+from messagefoundry.mllpcodec import frame as mllp_frame
 from messagefoundry.parsing import Peek
-from messagefoundry.parsing.x12 import X12Peek
+from messagefoundry.parsing.binary import iter_obx_documents, strip_documents
+from messagefoundry.parsing.dicom import DicomPeek
+from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.x12 import X12FrameReader, X12Peek
+from messagefoundry.transports import http_listener
 from tests._bash_resolver import (
     BASH_HARNESS_FAILURE,
     explain_returncode,
@@ -143,7 +153,16 @@ def test_the_registry_is_coherent() -> None:
 #: makes "every target passed" and "no target ran" the same green, which is the exact confusion this
 #: whole harness exists to remove. Asserting this floor was reached keeps the skip honest without
 #: making an optional extra mandatory.
-_ALWAYS_AVAILABLE = ("hl7_peek", "hl7_tree", "x12_peek")
+_ALWAYS_AVAILABLE = (
+    "hl7_peek",
+    "hl7_tree",
+    "x12_peek",
+    "stream_frames",
+    "x12_frames",
+    "http_request",
+    "compression",
+    "binary_carriage",
+)
 
 
 def _exercise(run: Callable[[FuzzTarget], None]) -> None:
@@ -351,6 +370,162 @@ def test_the_blank_segment_seed_reads_cleanly() -> None:
     assert peek.routing()["message_type"] == "ADT^A01"
     assert "" not in peek.segments()
     TARGETS_BY_NAME["hl7_peek"].run(BLANK_SEGMENT_HL7)
+
+
+def _x12_sample() -> bytes:
+    """The committed X12 sample, as the ``x12_peek`` target seeds it. Asserted present, not assumed."""
+    seed = next(
+        (s for s in TARGETS_BY_NAME["x12_peek"].seeds if s.startswith(b"ISA") and len(s) > 106),
+        None,
+    )
+    assert seed is not None, (
+        "no conformant ISA seed; samples/messages/x12_270_eligibility.edi gone?"
+    )
+    return seed
+
+
+#: An HL7 body carrying one OBX-5 ED Base64 document, with conformant MSH-2 encoding characters.
+_OBX_ED_ADT = (
+    CLEAN_ADT + "OBX|1|ED|DOC^Document||^Application^pdf^Base64^JVBERi0xLjQKJQ==\r"
+).encode()
+
+#: One injected fault per registered target: ``(object to patch, attribute, input builder)``.
+#:
+#: Each patch point sits INSIDE the code the target drives, below the target's own ``except``, so the
+#: fault has to travel back out through every handler the engine and the target put in its way. A
+#: ``KeyError`` is used throughout because no codec's contract error is one, so a target that lets it
+#: escape is a target that would let a real one escape. The input is built BEFORE the patch goes on,
+#: because a builder may itself use what is patched (the gzip one does).
+_INJECTIONS: dict[str, tuple[object, str, Callable[[], bytes]]] = {
+    "hl7_peek": (Peek, "routing", lambda: CLEAN_ADT.encode()),
+    "hl7_tree": (fuzz_targets, "parse_tree", lambda: CLEAN_ADT.encode()),
+    "x12_peek": (X12Peek, "groups", _x12_sample),
+    "dicom_peek": (DicomPeek, "parse", lambda: b"\x00" * 128 + b"DICM"),
+    "stream_frames": (FrameDecoder, "feed", lambda: b"\x00" + mllp_frame(CLEAN_ADT)),
+    "x12_frames": (X12FrameReader, "feed", lambda: b"\x00" + _x12_sample()),
+    "http_request": (http_listener, "HttpRequest", lambda: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"),
+    "compression": (gzip.GzipFile, "read", lambda: gzip.compress(CLEAN_ADT.encode(), mtime=0)),
+    "binary_carriage": (Message, "count_segments", lambda: _OBX_ED_ADT),
+}
+
+
+def test_every_registered_target_has_an_injected_fault() -> None:
+    """A target added without a fault-injection case is a target nobody has seen catch anything."""
+    assert set(_INJECTIONS) == set(TARGETS_BY_NAME), (
+        "add an entry to _INJECTIONS for every fuzz target, and drop the entry of a removed one"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(_INJECTIONS))
+def test_an_injected_fault_escapes_every_target(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    owner, attribute, build_input = _INJECTIONS[name]
+    data = build_input()
+    monkeypatch.setattr(owner, attribute, _boom(KeyError("injected")))
+    with pytest.raises(KeyError, match="injected"):
+        TARGETS_BY_NAME[name].run(data)
+
+
+def _deaf_to_one_byte_reads(
+    original: Callable[[Any, bytes], Iterator[bytes]],
+) -> Callable[[Any, bytes], Iterator[bytes]]:
+    """A ``feed`` that keeps the decoder's state right but loses any frame completed by a 1-byte read.
+
+    The shape of a real reassembly bug: correct when a frame arrives whole, wrong when it is split.
+    """
+
+    def feed(self: Any, data: bytes) -> Iterator[bytes]:
+        completed = list(original(self, data))
+        if len(data) > 1:
+            yield from completed
+
+    return feed
+
+
+@pytest.mark.parametrize("selector", [0, 1], ids=["mllp", "stx_etx"])
+def test_the_stream_target_catches_a_decoder_that_loses_a_frame_across_reads(
+    selector: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The split-invariance oracle fires. Control first, so a pass is attributable to the patch."""
+    framed = mllp_frame(CLEAN_ADT) if selector == 0 else b"\x02" + CLEAN_ADT.encode() + b"\x03"
+    data = bytes([selector]) + framed  # selectors 0 and 1 both mean one-byte reads
+    TARGETS_BY_NAME["stream_frames"].run(data)
+    monkeypatch.setattr(FrameDecoder, "feed", _deaf_to_one_byte_reads(FrameDecoder.feed))
+    with pytest.raises(AssertionError, match="split into reads"):
+        TARGETS_BY_NAME["stream_frames"].run(data)
+
+
+def test_the_stream_target_catches_a_payload_delivered_over_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An over-cap frame must raise; a decoder that ignores its cap and delivers it is a finding."""
+    data = b"\x00" + mllp_frame(b"A" * (_STREAM_CAP + 1))
+    TARGETS_BY_NAME["stream_frames"].run(data)  # control: the real decoder refuses it
+    original_init = FrameDecoder.__init__
+
+    def uncapped(self: FrameDecoder, codec: Any, max_frame_bytes: int | None = None) -> None:
+        original_init(self, codec, max_frame_bytes=None)
+
+    monkeypatch.setattr(FrameDecoder, "__init__", uncapped)
+    with pytest.raises(AssertionError, match="larger than max_frame_bytes"):
+        TARGETS_BY_NAME["stream_frames"].run(data)
+
+
+def test_the_x12_frame_target_catches_a_reader_that_loses_an_interchange_across_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = b"\x00" + _x12_sample()  # selector 0 means one-byte reads
+    TARGETS_BY_NAME["x12_frames"].run(data)
+    monkeypatch.setattr(X12FrameReader, "feed", _deaf_to_one_byte_reads(X12FrameReader.feed))
+    with pytest.raises(AssertionError, match="split into reads"):
+        TARGETS_BY_NAME["x12_frames"].run(data)
+
+
+def test_the_compression_target_catches_output_over_its_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A decompressor that returns past its ceiling is the bomb guard failing; the target says so."""
+
+    def gzip_decompress(data: bytes, *, max_output_bytes: int | None) -> bytes:
+        assert max_output_bytes is not None
+        return b"\x00" * (max_output_bytes + 1)
+
+    seed = TARGETS_BY_NAME["compression"].seeds[0]
+    TARGETS_BY_NAME["compression"].run(seed)
+    monkeypatch.setattr(fuzz_targets, "gzip_decompress", gzip_decompress)
+    with pytest.raises(AssertionError, match="ceiling"):
+        TARGETS_BY_NAME["compression"].run(seed)
+
+
+def test_the_short_msh2_finding_still_reproduces_through_the_raw_helpers() -> None:
+    """The registered known finding is still live in the engine, not only in the register.
+
+    **When this test fails, the defect is fixed.** That is the instruction to delete its
+    ``KNOWN_FINDINGS`` entry and the carve-out in ``_binary_carriage`` (and this test), and to keep
+    the reproducer on as a ``binary_carriage`` seed so the fix cannot quietly regress -- the same
+    retirement BACKLOG #1594's finding went through.
+    """
+    (finding,) = [f for f in KNOWN_FINDINGS if f.target == "binary_carriage"]
+    text = finding.reproducer.decode("ascii")
+    assert Peek.parse(text).control_id == "X1", "the listener-side parse no longer accepts it"
+    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+        strip_documents(text, pruned_at=0.0)
+    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+        list(iter_obx_documents(Message.parse(text)))
+    assert _separators_undeterminable(text)
+
+
+def test_the_short_msh2_carve_out_does_not_swallow_a_valueerror_on_any_other_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The carve-out is keyed on the structural condition, never on the exception type alone.
+
+    A ``ValueError`` planted on a body whose separators ARE readable must still escape. A carve-out
+    widened to ``except ValueError`` with no discriminator would swallow it and pass every other test.
+    """
+    assert not _separators_undeterminable(_OBX_ED_ADT.decode())
+    monkeypatch.setattr(Message, "count_segments", _boom(ValueError("injected")))
+    with pytest.raises(ValueError, match="injected"):
+        TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:
