@@ -111,9 +111,9 @@ from messagefoundry.config.loaded_crls import (
     replace_held_copy,
 )
 from messagefoundry.config.tls_policy import (
-    CrlNotInEffect,
     crl_in_effect,
     crl_label,
+    crl_not_in_effect,
     judge_crl_bytes,
 )
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
@@ -182,6 +182,7 @@ _RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY, NO_ISSUER})
 #: Which remedy a refusal names when the contexts of one file disagree: the earliest here. A file
 #: to fix, then a restart, outrank a wait, because waiting would not apply the file.
 _PRECEDENCE = (FIX, BAD_SIGNATURE, _NOT_PROVABLE, RESTART, NO_ISSUER, LAPSES_FIRST, RETRY, WAIT)
+_RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
 #: The remedies that say only time is missing.
 _TIME_ONLY = frozenset({WAIT, LAPSES_FIRST})
 
@@ -255,7 +256,7 @@ def supersede_refusal(
             "running hop can only add CRLs"
         )
         return reason, RESTART
-    return min(waits, key=lambda wait: _PRECEDENCE.index(wait[1]), default=None)
+    return min(waits, key=lambda wait: _RANK[wait[1]], default=None)
 
 
 def _certificates_in(copy: Path, *, label: str) -> set[bytes]:
@@ -288,14 +289,14 @@ class _Refusals:
     among equals), kept whole, and whether every one was sticky."""
 
     def __init__(self) -> None:
-        self.first: tuple[str, str] | None = None
+        self.strongest: tuple[str, str] | None = None
         self.sticky = True
         #: An unexpected failure, logged with its traceback once per file version.
         self.error: BaseException | None = None
 
     def add(self, reason: str, remedy: str) -> None:
-        if self.first is None or _PRECEDENCE.index(remedy) < _PRECEDENCE.index(self.first[1]):
-            self.first = (reason, remedy)
+        if self.strongest is None or _RANK[remedy] < _RANK[self.strongest[1]]:
+            self.strongest = (reason, remedy)
         self.sticky = self.sticky and remedy not in _RETRIED
 
 
@@ -415,13 +416,10 @@ def _reload_path(
     refusals = _Refusals()
     reloaded = 0
     try:
-        not_yet: CrlNotInEffect | None = None
-        try:
-            facts, blocks = judge_crl_bytes(pem, label=label, now=now)
-        except CrlNotInEffect as exc:
-            # Only time is missing, so far. Go on: a context at the cap, a held CRL nothing
-            # supersedes, or a file to fix each outranks a wait, and must be the one reported.
-            facts, blocks, not_yet = exc.facts, exc.blocks, exc
+        # A CRL not in effect yet is judged here, not refused there: a context at the cap, a held
+        # CRL nothing supersedes, or a file to fix each outranks a wait, and must be reported.
+        facts, blocks = judge_crl_bytes(pem, label=label, now=now, require_in_effect=False)
+        not_yet = crl_not_in_effect(blocks, now=now)
         # The cheap rules first: a rollback refuses every context without touching a file.
         verdicts: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         ready: list[tuple[ssl.SSLContext, HeldCrl, tuple[str, str] | None]] = []
@@ -440,7 +438,7 @@ def _reload_path(
                 refusals.add(f"{label}: {wait[0]}", wait[1])
                 continue
             if wait is None and not_yet is not None:
-                wait = _waiting(held.blocks, not_yet.issuer, not_yet.takes_effect)
+                wait = _waiting(held.blocks, not_yet.issuer, not_yet.this_update)
             ready.append((ctx, held, wait))
         if ready:
             reloaded = _load(pem, label, ready, refusals, fingerprint, facts, blocks)
@@ -551,10 +549,10 @@ def _finish(
         log.info(
             "crl_reload: applied %s to %d running TLS context(s) without a restart", label, reloaded
         )
-    if refusals.first is None:
+    if refusals.strongest is None:
         clear_reload_refusal(path)
         return ReloadOutcome(path, reloaded, None)
-    reason, remedy = refusals.first
+    reason, remedy = refusals.strongest
     refusal = ReloadRefusal(fingerprint, reason, remedy, refusals.sticky)
     record_reload_refusal(path, refusal)
     if prior is None or prior.reason != reason:
@@ -661,10 +659,8 @@ class CrlReloadRunner:
     ) -> None:
         self._interval = interval_seconds
         self._reload = reload or functools.partial(reload_replaced_crls, max_reloads=max_reloads)
-        # With no CRL load recorded there is nothing to reload, so no worker thread is started.
-        self._idle: Callable[[], bool] = (
-            (lambda: False) if reload else (lambda: not has_held_copies())
-        )
+        # An injected pass (a test) always runs; the engine's own skips the thread while idle.
+        self._gated = reload is None
         self._stop_timeout = stop_timeout_seconds
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -709,7 +705,9 @@ class CrlReloadRunner:
                 await asyncio.wait_for(self._stop.wait(), self._interval)
             if self._stop.is_set():
                 return
-            if self._idle():
+            if self._gated and not has_held_copies():
+                # Nothing to reload. A refusal for a file no hop holds any more explains nothing.
+                prune_reload_refusals(())
                 continue
             try:
                 await asyncio.to_thread(self._reload)

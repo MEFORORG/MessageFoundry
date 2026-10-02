@@ -73,8 +73,6 @@ TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 MIRRORED_CONNECTION_SETTING = "connection_name"
 
 if TYPE_CHECKING:
-    import datetime
-
     from messagefoundry.pki import CrlBlock, CrlFacts
 
 __all__ = [
@@ -110,6 +108,7 @@ __all__ = [
     "CrlNotInEffect",
     "crl_in_effect",
     "crl_label",
+    "crl_not_in_effect",
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
@@ -406,7 +405,9 @@ def crl_label(crl_file: str, setting: str | None) -> str:
     return f"{setting} ({crl_file!r})" if setting else f"CRL file {crl_file!r}"
 
 
-def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> tuple[CrlFacts, tuple[CrlBlock, ...]]:
+def judge_crl_bytes(
+    pem: bytes, *, label: str, now: float, require_in_effect: bool = True
+) -> tuple[CrlFacts, tuple[CrlBlock, ...]]:
     """Refuse CRL bytes no context may load. Return the facts of the soonest-expiring block, and
     every block, which a context that records its copy needs (BACKLOG #299).
 
@@ -416,8 +417,9 @@ def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> tuple[CrlFacts, tu
     loads every CRL in the file; that is the expiry monitor's rule too. Unlike the monitor, a block
     that cannot be judged, or a delta CRL, refuses rather than being skipped, because this decides a
     load. An expired CRL refuses, because past ``nextUpdate`` it fails every peer, not only revoked
-    ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`). Raises
-    ``ValueError`` led by ``label``."""
+    ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`), unless
+    ``require_in_effect`` is False: the reload asks :func:`crl_not_in_effect` itself, because a file
+    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``."""
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:
@@ -433,7 +435,13 @@ def judge_crl_bytes(pem: bytes, *, label: str, now: float) -> tuple[CrlFacts, tu
             "remove it if a newer CRL for that issuer is already in the file"
         )
     blocks = tuple(block for _, block in judged)
-    _refuse_crl_not_in_effect(facts, blocks, label=label, now=now)
+    if require_in_effect and (first := crl_not_in_effect(blocks, now=now)) is not None:
+        raise CrlNotInEffect(
+            f"{label} holds a CRL (issuer {first.issuer!r}) that does not take effect until "
+            f"{first.this_update.isoformat()}, and no CRL from that issuer that is in effect now. "
+            "Loaded now, it would refuse EVERY peer certificate it judges with 'CRL is not yet "
+            "valid'. Give a CRL that is in effect now, or wait until then"
+        )
     return facts, blocks
 
 
@@ -451,25 +459,7 @@ class CrlNotInEffect(ValueError):
 
     OpenSSL prefers a CRL that is in effect, so a future CRL beside a current one from the same
     issuer is harmless. Alone, it is the one OpenSSL picks, and it refuses every peer that issuer's
-    CRL judges with ``CRL is not yet valid``. A start refuses it with this error's message. The
-    running-hop reload reads ``issuer`` and ``takes_effect`` to say whether waiting is safe, and
-    ``facts`` and ``blocks`` (what :func:`judge_crl_bytes` would have returned) to go on checking
-    what else is wrong with the file, since a file to fix outranks a file to wait for."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        issuer: str,
-        takes_effect: datetime.datetime,
-        facts: CrlFacts,
-        blocks: tuple[CrlBlock, ...],
-    ) -> None:
-        super().__init__(message)
-        self.issuer = issuer
-        self.takes_effect = takes_effect
-        self.facts = facts
-        self.blocks = blocks
+    CRL judges with ``CRL is not yet valid``. A start refuses it with this error's message."""
 
 
 def crl_in_effect(block: CrlBlock, *, now: float) -> bool:
@@ -477,25 +467,12 @@ def crl_in_effect(block: CrlBlock, *, now: float) -> bool:
     return block.this_update.timestamp() <= now + CRL_CLOCK_SKEW_SECONDS
 
 
-def _refuse_crl_not_in_effect(
-    facts: CrlFacts, blocks: tuple[CrlBlock, ...], *, label: str, now: float
-) -> None:
-    """Raise :class:`CrlNotInEffect` when some issuer in ``blocks`` has no CRL in effect at ``now``."""
+def crl_not_in_effect(blocks: Sequence[CrlBlock], *, now: float) -> CrlBlock | None:
+    """The earliest CRL in ``blocks`` from an issuer with no CRL in effect at ``now``, or ``None``
+    when every issuer has one in effect."""
     in_effect = {block.issuer for block in blocks if crl_in_effect(block, now=now)}
     pending = [block for block in blocks if block.issuer not in in_effect]
-    if not pending:
-        return
-    first = min(pending, key=lambda block: block.this_update)
-    raise CrlNotInEffect(
-        f"{label} holds a CRL (issuer {first.issuer!r}) that does not take effect until "
-        f"{first.this_update.isoformat()}, and no CRL from that issuer that is in effect now. "
-        "Loaded now, it would refuse EVERY peer certificate it judges with 'CRL is not yet valid'. "
-        "Give a CRL that is in effect now, or wait until then",
-        issuer=first.issuer,
-        takes_effect=first.this_update,
-        facts=facts,
-        blocks=blocks,
-    )
+    return min(pending, key=lambda block: block.this_update, default=None)
 
 
 def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:

@@ -219,7 +219,7 @@ def _copy() -> tuple[list[tuple[ssl.SSLContext, tuple[HeldCrl, ...]]], dict[str,
 def has_held_copies() -> bool:
     """Whether any context, live or awaiting collection, has recorded a CRL load."""
     with _LOCK:
-        return len(_HELD) > 0
+        return bool(_HELD)
 
 
 def held_contexts() -> list[tuple[ssl.SSLContext, HeldCrl]]:

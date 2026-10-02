@@ -42,6 +42,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from messagefoundry.config import loaded_crls
 from messagefoundry.config.loaded_crls import (
+    ReloadRefusal,
     crl_fingerprint,
     held_crl_copies,
     record_crl_load,
@@ -167,32 +168,42 @@ class _Pki:
         return ctx
 
 
-def _make_pki(d: Path, cn: str) -> _Pki:
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-    aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key())
-    ca = (
+def _ca_cert(
+    name: x509.Name,
+    key: ec.EllipticCurvePrivateKey,
+    issuer: x509.Name,
+    signer: ec.EllipticCurvePrivateKey,
+) -> x509.Certificate:
+    return (
         x509.CertificateBuilder()
         .subject_name(name)
-        .issuer_name(name)
+        .issuer_name(issuer)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(_NOW - _DAY)
         .not_valid_after(_NOW + 365 * _DAY)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
-        .add_extension(aki, False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), False
+        )
         .add_extension(_ku(ca=True), critical=True)
-        .sign(key, hashes.SHA256())
+        .sign(signer, hashes.SHA256())
     )
-    leaf_key = ec.generate_private_key(ec.SECP256R1())
-    serial = x509.random_serial_number()
+
+
+def _leaf(
+    issuer: x509.Name, signer: ec.EllipticCurvePrivateKey
+) -> tuple[x509.Certificate, ec.EllipticCurvePrivateKey]:
+    """A ``localhost`` leaf for server and client auth, issued by ``issuer`` and signed by
+    ``signer``, and its key."""
+    key = ec.generate_private_key(ec.SECP256R1())
     leaf = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
-        .issuer_name(name)
-        .public_key(leaf_key.public_key())
-        .serial_number(serial)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
         .not_valid_before(_NOW - _DAY)
         .not_valid_after(_NOW + 90 * _DAY)
         .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), False)
@@ -203,21 +214,35 @@ def _make_pki(d: Path, cn: str) -> _Pki:
             False,
         )
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()), False)
-        .add_extension(aki, False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), False
+        )
         .add_extension(_ku(ca=False), critical=True)
-        .sign(key, hashes.SHA256())
+        .sign(signer, hashes.SHA256())
     )
+    return leaf, key
+
+
+def _key_pem(key: ec.EllipticCurvePrivateKey) -> bytes:
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def _make_pki(d: Path, cn: str) -> _Pki:
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key())
+    ca = _ca_cert(name, key, name, key)
+    leaf, leaf_key = _leaf(name, key)
+    serial = leaf.serial_number
     ca_pem = ca.public_bytes(serialization.Encoding.PEM)
     (d / f"{cn}.pem").write_bytes(ca_pem)
     (d / f"{cn}-leaf.pem").write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
-    (d / f"{cn}-leaf-key.pem").write_bytes(
-        leaf_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
+    (d / f"{cn}-leaf-key.pem").write_bytes(_key_pem(leaf_key))
     made = _Pki(
         key,
         name,
@@ -724,30 +749,6 @@ def test_the_cap_is_a_cert_monitor_setting() -> None:
 # --- round-three review findings --------------------------------------------------------------------
 
 
-def _ca_cert(
-    name: x509.Name,
-    key: ec.EllipticCurvePrivateKey,
-    issuer: x509.Name,
-    signer: ec.EllipticCurvePrivateKey,
-) -> x509.Certificate:
-    return (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(_NOW - _DAY)
-        .not_valid_after(_NOW + 365 * _DAY)
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
-        .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), False
-        )
-        .add_extension(_ku(ca=True), critical=True)
-        .sign(signer, hashes.SHA256())
-    )
-
-
 def _make_intermediate_pki(d: Path) -> tuple[_Pki, Path]:
     """A root, an intermediate it signed, and a leaf the intermediate signed. The CRL is the
     intermediate's. The hop's CA file holds the root alone, as a partner's PKI often has it, and
@@ -760,36 +761,18 @@ def _make_intermediate_pki(d: Path) -> tuple[_Pki, Path]:
     mid_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-299-intermediate")])
     mid = _ca_cert(mid_name, mid_key, root_name, root_key)
     mid_aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(mid_key.public_key())
-    leaf_key = ec.generate_private_key(ec.SECP256R1())
-    serial = x509.random_serial_number()
-    leaf = (
-        x509.CertificateBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
-        .issuer_name(mid_name)
-        .public_key(leaf_key.public_key())
-        .serial_number(serial)
-        .not_valid_before(_NOW - _DAY)
-        .not_valid_after(_NOW + 90 * _DAY)
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), False)
-        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .add_extension(mid_aki, False)
-        .add_extension(_ku(ca=False), critical=True)
-        .sign(mid_key, hashes.SHA256())
-    )
+    leaf, leaf_key = _leaf(mid_name, mid_key)
     (d / "root.pem").write_bytes(root.public_bytes(pem))
     (d / "root-and-intermediate.pem").write_bytes(root.public_bytes(pem) + mid.public_bytes(pem))
     (d / "chain.pem").write_bytes(leaf.public_bytes(pem) + mid.public_bytes(pem))
-    (d / "leaf-key.pem").write_bytes(
-        leaf_key.private_bytes(pem, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
-    )
+    (d / "leaf-key.pem").write_bytes(_key_pem(leaf_key))
     made = _Pki(
         mid_key,
         mid_name,
         mid_aki,
         root.public_bytes(pem),
         d / "root.pem",
-        serial,
+        leaf.serial_number,
         d / "chain.pem",
         d / "leaf-key.pem",
         d / "intermediate-crl.pem",
@@ -926,7 +909,7 @@ def test_a_reload_allows_five_minutes_of_clock_skew(pki: _Pki, minutes: int, app
 def test_one_context_loading_one_file_twice_is_one_record_and_one_reload(pki: _Pki) -> None:
     hop = pki.outbound_hop()
     harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
-    (held,) = held_crl_copies(pki.crl)
+    assert len(held_crl_copies(pki.crl)) == 1
     pki.crl.write_bytes(_fresher(pki))
 
     outcome = _reload(pki)
@@ -963,7 +946,10 @@ def test_the_runner_starts_no_thread_while_no_crl_is_held(
         await runner.stop()
         del held
 
+    # A refusal left for a file no hop holds is dropped even though no pass runs.
+    loaded_crls.record_reload_refusal(pki.crl, ReloadRefusal((1, 2), "gone", RESTART))
     asyncio.run(drive(hold=False))
     assert calls == []
+    assert reload_refusal(pki.crl, (1, 2)) is None
     asyncio.run(drive(hold=True))
     assert calls  # control: the same runner works once a CRL is held
