@@ -54,9 +54,10 @@ def _sets_sign_in(text: str) -> list[int]:
 def test_no_workflow_names_the_sign_in_switch() -> None:
     """No step hands ``serve`` the sign-in switch, so every ``serve`` a workflow starts runs with
     sign-in on, as shipped."""
-    offenders = {
-        name: lines for name, text in _workflow_texts().items() if (lines := _sets_sign_in(text))
-    }
+    texts = _workflow_texts()
+    # The helper already floors this; the lint that guards absence asserts reads only this function.
+    assert len(texts) >= 10, f"CONTROL FAILED: only {len(texts)} workflow file(s) were read"
+    offenders = {name: lines for name, text in texts.items() if (lines := _sets_sign_in(text))}
     assert not offenders, (
         f"these workflow lines set {_KEY}. A leg that starts an engine provisions the rig "
         f"Administrator and signs in (harness/load/rigadmin.py): {offenders}"

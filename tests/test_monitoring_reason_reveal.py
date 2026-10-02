@@ -580,6 +580,7 @@ def test_the_multishard_attribution_keeps_a_failed_lane_whose_error_is_withheld(
     sees ``error`` null and has its reveal refused; the failed lane must still be reported, with a
     placeholder, and the refusal must stop further reveals. A caller that may reveal gets the
     engine's reason. The running lane is the control in both arms: it is never reported."""
+    import harness.load.multishard as multishard
     import messagefoundry.apiclient as apiclient
     from harness.load.multishard import _attribute_engines_sync
 
@@ -611,7 +612,10 @@ def test_the_multishard_attribution_keeps_a_failed_lane_whose_error_is_withheld(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(apiclient, "EngineClient", _Client)
+    # The attribution reads through `rig_client`, which builds the client AND signs it in as the rig
+    # Administrator (vault BACKLOG #2719). Replace that seam, not `EngineClient`: a fake client
+    # under the real sign-in has no engine to sign in to, and the attribution would come back empty.
+    monkeypatch.setattr(multishard, "rig_client", _Client)
     node = cast(Any, type("Node", (), {"url": "https://n", "cacert": None, "node_id": "n0"})())
     (attribution,) = _attribute_engines_sync([node])
     if may_reveal:
