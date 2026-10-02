@@ -133,17 +133,88 @@ def test_redacted_settings_masks_an_env_default_url_and_other_url_keys() -> None
     assert shown["smart_token_url"] == "https://t.example.invalid/token?client_secret=***"
 
 
-def test_userinfo_mask_ignores_an_at_sign_in_the_query() -> None:
-    """``_mask_url_userinfo`` split at the LAST ``@`` in the URL, so an ``@`` in a query was read as
-    the end of a userinfo and the view showed the wrong host."""
+def test_a_query_at_sign_with_no_colon_before_it_leaves_the_host_alone() -> None:
+    """A query ``@`` with no ``:`` ahead of it gives urllib's proxy parser a user and no password,
+    so only the query key is masked. CORRECTED (Lander QA on PR 1912): this test also pinned a port
+    and an IPv6 host as untouched. urllib reads a PASSWORD in both (``8443/x?email=a``), so the mask
+    now follows it and they are in the parity table below instead."""
     from messagefoundry.config.wiring import redacted_settings
 
-    for url in (
-        "https://h.example.invalid:8443/x?email=a@b.example.invalid&key=SYNTHETIC-9",
-        "https://h.example.invalid/x?t=12:00&email=a@b.example.invalid&key=SYNTHETIC-9",
-        "https://[::1]/x?email=a@b.example.invalid&key=SYNTHETIC-9",
-    ):
-        assert redacted_settings({"url": url})["url"] == url.replace("SYNTHETIC-9", "***")
+    url = "https://h.example.invalid/x?email=a@b.example.invalid&key=SYNTHETIC-9"
+    assert redacted_settings({"url": url})["url"] == url.replace("SYNTHETIC-9", "***")
+
+
+#: (case, URL). Each one is run through urllib's own proxy parser in the parity test below.
+_PARITY_CASES = [
+    ("? in password", "http://user:p?ss@proxy.example.invalid:3128"),
+    ("# in password", "http://user:p#ss@proxy.example.invalid:3128"),
+    ("/ in password", "http://user:pa/ss@proxy.example.invalid:3128"),
+    ("@ in password", "http://user:a@b?c@proxy.example.invalid:3128"),
+    ("digits and / in password", "http://user:1234/5@proxy.example.invalid"),
+    ("@ in user", "http://alice@corp:p?ss@proxy.example.invalid:3128"),
+    ("IPv6 host with a query @", "https://[::1]/x?email=a@b.example.invalid&key=SYNTHETIC-11"),
+    ("path @ after a port", "https://h.example.invalid:8443/users/a@b.example.invalid"),
+    ("query @ after a port", "https://h.example.invalid:8443/x?email=a@b.example.invalid"),
+    ("query @ after a time", "https://h.example.invalid/x?t=12:00&email=a@b.example.invalid"),
+    ("path @ with no port", "https://h.example.invalid/users/a@b.example.invalid"),
+    ("no scheme", "user:pw-no-scheme@proxy.example.invalid:3128"),
+    ("no scheme, no password", "user@proxy.example.invalid:3128"),
+    ("port, password and path", "http://user:pw-port@proxy.example.invalid:3128/x"),
+    ("no userinfo", "http://proxy.example.invalid:3128/path?x=1#f"),
+    ("no userinfo, no scheme", "proxy.example.invalid:3128"),
+    ("user, no password", "https://token@h.example.invalid/x"),
+]
+
+
+@pytest.mark.parametrize(("case", "url"), _PARITY_CASES, ids=[c for c, _ in _PARITY_CASES])
+def test_the_userinfo_mask_hides_every_password_urllib_reads(case: str, url: str) -> None:
+    """Parity with urllib's proxy parser, the code that SENDS a proxy_url's password. Lander QA on
+    PR 1912: a hand-rolled rule showed ``user:1234/5@proxy``, whose password urllib reads as
+    ``1234/5``. Whatever password urllib reads must never appear in the masked view, and a URL in
+    which it reads none must come back unchanged apart from a masked query key."""
+    import urllib.request
+
+    from messagefoundry.config.wiring import redacted_settings
+    from messagefoundry.secretscrub import mask_credential_query
+
+    _scheme, _user, password, _hostport = urllib.request._parse_proxy(url)  # type: ignore[attr-defined]
+    shown = redacted_settings({"proxy_url": url})["proxy_url"]
+    assert "SYNTHETIC" not in shown, case
+    if password:
+        assert password not in shown, case
+        assert ":***@" in shown, case
+    else:
+        assert shown == mask_credential_query(url), case
+
+
+def test_the_parser_mirror_agrees_with_urllib_over_generated_strings() -> None:
+    """The table above holds the shapes someone thought of. This drives the mirror and urllib's
+    parser over seeded random strings built from the characters that move its spans, and requires
+    the same answer: a password exactly when urllib reads one, the same user, and the same host."""
+    import random
+    import urllib.request
+
+    from messagefoundry.config.wiring import _proxy_userinfo_split
+
+    rng = random.Random(1912)
+    compared = with_password = 0
+    for alphabet in ("ab:/@?#[]1.", "h:/@?#&=k12.", "u:p/@x"):
+        for _ in range(20000):
+            value = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 16)))
+            got = _proxy_userinfo_split(value)
+            try:
+                _scheme, user, password, hostport = urllib.request._parse_proxy(value)  # type: ignore[attr-defined]
+            except ValueError:
+                assert got is None, value
+                continue
+            compared += 1
+            if password is None:
+                assert got is None, value
+            else:
+                with_password += 1
+                assert got is not None and got[1] == user and got[2].startswith(hostport), value
+    # Liveness: the generator must reach both arms, or the agreement above says nothing.
+    assert compared > 10000 and with_password > 1000, (compared, with_password)
 
 
 @pytest.mark.parametrize(
@@ -176,12 +247,12 @@ def test_a_query_credential_is_masked_behind_a_password_holding_a_question_mark(
 
 
 def test_userinfo_mask_leaves_a_url_with_no_userinfo_alone() -> None:
-    """Controls that reach the new branches: an "@" after the path, with and without a port."""
+    """Controls that reach the parser mirror: an "@" after the path with no ":" ahead of it, and no
+    "@" at all. CORRECTED: a path "@" after a PORT was here too; urllib reads a password there."""
     from messagefoundry.config.wiring import redacted_settings
 
     for url in (
         "http://proxy.example.invalid:3128/path?x=1#f",
-        "https://h.example.invalid:8443/users/a@b.example.invalid",
         "https://h.example.invalid/users/a@b.example.invalid",
     ):
         assert redacted_settings({"proxy_url": url})["proxy_url"] == url

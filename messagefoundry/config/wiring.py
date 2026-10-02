@@ -1410,53 +1410,74 @@ def connector_secret_env_values(
 _URL_SETTING_SUFFIXES = ("url", "_url", "_uri", "endpoint", "_endpoint")
 
 
-def _mask_url_userinfo(value: object) -> object:
-    """Replace the PASSWORD half of a URL's userinfo with ``***``, keeping everything else readable.
+def _proxy_userinfo_split(value: str) -> tuple[str, str, str] | None:
+    """``(text before the user, user, text after the userinfo's "@")`` where urllib's proxy parser
+    finds a user AND a password in ``value``, else ``None``.
+
+    A re-statement, in code written here, of CPython's ``urllib.request._parse_proxy`` (3.14), the
+    parser that sends a ``proxy_url``'s password. It is private, so it is mirrored rather than
+    called, and ``tests/test_url_query_credential.py`` checks this against it case by case. In order:
+
+    * The scheme is the text before the first ``:``, if that text is not empty and holds no ``/``
+      (``_splittype``). What follows it, or the whole value when there is no scheme, is the rest.
+      When the rest does not start with ``/``, the WHOLE value is the authority, so
+      ``user:pw@proxy:3128`` has a password.
+    * Otherwise the rest must start with ``//``; if it does not, the parser raises, reads no
+      password, and this returns ``None``.
+    * If an ``@`` appears ANYWHERE after the ``:``, the authority runs from after ``//`` to the
+      first ``/`` after the FIRST ``@``, or to the end. So ``user:1234/5@proxy`` has the password
+      ``1234/5``, and a query ``@`` (``h:8443/x?email=a@b``) makes everything up to the next ``/``
+      authority too, which is why this can mask a URL with no real userinfo.
+    * The userinfo is the authority before its LAST ``@``; the user is the userinfo before its first
+      ``:``, and there is a password only when that ``:`` exists."""
+    colon = value.find(":")
+    rest = colon + 1 if colon > 0 and "/" not in value[:colon] else 0
+    if not value.startswith("/", rest):
+        auth_start, auth_end = 0, len(value)
+    elif not value.startswith("//", rest):
+        return None
+    else:
+        auth_start = rest + 2
+        first_at = value.find("@", rest)
+        slash = value.find("/", first_at if first_at >= 0 else auth_start)
+        auth_end = len(value) if slash < 0 else slash
+    authority = value[auth_start:auth_end]
+    userinfo, at, hostport = authority.rpartition("@")
+    if not at:
+        return None
+    user, has_password, _password = userinfo.partition(":")
+    if not has_password:
+        return None  # a user with no password -- nothing secret to remove
+    return value[:auth_start], user, hostport + value[auth_end:]
+
+
+def _mask_url(value: str) -> str:
+    """A URL setting as ``redacted_settings`` shows it: the userinfo password and the value of each
+    credential-like query parameter replaced with ``***``, everything else kept.
 
     BACKLOG #1207. ``url="https://user:SECRET@host/path"`` was returned verbatim by both serializers
     while ``proxy_password`` on the SAME object masked -- the credential was safe in the typed field
-    and disclosed in the URL beside it.
+    and disclosed in the URL beside it. The user half and the host and path are PRESERVED
+    deliberately: an operator diagnosing a connection needs to see which account and which host.
 
-    The user half and the host and path are PRESERVED deliberately: an operator diagnosing a
-    connection needs to see which account and which host, and masking the whole URL would destroy the
-    view rather than protect it. Only the secret is removed.
-    """
-    if not isinstance(value, str) or "@" not in value or "//" not in value:
-        return value
-    scheme, _, rest = value.partition("//")
-    # The authority ends at the first "/", as urllib's proxy parser reads it. A "?" or "#" does NOT
-    # end it here, because that parser keeps both in a password (``http://user:p?ss@proxy:3128``),
-    # and the LAST "@" in it ends the userinfo, so an "@" in the user (``alice@corp:pw@proxy``) or
-    # in the password is kept inside it. An "@" after the first "/" is a path or query "@"
-    # (``/x?email=a@b.com``) and leaves the URL alone.
-    slash = rest.find("/")
-    authority = rest if slash < 0 else rest[:slash]
-    if "@" in authority:
-        userinfo, _, hostpart = authority.rpartition("@")
-        tail = rest[len(authority) :]
-    elif slash >= 0 and "@" in rest[slash:] and not authority.startswith("["):
-        # A password may hold a "/" too (``user:pa/ss@proxy``), which ends that authority early.
-        # Tell it from a host and port (``h:8443/users/a@b``) by the port: digits only is a port.
-        # Anything else after the ":" is read as a password and masked to the LAST "@", failing
-        # toward masking; the cost is a wrong host in the view, never a shown password.
-        _host, colon, after = authority.partition(":")
-        if not colon or after.isdigit():
-            return value
-        userinfo, _, hostpart = rest.rpartition("@")
-        tail = ""
-    else:
-        return value
-    if ":" not in userinfo:
-        return value  # a user with no password -- nothing secret to remove
-    user, _, _pw = userinfo.partition(":")
-    return f"{scheme}//{user}:***@{hostpart}{tail}"
+    WHAT is the password is decided by :func:`_proxy_userinfo_split`, which mirrors urllib's proxy
+    parser exactly. CORRECTED (Lander QA on PR 1912, 2026-10-01): a hand-rolled authority rule
+    before this showed ``http://user:1234/5@proxy`` verbatim, and urllib reads ``1234/5`` as the
+    password. Mirroring the parser fails toward masking: a URL whose query holds an ``@`` after a
+    ``:`` can lose its host in the view, and a password the parser would send is never shown.
 
+    The userinfo is masked FIRST: a "?" or "#" in a password moves the query span the query mask
+    reads, so masking the password first is what lets the query mask find the real query.
 
-def _mask_url(value: str) -> object:
-    """Both URL masks, userinfo FIRST: a "?" or "#" in a password moves the query span the query
-    mask reads, so masking the password first is what lets the query mask find the real query."""
-    masked = _mask_url_userinfo(value)
-    return mask_credential_query(masked) if isinstance(masked, str) else masked
+    When the userinfo mask swallowed the URL's only "?" (a query "@" made the parser read the query
+    as part of a password), what is left after the masked userinfo still holds the parameters, with
+    no "?" in front of them. Those are masked as a query too, so a credential cannot surface there."""
+    split = _proxy_userinfo_split(value) if "@" in value else None
+    if split is None:
+        return mask_credential_query(value)
+    before, user, after = split
+    after = mask_credential_query(after) if "?" in after else mask_credential_query("?" + after)[1:]
+    return f"{before}{user}:***@{after}"
 
 
 def _redact_header_name(name: object) -> str:
