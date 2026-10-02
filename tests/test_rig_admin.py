@@ -370,6 +370,21 @@ def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(
         enginepoll.adopt_rig_session(_FakeClient(set()), "https://a", None)  # type: ignore[arg-type]
 
 
+def test_a_drive_of_another_processs_engines_refuses_to_draw_its_own_credential(
+    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A split drive signs in to engines another process provisioned. A password drawn in the drive
+    could only be wrong, and each wrong try counts against the account. So it refuses first."""
+    poller = EnginePoller("https://127.0.0.1:1", rigadmin.REMOTE_RIG_SESSION, origin=0.0)
+    with pytest.raises(rigadmin.RigAdminError, match="another process started"):
+        poller._open_sync()
+    assert rigadmin.ADMIN_PASS_ENV not in os.environ, "it drew a credential anyway"
+    # CONTROL: with the credential supplied the same check passes.
+    monkeypatch.setenv(rigadmin.ADMIN_PASS_ENV, "ab" * 24)
+    rigadmin.require_supplied_credential()
+    assert rigadmin.RIG_SESSION.supplied is False and rigadmin.REMOTE_RIG_SESSION.supplied is True
+
+
 # --- no runner hands `serve` the sign-in switch -------------------------------
 
 

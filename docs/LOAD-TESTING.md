@@ -49,13 +49,19 @@ choice is the whole point). The engine serves with sign-in on, so the run signs 
 Administrator, serve the synthetic high-fan-out system-under-test, then run a profile as that account.
 
 ```bash
+# 0) A dev-box posture for a SYNTHETIC run: the settings the harness gives the nodes it starts
+#    itself (harness/load/failover.py), plus the one the rig account needs. Both commands below
+#    read them. To run at the shipped `enforce` posture instead, copy the env block of the
+#    `load test (smoke, sqlite)` step in .github/workflows/ci.yml, which also mints a store key.
+export MEFOR_SECURITY_ENFORCEMENT=warn MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI=true \
+       MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=false MEFOR_SECURITY_REQUIRE_MFA=false
+
 # 1) Draw a password for this run and provision the rig Administrator in the store.
 #    The password is read from the environment and is never an argument.
 export MEFOR_RIG_ADMIN_PASSWORD="$(python -c 'import secrets; print(secrets.token_hex(24))')"
 python -m harness.load.rigadmin provision --db ./load.db
 
 # 2) Serve the load config (its own ports, separate from harness/config). Tune via env (below).
-MEFOR_SECURITY_REQUIRE_MFA=false \
 MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_TRANSFORM=edit MEFOR_LOAD_SINK_PORT=2700 \
   python -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 
@@ -72,7 +78,7 @@ path to a `.toml`. To run as an account you already hold, skip `rigadmin` and pa
 
 ### Rigs sign in
 
-Every rig that starts a real engine signs in to it. A rig is a CI leg or a harness runner
+Every rig that starts `messagefoundry serve` signs in to it. A rig is a CI leg or a harness runner
 (`--failover`, `--connscale`, `--estate`, `multishard`, `shardcert`). The helper is
 [`harness/load/rigadmin.py`](../harness/load/rigadmin.py). It is test tooling, and it adds no
 password input to any shipped command.
@@ -85,7 +91,15 @@ its nodes, and then signs in. You pass nothing.
 | You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it. `provision-admin` enrols an authenticator app at a terminal and offers no other way, so the rig account has none. |
 | That `serve` runs under `[security].enforcement = enforce` | Give it an `[alerts]` channel too. With sign-in on, an enforcing start refuses without a way to send account-security notices. The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) shows the settings. |
 | You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell. `provision-admin` declines when the store already has an Administrator, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs neither variable. |
-| The drive runs on a second box | Export the same two variables on both boxes. The drive signs in to engines another process started. |
+| The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. |
+
+**Signed-in polling is in the numbers.** The poller's reads are no longer free. The engine does two
+store commits for each signed-in request: it stamps the session's last use, and it audits the
+authorization grant. A poller sample is three requests, so six commits and three audit rows.
+Measured 2026-10-02 on an idle engine on SQLite, 20 samples moved `committed_txns` by 120; with
+sign-in off the same 20 moved it by 0. So `committed_txns`, `txn/msg (measured)` and DB growth carry
+that much per sample. A figure banked before rigs signed in is not comparable with one taken after
+until `6 x samples` is taken off the commit count. At a low message rate the share is not small.
 
 ### Engine load-config knobs (env, read at serve time)
 

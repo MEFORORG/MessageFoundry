@@ -4296,7 +4296,8 @@ jobs:
           "no MessageFoundry service key is left, so no SID type and no privilege list is either"
 
       # --- ADR 0183 Amendment A, Wave 0 (BACKLOG #1136): the AUTH-ON arm ------------------------------
-      # Everything above runs with sign-in OFF, so it cannot see the question these two steps ask:
+      # Everything above runs on ONE data directory in ONE order, so it cannot answer the question
+      # these steps ask:
       # can the NSSM service account and the operator who runs `provision-admin` both open ONE SQLite
       # store, in either order? ADR 0163 reads MessageStore.open as re-securing the store trio to the
       # current user alone on every open, which would make whichever identity opens a fresh store

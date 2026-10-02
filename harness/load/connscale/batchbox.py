@@ -668,9 +668,17 @@ async def _run_remote_proc(argv: list[str], report_path: Path, cwd: Path) -> dic
         *argv,
         cwd=str(cwd),
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    await proc.wait()
+    _, said = await proc.communicate()
+    if not report_path.exists():
+        # The process writes its report only when it ran. One that could not start (a band layout
+        # it refused, a sign-in the engine refused) says why on stderr and writes nothing, and that
+        # reason used to be discarded, leaving a bare FileNotFoundError.
+        reason = said.decode("utf-8", "replace").strip()[-600:] or "it said nothing on stderr"
+        raise ConnScaleError(
+            f"connscale-remote exited {proc.returncode} and wrote no report: {reason}"
+        )
     data = json.loads(report_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ConnScaleError(f"connscale-remote report {report_path} is not a JSON object")

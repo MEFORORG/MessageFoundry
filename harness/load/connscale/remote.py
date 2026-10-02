@@ -54,7 +54,7 @@ from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.multishard import _build_ms_corpus
 from harness.load.profile import TypeMix
-from harness.load.rigadmin import RIG_SESSION
+from harness.load.rigadmin import REMOTE_RIG_SESSION
 
 _STOP_GRACE = 5.0
 _SETTLE = 0.5
@@ -285,9 +285,10 @@ async def run_connscale_remote(
     ]
     # The engines are another process's (the batch engine half, or an operator's), and they
     # serve with sign-in on. This process signs in as the same rig Administrator: a child of a
-    # harness process inherits the credential, and a second box must be given it
-    # (MEFOR_RIG_ADMIN_USERNAME / MEFOR_RIG_ADMIN_PASSWORD, see harness.load.rigadmin).
-    poller = EnginePoller(engine_urls, token=RIG_SESSION, origin=time.perf_counter())
+    # harness process inherits the credential, and any other process must be given it
+    # (MEFOR_RIG_ADMIN_USERNAME / MEFOR_RIG_ADMIN_PASSWORD, see harness.load.rigadmin). The REMOTE
+    # marker refuses to sign in without one: a password drawn here could only be wrong.
+    poller = EnginePoller(engine_urls, token=REMOTE_RIG_SESSION, origin=time.perf_counter())
     samples: list[EngineSample] = []
     notes: list[str] = []
     aggregate_rate = per_conn_rate * count  # per band

@@ -68,6 +68,7 @@ __all__ = [
     "EXIT_EXISTS",
     "EXIT_RIG_FAILED",
     "NOTIFY_ENV",
+    "REMOTE_RIG_SESSION",
     "RIG_SESSION",
     "SERVE_ENV",
     "RigAdmin",
@@ -77,6 +78,7 @@ __all__ = [
     "RigUnreachable",
     "provision",
     "renew_session",
+    "require_supplied_credential",
     "rig_admin",
     "session_token",
     "sign_in",
@@ -145,15 +147,24 @@ class RigSignInRefused(RigAdminError):
 
 
 class RigSession:
-    """Marker type for :data:`RIG_SESSION`."""
+    """Marker type for :data:`RIG_SESSION` and :data:`REMOTE_RIG_SESSION`."""
+
+    def __init__(self, label: str, *, supplied: bool) -> None:
+        self._label = label
+        #: True when the engine is ANOTHER process's, so the credential must be supplied.
+        self.supplied = supplied
 
     def __repr__(self) -> str:
-        return "RIG_SESSION"
+        return self._label
 
 
 #: Pass this where a bearer token goes to mean "sign in as this run's rig Administrator, when the
 #: engine is up". ``EnginePoller`` takes it, because a poller is built before its engine starts.
-RIG_SESSION = RigSession()
+RIG_SESSION = RigSession("RIG_SESSION", supplied=False)
+
+#: The same, for engines ANOTHER process started and provisioned (a split drive). The credential
+#: must then be in the environment: :func:`require_supplied_credential` refuses before any sign-in.
+REMOTE_RIG_SESSION = RigSession("REMOTE_RIG_SESSION", supplied=True)
 
 
 @dataclass(frozen=True)
@@ -195,6 +206,18 @@ def rig_admin() -> RigAdmin:
                 os.environ[ADMIN_PASS_ENV] = password
             _credential.admin = RigAdmin(username, password)
         return _credential.admin
+
+
+def require_supplied_credential() -> None:
+    """Refuse, before any sign-in, when the environment holds no rig credential.
+
+    For a process that signs in to engines another process provisioned. A password drawn here can
+    only be wrong there, and each wrong try counts against the account's lockout."""
+    if not os.environ.get(ADMIN_PASS_ENV):
+        raise RigAdminError(
+            "this process signs in to engines another process started, so it needs that rig's "
+            f"credential: set {ADMIN_NAME_ENV} and {ADMIN_PASS_ENV} to it"
+        )
 
 
 # --- provisioning ------------------------------------------------------------
@@ -403,9 +426,13 @@ _held = _HeldSession()
 def session_token(base_url: str, *, cacert: str | None = None) -> str:
     """This process's rig session, signing in at ``base_url`` on first use.
 
-    No request is made once a session is held. A node that refuses the token (HTTP 401) is on a
-    store this session is not in, or the session has expired: call :func:`renew_session`.
+    No request is made once a session is held, and no lock is taken: a caller that polls many
+    nodes must not wait behind another thread's sign-in. A node that refuses the token (HTTP 401) is
+    on a store this session is not in, or the session has expired: call :func:`renew_session`.
     """
+    held = _held.token
+    if held is not None:
+        return held
     with _held.lock:
         if _held.token is None:
             _held.token = sign_in(base_url, cacert=cacert)

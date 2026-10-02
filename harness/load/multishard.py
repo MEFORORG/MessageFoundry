@@ -837,10 +837,11 @@ def _build_ms_corpus(ids: ControlIds):  # type: ignore[no-untyped-def]
 def _apply_cluster_env(
     env: dict[str, str], *, cluster_enabled: bool, node_id: str
 ) -> dict[str, str]:
-    """The three insecure-test escapes on EVERY engine; ``[cluster]`` OFF (PRIMARY sweep: all N engines
-    write simultaneously with disjoint rows) or ON (the lease-protocol comparison arm)."""
+    """The two insecure-test escapes on EVERY engine; ``[cluster]`` OFF (PRIMARY sweep: all N engines
+    write simultaneously with disjoint rows) or ON (the lease-protocol comparison arm). Sign-in is not
+    among them: every engine serves with it on, and ``EngineNode`` provisions the rig Administrator."""
     env = dict(env)
-    # Loopback API + no auth + the config-source/TLS escapes so `serve --host 127.0.0.1` starts clean.
+    # Loopback API + the config-source/TLS escapes so `serve --host 127.0.0.1` starts clean.
     env["MEFOR_ALLOW_INSECURE_TLS"] = "1"
     env["MEFOR_ALLOW_INSECURE_CONFIG_SOURCE"] = "1"
     if cluster_enabled:

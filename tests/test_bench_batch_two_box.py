@@ -13,6 +13,7 @@ flow here (that + the ~450-500 msg/s number is the AWS rig's job).
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import types
 from collections.abc import Mapping
@@ -383,6 +384,21 @@ async def test_batch_engine_claim_mode_per_lane(monkeypatch: pytest.MonkeyPatch)
 # --------------------------------------------------------------------------------------------------
 # CLI flag threading
 # --------------------------------------------------------------------------------------------------
+
+
+async def test_a_remote_process_that_wrote_no_report_says_why(tmp_path: Path) -> None:
+    """A ``connscale-remote`` that cannot start says why on stderr and writes no report. The driver
+    used to discard stderr, so a refused sign-in read as a bare ``FileNotFoundError``. The real
+    seam, with a real child process."""
+    child = "import sys; sys.stderr.write('connscale-remote setup failed: the reason'); sys.exit(2)"
+    with pytest.raises(ConnScaleError, match="exited 2 and wrote no report.*the reason"):
+        await bb._run_remote_proc([sys.executable, "-c", child], tmp_path / "none.json", tmp_path)
+    # CONTROL: a child that does write its report is read, whatever it said on stderr.
+    report = tmp_path / "there.json"
+    writer = f"import sys; open({str(report)!r}, 'w').write('{{\"sent\": 3}}'); sys.stderr.write('noise')"
+    assert await bb._run_remote_proc([sys.executable, "-c", writer], report, tmp_path) == {
+        "sent": 3
+    }
 
 
 def test_batch_engine_cli_threads_flags(monkeypatch: pytest.MonkeyPatch) -> None:

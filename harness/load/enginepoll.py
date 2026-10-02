@@ -9,6 +9,14 @@ then measures **drain time** after offered load stops. The :class:`~messagefound
 load engine's event loop is never blocked. The harness reaches the engine only through this API; it
 never touches the store.
 
+**A signed-in read is not free, and the poller's own reads are in the numbers.** A poller that
+signs in (``RIG_SESSION``) makes the engine do two store commits for every request: it stamps the
+session's last use, and it audits the authorization grant. A sample is three requests, so SIX
+commits and three audit rows. Measured 2026-10-02 on an idle engine on SQLite: 20 samples moved
+``committed_txns`` by 120, and the same 20 with sign-in off moved it by 0. So ``committed_txns``,
+``txn_per_message_measured`` and DB growth now carry that much per sample, and a figure banked
+before rigs signed in is not comparable with one taken after until that is taken off.
+
 **Cluster-wide aggregation.** A ``messagefoundry supervise`` cluster spreads inbounds across several
 shard subprocesses, each with its own API. The poller takes a **list** of engine base-URLs (the
 primary ``--engine`` plus any ``--shard-engine``, de-duped), polls each in turn off the event loop,
@@ -510,7 +518,8 @@ def adopt_rig_session(client: EngineClient, url: str, cacert: str | None) -> Non
 
     An engine that does not answer raises ``ApiError``, as every other client call does, so a caller
     that already treats ``ApiError`` as "not reachable yet" needs no second arm. A refused sign-in is
-    not that: it raises :class:`~harness.load.rigadmin.RigSignInRefused`, which no caller swallows.
+    not that: it raises :class:`~harness.load.rigadmin.RigSignInRefused`, so a caller waiting for an
+    engine to come up does not wait out its whole timeout on a credential the engine will never take.
     """
     try:
         token = rigadmin.session_token(url, cacert=cacert)
@@ -718,6 +727,8 @@ class EnginePoller:
         return harness_tls_material()[0]
 
     def _open_sync(self) -> None:
+        if isinstance(self._token, rigadmin.RigSession) and self._token.supplied:
+            rigadmin.require_supplied_credential()
         clients: list[EngineClient] = []
         for url in self._urls:
             cacert = self._cacert or self._cacert_for(url)

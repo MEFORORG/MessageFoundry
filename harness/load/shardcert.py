@@ -829,6 +829,18 @@ _FILLING_MIN_SAMPLES = 30
 _FILLING_RAMP_FRACTION = 0.2
 
 
+async def _sign_in_before_load(urls: list[str]) -> None:
+    """Open one poller over the fleet, and so sign in, BEFORE any load is offered.
+
+    Without this the first poller that opens with nothing to swallow its error is the DRAIN poller,
+    after the whole hold, and the samplers that open earlier run as tasks whose failures are
+    suppressed. A store that held an Administrator before this run refuses the rig's sign-in, and
+    that is better learned in the first seconds than after the run, or as a peak that reads zero."""
+    poller = EnginePoller(urls, RIG_SESSION, origin=time.perf_counter())
+    await poller.open()
+    await poller.close()
+
+
 class ShardCertNode(EngineNode):
     """An :class:`EngineNode` that serves ONE shard: injects ``--shard <id>`` into the argv (and keeps
     per-PID :meth:`kill` for the crash leg, which ``supervise()`` does not expose). Everything else —
@@ -1529,6 +1541,7 @@ async def run_shardcert(
                 port = inbound_base + i * lanes + lane
                 if not await _await_port("127.0.0.1", port, timeout=30.0):
                     raise RuntimeError(f"shard {s} inbound lane port {port} never bound")
+        await _sign_in_before_load([nodes[s].url for s in ids_list])
 
         # One persistent connection per (shard, lane) inbound (tracker wired for on_ack) — N*lanes now.
         for i, _s in enumerate(ids_list):
@@ -2691,6 +2704,7 @@ async def _start_shards(
             port = inbound_base + i * lanes + lane
             if not await _await_port(preflight_host, port, timeout=30.0):
                 raise RuntimeError(f"shard {s} inbound lane port {port} never bound")
+    await _sign_in_before_load([nodes[s].url for s in ids_list])
 
 
 async def _drive_load(

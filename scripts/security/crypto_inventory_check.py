@@ -382,7 +382,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # per-run password (secrets.token_hex) and signs in over the engine's TLS listener with a
     # verifying context (ssl.create_default_context, pinned to a PEM when one is given; there is
     # no verification-off path). Test tooling: the password is hashed by the same argon2id path
-    # as any local account, in a store the rig provisions, and is never written or printed.
+    # as any local account, in a store the rig provisions. This module never writes it to a
+    # file or prints it.
     "harness/load/rigadmin.py": frozenset({"secrets", "ssl"}),
     # Vault BACKLOG #2354: these two rigs open a server store against a self-signed dev container
     # directly, so they pass an explicit warn HopPosture; a missing posture now refuses the escape.
