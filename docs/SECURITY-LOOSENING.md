@@ -265,13 +265,13 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
   declared TLS terminator — is a **hard refuse** — serving full-privilege admin to the network is never one "I
   accept the risk" away, at any posture.
 
-### `require_mfa = false` — single-factor admin
+### `require_mfa = false` — single-factor sign-in
 - **What you lose:** every account with no second factor enrolled, Administrators included,
-  authenticates with a single factor, unless an OIDC sign-in carries an amr/acr claim checked while
-  `[auth].oidc_require_mfa_claim` is on. Directory accounts lose it too (BACKLOG #1144): a Kerberos
-  session mints MFA-pending, and this knob is the only thing that lets it through the gate without an
-  engine factor. An enrolled account owes its factor only while it keeps one, and its holder may
-  remove the last.
+  authenticates with a single factor. The one exception is an OIDC sign-in that carries an amr/acr
+  claim checked while `[auth].oidc_require_mfa_claim` is on. Directory accounts are in that set
+  (BACKLOG #1144): a Kerberos session mints MFA-pending, and this knob is the only thing that lets it
+  through the gate without an engine factor. An enrolled account owes its factor only while it keeps
+  one, and its holder may remove the last.
 - **When acceptable:** a loopback single-operator box where the second factor adds friction without a
   network exposure.
 - **Compensating controls:** keep the bind loopback; enable `admin_new_ip_step_up` if exposed.
@@ -340,9 +340,10 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 ### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-admin refusal
 - **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)
   whose admin surface is exposed (off-loopback bind or a declared reverse proxy) with `require_mfa` off,
-  MessageFoundry normally **refuses to start**: every account with no second factor enrolled,
-  Administrators included, would authenticate with a single factor over the network, unless an OIDC
-  sign-in carries an amr/acr claim checked while `[auth].oidc_require_mfa_claim` is on. This ack **downgrades that refusal to a loud, audited warning** (the same
+  MessageFoundry normally **refuses to start**. Every account with no second factor enrolled,
+  Administrators included, would then sign in over the network with a single factor. The one
+  exception is an OIDC sign-in that carries an amr/acr claim checked while
+  `[auth].oidc_require_mfa_claim` is on. This ack **downgrades that refusal to a loud, audited warning** (the same
   warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
   single-factor while staying at `enforce`.
 - **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means exactly

@@ -10,6 +10,7 @@ AC-5 (the read-only posture view) is in ``tests/test_api_security_posture.py``.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -30,6 +31,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     keyless_opt_out_refusal,
     load_settings,
+    oidc_mfa_claim_exception,
     security_loosenings,
 )
 
@@ -388,8 +390,8 @@ def test_require_mfa_scope_advisory_names_only_the_accounts_it_frees() -> None:
     loos = dict(_loosenings(SecuritySettings(require_mfa_scope="administrators")))
     assert loos["require_mfa_scope"] == (
         "a local account without the Administrator role is single-factor until it enrolls a "
-        "second factor. Administrators and directory accounts still owe one; an OIDC sign-in "
-        "meets it with an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
+        "second factor. Administrators and directory accounts still owe one, unless an OIDC "
+        "sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
     )
 
 
@@ -408,10 +410,36 @@ def test_require_mfa_advisory_keeps_an_enrolled_factor_and_the_oidc_claim() -> N
     assert loos["require_mfa"] == (
         "an account with no second factor enrolled is single-factor, so a Kerberos session enters "
         "on a ticket that asserts no strength. An enrolled account owes its factor only while it "
-        "keeps one, and its holder may remove the last. An OIDC sign-in needs an amr/acr claim "
-        "checked while [auth].oidc_require_mfa_claim is on, and that claim stands in for the "
+        "keeps one, and its holder may remove the last. Where an OIDC sign-in carries an amr/acr "
+        "claim checked while [auth].oidc_require_mfa_claim is on, that claim stands in for the "
         "enrolled factor"
     )
+
+
+@pytest.mark.parametrize(
+    ("oidc_enabled", "claim_gate", "expected"),
+    [
+        (
+            True,
+            True,
+            ", unless an OIDC sign-in carries an amr/acr claim checked while "
+            "[auth].oidc_require_mfa_claim is on",
+        ),
+        (True, False, ""),
+        (False, True, ""),
+    ],
+)
+def test_startup_texts_name_the_oidc_exception_only_where_it_exists(
+    oidc_enabled: bool, claim_gate: bool, expected: str
+) -> None:
+    """Vault BACKLOG #1133. The exposed-without-MFA refusal, warnings and AUDIT line describe ONE
+    running config. With OIDC off, or its claim gate off, every OIDC session mints unverified, so the
+    record must not name an exception this instance does not have. ``model_construct`` skips the
+    OIDC-enabled validators (issuer, client secret, endpoints), which are not what is on trial."""
+    auth = AuthSettings.model_construct(
+        oidc_enabled=oidc_enabled, oidc_require_mfa_claim=claim_gate
+    )
+    assert oidc_mfa_claim_exception(auth) == expected
 
 
 def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
@@ -452,9 +480,13 @@ def test_ide_security_editor_risk_mirrors_the_mfa_advisories(
     source = (
         Path(__file__).resolve().parent.parent / "ide" / "src" / "securityEditorWebview.ts"
     ).read_text(encoding="utf-8")
-    match = re.search(rf'key: "{switch}",.*?risk: "([^"]*)"', source, re.DOTALL)
-    assert match is not None, f"no risk string for {switch} in securityEditorWebview.ts"
-    assert match.group(1) == dict(_loosenings(sec))[switch]
+    # One FIELDS entry is one `{ ... }` with no nested braces, so `[^{}]` keeps the match inside it,
+    # and the captured literal is decoded as JSON so a backslash-u escape compares as its character.
+    entry = re.search(rf'\{{ key: "{re.escape(switch)}",[^{{}}]*\}}', source)
+    assert entry is not None, f"no FIELDS entry for {switch} in securityEditorWebview.ts"
+    risk = re.search(r'risk: ("(?:[^"\\]|\\.)*")', entry.group(0))
+    assert risk is not None, f"the {switch} entry has no risk string"
+    assert json.loads(risk.group(1)) == dict(_loosenings(sec))[switch]
 
 
 def test_loosening_warns_and_prod_phi_refuses(

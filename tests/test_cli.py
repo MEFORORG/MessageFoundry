@@ -1240,8 +1240,10 @@ def _expose_toml(
 
 # --- #186/#188 secure-by-default serve gates (retention / egress deny-by-default / security notify) --
 #
-# These gates mirror the sanctioned open-egress / MFA-at-exposure posture: a PRODUCTION PHI instance
-# REFUSES to start, a non-production PHI instance (staging) WARNS, a synthetic instance (dev) is quiet.
+# These gates mirror the sanctioned open-egress posture: a PRODUCTION PHI instance REFUSES to start, a
+# non-production PHI instance (staging) WARNS, a synthetic instance (dev) is quiet. The MFA-at-exposure
+# gate no longer belongs in that list: it splits on [security].enforcement, never on the tier, and no
+# instance stays quiet on it (the MFA-at-exposure section above).
 # The building blocks below let a PRODUCTION PHI serve pass every PRIOR gate so exactly one new gate is
 # under test per case (a locked-down egress, a bounded retention, and a real SMTP channel). See
 # messagefoundry/__main__.py.
@@ -1303,14 +1305,14 @@ def test_serve_refuses_exposed_without_mfa_in_prod(
     err = capsys.readouterr().err
     assert "require_mfa off; refusing to start" in err
     # Vault BACKLOG #2798 amendment: with require_mfa off the un-enrolled accounts are single-factor,
-    # not the Administrator role alone, and an OIDC sign-in with a checked claim is the exception.
+    # not the Administrator role alone. Vault BACKLOG #1133: this config has OIDC off, so no OIDC
+    # sign-in is an exception and the refusal must not name one (oidc_mfa_claim_exception).
     assert (
         "every account with no second factor enrolled, Administrators included, would "
-        "authenticate with a single factor over the network, unless an OIDC sign-in carries an "
-        "amr/acr claim checked while [auth].oidc_require_mfa_claim is on." in err
+        "authenticate with a single factor over the network. Enable" in err
     )
-    # The AD-only advice names the same condition: _check_mfa_gate reads only that setting.
-    assert "each enrolls an engine factor unless an OIDC sign-in meets it with that claim)" in err
+    assert "each enrolls an engine factor); or set" in err
+    assert "amr/acr" not in err
 
 
 def test_serve_warns_exposed_without_mfa_in_staging(
@@ -1334,12 +1336,12 @@ def test_serve_warns_exposed_without_mfa_in_staging(
     assert "refusing to start" not in err  # warned, did not refuse
     # Vault BACKLOG #2798: with require_mfa off the scope is not read, so the warning must not name it.
     assert (
-        "every account with no second factor enrolled is single-factor over the network, unless "
-        "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is "
-        "on." in err
+        "every account with no second factor enrolled is single-factor over the network. Enable"
+        in err
     )
     warning = next(line for line in err.splitlines() if "with [security].require_mfa off" in line)
     assert "require_mfa_scope" not in warning
+    assert "amr/acr" not in warning  # OIDC is off here, so there is no claim exception to name
 
 
 def test_serve_exposed_without_mfa_refuses_on_dev_too(
@@ -1451,10 +1453,9 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
     both = captured.out + captured.err
     audit = next(line for line in both.splitlines() if "AUDIT:" in line and "require_mfa" in line)
     assert (
-        "every account with no second factor enrolled is single-factor over the network, unless "
-        "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is "
-        "on." in audit
+        "every account with no second factor enrolled is single-factor over the network." in audit
     )
+    assert "amr/acr" not in audit  # OIDC is off here: the audit record names no exception
 
 
 def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
@@ -2184,9 +2185,8 @@ def test_undeclared_proxy_warns_about_single_factor_admin(
     # Vault BACKLOG #2798: the accounts this frees are the un-enrolled ones, not a scope the gate
     # does not read with require_mfa off. RED on the "every account in require_mfa_scope" wording.
     assert (
-        "every account with no second factor enrolled is single-factor over the network (unless an "
-        "OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on) "
-        "and the MFA-at-exposure refusal cannot see it" in err
+        "every account with no second factor enrolled is single-factor over the network, and the "
+        "MFA-at-exposure refusal cannot see it" in err
     )
     assert "proxy posture is undeclared" not in err, (
         "the ADR 0068 §8 heuristic fired after all — re-check whether this arm is still needed, and "

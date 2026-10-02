@@ -1732,12 +1732,12 @@ def _serve(args: argparse.Namespace) -> int:
         KEYLESS_REFUSED_BY_NO_OPT_OUT,
         KEYLESS_REFUSED_BY_REQUIRE_ENCRYPTION,
         KEYLESS_REFUSED_BY_UNREAD_KEY,
-        OIDC_MFA_CLAIM_EXCEPTION,
         LogWriteFailurePolicy,
         StoreBackend,
         SyslogProtocol,
         forward_hop_disposition,
         hop_posture_from_ai,
+        oidc_mfa_claim_exception,
         security_loosenings,
     )
     from messagefoundry.config.tls_policy import (
@@ -3130,6 +3130,9 @@ def _serve(args: argparse.Namespace) -> int:
     # identically (extend-never-weaken). It reads `instance_exposed`, NOT the mutated console flag: the
     # single-factor admin surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
     admin_exposed = instance_exposed
+    # Empty unless this config has the OIDC claim exception, so an AUDIT line never names one that
+    # does not exist here (settings.oidc_mfa_claim_exception says why).
+    oidc_exception = oidc_mfa_claim_exception(settings.auth)
     if admin_exposed and settings.auth.enabled and not settings.auth.require_mfa:
         exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
@@ -3142,11 +3145,10 @@ def _serve(args: argparse.Namespace) -> int:
                 f"error: {exposure_desc} on a {'production ' if production else ''}PHI "
                 f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — every "
                 "account with no second factor enrolled, Administrators included, would "
-                "authenticate with a single factor over the network, unless "
-                f"{OIDC_MFA_CLAIM_EXCEPTION}. "
+                f"authenticate with a single factor over the network{oidc_exception}. "
                 "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
                 "API (on an AD-only deployment it binds directory principals too: each enrolls an "
-                "engine factor unless an OIDC sign-in meets it with that claim); or set "
+                f"engine factor{oidc_exception}); or set "
                 "[security].allow_single_factor_admin_when_exposed=true to deliberately permit "
                 "single-factor sign-in at exposure (audited).",
                 file=sys.stderr,
@@ -3159,19 +3161,17 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).warning(
                 "AUDIT: %s on a %sPHI instance (environment %r) with [security].require_mfa "
                 "off, permitted because [security].allow_single_factor_admin_when_exposed=true — every "
-                "account with no second factor enrolled is single-factor over the network, unless "
-                "%s.",
+                "account with no second factor enrolled is single-factor over the network%s.",
                 exposure_desc,
                 "production " if production else "",
                 env_name,
-                OIDC_MFA_CLAIM_EXCEPTION,
+                oidc_exception,
             )
         print(
             f"warning: {exposure_desc} in a PHI-carrying "
             f"environment ({env_name!r}) with [security].require_mfa off — every account with no "
-            "second factor enrolled is single-factor over the network, unless "
-            f"{OIDC_MFA_CLAIM_EXCEPTION}. Enable [security].require_mfa=true (WP-14 native TOTP) "
-            "before exposure.",
+            f"second factor enrolled is single-factor over the network{oidc_exception}. Enable "
+            "[security].require_mfa=true (WP-14 native TOTP) before exposure.",
             file=sys.stderr,
         )
 
@@ -3197,7 +3197,7 @@ def _serve(args: argparse.Namespace) -> int:
             "on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
             "UNDECLARED reverse proxy, every account with no second factor enrolled is single-factor "
-            f"over the network (unless {OIDC_MFA_CLAIM_EXCEPTION}) and "
+            f"over the network{oidc_exception}, and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
             "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
             "trusted_proxies, or set [security].require_mfa=true.",
