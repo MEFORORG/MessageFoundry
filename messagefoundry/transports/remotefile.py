@@ -2399,9 +2399,10 @@ class RemoteFileSource(SourceConnector):
                 )
                 continue
             if stopped:
-                # Stopping part-way through a batch: the whole file stays, and the next start hands
-                # it over again (at-least-once, as the File source does).
-                return
+                # A stop arrived before the file's last message: the whole file stays, and the next
+                # start hands it over again (at-least-once, as the File source does). Break, not
+                # return, so the prune below still bounds what this poll recorded.
+                break
             await self._after_processing(path, name, len(raw))
             disposed += 1
             if file_key is not None:
@@ -2422,13 +2423,17 @@ class RemoteFileSource(SourceConnector):
         and one disposition per message, in file order. The listener refuses a body holding a second
         ``MSH``, so a whole batch handed over unsplit would be one ``ERROR``. A single-message or
         undecodable file is handed over as its original bytes. Any other content type is handed over
-        verbatim, never decoded."""
+        verbatim, never decoded.
+
+        The stop is checked before every hand-off, the first included: a stop set while the file was
+        retrieved or scanned hands nothing over, so the next start does not ingest a message twice."""
         assert self._handler is not None
         if self.content_type is not None and self.content_type is not ContentType.HL7V2:
-            await self._handler(raw)
-            return False
-        for index, message in enumerate(split_batch_bytes(raw, self._encoding)):
-            if index and self._stop.is_set():
+            messages = [raw]
+        else:
+            messages = split_batch_bytes(raw, self._encoding)
+        for message in messages:
+            if self._stop.is_set():
                 return True
             await self._handler(message)
         return False

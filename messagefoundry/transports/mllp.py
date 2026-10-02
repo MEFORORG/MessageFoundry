@@ -528,14 +528,16 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
     delimiters. This is the "parse → set new MSH-1/MSH-2 → re-encode" contract, done by re-joining the
     parse tree rather than by string-slicing the raw bytes.
 
-    Leaf values are carried through **verbatim except for the escape character**: structural delimiters
-    never appear literally inside a leaf (they are escaped), and HL7's named escapes (``\\F\\``,
-    ``\\S\\`` …) are delimiter-agnostic — only their surrounding escape character changes when the
-    escape character does. Crucially we do **not** round-trip leaves through an ``unescape``/``escape``
+    **Every leaf reads the same under the target set as it did under the source set** (ADR 0206 rule
+    4). A target delimiter that sits literally in a leaf is escaped with the target escape character.
+    A separator escape (``\\F\\``, ``\\S\\``, ``\\R\\``, ``\\T\\``, ``\\E\\``) names a delimiter of
+    the set it is read under, so it is decoded against the source set and re-escaped against the
+    target set; other escapes (``\\H\\``, ``\\Xhh\\`` …) keep their text under the target escape
+    character. Crucially we do **not** round-trip leaves through a general ``unescape``/``escape``
     pair (python-hl7's corrupted code points above U+007F — accented/CJK names — and would silently
-    mangle PHI; the same quirk :class:`~messagefoundry.parsing.message.Message` avoids). When the source
-    already uses the target escape character, leaves are byte-identical. A target delimiter that sits
-    literally in a leaf is escaped with the target escape character (ADR 0206 rule 4).
+    mangle PHI; the same quirk :class:`~messagefoundry.parsing.message.Message` avoids): a character
+    above U+007F is never touched. When the target set equals the source set, leaves are
+    byte-identical.
 
     Raises :class:`ValueError` if ``payload`` is not parseable HL7 (no MSH / malformed header), so the
     caller can fail the delivery loud instead of framing a corrupted message, and

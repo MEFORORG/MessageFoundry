@@ -1050,16 +1050,27 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     :func:`separators`. Each data field is rewritten with a character map from the message's own
     repetition, component, subcomponent and escape characters to the target ones. That equals splitting
     the field on its separators and re-joining with the targets, because a split leaf holds no source
-    separator. Leaves are never unescaped, so a character above U+007F passes through byte for byte.
+    separator. A character above U+007F is never touched, so it passes through byte for byte.
 
-    **A target delimiter that sits literally inside a leaf is escaped with the target escape character**
-    (ADR 0206 rule 4): the sender chooses the source separators, so a character that is plain data
-    under them may be a delimiter under the target set, and carried raw it would become structure the
-    Router and Handler never saw. The target field, component, repetition, subcomponent and escape
-    characters become ``F``, ``S``, ``R``, ``T`` and ``E`` escapes. A leaf the target set cannot
-    represent raises :class:`DelimiterRewriteRefused`: an escape sequence, or an escape character
-    nothing closes, whose text holds such a character, and a segment id holding the target field
-    separator. A field with none of those characters takes a single ``str.translate``.
+    **A leaf reads the same after the rewrite as it did before** (ADR 0206 rule 4). The sender chooses
+    the source separators, so a character that is plain data under them may be a delimiter under the
+    target set, and carried raw it would become structure the Router and Handler never saw. So:
+
+    * a target delimiter sitting literally in a leaf is escaped with the target escape character, the
+      target field, component, repetition, subcomponent and escape characters becoming ``F``, ``S``,
+      ``R``, ``T`` and ``E`` escapes;
+    * a separator escape (``F``, ``S``, ``R``, ``T``, ``E``) is decoded against the source set and
+      re-escaped against the target set, because its letter names a different character there;
+    * an escape character nothing closes is data, as :func:`unescape` reads it, so it and the text
+      after it are written as data under the target set;
+    * any other escape sequence (``H``, ``N``, ``Xhh``, ``.br`` and the rest) keeps its text under the
+      target escape character.
+
+    Two values the target set cannot represent raise :class:`DelimiterRewriteRefused`: an escape
+    sequence other than the five separator escapes whose text holds a target delimiter, and a segment
+    id holding the target field separator. A field holding no source escape character takes a single
+    ``str.translate`` that also escapes its data characters, and every field takes the plain one when
+    the target set equals the source set.
 
     Where two source separators are the same character, the one split first wins: repetition, then
     component, then subcomponent, the order python-hl7 split them. The segment id is kept verbatim. On
@@ -1083,18 +1094,12 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
         structure.setdefault(source, dest)
     table = {ord(source): dest for source, dest in structure.items()}
     table.setdefault(ord(s_esc), t_esc)
-    # The characters that are data under the source set and a delimiter under the target set. A
-    # source separator or the source escape character is never data in a field's text (and the
-    # field separator never appears in it at all), so each is left out. An override that only
-    # renames separators therefore leaves this empty and takes the plain translate.
-    codes: dict[str, str] = {}
-    for char, code in ((t_field, "F"), (t_comp, "S"), (t_rep, "R"), (t_sub, "T"), (t_esc, "E")):
-        if char not in (s_field, s_comp, s_rep, s_sub, s_esc):
-            codes.setdefault(char, code)
+    # The same set on both sides changes no leaf, so one translate is exact. Any difference can make
+    # a literal character a target delimiter, or give a separator escape's letter a new meaning.
     rewrite: Callable[[str], str] = (
-        _LeafRewrite(table, structure, codes, s_esc, t_esc)
-        if codes
-        else operator.methodcaller("translate", table)
+        operator.methodcaller("translate", table)
+        if tuple(msg["seps"]) == tuple(target)
+        else _LeafRewrite(table, structure, msg["seps"], target)
     )
     lines: list[str] = []
     for index, seg in enumerate(msg["segments"]):
@@ -1122,33 +1127,52 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
 
 
 class _LeafRewrite:
-    """The per-field rewrite :func:`encode_with_separators` uses when some target delimiter is data
-    under the source set. ``table`` is the whole-field ``str.translate`` map, ``structure`` the
-    source-to-target separator map (checked before the escape character, as ``table`` ranks them),
-    and ``codes`` maps each such data character to its escape code."""
+    """The per-field rewrite :func:`encode_with_separators` uses when a single translate would change
+    what a receiver reads: some target delimiter is data under the source set, or a separator escape
+    means a different character under the target set.
+
+    ``table`` is the whole-field ``str.translate`` map and ``structure`` the source-to-target
+    separator map (checked before the escape character, as ``table`` ranks them). ``source`` and
+    ``target`` are the two separator sets, each ``(field, component, repetition, subcomponent,
+    escape)``, the order of the ``F``, ``S``, ``R``, ``T`` and ``E`` escapes."""
 
     def __init__(
         self,
         table: dict[int, str],
         structure: dict[str, str],
-        codes: dict[str, str],
-        s_esc: str,
-        t_esc: str,
+        source: tuple[str, str, str, str, str],
+        target: tuple[str, str, str, str, str],
     ) -> None:
-        self._table = table
         self._structure = structure
-        self._codes = codes
-        self._s_esc = s_esc
-        self._t_esc = t_esc
+        self._s_esc = source[4]
+        self._t_esc = t_esc = target[4]
+        # Each separator escape letter to the source character it stands for.
+        self._decode = dict(zip("FSRTE", source, strict=True))
+        # Each target delimiter to the escape that carries it as data under the target set.
+        self._target_codes: dict[str, str] = {}
+        for code, char in zip("FSRTE", target, strict=True):
+            self._target_codes.setdefault(char, code)
+        # The characters that are data under the source set and a delimiter under the target set. A
+        # source separator or the source escape character is never data in a field's text (and the
+        # field separator never appears in it at all), so each is left out.
+        self._codes = {c: k for c, k in self._target_codes.items() if c not in source}
+        # A field holding no source escape character is structure and plain data only, so one
+        # translate maps its separators and escapes its data characters at once.
+        self._data_table = {**table, **{ord(c): t_esc + k + t_esc for c, k in self._codes.items()}}
 
     def _holds_code(self, text: str) -> bool:
         # At most five characters, each a C-level substring scan; no pattern is built from config.
         return any(char in text for char in self._codes)
 
+    def _data(self, char: str) -> str:
+        """``char`` as data under the target set: its escape when it is a target delimiter."""
+        code = self._target_codes.get(char)
+        return char if code is None else self._t_esc + code + self._t_esc
+
     def __call__(self, text: str) -> str:
-        if not self._holds_code(text):
-            return text.translate(self._table)
-        structure, codes, s_esc, t_esc = self._structure, self._codes, self._s_esc, self._t_esc
+        if self._s_esc not in text:
+            return text.translate(self._data_table)
+        structure, s_esc, data = self._structure, self._s_esc, self._data
         out: list[str] = []
         run: list[str] | None = None  # the text of an open escape sequence
         for char in text:
@@ -1159,28 +1183,36 @@ class _LeafRewrite:
                 out.append(structure[char])
             elif run is not None:
                 if char == s_esc:
-                    out.append(t_esc + self._sequence(run) + t_esc)
+                    out.append(self._sequence(run))
                     run = None
                 else:
                     run.append(char)
             elif char == s_esc:
                 run = []
             else:
-                code = codes.get(char)
-                out.append(char if code is None else t_esc + code + t_esc)
+                out.append(data(char))
         if run is not None:
             out.append(self._unclosed(run))
         return "".join(out)
 
     def _sequence(self, run: list[str]) -> str:
+        """A closed escape sequence, rewritten for the target set. A separator escape (``F``, ``S``,
+        ``R``, ``T``, ``E``) is decoded against the source set and re-escaped against the target, so
+        the receiver reads the character the engine read. Any other sequence keeps its text under the
+        target escape character, which only works while that text holds no target delimiter."""
         text = "".join(run)
+        decoded = self._decode.get(text)
+        if decoded is not None:
+            return self._data(decoded)
         if self._holds_code(text):
             raise DelimiterRewriteRefused(
-                "an escape sequence holds a target delimiter, which the target set cannot carry"
+                "an escape sequence other than F, S, R, T or E holds a target delimiter, which the "
+                "target set cannot carry inside a sequence"
             )
-        return text
+        return self._t_esc + text + self._t_esc
 
     def _unclosed(self, run: list[str]) -> str:
-        # unescape() keeps an escape character nothing closes as data, with the text after it, and
-        # translate() maps it to the target escape character. Kept the same way here.
-        return self._t_esc + self._sequence(run)
+        # unescape() keeps an escape character nothing closes as data, with the text after it. So
+        # both are written as data under the target set: the source escape character and each
+        # character after it, each escaped where it is a target delimiter.
+        return self._data(self._s_esc) + "".join(self._data(char) for char in run)

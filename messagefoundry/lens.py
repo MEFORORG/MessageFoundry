@@ -2579,7 +2579,51 @@ def _apply_set_params(
     result = _splice_slots(src, slots, params, moded=(row["kind"], row.get("action")))
     if any(isinstance(v, dict) and set(v) == {"parts"} for v in params.values()):
         _refuse_overlong_template_lines(src, result, line_start, line_end)
+    if row.get("action") == "copy_field" and ("src" in params or "dst" in params):
+        result = _repick_copy_write(result, line_start, line_end)
     return result
+
+
+def _repick_copy_write(source: str, line_start: int, line_end: int) -> str:
+    """Re-pick the write of the native Copy Field at ``line_start``-``line_end`` of ``source``, after
+    an edit of its ``src`` or ``dst`` (ADR 0206 rule 1).
+
+    The write is the one :func:`_copy_write_method` picks on insert. Splicing only the paths would
+    keep the old method: a leaf source left on ``set`` into a whole field turns its decoded
+    separators into structure, and a whole-field source moved to ``set_data`` escapes the field's
+    structure into one component. The two writes are the same at a literal leaf destination, so
+    there the method is left as written. A source that is not a literal cannot be classified and
+    keeps its method. ``source`` is the already-spliced text, so the paths read here are the ones the
+    edit wrote."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    for stmt in ast.walk(tree):
+        if (
+            isinstance(stmt, ast.Expr)
+            and stmt.lineno == line_start
+            and stmt.end_lineno == line_end
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+        ):
+            break
+    else:
+        return source
+    native = _recognize_native_method(stmt.value)
+    if native is None or native.action != "copy_field":
+        return source
+    slots = dict(native.slots)
+    src, dst = (getattr(slots[name], "value", None) for name in ("src", "dst"))
+    func = stmt.value.func
+    if not isinstance(src, str) or _is_leaf_literal(dst) or func.end_col_offset is None:
+        return source
+    want = _copy_write_method(src)
+    if func.attr == want:
+        return source
+    data = source.encode("utf-8")
+    end = _line_byte_starts(data)[(func.end_lineno or func.lineno) - 1] + func.end_col_offset
+    return (data[: end - len(func.attr)] + want.encode("ascii") + data[end:]).decode("utf-8")
 
 
 def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line_end: int) -> None:
@@ -4524,6 +4568,14 @@ def _is_leaf_literal(value: Any) -> bool:
     return isinstance(value, str) and _LEAF_PATH_RE.match(value) is not None
 
 
+def _copy_write_method(src: Any) -> str:
+    """The ``Message`` write a native Copy Field from ``src`` uses (ADR 0206 rule 1): ``set_data`` for
+    a literal component or subcomponent path, whose read is decoded, as ``actions.copy_field`` does;
+    ``set`` otherwise. A ``src`` given as an expression cannot be classified and keeps ``set``; the
+    handler-security lint cannot see that one either."""
+    return "set_data" if _is_leaf_literal(src) else "set"
+
+
 def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> str:
     """Render the NATIVE Message-API form of an inserted ``set_field``/``copy_field``/``delete_segment``.
 
@@ -4568,10 +4620,7 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
         dst = _render_insert_value(params.get("dst", ""), "dst")
         # The occurrence applies to BOTH the inner read and the outer write, so the copy operates on the
         # loop's occurrence (not occurrence 1); the recognizer surfaces only the outer set's occurrence.
-        # A literal component or subcomponent ``src`` reads decoded, so it is written with set_data,
-        # as actions.copy_field does (ADR 0206 rule 1). A ``src`` given as an expression cannot be
-        # classified here and keeps set; the handler-security lint cannot see that one either.
-        write = "set_data" if _is_leaf_literal(params.get("src")) else "set"
+        write = _copy_write_method(params.get("src"))
         return f'msg.{write}({dst}, msg.field({src}{suffix}) or ""{suffix})'
     if name == "add_segment":
         line = _render_insert_value(params.get("line", ""), "line")

@@ -13,6 +13,7 @@ written to disk.
 from __future__ import annotations
 
 import textwrap
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,13 @@ import pytest
 
 from messagefoundry import actions
 from messagefoundry.checks import _check_handler_security
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Validation
+from messagefoundry.config.models import (
+    ConnectorType,
+    ContentType,
+    Destination,
+    Source,
+    Validation,
+)
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -30,14 +37,21 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.lens import parse_source, rewrite_source
 from messagefoundry.parsing import _builtin_hl7
+from messagefoundry.parsing import split as split_mod
 from messagefoundry.parsing.message import Message, reencode_with_separators
-from messagefoundry.parsing.split import split_batch_bytes
+from messagefoundry.parsing.split import split_batch, split_batch_bytes
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.mllp import MLLPDestination
-from tests.test_remotefile_transport import _FakeClient, _RecordingHandler, _settle
+from tests.test_remotefile_transport import (
+    _FakeClient,
+    _FakeLedger,
+    _RecordingHandler,
+    _settle,
+)
 from tests.test_remotefile_transport import _src as _remote_src
 
 CR, BS = "\r", chr(92)
@@ -336,7 +350,6 @@ def test_a_field_with_no_target_delimiter_is_byte_identical_to_before() -> None:
         pytest.param(
             "PID#1##A" + BS + "Z|Y" + BS + "B", id="escape-sequence-holds-a-target-delimiter"
         ),
-        pytest.param("PID#1##AB" + BS + "Z|Y", id="unclosed-escape-holds-a-target-delimiter"),
         pytest.param("P|D#1##A", id="segment-id-holds-the-target-field-separator"),
     ],
 )
@@ -572,3 +585,302 @@ async def test_a_stop_part_way_through_a_remote_batch_leaves_the_file(
     await src._poll_once()
     assert len(handler.bodies) == 1
     assert "/in/batch.hl7" in client.files and "/in/.processed/batch.hl7" not in client.files
+
+
+# --- review repair: no leading message is dropped by the batch split (#2560) ----------------------
+
+MSH3 = MSH.replace("CTRL1", "CTRL3")
+THREE = [
+    MSH + CR + "PID|1||111" + CR,
+    MSH2 + CR + "PID|1||222" + CR,
+    MSH3 + CR + "PID|1||333" + CR,
+]
+#: What a file may carry before its first ``MSH``: a byte order mark, a space or a tab.
+LEADS = [
+    pytest.param(chr(0xFEFF), id="bom"),
+    pytest.param(" ", id="space"),
+    pytest.param(chr(9), id="tab"),
+]
+
+
+def _remote_ic() -> InboundConnection:
+    return InboundConnection(
+        "in",
+        ConnectionSpec(ConnectorType.REMOTEFILE, {"host": "sftp.example.com", "remote_dir": "/in"}),
+        router="r",
+        content_type=ContentType.HL7V2,
+        validation=Validation(strict=False, hl7_version="2.5"),
+    )
+
+
+@pytest.mark.parametrize("lead", LEADS)
+@pytest.mark.parametrize("count", [1, 2, 3])
+async def test_every_message_of_a_noise_led_remote_file_gets_a_disposition(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, lead: str, count: int
+) -> None:
+    body = (lead + "".join(THREE[:count])).encode("utf-8")
+    client = _FakeClient(files={"/in/batch.hl7": body})
+    src = _remote_src(monkeypatch, client)
+    ic = _remote_ic()
+    runner = wiring_runner.RegistryRunner(_registry(ic), store)
+    src._handler = runner._make_handler(ic)
+    await _settle(src)
+    await src._poll_once()
+    # One row per message the file holds: none is dropped and none is folded into another's ERROR.
+    rows = await _rows(store)
+    assert len(rows) == count
+    if lead != chr(0xFEFF) or count > 1:
+        assert {r["status"] for r in rows} == {MessageStatus.RECEIVED.value}
+
+
+@pytest.mark.parametrize("lead", LEADS)
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_split_batch_keeps_a_first_message_led_by_noise(lead: str, count: int) -> None:
+    text = lead + "".join(THREE[:count])
+    parts = split_batch(text)
+    assert len(parts) == count
+    if count > 1:
+        assert [p.split("|")[9] for p in parts] == ["CTRL1", "CTRL2", "CTRL3"][:count]
+    raw = text.encode("utf-8")
+    bytes_parts = split_batch_bytes(raw, "utf-8")
+    assert len(bytes_parts) == count
+    if count == 1:
+        assert bytes_parts == [raw]
+
+
+def test_a_first_chunk_that_is_not_an_envelope_is_kept_for_the_parser() -> None:
+    parts = split_batch("JUNK|1" + CR + "".join(THREE[:2]))
+    assert len(parts) == 3 and parts[0] == "JUNK|1"
+    enveloped = split_batch("FHS|" + ENC + CR + "BHS|" + ENC + CR + "".join(THREE[:2]))
+    assert [p.split("|")[9] for p in enveloped] == ["CTRL1", "CTRL2"]
+
+
+async def test_the_file_source_keeps_a_bom_led_first_message(tmp_path: Path) -> None:
+    source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path)}))
+    handler = _RecordingHandler()
+    source._handler = handler
+    assert await source._emit((chr(0xFEFF) + "".join(THREE)).encode("utf-8")) is True
+    assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1", "CTRL2", "CTRL3"]
+
+
+def test_split_batch_bytes_hands_a_single_message_over_without_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _no_split(_raw: object) -> list[str]:
+        raise AssertionError("a one-message file was decoded and split")
+
+    monkeypatch.setattr(split_mod, "split_batch", _no_split)
+    for lead in (chr(0xFEFF), " ", ""):
+        raw = (lead + THREE[0]).encode("utf-8")
+        assert split_batch_bytes(raw, "utf-8") == [raw]
+        lf = raw.replace(CR.encode(), chr(10).encode())
+        assert split_batch_bytes(lf, "latin-1") == [lf]
+
+
+def test_split_batch_bytes_still_splits_an_encoding_the_byte_check_cannot_read() -> None:
+    raw = "".join(THREE).encode("utf-16")
+    assert len(split_batch_bytes(raw, "utf-16")) == 3
+
+
+async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prunes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(
+        files={"/in/a.hl7": THREE[0].encode("utf-8"), "/in/b.hl7": "".join(THREE).encode("utf-8")}
+    )
+    src = _remote_src(monkeypatch, client, after_read="leave")
+    ledger = _FakeLedger()
+    src.processed_ledger = ledger
+    handler = _RecordingHandler()
+    src._handler = handler
+    original = split_mod.split_batch_bytes
+
+    def _stop_on_the_batch(raw: bytes, encoding: str) -> list[bytes]:
+        if raw.count(b"MSH") > 1:
+            src._stop.set()
+        return original(raw, encoding)
+
+    monkeypatch.setattr(
+        "messagefoundry.transports.remotefile.split_batch_bytes", _stop_on_the_batch
+    )
+    await _settle(src)
+    await src._poll_once()
+    # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
+    assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1"]
+    assert len(ledger.keys) == 1 and ledger.pruned == 1
+
+
+# --- review repair: a separator escape means what the engine read, under the target set (#2559) ---
+
+
+def _reencode(field_text: str, target: tuple[str, str, str, str, str], path: str) -> str | None:
+    src = MSH + CR + "OBX|1|ST|C||" + field_text + CR
+    return Message.parse(reencode_with_separators(src, target)).field(path)
+
+
+@pytest.mark.parametrize(
+    ("field_text", "target", "read"),
+    [
+        pytest.param(
+            "SMITH " + _esc("T") + " SONS", ("|", "^", "~", "#", BS), "SMITH & SONS", id="T-to-#"
+        ),
+        pytest.param("A" + _esc("S") + "B", ("|", "!", "~", "&", BS), "A^B", id="S-under-!"),
+        pytest.param("A!B", ("|", "!", "~", "&", BS), "A!B", id="literal-!"),
+        pytest.param("C:" + _esc("E") + "x", ("|", "^", "~", "&", "#"), "C:" + BS + "x", id="E"),
+        pytest.param("A" + _esc("F") + "B", ("#", "^", "~", "&", BS), "A|B", id="F-under-#"),
+        pytest.param("A" + _esc("R") + "B", ("|", "^", "@", "&", BS), "A~B", id="R-under-@"),
+        pytest.param("A" + _esc("H") + "B", ("|", "^", "~", "&", "#"), "A_B", id="H-kept"),
+    ],
+)
+def test_a_separator_escape_reads_the_same_after_the_rewrite(
+    field_text: str, target: tuple[str, str, str, str, str], read: str
+) -> None:
+    assert Message.parse(MSH + CR + "OBX|1|ST|C||" + field_text + CR).field("OBX-5.1") == read
+    assert _reencode(field_text, target, "OBX-5.1") == read
+
+
+def test_an_escaped_and_a_literal_component_stay_distinct_under_the_target() -> None:
+    target = ("|", "!", "~", "&", BS)
+    src = MSH + CR + "OBX|1|ST|C||A" + _esc("S") + "B|A!B" + CR
+    out = reencode_with_separators(src, target).split(CR)[1].split("|")
+    assert out[5] != out[6]
+    assert out[5] == "A^B" and out[6] == "A" + _esc("S") + "B"
+
+
+@pytest.mark.parametrize(
+    ("field_text", "target"),
+    [
+        pytest.param("C:" + BS + "dir!x", ("|", "!", "~", "&", BS), id="unclosed-holds-component"),
+        pytest.param("C:" + BS + "dir!x", ("|", "!", "~", "&", "#"), id="new-escape-char"),
+        pytest.param("AB" + BS + "Z#Y", ("#", "^", "~", "&", BS), id="unclosed-holds-field-sep"),
+    ],
+)
+def test_an_unclosed_escape_holding_a_target_delimiter_is_carried(
+    field_text: str, target: tuple[str, str, str, str, str]
+) -> None:
+    seen = Message.parse(MSH + CR + "OBX|1|ST|C||" + field_text + CR).field("OBX-5.1")
+    assert seen == field_text
+    assert _reencode(field_text, target, "OBX-5.1") == seen
+
+
+# --- review repair: the Steps view re-picks the copy's write when its source changes (#2558) -----
+
+
+def _edit_copy_src(write: str, old_src: str, new_src: str) -> str:
+    source = LENS_SOURCE + f'    msg.{write}("PV1-19", msg.field("{old_src}") or "")\n'
+    row = _copy_rows(source)[0]
+    return rewrite_source(
+        source,
+        {
+            "op": "set_params",
+            "line_start": row["line_start"],
+            "line_end": row["line_end"],
+            "params": {"src": new_src},
+        },
+    )
+
+
+def test_a_copy_edited_from_a_leaf_to_a_whole_field_source_writes_with_set() -> None:
+    out = _edit_copy_src("set_data", "PID-3.1", "PID-3")
+    assert 'msg.set("PV1-19", msg.field("PID-3") or "")' in out
+    assert _copy_rows(out)[0]["params"] == {"src": "PID-3", "dst": "PV1-19"}
+
+
+def test_a_copy_edited_from_a_whole_field_to_a_leaf_source_writes_with_set_data() -> None:
+    out = _edit_copy_src("set", "PID-3", "PID-3.1")
+    assert 'msg.set_data("PV1-19", msg.field("PID-3.1") or "")' in out
+    assert _copy_rows(out)[0]["params"] == {"src": "PID-3.1", "dst": "PV1-19"}
+
+
+def test_a_copy_edit_that_keeps_the_level_keeps_the_write() -> None:
+    out = _edit_copy_src("set_data", "PID-3.1", "PID-4.2")
+    assert 'msg.set_data("PV1-19", msg.field("PID-4.2") or "")' in out
+
+
+def test_a_copy_whose_destination_is_edited_to_a_whole_field_writes_with_set_data() -> None:
+    source = LENS_SOURCE + '    msg.set("NK1-2.1", msg.field("PID-5.1") or "")\n'
+    row = _copy_rows(source)[0]
+    edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
+    out = rewrite_source(source, {**edit, "params": {"dst": "NK1-2"}})
+    assert 'msg.set_data("NK1-2", msg.field("PID-5.1") or "")' in out
+    # At a leaf destination the two writes are the same, so an edit there leaves the method alone.
+    out = rewrite_source(source, {**edit, "params": {"dst": "NK1-3.1"}})
+    assert 'msg.set("NK1-3.1", msg.field("PID-5.1") or "")' in out
+
+
+# --- review repair: the lint follows the value, not every read near it (#2558) --------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'msg.set("PV1-19", TABLE[msg.field("PID-3.1")])',
+        'msg.set("PV1-19", TABLE.get(msg.field("PID-3.1"), "X"))',
+        'msg.set("PV1-19", "A" if msg.field("PID-3.1") else "B")',
+        'msg.set("PV1-19", str(len(msg.field("PID-3.1") or "")))',
+        'msg.set("PV1-19", next(r for r in reps if msg.field("PID-3.5") == r))',
+        'msg.set("PV1-19", "Y" if msg.field("PID-3.1").startswith("9") else "N")',
+    ],
+)
+def test_the_lint_ignores_a_leaf_that_does_not_flow_into_the_value(
+    tmp_path: Path, line: str
+) -> None:
+    body = f'TABLE = {{}}\n@handler("h")\ndef h(msg, reps=()):\n    {line}\n'
+    assert "[leaf-to-whole-field]" not in _lint(tmp_path, body)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'msg.set("PV1-19", TABLE.get("k", msg.field("PID-3.1")))',
+        'msg.set("PV1-19", msg.field("PID-3.1") if ok else "B")',
+        'msg.set("PV1-19", "-".join([msg.field("PID-3.1") or "", "x"]))',
+        'msg.set("PV1-19", f"{msg.field(\'PID-3.1\')}")',
+        'msg.set("PV1-19", str(msg.field("PID-3.1")))',
+        'msg.set("PV1-19", next(r for r in [msg.field("PID-3.1")] if r))',
+        'msg.set("PV1-19", (msg.field("PID-3.1") or "")[:3])',
+    ],
+)
+def test_the_lint_still_flags_a_leaf_that_flows_into_the_value(tmp_path: Path, line: str) -> None:
+    body = f'TABLE = {{}}\n@handler("h")\ndef h(msg, ok=True):\n    {line}\n'
+    assert "[leaf-to-whole-field]" in _lint(tmp_path, body)
+
+
+def test_the_lint_follows_a_name_only_through_its_value(tmp_path: Path) -> None:
+    clean = """
+    @handler("h")
+    def h(msg):
+        flag = msg.field("PID-3.1") == "X"
+        code = "A" if flag else "B"
+        msg.set("PV1-19", code)
+    """
+    assert "[leaf-to-whole-field]" not in _lint(tmp_path, clean)
+    tainted = """
+    @handler("h")
+    def h(msg):
+        a = b = ""
+        a = b
+        b = a + (msg.field("PID-3.1") or "")
+        msg.set("PV1-19", a)
+    """
+    assert "[leaf-to-whole-field]" in _lint(tmp_path, tainted)
+
+
+def test_the_shipped_results_relay_sample_is_clean() -> None:
+    root = Path(__file__).resolve().parents[1] / "samples" / "results_relay"
+    result = _check_handler_security(root)
+    assert "[leaf-to-whole-field]" not in result.detail
+
+
+@pytest.mark.parametrize(("source", "flagged"), [("PID-3", False), ("PID-3.1", True)])
+def test_the_lint_resolves_a_deep_doubling_chain_quickly(
+    tmp_path: Path, source: str, flagged: bool
+) -> None:
+    # A clean chain is the slow one without a memo: no read short-circuits, so every name is resolved
+    # once per path to it, 2**40 times here.
+    lines = [f'    v0 = msg.field("{source}") or ""']
+    lines += [f"    v{i} = v{i - 1} + v{i - 1}" for i in range(1, 41)]
+    body = '@handler("h")\ndef h(msg):\n' + "\n".join(lines) + '\n    msg.set("PV1-19", v40)\n'
+    started = time.perf_counter()
+    assert ("[leaf-to-whole-field]" in _lint(tmp_path, body)) is flagged
+    assert time.perf_counter() - started < 2.0
