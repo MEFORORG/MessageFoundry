@@ -1890,7 +1890,7 @@ separate follow-up.
 | Item | Closes | Maps to | Effort |
 |---|---|---|---|
 | **P2-1** TLS on the engine API | Tokens + PHI cleartext over the network | §164.312(e) · SC-8 | M |
-| **P2-2** MFA for console/API auth — ✅ **Built (WP-14, native TOTP, local accounts)** | Single-factor auth (mitigated for local accounts: `[security].require_mfa` is an **access gate on every authorized route**, and its shipped `require_mfa_scope` is `every_local_account`, not the Administrator role alone; AD MFA delegated) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
+| **P2-2** MFA for console/API auth — ✅ **Built (WP-14 TOTP and WP-14b passkeys, local and directory accounts)** | Single-factor auth (mitigated: `[security].require_mfa` is an **access gate on every authorized route**, and its shipped `require_mfa_scope` is `every_local_account`, not the Administrator role alone. Directory accounts are not exempt; [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states which sessions owe a factor) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
 | **P2-3** Network-segmentation guidance + periodic integrity checks | Lateral movement; tamper detection | §164.312(c) · SC-7/SI-7 | S–M |
 | **P2-4** Strict-parse CPU/time budget on the hl7apy path | Malformed input pinning a worker — message size/segment caps are built, but the opt-in strict parse itself has no time bound | NIST SC-5 (DoS; not a §164.312 safeguard) | S |
 
@@ -1927,7 +1927,7 @@ Complements the access/audit mapping in [SECURITY.md](SECURITY.md#hipaa-164312-a
 | Access control (a) | Built (RBAC + owner-only DB/`-wal`/`-shm` ACL — **SQLite store only**; on SQL Server / Postgres the file permissions on `.mdf`/`.ldf`/tempdb/native backups are **DBA-owned**, see §2) | [SECURITY.md](SECURITY.md), §2 |
 | Audit controls (b) | Built (PHI-access audit, tamper-evident chain, off-box tee) + global log redaction (three handler filters) | §6, §7 |
 | Integrity (c) | Built (GCM AEAD tag on bodies; audit hash-chain) + periodic integrity checks planned | §3, §6 |
-| Authentication (d) | Built (argon2id / AD); native TOTP MFA built for local accounts (WP-14) | [SECURITY.md](SECURITY.md), §11 |
+| Authentication (d) | Built (argon2id / AD); native TOTP and passkey MFA built for local and directory accounts (WP-14, WP-14b) | [SECURITY.md](SECURITY.md), §11 |
 | Transmission security (e) | Built: LDAPS, MLLP-over-TLS, API/WebSocket TLS, DB TLS, TLS-syslog | §4, §7 |
 
 ---
