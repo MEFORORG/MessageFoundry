@@ -397,8 +397,18 @@ def _build_body(event: SecurityEvent) -> str:
         # The takeover runs only when the install has no enabled Administrator, so "contact your
         # administrator" would name nobody, or the person who ran it.
         closing = "If you did not expect this, tell whoever operates the MessageFoundry host."
-    elif moved_by_admin or set_by_admin or event.event_type in (ACCOUNT_CREATED, USERNAME_CHANGED):
+    elif (
+        moved_by_admin
+        or set_by_admin
+        or event.event_type
+        in (
+            ACCOUNT_CREATED,
+            USERNAME_CHANGED,
+            FEDERATED_IDENTITY_BOUND,
+        )
+    ):
         # A directory rename is an administrator's act, so "if this was you" cannot apply to it.
+        # Nor to a federated link: both routes refuse an administrator linking their own account.
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

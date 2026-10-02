@@ -1374,8 +1374,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if await auth.session_steps_up_at_idp(token):
             # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at
             # the IdP, so this page renders NO password field at all. Decided by the SESSION's
-            # mechanism, not the account: a Kerberos session keeps the password form below. (A
-            # bound account holds none: the bind ends its sessions and Windows SSO refuses it.)
+            # mechanism, not the account: a Kerberos session keeps the password form below.
             # Ahead of the enroll-first bounce; _reauth_idp_page says why.
             return await _reauth_idp_page(auth, token, mfa, next_, action.step_up)
         if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:

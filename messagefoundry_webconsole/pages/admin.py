@@ -601,7 +601,7 @@ _FEDERATED_NOTICES: dict[str, str] = {
 }
 
 _SELF_NOTE = (
-    "Another administrator must change your own link. Relinking or unlinking it ends every "
+    "Another administrator must change your own link. Linking, relinking or unlinking it ends every "
     "session you hold, this one included, and on a site where you sign in only through the "
     "identity provider it can lock you out."
 )
@@ -760,8 +760,8 @@ def federated_unlink_confirm_page(view: FederatedIdentityView, *, is_self: bool)
             el(
                 "p",
                 f"Unlinking signs {view.username} out of every session. Their next federated "
-                "sign-in is refused until an administrator links them again. Any other way they "
-                "sign in is not changed.",
+                "sign-in is refused until an administrator links them again. Windows SSO can sign "
+                "them in again once they are unlinked.",
             ),
             el(
                 "form",

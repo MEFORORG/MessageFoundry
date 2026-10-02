@@ -3644,8 +3644,9 @@ class AuthService:
 
         True exactly when the session was minted by the federated login (``sessions.auth_mechanism``,
         ADR 0184 item (iv)). The SESSION decides, not the account, so a Kerberos session keeps its
-        existing step-up. (A bound account holds no Kerberos session: the bind ends its sessions and
-        Windows SSO refuses it afterwards, vault BACKLOG #2609.) PUBLIC because the web
+        existing step-up. (A bind ends the account's sessions and Windows SSO refuses it
+        afterwards, vault BACKLOG #2609; ``docs/SECURITY.md``, *Federated sign-in*, is the source
+        of record for that rule.) PUBLIC because the web
         console's ``/ui/reauth`` asks it to choose which page to render. :meth:`reauth` asks it too,
         so a caller that forgot to would still never verify a password for an OIDC session.
         """
@@ -4268,8 +4269,13 @@ class AuthService:
             )
         except _BindingChangedMidLogin:
             if not federated:
-                # A bind landed between the refusal check and the insert. Same answer as the
-                # check gives, and nothing was minted.
+                # A bind landed between the refusal check and the insert, so no session was
+                # minted. The caller gets the answer the check gives. NOT THE SAME AS THAT
+                # CHECK IN ONE WAY: the role, scope and profile sync above already ran, so a
+                # directory role change in this window is applied and audited, and it ends
+                # the account's other sessions as that sync always does. The reason is
+                # also written for a row deleted in the same window, which the guard
+                # refuses too; that row has no binding to look for.
                 return await self._refuse_directory_row(
                     principal.username, FEDERATED_SIGN_IN_REQUIRED, client=client
                 )

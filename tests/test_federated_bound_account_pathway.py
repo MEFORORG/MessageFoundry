@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND
+from messagefoundry.auth.notifications import FEDERATED_IDENTITY_BOUND, SecurityEvent
 from messagefoundry.auth.service import FEDERATED_SIGN_IN_REQUIRED, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.pipeline import Engine, security_notify
@@ -490,6 +490,18 @@ def test_the_bind_notice_tells_the_holder_what_the_bind_took_away() -> None:
     notice = security_notify._DESCRIPTIONS[FEDERATED_IDENTITY_BOUND]
     assert "sessions were ended" in notice
     assert "Windows single sign-on no longer" in notice
+    body = security_notify._build_body(
+        SecurityEvent(
+            event_type=FEDERATED_IDENTITY_BOUND,
+            username="jdoe",
+            email="jdoe@corp.example",
+            detail={"issuer": "https://idp.example", "sessions_revoked": 2},
+        )
+    )
+    assert "Sessions ended: 2" in body
+    # An administrator did it, and the holder never can, so the "if this was you" closing is wrong.
+    assert "If this was you" not in body
+    assert "If you did not expect this change" in body
 
 
 def test_the_security_doc_says_provision_admin_does_not_replace_a_local_administrator() -> None:

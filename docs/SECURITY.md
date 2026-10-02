@@ -2691,7 +2691,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
 - **Step-up for a federated session goes back to the IdP** (BACKLOG #296, ADR 0142 Amendment B).
   Each session records how it was minted (`sessions.auth_mechanism`: `password`, `kerberos` or
   `oidc`; ADR 0184 item (iv)), and rotation carries that forward. The **session** decides, not the
-  account: a Kerberos session keeps the password re-bind, and a bound account holds none. For an `oidc`
+  account: a Kerberos session keeps the password re-bind. For an `oidc`
   session, `GET /ui/reauth` renders **no password field**. Its Continue button posts to
   `POST /ui/reauth/oidc`, which stages a step-up flow bound to the session's hash and sends the
   browser to the IdP with `max_age=0` and `prompt=login`. The IdP returns to the same
@@ -2737,8 +2737,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   URL exists and a token's `kid` can never steer *where* the engine fetches from (no SSRF). It can
   still cause a refetch *of the pinned JWKS URI* — an unknown `kid` triggers at most one fetch per
   `[auth].oidc_jwks_min_refetch_seconds` (default 300s), globally, which is the amplification bound.
-- **Degradation is isolated.** An unreachable IdP does not affect local or Kerberos sign-in,
-  and federation recovers without an engine restart.
+- **Degradation is isolated, for an account with no binding.** An unreachable IdP does not
+  affect local sign-in, or Kerberos sign-in by an account with no federated binding, and
+  federation recovers without an engine restart. A bound account has no other sign-in during
+  the outage (see *A bound account signs in through the IdP only*, above).
 - **Step-up caveat, now for Kerberos sessions only.** Re-authentication for an AD identity that
   signed in by **Kerberos** still re-binds with a **password**. An org whose users are passwordless
   (WHfB/FIDO2) or smartcard-required may find those Kerberos sessions cannot complete step-up. An

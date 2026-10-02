@@ -12176,7 +12176,7 @@ class MessageStore:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
         caller's current session — "sign out everywhere else"). Returns the number revoked."""
         now = time.time() if now is None else now
-        sql = "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+        sql = _REVOKE_USER_SESSIONS_SQL
         params: list[object] = [now, user_id]
         if except_token_hash is not None:
             sql += " AND token_hash != ?"

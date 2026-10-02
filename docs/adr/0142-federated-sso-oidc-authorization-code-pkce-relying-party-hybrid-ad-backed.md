@@ -524,10 +524,10 @@ B.1 left the verification of what comes back to the build. These are its criteri
   carrying `mfa_verified_at` and `auth_mechanism` forward, and only then mint any single-use action
   grant against the new hash.
 
-## Amendment C (2026-10-02) — a bound account signs in through the IdP only, and a bind ends its sessions (vault BACKLOG #2609)
+## Amendment C (2026-10-01) — a bound account signs in through the IdP only, and a bind ends its sessions (vault BACKLOG #2609)
 
-> Decided 2026-10-02 after an adversarial review the owner asked for and said to follow. It came from
-> the architecture review the owner approved on 2026-10-01. This amendment does not change the status
+> Decided 2026-10-01 after an adversarial review the owner asked for and said to follow. It came from
+> the architecture review the owner approved the same day. This amendment does not change the status
 > line at the top of this ADR.
 
 An administrator binds an account to put it behind the identity provider's own sign-in. Windows SSO
