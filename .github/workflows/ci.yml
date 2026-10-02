@@ -3762,9 +3762,10 @@ jobs:
           uv pip install --system --constraint constraints.lock -e ".[fhir,dicom]"
 
       # RIGS SIGN IN (vault BACKLOG #2719). The service runs with sign-in on, as shipped, so this
-      # smoke provisions one Administrator before the first start and reads /messages as that
-      # account (harness/load/rigadmin.py). The password is drawn here, masked before anything can
-      # echo it, and handed as a step output to the two steps that use it and to no other. Hex
+      # smoke provisions one Administrator before the first start and reads /messages and the
+      # security posture as that account (harness/load/rigadmin.py). The password is drawn here,
+      # masked before anything can echo it, and handed as a step output to the steps that use it
+      # (the install, the /messages read and the launch read) and to no other. Hex
       # cannot spell a word on the engine's password deny-list.
       - name: Draw the rig Administrator's password for this run
         id: rig
@@ -4084,22 +4085,41 @@ jobs:
       # The matches are CASE-SENSITIVE: `-i` is a different interpreter option from `-I`.
       # It runs BEFORE the token step, which puts a probe in the engine's place.
       #
+      # THE READ IS SIGNED IN (vault BACKLOG #2719), as the rig Administrator the install step
+      # provisioned: `rigadmin get` first checks the service refuses the posture to a request
+      # with no session, then signs in once and reads it.
+      #
+      # THIS STEP STARTS NO ENGINE. It compares the launch the installer registered, so the launch
+      # is spelled here in two parts. tests/test_ci_rig_legs_sign_in.py takes a step whose script
+      # spells the serve command whole for one that starts an engine, and holds it to
+      # provision, serve, read. That order belongs to the install and start steps above.
+      #
       # NOT PROVEN HERE: that the service account cannot write site-packages. The engine's reading
       # is printed and not judged. This runner's Python is the hosted tool cache, whose permissions
       # are the runner image's and say nothing about an install.
       - name: "Verify the service runs isolated, remote debugging off (vault BACKLOG #2701)"
+        env:
+          MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
+          # The posture is printed whole, and nothing keeps its text to ASCII. Without this a
+          # Windows pipe is cp1252, and Python stops on the first character that code page lacks.
+          PYTHONUTF8: "1"
         run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $options = "-I -X disable-remote-debug"
-          $tail = " -m messagefoundry serve "
+          $module = " -m messagefoundry "
+          $command = "serve "
+          $tail = $module + $command
           $launch = '^' + [regex]::Escape($options + $tail)
           # CONTROL: launches that must NOT read as the hardened one.
-          foreach ($not in "serve --config C:\x",
-                           "-I -m messagefoundry serve --config C:\x",
-                           "-X disable-remote-debug -m messagefoundry serve --config C:\x",
-                           "-i -X disable-remote-debug -m messagefoundry serve --config C:\x",
-                           "-I -X disable_remote_debug -m messagefoundry serve --config C:\x") {
-            if ($not -cmatch $launch) { throw "CONTROL FAILED: '$not' reads as the isolated launch, so the pattern proves nothing" }
+          foreach ($not in $command,
+                           ("-I" + $tail),
+                           ("-X disable-remote-debug" + $tail),
+                           ("-i -X disable-remote-debug" + $tail),
+                           ("-I -X disable_remote_debug" + $tail)) {
+            if (($not + "--port 1") -cmatch $launch) { throw "CONTROL FAILED: '$not' reads as the isolated launch, so the pattern proves nothing" }
           }
+          # And the pattern can match: the launch itself reads as the launch.
+          if (($options + $tail + "--port 1") -cnotmatch $launch) { throw "CONTROL FAILED: the pattern does not match the launch it is built from" }
 
           # --- 1. the registration -----------------------------------------------------------------
           $registered = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters"
@@ -4134,9 +4154,11 @@ jobs:
 
           # --- 3. the engine's own report ----------------------------------------------------------
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
-          $probe = 'import json,ssl,sys,urllib.request;ctx=ssl.create_default_context(cafile=sys.argv[1]);print(json.dumps(json.load(urllib.request.urlopen(sys.argv[2],context=ctx,timeout=5))))'
-          $posture = & python -c $probe $cert "https://127.0.0.1:8765/security/posture" | ConvertFrom-Json
-          if (-not $posture) { throw "GET /security/posture did not answer" }
+          $answer = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert /security/posture
+          if ($LASTEXITCODE -eq 4) { throw "the rig could not sign in to the service, or the service answered /security/posture with no session" }
+          if ($LASTEXITCODE -ne 0) { throw "GET /security/posture did not answer (exit $LASTEXITCODE)" }
+          $posture = $answer | ConvertFrom-Json
+          if (-not $posture) { throw "GET /security/posture answered nothing that reads as JSON" }
           # CONTROL: this is the posture, and the read can see a field of it.
           if (-not $posture.enforcement) { throw "CONTROL FAILED: the answer has no enforcement field, so it is not the posture" }
           $interpreter = $posture.interpreter
@@ -4300,7 +4322,7 @@ jobs:
               Kind = $key.GetValueKind($value)
             }
           }
-          if ($saved.AppParameters.Text -cnotmatch '^-I -X disable-remote-debug -m messagefoundry serve ') { throw "CONTROL FAILED: the saved parameters are not the engine's: $($saved.AppParameters.Text)" }
+          if ($saved.AppParameters.Text -cnotmatch ('^' + [regex]::Escape("-I -X disable-remote-debug -m messagefoundry ") + 'serve ')) { throw "CONTROL FAILED: the saved parameters are not the engine's: $($saved.AppParameters.Text)" }
           try {
             & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry Application $python
             Assert-Native "setting the probe as the service's program"
@@ -4596,22 +4618,20 @@ jobs:
             exit 1
           fi
 
-      # vault BACKLOG #2701, #2700: the image starts the engine as
-      # `python -I -X disable-remote-debug -u -B -m messagefoundry`, and copies its venv root-owned.
-      # The step above is green with or without either, so this one reads both, each with a control.
-      #
-      # 1. PID 1's command line: what the ENTRYPOINT became.
-      # 2. The engine's own report (GET /security/posture, `interpreter`): the flags as the
-      #    interpreter holds them, the start-up code it found, and whether it can write a site
-      #    directory. The interpreter accepts and ignores a misspelt option, so only this reading
-      #    shows the options took effect.
-      # 3. A real write, as the engine's own uid: a file in site-packages must be refused, and one
-      #    in the store volume must be created. This container runs with NO --read-only, which is
-      #    the case the root-owned venv is for.
-      - name: "Verify the engine runs isolated and cannot write its venv (vault BACKLOG #2701)"
-        run: |
-          set -euo pipefail
-          cert=/var/lib/mefor/api-generated-cert.pem
+          # vault BACKLOG #2701, #2700: the image starts the engine as
+          # `python -I -X disable-remote-debug -u -B -m messagefoundry`, and copies its venv
+          # root-owned. Everything above is green with or without either, so both are read here,
+          # each with a control. It is in this step because the posture read is signed in, and
+          # the rig Administrator's password lives in this step's shell.
+          #
+          # 1. PID 1's command line: what the ENTRYPOINT became.
+          # 2. The engine's own report (GET /security/posture, `interpreter`), read signed in: the
+          #    flags as the interpreter holds them, the start-up code it found, and whether it can
+          #    write a start-up directory. The interpreter accepts and ignores a misspelt option,
+          #    so only this reading shows the options took effect.
+          # 3. A real write, as the engine's own uid: a file in site-packages must be refused, and
+          #    one in the store volume must be created. This container runs with NO --read-only,
+          #    which is the case the root-owned venv is for.
           cmdline="$(docker exec mefor sh -c "tr '\0' ' ' < /proc/1/cmdline")"
           echo "PID 1: $cmdline"
           wanted="/opt/venv/bin/python -I -X disable-remote-debug -u -B -m messagefoundry serve "
@@ -4623,7 +4643,16 @@ jobs:
             *"$wanted"*) ;;
             *) echo "FAIL: PID 1 was not started as: $wanted"; exit 1 ;;
           esac
-          docker exec mefor python -c "import ssl,urllib.request,json;ctx=ssl.create_default_context(cafile='$cert');print(json.dumps(json.load(urllib.request.urlopen('https://127.0.0.1:8765/security/posture',context=ctx))))" > "$RUNNER_TEMP/posture.json"
+          # Signed in, like the counts above. Exit 4 is the rig failing to sign in, or the engine
+          # answering the posture with no session; the `||` lets that be said before the step ends.
+          posture_rc=0
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" docker exec -e MEFOR_RIG_ADMIN_PASSWORD mefor \
+            python /rig/rigadmin.py get --engine https://127.0.0.1:8765 --cacert "$cert" \
+            /security/posture > "$RUNNER_TEMP/posture.json" || posture_rc=$?
+          if [ "$posture_rc" -ne 0 ]; then
+            echo "FAIL: the signed-in read of /security/posture did not answer (rigadmin exit $posture_rc; 4 is a failed sign-in)"
+            exit 1
+          fi
           python3 - "$RUNNER_TEMP/posture.json" <<'PY'
           import json
           import sys
