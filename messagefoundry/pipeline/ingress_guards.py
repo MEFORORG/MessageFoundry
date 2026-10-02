@@ -359,10 +359,10 @@ class IngressNulRejected(IngressBodyRejected):
         super().__init__(NUL_REJECTED_REASON)
 
 
-#: The stored reason for an ``hl7v2`` body holding an MLLP frame byte past its leading whitespace
-#: (ADR 0205 rule 4). Content-free: it names the byte, never where the body put it.
+#: The stored reason for an ``hl7v2`` body holding an MLLP frame byte inside it, not in the
+#: whitespace around it (ADR 0205 rule 4). Content-free: it names the byte, never where it sat.
 FRAME_BYTE_REJECTED_REASON = (
-    "ingress HL7 v2 body contains an MLLP frame byte (0x0B or 0x1C) after its start, "
+    "ingress HL7 v2 body contains an MLLP frame byte (0x0B or 0x1C) inside the message, "
     "which a conformant message never holds"
 )
 
@@ -371,9 +371,9 @@ _MLLP_FRAME_CHARS = (chr(MLLP_CODEC.start), chr(MLLP_CODEC.end))
 
 
 class IngressFrameByteRejected(IngressBodyRejected):
-    """An ``hl7v2`` body holding ``0x0B`` or ``0x1C`` anywhere but its leading whitespace (ADR 0205
-    rule 4). MLLP reserves both bytes, so a conformant HL7 v2 body holds neither; one inside the body
-    is how a single inbound message would leave as two."""
+    """An ``hl7v2`` body holding ``0x0B`` or ``0x1C`` anywhere but the whitespace around it (ADR
+    0205 rule 4). MLLP reserves both bytes, so a conformant HL7 v2 body holds neither; one inside
+    the body is how a single inbound message would leave as two."""
 
     ack_text = "MLLP frame byte in body"
 
@@ -382,14 +382,15 @@ class IngressFrameByteRejected(IngressBodyRejected):
 
 
 def _holds_an_embedded_frame_byte(text: str) -> bool:
-    """Whether ``text`` holds ``0x0B`` or ``0x1C`` past the leading run ``Peek.parse`` strips.
+    """Whether ``text`` holds ``0x0B`` or ``0x1C`` in what is left once the HL7 parser strips it.
 
-    That run is tolerated (ADR 0205): the parser drops it on encode, so it never reaches a delivery.
-    It is found with ``str.lstrip()``, Peek's own call, and only once a frame byte is known to be
-    present, so a clean body costs two scans and no copy."""
+    The parser strips the whitespace at both ends with ``str.strip()`` and never encodes it, so a
+    frame byte there (an MLLP frame saved whole to a file, say) never reaches a delivery and is
+    tolerated (ADR 0205). The strip runs only once a frame byte is known to be present, so a clean
+    body costs two scans and no copy."""
     if not any(ch in text for ch in _MLLP_FRAME_CHARS):
         return False
-    rest = text.lstrip()
+    rest = text.strip()
     return any(ch in rest for ch in _MLLP_FRAME_CHARS)
 
 

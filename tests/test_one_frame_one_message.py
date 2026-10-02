@@ -37,7 +37,7 @@ from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.framing import frame_for_delivery, frame_reply
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
-from messagefoundry.transports.tcp import TcpDestination
+from messagefoundry.transports.tcp import TcpDestination, TcpSource
 
 SB, EB, CR, BS, NUL = "\x0b", "\x1c", "\r", chr(92), "\x00"
 ENC = "^~" + BS + "&"
@@ -134,10 +134,12 @@ async def test_all_four_mllp_send_paths_refuse_before_any_dial(
 ) -> None:
     dest = _mllp(persistent, no_ack)
     monkeypatch.setattr(dest, "_dial", _never_dial)
-    with pytest.raises(NegativeAckError) as caught:
-        await dest.send(SMUGGLED)
+    try:
+        with pytest.raises(NegativeAckError) as caught:
+            await dest.send(SMUGGLED)
+    finally:
+        await dest.aclose()
     assert caught.value.permanent is True
-    await dest.aclose()
 
 
 @pytest.mark.parametrize("persistent", [False, True])
@@ -153,10 +155,12 @@ async def test_both_tcp_send_paths_refuse_before_any_dial(
     }
     dest = TcpDestination(Destination(name="out", type=ConnectorType.TCP, settings=settings))
     monkeypatch.setattr(dest, "_dial", _never_dial)
-    with pytest.raises(NegativeAckError) as caught:
-        await dest.send(SMUGGLED_STX)
+    try:
+        with pytest.raises(NegativeAckError) as caught:
+            await dest.send(SMUGGLED_STX)
+    finally:
+        await dest.aclose()
     assert caught.value.permanent is True
-    await dest.aclose()
 
 
 # --- rule 2: a leaf write never emits a raw control character -----------------------------------
@@ -266,7 +270,7 @@ def _ic(content_type: ContentType = ContentType.HL7V2) -> InboundConnection:
     [
         pytest.param(EMBEDDED_SB, id="P15-embedded-start"),
         pytest.param(SMUGGLED, id="P1-embedded-end-and-start"),
-        pytest.param(CLEAN + EB, id="trailing-end-byte"),
+        pytest.param(CLEAN.replace(CR + "PID", CR + EB + CR + "PID"), id="blank-line-between"),
         pytest.param(CLEAN.replace("JANE", "JA" + SB + "NE"), id="inside-a-field"),
     ],
 )
@@ -277,12 +281,23 @@ def test_ingress_refuses_an_embedded_frame_byte(body: str) -> None:
     assert caught.value.reason == ingress_guards.FRAME_BYTE_REJECTED_REASON
 
 
-@pytest.mark.parametrize("lead", [SB, EB, " " + SB + "\r", SB + EB])
-def test_a_leading_frame_byte_stays_tolerated_and_never_reaches_the_encode(lead: str) -> None:
-    # Peek.parse strips the leading run with str.lstrip(), and the encode drops it (audit probe P16),
-    # so a leading frame byte cannot carry a second message and never reaches a delivery.
-    ingress_guards.check_decoded(lead + CLEAN, _ic())
-    encoded = Message.parse(lead + CLEAN).encode()
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(SB + CLEAN, id="leading-start"),
+        pytest.param(EB + CLEAN, id="leading-end"),
+        pytest.param(" " + SB + CR + CLEAN, id="leading-run"),
+        pytest.param(CLEAN + EB, id="trailing-end"),
+        pytest.param(SB + CLEAN + EB + CR, id="a-whole-mllp-frame-saved-to-a-file"),
+    ],
+)
+def test_a_frame_byte_around_the_message_stays_tolerated_and_never_reaches_the_encode(
+    body: str,
+) -> None:
+    # The parser strips the whitespace at both ends with str.strip(), and the encode drops it (audit
+    # probe P16), so such a byte cannot carry a second message and never reaches a delivery.
+    ingress_guards.check_decoded(body, _ic())
+    encoded = Message.parse(body).encode()
     assert SB not in encoded and EB not in encoded
 
 
@@ -352,10 +367,44 @@ async def test_the_mllp_listener_sends_one_frame_when_its_reply_holds_a_start_by
     await source.start(handler)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
-        writer.write(MLLP_CODEC.frame(CLEAN))
-        await writer.drain()
-        got = await asyncio.wait_for(reader.readuntil(b"\x1c"), 5)
-        writer.close()
+        try:
+            writer.write(MLLP_CODEC.frame(CLEAN))
+            await writer.drain()
+            got = await asyncio.wait_for(reader.readuntil(b"\x1c"), 5)
+        finally:
+            writer.close()
     finally:
         await source.stop()
     assert got.count(b"\x0b") == 1
+
+
+def test_the_mllp_handler_fault_nak_is_one_frame_when_the_header_holds_a_start_byte() -> None:
+    source = MLLPSource(Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0}))
+    header = f"MSH|{ENC}|S|F|R|F|20260101||ADT^A01|C{SB}1|P|2.5{CR}"
+    nak = source._handler_failure_nak(header.encode("utf-8"))
+    assert nak is not None and nak.count(b"\x0b") == 1 and nak.count(b"\x1c") == 1
+
+
+async def test_the_tcp_listener_sends_one_frame_when_its_reply_holds_its_start_byte() -> None:
+    reply = f"MSH|{ENC}|R|F|S|F|20260101||ACK|C\x021|P|2.5{CR}MSA|AA|C\x021{CR}"
+
+    async def handler(raw: bytes) -> str:
+        return reply
+
+    source = TcpSource(
+        Source(
+            type=ConnectorType.TCP, settings={"host": "127.0.0.1", "port": 0, "framing": "stx_etx"}
+        )
+    )
+    await source.start(handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            writer.write(STX_ETX_CODEC.frame(CLEAN))
+            await writer.drain()
+            got = await asyncio.wait_for(reader.readuntil(b"\x03"), 5)
+        finally:
+            writer.close()
+    finally:
+        await source.stop()
+    assert got.count(b"\x02") == 1

@@ -216,7 +216,10 @@ def test_a_multibyte_fill_is_sized_in_bytes() -> None:
 
 
 def test_expected_delivery_follows_the_documented_rules() -> None:
-    framing = build_injection(_value("framing_bytes", "start_and_end_block"), "mllp")
+    # An end block alone: the data file's framing values also carry a start block, which ingress
+    # refuses (ADR 0205), so the truncation rule is pinned with a value of its own.
+    end_only = HostileValue("framing_bytes", "end_block_only", "PID-5.1", text="before\x1cafter")
+    framing = build_injection(end_only, "mllp")
     end_block = framing.payload.index(0x1C)
     # Over MLLP the end block delimits the frame: only the bytes before it arrive.
     assert framing.expected is not None
@@ -233,6 +236,9 @@ def test_expected_delivery_follows_the_documented_rules() -> None:
     assert identical
     refused = build_injection(_value("non_ascii", "latin1_on_a_utf8_connection"), "mllp")
     assert refused.expected is None
+    # The data file's framing value arrives raw, though the model would escape it (ADR 0205).
+    framed = build_injection(_value("framing_bytes", "start_and_end_block"), "mllp")
+    assert b"\x0b" in framed.payload and framed.expected is None
 
 
 def test_the_control_id_is_read_from_what_the_engine_receives() -> None:
@@ -433,8 +439,13 @@ class KnownDefectReproduced(AssertionError):
 
 
 def test_a_defect_signature_does_not_absorb_another_failure() -> None:
-    (defect,) = KNOWN_DEFECTS
-    scenario = defect.scenario
+    # KNOWN_DEFECTS is empty since ADR 0205, so the matcher is pinned on a defect built here.
+    scenario = HostileScenario("hostile_example", "an example", ("markup",), drivers=("file",))
+    defect = KnownDefect(
+        scenario,
+        reason="example",
+        signature=("the mllp sink got", "unexpected record(s) reached the mllp sink"),
+    )
     head = "2 hostile message(s) across file: "
     alone = "a via file: the mllp sink got 1 bytes that differ; 1 unexpected record(s) reached"
     assert defect.reproduced_by(ScenarioResult(scenario, False, head + alone + " the mllp sink"))

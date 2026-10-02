@@ -5,9 +5,9 @@
 The codec moved out of ``transports/`` so a client can import it without registering every
 connector (BACKLOG #1697). Engine callers keep importing it from here.
 
-The engine frames through the two functions defined here (ADR 0205), never through
-:meth:`FrameCodec.frame` directly, which stays unchecked because the test harness frames hostile
-bytes on purpose.
+The MLLP and TCP destinations and listeners frame through the two functions defined here (ADR
+0205). :meth:`FrameCodec.frame` stays unchecked, because a client such as the test harness frames
+hostile bytes on purpose.
 """
 
 from __future__ import annotations

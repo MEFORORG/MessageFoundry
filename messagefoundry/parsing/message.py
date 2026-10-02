@@ -58,6 +58,8 @@ _SEG_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{2}$")
 # The characters a write that takes the caller's text as STRUCTURE refuses beside CR and LF (ADR 0205
 # rule 3): MLLP's start and end bytes and NUL. A leaf write escapes them instead (rule 2); a
 # whole-field write, ``add_repetition`` and ``add_segment`` cannot escape the caller's structure.
+# Written as literals because ``parsing`` may not import ``messagefoundry.framing`` (its import
+# allowlist in tests/test_dependency_boundaries.py); MLLP's bytes are fixed by the standard.
 _STRUCTURE_REFUSED = ("\x0b", "\x1c", "\x00")
 
 

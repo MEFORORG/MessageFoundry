@@ -501,7 +501,7 @@ def test_a_hostile_control_id_cannot_reshape_the_soap_envelope() -> None:
 
 
 def test_a_control_character_cannot_make_the_soap_envelope_ill_formed() -> None:
-    raw = "MSH|^~\\&|A|B|C|D|20260101000000||ORM^O01|A\x0bB\x01C|P|2.5.1\rPID|1||X\r"
+    raw = "MSH|^~\\&|A|B|C|D|20260101000000||ORM^O01|A\x1fB\x01C|P|2.5.1\rPID|1||X\r"
     (delivery,) = dry_run(_graph(), raw, inbound="IB_Http_HL7").deliveries
     assert "<h:ControlId>ABC</h:ControlId>" in delivery.payload
     assert not any(c < " " for c in delivery.payload)
