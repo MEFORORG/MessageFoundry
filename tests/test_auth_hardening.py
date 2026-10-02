@@ -939,7 +939,9 @@ class _FakeRequest:
     """Minimal ASGI-shaped Request for driving ``api.security.require()`` directly — the HTTP sibling of
     :class:`_FakeWS`. ``require()`` reads only ``.app.state.auth``, ``.headers``, ``.url.path``,
     ``.method`` and — since BACKLOG #1644 — ``.client`` (``allow_no_auth`` is absent → fail-closed,
-    matching a served app)."""
+    matching a served app). Since vault BACKLOG #2739 it also reads ``.scope``, the ASGI scope
+    every real Request has, where the check that runs before the body is read may have left the
+    identity it resolved. It is empty here, so the gate does its own lookup, as it did before."""
 
     def __init__(self, auth: object, token: str | None, *, method: str, path: str) -> None:
         self.app = _FakeApp(auth)
@@ -947,6 +949,7 @@ class _FakeRequest:
         self.headers: dict[str, str] = {"Authorization": f"Bearer {token}"} if token else {}
         self.url = _FakeReqURL(path)
         self.client = _PEER  # BACKLOG #1644 — see the note on :class:`_FakeWS`
+        self.scope: dict[str, object] = {}
 
 
 async def _assert_http_grant_deny_precision(store: object) -> None:

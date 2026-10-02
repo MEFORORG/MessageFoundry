@@ -766,26 +766,6 @@ async def resolve_client_cert_identity(request: Request) -> Identity | None:
     return identity
 
 
-async def _cert_caller(request: Request) -> Identity:
-    """The authentication step of :func:`require_service_cert`: the cert-mapped identity, or its 401.
-
-    An identity the early check carried is taken and spent here (:class:`_Carried`)."""
-    carried = request.scope.pop(_CARRIED_CERT, None)
-    if isinstance(carried, _Carried):
-        return carried.identity
-    identity = await resolve_client_cert_identity(request)
-    if identity is None:
-        # No subject in the message (no cert / unmapped) — never echo the presented subject (could be
-        # attacker-chosen); a generic 401 keeps the deny-by-default surface uniform.
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "client certificate not authorized")
-    return identity
-
-
-async def _authenticate_cert_before_body(request: Request) -> None:
-    """The early-check step of :func:`require_service_cert`."""
-    request.scope[_CARRIED_CERT] = _Carried(await _cert_caller(request))
-
-
 def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Authorize a **non-interactive service-to-service** route by a VERIFIED mTLS client cert (ADR 0083).
 
@@ -814,8 +794,27 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
             "authorize PHI (ADR 0083)"
         )
 
+    # Both steps below live INSIDE this factory on purpose. tests/test_docs_security_pathways.py
+    # pins that the primitive admitting a certificate identity is referenced from here alone, so
+    # a second route cannot widen the plane unseen. A module-level helper would move that
+    # reference out from under the pin.
+    async def caller(request: Request) -> Identity:
+        # An identity the early check carried is taken and spent here (:class:`_Carried`).
+        carried = request.scope.pop(_CARRIED_CERT, None)
+        if isinstance(carried, _Carried):
+            return carried.identity
+        identity = await resolve_client_cert_identity(request)
+        if identity is None:
+            # No subject in the message (no cert / unmapped) — never echo the presented subject
+            # (could be attacker-chosen); a generic 401 keeps the deny-by-default surface uniform.
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "client certificate not authorized")
+        return identity
+
+    async def before_body(request: Request) -> None:
+        request.scope[_CARRIED_CERT] = _Carried(await caller(request))
+
     async def dependency(request: Request) -> Identity:
-        identity = await _cert_caller(request)
+        identity = await caller(request)
         # An identity implies a live AuthService — :func:`resolve_client_cert_identity` returns None
         # when auth is absent or disabled. Narrowed rather than asserted so a later refactor of that
         # resolver degrades to a missing audit row instead of a 500 on the request path.
@@ -860,7 +859,7 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
                 )
         return identity
 
-    return _gate(dependency, _authenticate_cert_before_body)
+    return _gate(dependency, before_body)
 
 
 def enforce_phi_read_hop(request: Request) -> None:
