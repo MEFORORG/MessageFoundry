@@ -4,8 +4,8 @@
 
 The defect, reproduced at engine ``fcbe2f93a`` with synthetic data: ``provision-admin`` opened the
 store with ``create=True`` and no key check, so with no key in the shell running it the store came up
-under the identity cipher. ``_load_audit_chain_meta`` wrote no keying watermark, the provisioning
-audit row was keyless SHA-256, and a later keyed open auto-keys only an EMPTY ``audit_log``. The chain
+under the identity cipher. The provisioning audit row was keyless SHA-256, and a later keyed open
+starts a keyed chain only in an EMPTY ``audit_log``. The chain
 therefore stayed keyless for good, nothing reported it, and a forged row verified clean. The
 documented install order (``docs/SECURITY.md``, ``docs/DEPLOYMENT.md``) runs ``provision-admin``
 before the first ``serve``, and the service key lives in the NSSM environment, not the admin's shell.
@@ -13,10 +13,11 @@ before the first ``serve``, and the service key lives in the NSSM environment, n
 Two layers, both pinned here:
 
 1. ``provision-admin`` applies the same no-key refusal ``serve`` applies, before it opens anything.
-2. A keyed-capable store that opens onto a keyless chain with rows logs a WARNING naming
-   ``rekey-audit`` and reports the state through ``security_loosenings()`` and
-   ``GET /security/posture``. It does NOT re-key the rows at open: the existing docstring forbids
-   silent re-keying, because a forged row would be blessed into a keyed chain.
+2. A keyed-capable store that opens onto a chain that holds keyless rows logs an ERROR and reports
+   the state through ``security_loosenings()`` and ``GET /security/posture``. It does NOT re-key
+   the rows, at open or by any command: a forged row would be blessed into a keyed chain. Since
+   vault BACKLOG #2594 a store that holds a key requires every audit row keyed, so that chain is
+   also one ``audit-verify`` reports as broken.
 
 Severity is conditional (CLAUDE.md section 0): zero deployments, so this is what a first deployment
 following the documented order would have inherited.
@@ -50,7 +51,12 @@ from messagefoundry.store.keyprovider import (
     KeyProviderError,
     unread_key_refusal,
 )
-from messagefoundry.store.store import MessageStore, audit_row_hash
+from messagefoundry.store.store import (
+    AUDIT_KEY_EPOCH_ACTION,
+    MessageStore,
+    audit_row_hash,
+    load_audit_chain,
+)
 from tests.test_provision_first_administrator import _tty
 
 _PASSWORD = "a-long-enough-operator-passphrase"
@@ -114,8 +120,9 @@ def test_provision_admin_honours_the_same_audited_opt_out_serve_does(
 def test_the_documented_order_with_the_key_in_the_shell_keys_the_chain_from_row_1(
     shell: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The closing test the item names: provision first, then open as serve would. Row 1 -- the
-    provisioning audit row -- is an HMAC, not the forgeable keyless SHA-256."""
+    """The closing test the item names: provision first, then open as serve would. Row 1 is the
+    genesis row, and the provisioning audit row after it is an HMAC, not the forgeable keyless
+    SHA-256."""
     key = generate_key()
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
@@ -126,18 +133,20 @@ def test_the_documented_order_with_the_key_in_the_shell_keys_the_chain_from_row_
         cipher = make_cipher(key)
         store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
-            assert store._audit_keyed_from == 1
+            assert store._audit_chain_keyed is True
             assert store.audit_chain_unkeyed() is False
             ok, msg = await store.verify_audit_chain()
             assert ok, msg
             cur = await store._db.execute(
-                "SELECT ts, actor, action, channel_id, detail, client, row_hash"
-                " FROM audit_log ORDER BY id LIMIT 1"
+                "SELECT seq, ts, actor, action, channel_id, detail, client, row_hash"
+                " FROM audit_log ORDER BY seq LIMIT 2"
             )
-            row = await cur.fetchone()
-            assert row is not None
+            genesis, row = list(await cur.fetchall())
+            assert genesis["seq"] == 1 and genesis["action"] == AUDIT_KEY_EPOCH_ACTION
+            assert row["seq"] == 2
             keyless = audit_row_hash(
-                "",
+                genesis["row_hash"],
+                seq=2,
                 ts=row["ts"],
                 actor=row["actor"],
                 action=row["action"],
@@ -164,7 +173,7 @@ async def _keyless_rows(path: Path, n: int) -> None:
         await store.close()
 
 
-async def test_a_keyless_chain_on_a_keyed_store_warns_and_is_reported(
+async def test_a_keyless_chain_on_a_keyed_store_is_logged_and_reported(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = tmp_path / "flag.db"
@@ -173,15 +182,18 @@ async def test_a_keyless_chain_on_a_keyed_store_warns_and_is_reported(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
         store = await MessageStore.open(path, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
     try:
-        assert store._audit_keyed_from is None, "open must not re-key existing rows"
+        assert store._audit_chain_keyed is False, "open must not re-key existing rows"
         assert store.audit_chain_unkeyed() is True
-        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("rekey-audit" in m and "keyless" in m.lower() for m in warned), warned
+        logged = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("genesis row" in m and "audit-verify" in m for m in logged), logged
+        # The text names no command that would key the rows in place: none exists.
+        assert not any("rekey-audit" in m for m in logged), logged
 
-        # The operator's documented remedy clears it, and nothing else does.
-        ok, msg = await store.rekey_audit_chain()
-        assert ok, msg
-        assert store.audit_chain_unkeyed() is False
+        # Nothing clears it on this store: the chain is a reported break, and stays one.
+        ok, msg = await store.verify_audit_chain()
+        assert not ok and "genesis row" in (msg or ""), msg
+        await store.record_audit("after", actor="u")
+        assert store.audit_chain_unkeyed() is True
     finally:
         await store.close()
 
@@ -199,7 +211,7 @@ async def test_the_flag_discriminates_keyless_by_choice_and_keyed_from_fresh(
         assert store.audit_chain_unkeyed() is False
     finally:
         await store.close()
-    # A fresh keyed store auto-keys from row 1 and has nothing to report.
+    # A fresh keyed store writes its genesis row and has nothing to report.
     cipher = make_cipher(generate_key())
     with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
         fresh = await MessageStore.open(
@@ -207,7 +219,7 @@ async def test_the_flag_discriminates_keyless_by_choice_and_keyed_from_fresh(
         )
     try:
         assert fresh.audit_chain_unkeyed() is False
-        assert not [r for r in caplog.records if "rekey-audit" in r.getMessage()]
+        assert not [r for r in caplog.records if "genesis row" in r.getMessage()]
     finally:
         await fresh.close()
 
@@ -279,57 +291,26 @@ async def test_both_server_backends_report_a_keyless_chain_on_a_keyed_store(
 ) -> None:
     """The server twins, offline, through the same bare-instance seam the Transit rider uses. The
     live-database legs of these backends run only on a hosted runner."""
-    import contextlib
-    from typing import Any
-
-    from tests.test_asvs_transit_audit_mac_server_backends import _bare
+    from tests.test_asvs_transit_audit_mac_server_backends import _bare, chained_rows, serve_rows
 
     store = _bare(backend, mac_key=b"k" * 32)
-    store._audit_chain_unkeyed = False
-    written: list[str] = []
-
-    async def _fetchone(sql: str, *_a: Any, **_kw: Any) -> Any:
-        return {"keyed_from_id": None} if "keyed_from_id" in sql else {"n": rows}
-
-    class _Conn:
-        async def fetchrow(self, sql: str, *_a: Any) -> Any:
-            return await _fetchone(sql)
-
-        async def execute(self, sql: str, *_a: Any) -> str:
-            written.append(sql)
-            return "INSERT 0 1"  # asyncpg's tag: one keying row went in
-
-        async def fetchone(self) -> tuple[int]:
-            return (1,)  # SQL Server's guarded INSERT OUTPUT: one keying row went in
-
-    @contextlib.asynccontextmanager
-    async def _conn() -> Any:
-        yield _Conn()
-
-    @contextlib.asynccontextmanager
-    async def _cursor(conn: Any) -> Any:
-        yield conn
-
-    async def _commit(_conn: Any) -> None:
-        return None
-
-    store._fetchone = _fetchone
-    store._timed_acquire = _conn
-    store._acquire = _conn
-    store._cursor = _cursor
-    store._commit = _commit
+    held = chained_rows([("legacy", None)] * rows)  # written with no key
+    before = [dict(r) for r in held]
+    serve_rows(store, held)
     with caplog.at_level(logging.WARNING):
-        await store._load_audit_chain_meta()
-    warned = any("rekey-audit" in r.getMessage() for r in caplog.records)
+        await load_audit_chain(store, read_only=False)
+    logged = any("genesis row" in r.getMessage() for r in caplog.records)
     if rows == 0:
-        # The control arm: a fresh keyed store still auto-keys from row 1 and reports nothing.
-        assert store._audit_keyed_from == 1, f"{backend}: a fresh keyed store must key from row 1"
-        assert any("audit_chain_meta" in s for s in written)
-        assert store.audit_chain_unkeyed() is False and not warned
+        # The control arm: a fresh keyed store writes its genesis row and reports nothing.
+        assert store._audit_chain_keyed is True, f"{backend}: a fresh keyed store must be keyed"
+        assert [r["action"] for r in held] == [AUDIT_KEY_EPOCH_ACTION]
+        assert store.audit_chain_unkeyed() is False and not logged
     else:
-        assert store._audit_keyed_from is None, f"{backend}: open must not re-key existing rows"
-        assert written == [], f"{backend}: nothing may be written at open"
-        assert store.audit_chain_unkeyed() is True and warned
+        assert store._audit_chain_keyed is False, f"{backend}: open must not re-key existing rows"
+        assert held == before, f"{backend}: nothing may be written at open"
+        assert store.audit_chain_unkeyed() is True and logged
+        ok, message = await store.verify_audit_chain()
+        assert not ok and "genesis row" in (message or ""), f"{backend}: {message}"
 
 
 @pytest.mark.parametrize(

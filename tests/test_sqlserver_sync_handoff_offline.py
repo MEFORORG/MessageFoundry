@@ -136,7 +136,7 @@ def _bare_store(command_timeout: int = 30) -> SqlServerStore:
     # byte-identical ("all" records every event; keyless audit chain).
     store._message_events = "all"
     store._audit_mac_key = None
-    store._audit_keyed_from = None
+    store._audit_chain_keyed = False
     # A1 live cost counters — normally set by __init__ (bypassed here); the commit/insert helpers bump
     # them, so a bare store must carry them at 0.
     store.committed_txns = 0

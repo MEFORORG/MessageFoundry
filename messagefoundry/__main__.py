@@ -897,7 +897,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--expected-anchor",
         default=None,
         metavar="COUNT:HEAD",
-        help="also compare against an anchor previously printed by 'audit-anchor'. The hash-chain "
+        help="also compare against an anchor previously printed by 'audit-anchor' (COUNT is the "
+        "newest row's sequence number, which the off-box audit record carries as 'seq'). The hash-chain "
         "walk alone CANNOT see a truncated tail (the surviving prefix still chains cleanly); this "
         "is what detects it",
     )
@@ -922,18 +923,6 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     audit_anchor.add_argument("--db", default=None, help="store path (overrides [store].path)")
     audit_anchor.add_argument("--json", action="store_true", help="emit JSON")
-
-    rekey_audit = sub.add_parser(
-        "rekey-audit",
-        help="enable HMAC keying of an existing keyless audit chain (#190-D migration; non-silent, "
-        "re-verifies first, requires the store encryption key — run with the engine stopped)",
-    )
-    rekey_audit.add_argument(
-        "--service-config",
-        default=None,
-        help="service settings TOML (default: ./messagefoundry.toml if present)",
-    )
-    rekey_audit.add_argument("--db", default=None, help="store path (overrides [store].path)")
 
     rotate_key = sub.add_parser(
         "rotate-key",
@@ -6161,8 +6150,9 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     ``serve``, and ``provision-admin`` since BACKLOG #1905. Before that item the decision lived inline in
     ``serve`` alone, so the documented install order -- ``provision-admin`` before the first ``serve``,
     with the key in the service environment rather than the operator's shell -- opened the store with
-    no key, wrote the first audit row as keyless SHA-256, and left a chain that a later keyed open never
-    keys (``_load_audit_chain_meta`` auto-keys only an EMPTY ``audit_log``).
+    no key, wrote the first audit row as keyless SHA-256, and left a chain that a later keyed open
+    reports as broken: a store that holds a key requires every audit row keyed, and only an EMPTY
+    ``audit_log`` gets a genesis row.
 
     ``None`` covers two cases: a key is configured, or one of the audited opt-outs applies (the caller
     then proceeds keyless and says so). The WORDING stays with each caller, because the remedy differs:
@@ -7228,68 +7218,6 @@ def _audit_anchor(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0
-
-
-def _rekey_audit(args: argparse.Namespace) -> int:
-    """Enable HMAC keying of an EXISTING keyless audit chain (#190-D migration).
-
-    This is the owner-visible fork the spec asked for: fresh encrypted stores auto-key from row 1, but
-    an already-deployed keyless encrypted store only becomes keyed through this explicit, **non-silent**
-    step — never on ``open()``. It requires the store encryption key (``MEFOR_STORE_ENCRYPTION_KEY``),
-    FIRST re-verifies the existing keyless chain (refusing to bless a broken/forged one), then sets the
-    keying watermark to the next id without rewriting any existing ``row_hash``. Run with the engine
-    stopped so no concurrent append races the watermark move."""
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
-    from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store.base import (
-        KeylessAuditChainRefused,
-        StoreNotFoundError,
-        open_store,
-    )
-
-    cli: dict[str, dict[str, object]] = {}
-    if args.db is not None:
-        cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    # Refuse to create-and-key a fresh empty SQLite DB from a typo'd path or a zero-byte file
-    # (mirrors the _audit_verify guard).
-    refused = _refuse_a_store_that_is_not_an_audit_log(
-        is_sqlite=settings.store.backend == StoreBackend.SQLITE,
-        path=settings.store.path,
-        refusal="refusing to create one",
-        as_json=False,  # rekey-audit has no --json
-    )
-    if refused is not None:
-        return refused
-
-    async def run() -> tuple[bool, str]:
-        # warn_unkeyed_chain=False (#1916): the keyless-chain WARNING names this command as its remedy.
-        store = await open_store(
-            settings.store,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-            warn_unkeyed_chain=False,
-        )
-        try:
-            return await store.rekey_audit_chain()
-        finally:
-            await store.close()
-
-    try:
-        ok, message = run_guarded(run())
-    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780: could not start
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=False)
-    print(("OK: " if ok else "FAIL: ") + message)
-    return 0 if ok else 1
 
 
 class _OfflineProbe(NamedTuple):
@@ -8705,7 +8633,6 @@ _DISPATCH = {
     "check-privileges": _check_privileges,
     "audit-verify": _audit_verify,
     "audit-anchor": _audit_anchor,
-    "rekey-audit": _rekey_audit,
     "rotate-key": _rotate_key,
     "backup": _backup,
     "restore-verify": _restore_verify,

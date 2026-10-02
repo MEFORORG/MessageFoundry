@@ -230,12 +230,14 @@ async def test_read_only_open_refuses_every_write(tmp_path: Path) -> None:
 
 async def test_read_only_open_of_a_keyed_store_writes_nothing_at_open(tmp_path: Path) -> None:
     """A keyed open reserves an AES-GCM invocation block and settles it at close. A read-only open
-    does neither, and it does not key an empty audit chain either."""
+    does neither, and it does not start an empty audit chain either: it writes no genesis row."""
     target = tmp_path / "keyed.db"
     settings = await _store_missing_an_index(target, encryption_key=generate_key())
     conn = sqlite3.connect(target)
     try:
-        conn.execute("DELETE FROM audit_chain_meta")  # an empty chain the next writable open keys
+        # An empty chain, which the next writable open starts. The keyed create above wrote a
+        # genesis row, so it is removed to put the log back in the state under test.
+        conn.execute("DELETE FROM audit_log")
         conn.commit()
     finally:
         conn.close()
@@ -246,12 +248,12 @@ async def test_read_only_open_of_a_keyed_store_writes_nothing_at_open(tmp_path: 
     await store.close()
 
     assert _durable(target, "SELECT key_id, invocations FROM cipher_meta ORDER BY key_id") == before
-    assert _durable(target, "SELECT COUNT(*) FROM audit_chain_meta") == [(0,)]
+    assert _durable(target, "SELECT COUNT(*) FROM audit_log") == [(0,)]
 
     # Control: a writable open of the same file does write both.
     store = await open_store(settings, keyless_chain_refusal=None)
     await store.close()
-    assert _durable(target, "SELECT COUNT(*) FROM audit_chain_meta") == [(1,)]
+    assert _durable(target, "SELECT seq, action FROM audit_log") == [(1, "audit.key_epoch")]
 
 
 async def test_read_only_open_refuses_an_absent_store(tmp_path: Path) -> None:
@@ -306,15 +308,23 @@ def test_status_snapshot_reports_a_store_this_build_would_refuse(tmp_path: Path)
 
 
 async def test_read_only_open_names_an_older_store_it_cannot_read(tmp_path: Path) -> None:
-    """An older store that only needs migrating lacks a column the read-only open's own audit load
-    reads. It is refused as a schema mismatch that says why, not as a bare "no such column"."""
+    """A store whose ``audit_log`` is in an earlier layout lacks a column the read-only open's own
+    audit load reads. It is refused as a schema mismatch that says why, not as a bare "no such
+    column". No earlier audit layout is converted (vault BACKLOG #2594), so the ordinary open
+    refuses it too, by name. The control is the same store before its table is swapped."""
     from messagefoundry.store.schema_verify import SchemaMismatchError
 
     target = tmp_path / "older.db"
     assert await _open_then_close(target, create=True) is None
+    assert await _open_then_close(target, read_only=True) is None  # the control
     conn = sqlite3.connect(target)
     try:
-        conn.execute("ALTER TABLE audit_chain_meta DROP COLUMN key_id")
+        conn.execute("DROP TABLE audit_log")
+        conn.execute(
+            "CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,"
+            " actor TEXT, action TEXT NOT NULL, channel_id TEXT, detail TEXT, client TEXT,"
+            " row_hash TEXT NOT NULL)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -323,10 +333,10 @@ async def test_read_only_open_names_an_older_store_it_cannot_read(tmp_path: Path
 
     assert isinstance(raised, SchemaMismatchError)
     assert "opened read-only and lacks what this build reads" in str(raised)
-    assert "no such column: key_id" in str(raised)
-    # Control: the ordinary open migrates it, after which the read-only open reads it.
-    assert await _open_then_close(target) is None
-    assert await _open_then_close(target, read_only=True) is None
+    assert "no such column: seq" in str(raised)
+    refused = await _open_then_close(target)
+    assert isinstance(refused, SchemaMismatchError)
+    assert "missing column 'seq'" in str(refused)
 
 
 async def test_read_only_open_of_a_keyed_store_does_not_decrypt_the_caches(tmp_path: Path) -> None:

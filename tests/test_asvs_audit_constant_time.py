@@ -14,7 +14,7 @@ it and both are asserted here:
    for a tamper at the FIRST row against a tamper at the LAST row.
 
 **Backend coverage without a live server.** ``verify_audit_chain`` on the Postgres / SQL Server backends
-needs only ``_audit_keyed_from``, ``_audit_mac_key`` and ``_fetchall``, so the real method is driven here
+needs only the audit key attributes and ``_fetchall``, so the real method is driven here
 against a bare instance with a stubbed row source. That is deliberate: the ``sql-server`` and Postgres
 pytest legs SKIP SILENTLY without a live container, so a three-backend parity change that is only covered
 by gated tests looks green locally and is in truth untested. These offline cases run on EVERY leg.
@@ -33,7 +33,13 @@ import pytest
 
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import audit_key_id
-from messagefoundry.store.store import audit_mac_bytes, audit_row_hash, build_audit_mac_keys
+from messagefoundry.store.store import (
+    AUDIT_KEY_EPOCH_ACTION,
+    audit_genesis_detail,
+    audit_mac_bytes,
+    audit_row_hash,
+    build_audit_mac_keys,
+)
 
 
 @pytest.fixture
@@ -180,21 +186,29 @@ async def test_sqlite_null_row_hash_is_refused_by_the_schema(store: MessageStore
 
 
 def _rows(n: int, *, key: bytes | None = None) -> list[dict[str, Any]]:
-    """A well-formed audit chain of ``n`` rows, hashed exactly as the backends hash it."""
+    """A well-formed audit chain of ``n`` rows, hashed exactly as the backends hash it. With a
+    ``key`` the first of the ``n`` rows is the genesis row naming it, as on a keyed store."""
     rows: list[dict[str, Any]] = []
     prev = ""
     for i in range(1, n + 1):
+        genesis = key is not None and i == 1
         row: dict[str, Any] = {
             "id": i,
+            "seq": i,
             "ts": float(i),
             "actor": "u",
-            "action": "act",
+            "action": AUDIT_KEY_EPOCH_ACTION if genesis else "act",
             "channel_id": None,
-            "detail": f'{{"n":{i}}}',
+            "detail": (
+                audit_genesis_detail(audit_key_id(key))
+                if key is not None and i == 1
+                else f'{{"n":{i}}}'
+            ),
             "client": None,
         }
         prev = audit_row_hash(
             prev,
+            seq=i,
             ts=row["ts"],
             actor=row["actor"],
             action=row["action"],
@@ -211,19 +225,18 @@ def _rows(n: int, *, key: bytes | None = None) -> list[dict[str, Any]]:
 def _offline_server_store(module_name: str, rows: list[dict[str, Any]]) -> Any:
     """A bare Postgres/SQL Server store whose only wired collaborator is the row source.
 
-    ``verify_audit_chain`` touches ``_audit_keyed_from``, the audit key attributes and ``_fetchall``,
+    ``verify_audit_chain`` touches the audit key attributes and ``_fetchall``,
     so this drives the REAL method (no reimplementation) with no DB, no driver and no container."""
     import importlib
 
     module = importlib.import_module(f"messagefoundry.store.{module_name}")
     cls = getattr(module, "PostgresStore" if module_name == "postgres" else "SqlServerStore")
     store = object.__new__(cls)
-    store._audit_keyed_from = None
+    store._audit_chain_keyed = False
     store._audit_mac_key = None
     store._audit_mac_fn = None  # ADR 0138 isolated-module MAC (the 13.3.3 rider seam); unused here
-    # BACKLOG #1904: the audit keyring and the first keyed range's key, which open would have set.
+    # BACKLOG #1904: the audit keyring, which open would have set.
     store._audit_mac_keys = {}
-    store._audit_first_key_id = None
 
     async def _fetchall(_sql: str, *_a: Any, **_kw: Any) -> list[dict[str, Any]]:
         return rows
@@ -318,12 +331,18 @@ async def test_server_backend_keyed_chain_verifies(backend: str) -> None:
     key = b"k" * 32
     rows = _rows(3, key=key)
     store = _offline_server_store(backend, rows)
-    store._audit_keyed_from = 1
+    store._audit_chain_keyed = True
     store._audit_mac_key = key
     store._audit_mac_keys = build_audit_mac_keys(None, key)
-    store._audit_first_key_id = audit_key_id(key)
     ok, message = await store.verify_audit_chain()
     assert ok, message
+    # The same rows without their genesis row: a keyed handle reports the chain, so the pass above
+    # is the genesis row naming the key and not a walk that accepts anything.
+    headless = _offline_server_store(backend, rows[1:])
+    headless._audit_mac_key = key
+    headless._audit_mac_keys = build_audit_mac_keys(None, key)
+    ok, message = await headless.verify_audit_chain()
+    assert not ok and "seq=1" in (message or ""), message
 
 
 def test_backend_module_list_matches_the_shipped_server_backends() -> None:
