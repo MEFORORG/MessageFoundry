@@ -15,7 +15,7 @@
 // imported as TYPES ONLY from liveDebug (erased at compile time — no runtime dependency, so this module
 // stays vscode-free and node-testable). The values come from a SECOND `dryrun --trace json` the provider
 // shells (ADR 0072), never from reaching into LiveDebugController's private trace state.
-import type { TraceInvocation, TraceValue } from "./liveDebug";
+import type { TraceInvocation, TraceValue } from "./liveDebugModel";
 
 // ---- the `lens parse --json` contract (ADR 0076 §3; mirror of messagefoundry/lens.py output) --------
 

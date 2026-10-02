@@ -242,7 +242,8 @@ export function revealPickItems(
 /**
  * The ONE entry a revealed run may keep, or null when it cannot tell which. With no focus, only a
  * one-message run qualifies. With one, the run must still hold as many messages as the pick listed,
- * since a sample edited in between would shift every index onto a different message.
+ * since adding or removing a message would shift every index. A pick is by position, so an edit
+ * that keeps the count reveals whatever message now sits there: still exactly one message.
  */
 export function revealedEntry(
   entries: LiveTraceEntry[],

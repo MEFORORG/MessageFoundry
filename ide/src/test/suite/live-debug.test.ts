@@ -663,6 +663,65 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
     }
   });
 
+  test("after a count mismatch the next reveal re-lists the messages before it asks", async () => {
+    let count = 1;
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return Array.from({ length: count }, (_v, i) => traceEntry({ source: `a [${i + 1}]` }));
+    };
+    const offered: number[] = [];
+    const picker = async (messages: { source: string }[]): Promise<number | undefined> => {
+      offered.push(messages.length);
+      return 0;
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", picker);
+    try {
+      await controller.runWith(syntheticSample(), "/ws"); // masked: one message listed
+      count = 2; // the sample gains a message, and no masked run notices
+      await controller.revealOnce(); // focus {0 of 1} meets two entries: nothing revealed
+      assert.deepStrictEqual(calls, [false, true]);
+      assert.strictEqual(controller.isShowingValues(), false);
+      await controller.revealOnce(); // re-lists with a masked run, then asks
+      assert.deepStrictEqual(calls, [false, true, false, true]);
+      assert.deepStrictEqual(offered, [2]);
+      assert.strictEqual(controller.isShowingValues(), true);
+      assert.strictEqual(controller["entries"]?.length, 1);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test("a second reveal while the first is choosing does nothing", async () => {
+    let answer!: (index: number | undefined) => void;
+    const asked = new Promise<number | undefined>((r) => (answer = r));
+    let picks = 0;
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({ source: "a [1]" }), traceEntry({ source: "a [2]" })];
+    };
+    const picker = (): Promise<number | undefined> => {
+      picks += 1;
+      return asked;
+    };
+    const controller = new LiveDebugController(runner, () => "/ws", picker);
+    try {
+      await controller.runWith(syntheticSample(), "/ws");
+      await controller.toggle(); // Live on, masked
+      const first = controller.revealOnce(); // the pick is open
+      await waitFor(() => picks === 1, 5000);
+      await controller.revealOnce(); // returns at once
+      assert.strictEqual(picks, 1, "the second reveal must not open a second pick");
+      answer(1);
+      await first;
+      assert.deepStrictEqual(calls, [false, false, true]);
+      assert.strictEqual(controller.isShowingValues(), true);
+    } finally {
+      controller.dispose();
+    }
+  });
+
   test("a revealed run that cannot tell which message to keep stores none", async () => {
     const runner: TraceRunner = async () => [traceEntry({ error: "SYNTH-ONE" }), traceEntry({ error: "SYNTH-TWO" })];
     const controller = new LiveDebugController(runner);
@@ -682,8 +741,10 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
   test("turning Live off orphans a reveal still running", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
+    let revealStarted = false;
     const runner: TraceRunner = async (_s, _c, showPhi) => {
       if (showPhi) {
+        revealStarted = true;
         await gate;
       }
       return [traceEntry({})];
@@ -693,6 +754,9 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
       await controller.runWith(syntheticSample(), "/ws");
       await controller.toggle(); // Live on, masked
       const reveal = controller.revealOnce();
+      // Wait until the --show-phi run is in flight, or this would test the cancelled-choice path.
+      await waitFor(() => revealStarted, 5000);
+      assert.ok(revealStarted, "the reveal's --show-phi run never started");
       await controller.toggle(); // Live off; no masked re-run follows to supersede the reveal
       release();
       await reveal;

@@ -6,9 +6,10 @@
 // PHI (ASVS 14.2.6, vault BACKLOG #1187, ground d2). A failure here becomes text the user sees: a
 // CodeLens title, a status-bar tooltip, an error toast. So the message is OURS, and never quotes what
 // the CLI wrote. Two paths used to quote it:
-//   * stdout that is not JSON. A dry-run runs Routers and Handlers in this same process, so a print()
-//     in one writes to stdout ahead of the JSON. JSON.parse then fails, and V8's message quotes the
-//     start of the text, which is whatever that print wrote.
+//   * stdout that is not JSON. The CLI runs config modules in its own process, so a print() in one
+//     can write to stdout ahead of the JSON. JSON.parse then fails, and V8's message quotes the
+//     start of the text, which is whatever that print wrote. (`dryrun` now sends an author's print
+//     to stderr; `validate` and `graph`, which also import config modules, do not.)
 //   * empty stdout. The message used to be the CLI's stderr, which can carry a traceback or a
 //     warning quoting a value.
 // Either text stays out of the message. It is not logged either: the extension's output channels are
@@ -79,7 +80,7 @@ export function parseJsonResult<T>(res: CliResult, args: string[]): T {
     throw new CliOutputError(
       `messagefoundry ${label} exited with code ${res.code} and printed no JSON. Its error output ` +
         `(${byteLength(res.stderr)} bytes) is not shown here because it can quote message data. Run ` +
-        "the command in a terminal to read it.",
+        "the command with --json in a terminal to read it.",
       looksLikeUnknownArgument(res.stderr),
     );
   }
@@ -88,9 +89,10 @@ export function parseJsonResult<T>(res: CliResult, args: string[]): T {
     parsed = JSON.parse(text);
   } catch {
     throw new CliOutputError(
-      `messagefoundry ${label} printed ${byteLength(res.stdout)} bytes that are not valid JSON. The ` +
-        "output is not shown here because it can quote message data. A print() in a Router or " +
-        "Handler writes to this output; remove it, or run the command in a terminal to read it.",
+      `messagefoundry ${label} exited with code ${res.code} and printed ${byteLength(res.stdout)} ` +
+        "bytes that are not valid JSON. The output is not shown here because it can quote message " +
+        "data. A print() in a config module can cause this. Run the command with --json in a " +
+        "terminal to read it.",
       USAGE_ON_STDOUT.test(text) || looksLikeUnknownArgument(res.stderr),
     );
   }

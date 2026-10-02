@@ -470,20 +470,28 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
    * a re-toggle) is masked again. Turns Live on first if it is off, since decorations render only then.
    */
   async revealOnce(): Promise<void> {
-    if ((this.enabling || !this.enabled) && !(await this.enable())) {
-      return;
+    if (this.choosingReveal) {
+      return; // one choice at a time: a second would share, and then clear, this one's state
     }
-    // A save just before the click would otherwise fire a masked run that silently drops this reveal.
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer);
-      this.debounceTimer = undefined;
-    }
+    // Taken before Live is turned on, so a Hide during the sample pick cancels this reveal too.
     const intent = ++this.revealIntent;
     this.choosingReveal = true;
     this.updateRevealStatus();
     let focus: RevealFocus | undefined;
     try {
-      focus = await this.chooseRevealFocus();
+      if ((this.enabling || !this.enabled) && !(await this.enable())) {
+        return;
+      }
+      if (intent !== this.revealIntent) {
+        await this.run(false); // cancelled during the sample pick: Live is on, so run it masked
+        return;
+      }
+      // A save just before the click would otherwise fire a masked run that silently drops this reveal.
+      if (this.debounceTimer) {
+        clearTimeout(this.debounceTimer);
+        this.debounceTimer = undefined;
+      }
+      focus = await this.chooseRevealFocus(intent);
     } finally {
       this.choosingReveal = false;
       this.updateRevealStatus();
@@ -498,11 +506,15 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
    * here summarize the whole sample, so nothing on screen singles one out: a one-message sample needs
    * no choice, and a larger one asks, listing the last masked run's messages by file name and
    * disposition. With no masked run of this sample yet, one runs first to learn the list. Undefined
-   * means reveal nothing: the pick was dismissed, Live went off, or there was no message.
+   * means reveal nothing: the pick was dismissed, Live went off, Hide cancelled it, or there was no
+   * message.
    */
-  private async chooseRevealFocus(): Promise<RevealFocus | undefined> {
+  private async chooseRevealFocus(intent: number): Promise<RevealFocus | undefined> {
     if (!this.maskedMessages || this.maskedFor !== this.samplePath) {
       await this.run(false);
+      if (intent !== this.revealIntent) {
+        return undefined; // Hide or Live off cancelled this reveal while its masked run ran
+      }
     }
     const messages = this.maskedMessages;
     if (!this.enabled || !messages || messages.length === 0) {
@@ -673,7 +685,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
         if (one === null) {
           unmatched = true;
           throw new Error(
-            "the sample changed since its messages were listed, so nothing was revealed. Reveal again.",
+            "the sample's message count changed since it was listed, so nothing was revealed. Reveal again.",
           );
         }
         entries = [one]; // every other message's values are dropped here, before anything renders
@@ -701,6 +713,8 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       // Only a masked run may refresh the reveal pick's list, and only one that produced entries.
       this.maskedMessages = entries ? maskedMessagesOf(entries) : null;
       this.maskedFor = samplePath;
+    } else if (unmatched) {
+      this.maskedMessages = null; // the list is stale: the next reveal re-lists before it asks
     }
     this.rows = rows;
     this.error = err;

@@ -42,9 +42,10 @@ suite("cliJson.parseJsonResult never quotes CLI output (vault BACKLOG #1187, gro
     // Positive control: the bare JSON.parse the old code used quotes the value, so the absence
     // asserted below is the fix and not a parser that happens to stay quiet.
     assert.throws(() => JSON.parse(stdout.trim()), (e: Error) => e.message.includes("SYNTH"));
-    const err = failure(result({ stdout }));
+    const err = failure(result({ stdout, code: 0 }));
     assert.ok(!err.message.includes("SYNTH"), err.message);
     assert.ok(err.message.includes(`printed ${Buffer.byteLength(stdout)} bytes`), err.message);
+    assert.ok(err.message.includes("exited with code 0"), err.message);
     assert.ok(err.message.startsWith("messagefoundry dryrun "), err.message);
     assert.strictEqual(err.argumentRejected, false);
   });

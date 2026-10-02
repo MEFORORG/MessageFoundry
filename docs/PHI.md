@@ -562,7 +562,8 @@ the off-box forwarder spool (`[logging].forward_spool_dir`).
   channel scope, **plus a `message_attachment` linkage check** — a guessed content address that is not
   linked to an in-scope message is a 404 — and writes a `record_view` **and** an `attachment_download`
   audit row **before** any byte leaves. `response.body` is exposed by `GET /messages/{id}/responses`
-  only when the caller *also* holds `messages:view_raw`. `shared_body.body` has **no direct read API**
+  only when the caller *also* holds `messages:view_raw` and `messages:view_summary` (vault BACKLOG
+  #1187). `shared_body.body` has **no direct read API**
   (reachable only via the delivery deref and the resend source read). Uploaded-log blobs are `files:*`
   gated, step-up + PHI-hop-guarded on browse, and audited (metadata only).
   **Bulk egress is a separate, stronger gate:** `GET /messages/export` streams many raw bodies at
