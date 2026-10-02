@@ -55,6 +55,21 @@ if TYPE_CHECKING:  # the SegmentGroup view imports Message back; keep the cycle 
 # e.g. ``MSH``/``PID``/``ZAL``. Used to validate :meth:`Message.add_segment` input.
 _SEG_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{2}$")
 
+# The characters a write that takes the caller's text as STRUCTURE refuses beside CR and LF (ADR 0205
+# rule 3): MLLP's start and end bytes and NUL. A leaf write escapes them instead (rule 2); a
+# whole-field write, ``add_repetition`` and ``add_segment`` cannot escape the caller's structure.
+_STRUCTURE_REFUSED = ("\x0b", "\x1c", "\x00")
+
+
+def _refuse_frame_bytes(value: str) -> None:
+    """Raise ``ValueError`` if ``value`` holds an MLLP frame byte or NUL (ADR 0205 rule 3)."""
+    for char in _STRUCTURE_REFUSED:
+        if char in value:
+            raise ValueError(
+                f"HL7 value may not contain the control character U+{ord(char):04X} "
+                "(an MLLP frame byte or NUL); write it through a component path to escape it"
+            )
+
 
 class Message:
     """A parsed HL7 message you can read (``msg["MSH-9.2"]``), mutate (``msg["MSH-3"] = …``),
@@ -263,7 +278,10 @@ class Message:
         split into extra fields); both raise ``ValueError`` (XFORM-1, review M-12). A component/
         subcomponent write **escapes** the value's structural delimiters (``| ^ ~ & \\``) so they are
         carried as data, not new structure (e.g. ``PID-5.1 = "O^Brien"`` stays one component), while
-        non-delimiter characters — incl. CJK/accented names — pass through intact (review M-13).
+        non-delimiter characters — incl. CJK/accented names — pass through intact (review M-13). A
+        component/subcomponent write also carries each C0 control character and DEL except TAB as a
+        ``\\Xhh\\`` hex escape, and a whole-field write refuses ``0x0B``, ``0x1C`` and NUL, so no
+        write emits a raw MLLP frame byte (ADR 0205 rules 2 and 3).
 
         ``occurrence`` (1-based) selects which segment of that id to write — ``occurrence=2`` edits
         the **second** ``OBX``. ``repetition`` (1-based) scopes the write to one field repetition: a
@@ -290,6 +308,7 @@ class Message:
             # Whole-field write assigns the caller's structure verbatim — but the field separator
             # would split it into extra fields downstream, so reject it (review M-12). Components and
             # repetitions are the caller's intended structure and remain allowed.
+            _refuse_frame_bytes(value)
             if field_sep in value:
                 raise ValueError(
                     f"HL7 field value may not contain the field separator {field_sep!r}; "
@@ -356,6 +375,7 @@ class Message:
         if not self._segment_present(seg, occurrence):
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot add a repetition to absent segment {where}")
+        _refuse_frame_bytes(value)
         field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._encoding_chars()
         if field_sep in value:
             raise ValueError(
@@ -382,6 +402,7 @@ class Message:
             raise ValueError(
                 "add_segment takes one segment line (no CR/LF); call it once per segment"
             )
+        _refuse_frame_bytes(line)
         field_sep, *_ = self._encoding_chars()
         tokens = line.split(field_sep)
         segment_id = tokens[0]
@@ -547,17 +568,14 @@ class Message:
     def _escape_leaf(
         value: str, field_sep: str, comp_sep: str, rep_sep: str, esc: str, sub_sep: str
     ) -> str:
-        """Escape ONLY the structural delimiters (and the escape char) so a leaf value carries them
-        as data, not new structure. Every other character — including code points above U+00FF
+        """Escape the structural delimiters, the escape char and the C0/DEL control characters
+        (TAB excepted) so a leaf value carries them as data, not new structure or a frame byte (ADR
+        0205 rule 2). Every other character — including code points above U+00FF
         (CJK/Cyrillic/Greek names) — passes through untouched and round-trips via ``unescape``;
         python-hl7's ``escape()``, used before the built-in parser, hex-encoded those as byte pairs
-        that ``unescape()`` then mis-decoded, silently corrupting them (review M-13)."""
-        out = value.replace(esc, f"{esc}E{esc}")  # the escape char first, so we don't double-escape
-        out = out.replace(field_sep, f"{esc}F{esc}")
-        out = out.replace(comp_sep, f"{esc}S{esc}")
-        out = out.replace(rep_sep, f"{esc}R{esc}")
-        out = out.replace(sub_sep, f"{esc}T{esc}")
-        return out
+        that ``unescape()`` then mis-decoded, silently corrupting them (review M-13). The one
+        implementation is :func:`~messagefoundry.parsing._builtin_hl7.escape_leaf`."""
+        return _builtin_hl7.escape_leaf(value, (field_sep, comp_sep, rep_sep, sub_sep, esc))
 
 
 def emit_raw_separators(payload: str) -> str:
