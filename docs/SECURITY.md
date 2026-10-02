@@ -162,23 +162,27 @@ decodes a declared request body before it runs a route's dependencies, and the `
 is a dependency. Left alone, a gated JSON route that declares a body would answer a caller with no
 session from the body parser: **422** for JSON that does not parse, or **400** for bytes that
 cannot be read. The engine's route class, `AuthenticatedBeforeBodyRoute`
-(`messagefoundry/api/security.py`), stops that. Before FastAPI reads the body it runs the gate's
-authentication step, and ahead of it the guards that sit before the gate, in the order FastAPI
-would run them. So a caller with no identity gets the gate's own refusal whatever the body holds.
-The response does not say whether the body parsed, or whether the route takes a body.
+(`messagefoundry/api/security.py`), stops that. On a gated route that declares a body it runs the
+gate's authentication step before FastAPI reads the body, and ahead of it the guards that sit
+before the gate, in the order FastAPI would run them. So a caller with no identity gets the gate's
+own refusal whatever the body holds. The response does not say whether the body parsed, or whether
+the route takes a body.
 
-- **Every gated route is covered, and no list is kept.** `create_app` sets the class on the
-  router, so a new gated route gets the check with nothing to remember.
-- **Only authentication moves.** The rest of the ladder runs after the body is read, as before:
-  the password and factor checks, the permission check and its audit rows, pacing and step-up.
-  So a signed-in caller that the gate then refuses still gets the parser's answer first for a
-  body that does not parse.
-- **One request pays one session lookup.** The check hands the identity it resolved to the gate.
-  A signed-in caller whose body does not parse now pays that lookup too, where the parser used
-  to answer with no session read.
-- **A route with no gate is not touched.** `POST /auth/login` has to parse a body from a caller
-  with no session. The web console's `/ui` routes are not touched either: they read their forms
-  inside the handler, after their own gate.
+- `create_app` sets the class on the app's router, so each route registered on the app gets the
+  check with nothing to remember, and no list of routes is kept. At least two shapes are not
+  covered, and the engine has neither: a route added through `include_router`, and a gate nested
+  inside another dependency. An embedder who adds routes either way must check them.
+- The gate itself does not change. After the body is read it runs in full, as before: sign-in
+  again, then the password and factor checks, the permission check and its audit rows, pacing and
+  step-up. So a signed-in caller that the gate then refuses still gets the parser's answer first
+  for a body that does not parse.
+- Nothing is handed from the early check to the gate. A session that ends while the body is
+  arriving is refused by the gate. The price is one more session read for a signed-in request
+  to a route with a body. That read does not move the session's idle clock.
+- A route with no gate is not touched. `POST /auth/login` has to parse a body from a caller with
+  no session. A gated route that declares no body is not touched either, because FastAPI already
+  runs its gate first. That includes the web console's `/ui` routes, which read their forms
+  inside the handler.
 
 `tests/test_auth_before_body.py` tests the mechanism. `tests/test_preauth_malformed_body.py` pins
 what an unauthenticated caller gets on every operation that takes a body.
@@ -2618,7 +2622,8 @@ flowchart TB
   steps that come before the ladder and the conditions on each rung.
 - Not every route takes this path. [Enforcement model](#enforcement-model) lists the routes that
   need no session, and the one route that authenticates by client certificate.
-- The session check runs before the request body is read. The checks below it run after.
+- On a route that declares a body, the session check runs before the body is read and again
+  after it. The checks below it run after.
 - The six-sided boxes are checks, and they run from top to bottom. Each account check lets a short
   list of self-service routes through. That lets a person change the password, prove the factor or
   set the address.

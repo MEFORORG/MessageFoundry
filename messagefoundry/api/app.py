@@ -1719,8 +1719,9 @@ def create_app(
     # Vault BACKLOG #2739: every route registered on this app from here on is built by this class,
     # which refuses a caller with no identity BEFORE FastAPI reads the request body. Set before the
     # first route is added, and on the router because ``FastAPI()`` takes no route class. A route
-    # reached through ``include_router`` would take its own router's class and miss this; the
-    # engine includes none, and tests/test_preauth_malformed_body.py reds on one that does.
+    # reached through ``include_router`` is NOT covered: it takes its own router's class, and a gate
+    # the include adds is not seen. The engine includes no router. The route walk cannot see into
+    # one, so tests/test_preauth_malformed_body.py fails on the first that is added.
     app.router.route_class = AuthenticatedBeforeBodyRoute
     if engine is not None:
         app.state.engine = engine

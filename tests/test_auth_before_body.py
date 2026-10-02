@@ -3,9 +3,10 @@
 """The check that refuses a caller with no identity before a request body is read (vault BACKLOG
 #2739).
 
-FastAPI reads and decodes a declared body before it solves a route's dependencies, and the sign-in
-check is a dependency. ``messagefoundry.api.security.AuthenticatedBeforeBodyRoute`` runs the
-authentication step of a route's gate, and the guards ahead of it, before FastAPI reads the body.
+The header comment in ``messagefoundry/api/security.py`` says what the mechanism is and why.
+In short: on a gated route that declares a body, ``AuthenticatedBeforeBodyRoute`` runs the
+authentication step of the gate, and the guards ahead of it, before FastAPI reads the body. The
+gate then runs after the body, unchanged, and looks the session up again.
 ``tests/test_preauth_malformed_body.py`` pins what an unauthenticated caller sees on every
 body-taking operation. This file tests the mechanism.
 
@@ -32,7 +33,6 @@ import collections
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -44,11 +44,14 @@ from pydantic import BaseModel
 
 from messagefoundry.api import create_app
 from messagefoundry.api import security as api_security
+from messagefoundry.api.app import _get_engine
 from messagefoundry.api.auth_routes import _no_store_reply
+from messagefoundry.api.auth_routes import _service as _service_guard
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
     before_body_of,
     require,
+    require_phi_read,
     require_service_cert,
     steps_before_body,
 )
@@ -63,7 +66,7 @@ from tests._admin_account import create_local_user_chosen
 from tests.test_api_tls import _ISSUER, _peercert, _wrap_with_cert
 from tests.test_directory_login_step_up_seed import _service as _directory_service
 from tests.test_preauth_malformed_body import _ARMS as _PROBES
-from tests.test_preauth_malformed_body import _JSON
+from tests.test_preauth_malformed_body import _JSON, _UNREADABLE
 
 PW = "a-strong-test-passphrase"
 _PEER = ("127.0.0.1", 123)
@@ -184,7 +187,10 @@ def _fastapi_own_handler(route: APIRoute) -> bool:
 
 
 def _uncovered(app: FastAPI) -> list[str]:
-    """Every JSON-API-gated route the early check does not stand in front of, and why."""
+    """Every JSON-API-gated route the early check is wrongly absent from, or wrongly on, and why.
+
+    It belongs in front of a gated route that declares a body, and nowhere else: with no body
+    FastAPI already runs the gate first, and a second sign-in check there would buy nothing."""
     problems: list[str] = []
     for route in app.routes:
         if not isinstance(route, APIRoute):
@@ -197,8 +203,10 @@ def _uncovered(app: FastAPI) -> list[str]:
             problems.append(f"{route.path}: served by {type(route).__name__}")
         elif not steps or steps[-1][0] is not gate:
             problems.append(f"{route.path}: its gate carries no step that answers before the body")
-        elif _fastapi_own_handler(route):
+        elif route.body_field is not None and _fastapi_own_handler(route):
             problems.append(f"{route.path}: FastAPI's own handler serves it")
+        elif route.body_field is None and not _fastapi_own_handler(route):
+            problems.append(f"{route.path}: checked early though it declares no body")
     return problems
 
 
@@ -267,8 +275,8 @@ async def test_every_dependency_ahead_of_a_gate_is_accounted_for(engine: Engine)
     dependencies read and found unable to refuse. A new kind fails here until someone reads it."""
     cannot_refuse = {_no_store_reply}
     app = create_app(engine, auth=await _service(engine), serve_ui=True, oidc_enabled=True)
-    marked: set[str] = set()
-    skipped: set[str] = set()
+    marked: set[object] = set()
+    skipped: set[object] = set()
     unread: set[str] = set()
     for route in app.routes:
         if not isinstance(route, APIRoute) or _api_gate(route) is None:
@@ -280,15 +288,16 @@ async def test_every_dependency_ahead_of_a_gate_is_accounted_for(engine: Engine)
             if found is not None and found.authenticates:
                 break
             if found is not None:
-                marked.add(call.__qualname__)
+                marked.add(call)
             elif call in cannot_refuse:
-                skipped.add(call.__qualname__)
+                skipped.add(call)
             else:
                 unread.add(f"{route.path}: {call.__qualname__}")
     assert not unread, unread
-    # Non-vacuous: both kinds exist on the live app, so both arms above ran.
-    assert marked == {"_get_engine", "_service"}
-    assert skipped == {"_no_store_reply"}
+    # Non-vacuous: both kinds exist on the live app, so both arms above ran. The functions
+    # themselves are compared, so a second function of the same name is not taken for these.
+    assert marked == {_get_engine, _service_guard}
+    assert skipped == cannot_refuse
 
 
 # --- 5. Ungated routes and the console are untouched ----------------------------------------------
@@ -308,9 +317,12 @@ async def test_a_route_with_no_json_gate_is_served_by_fastapis_own_handler(engin
     # early check knows. With no gate after that guard, the check stays out of the way.
     assert "/auth/login" in ungated and "/auth/negotiate" in ungated and "/health" in ungated
     assert len(console) >= 100, len(console)
-    # The control: a gated JSON route is NOT served by FastAPI's own handler.
+    # The control: a gated JSON route with a body is NOT served by FastAPI's own handler.
     gated = next(r for r in app.routes if isinstance(r, APIRoute) and r.path == _CHAT)
     assert not _fastapi_own_handler(gated)
+    # A gated route with no body is: FastAPI runs its gate before it reads anything.
+    stats = next(r for r in app.routes if isinstance(r, APIRoute) and r.path == "/stats")
+    assert _api_gate(stats) is not None and _fastapi_own_handler(stats)
 
 
 # --- 2. The answer is the same answer -------------------------------------------------------------
@@ -395,6 +407,39 @@ async def test_the_early_refusal_is_the_gates_own_answer_byte_for_byte(
         assert len(told_apart) >= 30, len(told_apart)
 
 
+_PHI_GATE = require_phi_read(Permission.MESSAGES_VIEW_SUMMARY)
+
+
+async def _phi_gated(body: _Body, identity: Identity = Depends(_PHI_GATE)) -> None:
+    return None
+
+
+async def test_a_gate_that_refuses_ahead_of_sign_in_does_so_before_the_body_too(
+    engine: Engine,
+) -> None:
+    """``require_phi_read`` refuses a PHI read on an unproven hop BEFORE it looks at the session.
+    No shipped route on that gate declares a body, so one is planted. Its early step gives the
+    hop refusal, in that order, and not sign-in's 401."""
+    service = await _service(engine)
+    operation = [("POST", "/planted/phi-body")]
+
+    def build() -> FastAPI:
+        app = _refuse_phi_reads(create_app(engine, auth=service))
+        app.post(operation[0][1])(_phi_gated)
+        return app
+
+    live, control = _live_and_control(build)
+    assert _uncovered(live) == []
+    no_body = {"no body": _NO_BODY}
+    (reference,) = (await _unauthenticated_answers(control, operation, no_body)).values()
+    assert reference[0] == 403
+    measured = await _unauthenticated_answers(live, operation, {**no_body, **_PROBES})
+    assert set(measured.values()) == {reference}
+    # THE CONTROL: served by FastAPI alone, the parser answered the same route's malformed body.
+    old = await _unauthenticated_answers(control, operation, _PROBES)
+    assert old["POST", "/planted/phi-body", "malformed JSON"][0] == 422
+
+
 async def test_an_overridden_gate_decides_in_place_of_the_early_check(engine: Engine) -> None:
     """``dependency_overrides`` replaces a dependency where FastAPI runs it. The early check
     stands aside for an overridden one, or a gate an embedder replaced would still refuse first.
@@ -436,7 +481,6 @@ _SERVICE_CALLS = (
 _STORE_CALLS = ("get_session", "touch_session", "revoke_session")
 #: The calls that are a charge, a row or a spent grant. One request makes each at most once.
 _ONCE = (
-    "identity_for_token",
     "touch_session",
     "audit_mfa_denied",
     "audit_permission_denied",
@@ -514,9 +558,10 @@ async def test_one_request_charges_each_side_effect_once(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every countable thing a gate does on a refusal and on a success, per request, with the early
-    check and without it. The two tallies are equal in every scenario, so the early check adds no
-    audit row, no pacing or PHI-read charge, no new-address signal, no spent grant and no second
-    session lookup. The one difference there is to find is pinned in the next case."""
+    check and without it. The early check adds one thing and only one: a signed-in caller's session
+    is read once more, on a route that declares a body. It adds no audit row, no pacing or
+    PHI-read charge, no new-address signal, no spent grant, and it does not move the idle clock a
+    second time."""
     service = await _service(engine)
     await _add(service, "admin", Role.ADMINISTRATOR)
     await _add(service, "viewer", Role.VIEWER)
@@ -549,13 +594,19 @@ async def test_one_request_charges_each_side_effect_once(
             )
         return response.status_code, dict(tally)
 
+    signed_in = {"admin", "viewer", "pending"}
+    second_read = collections.Counter({"identity_for_token": 1, "get_session": 1})
     seen: collections.Counter[str] = collections.Counter()
     doubled: collections.Counter[str] = collections.Counter()
     for scenario in _SCENARIOS:
         what = scenario[0]
         before = await one_request(control, scenario)
         after = await one_request(live, scenario)
-        assert after == before, (what, after, before)
+        signed_in_with_a_body = scenario[4] in signed_in and scenario[3] is not _NO_BODY
+        extra = collections.Counter(after[1]) - collections.Counter(before[1])
+        assert after[0] == before[0], (what, after, before)
+        assert extra == (second_read if signed_in_with_a_body else {}), (what, extra)
+        assert not collections.Counter(before[1]) - collections.Counter(after[1]), what
         over = {name: count for name, count in after[1].items() if name in _ONCE and count > 1}
         assert not over, (what, over)
         seen.update(after[1])
@@ -571,33 +622,39 @@ async def test_one_request_charges_each_side_effect_once(
         assert doubled[name] >= 1, (name, dict(doubled))
 
 
-async def test_a_signed_in_caller_pays_one_session_lookup_whatever_the_body(
+async def test_a_signed_in_caller_pays_a_second_session_read_only_where_a_body_is_declared(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """THE ONE COST THE EARLY CHECK ADDS. A signed-in caller whose body does not parse used to be
-    answered by the parser with no session read at all. The session is now read first, once, and
-    its idle clock moves as it does for any request. No row, no charge and no grant goes with it."""
+    """THE ONE COST THE EARLY CHECK ADDS, pinned so it cannot grow unseen. On a route that declares
+    a body a signed-in caller's session is read before the body and again by the gate after it. The
+    first read does not move the idle clock, so a body that then fails to parse leaves the clock
+    alone, as it did when the parser answered first. A route with no body is not checked early."""
     service = await _service(engine)
     await _add(service, "admin", Role.ADMINISTRATOR)
     live, control = _live_and_control(lambda: create_app(engine, auth=service))
     bearer = await _sign_in(live, "admin")
     tally = _count_calls(monkeypatch, service)
 
-    async def post(app: FastAPI, body: bytes) -> tuple[int, dict[str, int]]:
+    async def send(app: FastAPI, method: str, path: str, body: bytes) -> tuple[int, dict[str, int]]:
         tally.clear()
         async with _client(app) as client:
-            response = await client.post(_CHAT, content=body, headers={**_JSON, **bearer})
+            response = await client.request(method, path, content=body, headers={**_JSON, **bearer})
         return response.status_code, dict(tally)
 
-    lookup = {"identity_for_token": 1, "get_session": 1, "touch_session": 1}
-    assert await post(control, _MALFORMED[0]) == (422, {})
-    assert await post(live, _MALFORMED[0]) == (422, lookup)
-    # A body that parses: one lookup by the early check, none by the gate, which takes the carried
-    # identity. The second ``get_session`` is the factor gate's own read, there before the change.
-    status, parsed = await post(live, _CHAT_BODY)
-    assert status == _HANDLER_RAN
-    assert await post(control, _CHAT_BODY) == (status, parsed)
-    assert parsed["identity_for_token"] == 1 and parsed["touch_session"] == 1
+    second_read = {"identity_for_token": 1, "get_session": 1}
+    malformed = _PROBES["malformed JSON"][0]
+    assert await send(control, "POST", _CHAT, malformed) == (422, {})
+    assert await send(live, "POST", _CHAT, malformed) == (422, second_read)
+
+    status, old = await send(control, "POST", _CHAT, _CHAT_BODY)
+    assert status == _HANDLER_RAN and old["identity_for_token"] == old["touch_session"] == 1
+    assert await send(live, "POST", _CHAT, _CHAT_BODY) == (
+        status,
+        dict(collections.Counter(old) + collections.Counter(second_read)),
+    )
+
+    # THE CONTROL: a gated route with no body costs what it cost before.
+    assert await send(live, "GET", "/stats", b"") == await send(control, "GET", "/stats", b"")
 
 
 # --- 4. Authenticated behaviour is unchanged ------------------------------------------------------
@@ -638,14 +695,20 @@ async def test_a_signed_in_caller_gets_what_it_got_before_on_every_body_route(
                 # No handler ran: none of these bodies is one a route accepts.
                 assert after.status_code >= 400, (method, path, probe, after.status_code)
                 statuses[probe, after.status_code] += 1
+                # The parser's two answers give a position and nothing of the body. Compared
+                # with the control alone, a handler that began to echo it would pass.
+                if probe == "malformed JSON":
+                    (error,) = after.json()["detail"]
+                    assert set(error) == {"type", "loc", "msg"}, (method, path, error)
+                    assert error["type"] == "json_invalid", (method, path, error)
+                elif probe == "undecodable bytes":
+                    assert after.json() == _UNREADABLE, (method, path)
     assert statuses["malformed JSON", 422] == len(operations)
     assert statuses["undecodable bytes", 400] == len(operations)
 
 
-def _request(
-    app: FastAPI, headers: dict[str, str] | None = None, *, scope: dict[str, object] | None = None
-) -> Request:
-    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+def _request(app: FastAPI, headers: dict[str, str]) -> Request:
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
     return Request(
         {
             "type": "http",
@@ -655,70 +718,40 @@ def _request(
             "headers": raw,
             "client": _PEER,
             "app": app,
-            **(scope or {}),
         }
     )
 
 
-async def test_the_carried_identity_is_spent_once_and_cannot_be_planted(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+async def test_a_session_revoked_while_the_body_arrives_is_refused_by_the_gate(
+    engine: Engine,
 ) -> None:
-    """The early check hands the gate the identity it resolved. Only a value this module built,
-    under the session key, in the ASGI scope, is taken, and the gate that takes it removes it."""
+    """The early check passes nothing to the gate. So the gate that runs after the body reads the
+    session again, and a session ended in between is refused: on an ordinary route, and on the
+    routes the factor gate exempts, where a remembered identity would have been let through."""
     service = await _service(engine)
     await _add(service, "admin", Role.ADMINISTRATOR)
     app = create_app(engine, auth=service)
     bearer = await _sign_in(app, "admin")
-    tally = _count_calls(monkeypatch, service)
-    session_key, cert_key = api_security._CARRIED_SESSION, api_security._CARRIED_CERT
-    gate = require()
+    gates = [require(), require(mfa_gate=False), require(Permission.AI_ASSIST)]
+    found = before_body_of(gates[0])
+    assert found is not None and found.authenticates
 
-    # The round trip: one lookup, the gate takes the carried identity, and it is gone afterwards.
+    # THE CONTROL: the session is live, the early step passes, and each gate admits the caller.
     request = _request(app, bearer)
-    await api_security._authenticate_session_before_body(request)
-    assert isinstance(request.scope[session_key], api_security._Carried)
-    identity = await gate(request)
-    assert identity.username == "admin" and session_key not in request.scope
-    assert tally["identity_for_token"] == 1
-    # Spent: the same gate asked again on the same request does its own lookup.
-    assert (await gate(request)).username == "admin" and tally["identity_for_token"] == 2
+    keys = set(request.scope)
+    await found.step(request)
+    assert set(request.scope) == keys, "the early step left something in the scope"
+    for gate in gates:
+        assert (await gate(request)).username == "admin"
 
-    # Nothing but this module's own class is taken. Each of these is a caller with NO token.
-    system = api_security._SYSTEM_IDENTITY
-    planted: list[object] = [
-        system,
-        {"identity": system},
-        SimpleNamespace(identity=system),
-        "system",
-    ]
-    for value in planted:
+    # The early step passes, the session ends, and then the gate runs.
+    request = _request(app, bearer)
+    await found.step(request)
+    await service.logout(bearer["Authorization"].removeprefix("Bearer "), actor="admin")
+    for gate in gates:
         with pytest.raises(HTTPException) as refused:
-            await gate(_request(app, scope={session_key: value}))
-        assert refused.value.status_code == 401, value
-    # The cert plane's carry does not satisfy a session gate, nor the session's a cert gate.
-    with pytest.raises(HTTPException) as refused:
-        await gate(_request(app, scope={cert_key: api_security._Carried(system)}))
-    assert refused.value.status_code == 401
-    with pytest.raises(HTTPException) as refused:
-        await require_service_cert()(
-            _request(app, scope={session_key: api_security._Carried(system)})
-        )
-    assert refused.value.status_code == 401
-    # THE CONTROL: the real thing under the right key IS taken, with no lookup, so the refusals
-    # above are the check and not a gate that refuses everything.
-    lookups = tally["identity_for_token"]
-    planted_request = _request(app, bearer, scope={session_key: api_security._Carried(identity)})
-    assert await gate(planted_request) is identity
-    assert tally["identity_for_token"] == lookups
-
-    # And the wire cannot name the key: a header and a query parameter of that name are just that.
-    async with _client(app) as client:
-        response = await client.post(
-            f"{_CHAT}?{session_key}=system",
-            content=_CHAT_BODY,
-            headers={**_JSON, session_key: "system"},
-        )
-    assert (response.status_code, response.content) == (401, _REFUSED)
+            await gate(request)
+        assert (refused.value.status_code, refused.value.detail) == (401, "not authenticated")
 
 
 # --- 7. Every credential form the gate accepts -----------------------------------------------------
@@ -840,10 +873,11 @@ async def test_a_mapped_client_certificate_is_accepted(
         return response.status_code, response.content
 
     good, bad = b'{"value": 1}', _MALFORMED[0]
-    # Accepted: the handler runs, the parser answers a malformed body, and the cert is resolved once.
-    for app in (live, control):
+    # Accepted: the handler runs and the parser answers a malformed body. The cert is resolved
+    # before the body and again by the gate, as a session is.
+    for app, lookups in ((live, 2), (control, 1)):
         assert await post(app, "svc.internal", good) == (200, b'{"username":"svc"}')
-        assert tally["identity_for_cert_user_id"] == 1
+        assert tally["identity_for_cert_user_id"] == lookups
         assert (await post(app, "svc.internal", bad))[0] == 422
     # Not accepted: no cert, an unmapped subject, and a bearer session with no cert.
     for common_name, headers in ((None, {}), ("attacker.example", {}), (None, bearer)):
