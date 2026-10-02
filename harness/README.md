@@ -160,6 +160,9 @@ python -m messagefoundry serve --config harness/config/load --db ./load.db   # s
 python -m harness --load fanout-baseline --engine URL --token T --report-json out/load/run.json
 ```
 
+The engine serves with sign-in on, and `--token` is a session for it. `python -m harness.load.rigadmin`
+provisions an Administrator for the run and signs in for you; the guide below shows the three steps.
+
 Full guide — profile schema, the env knobs, reading the report/SLOs, exit codes, baseline
 comparison, and the backend-comparison recipe — is in [docs/LOAD-TESTING.md](../docs/LOAD-TESTING.md).
 
