@@ -490,7 +490,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 
 | Why it is left out | Files |
 |---|---|
-| It reads the JSON the MessageFoundry command line prints. The extension runs that command itself, and section 9 says when. Message content inside that JSON goes on to `hl7diff.ts`, in the table above. `connectionSchemaModel.ts` matches pattern 4 only because its caller passes it that command's result under the name `fetch`. | `cli.ts`, `connectionSchemaModel.ts`, `engineControlModel.ts`, `stepsModel.ts` |
+| It reads the JSON the MessageFoundry command line prints. The extension runs that command itself, and section 9 says when. Message content inside that JSON goes on to `hl7diff.ts`, in the table above. `connectionSchemaModel.ts` matches pattern 4 only because its caller passes it that command's result under the name `fetch`. | `cliJson.ts`, `connectionSchemaModel.ts`, `engineControlModel.ts`, `stepsModel.ts` |
 | It reads your config source line by line, from the open editor or the config folder. That code runs when the engine loads it (sections 1 and 2), so reading its text trusts it no further. | `completionScope.ts`, `editorToolbar.ts`, `liveDebug.ts`, `stepsModel.ts`, `symbolIndex.ts`, `traceView.ts` |
 | It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
 | It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |

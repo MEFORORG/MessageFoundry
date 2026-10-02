@@ -11,6 +11,7 @@
 // helpers — so `npm run test:unit` (plain-node mocha, no Extension Host, no Python) can exercise
 // it. Same split, and the same reason, as connectionMerge.ts.
 
+import { CliOutputError } from "./cliJson";
 import type { Direction } from "./connectionMerge";
 
 /** Re-exported so consumers of the catalogue need only one import for "inbound" | "outbound";
@@ -99,14 +100,18 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 /**
  * True when a failed schema fetch means "this engine has no such verb" rather than a real error.
  *
- * cli.ts's parseJsonResult reports the two old-engine shapes differently, so both are classified
- * here: argparse writes the usage blob to STDERR and exits 2 with empty stdout → parseJsonResult
- * throws the stderr text (`invalid choice: 'schema'`); if a build ever writes usage to stdout
- * instead, JSON.parse throws a SyntaxError quoting the start of that blob. Anything else (an
- * `{"error": ...}` body, the untrusted-workspace refusal, a crashed interpreter) is NOT this and
- * must keep its own message.
+ * Argparse writes its usage blob to STDERR and exits 2 with empty stdout; a build might write it
+ * to stdout instead. cliJson's parseJsonResult reads both shapes and throws a `CliOutputError`
+ * whose `argparseRejection` carries the verdict, since its message no longer quotes the output.
+ * The text tests serve any other error. Anything else (an `{"error": ...}` body, the
+ * untrusted-workspace refusal, a crashed interpreter) is NOT this and must keep its own message.
  */
 export function isEnginePredatesSchema(err: unknown): boolean {
+  // cli.ts's parse no longer quotes the CLI's output in a message (vault BACKLOG #1187), so it
+  // states the argparse verdict as a flag instead; the text tests below serve every other error.
+  if (err instanceof CliOutputError) {
+    return err.argparseRejection;
+  }
   const message = err instanceof Error ? err.message : String(err);
   if (ARGPARSE_REJECTION.test(message)) {
     return true;

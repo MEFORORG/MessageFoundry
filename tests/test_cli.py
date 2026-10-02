@@ -296,6 +296,71 @@ def test_dryrun_show_phi_still_yields_the_raised_text(
     assert "DOE^JANE^Q" in error and "900123456^^^H^MR" in error
 
 
+PRINTER_CONFIG = PHI_RAISER_CONFIG.replace(
+    '    raise ValueError("unmapped patient " + str(msg["PID-5"]) + " mrn " + str(msg["PID-3"]))',
+    '    print(msg["PID-5"])\n    return []',
+)
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace", "json"]])
+def test_dryrun_sends_a_handlers_print_to_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], trace: list[str]
+) -> None:
+    """A print() in a Handler goes to stderr, so ``dryrun --json`` stdout stays one JSON document.
+
+    Before vault BACKLOG #1187 the dry-run ran the Handler with stdout untouched, so the print came
+    first on stdout and the IDE's JSON.parse quoted it in an error message. The IDE no longer quotes
+    CLI output either way; this keeps the result parseable. Synthetic data only (CLAUDE.md §9)."""
+    assert PRINTER_CONFIG != PHI_RAISER_CONFIG, "the fixture swap did not apply"
+    cfg, _messages, message = _phi_raiser(tmp_path)
+    Path(cfg, "IB_TEST.py").write_text(PRINTER_CONFIG, encoding="utf-8")
+    rc = main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace])
+    assert rc == 0
+    captured = capsys.readouterr()
+    # Control: the print ran, and its text is on stderr, so the absence on stdout is not vacuous.
+    assert "DOE^JANE^Q" in captured.err
+    assert "DOE" not in captured.out
+    results = json.loads(captured.out)
+    assert isinstance(results, list) and len(results) == 1
+
+
+@pytest.mark.parametrize(
+    ("trace", "target"),
+    [
+        ([], "messagefoundry.pipeline.dryrun.dry_run"),
+        (["--trace", "json"], "messagefoundry.pipeline.dryrun_trace.trace_dry_run"),
+    ],
+)
+def test_dryrun_loop_error_withholds_text_except_inbound_selection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    trace: list[str],
+    target: str,
+) -> None:
+    """vault BACKLOG #1187: the IDE shows a ``{"error": ...}`` body as written, so an error that stops
+    the per-message loop is reported by class only. The inbound-selection refusal is the control: it
+    is composed from connection names and keeps its text."""
+    from messagefoundry.pipeline.dryrun import UnknownInboundError
+
+    cfg, _messages, message = _phi_raiser(tmp_path)
+
+    def raises(exc: Exception) -> Callable[..., object]:
+        def _run(*_a: object, **_k: object) -> object:
+            raise exc
+
+        return _run
+
+    monkeypatch.setattr(target, raises(KeyError("DOE^JANE^Q")))
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace]) != 0
+    body = json.loads(capsys.readouterr().out)
+    assert "DOE" not in body["error"] and "KeyError" in body["error"], body
+
+    monkeypatch.setattr(target, raises(UnknownInboundError("no such inbound connection: 'IB_X'")))
+    assert main(["dryrun", "--config", cfg, "--messages", message, "--json", *trace]) != 0
+    assert json.loads(capsys.readouterr().out) == {"error": "no such inbound connection: 'IB_X'"}
+
+
 # --- BACKLOG #1692: dryrun prints a Handler's declared metadata writes ----------------------------
 #
 # A SetMeta key and value are both message-derived in the general case, so this fixture builds each

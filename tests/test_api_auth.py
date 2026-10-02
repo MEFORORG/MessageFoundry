@@ -28,6 +28,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._role_pairing import bypass_view_raw_pairing_rule
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -479,6 +480,157 @@ async def test_outbound_payloads_require_view_raw(engine: Engine) -> None:
         assert (
             await c.get(f"/messages/{mid}/outbound", headers=_auth(vw))
         ).status_code == 403  # no view_raw
+
+
+async def _add_custom(service: AuthService, username: str, permissions: list[str]) -> None:
+    """A user holding ONE ADR 0045 custom role made of exactly ``permissions``."""
+    role = await service.create_custom_role(
+        display_name=f"role-{username}", description=None, permissions=permissions, actor="test"
+    )
+    user_id = await create_local_user_chosen(
+        service,
+        username=username,
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[role.id],
+        actor="test",
+    )
+    await _clear_must_change(service, user_id)
+
+
+async def test_reply_and_outbound_bodies_need_view_summary_beside_view_raw(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ASVS 14.2.6, vault BACKLOG #1187, ground (b2): owner ruling R18 makes a one-message JSON
+    request the reveal act only for a ``messages:view_summary`` holder. A caller holding
+    ``view_raw`` without it gets neither body: ``/outbound`` answers 403 with an
+    ``auth.permission_denied`` row naming the missing permission, and ``/responses`` returns a null
+    ``body``, the answer a caller without ``view_raw`` gets.
+
+    Minting refuses such a role, so this lifts that rule (see ``tests/_role_pairing.py``) to pin
+    the route gates as the second line.
+
+    The ``both`` custom role is the control arm: it differs from ``rawonly`` by ``view_summary``
+    alone, and it reads both bodies, so the refusals are that permission and not a broken route."""
+    bypass_view_raw_pairing_rule(monkeypatch)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    await _add(service, "vw", Role.VIEWER)
+    await _add_custom(service, "rawonly", ["messages:read", "messages:view_raw"])
+    await _add_custom(
+        service, "both", ["messages:read", "messages:view_raw", "messages:view_summary"]
+    )
+    mid = await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("OB_Q", "MSH|transformed")]
+    )
+    items = await engine.store.claim_ready(destination_name="OB_Q")
+    await engine.store.complete_with_response(
+        items[0].id, body="MSA|AA", outcome="accepted", detail="MSA-1=AA"
+    )
+    async with _client(engine, service) as c:
+        h = {u: _auth((await _login(c, u)).json()["token"]) for u in ("op", "adm", "vw")}
+        h |= {u: _auth((await _login(c, u)).json()["token"]) for u in ("rawonly", "both")}
+
+        # Built-in roles behave as before: the two that hold view_raw read both bodies.
+        for user in ("op", "adm", "both"):
+            out = await c.get(f"/messages/{mid}/outbound", headers=h[user])
+            assert out.status_code == 200, user
+            assert out.json()["payloads"][0]["payload"] == "MSH|transformed"
+            reply = (await c.get(f"/messages/{mid}/responses", headers=h[user])).json()
+            assert reply["responses"][0]["body"] == "MSA|AA", user
+        assert (await c.get(f"/messages/{mid}/outbound", headers=h["vw"])).status_code == 403
+        vw_reply = (await c.get(f"/messages/{mid}/responses", headers=h["vw"])).json()
+        assert vw_reply["responses"][0]["body"] is None
+
+        # The view_raw-only custom role: the same answers as a caller missing a permission.
+        refused = await c.get(f"/messages/{mid}/outbound", headers=h["rawonly"])
+        assert refused.status_code == 403
+        assert refused.json()["detail"] == "missing permission: messages:view_summary"
+        reply = await c.get(f"/messages/{mid}/responses", headers=h["rawonly"])
+        assert reply.status_code == 200
+        got = reply.json()["responses"][0]
+        assert got["outcome"] == "accepted" and got["body"] is None and got["detail"] is None
+
+    denied = [dict(r) for r in await engine.store.list_audit(action="auth.permission_denied")]
+    assert any(
+        r["actor"] == "rawonly"
+        and '"messages:view_summary"' in r["detail"]
+        and "/outbound" in r["detail"]
+        for r in denied
+    ), denied
+    # The response.read row records that no body went out to the view_raw-only caller.
+    reads = [dict(r) for r in await engine.store.list_audit(action="response.read")]
+    assert any(r["actor"] == "rawonly" and '"body": false' in r["detail"] for r in reads), reads
+
+
+async def test_role_routes_refuse_view_raw_without_view_summary(engine: Engine) -> None:
+    """vault BACKLOG #1187: the admin's own surface, POST and PUT /roles/custom, answers 400 with the
+    pairing message. Controls: a POST and a PUT keeping view_summary are accepted. A final listing
+    shows neither refusal wrote anything, name included."""
+    service = await _service(engine)
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])  # a fresh login is step-up fresh
+        refused = await c.post(
+            "/roles/custom",
+            headers=h,
+            json={"display_name": "Raw", "permissions": ["messages:read", "messages:view_raw"]},
+        )
+        assert refused.status_code == 400, refused.text
+        assert "messages:view_raw needs messages:view_summary" in refused.json()["detail"]
+        made = await c.post(
+            "/roles/custom",
+            headers=h,
+            json={
+                "display_name": "Raw and summary",
+                "permissions": ["messages:read", "messages:view_raw", "messages:view_summary"],
+            },
+        )
+        assert made.status_code == 201, made.text
+        role_url = f"/roles/custom/{made.json()['id']}"
+        both = ["messages:read", "messages:view_raw", "messages:view_summary"]
+        # PUT control: the same edit keeping view_summary is accepted.
+        kept = await c.put(role_url, headers=h, json={"display_name": "R", "permissions": both})
+        assert kept.status_code == 200, kept.text
+        # The refused edit drops view_summary and also renames; the 400's detail ties it to the
+        # pairing rule, and the listing below shows the rename did not land either.
+        edited = await c.put(
+            role_url,
+            headers=h,
+            json={
+                "display_name": "Changed",
+                "permissions": ["messages:read", "messages:view_raw"],
+            },
+        )
+        assert edited.status_code == 400, edited.text
+        assert "messages:view_raw needs messages:view_summary" in edited.json()["detail"]
+        # Neither refusal wrote anything: one role, still holding view_summary.
+        listed = (await c.get("/roles/custom", headers=h)).json()
+        assert [(r["display_name"], r["permissions"]) for r in listed] == [("R", sorted(both))]
+
+
+def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:
+    """The reply and outbound bodies now need both permissions (vault BACKLOG #1187). Every built-in
+    role that held ``view_raw`` must therefore hold ``view_summary`` too, or this change would take
+    a body away from a built-in role. The control is that at least one built-in role holds
+    ``view_raw`` at all, so an empty comprehension cannot pass."""
+    from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, Permission
+
+    raw_holders = [
+        role
+        for role, perms in BUILTIN_ROLE_PERMISSIONS.items()
+        if Permission.MESSAGES_VIEW_RAW in perms
+    ]
+    assert len(raw_holders) >= 2  # the count the absence assertion below needs to mean anything
+    assert {Role.ADMINISTRATOR, Role.OPERATOR} <= set(raw_holders)
+    lacking = [
+        role
+        for role in raw_holders
+        if Permission.MESSAGES_VIEW_SUMMARY not in BUILTIN_ROLE_PERMISSIONS[role]
+    ]
+    assert lacking == []
 
 
 async def test_the_body_fetch_requires_view_raw_and_channel_scope(engine: Engine) -> None:

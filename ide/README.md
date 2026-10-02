@@ -126,9 +126,14 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   on, every save of a config module re-runs a dry-run against a **synthetic** sample and annotates the
   code in place: a routing/disposition summary above each `inbound()` / `@router` / `@handler`, and the
   per-line values each executed line produced. Message-derived values render **redacted by default**.
-  *Reveal Values for One Run* re-runs once with real values shown, and turns Live Debug on first if it
-  is off. While Live Debug is on, a click on the **Values: Hidden** status-bar item does the same. The
-  next run is masked again, and *Hide Revealed Values* hides them sooner. Use synthetic samples only. Live Debug never contacts a real engine, and the re-run is
+  *Reveal Values for One Run* re-runs once with real values shown for **one message**, and turns Live
+  Debug on first if it is off. When the sample holds several messages, it first asks which one, by
+  file name and disposition. While Live Debug is on, a click on the **Values: Hidden** status-bar item does the same. The
+  next run is masked again, and *Hide Revealed Values* hides them sooner. On a masked run the
+  `inbound()` summary's tooltip says only how many messages failed; the error text shows on a revealed
+  run, because it can quote message data. When a run fails, the lens says so without quoting what
+  the CLI printed, and so does an error from a `--json` CLI call that printed no JSON; run the command
+  in a terminal to read the output. The CLI's own `{"error": ...}` message still shows as written. Use synthetic samples only. Live Debug never contacts a real engine, and the re-run is
   debounced (`messagefoundry.liveDebug.debounceMs`).
 - **Cookbook** (*MessageFoundry: Open Cookbook*) — a searchable gallery of solved HL7 routing/transform
   problems (crosswalk a code, split a batch, enrich via a lookup, fan out to several outbounds, …); each

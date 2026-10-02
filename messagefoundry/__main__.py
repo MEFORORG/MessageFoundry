@@ -27,6 +27,7 @@ from __future__ import annotations
 __lazy_modules__ = ["sqlite3", "tomllib"]
 
 import argparse
+import contextlib
 import functools
 import json
 import logging
@@ -4590,6 +4591,38 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
         return PipelineSettings().snapshot_on_send
 
 
+def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
+    """Send a print() in the author's own code to stderr for the duration of one call.
+
+    ``dryrun`` runs config modules, Routers and Handlers in this process, so a debugging print in
+    one used to land on stdout ahead of the JSON, which then would not parse. Stdout carries only
+    the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
+    ``_print_json`` still write to the real stdout (vault BACKLOG #1187)."""
+    return contextlib.redirect_stdout(sys.stderr)
+
+
+def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
+    """The text ``dryrun`` reports for an error that stopped its per-message loop.
+
+    The loop runs after the fixtures are read, so its error may come from processing a message.
+    The inbound-selection refusals are composed from connection names and keep their text: an
+    operator needs it to choose ``--inbound``. Anything else is reported by class only, because
+    ``str()`` of a ``ValueError`` or ``KeyError`` raised while reading a message can quote a field
+    value, and the IDE shows this text as written (vault BACKLOG #1187)."""
+    from messagefoundry.pipeline.dryrun import (
+        AmbiguousInboundError,
+        NoInboundError,
+        UnknownInboundError,
+    )
+
+    if isinstance(exc, (AmbiguousInboundError, NoInboundError, UnknownInboundError)):
+        return str(exc)
+    return (
+        f"dry-run stopped on an unexpected {type(exc).__name__} while processing a message; its "
+        "text is withheld because it can quote message data"
+    )
+
+
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
@@ -4600,7 +4633,8 @@ def _dryrun(args: argparse.Namespace) -> int:
         return resolved
     config_dir, service_config = resolved
     try:
-        reg = load_config(config_dir)
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
@@ -4628,23 +4662,25 @@ def _dryrun(args: argparse.Namespace) -> int:
         traced: list[dict[str, Any]] = []
         try:
             for source, path, raw in messages:
-                entry = trace_dry_run(
-                    reg,
-                    raw,
-                    inbound=args.inbound,
-                    show_phi=show_phi,
-                    snapshot_on_send=snapshot_on_send,
-                )
+                with _author_prints_to_stderr():
+                    entry = trace_dry_run(
+                        reg,
+                        raw,
+                        inbound=args.inbound,
+                        show_phi=show_phi,
+                        snapshot_on_send=snapshot_on_send,
+                    )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
-            return _emit_error(str(exc), as_json=args.json)
+            return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
         _print_json(traced, compact=args.json)
         return 0
 
     out: list[dict[str, Any]] = []
     try:
         for source, path, raw in messages:
-            result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
+            with _author_prints_to_stderr():
+                result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
             out.append(
                 {
                     "source": source,
@@ -4694,7 +4730,7 @@ def _dryrun(args: argparse.Namespace) -> int:
                 }
             )
     except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
-        return _emit_error(str(exc), as_json=args.json)
+        return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
     _print_json(out, compact=args.json)
     return 0
 

@@ -1,0 +1,16 @@
+- **An IDE error from a `--json` CLI call no longer quotes the CLI's output.** When the command's
+  stdout is not JSON, or is empty, the message now names the subcommand, its exit code and a byte
+  count, and says to run the command in a terminal to read the output. Before, the message quoted
+  the start of stdout (through Node's JSON parse error) or the whole stderr. That text could carry
+  message data, and it showed in the Live Debug lens title, the status-bar tooltip and the Test
+  Bench failure toasts. The CLI's own `{"error": ...}` body still shows as before. The paths traced
+  in `dryrun`, `validate` and `graph` build it from configuration and path facts, class-only text
+  or `safe_exc`-scrubbed text; `ide/src/cliJson.ts` lists them. (ASVS 14.2.6, vault
+  `BACKLOG #1187`)
+- **`messagefoundry dryrun` reports an unexpected error that stops its per-message loop by class
+  only.** Before, its `{"error"}` body was the exception's text, which can quote message data. The
+  inbound-selection refusals keep their text, since they name connections. (vault `BACKLOG #1187`)
+- **`messagefoundry dryrun` sends a `print()` in a config module, Router or Handler to stderr.**
+  Stdout now carries only the JSON result, so a debugging print no longer breaks the IDE's parse.
+  Nothing redacts what an author's own print writes, so stderr is no safer than stdout; see
+  [PHI.md](../docs/PHI.md). (vault `BACKLOG #1187`)
