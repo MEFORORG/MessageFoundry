@@ -34,8 +34,15 @@ from messagefoundry.parsing.xml.errors import XmlParseError, XmlSecurityError
 
 #: The ``encoding="…"`` pseudo-attribute of an XML declaration at the very start of the text (a
 #: leading BOM character is tolerated, since a ``str`` decoded from a BOM-prefixed body keeps it).
-#: Anchored and non-nested — a declaration cannot contain ``>`` — so it is linear-backtracking.
-_DECLARED_ENCODING = re.compile(r"\A(﻿?<\?xml\b[^>]*?)\s+encoding\s*=\s*(\"[^\"]*\"|'[^']*')")
+#:
+#: Linear because of the ``(?<!\s)``, not because it is anchored (BACKLOG #2561). Without it the lazy
+#: head could stop anywhere inside a whitespace run, and ``\s+`` re-walked the rest of the run from
+#: each stop: quadratic, about 0.2 s for 16,000 spaces. Slicing at the first ``>`` would not help,
+#: since the run sits inside the declaration. The lookbehind changes no match, because a stop inside a
+#: run never wins over the run's start. ``tests/test_xml_declared_encoding_regex.py`` holds both.
+_DECLARED_ENCODING = re.compile(
+    r"\A(\ufeff?<\?xml\b[^>]*?)(?<!\s)\s+encoding\s*=\s*(\"[^\"]*\"|'[^']*')"
+)
 
 
 def hardened_parser() -> Any:
