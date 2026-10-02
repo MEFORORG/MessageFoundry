@@ -69,7 +69,7 @@ Paths ride across as data to :meth:`Message.set` at run time.
 0086).** An action-list works on several message trees at once; a Handler receives one ``msg``. Before
 a list is parsed, :func:`_understood_list` decides once whether every element in it, at every depth,
 is on a small allow-list: a plain clone, a buildable ``MsgCreate``, a field write, a ``MsgLog``, a
-``MsgSend``, a ``<Block>`` whose label is prose, and a surely disabled step, each spelled in
+``MsgSend``, a ``<Block>`` with no label, and a surely disabled step, each spelled in
 exactly one canonical shape. Only then does :class:`_Binder` give each handle its own local, in
 statement order. Every other list takes the step 1 path unchanged, byte for byte.
 
@@ -1683,19 +1683,11 @@ _STRICT_TOKEN = re.compile(r"<span class='([a-z-]+)'>([^<>&]*)</span>|([^<>&]+)"
 _VALUE = re.compile(r"[ !#-%'-;=?-\[\]_-{}]*", re.ASCII)
 # ASCII only, short, and no ``/``, so a handle has one spelling, one reading and a safe local name.
 _HANDLE_NAME = re.compile(r"%[A-Za-z][A-Za-z0-9_]{0,39}", re.ASCII)
-# ``/PID-5-1``, ``/PID-5-1 (Patient Name)`` or ``/PID-5.1``: a field, never a tree node or a segment.
-_FIELD_PATH = re.compile(
-    r"/[A-Z][A-Z0-9]{2}(?:(?:-[1-9][0-9]*){1,3}(?: \([A-Za-z0-9 ]+\))?"
-    r"|-[1-9][0-9]*(?:\.[1-9][0-9]*){1,2})",
-    re.ASCII,
-)
+# ``/PID-5`` or ``/PID-5-1``: a field or a component, never a tree node, a segment, a ``(...)``
+# annotation (it may carry a mode or a repetition) or the dotted form no export is known to write.
+_FIELD_PATH = re.compile(r"/[A-Z][A-Z0-9]{2}(?:-[1-9][0-9]*){1,3}", re.ASCII)
 # The ``@Disabled`` values read as disabled with confidence. Any other value closes the gate.
 _DISABLED_SURE = frozenset({"1", "true", "yes"})
-# A ``<Block>`` label is read as prose only when it is letters, digits and spaces, and no word of it is
-# a Corepoint verb, begins like one, or has a capital past its first letter (a CamelCase verb, or a
-# handle spelled without ``%``). Whether Corepoint runs a label that is a statement is not known.
-_LABEL = re.compile(r"[A-Za-z0-9 ]*", re.ASCII)
-_VERB_FAMILIES = ("msg", "item", "seg", "env", "var", "actionlist")
 # The message-type and version a ``MsgCreate`` must name to build a valid MSH. Only the caret form of
 # the type is read: ``ADT_A01`` is also how HL7 spells a message STRUCTURE (MSH-9.3).
 _MESSAGE_TYPE = re.compile(r"([A-Z0-9]{3})\^([A-Z0-9]{3})(?:\^([A-Z0-9_]{3,7}))?")
@@ -1731,7 +1723,8 @@ def _understood_list(
 ) -> tuple[str, tuple[_Understood, ...]] | None:
     """``(input handle, elements)`` when the whole list is fully understood, else ``None``.
 
-    The list and every element enclosing it carry only ``Name`` and ``Desc``. Beyond each element's
+    Every element enclosing the list is a ``<Package>``, and the list and each of those carry only
+    ``Name`` and ``Desc``. Beyond each element's
     own shape (see :func:`_understood_body`), the list as a whole must name its handles
     unambiguously: no two spellings that differ only in case (whether Corepoint folds case is
     unverified), each handle styled the same way everywhere, at most one input handle, and no clone or
@@ -1741,6 +1734,8 @@ def _understood_list(
         if not set(node.attrib) <= {"Name", "Desc"}:
             return None
         node = parents.get(node)
+        if node is not None and node.tag != "Package":
+            return None
     if (action_list.text or "").strip():
         return None
     body = _understood_body(action_list, 0)
@@ -1774,7 +1769,8 @@ def _understood_body(container: Element, depth: int) -> tuple[_Understood, ...] 
 
     A ``<List>`` wrapper must carry no attribute and is flattened; every other child must be a
     ``<Line>`` holding one understood statement in ``@Data`` and nothing else, or a ``<Block>`` with
-    a prose label (see :data:`_LABEL`) whose body is understood too. Each may carry ``@Disabled`` only
+    no label whose body is understood too. A label is never read: whether Corepoint runs one that is a
+    statement is not known, and no word list tells prose from a verb. Each may carry ``@Disabled`` only
     with a sure value. No element may hold text outside its attributes. Tags are matched exactly, so a
     namespaced or differently cased tag is not understood.
 
@@ -1804,7 +1800,7 @@ def _understood_body(container: Element, depth: int) -> tuple[_Understood, ...] 
             if statement is None:
                 return None
             found.append(_Understood(child, statement, (), disabled))
-        elif child.tag == "Block" and _prose_label(data):
+        elif child.tag == "Block" and not data:
             inner = _understood_body(child, depth + 1)
             if inner is None:
                 return None
@@ -1812,18 +1808,6 @@ def _understood_body(container: Element, depth: int) -> tuple[_Understood, ...] 
         else:
             return None
     return tuple(found)
-
-
-def _prose_label(data: str) -> bool:
-    """Whether a ``<Block>`` label is provably not a statement (see :data:`_LABEL`)."""
-    if not _LABEL.fullmatch(data):
-        return False
-    return not any(
-        word.lower() in _KIND_BY_VERB
-        or word.lower().startswith(_VERB_FAMILIES)
-        or any(c.isupper() for c in word[1:])
-        for word in data.split()
-    )
 
 
 def _canonical(tokens: list[tuple[str, str]]) -> str:
@@ -1940,8 +1924,7 @@ class _Binder:
                 # Never runs, so it touches no handle: step 1 renders it as commented-out source.
                 steps.extend(_parse_statement(item.elem, *self._preview, False))
             elif item.statement is None:
-                label = _attr(item.elem, "Data") or "Block"
-                steps.append(Control("block", "Block", label, body=self.run(item.body)))
+                steps.append(Control("block", "Block", "Block", body=self.run(item.body)))
             else:
                 steps.append(self._statement(item.statement))
         return tuple(steps)
@@ -2075,6 +2058,13 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
     # ElementTree carries no parent link, so build one pass of child→parent up front: an <ActionList>
     # is switched off by @Disabled on ITSELF or on any element enclosing it (typically <Package>).
     parents = {child: parent for parent in root.iter() for child in parent}
+    # A list another list may call runs when and as often as its caller runs it, which the router
+    # cannot express: so in a package that may call any list, no list is fully understood.
+    calls = any(
+        _local(elem.tag).lower() == "call"
+        or any("actionlistcall" in value.lower() for value in elem.attrib.values())
+        for elem in root.iter()
+    )
 
     handlers: list[Handler] = []
     taken: set[str] = {"route"}
@@ -2094,7 +2084,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
         # The whole-list gate (BACKLOG #313 step 2, ADR 0086): decided ONCE, for the whole list. A
         # list it does not fully understand takes the step 1 path below untouched, so its output is
         # step 1's byte for byte; there is no partial binding.
-        understood = _understood_list(action_list, parents) if scope is None else None
+        understood = _understood_list(action_list, parents) if scope is None and not calls else None
         subject, held = _message_handles(action_list)
         if understood is not None:
             steps = _Binder(understood[0], subject, held).run(understood[1])

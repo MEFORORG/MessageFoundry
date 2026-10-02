@@ -1641,6 +1641,8 @@ def test_an_enclosing_element_with_an_unread_attribute_closes_the_gate() -> None
             id="a-lowercase-verb",
         ),
         pytest.param('<Block Data="itemclear OUT"><List></List></Block>', id="a-verb-label"),
+        pytest.param('<Block Data="Section"><List></List></Block>', id="any-block-label"),
+        pytest.param(_write("other-handle", "%OUT", "Q", "/MSH-6 (Facility)"), id="a-path-note"),
         pytest.param('<If Data="If (x)"><List></List></If>', id="any-construct"),
         pytest.param('<Line Data="ItemClear %ADT/PID-19"/>', id="a-markup-free-statement"),
     ],

@@ -141,6 +141,7 @@ class Write:
     lit: str
     path: str = "/PID-8"
     markup: bool = True
+    verb: str = "ItemCopy"  # ItemCopy | ItemAppend | ItemClear (which ignores ``lit``)
 
 
 @dataclass(frozen=True)
@@ -366,10 +367,14 @@ def _leaf_data(node: Node, inp: str) -> str | None:
                 tail = f" version {_lit('2.5.1')}" if good else ""
                 return f"{_kw('MsgCreate')} {_hs(h, inp)} as {_lit(kind)}{tail}"
             return f'MsgCreate {h.name} as "{kind}"' + (' version "2.5.1"' if good else "")
-        case Write(h, lit, path, markup):
+        case Write(h, lit, path, markup, verb):
+            if verb == "ItemClear":
+                if markup:
+                    return f"{_kw(verb)} {_hs(h, inp)}{_span('path', path)}"
+                return f"{verb} {h.name}{path}"
             if markup:
-                return f"{_kw('ItemCopy')} {_lit(lit)} to {_hs(h, inp)}{_span('path', path)}"
-            return f'ItemCopy "{lit}" to {h.name}{path}'
+                return f"{_kw(verb)} {_lit(lit)} to {_hs(h, inp)}{_span('path', path)}"
+            return f'{verb} "{lit}" to {h.name}{path}'
         case Log(h, markup):
             return f"{_kw('MsgLog')} {_hs(h, inp)}" if markup else f"MsgLog {h.name}"
         case SendS(h, dest, markup):
@@ -528,8 +533,7 @@ def _h(n: int) -> str:
 _R = r"<span class='path'>/</span>"
 _F = (
     r"<span class='path'>/(?:MSH-(?![12](?![0-9]))|(?:EVN|PID|PD1|PV1|PV2|MRG|ACC|UB1|UB2)-)"
-    r"(?:[1-9][0-9]*(?:-[1-9][0-9]*){0,2}(?: \([A-Za-z0-9 ]+\))?|[1-9][0-9]*(?:\.[1-9][0-9]*){1,2})"
-    r"</span>"
+    r"[1-9][0-9]*(?:-[1-9][0-9]*){0,2}</span>"
 )
 # A written value: printable ASCII less the quote, the markup characters and the HL7 delimiters.
 _VAL = r"<span class='literal'>\"(?P<v>(?:(?![\"&<>\\^|~])[ -~])*)\"</span>"
@@ -593,18 +597,6 @@ def _g_statement(data: str, handles: list[tuple[str, str]], writes: list[str]) -
     return False
 
 
-def _g_label(data: str) -> bool:
-    if not re.fullmatch(r"[A-Za-z0-9 ]*", data):
-        return False
-    for word in data.split():
-        low = word.lower()
-        if low in _G_CONTROL_WORDS or re.match(r"(msg|item|seg|env|var|actionlist)", low):
-            return False
-        if word[1:] != word[1:].lower():
-            return False
-    return True
-
-
 def _fully_understood(xml: str) -> bool:
     """Whether every element of the list, at every depth, is on the allow-list (ADR 0086)."""
     from messagefoundry._vendor.defusedxml.ElementTree import fromstring
@@ -634,7 +626,7 @@ def _fully_understood(xml: str) -> bool:
             if child.tag == "Line":
                 if len(child) or not _g_statement(data, handles, writes):
                     return False
-            elif child.tag != "Block" or not _g_label(data) or not walk(child):
+            elif child.tag != "Block" or data or not walk(child):
                 return False
         return True
 
@@ -780,11 +772,17 @@ class _Oracle:
                 env.vals[self.key(dst.name)] = frozenset(new)
             case Create(h, k, good, _):
                 env.vals[self.key(h.name)] = frozenset({("create", k) if good else UNK})
-            case Write(h, lit, path, _):
+            case Write(h, lit, path, _, verb):
                 key = self.key(h.name)
                 vals = env.get(key)
                 for v in vals - {UNK, EMPTY}:
-                    self.lits.setdefault(v, {})[path] = lit
+                    fields = self.lits.setdefault(v, {})
+                    if verb == "ItemClear":
+                        fields[path] = ""
+                    elif verb == "ItemAppend":
+                        fields[path] = fields.get(path, "") + lit
+                    else:
+                        fields[path] = lit
                 if EMPTY in vals:  # a write into nothing may build a tree
                     env.vals[key] = (vals - {EMPTY}) | {UNK}
             case Log():
@@ -792,7 +790,8 @@ class _Oracle:
             case SendS(h, dest, _):
                 self.sends.setdefault(dest, set()).update(env.get(self.key(h.name)))
                 for v in env.get(self.key(h.name)):
-                    self.sent_lits.setdefault(dest, set()).update(self.lits.get(v, {}).values())
+                    text = "".join(self.lits.get(v, {}).values())
+                    self.sent_lits.setdefault(dest, set()).update(_LITERAL.findall(text))
                 self.send_keys.setdefault(dest, set()).add(self.key(h.name))
                 if ctx.dead and not env.ended:
                     self.dead.add(dest)
@@ -937,7 +936,9 @@ def _kind(value: Val) -> str:
 
 # --- running both importers -----------------------------------------------------------------------
 
-_INPUT = "MSH|^~\\&|A|B|C|D|20260930||ADT^A01|CTRL|P|2.5.1\rPID|1||123\rOBX|1|ST|X||Y"
+_INPUT = (
+    "MSH|^~\\&|A|B|C|D|20260930||ADT^A01|CTRL|P|2.5.1\rEVN|A01\rPID|1||123\rPV1|1|I\rOBX|1|ST|X||Y"
+)
 _LITERAL = re.compile(r"W\d+Z")
 
 
@@ -951,8 +952,7 @@ class _Run:
     inp: Message | None
 
 
-def _execute(module: Any, xml: str, where: Path) -> _Run:
-    src, _ = _generate(module, xml)
+def _execute(src: str, where: Path) -> _Run:
     if not src:
         return _Run("", [], None)
     registry = Registry()
@@ -1048,16 +1048,22 @@ def _violations(shape: Shape) -> list[str]:
     found: list[str] = []
     if not step1_out[0]:
         found.append("(refusal) step 1 refuses the list, and the head renders it")
+    if not head_out[0]:
+        found.append("(refusal) the head refuses a list step 1 renders")
     if not _fully_understood(xml):
         found.append("(gate) the head differs from step 1 on a list that is not fully understood")
-    return found + _oracle_violations(shape, xml)
+    return found + _oracle_violations(shape, head_out[0], step1_out[0])
 
 
-def _oracle_violations(shape: Shape, xml: str) -> list[str]:
-    """Every way the head's handler for ``shape`` fails open against step 1 and the oracle."""
+def _oracle_violations(shape: Shape, head_src: str, step1_src: str) -> list[str]:
+    """Every way the head's handler for ``shape`` fails open against step 1 and the oracle.
+
+    Run only where the head differs from step 1, so nothing step 1 also renders is exempt: every
+    live send of the head must be provable, and every message it delivers must carry exactly the
+    literals its tree held at the send."""
     verdict = _oracle(shape)
-    out_head = _execute(head, xml, _WHERE)
-    out_step1 = _execute(step1, xml, _WHERE)
+    out_head = _execute(head_src, _WHERE)
+    out_step1 = _execute(step1_src, _WHERE)
     found: list[str] = []
 
     def provable(dest: str, local_is_msg: bool) -> str:
@@ -1088,7 +1094,6 @@ def _oracle_violations(shape: Shape, xml: str) -> list[str]:
             found.append(f"(level) a local is bound or sent below the handler level: {line}")
 
     # Every live send line of the head, on every path.
-    step1_live = {(d, local) for _, d, local in _live_sends(out_step1.src)}
     for _, dest, local in _live_sends(out_head.src):
         is_msg = local == "msg"
         if is_msg:
@@ -1099,8 +1104,6 @@ def _oracle_violations(shape: Shape, xml: str) -> list[str]:
             values = verdict.sends.get(dest, set())
             if values and not values & {IN, UNK, EMPTY}:
                 found.append(f"(iii) {dest} sends msg where the export sends another tree")
-        if (dest, local) in step1_live:
-            continue  # step 1 renders the same live send: not a change step 2 made
         if dest in verdict.doubt:
             found.append(f"(ii) {dest} sends {local} live where the import lost the scope")
             continue
@@ -1113,11 +1116,8 @@ def _oracle_violations(shape: Shape, xml: str) -> list[str]:
 
     # (i) and (ii), executed on the path where every placeholder condition is false.
     if out_head.sends:
-        delivered = {(d, _observed(m, out_step1.inp)) for d, m in out_step1.sends}
         for dest, message in out_head.sends:
             seen = _observed(message, out_head.inp)
-            if (dest, seen) in delivered:
-                continue
             if dest not in verdict.dead:
                 found.append(f"(ii) {dest} is delivered, but the export sends it only in a branch")
                 continue
@@ -1424,11 +1424,16 @@ def _random_shapes(seed: int, count: int) -> Iterator[Shape]:
 # --- shapes the gate is meant to open -------------------------------------------------------------
 #
 # The constructs above all close the gate, so on their own they test only byte-identity. These draw
-# from the allow-list alone (straight-line statements, prose Blocks, surely disabled steps) with
+# from the allow-list alone (straight-line statements, unlabelled Blocks, surely disabled steps) with
 # handles the gate reads, so the gate opens and the oracle's checks do the work. One in four also
 # carries ONE spoiler, an element just outside the allow-list, so the gate's edge is tested too.
 
 _SAFE_OTHERS = ("%OUT", "%NEW", "%OUT_A", "%X1", "%Tmp")
+
+
+# Fields and components of segments the synthetic input carries, none inside another.
+# /PID-8 twice, so a later write to a field it already wrote is common.
+_OPEN_PATHS = ("/PID-8", "/PID-8", "/MSH-10", "/PID-5-1", "/PV1-2", "/EVN-1")
 
 
 class _OpenBuild(_Build):
@@ -1439,11 +1444,15 @@ class _OpenBuild(_Build):
         self.variant = False
         self.mode = "role"
 
+    def write(self, h: H) -> Write:
+        verb = self.rng.choice(("ItemCopy", "ItemCopy", "ItemAppend", "ItemClear"))
+        return Write(h, f"W{self._next()}Z", self.rng.choice(_OPEN_PATHS), True, verb)
+
 
 def _spoiler(b: _OpenBuild) -> Node:
     """One element just outside the allow-list."""
     o = b.out
-    w = _leaf_data(b.write(o), b.inp.name)
+    w = _leaf_data(Write(o, f"W{b._next()}Z"), b.inp.name)
     s = _leaf_data(b.send(o), b.inp.name)
     assert w is not None and s is not None
     return b.rng.choice(
@@ -1474,7 +1483,7 @@ def _open_node(b: _OpenBuild, depth: int) -> Node:
     roll = rng.random()
     if depth > 0 and roll < 0.12:
         body = tuple(_open_node(b, depth - 1) for _ in range(rng.randint(1, 3)))
-        return Block(body, rng.choice(("Section", "Patient identity", "")))
+        return Block(body, "")
     if roll < 0.18:
         return Off(_open_node(b, 0), rng.choice(("1", "true", "yes")))
     return rng.choice(
@@ -2018,6 +2027,33 @@ def _gate_review_shapes() -> Iterator[Shape]:
             "%ADT",
             (clone, Write(out, value), SendS(out, "OB_OUT")),
         )
+    # Round 2 of the same review: a label read as prose, and a path annotation or spelling.
+    for label in ("Section", "While x", "raisesalert", "Raisesalert", "endif", "exit"):
+        yield Shape(
+            f"gate-review-label-{label}",
+            "%ADT",
+            (clone, Block((SendS(out, "OB_OUT"),), label, havoc=True)),
+        )
+    for path in ("/PID-8 (replace all)", "/PID-3 (2)", "/PID-5.1", "/MSH-6 (Receiving Facility)"):
+        for verb in ("ItemCopy", "ItemAppend", "ItemClear"):
+            yield Shape(
+                f"gate-review-path-{verb}-{path}",
+                "%ADT",
+                (clone, Write(out, "W8Z", path, True, verb), SendS(out, "OB_OUT")),
+            )
+    # Each write verb over a field already written, on a clone and on msg.
+    for target, sent in ((out, "OB_OUT"), (_ADT, "OB_IN")):
+        for verb in ("ItemAppend", "ItemClear", "ItemCopy"):
+            yield Shape(
+                f"gate-review-{verb}-over-a-write-{sent}",
+                "%ADT",
+                (
+                    clone,
+                    Write(target, "W1Z"),
+                    Write(target, "W2Z", "/PID-8", True, verb),
+                    SendS(target, sent),
+                ),
+            )
     for depth in (12, 34, 40, 49):
         nested: Node = Block((clone, SendS(out, "OB_OUT")))
         for _ in range(depth - 1):
@@ -2061,6 +2097,69 @@ def test_open_gate_shapes_are_well_represented() -> None:
     bound = [s for s in understood if "_msg = " in _generate(head, _render(s.nodes, s.inp))[0]]
     assert len(understood) >= 1500
     assert len(bound) >= 1000
+
+
+def _generate_text(module: Any, text: str) -> tuple[str, tuple[object, ...]]:
+    try:
+        channel = module.parse_package(text)[0]
+    except module.CorepointImportError:
+        return "", ()
+    counts = tuple(module._count_steps(h.steps, in_loop=False) for h in channel.handlers)
+    return module.generate_module(channel), counts
+
+
+_SUB = _render((Create(_OUT, 4), SendS(_OUT, "OB_OUT")), "%ADT")
+_CALL = _line(f"{_kw('ActionListCall')} {_lit('Sub')}")
+
+
+@pytest.mark.parametrize(
+    "package",
+    [
+        pytest.param(
+            '<Package Name="A"><ActionList Name="Main"><List><If Data="If (x)"><List>'
+            + _CALL
+            + '</List></If></List></ActionList><ActionList Name="Sub"><List>'
+            + _SUB
+            + "</List></ActionList></Package>",
+            id="a-list-another-list-calls",
+        ),
+        pytest.param(
+            '<Package Name="A"><ActionList Name="Main"><List><Call Data="Sub"><Actions/></Call>'
+            '</List></ActionList><ActionList Name="Sub"><List>'
+            + _SUB
+            + "</List></ActionList></Package>",
+            id="a-call-tag-anywhere",
+        ),
+        pytest.param(
+            '<Package Name="A"><ActionList Name="Outer"><List><Loop><List><ActionList Name="Sub">'
+            "<List>" + _SUB + "</List></ActionList></List></Loop></List></ActionList></Package>",
+            id="a-list-nested-in-a-loop",
+        ),
+        pytest.param(
+            '<Package Name="A"><ActionList Name="Outer"><List><Line><List><ActionList Name="Sub">'
+            "<List>" + _SUB + "</List></ActionList></List></Line></List></ActionList></Package>",
+            id="a-list-nested-in-a-line",
+        ),
+        pytest.param(
+            '<Foreach><ActionList Name="Sub"><List>' + _SUB + "</List></ActionList></Foreach>",
+            id="a-root-that-is-no-package",
+        ),
+        pytest.param(
+            '<Package Name="A" Enabled="false"><ActionList Name="Sub"><List>'
+            + _SUB
+            + "</List></ActionList></Package>",
+            id="an-unread-attribute-on-the-package",
+        ),
+    ],
+)
+def test_the_package_around_a_list_can_close_its_gate(package: str) -> None:
+    """The shapes above all sit in one fixed package frame. These do not: a list another list may
+    call, a list nested in another list's construct, a root that is no package, and an unread
+    attribute on the package. Each renders exactly as step 1 renders it (code review of the gate,
+    round 2). The control: the same list alone in a plain package opens the gate."""
+    assert _generate_text(head, package) == _generate_text(step1, package)
+    plain = f'<Package Name="A"><ActionList Name="Sub"><List>{_SUB}</List></ActionList></Package>'
+    assert _generate_text(head, plain) != _generate_text(step1, plain)
 
 
 def test_the_walker_tells_the_gate_apart_on_its_own_seeds() -> None:

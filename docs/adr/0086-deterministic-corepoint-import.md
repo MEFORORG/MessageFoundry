@@ -217,7 +217,7 @@ verb's one shape, character for character:
 | `ItemClear` | keyword verb, handle, a writable HL7 field path |
 | `MsgLog` | keyword verb, one handle |
 | `MsgSend` | keyword verb, one handle, `to connection`, a non-blank destination literal |
-| `<Block>` | a label of letters, digits and spaces, no word of which is a Corepoint verb, begins like one (`msg`, `item`, `seg`, `env`, `var`, `actionlist`), or has a capital past its first letter |
+| `<Block>` | no label: `@Data` absent or empty |
 | a surely disabled step | a `<Line>` or `<Block>` above with `@Disabled` of `1`, `true` or `yes` |
 | `<List>` | no attribute; flattened |
 
@@ -227,12 +227,18 @@ exactly so, and connectives are unstyled words. The canonical spelling quotes ea
 spacing, quoting or adjacency is not understood. A written value is printable ASCII with no `"`,
 `&`, `<`, `>` or HL7 delimiter (`|`, `^`, `~`, `\`). A handle is an `input-handle` or `other-handle`
 span matching `%` plus up to 40 ASCII letters, digits and underscores. A field path is `/SEG-F`,
-optionally with up to two more `-n` coordinates and a `(label)`, or the dotted form, on a
-single-occurrence segment and never MSH-1 or MSH-2. Spans carry only plain text: no nesting, no
-entity, no attribute but `class`. Across the list, no two handle spellings may differ only in case,
-each handle carries one span class everywhere, there is at most one input handle, and no clone or
-`MsgCreate` writes the input. The `<ActionList>` and every element enclosing it carry only `Name`
-and `Desc`. Tags are matched exactly, so a namespaced or differently cased tag is not understood. A
+optionally with up to two more `-n` coordinates, on a single-occurrence segment and never MSH-1 or
+MSH-2. A `(...)` annotation after it may carry a mode or a repetition, and no export is known to
+write the dotted form, so neither is understood. A `<Block>` label is never read: whether Corepoint
+runs a label that is a statement is not known, and no word list tells prose from a verb. Spans
+carry only plain text: no nesting, no entity, no attribute but `class`. Across the list, no two
+handle spellings may differ only in case, each handle carries one span class everywhere, there is
+at most one input handle, and no clone or `MsgCreate` writes the input. Every element enclosing the
+`<ActionList>` is a `<Package>`, and the list and each of those carry only `Name` and `Desc`. **In a
+package that may call any list** (a `<Call>` tag, or any attribute naming `ActionListCall`), **no
+list is fully understood:** a called list runs when and as often as its caller runs it, and the
+router, which forwards to every handler, cannot express that. Tags are matched exactly, so a
+namespaced or differently cased tag is not understood. A
 list nested more than 25 `<List>` and `<Block>` levels deep is not understood either, so a depth
 step 1 refuses is refused the same way.
 
@@ -241,7 +247,12 @@ step 1 refuses is refused the same way.
 unmodelled element, anywhere in the list. At least these also make the list NOT fully understood:
 a lowercase or variant verb, a `description`, `comment` or `detail` span on a statement line, any
 attribute but the ones above (`Enabled`, `Comment`, unknown names), a markup-free statement, a path
-such as `//ADT`, and a `<Block>` label wrapped in a span. When in doubt, it is not.
+such as `//ADT`, a path annotation, and any `<Block>` label. When in doubt, it is not.
+*Corrected 2026-10-01 (code review of the gate, round 2):* a `<Block>` with a prose label, a path
+with a `(...)` annotation, a dotted path, a list another list calls, and a list nested in another
+list's construct each opened the gate. A label such as `While x` or a path such as
+`/PID-8 (replace all)` passed the word rules, and a called sub-list became a handler that built and
+sent its message for every inbound message.
 
 **A list that is not fully understood renders exactly as step 1 renders it,** byte for byte, with the
 same summary counts: the importer runs step 1's code path on it, untouched, so there is no partial
@@ -299,27 +310,35 @@ finds the list fully understood AND every oracle check passes. The oracle is an 
 over the shape, in a case-sensitive and a case-insensitive reading of handle names. It says which
 trees the export may send at each `MsgSend`, and which literals each tree held at the send. Both
 handlers run against one synthetic input, past every refusal, and the guard fails when the head
-renders a list step 1 refuses, delivers a tree the oracle cannot prove, sends `msg` for another
-handle, sends a message carrying a literal its tree did not hold at the send or lacking one it did,
-lifts a send out of a branch, or binds a local below the handler's level. The walker matches each
+renders a list step 1 refuses or refuses one step 1 renders, delivers a tree the oracle cannot
+prove, sends `msg` for another handle, sends a message carrying a literal its tree did not hold at
+the send or lacking one it did, lifts a send out of a branch, or binds a local below the handler's
+level. Where the head differs from step 1, none of these checks exempts a send step 1 also makes,
+so a write leaking into `msg` is caught too. The oracle applies `ItemCopy`, `ItemAppend` and
+`ItemClear` to the field each names. The battery's shapes all sit in one package frame, so a
+separate test checks that a called list, a list nested in another list's construct, a root that is
+no `<Package>`, and an unread package attribute each render exactly as step 1. The walker matches each
 statement against one whole-string template per verb rather than walking tokens as the importer
 does, so the two read the specification by different methods.
 
-The battery holds 7,763 shapes, measured 2026-10-01: 307 fixed seeds (every repro from every review
-of PR 1900 and every Lander repro, the 23 round-3 shapes and the gate review's 17 among them), 4,056
+The battery holds 7,787 shapes, measured 2026-10-01: 331 fixed seeds (every repro from every review
+of PR 1900 and every Lander repro, the 23 round-3 shapes and the gate review's 41 among them), 4,056
 ordered construct pairs, 1,000 random shapes and 2,400 drawn from the allow-list alone, a quarter of
-those carrying one spoiler just off it. The guard's walker finds 1,847 fully understood, the head
-binds a local in 1,233 of them, and the head's output differs from step 1 in 1,812. At this head it
-fails none. Nine mutation arms each fail it: dropping the write-after-send rule (38 shapes),
-tolerating prose spans (68), folding verb case (33), accepting any `<Block>` label (80), ignoring
+those carrying one spoiler just off it. The guard's walker finds 1,686 fully understood, the head
+binds a local in 1,088 of them, and the head's output differs from step 1 in 1,656. At this head it
+fails none. Each mutation arm tried fails it. Measured in the first review round: dropping the
+write-after-send rule (38 shapes), tolerating prose spans (68), folding verb case (33), ignoring
 `Enabled` and `Comment` attributes (80), sending `msg` for an unknown handle (1,042), keeping a
 handle after a declined write to its skeleton (21), tolerating whitespace (4), and dropping the
-depth bound (3). Against the previous head, 6fa49a9d5, it fails 5,937 of the first 7,746, including
-20 of the 23 round-3 seeds.
+depth bound (3). In the second: accepting any `<Block>` label (2,312), accepting path annotations
+and the dotted form (12), landing a write to an unbound handle on `msg` (180), rendering
+`ItemAppend` as a set (4), and dropping `ItemClear` (2). The package-frame test fails on dropping
+the call rule (2 of 6 frames) or the ancestor rule (3 of 6). Against the previous head, 6fa49a9d5,
+the first battery of 7,746 shapes failed 5,937, including 20 of the 23 round-3 seeds.
 
 **Unverified assumptions, shared by the importer and the oracle.** At least these: that
 `MsgTreeCopy %A/ to %B/` makes B a copy of A; that `MsgSend` leaves its handle holding the message it
-sent; that a `<Block>` label written in plain prose is never run as a statement; that a `@Disabled`
+sent; that a `<Block>` with no label runs its body once, in line; that a `@Disabled`
 value of `1`, `true` or `yes` means the step never runs; and that `MsgCreate` and `MsgSend` stamp no
 header field the skeleton lacks, such as MSH-7, MSH-10 or MSH-11. If Corepoint stamps those, a built
 message goes out without them, and the generated module does not flag it. Each was read from the
