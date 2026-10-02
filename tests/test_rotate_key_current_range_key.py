@@ -68,10 +68,12 @@ async def _verify(path: Path, active: str, retired: tuple[str, ...] = ()) -> boo
 
 
 async def _epoch_rows(path: Path, active: str) -> int:
+    """How many range rows a roll has written: every key-epoch row after the genesis row."""
     store = await _open(path, active)
     try:
         cur = await store._db.execute(
-            "SELECT COUNT(*) AS n FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
+            "SELECT COUNT(*) AS n FROM audit_log WHERE action=? AND seq > 1",
+            (AUDIT_KEY_EPOCH_ACTION,),
         )
         row = await cur.fetchone()
         assert row is not None

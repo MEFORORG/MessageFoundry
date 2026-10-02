@@ -862,19 +862,19 @@ async def test_no_row_at_all_is_still_unobservable(monkeypatch: pytest.MonkeyPat
     assert "returned no row" in report.detail
 
 
-# Owner ruling R16 (ASVS 16.4.2): the runtime login holds INSERT and SELECT only on the audit tables.
+# Owner ruling R16 (ASVS 16.4.2): the runtime login holds INSERT and SELECT only on the audit table.
 
 
 @pytest.mark.parametrize(
     ("mode", "expected"),
-    [(None, ("DELETE on table audit_chain_meta",)), (SchemaManagement.AUTO, ())],
+    [(None, ("DELETE on table audit_log",)), (SchemaManagement.AUTO, ())],
     ids=["external", "auto"],
 )
 async def test_sqlserver_probe_names_an_audit_table_delete_under_external(
     monkeypatch: pytest.MonkeyPatch, mode: SchemaManagement | None, expected: tuple[str, ...]
 ) -> None:
     row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
-    row[audit_write_alias("audit_chain_meta", "DELETE")] = 1
+    row[audit_write_alias("audit_log", "DELETE")] = 1
     store = _sqlserver_probe(monkeypatch, row, schema_management=mode)
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.OBSERVED

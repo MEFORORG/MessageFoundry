@@ -51,6 +51,7 @@ def emit_audit_tee(
     detail: str | None,
     ts: float,
     row_id: int,
+    seq: int,
     row_hash: str,
     client: str | None = None,
 ) -> None:
@@ -58,29 +59,33 @@ def emit_audit_tee(
     16.x). Emits actor / action / channel / client address / timestamp / chain anchor plus a
     **redacted** ``detail`` to the ``messagefoundry.audit`` logger.
 
-    ``row_id`` and ``row_hash`` are the just-committed row's primary key and its chain hash -- the
-    ANCHOR fields (BACKLOG #1198). They are required, not optional: an anchor that could be omitted
-    silently would make an off-box copy with no anchor indistinguishable from one whose writer chose
-    not to send it. Neither carries PHI directly and neither discloses a key: the id is a counter and
-    ``row_hash`` is a digest, or under #190 keying an HMAC.
+    ``seq`` and ``row_hash`` are the just-committed row's sequence number and its chain hash -- the
+    ANCHOR fields (BACKLOG #1198). ``seq`` is the row's position in the chain and is inside its MAC,
+    so it is the SAME number ``audit-anchor`` prints and ``audit-verify`` takes: a collector's last
+    ``seq`` and ``row_hash`` can be passed back as an anchor unchanged (vault BACKLOG #2594). They
+    are required, not optional: an anchor that could be omitted silently would make an off-box copy
+    with no anchor indistinguishable from one whose writer chose not to send it. ``row_id`` is the
+    row's primary key, sent so a reader can find the row; it is not a chain coordinate, and it may
+    skip numbers where ``seq`` never does. None of the three carries PHI directly or discloses a key:
+    two are counters and ``row_hash`` is a digest, or on a keyed chain an HMAC.
 
     **One residual, stated because "the head hash carries nothing" is very slightly too strong.** In
     the keyless posture ``row_hash`` is a plain SHA-256 over a canonical list whose every other
     member -- the previous row's hash, ``ts``, ``actor``, ``action``, ``channel_id``, ``client`` --
     travels in this same record or the one before it. So for a record whose ``detail`` ``safe_text``
-    actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess.
+    actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess
+    (``seq`` travels in the record too).
     That is narrow (it needs an exact byte-for-byte reconstruction of a redacted exception string, and
     an audit ``detail`` that was not HL7-shaped is forwarded unredacted anyway, so there is nothing left
-    to guess). It does not arise for a row written after the chain is keyed, where the digest is an
-    HMAC under a DEK-derived subkey or a Transit MAC. Keyless is not the shipped default. But a store
-    key does not by itself key a chain whose first row was written keyless, and rows written before
-    the chain was keyed keep their plain SHA-256. The "Audit chain" row in
-    ``docs/ASVS-L2-PHASE0-CHANGES.md`` says when a chain is keyed. It is recorded here rather than
-    left for a reader to rediscover.
+    to guess). It does not arise for a row written by a process that holds a key, where the digest is
+    an HMAC under a DEK-derived subkey or a Transit MAC. Keyless is not the shipped default. A row
+    written without a key keeps its plain SHA-256: no later open re-keys it, and a keyed process
+    reports it as a break. The "Audit chain" row in ``docs/ASVS-L2-PHASE0-CHANGES.md`` says when a
+    chain is keyed. It is recorded here rather than left for a reader to rediscover.
 
     **What the anchor fields do and do not buy, stated here so nobody over-reads them.** A within-store
     chain walk cannot see TAIL truncation -- deleting the newest rows leaves a prefix that still
-    verifies -- so an off-box record of ``(row_id, row_hash)`` is the witness that the chain once
+    verifies -- so an off-box record of ``(seq, row_hash)`` is the witness that the chain once
     reached that length with that head. That witness is only as good as the hop it travels. The default
     forwarder is lossy by
     :func:`~messagefoundry.logging_setup.configure_logging`'s own account: UDP is fire-and-forget; a
@@ -128,6 +133,7 @@ def emit_audit_tee(
         # fields so a SIEM can index them without parsing the redacted blob. See the docstring for
         # what they close and what the default transport leaves open.
         "row_id": row_id,
+        "seq": seq,
         "row_hash": row_hash,
         # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
         "detail": safe_text(detail) if detail else None,

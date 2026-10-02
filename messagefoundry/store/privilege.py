@@ -151,15 +151,17 @@ def refusal_reason(*, require_least_privilege: bool) -> str:
     )
 
 
-# --- the audit tables are append-only for the runtime login (owner ruling R16, ASVS 16.4.2) -----
-#: The two tables the runtime login may only INSERT into and SELECT from. ``audit_log`` is the hash
-#: chain; ``audit_chain_meta`` is its single keying-watermark row, written once when keying starts and
-#: never changed after (a key rotation appends an ``audit_log`` row instead, BACKLOG #1904). So the
-#: engine's own write paths need no UPDATE or DELETE on either, and a login that holds one could
-#: rewrite or drop audit rows on a first deployment. Under ``[store].schema_management = external``
-#: each such right is excess. Under ``auto`` it is not counted: the Postgres login OWNS the tables
-#: there and may grant itself any right back, and the SQL Server login holds ``db_ddladmin``.
-AUDIT_APPEND_ONLY_TABLES: tuple[str, ...] = ("audit_log", "audit_chain_meta")
+# --- the audit table is append-only for the runtime login (owner ruling R16, ASVS 16.4.2) -------
+#: The tables the runtime login may only INSERT into and SELECT from. ``audit_log`` is the hash chain,
+#: and it is the whole of the audit record: the genesis row that names the first key, and every later
+#: key range, are rows inside it (BACKLOG #1904, vault BACKLOG #2594). R16 as first ruled also listed
+#: ``audit_chain_meta``; the owner amended the ruling on 2026-10-01 when that table was removed. So the
+#: engine's own write paths need no UPDATE or DELETE here, and a login that holds one could rewrite or
+#: drop audit rows on a first deployment. Under ``[store].schema_management = external`` each such
+#: right is excess. Under ``auto`` it is not counted: the Postgres login OWNS the table there and may
+#: grant itself any right back, and the SQL Server login holds ``db_ddladmin``. A tuple, so a later
+#: append-only table joins the probe by being named here.
+AUDIT_APPEND_ONLY_TABLES: tuple[str, ...] = ("audit_log",)
 
 #: The row-changing rights probed on each append-only table. This is at least the direct routes, not
 #: every route: Postgres ``TRUNCATE`` empties a table without ``DELETE``, and ``TRIGGER`` lets a role

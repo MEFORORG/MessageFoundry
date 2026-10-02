@@ -134,9 +134,6 @@ from messagefoundry.store.store import (
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
-    AUDIT_ALL_ROWS,
-    AUDIT_CHAIN_META_ROW_CHANGED,
-    AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
@@ -149,8 +146,8 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_MANUAL,
     AlertInstance,
     AlertSummary,
+    AppendedAuditRow,
     AuditAppend,
-    AuditHeadMovedError,
     CapturedResponse,
     ChannelScopeSource,
     ClaimAbortPhase,
@@ -193,16 +190,14 @@ from messagefoundry.store.store import (
     _qmark_cutoff_case,
     _session_cap_groups,
     _session_live_params,
-    audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
-    audit_rekey_refused,
-    audit_rekey_when_keyed,
-    audit_row_hash,
+    audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
     check_password_generated,
     delivery_key,
+    load_audit_chain,
     lockout_arms,
     lockout_clear_set,
     lockout_escalates,
@@ -213,10 +208,8 @@ from messagefoundry.store.store import (
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
-    settle_audit_ranges,
     should_record_event,
     verify_audit_rows,
-    warn_unkeyed_audit_chain,
 )
 from messagefoundry.support.redact import redact_log_line
 
@@ -1778,27 +1771,24 @@ _SCHEMA: list[str] = [
     # unchained row has no legitimate producer. See the SQLite `_SCHEMA` for the full reasoning. The
     # `IF COL_LENGTH(...) ADD row_hash` shim that used to sit below is gone with it — it added the
     # column as NULLable for stores written before hash-chaining, a population that does not exist.
+    # `seq` is the row's position in the hash chain: 1, then rising by one, with no gap. It is inside
+    # the row's MAC and is what an anchor and the off-box tee name a row by. `id` is only the surrogate
+    # key: IDENTITY can skip values. UNIQUE, so two appends can never take one position. The CHECK
+    # refuses a row below position 1 to a role that cannot alter the table. Whoever owns the table can
+    # drop or disable it, so every reader of `seq` still treats the value as untrusted. `id` stays the
+    # clustered key: the audit listings read newest-first by `id`, and the append's head read is one
+    # seek on the UNIQUE index. The chain walk reads in `seq` order through that index.
     """IF OBJECT_ID('audit_log','U') IS NULL CREATE TABLE audit_log (
-        id INT IDENTITY(1,1) PRIMARY KEY, ts FLOAT NOT NULL, actor NVARCHAR(256) NULL,
+        id INT IDENTITY(1,1) PRIMARY KEY, seq BIGINT NOT NULL UNIQUE CHECK (seq >= 1),
+        ts FLOAT NOT NULL, actor NVARCHAR(256) NULL,
         action NVARCHAR(128) NOT NULL, channel_id NVARCHAR(256) NULL, detail NVARCHAR(MAX) NULL,
         client NVARCHAR(256) NULL, row_hash NVARCHAR(64) NOT NULL)""",
-    # ADR 0150 client attribution for a pre-existing audit_log. NVARCHAR(256) mirrors sessions.client so
-    # the two attribution columns share one width. NULL on every existing row is CORRECT (their address
-    # was never captured) and is what preserves their row_hash: audit_row_hash omits the conditional 7th
-    # element when client is None, so the legacy digest reproduces byte-for-byte across the upgrade.
-    """IF COL_LENGTH('audit_log','client') IS NULL
-        ALTER TABLE audit_log ADD client NVARCHAR(256) NULL""",
+    # `client` (ADR 0150) is NVARCHAR(256), mirroring sessions.client, so the two attribution columns
+    # share one width.
     """IF INDEXPROPERTY(OBJECT_ID('audit_log'),'ix_audit_ts','IndexID') IS NULL
         CREATE INDEX ix_audit_ts ON audit_log(ts)""",
-    # Audit-chain keying watermark (#190) — single row (id=1). keyed_from_id = the first audit_log.id
-    # hashed with the HMAC key; NULL/no row = the whole chain is keyless (byte-identical to pre-#190).
-    """IF OBJECT_ID('audit_chain_meta','U') IS NULL CREATE TABLE audit_chain_meta (
-        id INT NOT NULL PRIMARY KEY CHECK (id = 1), keyed_from_id BIGINT NULL)""",
-    # BACKLOG #1904 (ADR 0193): the audit key the FIRST keyed range is MAC'd under. NULL on a
-    # pre-existing row, reported as a chain that does not record its key (ADR 0193). BIN2 like the other
-    # fingerprint-keyed columns.
-    """IF COL_LENGTH('audit_chain_meta','key_id') IS NULL
-        ALTER TABLE audit_chain_meta ADD key_id VARCHAR(64) COLLATE Latin1_General_BIN2 NULL""",
+    # No table beside audit_log says where its keying starts: the process that holds the key decides,
+    # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
     # reserve-then-spend rationale and which key a row counts (the sealing key, ADR 0196). One row
     # per key_id; non-secret (a one-way fingerprint plus a counter). BIN2 collation matches the
@@ -2318,19 +2308,6 @@ def _options_remedy(database: str | None, off: Sequence[str]) -> str:
     )
 
 
-#: The one statement that writes the audit chain's keying row (owner ruling R16): an INSERT that
-#: never replaces, so the runtime login needs INSERT and SELECT on ``audit_chain_meta`` and no more.
-#: Parameters are ``(keyed_from_id, key_id)``. UPDLOCK+HOLDLOCK make the existence test and the
-#: INSERT one step against a second process, where RCSI would otherwise read a snapshot; the live
-#: legs run it under the runbook's DENY. ``OUTPUT`` says whether a row went in, since a session
-#: under NOCOUNT reports a rowcount of -1.
-_AUDIT_META_GUARDED_INSERT = (
-    "INSERT INTO audit_chain_meta (id, keyed_from_id, key_id) OUTPUT INSERTED.id"
-    " SELECT 1, ?, ? WHERE NOT EXISTS (SELECT 1 FROM audit_chain_meta"
-    " WITH (UPDLOCK, HOLDLOCK) WHERE id=1)"
-)
-
-
 def _audit_write_probe(table: str, privilege: str) -> str:
     """One privilege-probe column: does this login hold ``privilege`` on the append-only audit
     ``table`` (owner ruling R16)?
@@ -2439,7 +2416,7 @@ class SqlServerStore:
         # the weakened-TLS clamp against the real production-PHI posture (not the unclamped escape).
         self._posture = posture
         self._cipher: Cipher = cipher or IdentityCipher()
-        # #190 audit-chain HMAC key (HKDF-derived; None → keyless chain) + keying watermark.
+        # #190 audit-chain HMAC key (HKDF-derived; None, with no MAC provider, is the keyless mode).
         self._audit_mac_key = audit_mac_key
         # ADR 0138: an isolated-module MAC provider (Vault/OpenBao Transit ``generate_hmac``) keying the
         # audit chain WITHOUT an in-heap key — set only in `vault_transit` mode (from Cipher.audit_mac_fn),
@@ -2447,12 +2424,13 @@ class SqlServerStore:
         # server-DB deployment ran its audit chain fully UNKEYED under the posture meant to be the most
         # isolated one (ASVS 13.3.3).
         self._audit_mac_fn = audit_mac_fn
-        self._audit_keyed_from: int | None = None
-        self._audit_chain_unkeyed = False  # BACKLOG #1905 -- see the SQLite twin
-        # BACKLOG #1904 (ADR 0193): the audit keyring (active AND retired), the first keyed range's key and
-        # the CURRENT range -- see the SQLite twin and `settle_audit_ranges`.
+        # Whether the chain opens with a genesis row, so is keyed; and whether a keyed handle found
+        # keyless rows instead (BACKLOG #1905). Both read from the chain by `load_audit_chain`.
+        self._audit_chain_keyed = False
+        self._audit_chain_unkeyed = False
+        # BACKLOG #1904 (ADR 0193): the audit keyring (active AND retired) and the CURRENT range --
+        # see the SQLite twin and `settle_audit_ranges`. `_audit_range_from` is a sequence number.
         self._audit_mac_keys: dict[str, bytes] = build_audit_mac_keys(cipher, audit_mac_key)
-        self._audit_first_key_id: str | None = None
         self._audit_range_key_id: str | None = None
         self._audit_range_from: int | None = None
         self._audit_range_keys: list[str] = []
@@ -3160,7 +3138,9 @@ class SqlServerStore:
                 await store.checkpoint_cipher_invocations()
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
-            await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
+            # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
+            # genesis append takes the audit applock and needs INSERT and SELECT only.
+            await load_audit_chain(store, read_only=read_only)
             if not read_only:
                 # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
                 await store._load_state_cache()  # ADR 0005 read-through cache warm-up
@@ -3180,59 +3160,6 @@ class SqlServerStore:
 
     # `_backfill_audit_chain` was deleted with BACKLOG #1198 — see the SQLite twin for why.
 
-    async def _load_audit_chain_meta(self) -> None:
-        """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
-        encrypted store (nothing to re-bless). An existing keyless chain stays keyless until the
-        explicit :meth:`rekey_audit_chain` migration — never silent (see the SQLite twin).
-
-        The watermark row is only ever INSERTed (owner ruling R16), by the guarded INSERT the rekey
-        uses too. When no row went in, or the chain already has rows, the row is read again: a peer
-        engine may have keyed the chain, and appended to it, since the first read, and this open then
-        adopts what the peer wrote rather than failing on the primary key."""
-        meta = "SELECT keyed_from_id, key_id FROM audit_chain_meta WHERE id=1"
-        row = await self._fetchone(meta)
-        if row is None or row["keyed_from_id"] is None:
-            if not self._audit_keyed_capable():
-                return  # keyless store — the chain stays byte-identical to pre-#190
-            cnt = await self._fetchone("SELECT COUNT(*) AS n FROM audit_log")
-            if cnt is None:
-                return  # no count read: never key over rows that may exist
-            rows = int(cnt["n"])
-            if rows == 0 and self._read_only:
-                return  # BACKLOG #1780: key nothing from a read-only handle
-            active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
-            inserted = False
-            if rows == 0:
-                async with self._acquire() as conn, self._cursor(conn) as cur:
-                    try:
-                        await cur.execute(_AUDIT_META_GUARDED_INSERT, (1, active_id))
-                        inserted = await cur.fetchone() is not None
-                        await self._commit(conn)
-                    except Exception:
-                        await conn.rollback()
-                        raise
-            if inserted:
-                self._audit_keyed_from = 1
-                self._audit_first_key_id = self._audit_range_key_id = active_id
-                self._audit_range_from = 1
-                self._audit_range_keys = [active_id] if active_id is not None else []
-                return
-            row = await self._fetchone(meta)
-            if row is None or row["keyed_from_id"] is None:
-                if rows > 0:
-                    self._audit_chain_unkeyed = True  # BACKLOG #1905: report, never re-key at open
-                    warn_unkeyed_audit_chain(log, rows)
-                    return
-                reason = (
-                    AUDIT_CHAIN_META_ROW_CHANGED
-                    if row is None
-                    else AUDIT_CHAIN_META_ROW_WITHOUT_WATERMARK
-                )
-                log.error("sqlserver: %s", reason)
-                raise RuntimeError(reason)
-        self._audit_keyed_from = int(row["keyed_from_id"])
-        await settle_audit_ranges(self, row["key_id"])  # BACKLOG #1904
-
     def audit_chain_unkeyed(self) -> bool:
         """See :meth:`~messagefoundry.store.store.MessageStore.audit_chain_unkeyed` (#1905)."""
         return self._audit_chain_unkeyed
@@ -3243,10 +3170,10 @@ class SqlServerStore:
 
     def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
         """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with -- :func:`audit_append_secret`,
-        shared by all three backends: keyless below the #190 watermark, else the CURRENT range's key
-        (BACKLOG #1904), failing closed when that key is not held. See the SQLite twin."""
+        shared by all three backends: the CURRENT range's key whenever this handle holds a keying
+        secret (BACKLOG #1904), failing closed when that key is not held. See the SQLite twin."""
         return audit_append_secret(
-            keyed_from=self._audit_keyed_from,
+            chain_keyed=self._audit_chain_keyed,
             range_key_id=self._audit_range_key_id,
             mac_keys=self._audit_mac_keys,
             mac_key=self._audit_mac_key,
@@ -3262,76 +3189,38 @@ class SqlServerStore:
         provider (``vault_transit`` mode, ADR 0138). Either keys the chain; neither leaves it keyless."""
         return self._audit_mac_key is not None or self._audit_mac_fn is not None
 
-    async def rekey_audit_chain(
-        self, *, expected_anchor: tuple[int, str] | None = None
-    ) -> tuple[bool, str]:
-        """Non-silent #190-D migration — enable HMAC keying on an existing keyless chain. Refuses
-        without a DEK, verifies the existing chain first (refusing on any break), reports that verify
-        when already keyed (BACKLOG #1904), else sets the watermark to the next id (never rewrites
-        existing hashes). See the SQLite twin."""
-        if not self._audit_keyed_capable():
-            return False, "no store encryption key/MAC configured; cannot key the audit chain"
-        ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
-        if self._audit_keyed_from is not None:
-            return audit_rekey_when_keyed(self._audit_keyed_from, ok, msg)  # BACKLOG #1904
-        if not ok:
-            return False, f"refusing to key a broken audit chain: {msg}"
-        active_id = audit_active_key_id(self._audit_mac_key, self._audit_mac_fn)
-        async with self._audit_lock, self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
-                mrow = await cur.fetchone()
-                watermark = (int(mrow[0]) if mrow is not None else 0) + 1
-                # INSERT only, never replace (owner ruling R16): the runtime login holds INSERT and
-                # SELECT on audit_chain_meta, and SQL Server checks an UPDATE's permission even when
-                # it would touch no row. A row already there is reported instead.
-                await cur.execute(_AUDIT_META_GUARDED_INSERT, (watermark, active_id))
-                if await cur.fetchone() is None:
-                    await cur.execute("SELECT keyed_from_id FROM audit_chain_meta WHERE id=1")
-                    held = await cur.fetchone()
-                    await conn.rollback()
-                    return False, audit_rekey_refused(
-                        held is not None, None if held is None else held[0]
-                    )
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        self._audit_keyed_from = watermark
-        self._audit_first_key_id = self._audit_range_key_id = active_id
-        self._audit_range_from = watermark
-        self._audit_range_keys = [active_id] if active_id is not None else []
-        self._audit_ranges_trusted = True
-        self._audit_chain_unkeyed = False
-        return True, f"audit chain keyed from id={watermark}"
-
-    async def _audit_rows(
-        self, from_id: int, *, limit: int | None = None
-    ) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: audit rows with ``id >= from_id``, in id order."""
+    async def _audit_rows(self, *, limit: int | None = None) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every audit row, in ``seq`` order."""
         top = "" if limit is None else f"TOP ({int(limit)}) "
-        # audit_log.id is INT here: clamp the "every row" floor to INT's own minimum, which selects
-        # the same rows and keeps the parameter inside the column's type.
         rows: list[Mapping[str, Any]] = list(
             await self._fetchall(
-                f"SELECT {top}id, ts, actor, action, channel_id, detail, client, row_hash"
-                " FROM audit_log WHERE id >= ? ORDER BY id",
-                (max(from_id, -(2**31)),),
+                f"SELECT {top}id, seq, ts, actor, action, channel_id, detail, client, row_hash"
+                " FROM audit_log ORDER BY seq"
             )
         )
         return rows
 
-    async def _audit_range_rows(self, from_id: int) -> list[Mapping[str, Any]]:
-        """``AuditRangeHost`` primitive: every range row at or after ``from_id``, in id order.
+    async def _audit_genesis_row(self) -> Mapping[str, Any] | None:
+        """``AuditRangeHost`` primitive: the row at ``seq = 1``, or ``None``."""
+        rows: list[Mapping[str, Any]] = list(
+            await self._fetchall(
+                "SELECT id, seq, ts, actor, action, channel_id, detail, client, row_hash"
+                " FROM audit_log WHERE seq = 1"
+            )
+        )
+        return rows[0] if rows else None
+
+    async def _audit_range_rows(self) -> list[Mapping[str, Any]]:
+        """``AuditRangeHost`` primitive: every range row after the genesis row, in ``seq`` order.
 
         The shared walk matches the action EXACTLY. ``audit_log.action`` takes the database's
         case-insensitive default, so the predicate is BIN2; and SQL Server pads trailing spaces for
         ``=`` under EVERY collation, BIN2 included, so the exact match is re-applied here in Python --
         otherwise ``'audit.key_epoch '`` would be read as a range row the walk treats as ordinary."""
         rows = await self._fetchall(
-            "SELECT id, action, detail FROM audit_log"
-            " WHERE action COLLATE Latin1_General_BIN2 = ? AND id >= ? ORDER BY id",
-            (AUDIT_KEY_EPOCH_ACTION, from_id),
+            "SELECT seq, action, detail FROM audit_log"
+            " WHERE action COLLATE Latin1_General_BIN2 = ? AND seq > 1 ORDER BY seq",
+            (AUDIT_KEY_EPOCH_ACTION,),
         )
         exact: list[Mapping[str, Any]] = [r for r in rows if r["action"] == AUDIT_KEY_EPOCH_ACTION]
         return exact
@@ -3877,7 +3766,7 @@ class SqlServerStore:
                     database_roles=database_roles,
                     detail=(
                         f"{note}; [store].schema_management is 'external', which requires INSERT and"
-                        " SELECT only on audit_log and audit_chain_meta"
+                        " SELECT only on audit_log"
                     ),
                 )
         return StorePrivilegeReport(
@@ -3892,7 +3781,7 @@ class SqlServerStore:
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
                     "runtime (schema_management=external: no db_ddladmin, and no UPDATE, DELETE, "
-                    "ALTER, CONTROL or take ownership on audit_log or audit_chain_meta)"
+                    "ALTER, CONTROL or take ownership on audit_log)"
                     if external
                     else "auto-mode"
                 )
@@ -10752,7 +10641,7 @@ class SqlServerStore:
                         # OPENS THE TRANSACTION, and that is its whole job — `_applock` takes
                         # `@LockOwner='Transaction'`, which requires one already open. The
                         # autocommit=False pool begins a transaction on the first statement that
-                        # touches a table, so this is a real one-row read of audit_log's PK index
+                        # touches a table, so this is a real one-row read of audit_log's `seq` index
                         # rather than a bare `SELECT 1`: under the driver's implicit-transactions
                         # mode a SELECT with no FROM begins nothing, and the applock would then be
                         # scoped to a transaction that does not exist. Nor `BEGIN TRANSACTION`,
@@ -10760,9 +10649,9 @@ class SqlServerStore:
                         # it once, leaving the lock held on a pooled connection. The value read here
                         # is deliberately discarded — it is read OUTSIDE the lock, and only the
                         # re-read `_append_audit_row` makes under the applock is authoritative.
-                        await cur.execute("SELECT TOP (1) id FROM audit_log ORDER BY id DESC")
+                        await cur.execute("SELECT TOP (1) seq FROM audit_log ORDER BY seq DESC")
                         await cur.fetchall()  # drain, so the next execute on this cursor is clean
-                        row_id, row_hash = await self._append_audit_row(
+                        appended = await self._append_audit_row(
                             cur,
                             action,
                             actor=actor,
@@ -10787,8 +10676,9 @@ class SqlServerStore:
             detail=detail,
             client=client,
             ts=now,
-            row_id=row_id,
-            row_hash=row_hash,
+            row_id=appended.row_id,
+            seq=appended.seq,
+            row_hash=appended.row_hash,
         )
 
     async def _append_audit_row(
@@ -10802,45 +10692,41 @@ class SqlServerStore:
         client: str | None,
         now: float,
         expect_prev: str | None = None,
-    ) -> tuple[int, str]:
+    ) -> AppendedAuditRow:
         """Append one chained ``audit_log`` row on ``cur``, inside a transaction already open.
 
         Takes ``_AUDIT_APPEND_LOCK`` first, whose ``@LockOwner='Transaction'`` needs that open
         transaction. The caller holds ``_audit_lock``, commits, then tees. :meth:`record_audit` is
-        one caller; a write whose audit row must commit with it is the other (BACKLOG #2100).
-        Returns ``(row id, row hash)``."""
+        one caller; a write whose audit row must commit with it is the other (BACKLOG #2100). The
+        applock is held to the commit and every append in every engine shard takes it, so
+        ``head.seq + 1``, read under it, is the next sequence number."""
         await self._applock(cur, _AUDIT_APPEND_LOCK)
-        await cur.execute("SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC")
+        await cur.execute("SELECT TOP (1) seq, row_hash FROM audit_log ORDER BY seq DESC")
         last = await cur.fetchone()
-        prev = last[0] if last and last[0] else ""
-        if expect_prev is not None and prev != expect_prev:
-            raise AuditHeadMovedError(prev)  # BACKLOG #1904: roll sealed another head
-        # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
-        # watermark is set, else keyless.
-        _key, _mac = self._audit_append_mac()
-        row_hash = audit_row_hash(
-            prev,
+        # BACKLOG #1904: raises AuditHeadMovedError when the caller sealed a different head.
+        seq, row_hash = audit_seal_next(
+            None if last is None else (last[0], last[1]),
+            expect_prev,
+            self._audit_append_mac,
             ts=now,
             actor=actor,
             action=action,
             channel_id=channel_id,
             detail=detail,
             client=client,
-            key=_key,
-            mac=_mac,
         )
-        # OUTPUT INSERTED.id gives the anchor id in the same statement, so it cannot name
+        # OUTPUT INSERTED.id gives the row id in the same statement, so it cannot name
         # a row another session inserted (which is what SCOPE_IDENTITY over a pooled
         # connection risks). The table carries no trigger, so no OUTPUT INTO is needed.
         await cur.execute(
             "INSERT INTO audit_log"
-            " (ts, actor, action, channel_id, detail, client, row_hash)"
+            " (seq, ts, actor, action, channel_id, detail, client, row_hash)"
             " OUTPUT INSERTED.id"
-            " VALUES (?,?,?,?,?,?,?)",
-            (now, actor, action, channel_id, detail, client, row_hash),
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (seq, now, actor, action, channel_id, detail, client, row_hash),
         )
         inserted = await cur.fetchone()
-        return (int(inserted[0]) if inserted is not None else 0), row_hash
+        return AppendedAuditRow(int(inserted[0]) if inserted is not None else 0, seq, row_hash)
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 
@@ -11043,14 +10929,13 @@ class SqlServerStore:
         )
 
     async def audit_anchor(self) -> tuple[int, str]:
-        """The audit log's external anchor — ``(row_count, head_hash)`` — see the SQLite store (low-1)."""
-        rows = await self._fetchall(
-            "SELECT COUNT(*) AS n, "
-            "(SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC) AS head FROM audit_log"
-        )
+        """The audit log's external anchor: ``(seq, head_hash)`` of its newest row, or ``(0, "")``
+        when it is empty. See the SQLite store (low-1)."""
+        rows = await self._fetchall("SELECT TOP (1) seq, row_hash FROM audit_log ORDER BY seq DESC")
         if not rows:
             return 0, ""
-        return int(rows[0]["n"]), (rows[0]["head"] or "")
+        # Never 0 for a log that holds a row: 0 means "empty" to every caller.
+        return max(int(rows[0]["seq"]), 1), (rows[0]["row_hash"] or "")
 
     async def has_prior_backup_history(self) -> bool:
         """See :meth:`AuditStore.has_prior_backup_history` — ≥1 ``dr_backup`` audit row (the #102 server-DB
@@ -11080,9 +10965,7 @@ class SqlServerStore:
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
-            await self._audit_rows(AUDIT_ALL_ROWS),
-            keyed_from=self._audit_keyed_from,
-            first_key_id=self._audit_first_key_id,
+            await self._audit_rows(),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
             capable=self._audit_keyed_capable(),
@@ -11281,7 +11164,7 @@ class SqlServerStore:
                 try:
                     async with self._cursor(conn) as cur:
                         await cur.execute(sql, params)
-                        row_id, row_hash = await self._append_audit_row(
+                        appended = await self._append_audit_row(
                             cur,
                             audit.action,
                             actor=audit.actor,
@@ -11296,7 +11179,7 @@ class SqlServerStore:
                     # detached close of the raw connection cannot race the cursor's own close.
                     await self._rollback_or_discard(conn)
                     raise
-        audit.tee(ts=now, row_id=row_id, row_hash=row_hash)
+        audit.tee(ts=now, row=appended)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=?", (user_id,))

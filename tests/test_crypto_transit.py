@@ -455,11 +455,11 @@ async def test_open_store_audit_chain_keyed_in_transit(
     try:
         assert store._audit_mac_key is None  # no key material in engine heap
         assert store._audit_mac_fn is not None  # …but the chain is keyed via the isolated module
-        assert store._audit_keyed_from == 1  # fresh store auto-keyed from the first row
+        assert store._audit_chain_keyed is True  # the fresh store wrote its genesis row
         await store.record_audit("view", actor="u", detail='{"m":1}')
         await store.record_audit("export", actor="u", detail='{"m":2}')
         hashes = _audit_row_hashes(db)
-        assert len(hashes) == 2
+        assert len(hashes) == 3  # the genesis row and the two rows above
         # Every row's MAC is Transit's `vault:v1:` string — NOT a 64-hex local SHA-256/HMAC digest.
         assert all(h.startswith("vault:v1:") for h in hashes), hashes
         ok, msg = await store.verify_audit_chain()  # round-trips through Transit
@@ -488,7 +488,7 @@ async def test_transit_audit_chain_detects_tampering(
         await store.record_audit("view", actor="u")
         ok, _ = await store.verify_audit_chain()
         assert ok
-        await store._db.execute("UPDATE audit_log SET action='HACKED' WHERE id=1")
+        await store._db.execute("UPDATE audit_log SET action='HACKED' WHERE seq=2")
         await store._db.commit()
         ok2, message = await store.verify_audit_chain()
         assert not ok2  # the Transit MAC no longer matches the tampered content

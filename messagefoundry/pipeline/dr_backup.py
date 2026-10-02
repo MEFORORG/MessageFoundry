@@ -2243,7 +2243,7 @@ def _count_tables(db_path: Path) -> dict[str, int]:
     rather than a hand-picked sample (BACKLOG #1722): the old fixed four-table list
     (``messages``/``queue``/``message_events``/``audit_log``) covered 4 of this schema's 30 tables —
     a truncated or absent table among the other 26 (at least the auth tables ``users``/``sessions``/
-    ``roles``/``webauthn_credentials`` and the audit chain's ``audit_chain_meta``) passed
+    ``roles``/``webauthn_credentials``) passed
     restore-verify PASS undetected, and the old list could not have named all of them: it predates
     several of those tables entirely, and the next one added to the schema would have been silently
     out of scope again. Called once against the just-taken snapshot when the manifest is written and
@@ -2356,8 +2356,10 @@ def _full_open_check(
         # unreachable key provider — must surface ITS OWN cause, not a NameError from a finally closing
         # a store that was never created. A handle left open here would also hold the extracted store
         # on Windows and send the staging teardown to its fail-safe (see _discard_verify_staging).
-        # A throwaway snapshot copy, integrity-checked and deleted: it appends no audit row, so it
-        # cannot start a chain (BACKLOG #1916).
+        # A throwaway snapshot copy, integrity-checked and deleted, so nothing it writes outlives
+        # the check (BACKLOG #1916). A keyed open of a snapshot whose audit_log is EMPTY writes that
+        # copy's genesis row, like any keyed open of an empty log, and tees it; a snapshot of a
+        # store that holds a key already has one.
         store = await open_store(snap_settings, keyless_chain_refusal=None)
         try:
             return await store.integrity_check()

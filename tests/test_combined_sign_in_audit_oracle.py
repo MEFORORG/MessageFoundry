@@ -1054,6 +1054,7 @@ def test_a_broken_tee_sink_logs_once_and_names_no_action(
                 detail=None,
                 ts=1.0,
                 row_id=n,
+                seq=n,
                 row_hash="h",
             )
     lines = [r.getMessage() for r in caplog.records if r.name == audit_tee.log.name]

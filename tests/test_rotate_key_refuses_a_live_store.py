@@ -53,10 +53,12 @@ async def _seed(path: Path, active: str) -> None:
 
 
 def _epoch_rows(path: Path) -> int:
+    """How many range rows a rotation has written: every key-epoch row after the genesis row."""
     conn = sqlite3.connect(path)
     try:
         row = conn.execute(
-            "SELECT COUNT(*) FROM audit_log WHERE action=?", (AUDIT_KEY_EPOCH_ACTION,)
+            "SELECT COUNT(*) FROM audit_log WHERE action=? AND seq > 1",
+            (AUDIT_KEY_EPOCH_ACTION,),
         ).fetchone()
         return int(row[0])
     finally:

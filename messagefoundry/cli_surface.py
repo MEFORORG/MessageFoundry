@@ -105,7 +105,6 @@ CLI_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         # Audit log.
         "audit-verify": "production",
         "audit-anchor": "production",
-        "rekey-audit": "production",
         # Store, backup and restore.
         "store": "production",
         "store provision-schema": "production",

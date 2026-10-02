@@ -383,8 +383,11 @@ async def test_handler_name_column_added_to_step_a_db(tmp_path: Path) -> None:
           last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
         CREATE TABLE message_events (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
           ts REAL NOT NULL, event TEXT NOT NULL, destination TEXT, detail TEXT);
-        CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, actor TEXT,
-          action TEXT NOT NULL, channel_id TEXT, detail TEXT, row_hash TEXT);
+        -- audit_log is in the CURRENT layout: no earlier audit layout is converted, so a store
+        -- whose audit_log lacks `seq` is refused rather than migrated (vault BACKLOG #2594).
+        CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER NOT NULL UNIQUE,
+          ts REAL NOT NULL, actor TEXT, action TEXT NOT NULL, channel_id TEXT, detail TEXT,
+          client TEXT, row_hash TEXT NOT NULL);
         CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, auth_provider TEXT NOT NULL,
           display_name TEXT, email TEXT, disabled INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
           updated_at REAL NOT NULL, last_login_at REAL, password_hash TEXT, password_changed_at REAL,
@@ -1056,8 +1059,11 @@ async def test_legacy_outbox_migrates_to_queue_with_encryption(tmp_path: Path) -
           created_at REAL NOT NULL, updated_at REAL NOT NULL);
         CREATE TABLE message_events (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
           ts REAL NOT NULL, event TEXT NOT NULL, destination TEXT, detail TEXT);
-        CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, actor TEXT,
-          action TEXT NOT NULL, channel_id TEXT, detail TEXT, row_hash TEXT);
+        -- audit_log is in the CURRENT layout: no earlier audit layout is converted, so a store
+        -- whose audit_log lacks `seq` is refused rather than migrated (vault BACKLOG #2594).
+        CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER NOT NULL UNIQUE,
+          ts REAL NOT NULL, actor TEXT, action TEXT NOT NULL, channel_id TEXT, detail TEXT,
+          client TEXT, row_hash TEXT NOT NULL);
         CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, auth_provider TEXT NOT NULL,
           display_name TEXT, email TEXT, disabled INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
           updated_at REAL NOT NULL, last_login_at REAL, password_hash TEXT, password_changed_at REAL,
@@ -1252,8 +1258,11 @@ async def test_migration_skips_orphan_outbox_rows(tmp_path: Path) -> None:
           last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
         CREATE TABLE message_events (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
           ts REAL NOT NULL, event TEXT NOT NULL, destination TEXT, detail TEXT);
-        CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, actor TEXT,
-          action TEXT NOT NULL, channel_id TEXT, detail TEXT, row_hash TEXT);
+        -- audit_log is in the CURRENT layout: no earlier audit layout is converted, so a store
+        -- whose audit_log lacks `seq` is refused rather than migrated (vault BACKLOG #2594).
+        CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER NOT NULL UNIQUE,
+          ts REAL NOT NULL, actor TEXT, action TEXT NOT NULL, channel_id TEXT, detail TEXT,
+          client TEXT, row_hash TEXT NOT NULL);
         CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, auth_provider TEXT NOT NULL,
           display_name TEXT, email TEXT, disabled INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
           updated_at REAL NOT NULL, last_login_at REAL, password_hash TEXT, password_changed_at REAL,
