@@ -8,8 +8,8 @@
                                                 and exit 0 (pass) / 1 (fail) / 2 (setup, or
                                                 SKIP: a precondition is missing) — for CI.
 ``python -m harness --coverage``      -> print every registered connector kind, by direction,
-                                                against the scenarios that cover it (no engine
-                                                needed).
+                                                against the scenarios that cover it or the reason
+                                                it is exempt (no engine needed); exit 1 on a gap.
 ``python -m harness --fuzz``          -> fuzz a running engine: seeded byte, field and MLLP-frame
                                                 mutations of generated HL7 through a harness driver,
                                                 checking health, ACK-implies-stored, reply shape and no
@@ -392,11 +392,13 @@ def _list_scenarios() -> int:
 
 
 def _print_coverage() -> int:
-    from harness.coverage import coverage_rows, format_report, registered_kinds
+    from harness.coverage import coverage_gaps, coverage_rows, format_report, registered_kinds
     from harness.scenarios import SCENARIOS
 
-    print(format_report(coverage_rows(registered_kinds(), SCENARIOS.values())))
-    return 0
+    rows = coverage_rows(registered_kinds(), SCENARIOS.values())
+    print(format_report(rows))
+    # Exit 1 on a gap, so a CI step can run this as the gate tests/test_harness_coverage_gate.py is.
+    return 1 if coverage_gaps(rows) else 0
 
 
 def _run_scenario(

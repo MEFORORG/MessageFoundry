@@ -126,6 +126,22 @@ running engine. `harness/coverage.py` is the one harness module allowed to impor
 `messagefoundry.transports` (read-only; `_CLIENT_ALLOWED` in `tests/test_dependency_boundaries.py`
 names it), because the registries have no public listing.
 
+It is also a gate. Every registered (kind, direction) pair must have a scenario or an entry, with a
+reason, in `EXEMPT` in `harness/coverage.py`; `--coverage` prints a `GAP:` line and exits 1 when
+one does not, and `tests/test_harness_coverage_gate.py` runs the same check in CI. A stale
+exemption (its pair gained a scenario or is no longer registered) and a claim on a kind the engine
+does not register are gaps too. The one exemption today is the Direct outbound, which needs S/MIME
+keys and certificates on disk and is proven in its own family test instead.
+
+A claim counts as coverage. A few families claim kinds their scenarios run only where the
+dependency exists, and none of them passes without it: the database family needs a SQL Server
+(`MEFOR_TEST_SQLSERVER`) and prints `SKIP` (exit 2) without one; DIMSE needs the `[dicom]` extra
+and fails with "cannot run" without it; remote file needs the `[sftp]` extra and a password and
+exits 2 (`SETUP`) without them, and runs over SFTP only (FTP and FTPS are not exercised). In the
+test suite each is reported as a skip. The gate counts what a scenario CLAIMS, so a claimed pair
+is covered even on a runner where its scenario skips -- and the Direct outbound, exempt here,
+does run end to end in `tests/test_harness_email.py`.
+
 ## Load testing (headless)
 
 A separate, **Qt-free** asyncio load engine (`harness/load/`) drives the engine under heavy MLLP

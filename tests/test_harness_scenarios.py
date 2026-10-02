@@ -316,10 +316,18 @@ def test_coverage_reports_an_uncovered_kind_and_a_stale_claim() -> None:
     rows = coverage_rows(
         {"inbound": frozenset({"mllp", "smoke"}), "outbound": frozenset()}, [Claims()]
     )
-    report = format_report(rows)
+    report = format_report(rows, exempt={})
     assert "inbound  smoke       NONE" in report
     assert "NOT REGISTERED, claimed by claims_kafka" in report
-    assert report.endswith("0 of 2 registered (kind, direction) pairs have a scenario")
+    assert (
+        "0 of 2 registered (kind, direction) pairs have a scenario; 0 exempt with a reason"
+        in report
+    )
+    assert [ln for ln in report.splitlines() if ln.startswith("GAP: ")] == [
+        "GAP: inbound mllp: no scenario and no exemption",
+        "GAP: inbound smoke: no scenario and no exemption",
+        "GAP: inbound kafka: claimed by claims_kafka but not registered",
+    ]
 
 
 def test_a_scenario_claims_an_outbound_only_through_a_sink() -> None:
@@ -577,7 +585,11 @@ def test_the_coverage_graph_imports_nothing_from_the_harness() -> None:
     and `messagefoundry check` refuses an unvetted import (review of vault BACKLOG #2672)."""
     import ast
 
-    for path in sorted(p for directory in _graph_dirs() for p in directory.glob("*.py")):
+    # Every family graph directory, plus harness/config/direct/: no scenario names it and no
+    # endpoints family is called that, so _graph_dirs() does not reach it, and it is served too.
+    graph_dirs = [*_graph_dirs(), HARNESS_CONFIG / "direct"]
+    assert (HARNESS_CONFIG / "direct").is_dir()
+    for path in sorted(p for directory in graph_dirs for p in directory.glob("*.py")):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             names = (
                 [a.name for a in node.names]
