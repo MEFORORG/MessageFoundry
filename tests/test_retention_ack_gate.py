@@ -171,6 +171,7 @@ def test_each_switch_is_a_named_loosening() -> None:
                 api=ApiSettings(),
                 store_privilege=None,
                 audit_chain_unkeyed=None,
+                remote_debug=None,
             )
         ]
 

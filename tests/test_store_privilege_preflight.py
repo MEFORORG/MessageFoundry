@@ -980,6 +980,7 @@ def _names(store_privilege: StorePrivilegePosture | None) -> dict[str, str]:
             api=ApiSettings(),
             store_privilege=store_privilege,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
 
@@ -1041,6 +1042,7 @@ def test_the_opt_out_is_named_as_a_loosening() -> None:
             api=ApiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
+            remote_debug=None,
         )
     )
     assert "allow_over_granted_store_principal" in names
@@ -1068,6 +1070,7 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
                 api=ApiSettings(),
                 store_privilege=None,
                 audit_chain_unkeyed=None,
+                remote_debug=None,
             )
         )
         == {}

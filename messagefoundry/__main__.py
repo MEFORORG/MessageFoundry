@@ -63,6 +63,11 @@ from messagefoundry.logging_setup import (
     query_sntp_offset,
 )
 from messagefoundry.odbc_env import disable_driver_manager_pooling
+from messagefoundry.remotedebug import (
+    install_remote_debug_guard,
+    remote_debug_loosening,
+    remote_debug_posture,
+)
 
 if TYPE_CHECKING:
     # Type-only, so the settings module still loads lazily per command: a quick `validate` /
@@ -1699,6 +1704,11 @@ def _forward_spool_dir(settings: ServiceSettings, shard: str | None) -> str:
 
 
 def _serve(args: argparse.Namespace) -> int:
+    # Vault BACKLOG #2700: first, ahead of the imports below and of config, because a script
+    # injected before the hook is in place runs. A no-op where the interpreter was started with
+    # remote debugging disabled, which is every engine shard under `supervise`.
+    install_remote_debug_guard()
+
     import uvicorn
 
     from messagefoundry.api import create_managed_app
@@ -2387,6 +2397,8 @@ def _serve(args: argparse.Namespace) -> int:
     # GET /security/posture. None here is "not yet observed", never "observed and clean". The same
     # holds for the #1905 audit-chain keying observation: the store logs its own WARNING when it opens
     # onto a keyless chain, and GET /security/posture reports it off the live store.
+    # The remote-debugging reading (vault BACKLOG #2700) is the one observation that IS complete
+    # here: it is a fact about this process, and this is the process.
     _loosenings = security_loosenings(
         settings.security,
         settings.store,
@@ -2403,6 +2415,7 @@ def _serve(args: argparse.Namespace) -> int:
         api=settings.api,
         store_privilege=None,
         audit_chain_unkeyed=None,
+        remote_debug=remote_debug_posture(),
     )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
@@ -4356,11 +4369,23 @@ def _supervise(args: argparse.Namespace) -> int:
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
     API port. Monitors + restarts crashed shards, and stops them all cleanly on SIGINT/SIGTERM. A single
     (default) shard yields a single subprocess — identical to a plain `serve`."""
+    # Vault BACKLOG #2700: first, for the reason `_serve` gives. The supervisor holds the same
+    # environment its shards do, secrets included.
+    install_remote_debug_guard()
+
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.supervisor import supervise
 
     configure_logging("INFO")
+
+    # The supervisor has no API and builds no loosening list, so its own reading is reported here.
+    # Each shard reports its own through `serve`.
+    remote_debug = remote_debug_loosening(remote_debug_posture())
+    if remote_debug is not None:
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
+        )
 
     # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
     # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
@@ -8346,7 +8371,9 @@ def _security(args: argparse.Namespace) -> int:
         # declares BOTH gaps
         # in `loosenings_scope` below, instead of reporting a settings-only view as if it were the whole
         # posture. GET /security/posture is the complete surface; `messagefoundry check` adds the
-        # connection-scoped entries but opens no store either.
+        # connection-scoped entries but opens no store either. The remote-debugging reading (vault
+        # BACKLOG #2700) is a fact about the ENGINE process, and this command is another process, so
+        # it passes None for that too.
         return [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
@@ -8365,6 +8392,7 @@ def _security(args: argparse.Namespace) -> int:
                 api=_api,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
+                remote_debug=None,
             )
         ]
 
@@ -8389,7 +8417,9 @@ def _security(args: argparse.Namespace) -> int:
             "tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
-            "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "
+            "GET /security/posture reports both). Nor is the engine process's remote-debugging "
+            "reading: this command is a separate process (GET /security/posture reports it). "
+            "These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
             "GET /security/posture"
         ),

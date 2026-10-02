@@ -24,6 +24,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.pipeline import Engine
+from messagefoundry.remotedebug import RemoteDebugPosture
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy
@@ -134,9 +135,18 @@ async def test_posture_reports_security_and_has_no_write_route(engine: Engine) -
             )
 
 
-async def test_posture_on_secure_defaults_reports_no_loosenings(engine: Engine) -> None:
+async def test_posture_on_secure_defaults_reports_no_loosenings(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # All-secure defaults: nothing reported. Every instance carries patient data (BACKLOG #1279),
     # so this is now the ONLY quiet posture -- there is no second, quieter one a declaration buys.
+    # The route also reports one PROCESS reading (vault BACKLOG #2700), which under pytest follows
+    # how pytest was started. Pinned here to the hardened launch; tests/test_remote_debug_guard.py
+    # covers the other readings.
+    monkeypatch.setattr(
+        "messagefoundry.api.app.remote_debug_posture",
+        lambda: RemoteDebugPosture(interpreter_enabled=False, guard_installed=False),
+    )
     service = await _service(engine)
     await _add_viewer(service, "vw")
     ai = AiSettings(environment="prod")

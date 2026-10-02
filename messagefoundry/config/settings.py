@@ -92,6 +92,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
 from messagefoundry.service_status import is_safe_service_name
 
 __all__ = [
@@ -6721,6 +6722,7 @@ def security_loosenings(
     api: ApiSettings,
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
+    remote_debug: RemoteDebugPosture | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -6789,6 +6791,13 @@ def security_loosenings(
     rows were written before any key was in hand, and a keyed open never re-keys existing rows.
     ``None`` has the same meaning as for ``store_privilege`` -- no store is open at this call site, so
     nothing was observed -- and is never read as a clean result.
+
+    ``remote_debug`` is a PROCESS observation (vault BACKLOG #2700), from
+    :func:`messagefoundry.remotedebug.remote_debug_posture`: whether the interpreter of the engine
+    process accepts a script another process injects (PEP 768), and whether the engine's refusal
+    hook is installed. It is a fact about one process, so only a caller running IN the engine
+    process passes a reading (``serve``, ``GET /security/posture``). ``None`` means this call site
+    is some other process (``messagefoundry security show``), which says so in its own output.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -7302,6 +7311,13 @@ def security_loosenings(
                 "key every row after it",
             )
         )
+    # --- the engine PROCESS's observed remote-debugging state (vault BACKLOG #2700). An observation
+    # like the two above: no setting declares it, it follows from how the interpreter was started.
+    # The wording lives beside the hook, in one place for this registry and `supervise`.
+    if remote_debug is not None:
+        remote_debug_entry = remote_debug_loosening(remote_debug)
+        if remote_debug_entry is not None:
+            out.append(remote_debug_entry)
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.
