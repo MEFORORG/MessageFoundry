@@ -97,30 +97,8 @@ def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
 
 
 @_windows_only
-def test_secure_file_grants_extra_read_principals(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The DPAPI key file must stay readable by the engine's service principal (SYSTEM + any
-    # --grant-account), not just the minting admin (BACKLOG #44). The icacls grant must carry them.
-    from pathlib import Path
-
-    import messagefoundry.store.store as store_mod
-
-    captured = _capture_icacls(monkeypatch)
-    store_mod._secure_file(
-        Path("key.dpapi"), extra_read_grants=["*S-1-5-18", "NT SERVICE\\MessageFoundry"]
-    )
-    argv = captured[0]
-    # argv[0] is the pinned absolute path; test_secure_file_pins_icacls_to_the_system_directory
-    # owns that assertion, so check only that it is still icacls here.
-    assert os.path.basename(argv[0]).lower() == "icacls.exe"
-    assert "/inheritance:r" in argv and "/grant:r" in argv
-    assert "minter:F" in argv  # owner keeps full control
-    assert "*S-1-5-18:R" in argv  # SYSTEM read
-    assert "NT SERVICE\\MessageFoundry:R" in argv  # service account read
-
-
-@_windows_only
 def test_secure_file_default_is_owner_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The generic store DB/WAL path passes no extra grants -> owner-only DACL, unchanged.
+    # The store DB/WAL path: an owner-only DACL, and nothing else.
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
@@ -176,7 +154,7 @@ def _record_secure_file_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
     idents: list[int] = []
 
-    def _record(path: object, *, extra_read_grants: object = None) -> None:
+    def _record(path: object) -> None:
         idents.append(threading.get_ident())
 
     monkeypatch.setattr(store_mod, "_secure_file", _record)

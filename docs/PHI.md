@@ -242,6 +242,45 @@ a suppressed `OSError` and never calls the `icacls` enforcer, so **on Windows th
 no engine-applied ACL at all**. The File-connector spill dirs likewise remain operator-owned — harden
 all of these per [§10](#10-secure-deployment--operations-checklist).
 
+**Key files `[BUILT]`.** A file that holds a key is not tightened after the fact. The engine
+creates it restricted, in the call that creates it, and refuses to replace a file or link already at
+that name. This covers the DPAPI store key file that `protect-key` writes and every TLS private key
+the engine writes: the pair it mints for the API, `cert self-signed` and `cert import`. On POSIX the
+file is created with mode `0600`. On Windows its access list names SYSTEM, Administrators and the
+account that created it, plus read for the one account `protect-key --grant-account` names, and it
+does not inherit from the directory. If the file cannot be created that way, the command fails and writes no file
+([restricted_file.py](../messagefoundry/restricted_file.py)).
+
+`serve` and `supervise` also check two of these files before they use them: the store key file,
+when `[store].key_provider` loads it, and the TLS key the engine minted. If a broad group can read
+or change the file, or its access cannot be read, the engine refuses to start under
+`[security].enforcement = "enforce"` and warns under `"warn"`. Every other command that reads the
+store key file, such as `provision-admin` and `rotate-key`, logs a warning and goes on.
+
+**What this does not cover.** Know these before you rely on it:
+
+- On Windows the check looks for known broad groups: at least Everyone, Authenticated Users, the
+  local Users group and the logon classes such as INTERACTIVE. It is a list of known groups. It
+  does not prove that only the accounts you meant can reach the file. `protect-key
+  --grant-account` refuses the same list, and refuses a name that is a group or a domain.
+- It does not vet the file's owner or an account you granted yourself. LOCAL SERVICE and NETWORK
+  SERVICE are accounts that many services share, and the check does not report them.
+- On POSIX the test is a group or other read or write bit, whoever is in the group. A volume that
+  makes every file group-readable on each mount, such as a Kubernetes volume with `fsGroup`, lets
+  the first start mint a key and makes every later start refuse it. Supply your own certificate
+  there, as the shipped manifest does.
+- The create has no warn mode. On a filesystem that cannot hold the restriction, such as a FAT
+  volume or a mount that reports every file as mode `0777`, the engine cannot mint its TLS key and
+  does not start, whatever `[security].enforcement` says. Put the store on a filesystem that holds
+  permissions, or supply your own certificate.
+- It does not look at an operator-supplied `[api].tls_key_file` or a connection's key file.
+  Restrict those yourself.
+- A key file is created for the account that creates it. `cert import` and `cert self-signed` have
+  no grant option, so run them as the account that will read the key, or grant that account
+  yourself. If an administrator runs `serve` by hand before the service first starts, the minted
+  TLS key is readable by that administrator and not by the service account. Delete the pair and
+  let the service mint its own.
+
 **Git hygiene `[BUILT]`.** `.gitignore` excludes `*.db` / `-wal` / `-shm`, generated message corpora,
 and logs, so runtime PHI is never committed. Keep it that way — never `git add -f` a database or a
 real message file.
