@@ -255,7 +255,8 @@ def test_the_structural_escapes_are_unchanged() -> None:
 
 def test_a_separator_that_is_an_escape_letter_is_not_escaped_twice() -> None:
     # MSH-2 "F~\&": the component separator is F, the letter of the field-separator escape. A
-    # chained replace rescanned the escape it had just written and turned \F\ into \\S\\.
+    # chained replace rescanned the escape it had just written and turned \F\ into \\S\\. This pins
+    # the one-pass output only: a re-parse still splits \F\ on F, a residual ADR 0205 leaves open.
     msh = "MSH|F~" + BS + "&|SND|FAC|RCV|FAC|20260101120000||ADTFA01|CTRL1|P|2.5"
     msg = Message.parse(msh + CR + "PID|1||111||DOEFJANE" + CR)
     msg.set("PID-5.1", "a|b")
@@ -469,6 +470,38 @@ async def _enqueue(store: MessageStore, bodies: list[str]) -> list[str]:
         await store.enqueue_message(channel_id="c1", raw=b, deliveries=[(DEST, b)], now=100.0 + i)
         for i, b in enumerate(bodies)
     ]
+
+
+@pytest.mark.parametrize(
+    ("setting", "field"),
+    [
+        pytest.param({}, {"hl7_raw_separators": True}, id="raw-separators"),
+        pytest.param({"encoding_characters": "|^~" + BS + "&"}, {}, id="encoding-characters"),
+    ],
+)
+def test_check_frame_sees_the_payload_after_the_send_rewrites(
+    setting: dict[str, object], field: dict[str, Any]
+) -> None:
+    # A delimiter rewrite re-serializes the message, which drops a frame byte at either end, so a
+    # live send of CLEAN + 0x1C goes out. check_frame must judge the same rewritten bytes, or a
+    # shadow outbound would dead-letter what a live one delivers.
+    settings: dict[str, object] = {"host": "127.0.0.1", "port": 1, **setting}
+    config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
+    rewriting = MLLPDestination(config)
+    rewriting.check_frame(CLEAN + EB)
+    with pytest.raises(NegativeAckError):
+        rewriting.check_frame(EMBEDDED_SB)  # an interior start byte survives any rewrite
+    with pytest.raises(NegativeAckError):
+        _SendRecorder().check_frame(CLEAN + EB)  # control: no rewrite, the byte reaches the frame
+
+
+def test_the_tcp_destination_check_frame_refuses_with_its_label() -> None:
+    settings: dict[str, object] = {"host": "127.0.0.1", "port": 1, "framing": "stx_etx"}
+    dest = TcpDestination(Destination(name=DEST, type=ConnectorType.TCP, settings=settings))
+    dest.check_frame(CLEAN)
+    with pytest.raises(NegativeAckError) as caught:
+        dest.check_frame(SMUGGLED_STX)
+    assert caught.value.permanent is True and str(caught.value).startswith("TCP: ")
 
 
 @pytest.mark.parametrize(

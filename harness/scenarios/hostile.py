@@ -10,8 +10,9 @@ non-ASCII text. The values are data in ``hostile_values.toml`` beside this modul
 into a generated ADT^A01 with the :class:`~messagefoundry.parsing.message.Message` API, and no
 field's content is ever sliced. Three places do touch the serialized text, each named where it
 happens: a bare line break is a segment terminator, so it is chosen when the encoded segments are
-joined; a raw MLLP frame byte or NUL is put back in place of a placeholder after the encode
-(:func:`_raw_placeholders`), because the model will not write one (ADR 0205); and
+joined; a raw control character the model will not write (a frame byte, NUL or any other C0
+character a leaf write hex-escapes, ADR 0205) is put back in place of a placeholder after the
+encode (:func:`_raw_placeholders`), so a value reaches the wire with it raw; and
 :func:`received_bytes` models the MLLP decoder cutting a frame at its end block.
 Nothing here prints or logs a payload; a report names a value by its label.
 

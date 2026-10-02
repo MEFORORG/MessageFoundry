@@ -543,6 +543,42 @@ async def test_a_member_holding_a_frame_byte_is_dead_lettered_alone(
     assert "frame end byte 0x1C" in error and "DOE" not in error  # content-free
 
 
+async def test_a_store_fault_dead_lettering_a_refused_member_spares_the_rest(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The refused member is dead-lettered only after the rest are resolved, outside the batch's
+    # own error handling, so a store fault there cannot dead-letter clean members that were never
+    # sent. The fault escapes to the #1579 guard, which re-pends the refused member.
+    bad = _msg(2).replace("DOE^P2", "DOE^P" + chr(0x1C) + "2")
+    mids = await _enqueue_bodies(store, [_msg(1), bad, _msg(3)])
+
+    async def locked(outbox_id: str, error: str, now: float | None = None) -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "dead_letter_now", locked)
+    with pytest.raises(RuntimeError, match="locked"):
+        await _run_one_batch(store, simulate=False)
+    assert await _states(store, mids) == [DELIVERED, QUEUED, DELIVERED]
+
+
+async def test_a_retryable_member_refusal_re_pends_the_whole_batch(store: Any) -> None:
+    # Only a permanent refusal takes one member out; any other is the whole batch's, as a send
+    # raising it would be.
+    class _Transient(_Recorder):
+        def check_frame(self, payload: str) -> None:
+            raise NegativeAckError("try later", code="framing", permanent=False)
+
+    mids = await _enqueue_bodies(store, [_msg(1), _msg(2)])
+    runner = _runner(store)
+    rec = _Transient()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert rec.sent == []
+    assert await _states(store, mids) == [QUEUED, QUEUED]
+
+
 async def test_a_batch_whose_every_member_holds_a_frame_byte_sends_nothing(store: Any) -> None:
     bodies = [_msg(n).replace("DOE", "DOE" + chr(0x0B)) for n in (1, 2)]
     mids = await _enqueue_bodies(store, bodies)

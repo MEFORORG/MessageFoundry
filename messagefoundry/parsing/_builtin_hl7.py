@@ -820,8 +820,9 @@ def escape_leaf(value: str, seps: tuple[str, str, str, str, str]) -> str:
     separator, and a chained replace rewrote the ``F`` of a ``\\F\\`` it had just written. The output
     round-trips through :func:`unescape` whenever the escape char is not itself one of the letters
     or hex digits an escape holds. Separately, the parser splits a field on its separators before
-    it unescapes anything, so a separator that is such a letter cannot carry an escape that holds it
-    through a re-parse, whatever this function writes."""
+    it unescapes anything, so when a separator is such a letter, an escape this function writes
+    that holds it (``\\F\\`` under component separator ``F``) is split on re-parse. A hex escape of
+    the character, or refusing the write, would avoid that; this function does neither yet."""
     return value.translate(_leaf_escape_table(seps))
 
 

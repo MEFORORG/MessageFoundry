@@ -74,8 +74,12 @@ as the accepted draft wrote them except where a point below says otherwise.
      that only they override. The delivery stage calls it where no
      single-payload `send()` runs: on each member of an MLLP batch before the envelope is built,
      and on a simulate (shadow) outbound, which never calls `send()`. `send()` still checks the
-     bytes it frames. A shadow single send checks the stored payload without re-attaching a
-     detached document, since the re-attach splices back only base64, which holds no frame byte.
+     bytes it frames. MLLP's `check_frame` judges the payload after the same delimiter rewrites
+     `send()` applies (`encoding_characters`, `hl7_raw_separators`), which drop a frame byte at
+     either end, and the shadow path re-attaches a detached document first, so both see the bytes a
+     live send would frame. A batch member's refusal is dead-lettered only after the rest of the
+     batch is resolved, so a store fault there cannot reach the clean members. A refusal that is
+     not permanent is the whole batch's, as from `send()`.
 2. **A leaf write through the HL7 model never emits a raw control character.** On a component or
    subcomponent write, each C0 control character and DEL except TAB is written as an HL7 hex escape
    (`\X0B\`, uppercase digits), so a value that arrived hex-escaped leaves hex-escaped. CR and LF
@@ -84,9 +88,11 @@ as the accepted draft wrote them except where a point below says otherwise.
    separator set, so nothing it inserts is scanned again. *Corrected 2026-10-02 in review:* the
    build first chained one `str.replace` per character. That rescanned its own escapes, so with
    MSH-2 `F~\&` (component separator `F`) a write of `a|b` came out `a\\S\\b` and read back
-   `aSb`. A separator that is a letter or digit an escape is made of still cannot carry such an
-   escape through a re-parse, because the parser splits a field on its separators before it
-   unescapes; no escaper can fix that. `Message._escape_leaf` and the DICOM mapper's `_escape_leaf` delegate to it, so
+   `aSb`. One residual stays open: when a separator is a letter or digit an escape is made of,
+   the escape that holds it (`\F\` under component separator `F`) is split on re-parse, because
+   the parser splits a field on its separators before it unescapes. So a write of `a|b` there
+   still changes structure at the receiver. A hex escape of the character, or refusing the write,
+   would close it; this build does neither, and MSH-2 is sender-controlled. `Message._escape_leaf` and the DICOM mapper's `_escape_leaf` delegate to it, so
    the three escapers the draft named cannot drift. The alphabet comes from
    `messagefoundry/controlchars.py`, scanned to U+00FF as the log scrub table is, so a deliberate
    widening there reaches this table too.

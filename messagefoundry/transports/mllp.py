@@ -889,9 +889,42 @@ class MLLPDestination(DestinationConnector):
 
     def check_frame(self, payload: str) -> None:
         """ADR 0205 rule 1 on ``payload`` without sending it: raise the permanent
-        :class:`NegativeAckError` :meth:`send` would. For the delivery stage's batch members and
-        shadow outbound, where ``send`` does not run on this one payload."""
-        check_frame_bytes(MLLP_CODEC, payload, self.encoding, transport="MLLP")
+        :class:`NegativeAckError` :meth:`send` would. It checks the payload as :meth:`send` frames
+        it, after the same delimiter rewrites, so a rewrite that drops a frame byte at either end
+        is matched. For the delivery stage's batch members and shadow outbound, where ``send``
+        does not run on this one payload."""
+        check_frame_bytes(
+            MLLP_CODEC, self._rewrite_for_wire(payload), self.encoding, transport="MLLP"
+        )
+
+    def _rewrite_for_wire(self, payload: str) -> str:
+        """``payload`` after this destination's delimiter rewrites, as :meth:`send` frames it; a
+        payload the rewrites cannot parse is a :class:`DeliveryError`."""
+        if self.encoding_characters is not None:
+            # Re-encode the body with this destination's delimiters before framing. A non-HL7/
+            # garbled payload can't be rewritten — surface it as a DeliveryError (the message
+            # reached neither the wire nor the peer) rather than framing a corrupted message; the
+            # pipeline records the ERROR.
+            try:
+                payload = reencode_delimiters(payload, self.encoding_characters)
+            except ValueError as exc:
+                raise DeliveryError(f"MLLP encoding-character override failed: {exc}") from exc
+        if self.hl7_raw_separators:
+            # BACKLOG #107: re-serialize emitting the reserved structural separators as raw bytes
+            # (composes after any delimiter rewrite above). A non-HL7 / unparseable payload can't be
+            # rewritten — surface a DeliveryError (the message reached neither wire nor peer) rather
+            # than framing a corrupted message; the pipeline records the ERROR.
+            try:
+                payload = emit_raw_separators(payload)
+            except (ValueError, IndexError) as exc:
+                # ValueError includes HL7PeekError (no leading MSH, or an over-budget escape
+                # expansion). IndexError: the same truncated-header shapes that
+                # reencode_delimiters maps to ValueError above (BACKLOG #1601).
+                raise DeliveryError(
+                    "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
+                    f"{safe_exc(exc)}"
+                ) from exc
+        return payload
 
     def waiting_for_reply(self, now: float) -> bool:
         """#136 (ADR 0065 amendment): whether this outbound is currently AWAITING an MLLP ACK and at
@@ -921,30 +954,7 @@ class MLLPDestination(DestinationConnector):
                 # before any payload byte leaves the box (defense in depth against a reload routing PHI
                 # around the construction-only gate).
                 self._hop_guard.assert_send()
-            if self.encoding_characters is not None:
-                # Re-encode the body with this destination's delimiters before framing. A non-HL7/
-                # garbled payload can't be rewritten — surface it as a DeliveryError (the message
-                # reached neither the wire nor the peer) rather than framing a corrupted message; the
-                # pipeline records the ERROR.
-                try:
-                    payload = reencode_delimiters(payload, self.encoding_characters)
-                except ValueError as exc:
-                    raise DeliveryError(f"MLLP encoding-character override failed: {exc}") from exc
-            if self.hl7_raw_separators:
-                # BACKLOG #107: re-serialize emitting the reserved structural separators as raw bytes
-                # (composes after any delimiter rewrite above). A non-HL7 / unparseable payload can't be
-                # rewritten — surface a DeliveryError (the message reached neither wire nor peer) rather
-                # than framing a corrupted message; the pipeline records the ERROR.
-                try:
-                    payload = emit_raw_separators(payload)
-                except (ValueError, IndexError) as exc:
-                    # ValueError includes HL7PeekError (no leading MSH, or an over-budget escape
-                    # expansion). IndexError: the same truncated-header shapes that
-                    # reencode_delimiters maps to ValueError above (BACKLOG #1601).
-                    raise DeliveryError(
-                        "MLLP hl7_raw_separators emit failed (payload not parseable HL7): "
-                        f"{safe_exc(exc)}"
-                    ) from exc
+            payload = self._rewrite_for_wire(payload)
             # ADR 0205 rule 1: frame once, before any dial; the four paths below only write bytes.
             wire = frame_for_delivery(MLLP_CODEC, payload, self.encoding, transport="MLLP")
             if self.no_ack:
