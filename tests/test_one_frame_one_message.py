@@ -13,6 +13,8 @@ Control bytes are written as escapes, never literally, so a byte grep of this fi
 from __future__ import annotations
 
 import asyncio
+import random
+import re
 from pathlib import Path
 from typing import Any
 
@@ -229,6 +231,55 @@ def test_the_structural_escapes_are_unchanged() -> None:
     expected = "O" + BS + "S" + BS + "B" + BS + "F" + BS + "x" + BS + "R" + BS + "y"
     expected += BS + "T" + BS + "z" + BS + "E" + BS
     assert _builtin_hl7.escape_leaf("O^B|x~y&z" + BS, SEPS) == expected
+
+
+def test_a_separator_that_is_an_escape_letter_is_not_escaped_twice() -> None:
+    # MSH-2 "F~\&": the component separator is F, the letter of the field-separator escape. A
+    # chained replace rescanned the escape it had just written and turned \F\ into \\S\\.
+    msh = "MSH|F~" + BS + "&|SND|FAC|RCV|FAC|20260101120000||ADTFA01|CTRL1|P|2.5"
+    msg = Message.parse(msh + CR + "PID|1||111||DOEFJANE" + CR)
+    msg.set("PID-5.1", "a|b")
+    assert _pid5(msg) == "a" + BS + "F" + BS + "bFJANE"
+    seps = ("|", "F", "~", "&", BS)
+    assert _builtin_hl7.escape_leaf("a|b", seps) == "a" + BS + "F" + BS + "b"
+    assert _builtin_hl7.unescape(_builtin_hl7.escape_leaf("a|bF", seps), seps) == "a|bF"
+
+
+def _reference_escape(value: str, seps: tuple[str, str, str, str, str]) -> str:
+    """An independent one-pass escaper: a regex alternation over every character to escape, with
+    the alphabet written out here rather than read from the module under test."""
+    field_sep, comp_sep, rep_sep, sub_sep, esc = seps
+    controls = [chr(cp) for cp in range(0x20) if cp not in (0x09, 0x0A, 0x0D)] + [chr(0x7F)]
+    table = {ch: f"{esc}X{ord(ch):02X}{esc}" for ch in controls}
+    for char, code in ((sub_sep, "T"), (rep_sep, "R"), (comp_sep, "S"), (field_sep, "F")):
+        table[char] = f"{esc}{code}{esc}"
+    table[esc] = f"{esc}E{esc}"
+    pattern = re.compile("[" + "".join(re.escape(ch) for ch in table) + "]")
+    return pattern.sub(lambda m: table[m.group()], value)
+
+
+#: Characters an escape body is made of. An escape character drawn from these cannot round-trip
+#: through ``unescape``, which closes a sequence at the next escape character, so the inverse
+#: check below draws its escape character from outside them.
+_ESCAPE_BODY = frozenset("EFSRTX0123456789ABCDEF")
+
+
+def test_escape_leaf_matches_a_reference_across_separator_sets() -> None:
+    rng = random.Random(2557)
+    letters = "EFSRTXHNabz"
+    digits = "0129"
+    punctuation = "|^~&" + BS + "#$*!@"
+    controls = "".join(chr(cp) for cp in (0x00, 0x01, 0x0B, 0x1B, 0x1C, 0x1F, 0x7F))
+    pool = letters + digits + punctuation + controls
+    data = pool + "\t " + chr(0xE9) + chr(0x738B)
+    for _ in range(3000):
+        field_sep, comp_sep, rep_sep, sub_sep, esc = rng.sample(pool, 5)
+        seps = (field_sep, comp_sep, rep_sep, sub_sep, esc)
+        value = "".join(rng.choice(data) for _ in range(rng.randrange(0, 12)))
+        escaped = _builtin_hl7.escape_leaf(value, seps)
+        assert escaped == _reference_escape(value, seps), (seps, value)
+        if esc not in _ESCAPE_BODY:
+            assert _builtin_hl7.unescape(escaped, seps) == value, (seps, value)
 
 
 # --- rule 3: a whole-field write, add_repetition and add_segment refuse 0x0B, 0x1C and NUL --------

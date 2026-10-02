@@ -73,9 +73,13 @@ as the accepted draft wrote them except where a point below says otherwise.
    subcomponent write, each C0 control character and DEL except TAB is written as an HL7 hex escape
    (`\X0B\`, uppercase digits), so a value that arrived hex-escaped leaves hex-escaped. CR and LF
    keep today's refusal. The one implementation is `escape_leaf` in
-   `messagefoundry/parsing/_builtin_hl7.py`: the escape character first, so nothing inserted later
-   is escaped again, then the delimiters, then each control character present, each a C-level
-   `str.replace`. `Message._escape_leaf` and the DICOM mapper's `_escape_leaf` delegate to it, so
+   `messagefoundry/parsing/_builtin_hl7.py`: one `str.translate` pass over a table cached per
+   separator set, so nothing it inserts is scanned again. *Corrected 2026-10-02 in review:* the
+   build first chained one `str.replace` per character. That rescanned its own escapes, so with
+   MSH-2 `F~\&` (component separator `F`) a write of `a|b` came out `a\\S\\b` and read back
+   `aSb`. A separator that is a letter or digit an escape is made of still cannot carry such an
+   escape through a re-parse, because the parser splits a field on its separators before it
+   unescapes; no escaper can fix that. `Message._escape_leaf` and the DICOM mapper's `_escape_leaf` delegate to it, so
    the three escapers the draft named cannot drift. The alphabet comes from
    `messagefoundry/controlchars.py`, scanned to U+00FF as the log scrub table is, so a deliberate
    widening there reaches this table too.
