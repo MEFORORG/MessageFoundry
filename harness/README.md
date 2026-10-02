@@ -319,3 +319,21 @@ CLAIM them. That claim is made good only where a server exists; on a run that sk
 exercised the connector. `tests/test_harness_database.py` holds the end-to-end test, gated on
 `MEFOR_TEST_SQLSERVER`. No CI step runs it, and wiring it into the existing SQL Server legs alone
 would not verify anything: those present an untrusted certificate, so the test skips there.
+
+### DICOM DIMSE (C-STORE SCP inbound, SCU outbound)
+
+`harness/config/dimse.py` forwards every object its C-STORE SCP inbound receives, unchanged, to a
+C-STORE SCU outbound whose peer is the harness DIMSE sink; the endpoints are `dimse_in` and
+`dimse_out` (`harness/endpoints/dimse.py`), and the AE titles are in the graph's docstring. The
+driver (`harness/drivers/dimse.py`) C-STOREs synthetic Basic Text SR objects with a fresh
+SOPInstanceUID each; the sink (`harness/sinks/dimse.py`) records every C-STORE and answers Success
+or a configured failure status. Serving `harness/config` now also binds that SCP, which needs the
+`[dicom]` extra; without it that one inbound fails to start, harness discovery still works, and a
+DIMSE scenario reports the missing extra rather than passing.
+
+The engine records a DICOM object with no control id, so these scenarios match rows differently from
+the HL7 ones: they snapshot the inbound's rows before sending, then read the bodies of rows that
+arrived after it through the audited raw-body route (`surface="harness"`) and match them by
+SOPInstanceUID. That needs a token with `messages:view_raw` as well as `messages:read`.
+`harness/scenarios/dimse.py` lists the scenarios: delivered, retried-then-dead-lettered, and
+refused-then-dead-lettered, each also counting the C-STOREs that reached the sink.

@@ -83,6 +83,11 @@ class BaseScenario(abc.ABC):
     def run(self, ctx: ScenarioContext) -> ScenarioResult:
         """Run end to end and report pass or fail with a one-line detail."""
 
+    def unavailable(self) -> str | None:
+        """Why this scenario cannot run in this install (an optional extra it needs is missing), or
+        None. A test reports that as a skip; :meth:`run` still fails rather than passing."""
+        return None
+
 
 @dataclass(frozen=True)
 class Scenario(BaseScenario):
