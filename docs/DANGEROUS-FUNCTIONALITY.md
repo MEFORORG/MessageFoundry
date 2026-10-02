@@ -543,7 +543,7 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. Sets the service's privilege list and its SID type. |
 | `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
@@ -555,6 +555,16 @@ least-privilege virtual account, `NT SERVICE\<ServiceName>`, with no password. `
 opts out, and the engine then runs as LocalSystem, the most privileged local account. Section 1
 then means that whoever can write the config directory can run code as LocalSystem.
 `-ServiceAccount` names any other account, such as a group managed service account.
+
+**The installer also limits the service's token, and the same switches loosen that.** It sets a
+one-entry privilege list for every account. When the service runs as its own virtual account it
+also sets a restricted service SID, so the engine writes only where a permission names the service
+itself. `-SkipRestrictedServiceSid` opts out of the restricted SID: the engine can then write
+wherever its account, or any group the account is in, can. `-ServiceAccount` and
+`-AllowLocalSystem` have the same effect, because the installer sets the restricted SID only for
+the service's own virtual account. The restriction does not contain code that runs inside the
+engine. [SERVICE.md](SERVICE.md#restrict-the-service-token) says what it covers and what it does
+not.
 
 Other switches on `install-service.ps1` change more than the service:
 

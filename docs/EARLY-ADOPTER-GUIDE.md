@@ -318,6 +318,10 @@ the service, and (with `-ServiceAccount`) auto-grants config-read + data-dir-rea
 account. Service defaults: name `MessageFoundry`, data dir `C:\ProgramData\MessageFoundry`, store
 `<DataDir>\messagefoundry.db`, logs `<DataDir>\logs`, bind `127.0.0.1:8765`.
 
+Under that default account the service's token is write-restricted. Grant any other directory the
+engine writes, such as a File connection's, to `NT SERVICE\MessageFoundry` by name.
+[SERVICE.md](SERVICE.md#restrict-the-service-token) says why.
+
 > **WARNING: Pinned-wheel operational model.** With a pinned-version install (§4.1), the running service
 > loads the **installed wheel** — a known, pinned version, not a moving checkout. Picking up a new
 > engine version is a deliberate run of the §13 upgrade runbook, which pins the new version, so every

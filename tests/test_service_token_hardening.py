@@ -354,6 +354,17 @@ def test_the_wiring_guard_fails_when_a_piece_is_changed(
     assert any(expect in p for p in problems), problems
 
 
+def test_the_opt_out_is_a_switch_and_so_defaults_to_the_hardened_token() -> None:
+    """A [switch] is off unless it is passed, which is what makes the restricted SID the default.
+    The same name must be in both documents that list the installer's loosening switches."""
+    assert _SCRIPT is not None
+    assert "[switch]$SkipRestrictedServiceSid" in _SCRIPT.read_text(encoding="utf-8")
+    for doc in ("SERVICE.md", "DANGEROUS-FUNCTIONALITY.md"):
+        text = (_ROOT / "docs" / doc).read_text(encoding="utf-8")
+        assert "-SkipRestrictedServiceSid" in text, f"docs/{doc} does not name the opt-out switch"
+        assert "-AllowLocalSystem" in text, f"CONTROL FAILED: docs/{doc} lists no installer switch"
+
+
 # --- 4. the grant a restricted token depends on is read from the DACL ------------------------------
 
 
