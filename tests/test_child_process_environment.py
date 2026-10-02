@@ -460,6 +460,12 @@ _NO_VENV_WINDOWS_SITES = ["base", "base/Lib/site-packages"]
         ),
         # The same, with no site-packages directory left after the standard library: last.
         (_VENV_SITES, ["site", "base/zip", "base/Lib"], ["site", "base/zip", "base/Lib", "ROOT"]),
+        # No entry is found to be the standard library: last, the one place certainly after it.
+        (
+            _VENV_SITES,
+            ["site", "elsewhere", "user-site"],
+            ["site", "elsewhere", "user-site", "ROOT"],
+        ),
         # An operator's own PYTHONPATH entry ahead of the standard library changes nothing.
         (
             _VENV_SITES,
@@ -524,8 +530,13 @@ def test_a_site_packages_directory_on_pythonpath_does_not_let_the_checkout_shado
     package.mkdir(parents=True)
     shutil.copyfile(_child_bootstrap.__file__, package / "_child_bootstrap.py")
     (package / "__init__.py").write_text("", encoding="utf-8")
+    # A json already imported at start-up would make the decoy's absence prove nothing.
     (package / "probe.py").write_text(
-        "import json\nimport mf_checkout_marker\nprint(json.__file__)\n", encoding="utf-8"
+        "import sys\n"
+        "if 'json' in sys.modules:\n"
+        "    raise SystemExit('json was imported before the bootstrap placed the checkout')\n"
+        "import json\nimport mf_checkout_marker\nprint(json.__file__)\n",
+        encoding="utf-8",
     )
     (checkout / "json.py").write_text("raise SystemExit('the decoy answered')\n", encoding="utf-8")
     (checkout / "mf_checkout_marker.py").write_text("", encoding="utf-8")

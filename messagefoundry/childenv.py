@@ -262,7 +262,8 @@ def hook_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]
 
 def engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment for a Python child started through the bootstrap that runs the engine's own
-    trusted code: all of it, less any ``PYTHONPATH`` entry that names the working directory.
+    trusted code: all of it, less any empty or relative ``PYTHONPATH`` entry, which would resolve
+    against the working directory.
 
     An engine shard is one such child, and it needs the secrets. The tray's branded relaunch is
     another. A child that runs code the engine does not fully trust takes
