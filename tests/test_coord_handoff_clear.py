@@ -106,15 +106,21 @@ def register(home: Path, session: str, pid: int, started_ms: int) -> None:
 
 
 def field_differences(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
-    """Every way ``after`` differs from ``before`` outside the two fields a clear may touch."""
-    touched = {"handoff", "handoffClears"}
+    """Every way ``after`` differs from ``before``, outside the two VALUES a clear may change.
+
+    ``handoff`` stays in the key-order check, so moving it is caught. Values are compared as JSON
+    text, because Python's ``==`` calls ``1 == 1.0`` and ``True == 1`` equal and a round trip that
+    changed a number's type would pass.
+    """
     out: list[str] = []
-    kb = [k for k in before if k not in touched]
-    ka = [k for k in after if k not in touched]
+    kb = [k for k in before if k != "handoffClears"]
+    ka = [k for k in after if k != "handoffClears"]
     if kb != ka:
         out.append(f"key order: {kb} -> {ka}")
     for k in kb:
-        if k in after and before[k] != after[k]:
+        if k == "handoff" or k not in after:
+            continue
+        if json.dumps(before[k]) != json.dumps(after[k]):
             out.append(f"{k}: {before[k]!r} -> {after[k]!r}")
     return out
 
@@ -167,7 +173,7 @@ class TestClearsADeadPointer:
         rec["asOf"] = "2026-09-25T00:37:14.1234567+00:00"
         rec["lifecycleAt"] = "2026-09-25T00:37:14Z"
         rec["declaredAt"] = "09/25/2026 00:37:14"
-        rec["notes"] = "café → ok"
+        rec["notes"] = "café ok"
         rp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
         before = load(rp)
 
@@ -194,6 +200,33 @@ class TestClearsADeadPointer:
         reordered = {"writes": after["writes"], **{k: v for k, v in after.items() if k != "writes"}}
         assert any(d.startswith("key order") for d in field_differences(before, reordered))
 
+        retyped = dict(after)
+        retyped["writes"] = float(after["writes"])
+        assert any(d.startswith("writes:") for d in field_differences(before, retyped))
+
+    def test_a_later_record_keeps_the_audit_trail(self, repo: Path, home: Path) -> None:
+        """The normal write path rebuilds the record from a fixed field list. It must carry this."""
+        rp = declare_dangling(repo)
+        assert clear(repo, home, rp.parent.name, rp.stem).returncode == 0
+        trail = load(rp)["handoffClears"]
+        seat(repo, "-Record", session=DEAD)
+        after = load(rp)
+        assert after["handoffClears"] == trail, "a -Record dropped the clear's audit entry"
+        assert after["handoff"] is None
+
+    def test_a_stale_pid_is_cleared(self, repo: Path, home: Path) -> None:
+        """A pid now held by a process that started long after the session registered."""
+        rp = declare_dangling(repo)
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            register(home, DEAD, other.pid, int((time.time() - 86400) * 1000))
+            proc = clear(repo, home, rp.parent.name, rp.stem)
+        finally:
+            other.kill()
+            other.wait()
+        assert proc.returncode == 0, proc.stderr
+        assert load(rp)["handoffClears"][-1]["fenceState"] == "STALE"
+
 
 class TestRefuses:
     def _assert_refused(self, proc: subprocess.CompletedProcess[str], rp: Path, raw: str) -> None:
@@ -201,19 +234,74 @@ class TestRefuses:
         assert "REFUSED" in proc.stderr, proc.stderr
         assert rp.read_text(encoding="utf-8-sig") == raw, "a refusal must not write"
 
-    def test_a_live_session_is_refused(self, repo: Path, home: Path) -> None:
+    @pytest.mark.parametrize(
+        ("started", "state"),
+        [("now", "LIVE"), (None, "UNVERIFIED")],
+    )
+    def test_a_possibly_live_session_is_refused(
+        self, repo: Path, home: Path, started: str | None, state: str
+    ) -> None:
+        """A running pid with a matching start reads LIVE; with no startedAt it reads UNVERIFIED."""
         rp = declare_dangling(repo)
         raw = rp.read_text(encoding="utf-8-sig")
         live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
-            register(home, DEAD, live.pid, int(time.time() * 1000))
+            # startedAt is PRESENT and null for UNVERIFIED. An ABSENT one makes the registry's
+            # fence throw under StrictMode, which the next test pins as its own refusal.
+            entry: dict[str, Any] = {"pid": live.pid, "sessionId": DEAD, "cwd": "x"}
+            entry["startedAt"] = int(time.time() * 1000) if started == "now" else None
+            (home / ".claude" / "sessions" / f"{live.pid}.json").write_text(
+                json.dumps(entry), encoding="utf-8"
+            )
             proc = clear(repo, home, rp.parent.name, rp.stem)
         finally:
             live.kill()
             live.wait()
         self._assert_refused(proc, rp, raw)
-        assert "LIVE" in proc.stderr, proc.stderr
+        assert f"reads {state}" in proc.stderr, proc.stderr
         assert not (seats_dir(repo) / ".writer-errors.txt").exists(), "a refusal is not an error"
+
+    def test_a_registry_record_with_no_pid_is_refused_as_unreadable(
+        self, repo: Path, home: Path
+    ) -> None:
+        rp = declare_dangling(repo)
+        raw = rp.read_text(encoding="utf-8-sig")
+        (home / ".claude" / "sessions" / "x.json").write_text(
+            json.dumps({"pid": None, "sessionId": DEAD, "startedAt": 1}), encoding="utf-8"
+        )
+        proc = clear(repo, home, rp.parent.name, rp.stem)
+        self._assert_refused(proc, rp, raw)
+        assert "reads UNREADABLE" in proc.stderr, proc.stderr
+
+    def test_a_fence_that_throws_is_refused(self, repo: Path, home: Path) -> None:
+        """A registry record with NO pid key makes Test-RecordLiveness throw under StrictMode."""
+        rp = declare_dangling(repo)
+        raw = rp.read_text(encoding="utf-8-sig")
+        (home / ".claude" / "sessions" / "x.json").write_text(
+            json.dumps({"sessionId": DEAD, "startedAt": 1}), encoding="utf-8"
+        )
+        proc = clear(repo, home, rp.parent.name, rp.stem)
+        self._assert_refused(proc, rp, raw)
+        assert "liveness lookup" in proc.stderr and "failed" in proc.stderr, proc.stderr
+
+    def test_an_unparsable_registry_file_vetoes_the_clear(self, repo: Path, home: Path) -> None:
+        """A file caught mid-write may be the very session being fenced."""
+        rp = declare_dangling(repo)
+        raw = rp.read_text(encoding="utf-8-sig")
+        (home / ".claude" / "sessions" / "9999.json").write_text('{"pid": 99', encoding="utf-8")
+        proc = clear(repo, home, rp.parent.name, rp.stem)
+        self._assert_refused(proc, rp, raw)
+        assert "cannot be read" in proc.stderr, proc.stderr
+
+    def test_a_codex_seat_is_refused(self, repo: Path, home: Path) -> None:
+        """Claude's registry cannot fence a Codex session, so it would read as a clean miss."""
+        rp = declare_dangling(repo)
+        codex = rp.with_name("codex-abc.json")
+        codex.write_text(rp.read_text(encoding="utf-8-sig"), encoding="utf-8")
+        raw = codex.read_text(encoding="utf-8-sig")
+        proc = clear(repo, home, rp.parent.name, codex.stem)
+        self._assert_refused(proc, codex, raw)
+        assert "Codex seat" in proc.stderr, proc.stderr
 
     def test_a_pointer_whose_file_still_exists_is_refused(self, repo: Path, home: Path) -> None:
         doc = repo / "h.md"
@@ -268,10 +356,21 @@ class TestRefuses:
         self._assert_refused(proc, rp, raw)
         assert "cannot be evaluated" in proc.stderr
 
-    @pytest.mark.parametrize("box", ["..", ".writer-alive", "a/b", ""])
+    @pytest.mark.parametrize(
+        ("box", "session", "flag"),
+        [
+            ("..", DEAD, "-Box"),
+            (".writer-alive", DEAD, "-Box"),
+            ("a/b", DEAD, "-Box"),
+            ("", DEAD, "-Box"),
+            ("box", "..", "-SessionId"),
+            ("box", "../x", "-SessionId"),
+        ],
+    )
     def test_a_key_that_could_escape_the_seats_directory_is_refused(
-        self, repo: Path, home: Path, box: str
+        self, repo: Path, home: Path, box: str, session: str, flag: str
     ) -> None:
-        proc = clear(repo, home, box, DEAD)
+        """Only the key guard prints "must match", so the "no record" refusal cannot pass this."""
+        proc = clear(repo, home, box, session)
         assert proc.returncode == 1, (proc.stdout, proc.stderr)
-        assert "REFUSED" in proc.stderr or "-Box" in proc.stderr, proc.stderr
+        assert f"REFUSED: {flag} " in proc.stderr and "must match" in proc.stderr, proc.stderr
