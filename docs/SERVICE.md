@@ -360,10 +360,12 @@ directory is still code that runs with the service account's access. Lock it dow
 
 **When it takes effect.** A service gets both settings when Windows starts it. Microsoft documents
 a SID type change as needing a system start. The `windows-service-smoke` CI leg installs a new
-service, starts it and reads the token the running engine holds, so a fresh install is the case
-that leg reads. Nobody has measured a change on a service that was already installed. Restart the
-host after you re-run the installer over an existing service, if you need the new SID type to be in
-force.
+service, starts it and reads the token the running engine holds. Measured 2026-10-02 on Windows
+Server 2022 and 2025 (CI run 36981542600): a new service held the write-restricted token and the
+one-entry privilege list at its first start, with no restart of the host. Nobody has measured a
+change on a service that was already installed. Restart the host after you re-run the installer
+over an existing service, if you need the new SID type to be in force. The installer prints that
+reminder on every re-install.
 
 ### Protect the store encryption key at rest (WP-11d)
 

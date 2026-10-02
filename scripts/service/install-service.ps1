@@ -1085,9 +1085,10 @@ function Set-ServiceTokenHardening {
       off sc.exe does not arise.
 
       WHEN THEY TAKE EFFECT IS READ, NOT ASSUMED HERE. A service gets both when Windows starts it.
-      Microsoft documents a SID type change as needing a system start. The windows-service-smoke
-      leg installs a new service and reads the token its first start got; a change to a service
-      that was already installed has not been measured (docs/SERVICE.md).
+      Microsoft documents a SID type change as needing a system start. Measured 2026-10-02 on
+      hosted Windows Server 2022 and 2025 (CI run 36981542600): a NEW service held the restricted
+      token and the one-entry privilege list at its first start, with no restart of the host. A
+      change to a service that was already installed has not been measured (docs/SERVICE.md).
 
       $LASTEXITCODE IS CLEARED BEFORE EACH CALL, and a missing one is a failure, as in Invoke-Nssm:
       a launch that fails never writes it, and the check would read what an earlier command left.
@@ -1550,12 +1551,16 @@ if ($SidChoice.SidType -eq "restricted") {
 }
 # The lines above say what the REGISTRATION now holds. On a service that was already installed, the
 # token may not follow until the host restarts: Microsoft documents a SID type change that way, and
-# only a new service's first start has been measured (docs/SERVICE.md). So a re-install that changed
-# either setting says so, and does not let the lines above read as the token in force.
-if ($ServiceExisted -and $TokenWas) {
-    Write-Warning ("This changed the token settings of a service that was already installed. " +
-        "Windows may apply a SID type change only after the host restarts, so until then " +
-        "'$ServiceName' may start with its earlier token. Restart the host to be sure.")
+# only a new service's first start has been measured (docs/SERVICE.md). So a re-install says so, and
+# does not let the lines above read as the token in force. On EVERY re-install, not only the one
+# that made the change: a second run before the restart finds the registration already as asked,
+# and would otherwise print the lines above with no caveat.
+if ($ServiceExisted) {
+    $changed = "This run did not change the token settings."
+    if ($TokenWas) { $changed = "This run changed the token settings." }
+    Write-Warning ("'$ServiceName' was already installed. $changed Windows may apply a SID type " +
+        "change only after the host restarts, so if the settings changed since the last restart, " +
+        "'$ServiceName' may still start with its earlier token. Restart the host to be sure.")
 }
 
 # --- ACLs: applied AFTER the service exists + ObjectName is set (S4 ordering, #224) ------------------

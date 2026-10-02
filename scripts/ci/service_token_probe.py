@@ -392,7 +392,11 @@ def try_alternate_credential(granted: Path, denied: Path) -> dict[str, Any]:
     try:
         inner = asyncio.run(run())
     except OSError as exc:
-        return {"ran": True, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        # WHICH CALL FAILED is part of the reading. Only the logon and the impersonation raise
+        # CredentialLogonError; any other OSError came from the calls made under the credential,
+        # and blaming the logon for it would send a reader to the wrong step.
+        stage = "logon" if isinstance(exc, wincred.CredentialLogonError) else "under the credential"
+        return {"ran": True, "ok": False, "stage": stage, "error": f"{type(exc).__name__}: {exc}"}
     return {"ran": True, "ok": True, "error": None, **inner}
 
 
@@ -496,7 +500,7 @@ def inside_problems(
                 "CONTROL FAILED: the token is in neither Users nor Authenticated Users, so a "
                 "refused write to a directory that grants only those proves nothing"
             )
-    granted, denied, temp = report.get("granted"), report.get("denied"), report.get("temp")
+    granted, denied = report.get("granted"), report.get("denied")
     if granted and not granted["wrote"]:
         problems.append(f"it could not write {granted['directory']}, which names it in a grant")
     if denied and denied["wrote"]:
@@ -510,16 +514,15 @@ def inside_problems(
             f"the write to {denied['directory']} failed, but not as a refusal "
             f"({denied['error']}), so it shows nothing about the restriction"
         )
-    if temp and not temp["wrote"]:
-        problems.append(
-            f"it could not write its temporary directory ({temp['directory']}): {temp['error']}"
-        )
     cred = report.get("wincred")
     if cred:
         if not cred.get("ran"):
             problems.append(f"the alternate-credential call could not be run: {cred.get('error')}")
         elif not cred.get("ok"):
-            problems.append(f"the alternate-credential logon failed: {cred.get('error')}")
+            problems.append(
+                f"the alternate-credential call failed at the {cred.get('stage', 'logon')} "
+                f"stage: {cred.get('error')}"
+            )
         else:
             thread = cred.get("thread_token")
             level = thread["impersonation_level"] if thread else None
@@ -531,6 +534,26 @@ def inside_problems(
             if not cred["granted"]["wrote"]:
                 problems.append("a write under the alternate credential failed")
     return problems
+
+
+def inside_notes(report: dict[str, Any]) -> list[str]:
+    """Readings worth a line in the log that do NOT fail the leg.
+
+    The temporary directory is here and not in :func:`inside_problems`. Whether a hardened service
+    has a writable one says something about what the engine can still do, and nothing about whether
+    the token is restricted, which is what the leg is there to prove. It was a failing check until
+    the leg's first hosted run, which stopped before reading it. An unmeasured guess must not be
+    able to evict a pull request from the merge queue, so it is printed, loudly, and read by a
+    person.
+    """
+    temp = report.get("temp")
+    if temp and not temp["wrote"]:
+        return [
+            f"the service could not write its temporary directory ({temp['directory']}): "
+            f"{temp['error']}. The engine would meet this the first time it asked for a temporary "
+            "file."
+        ]
+    return []
 
 
 def _report_problems(subject: str, problems: list[str]) -> None:
@@ -575,6 +598,9 @@ def _check_inside(args: argparse.Namespace) -> int:
     print(json.dumps(report, indent=2))
     problems = inside_problems(report, service_sid=args.service_sid, privileges=args.privilege)
     _report_problems("the service", problems)
+    for note in inside_notes(report):
+        # A workflow command: GitHub shows it as a warning on the run, where a plain line is lost.
+        print(f"::warning title=service token probe::{note}")
     if not problems:
         cred = report["wincred"]
         print(

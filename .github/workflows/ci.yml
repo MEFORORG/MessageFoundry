@@ -4005,8 +4005,8 @@ jobs:
       #    work. scripts/ci/service_token_probe.py holds the rule; this shell is its control.
       # 3. What the token can DO, which only code running under it can show. The service is stopped
       #    and started again with the probe in place of the engine, under the same registration. It
-      #    must write the data directory, be REFUSED on a directory that grants only Users and
-      #    Authenticated Users, find a writable temporary directory, and get through the engine's
+      #    must hold the same token, write the data directory, be REFUSED on a directory that
+      #    grants only Users and Authenticated Users, and get through the engine's
       #    alternate-credential logon (transports/wincred.py), which is documented to need no
       #    privilege. The probe keeps running afterwards, so the stop step below still has a
       #    running service to stop.
@@ -4015,10 +4015,17 @@ jobs:
       # does not set the restricted SID for those, and no leg installs under them. Nor is a real
       # network share: the probe's credential is made up, so it runs the logon and the
       # impersonation and never the SMB hop, which the far end checks and this token does not.
+      # Nor is a writable temporary directory: the probe tries one and a failure is printed as a
+      # warning on the run, which a person has to read. It does not fail the leg.
       #
-      # A SID-type change is documented to need a system start. This install is the service's
-      # first, so the token read here is the one its first start got. A red at reading 2 with a
-      # green reading 1 would be that case, and is not to be turned green by dropping reading 2.
+      # MEASURED on this step's first run, merge-group run 36981542600, both runners: readings 1
+      # and 2 passed on a real service, so a SID type set on a new service is in force at its first
+      # start. Reading 3 never ran: the step read the exit code of the start command and stopped.
+      # The comment at that command says why that code says nothing here.
+      #
+      # "Invalid account name!" from the two set commands below is noise. This copy prints it on
+      # any set made once the service runs as a virtual account, and still makes the change. The
+      # install step's own set printed it in that run, and the token read after it passed.
       # The name is quoted: unquoted, YAML reads " #2702)" as a comment and cuts the name there.
       - name: "Verify the service token is restricted (vault BACKLOG #2702)"
         run: |
@@ -4116,8 +4123,16 @@ jobs:
             Assert-Native "setting the probe as the service's program"
             & "$env:SMOKE_NSSM_DIR\nssm.exe" set MessageFoundry AppParameters "$probe inside --report $report --granted-dir $data --denied-dir $denied --hold-seconds 900"
             Assert-Native "setting the probe's parameters"
+            # THE EXIT CODE OF THIS START IS NOT READ, AND READING IT IS WHAT FAILED THIS STEP ON ITS
+            # FIRST RUN (merge-group run 36981542600, both runners). The service holds
+            # START_PENDING for its AppThrottle, five seconds, before it reports RUNNING. This
+            # command gives up after about three and exits 1 with "Unexpected status
+            # SERVICE_START_PENDING in response to START control". The same run printed that
+            # line for EVERY start in the job, the engine's own included, and each of those
+            # services came up. The probe did too: the service log shows it reached its hold,
+            # which comes after it writes its report. So the start is judged by the report, with
+            # the bounded wait below, the way the health step judges the engine by /health.
             & "$env:SMOKE_NSSM_DIR\nssm.exe" start MessageFoundry
-            Assert-Native "starting the service with the probe"
             # The wait is INSIDE the try, so the engine's values go back only once the probe has
             # reported or the wait has run out. A probe that dies at once is restarted by the
             # service from the registry; put back any sooner, that restart would start the ENGINE,
@@ -4133,7 +4148,11 @@ jobs:
           }
           $restored = (Get-Item -LiteralPath $parameters).GetValue("AppParameters", $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
           if ($restored -ne $saved.AppParameters.Text) { throw "the engine's parameters were not put back: $restored" }
-          if (-not (Test-Path -LiteralPath $report)) { throw "the probe wrote no report as the service; see the service logs below" }
+          if (-not (Test-Path -LiteralPath $report)) {
+            # What the Service Control Manager says, since the start's own exit code says nothing.
+            Get-Service -Name MessageFoundry | Format-List Name, Status, StartType | Out-String
+            throw "the probe wrote no report as the service within 60 seconds; see the service logs below"
+          }
           & python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege
           Assert-Native "the check on what the service token can do"
 

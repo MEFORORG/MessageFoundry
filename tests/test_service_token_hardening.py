@@ -592,10 +592,15 @@ def _broken(path: list[str], value: Any) -> dict[str, Any]:
         # errno 2: the directory was not there. That is a failed write and not a refused one.
         (["denied", "errno"], 2, "not as a refusal"),
         (["granted", "wrote"], False, "could not write d"),
-        (["temp", "wrote"], False, "temporary directory"),
         (["token", "privileges"], [_PRIVILEGE, "SeImpersonatePrivilege"], "not exactly"),
         (["token", "groups"], [], "CONTROL FAILED"),
-        (["wincred", "ok"], False, "logon failed"),
+        (["wincred", "ok"], False, "failed at the logon stage"),
+        # The stage is part of the reading: a failure after the logon must not blame the logon.
+        (
+            ["wincred"],
+            {"ran": True, "ok": False, "stage": "under the credential", "error": "x"},
+            "failed at the under the credential stage",
+        ),
         # Windows answers a refused impersonation with an identification-level token and a success.
         (["wincred", "thread_token", "impersonation_level"], 1, "refused the impersonation"),
         (["wincred", "granted", "wrote"], False, "under the alternate credential"),
@@ -612,6 +617,18 @@ def test_the_rule_fails_each_way_a_report_can_be_wrong(
     assert probe.inside_problems(_passing_report(), **rule) == [], "CONTROL: the base report passes"
     problems = probe.inside_problems(_broken(path, value), **rule)
     assert any(expect in p for p in problems), problems
+
+
+def test_an_unwritable_temp_directory_is_a_note_and_not_a_failure() -> None:
+    """The temporary directory says what the engine can still do, not whether the token is
+    restricted. Its first hosted run never reached it, so it must not be able to fail the leg on a
+    guess. It is still reported: a failure is a note, and a success is no note at all."""
+    probe = _probe()
+    rule = {"service_sid": "S-1-5-80-1", "privileges": [_PRIVILEGE]}
+    failed = _broken(["temp"], {"directory": "t", "wrote": False, "errno": 13, "error": "denied"})
+    assert probe.inside_problems(failed, **rule) == []
+    assert any("temporary directory (t)" in note for note in probe.inside_notes(failed))
+    assert probe.inside_notes(_passing_report()) == [], "CONTROL: a writable one leaves no note"
 
 
 def test_a_report_with_a_step_missing_is_not_a_pass() -> None:
@@ -706,6 +723,37 @@ def test_the_smoke_leg_reads_the_token_it_asked_for() -> None:
         assert needle in script, f"the step no longer runs {needle!r}"
     # CONTROL: the comment lines are really gone, so a needle cannot be met by one.
     assert "# ---" not in script and "CONTROL" in script
+
+
+def test_the_smoke_leg_judges_the_probe_start_by_its_report() -> None:
+    """The first hosted run of this step failed on the exit code of the start command, on both
+    runners (merge-group run 36981542600). The service holds START_PENDING for its AppThrottle and
+    the command gives up first, so it exits 1 on a start that works: the same run printed the same
+    line for the engine's own start. The start is judged by the report the probe writes.
+
+    So no line may read the exit code of a start, and the step must still fail without a report.
+    The set lines are the control: their exit code is real, and each one is still read.
+    """
+    lines = _smoke_step_script("Verify the service token is restricted").splitlines()
+    follows = {
+        verb: [
+            lines[i + 1].strip()
+            for i, line in enumerate(lines[:-1])
+            if f'nssm.exe" {verb} MessageFoundry' in line
+        ]
+        for verb in ("start", "set")
+    }
+    assert len(follows["start"]) == 1 and len(follows["set"]) == 2, follows
+    assert not follows["start"][0].startswith("Assert-Native"), (
+        f"the step reads the exit code of the start again: {follows['start'][0]}"
+    )
+    assert all(line.startswith("Assert-Native") for line in follows["set"]), (
+        f"CONTROL FAILED: a set command's exit code is no longer read: {follows['set']}"
+    )
+    script = "\n".join(lines)
+    assert "if (-not (Test-Path -LiteralPath $report))" in script and "wrote no report" in script, (
+        "the step no longer fails when the probe wrote no report, so nothing judges the start"
+    )
 
 
 # --- 6. the uninstaller and a registration that is only marked for deletion ------------------------
