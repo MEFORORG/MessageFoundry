@@ -169,22 +169,24 @@ checkout's root. Step 1 usually puts it ahead of the site-packages folders. A fi
 named like a module outside the standard library would then load first in each child. Step 1 looks
 for site-packages only after the standard library ends. So a `PYTHONPATH` entry naming a
 site-packages folder cannot move the root ahead of the standard library. An absolute `PYTHONPATH`
-entry naming the root itself does. Then a file there named like a standard-library module that the
-interpreter finds by searching the path would load first too. That covers pure-Python modules such
-as `json`, and extension modules such as `select`. Built-in modules, such as `itertools`, would not
-load from there, because the interpreter finds them before it searches the path. Frozen modules,
-such as `runpy`, are the same only while frozen modules are on. A debug build, or
-`PYTHON_FROZEN_MODULES=off`, turns them off, and the child inherits that variable. Measured on
-Python 3.14.6 on Windows. In the usual installed engine, editable installs included, that folder is
-already on the path, so the script skips step 1.
+entry naming the root itself does. Then a file there could stand in for a standard-library module
+too. The path search finds pure-Python modules such as `json`, and extension modules such as
+`select`. A file in the root would load ahead of either. Built-in modules, such as `itertools`, are
+not affected. The interpreter finds them before it searches the path. Frozen modules, such as
+`runpy`, are not affected only while frozen modules are on. A debug build, or
+`PYTHON_FROZEN_MODULES=off`, turns them off, and the child inherits that variable. These examples
+were measured on Python 3.14.6 on Windows. So do not name the checkout root in `PYTHONPATH`. In the
+usual installed engine, editable installs included, that folder is already on the path, so the
+script skips step 1.
 
 **The first tray process starts without the script.** It starts however it was launched. Autostart
-launches it as `pythonw -m messagefoundry.tray`. Unless `PYTHONSAFEPATH` is set, a `-m` start puts
-the working directory first on its import path. That process imports part of the tray before it
-relaunches. If the relaunch fails, or the branded child exits within a short grace window, it
-carries on as the tray itself. `_CHILD_STARTUP_GRACE_S` in `tray/branding.py` sets that window. So
-a file planted in its working directory, named like a module the tray imports, would load in that
-module's place.
+launches it as `pythonw -m messagefoundry.tray`. A `-m` start puts the working directory first on
+its import path, unless `-P`, `-I` or `PYTHONSAFEPATH` keeps it off. That process imports the
+`messagefoundry` package and part of the tray before it tries to relaunch. So a file or folder
+planted in its working directory, named like any module it imports, would load in its place. That
+holds whether or not the relaunch then works. The process also carries on as the tray itself in at
+least three cases. Branding is unavailable, the relaunch cannot start, or the branded child exits
+within a short grace window. `_CHILD_STARTUP_GRACE_S` in `tray/branding.py` sets that window.
 
 ---
 
@@ -235,17 +237,17 @@ Two argument-list starts are not pinned that way:
 
 **What each child is handed.** A process started with no environment of its own gets a copy of the
 engine's, and the engine's environment holds its secrets. `messagefoundry/childenv.py` builds the
-environment for the sandbox worker, the disaster-recovery hook and the engine shards. It also
-builds it for the child that loads the config before any shard starts, and for the tray's branded
-relaunch. Its docstring says what each one gets, and why that is not an isolation boundary by
-itself. The tray's relaunch also takes its command line from that module, so it starts with `-P`
-like the engine's Python children. Its environment is the user's whole environment, less any empty
-or relative `PYTHONPATH` entry. The first tray process gets neither. It runs with its launcher's
-environment and command line, unchanged. Section 3, under *The first tray process starts without
-the script*, says what that means for its import path. The other starts in the table hand over the
-whole environment.
-`tests/test_child_process_environment.py` lists each of those with its reason, and fails a new
-start whose environment does not come from that module.
+environment for the sandbox worker, the disaster-recovery hook and the engine shards. The module
+also builds one for the config-loading child that runs before any shard starts, and for the tray's
+branded relaunch. The module's docstring says what each one gets, and why that is not an isolation
+boundary by itself. The tray's relaunch also takes its command line from that module, so it
+starts with `-P` like the engine's Python children. Its environment is the user's whole
+environment, less any empty or relative `PYTHONPATH` entry. The first tray process gets neither.
+It runs with its launcher's environment and command line, unchanged. Section 3, under *The first
+tray process starts without the script*, says what that means for its import path. The other
+starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
+lists each of those with its reason, and fails a new start whose environment does not come from
+that module.
 
 **The other forms are the ones to look at hardest.**
 
