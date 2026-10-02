@@ -531,9 +531,7 @@ _MUST_CHOOSE = frozenset(
         ("pipeline/dr.py", "_run_command", "create_subprocess_shell"),
         ("pipeline/supervisor.py", "_default_spawn", "create_subprocess_exec"),
         ("pipeline/supervisor.py", "preflight_shard_config", "create_subprocess_exec"),
-        # The tray starting itself again under its branded launcher (vault BACKLOG #2801). It
-        # keeps the user's whole environment, through the builder that drops a PYTHONPATH entry
-        # naming the working directory, which would undo the child's -P.
+        # The tray starting itself again under its branded launcher (vault BACKLOG #2801).
         ("tray/branding.py", "relaunch_branded", "subprocess.Popen"),
     }
 )
@@ -688,10 +686,10 @@ def test_the_guard_sees_the_calls_it_is_about() -> None:
 
 def test_one_function_builds_the_command_line_of_a_python_child() -> None:
     """``python_child_argv`` is where the interpreter flags are added, so a Python child started any
-    other way would start without them. It is the only code in the shipped packages that names this
-    interpreter's executable, apart from two tray modules that read it for another purpose:
-    ``tray/autostart.py`` writes the login command, and ``tray/branding.py`` finds where to put the
-    branded launcher and whether this process is it (vault BACKLOG #2801)."""
+    other way would start without them. Two tray modules also name the executable.
+    ``tray/branding.py`` reads it to place the branded launcher and to tell whether it is running
+    under it. ``tray/autostart.py`` writes the login command, which starts the first tray process
+    WITHOUT these flags; the ADR 0113 amendment of 2026-10-02 names that limit (vault BACKLOG #2801)."""
     names_the_interpreter = {
         rel
         for rel, source in _scanned_sources().items()

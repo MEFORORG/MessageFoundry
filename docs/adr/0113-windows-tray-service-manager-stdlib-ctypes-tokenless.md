@@ -395,13 +395,13 @@ have the package installed, `-P -X disable-remote-debug -m messagefoundry.childe
 start it from a foreign working directory.
 
 So the relaunch now builds its command line with `childenv.python_child_argv`, and its environment with
-`childenv.engine_environment`. That is the user's whole environment, as the tray needs, less any
-`PYTHONPATH` entry naming the working directory. Measured: an inherited `PYTHONPATH=.` puts the working
+`childenv.engine_environment`. That is the user's whole environment, as the tray needs, less any empty
+or relative `PYTHONPATH` entry. Measured: an inherited `PYTHONPATH=.` puts the working
 directory back under `-P`.
 
 This covers the relaunched child only. The first tray process starts however its launcher started it,
 and autostart writes `pythonw -m messagefoundry.tray`, so that process still has the working directory
-on its import path.
+on its import path. When branding is unavailable, that first process runs the whole tray.
 
 This adds `messagefoundry.childenv` to the tray-importable list, on the same terms as the modules above. It
 is accepted because `childenv` imports only the standard library, so it brings none of the packages the
