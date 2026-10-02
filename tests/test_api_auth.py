@@ -623,6 +623,7 @@ def test_no_builtin_role_holds_view_raw_without_view_summary() -> None:
         for role, perms in BUILTIN_ROLE_PERMISSIONS.items()
         if Permission.MESSAGES_VIEW_RAW in perms
     ]
+    assert len(raw_holders) >= 2  # the count the absence assertion below needs to mean anything
     assert {Role.ADMINISTRATOR, Role.OPERATOR} <= set(raw_holders)
     lacking = [
         role
