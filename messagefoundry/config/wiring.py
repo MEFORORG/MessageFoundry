@@ -1429,7 +1429,9 @@ def _proxy_userinfo_split(value: str) -> tuple[str, str, str] | None:
       ``1234/5``, and a query ``@`` (``h:8443/x?email=a@b``) makes everything up to the next ``/``
       authority too, which is why this can mask a URL with no real userinfo.
     * The userinfo is the authority before its LAST ``@``; the user is the userinfo before its first
-      ``:``, and there is a password only when that ``:`` exists."""
+      ``:``, and the password is what follows that ``:``. This returns a split only when that
+      password is not empty: urllib sends no credential otherwise, and an empty one is no secret.
+      The user may be empty (``http://:pw@proxy``)."""
     colon = value.find(":")
     rest = colon + 1 if colon > 0 and "/" not in value[:colon] else 0
     if not value.startswith("/", rest):
@@ -1451,28 +1453,43 @@ def _proxy_userinfo_split(value: str) -> tuple[str, str, str] | None:
     return value[:auth_start], user, hostport + value[auth_end:]
 
 
-def _password_spans(value: str) -> list[tuple[int, int]]:
-    """The ``[start, end)`` span of every userinfo password a URL reader would find in ``value``.
-
-    Two readers, because the settings this masks reach two: urllib's proxy parser for a proxy URL
-    (:func:`_proxy_userinfo_split`), and ``urlsplit``'s netloc, which ends at the first ``/``, ``?``
-    or ``#``, for every other URL a connector dials. Both are masked whichever key holds the URL,
-    which fails toward masking: a credential-free URL with a ``:`` before a query ``@`` can lose its
-    host in the view, and no password either reader would send is shown."""
-    spans: list[tuple[int, int]] = []
+def _raw_password_spans(value: str) -> list[tuple[int, int]]:
+    """The password span the proxy mirror finds in ``value`` as given, if any.
+    :func:`_password_spans` runs this over normalised copies as well."""
     split = _proxy_userinfo_split(value)
-    if split is not None:
-        before, user, after = split
-        spans.append((len(before) + len(user) + 1, len(value) - len(after) - 1))
-    slashes = value.find("//")
-    if slashes >= 0:
-        start = slashes + 2
-        ends = [i for i in (value.find(c, start) for c in "/?#") if i >= 0]
-        netloc_end = min(ends, default=len(value))
-        at = value.rfind("@", start, netloc_end)
-        colon = value.find(":", start, at) if at >= 0 else -1
-        if colon >= 0 and colon + 1 < at:
-            spans.append((colon + 1, at))
+    if split is None:
+        return []
+    before, user, after = split
+    return [(len(before) + len(user) + 1, len(value) - len(after) - 1)]
+
+
+def _password_spans(value: str) -> list[tuple[int, int]]:
+    """The ``[start, end)`` span of every userinfo password at least these readers find in
+    ``value``, in ``value``'s own coordinates:
+
+    * urllib's proxy parser (:func:`_proxy_userinfo_split`). Its password span CONTAINS the one a
+      ``urlsplit`` netloc read finds for a dialled URL, so no second reader is kept for that:
+      ``tests/test_url_query_credential.py`` drives ``urlsplit(...).password`` through the
+      composed mask to keep that claim tested (review of 2544705869, which measured a separate
+      netloc reader adding nothing);
+    * that reader over a copy with tab, CR and LF removed, because ``urlsplit`` removes them
+      before it looks for ``//`` (``http:/\t/user:pw@h``);
+    * that reader over a copy with ``%40`` read as ``@``, because urllib's ``Request`` unquotes
+      the host, so ``user:pw%40h`` leaks like ``user:pw@h`` (``transports.rest.refuse_url_credentials``).
+
+    Every span is masked whichever key holds the URL, which fails toward masking: a credential-free
+    URL with a ``:`` before a query ``@`` can lose its host in the view. A reader not listed here
+    is not modelled."""
+    spans = _raw_password_spans(value)
+    # %40 -> "@" plus two placeholders keeps every index where it was.
+    at_decoded = value.replace("%40", "@\0\0")
+    if at_decoded != value:
+        spans += _raw_password_spans(at_decoded)
+    kept = [i for i, ch in enumerate(value) if ch not in "\t\r\n"]
+    if len(kept) != len(value):
+        stripped = "".join(value[i] for i in kept)
+        for copy in {stripped, stripped.replace("%40", "@\0\0")}:
+            spans += [(kept[s], kept[e - 1] + 1) for s, e in _raw_password_spans(copy) if e > s]
     return spans
 
 
@@ -1486,19 +1503,22 @@ def _mask_url(value: str) -> str:
     deliberately: an operator diagnosing a connection needs to see which account and which host.
 
     It masks the UNION of spans found in the ORIGINAL string, never a substring another mask cut:
-    the password every reader finds (:func:`_password_spans`, which mirrors urllib's proxy parser
-    exactly), and the value of every credential-like ``name=value`` segment anywhere in the URL
-    (:func:`~messagefoundry.secretscrub.credential_value_spans`). Overlapping spans merge into one
-    ``***``. A reader that puts a query inside a user or a password therefore cannot hide a query
-    key, and a query reader that starts at the wrong ``?`` cannot hide a password.
+    the passwords :func:`_password_spans` finds, and the value of every credential-like
+    ``name=value`` segment (:func:`~messagefoundry.secretscrub.credential_value_spans`). Spans that
+    overlap or touch merge into one ``***``. So at least the readers and misreadings modelled there
+    cannot hide one another's secret; a reader not modelled can.
 
     CORRECTED (Lander QA on PR 1912, 2026-10-01): a hand-rolled authority rule showed
     ``http://user:1234/5@proxy`` verbatim, and urllib reads ``1234/5`` as the password. The next
     attempt masked the query only in the text after the userinfo, which served ``api_key`` when a
     ``:`` and an ``@`` later in the query made the proxy reader's USER swallow it. Masking spans of
-    the original string closes both. The cost is the view, never a secret: a credential-free URL with
-    a ``:`` before a query ``@`` can show a ``***`` and the wrong host, and a fragment segment that
-    looks like a credential is masked too."""
+    the original string closes both. The cost is the view, never a modelled secret: a credential-free
+    URL with a ``:`` before a query ``@`` can show a ``***`` and the wrong host, and a fragment or
+    path segment that looks like a credential is masked too.
+
+    Not masked, by decision: a userinfo with a user and no password (``https://TOKEN@host``). #1207
+    keeps the user visible, and a URL key carrying one is refused at build; an ``env()`` default or
+    a hand-built settings map is not, so such a token would be shown."""
     spans = sorted(_password_spans(value) + credential_value_spans(value))
     if not spans:
         return value
@@ -1507,11 +1527,11 @@ def _mask_url(value: str) -> str:
     for start, end in spans:
         if end <= cursor:
             continue  # inside a span already masked
-        if start < cursor:
-            start = cursor
-        else:
-            out.append(value[cursor:start])
-            out.append("***")
+        if start <= cursor and out:
+            cursor = end  # overlaps or touches the previous span: extend that one "***"
+            continue
+        out.append(value[cursor:start])
+        out.append("***")
         cursor = end
     out.append(value[cursor:])
     return "".join(out)

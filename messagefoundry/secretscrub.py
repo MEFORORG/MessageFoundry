@@ -664,56 +664,53 @@ def credential_value_spans(text: str) -> list[tuple[int, int]]:
     """The ``[start, end)`` span of the VALUE of every credential-like ``name=value`` segment in
     ``text``, wherever it sits.
 
-    A segment starts after any ``?``, ``&`` or ``#`` and ends at the next ``&`` or ``#``. It does not
-    care where a URL parser would put the query, which is the point: ``config.wiring._mask_url``
-    unions these with password spans so that no parser's misreading can hide a credential. A segment
-    in a fragment or a path that looks like a credential is masked too; that is the safe direction.
-    Names are judged by the same test as :func:`credential_query_params`. An empty value has no
-    span."""
+    A segment starts after any ``?``, ``&``, ``#`` or ``;`` (a path parameter such as
+    ``;jsessionid=``, or a server that splits its query on ``;``) and ends at the next ``&`` or
+    ``#``. It does not care where a URL parser would put the query, which is the point:
+    ``config.wiring._mask_url`` unions these with password spans so that at least the misreadings
+    tested there cannot hide a credential. A segment in a fragment or a path that looks like a
+    credential is masked too; that is the safe direction. A name is judged after dropping tab, CR
+    and LF, which ``urlsplit`` drops before ``parse_qsl`` decodes it, then by the same test as
+    :func:`credential_query_params`. An empty value has no span. One pass, linear in ``text``."""
     import urllib.parse  # noqa: PLC0415 -- see credential_query_params
 
+    n = len(text)
+    # next_end[i]: the first "&" or "#" at or after i, else n. Built right to left, once.
+    next_end = [n] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        next_end[i] = i if text[i] in "&#" else next_end[i + 1]
     spans: list[tuple[int, int]] = []
     for i, ch in enumerate(text):
-        if ch not in "?&#":
+        if ch not in "?&#;":
             continue
-        start = i + 1
-        ends = [j for j in (text.find("&", start), text.find("#", start)) if j >= 0]
-        end = min(ends, default=len(text))
-        equals = text.find("=", start, end)
-        if equals < 0 or equals + 1 >= end:
+        seg_start = i + 1
+        seg_end = next_end[seg_start]
+        equals = text.find("=", seg_start, seg_end)
+        if equals < 0 or equals + 1 >= seg_end:
             continue
-        if _is_credential_param(urllib.parse.unquote_plus(text[start:equals])):
-            spans.append((equals + 1, end))
+        name = text[seg_start:equals].replace("\t", "").replace("\r", "").replace("\n", "")
+        if _is_credential_param(urllib.parse.unquote_plus(name)):
+            spans.append((equals + 1, seg_end))
     return spans
 
 
 def mask_credential_query(url: str, *, placeholder: str = "***") -> str:
-    """``url`` with the VALUE of each credential-like query parameter replaced by ``placeholder``.
+    """``url`` with every span :func:`credential_value_spans` finds replaced by ``placeholder``.
 
-    For display surfaces that show a configured URL (``config.wiring.redacted_settings``, which
-    serves ``GET /metadata`` and ``graph --json``). Everything else in the URL is kept as written,
-    including every other parameter, so the view stays useful. A parameter is judged by the same
-    name test as :func:`credential_query_params`; a name with no ``=`` has no value to mask.
-
-    It splits the raw text, the fragment off first and then the query at the first ``?``, the
-    spans ``urlsplit`` uses. It does not call ``urlsplit``: that drops tab, CR and LF, so its query
-    is not always a substring of the URL as written, and finding it again by search can land on a
-    copy in the fragment. A ``?`` or ``#`` inside a userinfo password moves both spans, so a caller
-    that shows a URL masks the userinfo FIRST (``config.wiring.redacted_settings`` does)."""
-    import urllib.parse  # noqa: PLC0415 -- see credential_query_params
-
-    before, hash_mark, fragment = url.partition("#")
-    head, question, query = before.partition("?")
-    if not question:
-        return url
-    parts = []
-    for part in query.split("&"):
-        name, equals, _value = part.partition("=")
-        if equals and _is_credential_param(urllib.parse.unquote_plus(name)):
-            parts.append(f"{name}={placeholder}")
-        else:
-            parts.append(part)
-    return f"{head}?{'&'.join(parts)}{hash_mark}{fragment}"
+    The query-credential half of the settings-view mask. ``config.wiring._mask_url`` does NOT call
+    this: it unions these spans with userinfo password spans and replaces them together, so that one
+    mask cannot cut the string the other reads. Use this alone only for a URL known to carry no
+    userinfo. Everything that is not a span is kept as written."""
+    out: list[str] = []
+    cursor = 0
+    for start, end in credential_value_spans(url):
+        if start < cursor:
+            continue
+        out.append(url[cursor:start])
+        out.append(placeholder)
+        cursor = end
+    out.append(url[cursor:])
+    return "".join(out)
 
 
 def _run(text: str, placeholder: str, folded: str | None) -> str:

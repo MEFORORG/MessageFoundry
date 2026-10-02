@@ -197,25 +197,29 @@ def test_the_userinfo_mask_hides_every_password_urllib_reads(case: str, url: str
     import urllib.request
 
     from messagefoundry.config.wiring import redacted_settings
-    from messagefoundry.secretscrub import mask_credential_query
+    from messagefoundry.secretscrub import _is_credential_param, mask_credential_query
 
     _scheme, _user, password, _hostport = urllib.request._parse_proxy(url)  # type: ignore[attr-defined]
+    # Two readers' passwords: urllib's proxy parser, and urlsplit's netloc for a dialled URL.
+    passwords = [p for p in (password, urllib.parse.urlsplit(url).password) if p]
     for key in ("proxy_url", "url"):  # a proxy key and a dialled-URL key mask alike
         shown = redacted_settings({key: url})[key]
-        # Every query credential the detector names stays hidden, whichever reader cut the URL.
+        # Every query credential the detector's name test accepts stays hidden, whichever reader
+        # cut the URL. Raw names from parse_qsl, not the detector's display names.
         assert "SYNTHETIC" not in shown, (case, shown)
         for name, val in urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query):
-            if name in credential_query_params(url) and val:
+            if _is_credential_param(name) and val:
                 assert val not in shown, (case, name, shown)
-        if password:
-            assert password not in shown, (case, shown)
+        # A one- or two-character password can occur in the host by chance; the span tests in
+        # this file pin those shapes exactly.
+        for secret in passwords:
+            if len(secret) >= 3:
+                assert secret not in shown, (case, shown)
+        if passwords:
             assert "***" in shown, case
-        elif "@" not in url or case in (
-            "user, no password",
-            "path @ with no port",
-            "empty password",
-        ):
-            assert shown == mask_credential_query(url), case
+        else:
+            # Neither reader finds a password: the view is the query mask alone.
+            assert shown == mask_credential_query(url), (case, shown)
 
 
 def test_the_parser_mirror_agrees_with_urllib_over_generated_strings() -> None:
@@ -248,6 +252,24 @@ def test_the_parser_mirror_agrees_with_urllib_over_generated_strings() -> None:
     assert compared > 10000 and with_password > 1000, (compared, with_password)
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # urllib's Request unquotes the host, so "%40" ends a userinfo as "@" does.
+        ("http://user:SYNTH-PCT%40h.example.invalid/x", "http://user:***%40h.example.invalid/x"),
+        # urlsplit drops a tab before it finds "//", and then reads a password.
+        ("http:/\t/user:SYNTH-TAB@h.example.invalid/x", "http:/\t/user:***@h.example.invalid/x"),
+        # Two spans that touch merge into one "***".
+        ("http://h?key=x:&y@z/", "http://h?key=***@z/"),
+    ],
+)
+def test_the_mask_models_more_readers_than_the_two_parsers(url: str, expected: str) -> None:
+    """Review of 2544705869: each of these hid a password, or split one mask in two."""
+    from messagefoundry.config.wiring import redacted_settings
+
+    assert redacted_settings({"url": url})["url"] == expected
+
+
 def test_a_query_span_nested_inside_a_password_merges_into_one_mask() -> None:
     """The proxy reader's password ``x?key=S&tail`` contains a query segment's value. The two spans
     must merge; a merge that stepped back to the inner span's end would show ``&tail``."""
@@ -264,14 +286,18 @@ def test_the_composed_mask_never_shows_a_named_key_or_a_read_password() -> None:
     generator puts ``key=QZXJ`` among the characters that move every reader's spans, a value the
     detector names, or one inside a password urllib reads, is never shown."""
     import random
+    import urllib.parse
     import urllib.request
 
     from messagefoundry.config.wiring import redacted_settings
 
     rng = random.Random(14_2_1)
-    named = in_password = 0
-    for _ in range(20000):
-        noise = "h:/@?#&=1."
+    named = in_password = in_netloc = 0
+    for _ in range(30000):
+        # Tab, LF and "%40" too (review of 2544705869): urlsplit drops the first two before it
+        # reads, and urllib's Request unquotes the host, so each moves a reader's spans.
+        alphabets = ("h:/@?#&=1.", "h:/@?#&=1.\t\n", "h:/@?&=1.;")
+        noise = rng.choice(alphabets) + "%40" * rng.randint(0, 1)
         head = "".join(rng.choice(noise) for _ in range(rng.randint(0, 10)))
         tail = "".join(rng.choice(noise.replace("=", "")) for _ in range(rng.randint(0, 10)))
         url = f"http://{head}{rng.choice('?&')}key=QZXJ{tail}"
@@ -286,7 +312,14 @@ def test_the_composed_mask_never_shows_a_named_key_or_a_read_password() -> None:
         if password and "QZXJ" in password:
             in_password += 1
             assert "QZXJ" not in shown, (url, shown)
-    assert named > 1000 and in_password > 100, (named, in_password)
+        try:
+            netloc_password = urllib.parse.urlsplit(url).password
+        except ValueError:
+            continue
+        if netloc_password and "QZXJ" in netloc_password:
+            in_netloc += 1
+            assert "QZXJ" not in shown, (url, shown)
+    assert named > 1000 and in_password > 100 and in_netloc > 20, (named, in_password, in_netloc)
 
 
 @pytest.mark.parametrize(
@@ -311,7 +344,8 @@ def test_userinfo_mask_fails_toward_masking_a_password_holding_a_delimiter(
 
 
 def test_a_query_credential_is_masked_behind_a_password_holding_a_question_mark() -> None:
-    """The userinfo mask runs first, so a "?" in the password cannot move the query span."""
+    """Both masks read the original string and their spans are joined, so a "?" in the password
+    cannot move the span the query mask reads."""
     from messagefoundry.config.wiring import redacted_settings
 
     url = "http://user:p?ss@h.example.invalid/x?key=SYNTHETIC-10"
@@ -342,18 +376,44 @@ def test_mask_fails_toward_masking_when_urlsplit_strips_a_control_character() ->
     url = "https://h.example.invalid/p?api_\tkey=SECRET&fmt=json"
     assert credential_query_params(url) == ["api_key"]
     assert mask_credential_query(url) == "https://h.example.invalid/p?api_\tkey=***&fmt=json"
-    # A copy of the query in the fragment must not draw the mask away from the real one.
+    # A copy of the query in the fragment must not draw the mask away from the real one; both are
+    # masked, since the span scan judges every segment wherever it sits.
     url = "https://h.example.invalid/p?key=SE\tCRET#?key=SECRET"
-    assert mask_credential_query(url) == "https://h.example.invalid/p?key=***#?key=SECRET"
+    assert mask_credential_query(url) == "https://h.example.invalid/p?key=***#?key=***"
+    # A tab inside a percent-escape in the name (review of 2544705869): urlsplit drops it before
+    # parse_qsl decodes the name to api_key, so the span scan must drop it too.
+    url = "https://h.example.invalid/x?api%5\tFkey=TABESC2"
+    assert credential_query_params(url) == ["api_key"]
+    assert "TABESC2" not in mask_credential_query(url)
 
 
-def test_mask_and_detector_agree_on_where_the_query_is() -> None:
-    """A ``?`` after the ``#`` is fragment, not query, for both."""
+def test_the_span_scan_masks_more_than_the_detector_names() -> None:
+    """CORRECTED (review of 2544705869): this test pinned a fragment ``?key=`` as left alone. The
+    span scan now masks every segment that looks like a credential, wherever it sits, which fails
+    toward masking; the detector, which feeds the warning, still reads the query alone."""
     from messagefoundry.secretscrub import mask_credential_query
 
     url = "https://p.example.invalid/x#frag?key=S"
     assert credential_query_params(url) == []
-    assert mask_credential_query(url) == url
+    assert mask_credential_query(url) == "https://p.example.invalid/x#frag?key=***"
+
+
+@pytest.mark.parametrize(
+    ("text", "spans"),
+    [
+        ("https://h/x?key=abc&fmt=json", [(16, 19)]),
+        ("https://h/x?key=&fmt=json", []),  # an empty value has no span
+        ("https://h/x?fmt=json#key=abc", [(25, 28)]),  # "#" starts a segment
+        ("https://h/x?key=a?b&z=1", [(16, 19)]),  # "?" does not end a value; "&" does
+        ("https://h/app;jsessionid=ABC?x=1", [(25, 32)]),  # ";" starts a segment
+        ("https://h/x?a=1;api_key=SEMI", [(24, 28)]),
+        ("https://h/x?keyword=abc", []),  # control: not a credential name
+    ],
+)
+def test_credential_value_spans_contract(text: str, spans: list[tuple[int, int]]) -> None:
+    from messagefoundry.secretscrub import credential_value_spans
+
+    assert credential_value_spans(text) == spans
 
 
 def test_redacted_settings_masks_the_query_value_and_keeps_the_rest() -> None:
