@@ -9,10 +9,13 @@
 //
 // PHI (CLAUDE.md §9). The inline values are message-derived, hence PHI, and are screenshot-/screenshare-
 // capturable. They render as a redacted placeholder (`▸ ⋯`) BY DEFAULT. Real values appear ONLY for ONE
-// run the user asks for by name (`messagefoundry.revealValuesOnce`, ASVS 14.2.6, vault BACKLOG #1187):
+// run the user asks for by name (`messagefoundry.revealValuesOnce`, ASVS 14.2.6, vault BACKLOG #1187),
+// and for ONE message of that run: a multi-message sample asks which one first (owner ruling R15):
 // that run alone passes `--show-phi` to the CLI, and every later run is masked again. The reveal is never
 // a session state, so a run the user did not ask for never carries real values, and real values never
-// even leave the Python process otherwise. Samples must be synthetic (under messageSetsDir).
+// even leave the Python process otherwise. Samples must be synthetic (under messageSetsDir). The same
+// holds for the per-message error text: a masked run's lens tooltip shows only how many messages
+// failed, because the CLI's masked error is scrubbed rather than removed (vault BACKLOG #1187, d1).
 //
 // SCOPE (bounded by the CLI shape): each traced entry is ONE message and FLATTENS handler→delivery
 // attribution (top-level `sends` carry no `handler`). So a per-`@handler` Send count is only unambiguous
@@ -21,68 +24,48 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, isExecGated, messageSetsDir, runJson, workspaceDir } from "./cli";
-import { findElements, isConfigFile, type ElementKind } from "./editorToolbar";
+import { findElements, isConfigFile } from "./editorToolbar";
+import {
+  buildLiveLenses,
+  maskedMessagesOf,
+  revealPickItems,
+  revealedEntry,
+  revealedLabel,
+  rowsFromTrace,
+  summarize,
+  type LiveDryRunRow,
+  type LiveLens,
+  type LiveTraceEntry,
+  type MaskedMessage,
+  type NamedElement,
+  type RevealFocus,
+  type TraceInvocation,
+  type TraceValue,
+} from "./liveDebugModel";
 
-/**
- * The subset of a traced `dryrun` entry this lane reads for the v1 CodeLens summary — deliberately
- * minimal: only routing/disposition fields, NOT any body. Derived from a {@link LiveTraceEntry} via
- * {@link rowsFromTrace}, so the same fold ({@link summarize}) drives the summaries as before.
- */
-export interface LiveDryRunRow {
-  inbound: string;
-  disposition: string;
-  handlers: string[];
-  deliveries: { to: string }[];
-  error: string | null;
-}
-
-// --- traced dry-run schema (messagefoundry/pipeline/dryrun_trace.py, ADR 0072) -------------------
-// A JSON-safe captured value. Without --show-phi the CLI collapses every value to the string
-// "REDACTED"; with it, scalars pass through (strings/numbers/bools/null, length-capped upstream).
-export type TraceValue = string | number | boolean | null;
-
-/** One executed source line: the locals it (re)bound and the `msg[...]`/`msg.set(...)` writes it made. */
-export interface TraceEvent {
-  line: number; // 1-based (Python line number)
-  event: string; // always "line"
-  assigned?: Record<string, TraceValue>;
-  writes?: { path: string; value: TraceValue }[];
-}
-
-/** A live db_lookup/fhir_lookup that a pure preview cannot evaluate (raised + re-raised by the tracer). */
-export interface TraceAnnotation {
-  line: number | null; // 1-based Handler line the call was made on (or null → fall back to def_line)
-  kind: string; // "live_lookup_skipped"
-  call: string; // "db_lookup" | "fhir_lookup"
-}
-
-/** One Router/Handler invocation's execution trace. */
-export interface TraceInvocation {
-  kind: string; // "router" | "handler"
-  name: string;
-  module: string | null;
-  file: string | null; // absolute path of the module that defines the fn
-  def_line: number | null; // 1-based
-  events: TraceEvent[];
-  disposition: string;
-  sends: { outbound: string }[];
-  routed_to: string[];
-  annotations: TraceAnnotation[];
-  truncated?: boolean;
-}
-
-/** One traced message (one array element of `dryrun --trace json`). */
-export interface LiveTraceEntry {
-  source?: string;
-  path?: string;
-  inbound: string;
-  disposition: string;
-  handlers: string[];
-  sends: { outbound: string }[];
-  error: string | null;
-  trace_ok?: boolean;
-  invocations: TraceInvocation[];
-}
+// The pure half lives in liveDebugModel.ts so the unit suite can run it; re-export it so every
+// importer of this module keeps working unchanged.
+export {
+  buildLiveLenses,
+  inboundTooltip,
+  maskedMessagesOf,
+  revealPickItems,
+  revealedEntry,
+  revealedLabel,
+  rowsFromTrace,
+  summarize,
+  type LiveDryRunRow,
+  type LiveLens,
+  type LiveSummary,
+  type LiveTraceEntry,
+  type MaskedMessage,
+  type NamedElement,
+  type RevealFocus,
+  type TraceAnnotation,
+  type TraceEvent,
+  type TraceInvocation,
+  type TraceValue,
+} from "./liveDebugModel";
 
 /**
  * The spawn seam. The real runner shells the CLI; tests inject a canned trace-JSON runner (no live
@@ -116,24 +99,6 @@ export function buildTraceArgs(cfgDir: string, samplePath: string, showPhi: bool
 export const cliTraceRunner: TraceRunner = (samplePath, cwd, showPhi) =>
   runJson<LiveTraceEntry[]>(buildTraceArgs(configDir(), samplePath, showPhi), cwd);
 
-/** Project the v1 CodeLens fields out of the richer trace entries (the summary path is unchanged). */
-export function rowsFromTrace(entries: LiveTraceEntry[]): LiveDryRunRow[] {
-  return entries.map((e) => ({
-    inbound: e.inbound,
-    disposition: e.disposition,
-    handlers: e.handlers,
-    deliveries: e.sends.map((s) => ({ to: s.outbound })),
-    error: e.error,
-  }));
-}
-
-/** A config element located by line, with the name from its `("...")` argument (router/handler/inbound). */
-export interface NamedElement {
-  line: number; // 0-based
-  kind: ElementKind;
-  name: string | null;
-}
-
 const QUOTED_RE = /["']([^"']+)["']/;
 
 /**
@@ -147,106 +112,6 @@ export function namedElements(text: string): NamedElement[] {
     const m = QUOTED_RE.exec(lines[el.line] ?? "");
     return { line: el.line, kind: el.kind, name: m ? m[1] : null };
   });
-}
-
-/** A rendered summary, as plain data (line + label). The provider maps these to `vscode.CodeLens`. */
-export interface LiveLens {
-  line: number; // 0-based
-  title: string;
-  tooltip?: string;
-}
-
-/** The aggregate of one dry-run over a (possibly multi-message) sample — everything the lenses need. */
-export interface LiveSummary {
-  messageCount: number;
-  handlersUnion: string[]; // handler names selected across the run, first-seen order, de-duped
-  dispositions: [string, number][]; // disposition → count, first-seen order
-  totalSends: number; // total deliveries across every message
-  soleHandler: string | null; // the one handler name IFF exactly one distinct handler ran (else null)
-  errors: string[]; // distinct per-message error strings
-}
-
-/**
- * Fold a run's rows into a {@link LiveSummary}. `soleHandler` is set only when the entire run selected
- * exactly one distinct handler — the sole case in which `totalSends` is unambiguously that handler's,
- * given the CLI flattens handler→delivery attribution. Pure; unit-testable.
- */
-export function summarize(rows: LiveDryRunRow[]): LiveSummary {
-  const handlersUnion: string[] = [];
-  const seen = new Set<string>();
-  const dispCounts = new Map<string, number>();
-  let totalSends = 0;
-  const errors: string[] = [];
-  for (const r of rows) {
-    for (const h of r.handlers) {
-      if (!seen.has(h)) {
-        seen.add(h);
-        handlersUnion.push(h);
-      }
-    }
-    dispCounts.set(r.disposition, (dispCounts.get(r.disposition) ?? 0) + 1);
-    totalSends += r.deliveries.length;
-    if (r.error) {
-      errors.push(r.error);
-    }
-  }
-  return {
-    messageCount: rows.length,
-    handlersUnion,
-    dispositions: [...dispCounts.entries()],
-    totalSends,
-    soleHandler: seen.size === 1 ? handlersUnion[0] : null,
-    errors: [...new Set(errors)],
-  };
-}
-
-/**
- * Build the CodeLens summaries for one config document's elements against a run summary. Attaches the
- * disposition to inbound() lines, the routing decision to `@router` lines, and a Send count to a
- * `@handler` line ONLY when it is the run's sole handler (unambiguous). Pure; unit-testable.
- */
-export function buildLiveLenses(
-  elements: NamedElement[],
-  summary: LiveSummary,
-  label: string,
-): LiveLens[] {
-  const out: LiveLens[] = [];
-  const dispText = summary.dispositions.length
-    ? summary.dispositions
-        .map(([d, n]) => (summary.messageCount === 1 ? d : `${n} ${d}`))
-        .join(" · ")
-    : "no messages";
-  for (const el of elements) {
-    if (el.kind === "inbound") {
-      const prefix = label ? `${label}: ` : "";
-      out.push({
-        line: el.line,
-        title: `$(pulse) ${prefix}${dispText}`,
-        tooltip: summary.errors.length
-          ? `Errors: ${summary.errors.join("; ")}`
-          : `Live dry-run of ${label || "the selected sample"} (${summary.messageCount} message(s)).`,
-      });
-    } else if (el.kind === "router") {
-      const routed = summary.handlersUnion.length
-        ? `[${summary.handlersUnion.join(", ")}]`
-        : "(nowhere)";
-      out.push({
-        line: el.line,
-        title: `$(arrow-right) routed → ${routed}`,
-        tooltip: "Handlers this router selected across the sample run (from dryrun `handlers`).",
-      });
-    } else if (el.kind === "handler" && summary.soleHandler !== null && el.name === summary.soleHandler) {
-      const n = summary.totalSends;
-      out.push({
-        line: el.line,
-        title: `$(arrow-small-right) ${n} Send${n === 1 ? "" : "s"}`,
-        tooltip:
-          "Send count is attributable here because exactly one handler ran this sample. v1 flattens " +
-          "handler→delivery attribution, so per-handler counts for a multi-handler module are v2.",
-      });
-    }
-  }
-  return out;
 }
 
 // --- v2 inline decorations (per-statement values + hover) ----------------------------------------
@@ -375,6 +240,17 @@ export function invocationsForFile(entries: LiveTraceEntry[], fsPath: string): T
   return out;
 }
 
+/** Ask which of a masked run's messages to reveal; the 0-based index, or undefined if dismissed. */
+export type MessagePicker = (messages: MaskedMessage[]) => Promise<number | undefined>;
+
+/** The production {@link MessagePicker}: a quick pick listing file names and dispositions only. */
+export const quickPickMessage: MessagePicker = async (messages) => {
+  const pick = await vscode.window.showQuickPick(revealPickItems(messages), {
+    placeHolder: "Reveal values for which message? One reveal shows one message (PHI; synthetic only).",
+  });
+  return pick?.index;
+};
+
 /**
  * The live-debug controller: owns the on/off state, the chosen sample, the last run's rows + trace and
  * whether that one run was revealed, a debounced save watcher, its CodeLens provider, and the inline
@@ -394,6 +270,18 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
   // A reveal run has started and not yet landed or been superseded. Lets Hide cancel it, and the status
   // item say so, before any value is shown.
   private revealPending = false;
+  // The messages of the last MASKED run, and the sample they came from: what a reveal picks among.
+  // PHI-free (file-derived names and dispositions). Kept while a revealed run shows, so a second
+  // reveal can pick again without a masked run first.
+  private maskedMessages: MaskedMessage[] | null = null;
+  private maskedFor: string | undefined;
+  // Which message the stored revealed run shows; null on a masked run.
+  private revealedFocus: RevealFocus | null = null;
+  // A reveal is choosing its message (a masked run to list them, or the pick) and has not started its
+  // --show-phi run. `revealIntent` is bumped by Hide and Live off, so a choice that finishes after
+  // either starts nothing.
+  private choosingReveal = false;
+  private revealIntent = 0;
   // The in-progress sample pick, shared so a double-click cannot open a second pick (BACKLOG #1187 QA).
   private enabling: Promise<boolean> | undefined;
   private rows: LiveDryRunRow[] | null = null;
@@ -410,11 +298,13 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
 
   /**
    * `workspace` defaults to the open folder; a test passes a fixed path, since the integration host
-   * opens no folder and every trigger path stops at "no workspace" without one.
+   * opens no folder and every trigger path stops at "no workspace" without one. `pickMessage` is
+   * the reveal's which-message question, a quick pick by default; a test answers it directly.
    */
   constructor(
     private readonly runner: TraceRunner = cliTraceRunner,
     private readonly workspace: () => string | undefined = workspaceDir,
+    private readonly pickMessage: MessagePicker = quickPickMessage,
   ) {}
 
   setStatusBar(item: vscode.StatusBarItem): void {
@@ -492,11 +382,22 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       sb.command = undefined;
       sb.tooltip =
         "A run with real values is in progress. Run *MessageFoundry: Hide Revealed Values* to cancel it.";
+    } else if (this.choosingReveal) {
+      sb.text = "$(sync~spin) Values: Choosing…";
+      sb.command = undefined;
+      sb.tooltip =
+        "Choosing which message to reveal. No real values are shown or fetched yet. Run " +
+        "*MessageFoundry: Hide Revealed Values* to cancel.";
     } else if (this.shownRunRevealed) {
-      sb.text = "$(eye) Values: This Run";
+      const focus = this.revealedFocus;
+      sb.text =
+        focus && focus.total > 1
+          ? `$(eye) Values: Message ${focus.index + 1} of ${focus.total}`
+          : "$(eye) Values: This Run";
       sb.command = "messagefoundry.hideValues";
       sb.tooltip =
-        "Live-debug shows real values from ONE run (PHI, screenshot-capturable). Click to hide them now. " +
+        "Live-debug shows real values from ONE message of ONE run (PHI, screenshot-capturable). " +
+        "Click to hide them now. " +
         "The next run hides them anyway. Synthetic samples only.";
     } else {
       sb.text = "$(eye-closed) Values: Hidden";
@@ -533,11 +434,14 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       this.debounceTimer = undefined;
     }
     this.runToken += 1;
+    this.revealIntent += 1; // a reveal still choosing its message starts nothing
     this.running = false;
     this.revealPending = false;
     this.rows = null;
     this.entries = null;
     this.shownRunRevealed = false;
+    this.revealedFocus = null;
+    this.maskedMessages = null;
     this.updateStatus();
     this.updateRevealStatus();
     this.changed.fire();
@@ -572,15 +476,89 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
    * a re-toggle) is masked again. Turns Live on first if it is off, since decorations render only then.
    */
   async revealOnce(): Promise<void> {
-    if ((this.enabling || !this.enabled) && !(await this.enable())) {
+    if (this.choosingReveal) {
+      return; // one choice at a time: a second would share, and then clear, this one's state
+    }
+    // Taken before Live is turned on, so a Hide during the sample pick cancels this reveal too.
+    const intent = ++this.revealIntent;
+    this.choosingReveal = true;
+    this.updateRevealStatus();
+    let focus: RevealFocus | undefined;
+    let cancelledWhileEnabling = false;
+    try {
+      if ((this.enabling || !this.enabled) && !(await this.enable())) {
+        return;
+      }
+      if (intent !== this.revealIntent) {
+        cancelledWhileEnabling = true; // Hide during the sample pick: run masked, after the finally
+        return;
+      }
+      // A save just before the click would otherwise fire a masked run that silently drops this reveal.
+      if (this.debounceTimer) {
+        clearTimeout(this.debounceTimer);
+        this.debounceTimer = undefined;
+      }
+      focus = await this.chooseRevealFocus(intent);
+    } finally {
+      this.choosingReveal = false;
+      this.updateRevealStatus();
+    }
+    if (cancelledWhileEnabling) {
+      await this.run(false); // Live came on with no run; give it its first, masked one
       return;
     }
-    // A save just before the click would otherwise fire a masked run that silently drops this reveal.
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer);
-      this.debounceTimer = undefined;
+    if (focus && intent === this.revealIntent) {
+      // A save during the choice armed a debounced masked run; it would supersede this reveal.
+      if (this.debounceTimer) {
+        clearTimeout(this.debounceTimer);
+        this.debounceTimer = undefined;
+      }
+      await this.run(true, focus);
     }
-    await this.run(true);
+  }
+
+  /**
+   * Which ONE message to reveal (ASVS 14.2.6, vault BACKLOG #1187, ground e; owner ruling R15). Lenses
+   * here summarize the whole sample, so nothing on screen singles one out: a one-message sample needs
+   * no choice, and a larger one asks, listing the last masked run's messages by file name and
+   * disposition. With no masked run of this sample yet, one runs first to learn the list. Undefined
+   * means reveal nothing: the pick was dismissed, Live went off, Hide cancelled it, or there was no
+   * message.
+   */
+  private async chooseRevealFocus(intent: number): Promise<RevealFocus | undefined> {
+    if (!this.maskedMessages || this.maskedFor !== this.samplePath) {
+      await this.run(false);
+      if (intent !== this.revealIntent) {
+        return undefined; // Hide or Live off cancelled this reveal while its masked run ran
+      }
+    }
+    const messages = this.maskedMessages;
+    if (!this.enabled || !messages || messages.length === 0) {
+      if (this.enabled) {
+        void vscode.window.showInformationMessage(
+          this.running
+            ? "MEFOR Live: a newer run replaced the one listing the sample's messages. Reveal again when it lands."
+            : "MEFOR Live: the masked run gave no message to reveal. Fix the run, then reveal again.",
+        );
+      }
+      return undefined;
+    }
+    if (messages.length === 1) {
+      return { index: 0, total: 1 };
+    }
+    const index = await this.pickMessage(messages);
+    if (index === undefined || intent !== this.revealIntent) {
+      return undefined;
+    }
+    // A save-run that landed during the pick may have re-listed the sample. If its count moved, the
+    // index may name another message, so ask again rather than spawn a --show-phi run to find out.
+    if (this.maskedMessages?.length !== messages.length) {
+      void vscode.window.showInformationMessage(
+        "MEFOR Live: the sample's message count changed while you chose, so nothing was revealed. Reveal again.",
+      );
+      return undefined;
+    }
+    return { index, total: messages.length };
   }
 
   /**
@@ -589,7 +567,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
    * in-memory mask, is what restores the CLI's own redaction of the per-message error text.
    */
   async hideValues(): Promise<void> {
-    if (!this.shownRunRevealed && !this.revealPending) {
+    if (!this.shownRunRevealed && !this.revealPending && !this.choosingReveal) {
       void vscode.window.showInformationMessage("MEFOR Live: no values are shown, so there is nothing to hide.");
       return;
     }
@@ -664,7 +642,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     return true;
   }
 
-  private async run(showPhi: boolean): Promise<void> {
+  private async run(showPhi: boolean, focus?: RevealFocus): Promise<void> {
     if (!this.enabled || this.enabling) {
       return; // off, or a sample pick is open: the run that pick leads to is the next one
     }
@@ -684,7 +662,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       return;
     }
     // this.samplePath is set by ensureSample above.
-    await this.runWith(this.samplePath as string, ws, showPhi);
+    await this.runWith(this.samplePath as string, ws, showPhi, focus);
   }
 
   /**
@@ -692,9 +670,16 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
    * reveal request, masked by default — the ONLY place --show-phi is (conditionally) requested. The
    * stored result records whether IT was revealed, so the next run decides afresh. A per-run token
    * discards a superseded run's late result, so a rapid save-storm always renders the newest run only.
+   * A revealed run keeps ONE message: `focus`'s, or the only one when there is no focus. When it
+   * cannot tell which, it keeps none and says so (vault BACKLOG #1187, ground e).
    * Public so a test can drive it with a canned runner (no sample-pick, no workspace).
    */
-  async runWith(samplePath: string, cwd: string, showPhi = false): Promise<void> {
+  async runWith(
+    samplePath: string,
+    cwd: string,
+    showPhi = false,
+    focus?: RevealFocus,
+  ): Promise<void> {
     const token = ++this.runToken;
     this.running = true;
     if (!showPhi) {
@@ -710,6 +695,7 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
         this.rows = null;
         this.error = null; // a failed reveal's error text is unredacted too
         this.shownRunRevealed = false;
+        this.revealedFocus = null;
         this.changed.fire();
         this.refreshDecorations();
       }
@@ -720,11 +706,25 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     let entries: LiveTraceEntry[] | null = null;
     let rows: LiveDryRunRow[] | null = null;
     let err: string | null = null;
+    let unmatched = false; // a revealed run that could not tell which message to keep
     try {
       entries = await this.runner(samplePath, cwd, showPhi);
+      if (showPhi) {
+        const one = revealedEntry(entries, focus);
+        if (one === null) {
+          unmatched = true;
+          throw new Error(
+            focus
+              ? "the sample's message count changed since it was listed, so nothing was revealed. Reveal again."
+              : `the run held ${entries.length} messages and none was chosen, so nothing was revealed.`,
+          );
+        }
+        entries = [one]; // every other message's values are dropped here, before anything renders
+      }
       rows = rowsFromTrace(entries); // inside the try: a skewed trace shape is this run's error
     } catch (e) {
       entries = null;
+      rows = null;
       err = e instanceof Error ? e.message : String(e);
     }
     if (token !== this.runToken) {
@@ -735,9 +735,18 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     this.samplePath = samplePath;
     this.sampleLabel = path.basename(samplePath);
     this.entries = entries;
-    // A failed reveal counts as shown too: the --show-phi CLI's error text is unredacted, so Hide must
-    // still be able to clear it.
-    this.shownRunRevealed = showPhi;
+    // A failed reveal counts as shown too: its error can be the --show-phi CLI's own {"error": ...}
+    // text, so Hide must still be able to clear it. A reveal that could not tell which message to
+    // keep stored nothing revealed, so it does not count.
+    this.shownRunRevealed = showPhi && !unmatched;
+    this.revealedFocus = this.shownRunRevealed && entries ? (focus ?? { index: 0, total: 1 }) : null;
+    if (!showPhi) {
+      // Only a masked run may refresh the reveal pick's list, and only one that produced entries.
+      this.maskedMessages = entries ? maskedMessagesOf(entries) : null;
+      this.maskedFor = samplePath;
+    } else if (unmatched) {
+      this.maskedMessages = null; // the list is stale: the next reveal re-lists before it asks
+    }
     this.rows = rows;
     this.error = err;
     this.updateStatus();
@@ -819,7 +828,14 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (!this.rows) {
       return [];
     }
-    return buildLiveLenses(namedElements(text), summarize(this.rows), this.sampleLabel ?? "");
+    return buildLiveLenses(
+      namedElements(text),
+      summarize(this.rows),
+      this.shownRunRevealed
+        ? revealedLabel(this.sampleLabel ?? "", this.revealedFocus)
+        : (this.sampleLabel ?? ""),
+      this.shownRunRevealed,
+    );
   }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {

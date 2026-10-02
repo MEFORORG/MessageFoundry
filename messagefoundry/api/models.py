@@ -237,8 +237,9 @@ class MessageBody(BaseModel):
 
 class CapturedResponseInfo(PhiGatedModel):
     """One captured request/response reply (ADR 0013). ``outcome``/``detail`` are visible with the
-    message-read permission; ``body`` is PHI and populated only when the caller also holds the raw-body
-    permission (``None`` otherwise, and ``None`` once retention has purged it)."""
+    message-read permission; ``body`` is PHI and populated only when the caller also holds both
+    ``messages:view_raw`` and ``messages:view_summary`` (``None`` otherwise, and ``None`` once
+    retention has purged it; vault BACKLOG #1187)."""
 
     phi_gated_properties: ClassVar[frozenset[str]] = frozenset({"detail"})
 
@@ -260,7 +261,7 @@ class MessageResponses(BaseModel):
 class OutboundPayloadInfo(BaseModel):
     """One outbound delivery's **transformed payload** (#14 parity tool). ``payload`` is the PHI body
     MEFOR routed/transformed for ``destination_name``; it is returned in full only to a caller holding
-    ``MESSAGES_VIEW_RAW``, and every access is audited. (Distinct from :class:`OutboxInfo`, which is
+    ``MESSAGES_VIEW_RAW`` and ``MESSAGES_VIEW_SUMMARY``, and every access is audited. (Distinct from :class:`OutboxInfo`, which is
     the body-free delivery *metadata* shown in the message-detail view.)"""
 
     destination_name: str

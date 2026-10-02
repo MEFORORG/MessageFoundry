@@ -517,15 +517,19 @@ REST obey the authority does not settle these:
 
 The `verify_tls` / `use_tls` columns above, the cleartext-hop authority, and the escape-hatch list
 below are all about **turning verification off**. There is a **third, narrower weakening** that none of
-them covers, and it is the only TLS relaxation in the product with **no posture gate whatsoever** — so
+them covers, and it is one of at least two TLS relaxations with **no posture gate whatsoever** (the
+other is `tls_check_hostname = false`; CORRECTED 2026-10-01, this said "the only") — so
 an audit built from those columns alone has a hole:
 
-**`tls_allow_expired = true`** is a **per-connection** setting on **six** outbound connectors — **MLLP,
+**`tls_allow_expired = true`** is a **per-connection** setting on **six** outbound connectors, and on
+the `Ftp` (FTPS) inbound poller, which dials out through the same context. The six are **MLLP,
 REST, SOAP, FHIR, DICOM C-STORE SCU, and RemoteFile FTPS** (a factory parameter, and therefore also a
 `connections.toml` `[settings]` key and a GUI field — the connection schema is derived from the factory
 signatures). It relaxes **only** the certificate validity-period check: an **expired** server
-certificate is accepted **indefinitely**, while the **chain, hostname and key usage are still fully
-verified** (ADR 0094). It is genuinely narrower than `tls_verify=false` — that is the point of it — but:
+certificate is accepted **indefinitely**, while the **chain and key usage are still fully verified**,
+and the **hostname** too unless the connection also sets `tls_check_hostname = false` (ADR 0094).
+CORRECTED 2026-10-01: this said the hostname is verified without condition, which is false on an MLLP
+or hand-built FTPS hop that also turns the name check off. It is genuinely narrower than `tls_verify=false` — that is the point of it — but:
 
 - it needs **no** `MEFOR_ALLOW_INSECURE_TLS`;
 - it is **not clamped** by `[security].enforcement` — `enforce` does not touch it;

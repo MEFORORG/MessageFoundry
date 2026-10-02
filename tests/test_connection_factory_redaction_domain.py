@@ -699,9 +699,11 @@ def test_a_credential_in_url_userinfo_is_masked_on_url_and_proxy_url() -> None:
     out = redacted_settings(dict(spec.settings))
     assert SENTINEL not in str(out.get("url")), out.get("url")
     assert SENTINEL not in str(out.get("proxy_url")), out.get("proxy_url")
-    # The user, host and path SURVIVE. Masking the whole URL would destroy the operator's view rather
-    # than protect it, and nothing would report that as a loss.
-    assert "user:***@example.invalid/y" in str(out["url"])
+    # CORRECTED (Manager decision on PR 1912, 2026-10-01): this asserted that the user, host and
+    # path SURVIVE beside a masked password. The display mask is now coarse and fail-closed, so a URL
+    # with userinfo is withheld whole and only its scheme is shown.
+    assert out["url"] == "https://<redacted>"
+    assert out["proxy_url"] == "http://<redacted>"
 
 
 def test_a_url_without_userinfo_is_left_alone() -> None:

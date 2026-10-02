@@ -27,6 +27,7 @@ from __future__ import annotations
 __lazy_modules__ = ["sqlite3", "tomllib"]
 
 import argparse
+import contextlib
 import functools
 import json
 import logging
@@ -2394,6 +2395,8 @@ def _serve(args: argparse.Namespace) -> int:
         settings.secret_rotation,
         cleartext_hops=(),
         expiry_relaxed_hops=(),
+        hostname_unchecked_hops=(),
+        query_credential_hops=(),
         unverified_db_hops=(),
         attested_hops=(),
         revocation_attested_hops=(),
@@ -2406,7 +2409,9 @@ def _serve(args: argparse.Namespace) -> int:
         _seclog.warning(
             "[security] posture loosened from the secure defaults (%d): %s — see "
             "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
-            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, generic-ODBC "
+            "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, tls_check_hostname, "
+            "url_query_credential, "
+            "generic-ODBC "
             "database TLS, tls_hop_attested and tls_revocation_attested (ADR 0173) declarations are NOT in this list — the graph is not loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
@@ -4134,6 +4139,8 @@ def _serve(args: argparse.Namespace) -> int:
         audit_all_authz=settings.diagnostics.audit_all_authz,
         env_values_provider=env_values,
         auth_settings=settings.auth,
+        # The factory denies unless told (vault BACKLOG #2611), so sign-in off is said here.
+        allow_no_auth=not settings.auth.enabled,
         ai_settings=settings.ai,
         alerts_settings=settings.alerts,
         secrets_settings=settings.secrets,
@@ -4586,6 +4593,38 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
         return PipelineSettings().snapshot_on_send
 
 
+def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
+    """Send a print() in the author's own code to stderr for the duration of one call.
+
+    ``dryrun`` runs config modules, Routers and Handlers in this process, so a debugging print in
+    one used to land on stdout ahead of the JSON, which then would not parse. Stdout carries only
+    the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
+    ``_print_json`` still write to the real stdout (vault BACKLOG #1187)."""
+    return contextlib.redirect_stdout(sys.stderr)
+
+
+def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
+    """The text ``dryrun`` reports for an error that stopped its per-message loop.
+
+    The loop runs after the fixtures are read, so its error may come from processing a message.
+    The inbound-selection refusals are composed from connection names and keep their text: an
+    operator needs it to choose ``--inbound``. Anything else is reported by class only, because
+    ``str()`` of a ``ValueError`` or ``KeyError`` raised while reading a message can quote a field
+    value, and the IDE shows this text as written (vault BACKLOG #1187)."""
+    from messagefoundry.pipeline.dryrun import (
+        AmbiguousInboundError,
+        NoInboundError,
+        UnknownInboundError,
+    )
+
+    if isinstance(exc, (AmbiguousInboundError, NoInboundError, UnknownInboundError)):
+        return str(exc)
+    return (
+        f"dry-run stopped on an unexpected {type(exc).__name__} while processing a message; its "
+        "text is withheld because it can quote message data"
+    )
+
+
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
@@ -4596,7 +4635,8 @@ def _dryrun(args: argparse.Namespace) -> int:
         return resolved
     config_dir, service_config = resolved
     try:
-        reg = load_config(config_dir)
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
@@ -4624,23 +4664,25 @@ def _dryrun(args: argparse.Namespace) -> int:
         traced: list[dict[str, Any]] = []
         try:
             for source, path, raw in messages:
-                entry = trace_dry_run(
-                    reg,
-                    raw,
-                    inbound=args.inbound,
-                    show_phi=show_phi,
-                    snapshot_on_send=snapshot_on_send,
-                )
+                with _author_prints_to_stderr():
+                    entry = trace_dry_run(
+                        reg,
+                        raw,
+                        inbound=args.inbound,
+                        show_phi=show_phi,
+                        snapshot_on_send=snapshot_on_send,
+                    )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
-            return _emit_error(str(exc), as_json=args.json)
+            return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
         _print_json(traced, compact=args.json)
         return 0
 
     out: list[dict[str, Any]] = []
     try:
         for source, path, raw in messages:
-            result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
+            with _author_prints_to_stderr():
+                result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
             out.append(
                 {
                     "source": source,
@@ -4690,7 +4732,7 @@ def _dryrun(args: argparse.Namespace) -> int:
                 }
             )
     except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
-        return _emit_error(str(exc), as_json=args.json)
+        return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
     _print_json(out, compact=args.json)
     return 0
 
@@ -8317,6 +8359,8 @@ def _security(args: argparse.Namespace) -> int:
                 _rotation,
                 cleartext_hops=(),
                 expiry_relaxed_hops=(),
+                hostname_unchecked_hops=(),
+                query_credential_hops=(),
                 unverified_db_hops=(),
                 attested_hops=(),
                 revocation_attested_hops=(),
@@ -8342,7 +8386,9 @@ def _security(args: argparse.Namespace) -> int:
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
             "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]); the per-connection "
-            "cleartext_accepted, tls_allow_expired, generic-ODBC database TLS, tls_hop_attested and "
+            "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
+            "generic-ODBC database TLS, "
+            "tls_hop_attested and "
             "tls_revocation_attested declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). These are the AUTHORED values, so a `serve --host` bind override on a "

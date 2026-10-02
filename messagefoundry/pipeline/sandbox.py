@@ -56,7 +56,9 @@ line either — the boundary this seam draws is to the **engine**, not between a
 **What isolation buys (and its honest limits).** The child is a *separate OS process*: even if the
 admin code opens a socket or spins the CPU, it cannot touch the parent's DEK, audit chain, or
 sockets — those objects are never constructed in the child (it loads the message *graph*, not the
-store/crypto). On top of that address-space boundary the child adds defence-in-depth: a
+store/crypto). Its environment is an allowlist, not the engine's own
+(:mod:`messagefoundry.childenv`, which also says why that is not a boundary by itself).
+On top of that address-space boundary the child adds defence-in-depth: a
 forbidden-import guard (``socket``/store/crypto), a wall-clock cap enforced by the parent (plus
 POSIX ``RLIMIT_CPU``/``RLIMIT_AS`` when available), and a fail-closed refusal of the live
 ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop, which a process boundary
@@ -100,11 +102,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Final
 
+from messagefoundry.childenv import python_child_argv, worker_environment
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
-from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, SandboxError
+from messagefoundry.pipeline._sandbox_codec import GraphShape, SandboxCodecError, SandboxError
 
 __all__ = [
     "SandboxMode",
@@ -112,6 +116,9 @@ __all__ = [
     "SandboxCodecError",
     "SandboxPolicy",
     "SandboxSession",
+    "GraphShape",
+    "graph_shape",
+    "graph_differences",
     "run_sandboxed",
     "DEFAULT_FORBIDDEN_MODULES",
     "WORKER_MODULE",
@@ -119,8 +126,9 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-#: The worker is launched as ``python -m <WORKER_MODULE>`` (stdlib runpy), inheriting this
-#: interpreter + ``sys.path`` so it imports the same ``messagefoundry`` build.
+#: The worker module. :func:`messagefoundry.childenv.python_child_argv` builds the command line
+#: that runs it, and says how the child imports the same ``messagefoundry`` build as the engine
+#: without searching the working directory.
 WORKER_MODULE = "messagefoundry.pipeline._sandbox_worker"
 
 #: Top-level dotted module prefixes a sandboxed Router/Handler may not import. The address-space
@@ -175,6 +183,64 @@ class SandboxPolicy:
     mem_mb: int | None = 512
     startup_seconds: float = 30.0
     forbidden_modules: tuple[str, ...] = DEFAULT_FORBIDDEN_MODULES
+    #: ``[sandbox].pass_environment``: the extra variable NAMES the worker is given. Settings load
+    #: refuses the engine's own; this dataclass carries what it let through.
+    pass_environment: tuple[str, ...] = ()
+
+
+def graph_shape(registry: Any) -> GraphShape:
+    """The :class:`GraphShape` of a loaded :class:`~messagefoundry.config.wiring.Registry`."""
+    return GraphShape(
+        bindings={name: connection.router for name, connection in registry.inbound.items()},
+        inbound=registry.inbound_names(),
+        routers=frozenset(registry.routers),
+        handlers=frozenset(registry.handlers),
+        accepts=frozenset(registry.handler_accepts),
+        outbound=frozenset(registry.outbound),
+    )
+
+
+#: How many names a refusal lists per side of one part of the graph.
+_NAMES_SHOWN: Final = 3
+
+
+def _shown(names: set[str] | frozenset[str]) -> str:
+    """Up to :data:`_NAMES_SHOWN` names for an error text. Half of them come from the worker, so
+    each is scrubbed and cut before it reaches a log line."""
+    listed = [scrub_control_chars(name)[:80] for name in sorted(names)[:_NAMES_SHOWN]]
+    more = len(names) - len(listed)
+    return ", ".join(listed) + (f" and {more} more" if more > 0 else "")
+
+
+def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
+    """How a worker's graph differs from the engine's, one entry per part that differs, in words
+    an operator reads: the part, then the names only one side has.
+
+    ``bindings`` is compared over the inbounds the ENGINE holds. An engine shard holds only its
+    own, while its worker loads the whole config, so the worker's other bindings are not a
+    difference."""
+    found: list[str] = []
+    sets = {
+        "inbound connections": (engine.inbound, worker.inbound),
+        "routers": (engine.routers, worker.routers),
+        "handlers": (engine.handlers, worker.handlers),
+        "accepts= predicates": (engine.accepts, worker.accepts),
+        "outbound connections": (engine.outbound, worker.outbound),
+    }
+    for part, (ours, theirs) in sets.items():
+        sides = [
+            f"{side}: {_shown(names)}"
+            for side, names in (("engine only", ours - theirs), ("worker only", theirs - ours))
+            if names
+        ]
+        if sides:
+            found.append(f"{part} ({'; '.join(sides)})")
+    rebound = {
+        name for name, router in engine.bindings.items() if worker.bindings.get(name) != router
+    }
+    if rebound:
+        found.append(f"router bindings (of inbound: {_shown(rebound)})")
+    return found
 
 
 # --- length-prefixed framing over the worker pipe ----------------------------
@@ -579,9 +645,21 @@ class SandboxSession:
         inbound: str,
         config_dir: str | Path,
         env: str | None,
+        graph: Callable[[], GraphShape] | None,
         code_sets: Mapping[str, CodeSet] | None = None,
     ) -> None:
         self.policy = policy
+        # How to read the graph the engine is serving NOW, which a worker's must match before it is
+        # brought up. A callable, read at each spawn: a session can outlive a registry swap, and a
+        # shape captured when the session was made would then be the wrong one to compare with.
+        # Required, with no default, for the reason ``inbound`` is: a default would let a future
+        # caller skip the comparison without saying so. ``None`` is an explicit "do not compare",
+        # for a caller that holds no engine graph (a test, a benchmark).
+        self._graph = graph
+        # The last refusal, and the engine graph it was for. A mismatch cannot clear while that
+        # graph is being served, so a later spawn for it is refused at once, without paying for an
+        # interpreter start and a whole config load per message.
+        self._refused: tuple[GraphShape, str] | None = None
         # Required, with no default, deliberately: this is what attributes a relayed stderr line to a
         # feed (ADR 0176), and a default would silently reinstate the unattributable relay for every
         # future caller. Parent-side only -- it is not marshalled, on the same rule as ``_env`` below.
@@ -626,6 +704,9 @@ class SandboxSession:
         # reaping would leak the handle and let that dead worker's orphaned grandchild tree survive.
         # A no-op on the first spawn and whenever there is no live proc.
         self._kill(self._proc)
+        engine_graph = self._graph() if self._graph is not None else None
+        if self._refused is not None and self._refused[0] is engine_graph:
+            raise SandboxError(self._refused[1])
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
@@ -635,7 +716,7 @@ class SandboxSession:
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
         # POSIX-only ``setsid`` (False on Windows, where a job object does the reaping instead).
         proc = subprocess.Popen(  # nosec B603
-            [sys.executable, "-m", WORKER_MODULE],
+            python_child_argv(WORKER_MODULE),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             # CAPTURED, not inherited (BACKLOG #343, ADR 0176): with ``stderr=None`` the child's stderr
@@ -645,6 +726,14 @@ class SandboxSession:
             bufsize=0,
             close_fds=True,
             start_new_session=sys.platform != "win32",
+            # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
+            # environment (vault BACKLOG #2587). The one engine variable that crosses is the
+            # config-source escape, because the child runs ``load_config`` itself and would
+            # otherwise refuse a directory its parent loaded under that escape. The operator's
+            # ``[sandbox].pass_environment`` names cross with it.
+            env=worker_environment(
+                extra_names=(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, *self.policy.pass_environment)
+            ),
         )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
         # BOTH drains start before anything that can raise between here and the boot frame write. For
@@ -706,13 +795,31 @@ class SandboxSession:
             self._kill(proc)
             raise SandboxError("sandbox worker exited during bootstrap")
         try:
-            ready, detail = codec.decode_boot_reply(frame)
+            worker_graph, detail = codec.decode_boot_reply(frame)
         except SandboxError as exc:
             self._kill(proc)
             raise SandboxError(f"sandbox worker bootstrap frame was rejected: {exc}") from exc
-        if not ready:
+        if worker_graph is None:
             self._kill(proc)
             raise SandboxError(f"sandbox worker bootstrap failed: {detail}")
+        if engine_graph is not None:
+            differing = graph_differences(engine_graph, worker_graph)
+            if differing:
+                # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
+                # from that graph, and nothing in its answers would say so.
+                self._kill(proc)
+                refusal = (
+                    f"sandbox worker for inbound {self._inbound!r} was refused: the graph it loaded "
+                    f"differs from the one the engine is serving. {'. '.join(differing)}. Two "
+                    "things cause this. The config files changed on disk since the engine loaded "
+                    "them: reload the config. Or config code reads an environment variable the "
+                    "worker is not given, because the worker loads the config again under an "
+                    "allowlisted environment: name each such variable in "
+                    "[sandbox].pass_environment and restart."
+                )
+                self._refused = (engine_graph, refusal)
+                raise SandboxError(refusal)
+        self._refused = None
         self._proc = proc
 
     def _reader_loop(self, stdout: Any, sink: queue.Queue[Any]) -> None:

@@ -25,6 +25,7 @@ from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_ID_PREFIX,
     CustomRoleError,
     decode_custom_role_permissions,
+    raw_body_without_summary,
     validate_custom_role_permissions,
 )
 from messagefoundry.auth.service import AuthService
@@ -32,6 +33,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._role_pairing import bypass_view_raw_pairing_rule
 
 PW = "a-strong-test-passphrase"
 
@@ -108,6 +110,106 @@ def test_decode_malformed_or_empty_is_empty() -> None:
     assert decode_custom_role_permissions("") == frozenset()
     assert decode_custom_role_permissions("not json") == frozenset()
     assert decode_custom_role_permissions(json.dumps({"a": 1})) == frozenset()
+
+
+# --- view_raw needs view_summary (ASVS 14.2.6, vault BACKLOG #1187) ----------------------------------
+
+
+def test_validate_refuses_view_raw_without_view_summary() -> None:
+    with pytest.raises(CustomRoleError, match="messages:view_raw needs messages:view_summary"):
+        validate_custom_role_permissions(["messages:read", "messages:view_raw"])
+    with pytest.raises(CustomRoleError, match="messages:view_raw needs messages:view_summary"):
+        validate_custom_role_permissions(["messages:view_raw"])
+
+
+def test_validate_accepts_view_raw_with_view_summary_and_summary_alone() -> None:
+    # Control arms: the rule is the pair, not view_raw itself, and view_summary alone is fine.
+    assert validate_custom_role_permissions(
+        ["messages:read", "messages:view_raw", "messages:view_summary"]
+    ) == [Permission.MESSAGES_READ, Permission.MESSAGES_VIEW_RAW, Permission.MESSAGES_VIEW_SUMMARY]
+    assert validate_custom_role_permissions(["messages:view_summary"]) == [
+        Permission.MESSAGES_VIEW_SUMMARY
+    ]
+
+
+def test_decode_drops_view_raw_from_a_stored_row_without_view_summary() -> None:
+    # A row of the refused shape (hand-edited, or written before the rule) keeps everything but the
+    # body read. The control row, holding both, keeps both.
+    assert decode_custom_role_permissions(
+        json.dumps(["messages:read", "messages:view_raw"])
+    ) == frozenset({Permission.MESSAGES_READ})
+    assert decode_custom_role_permissions(
+        json.dumps(["messages:view_raw", "messages:view_summary"])
+    ) == frozenset({Permission.MESSAGES_VIEW_RAW, Permission.MESSAGES_VIEW_SUMMARY})
+
+
+def test_no_builtin_role_has_the_refused_shape() -> None:
+    from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, raw_body_without_summary
+
+    assert not [
+        r for r, perms in BUILTIN_ROLE_PERMISSIONS.items() if raw_body_without_summary(perms)
+    ]
+    # Control: the predicate does fire on the shape it exists for.
+    assert raw_body_without_summary({Permission.MESSAGES_VIEW_RAW})
+
+
+def test_the_predicate_answers_an_iterator_correctly() -> None:
+    # ORDER MATTERS: view_summary first. Two `in` tests on an iterator consume it on the way to
+    # view_raw, so the second test misses it; the reverse order would hide that defect.
+    pair = [Permission.MESSAGES_VIEW_SUMMARY, Permission.MESSAGES_VIEW_RAW]
+    assert not raw_body_without_summary(iter(pair))
+    assert raw_body_without_summary(iter([Permission.MESSAGES_VIEW_RAW]))
+
+
+def test_the_test_bypass_lifts_only_the_pairing_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    bypass_view_raw_pairing_rule(monkeypatch)
+    # Lifted: the pairing rule, at both mint and decode.
+    assert validate_custom_role_permissions(["messages:view_raw"]) == [Permission.MESSAGES_VIEW_RAW]
+    assert decode_custom_role_permissions(json.dumps(["messages:view_raw"])) == frozenset(
+        {Permission.MESSAGES_VIEW_RAW}
+    )
+    # Kept: at least these other rules, each arm able to fail on its own rule.
+    with pytest.raises(CustomRoleError, match="at least one permission"):
+        validate_custom_role_permissions([])
+    with pytest.raises(CustomRoleError, match="not assignable"):
+        validate_custom_role_permissions(["messages:view_raw", "users:manage"])
+    with pytest.raises(CustomRoleError, match="unknown permission"):
+        validate_custom_role_permissions(["messages:view_raw", "not:a:real:perm"])
+    assert decode_custom_role_permissions(
+        json.dumps(["messages:view_raw", "users:manage", "bogus:perm"])
+    ) == frozenset({Permission.MESSAGES_VIEW_RAW})
+
+
+async def test_service_refuses_to_mint_or_edit_into_view_raw_without_view_summary() -> None:
+    store = await _store()
+    try:
+        service = await _service(store)
+        with pytest.raises(CustomRoleError):
+            await service.create_custom_role(
+                display_name="Raw only",
+                description=None,
+                permissions=["messages:read", "messages:view_raw"],
+                actor="admin",
+            )
+        assert await service.list_custom_roles() == []
+        role = await service.create_custom_role(
+            display_name="Raw and summary",
+            description=None,
+            permissions=["messages:read", "messages:view_raw", "messages:view_summary"],
+            actor="admin",
+        )
+        with pytest.raises(CustomRoleError):
+            await service.update_custom_role(
+                role.id,
+                display_name="Raw and summary",
+                description=None,
+                permissions=["messages:read", "messages:view_raw"],
+                actor="admin",
+            )
+        (kept,) = await service.list_custom_roles()
+        assert Permission.MESSAGES_VIEW_SUMMARY in kept.permissions
+    finally:
+        await store.close()
 
 
 # --- service: create + resolve (AC-1) ----------------------------------------

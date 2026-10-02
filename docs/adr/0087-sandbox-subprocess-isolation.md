@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -384,6 +384,47 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
 - **DEK-in-worker:** the child never constructs the store/DEK, so there is no DEK in the worker to
   strip; if a future change loads store state at registry-build time, that must stay out of the
   child.
+
+  **CORRECTED 2026-10-01 (vault BACKLOG #2587). The sentence above was false wherever the key
+  arrives by environment variable.** It is kept as written, because this ADR was accepted with it.
+  It is true of the cipher *object*: the child builds no store and no cipher. It was not true of the
+  key. The worker was started with no `env=`, so it got a copy of the engine's whole environment.
+  That environment holds `MEFOR_STORE_ENCRYPTION_KEY` when the key is supplied that way, and the
+  store password and every `MEFOR_VALUE_*` connection secret a deployment sets. A Handler in the
+  child would have read them from its own environment. This ADR never mentioned the environment,
+  so nobody decided that; it was inherited.
+
+  **What changed.** The sandbox worker, the DR hook and the engine shards are now each handed an
+  environment that somebody chose. The other processes the engine starts, which run fixed system
+  tools, still inherit; the guard below lists each with its reason. The sandbox worker gets an
+  allowlist, and no `MEFOR_*` variable except one switch its own `load_config` reads. The worker and
+  the engine shards also start with `-P`, which keeps the engine's working directory off their
+  import path, and with the interpreter's remote debugging disabled.
+  `messagefoundry/childenv.py` is the source of
+  record for what each child gets and why; the `[sandbox]` and `[dr]` sections of
+  [CONFIGURATION.md](../CONFIGURATION.md) say what an operator sees. A guard in
+  `tests/test_child_process_environment.py` fails a process start whose environment does not come
+  from that module, unless the start is listed there with its reason.
+
+  **What this does NOT claim.** An explicit environment is not an isolation boundary by itself. The
+  child still runs as the engine's operating-system account, so it can still read the engine
+  process, and the files that account can read, including the store and a key file. This change
+  removes the direct read from the child's own environment and nothing more. Running the child as
+  a different account is separate, later work (ADR 0147).
+
+  **One new difference between the modes.** The worker loads the config directory again, in its
+  own process, under the allowlisted environment. Config code that reads an environment variable
+  directly, at the top of a module or inside a Router or Handler, sees it under `mode=off` and,
+  unless it is on the allowlist, does not see it under `mode=subprocess`. Where the code supplies a
+  default, the worker can build a different graph from the one the engine loaded.
+
+  **Added 2026-10-01, the same change.** The worker now reports the shape of the graph it
+  loaded, and the engine refuses a worker whose graph differs from its own, so the difference
+  fails closed and says why. `[sandbox].pass_environment` names the extra variables a config
+  needs. The `[sandbox]` section of [CONFIGURATION.md](../CONFIGURATION.md) says what is compared
+  and what the setting refuses. **The comparison is of names.** Two graphs with one shape can
+  still differ in what a function of the same name does, and a variable read inside a Router or
+  Handler body is never compared.
 - **The boundary confines the address space, not the machine.** `os`/`subprocess`/`ctypes`/`sqlite3`/
   `http.client` are importable inside the sandbox, so a Handler can still read and write files, open
   network connections, and spawn processes **as the service account**. The forbidden-import guard

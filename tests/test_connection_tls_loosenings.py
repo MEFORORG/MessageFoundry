@@ -142,6 +142,34 @@ def handle(msg):
 """
 
 
+#: ASVS 12.3.2: one outbound with the name check off AND the expiry bridge, one with the name check
+#: off alone, and one with the bridge alone, so the expiry line has to tell the two apart.
+_HOSTNAME_MODULE = """
+from messagefoundry import MLLP, Send, handler, inbound, outbound, router
+
+inbound("IB", MLLP(port=15098), router="r")
+outbound(
+    "OB_BOTH",
+    MLLP(host="both.example.invalid", port=6101, tls=True, tls_allow_expired=True,
+         tls_check_hostname=False),
+)
+outbound("OB_NAMELESS", MLLP(host="nameless.example.invalid", port=6102, tls=True,
+                             tls_check_hostname=False))
+outbound("OB_EXPIRED", MLLP(host="expired.example.invalid", port=6103, tls=True,
+                            tls_allow_expired=True))
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def handle(msg):
+    return Send("OB_BOTH", msg)
+"""
+
+
 def _write_config(tmp_path: Path, *, clean: bool = False, module: str | None = None) -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
@@ -167,6 +195,31 @@ def test_check_surfaces_the_expiry_bridge(tmp_path: Path) -> None:
     assert "OB_BRIDGE" in r.detail and "partner.example.invalid:6100" in r.detail
     # Advisory, and honest in both directions: it must not imply verify-off.
     assert "chain, hostname and key usage are still verified" in r.detail
+
+
+def test_check_surfaces_the_hostname_unchecked_set(tmp_path: Path) -> None:
+    """ASVS 12.3.2. The flag had no line on any surface; `check` now names every declaring hop."""
+    from messagefoundry.checks import run_checks
+
+    report = run_checks(_write_config(tmp_path, module=_HOSTNAME_MODULE), run_lint=False)
+    r = _result(report, "tls-check-hostname")
+    assert r.ok and not r.required and not r.skipped
+    assert "2 connection(s)" in r.detail
+    assert "OB_BOTH -> both.example.invalid:6101" in r.detail
+    assert "OB_NAMELESS -> nameless.example.invalid:6102" in r.detail
+    assert "OB_EXPIRED" not in r.detail
+
+
+def test_check_expiry_line_stops_claiming_the_hostname_where_it_is_off(tmp_path: Path) -> None:
+    """CORRECTED: the expiry line said "chain, hostname and key usage are still verified" for every
+    hop. It now names the hop where the hostname is not verified."""
+    from messagefoundry.checks import run_checks
+
+    report = run_checks(_write_config(tmp_path, module=_HOSTNAME_MODULE), run_lint=False)
+    detail = _result(report, "tls-allow-expired").detail
+    assert "chain, hostname and key usage are still verified" not in detail
+    assert "the hostname is NOT on OB_BOTH" in detail
+    assert "and is on the others" in detail  # OB_EXPIRED is the other, and it checks the name
 
 
 def test_check_surfaces_the_generic_db_hops_in_both_directions(tmp_path: Path) -> None:
@@ -210,6 +263,14 @@ def test_check_says_none_explicitly_when_there_is_nothing_to_report(tmp_path: Pa
         "no connection declares tls_revocation_attested"
         in _result(report, "tls-revocation-attested").detail
     )
+    assert (
+        "no connection declares tls_check_hostname=false"
+        in _result(report, "tls-check-hostname").detail
+    )
+    assert (
+        "no outbound or FhirLookup url carries a credential-like query parameter"
+        in _result(report, "url-query-credential").detail
+    )
 
 
 def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_path: Path) -> None:
@@ -227,6 +288,8 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
         "generic-db-tls",
         "tls-revocation-attested",
         "fhir-update-path-form",
+        "tls-check-hostname",
+        "url-query-credential",
     ):
         r = _result(report, name)
         assert r.skipped and r.ok and "config did not load" in r.detail
@@ -284,6 +347,19 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
     )
     reg.add_outbound(
         build_outbound_connection(
+            "OB_NAMELESS",
+            ConnectionSpec(
+                type=ConnectorType.MLLP,
+                settings={
+                    "host": "nameless.example.invalid",
+                    "port": 6102,
+                    "tls_check_hostname": False,
+                },
+            ),
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
             "OB_PG_RESULTS",
             Database(
                 server="results.example.invalid",
@@ -298,7 +374,7 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
             "OB_ATTESTED",
             ConnectionSpec(
                 type=ConnectorType.REST,
-                settings={"url": "https://partner.example.invalid/ingest"},
+                settings={"url": "https://partner.example.invalid/ingest?subscription-key=SYNTH"},
             ),
             tls_revocation_attested=True,
             tls_revocation_attested_reason="partner PKI runs OCSP at the edge",
@@ -338,6 +414,10 @@ async def test_posture_route_reports_both_connection_deviations(engine: Engine) 
     engine.add_registry(reg)
     switches = {e["switch"]: e["risk"] for e in _loosenings(await _posture(engine))}
     assert "OB_BRIDGE" in switches["tls_allow_expired"]
+    assert "OB_NAMELESS" in switches["tls_check_hostname"]
+    assert "OB_BRIDGE" not in switches["tls_check_hostname"]
+    assert "OB_ATTESTED" in switches["url_query_credential"]
+    assert "SYNTH" not in switches["url_query_credential"]
     assert "OB_PG_RESULTS" in switches["generic_odbc_tls_unenforced"]
     assert "OB_ATTESTED" in switches["tls_revocation_attested"]
     assert "inbound:IB_MTLS" in switches["tls_revocation_attested"]
@@ -356,6 +436,8 @@ async def test_posture_route_scope_names_every_connection_deviation(engine: Engi
     assert "DATABASE" in scope
     assert "tls_revocation_attested" in scope
     assert "tls_hop_attested" in scope
+    assert "tls_check_hostname" in scope
+    assert "url_query_credential" in scope
 
 
 def _loosenings(body: dict[str, object]) -> list[dict[str, str]]:

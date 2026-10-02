@@ -58,6 +58,7 @@ from pydantic import (
 )
 
 from messagefoundry.api_tls_source import api_tls_source
+from messagefoundry.childenv import outside_engine_namespace
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -1787,6 +1788,22 @@ class PipelineSettings(_Section):
     snapshot_on_send: bool = Field(default=True)
 
 
+def _pass_environment_refusal(name: str) -> str | None:
+    """Why ``name`` may not be handed to a sandbox worker, or ``None`` if it may.
+
+    The worker runs the code ``[sandbox]`` exists to keep the engine's secrets from, so nothing of
+    the engine's own may be named: no ``MEFOR_*`` variable at all, and no secret a library reads on
+    the engine's behalf. That is the rule the DR hook's environment follows
+    (:func:`messagefoundry.childenv.outside_engine_namespace`), reused so the two cannot drift.
+    Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
+    added. The text never echoes a value, only the name the operator typed."""
+    if not (name.isascii() and name.isidentifier()):
+        return f"{name!r} is not an environment variable name"
+    if not outside_engine_namespace(name):
+        return f"{name} is one of the engine's own variables; it may not be passed to a worker"
+    return None
+
+
 class SandboxSettings(_Section):
     """``[sandbox]`` — opt-in subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197).
 
@@ -1849,6 +1866,29 @@ class SandboxSettings(_Section):
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
+    # Extra environment variable NAMES the worker is given, beyond its allowlist
+    # (messagefoundry/childenv.py). The worker loads the config again under that allowlist, so a
+    # config that reads another variable needs it named here, or its worker is refused when the
+    # graph it builds differs from the engine's. Names only, and never a MEFOR_* name or another
+    # of the engine's own: see _pass_environment_refusal.
+    pass_environment: tuple[str, ...] = ()
+
+    @field_validator("pass_environment", mode="before")
+    @classmethod
+    def _split_pass_environment(cls, v: object) -> object:
+        # The env layer delivers MEFOR_SANDBOX_PASS_ENVIRONMENT as one string; split on commas.
+        if isinstance(v, str):
+            return [name.strip() for name in v.split(",") if name.strip()]
+        return v
+
+    @field_validator("pass_environment")
+    @classmethod
+    def _pass_environment_names(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        for name in v:
+            refusal = _pass_environment_refusal(name)
+            if refusal is not None:
+                raise ValueError(f"sandbox.pass_environment: {refusal}")
+        return v
 
 
 class DiagnosticsSettings(_Section):
@@ -6673,6 +6713,8 @@ def security_loosenings(
     *,
     cleartext_hops: Sequence[str],
     expiry_relaxed_hops: Sequence[str],
+    hostname_unchecked_hops: Sequence[str],
+    query_credential_hops: Sequence[str],
     unverified_db_hops: Sequence[str],
     attested_hops: Sequence[str],
     revocation_attested_hops: Sequence[str],
@@ -6696,7 +6738,9 @@ def security_loosenings(
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the per-connection
-    deviations — ``cleartext_accepted``, ``tls_allow_expired``, a generic-ODBC ``DATABASE`` hop
+    deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
+    12.3.2), an endpoint ``url`` with a credential in its query string (ASVS 14.2.1), a generic-ODBC
+    ``DATABASE`` hop
     with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
     ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), and
@@ -6748,14 +6792,20 @@ def security_loosenings(
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
-    ``tls_allow_expired`` (#129 / ADR 0094), ``unverified_db_hops`` is a generic-ODBC ``DATABASE``
+    ``tls_allow_expired`` (#129 / ADR 0094), ``hostname_unchecked_hops`` declares
+    ``tls_check_hostname=false`` (ASVS 12.3.2), ``query_credential_hops`` is an outbound or
+    ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
+    ``unverified_db_hops`` is a
+    generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` leave TLS unenforced (#66 / ADR 0092's amendment), and
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24), and
     ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173). They arrive as
     plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
-    connections; ``expiry_relaxed_hops``; ``unverified_generic_db_hops``, which walks inbound as well as
+    connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
+    ``hostname_unchecked_hops``, which walks inbound as well as outbound; ``query_credential_hops``,
+    which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``). A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
@@ -7135,10 +7185,38 @@ def security_loosenings(
         out.append(
             (
                 "tls_allow_expired",
-                f"{len(expiry_relaxed_hops)} outbound connection(s) accept an EXPIRED server "
+                f"{len(expiry_relaxed_hops)} connection(s) accept an EXPIRED server "
                 f"certificate ({named}) — indefinitely, with nothing that expires the relaxation or "
-                "re-checks it; the chain signature, hostname match and key usage are still fully "
-                "verified, so this is narrower than verify-off",
+                "re-checks it; the chain signature and key usage are still fully verified, and so is "
+                "the hostname match unless the same connection also sets tls_check_hostname=false "
+                "(listed under its own entry), so this is narrower than verify-off",
+            )
+        )
+    if hostname_unchecked_hops:
+        named = ", ".join(sorted(hostname_unchecked_hops))
+        # BOTH halves, for the reason tls_allow_expired gives above. The chain IS verified, so this
+        # is not verify-off; the name is NOT, so a certificate for any host that chains to the
+        # anchor is accepted. Stating only the first half would be the false-premise shape.
+        out.append(
+            (
+                "tls_check_hostname",
+                f"{len(hostname_unchecked_hops)} connection(s) declare tls_check_hostname=false "
+                f"({named}) — on a verifying hop that dials out, the chain is still verified, but "
+                "any certificate that chains to the trust anchor is accepted whatever host it "
+                "names, so anyone holding one could impersonate the peer and read the payload. An "
+                "env() value is listed because it cannot be read before it resolves",
+            )
+        )
+    if query_credential_hops:
+        named = ", ".join(sorted(query_credential_hops))
+        out.append(
+            (
+                "url_query_credential",
+                f"{len(query_credential_hops)} connection(s) carry a credential in the "
+                f"endpoint url's query string ({named}) — it rides the request line, so the "
+                "partner's and any proxy's access log holds it; the engine's own log lines drop the "
+                "query, its settings views withhold the URL, and on an https hop TLS still encrypts "
+                "it on the wire",
             )
         )
     if unverified_db_hops:

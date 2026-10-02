@@ -122,6 +122,10 @@ _MULTI_PERMISSION_ROUTES = frozenset(
         # BACKLOG #1184: the needle-bearing sibling of the export GET. Same two permissions, same
         # fail-closed-on-either behaviour; only the criteria's carrier differs.
         ("POST", "/messages/export"),
+        # ASVS 14.2.6, vault BACKLOG #1187: owner ruling R18 makes this one-message request the
+        # reveal act only for a messages:view_summary holder, so the payloads need it beside
+        # messages:view_raw. Fails closed on either.
+        ("GET", "/messages/{message_id}/outbound"),
         ("GET", "/ui/alerts"),
         # BACKLOG #324: the console editor DISPLAYS the body it edits (textarea + `data-original`),
         # and the POST's reject arm re-ships the pristine stored copy — so both verbs require

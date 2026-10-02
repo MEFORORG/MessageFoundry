@@ -91,6 +91,7 @@ def serve_harness_config(
             config_dir=config_dir,
             poll_interval=0.05,
             env_values=values,
+            allow_no_auth=True,  # the harness reads the API with no session
         )
         api_port = free_port()
         uv = uvicorn.Server(

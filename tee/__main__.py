@@ -248,7 +248,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="MEFOR engine API base URL (e.g. http://127.0.0.1:8000)",
     )
     compare.add_argument(
-        "--token", required=True, metavar="TOKEN", help="bearer token (needs messages:view_raw)"
+        "--token",
+        required=True,
+        metavar="TOKEN",
+        help="bearer token (needs messages:view_raw and messages:view_summary)",
     )
     compare.add_argument(
         "--since",
