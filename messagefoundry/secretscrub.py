@@ -109,6 +109,7 @@ import re
 __all__ = [
     "CREDENTIAL_PLACEHOLDER",
     "credential_query_params",
+    "credential_value_spans",
     "mask_credential_query",
     "scrub_credentials",
 ]
@@ -657,6 +658,33 @@ def credential_query_params(url: str) -> list[str]:
     except ValueError:
         return []
     return sorted({_display_name(name) for name, _ in pairs if _is_credential_param(name)})
+
+
+def credential_value_spans(text: str) -> list[tuple[int, int]]:
+    """The ``[start, end)`` span of the VALUE of every credential-like ``name=value`` segment in
+    ``text``, wherever it sits.
+
+    A segment starts after any ``?``, ``&`` or ``#`` and ends at the next ``&`` or ``#``. It does not
+    care where a URL parser would put the query, which is the point: ``config.wiring._mask_url``
+    unions these with password spans so that no parser's misreading can hide a credential. A segment
+    in a fragment or a path that looks like a credential is masked too; that is the safe direction.
+    Names are judged by the same test as :func:`credential_query_params`. An empty value has no
+    span."""
+    import urllib.parse  # noqa: PLC0415 -- see credential_query_params
+
+    spans: list[tuple[int, int]] = []
+    for i, ch in enumerate(text):
+        if ch not in "?&#":
+            continue
+        start = i + 1
+        ends = [j for j in (text.find("&", start), text.find("#", start)) if j >= 0]
+        end = min(ends, default=len(text))
+        equals = text.find("=", start, end)
+        if equals < 0 or equals + 1 >= end:
+            continue
+        if _is_credential_param(urllib.parse.unquote_plus(text[start:equals])):
+            spans.append((equals + 1, end))
+    return spans
 
 
 def mask_credential_query(url: str, *, placeholder: str = "***") -> str:

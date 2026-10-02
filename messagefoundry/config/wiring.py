@@ -89,7 +89,7 @@ from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.secretscrub import (
     credential_query_params,
-    mask_credential_query,
+    credential_value_spans,
     scrub_credentials,
 )
 
@@ -1445,10 +1445,35 @@ def _proxy_userinfo_split(value: str) -> tuple[str, str, str] | None:
     userinfo, at, hostport = authority.rpartition("@")
     if not at:
         return None
-    user, has_password, _password = userinfo.partition(":")
-    if not has_password:
-        return None  # a user with no password -- nothing secret to remove
+    user, _colon, password = userinfo.partition(":")
+    if not password:
+        return None  # no password, or an empty one -- nothing secret to remove
     return value[:auth_start], user, hostport + value[auth_end:]
+
+
+def _password_spans(value: str) -> list[tuple[int, int]]:
+    """The ``[start, end)`` span of every userinfo password a URL reader would find in ``value``.
+
+    Two readers, because the settings this masks reach two: urllib's proxy parser for a proxy URL
+    (:func:`_proxy_userinfo_split`), and ``urlsplit``'s netloc, which ends at the first ``/``, ``?``
+    or ``#``, for every other URL a connector dials. Both are masked whichever key holds the URL,
+    which fails toward masking: a credential-free URL with a ``:`` before a query ``@`` can lose its
+    host in the view, and no password either reader would send is shown."""
+    spans: list[tuple[int, int]] = []
+    split = _proxy_userinfo_split(value)
+    if split is not None:
+        before, user, after = split
+        spans.append((len(before) + len(user) + 1, len(value) - len(after) - 1))
+    slashes = value.find("//")
+    if slashes >= 0:
+        start = slashes + 2
+        ends = [i for i in (value.find(c, start) for c in "/?#") if i >= 0]
+        netloc_end = min(ends, default=len(value))
+        at = value.rfind("@", start, netloc_end)
+        colon = value.find(":", start, at) if at >= 0 else -1
+        if colon >= 0 and colon + 1 < at:
+            spans.append((colon + 1, at))
+    return spans
 
 
 def _mask_url(value: str) -> str:
@@ -1460,24 +1485,36 @@ def _mask_url(value: str) -> str:
     and disclosed in the URL beside it. The user half and the host and path are PRESERVED
     deliberately: an operator diagnosing a connection needs to see which account and which host.
 
-    WHAT is the password is decided by :func:`_proxy_userinfo_split`, which mirrors urllib's proxy
-    parser exactly. CORRECTED (Lander QA on PR 1912, 2026-10-01): a hand-rolled authority rule
-    before this showed ``http://user:1234/5@proxy`` verbatim, and urllib reads ``1234/5`` as the
-    password. Mirroring the parser fails toward masking: a URL whose query holds an ``@`` after a
-    ``:`` can lose its host in the view, and a password the parser would send is never shown.
+    It masks the UNION of spans found in the ORIGINAL string, never a substring another mask cut:
+    the password every reader finds (:func:`_password_spans`, which mirrors urllib's proxy parser
+    exactly), and the value of every credential-like ``name=value`` segment anywhere in the URL
+    (:func:`~messagefoundry.secretscrub.credential_value_spans`). Overlapping spans merge into one
+    ``***``. A reader that puts a query inside a user or a password therefore cannot hide a query
+    key, and a query reader that starts at the wrong ``?`` cannot hide a password.
 
-    The userinfo is masked FIRST: a "?" or "#" in a password moves the query span the query mask
-    reads, so masking the password first is what lets the query mask find the real query.
-
-    When the userinfo mask swallowed the URL's only "?" (a query "@" made the parser read the query
-    as part of a password), what is left after the masked userinfo still holds the parameters, with
-    no "?" in front of them. Those are masked as a query too, so a credential cannot surface there."""
-    split = _proxy_userinfo_split(value) if "@" in value else None
-    if split is None:
-        return mask_credential_query(value)
-    before, user, after = split
-    after = mask_credential_query(after) if "?" in after else mask_credential_query("?" + after)[1:]
-    return f"{before}{user}:***@{after}"
+    CORRECTED (Lander QA on PR 1912, 2026-10-01): a hand-rolled authority rule showed
+    ``http://user:1234/5@proxy`` verbatim, and urllib reads ``1234/5`` as the password. The next
+    attempt masked the query only in the text after the userinfo, which served ``api_key`` when a
+    ``:`` and an ``@`` later in the query made the proxy reader's USER swallow it. Masking spans of
+    the original string closes both. The cost is the view, never a secret: a credential-free URL with
+    a ``:`` before a query ``@`` can show a ``***`` and the wrong host, and a fragment segment that
+    looks like a credential is masked too."""
+    spans = sorted(_password_spans(value) + credential_value_spans(value))
+    if not spans:
+        return value
+    out: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if end <= cursor:
+            continue  # inside a span already masked
+        if start < cursor:
+            start = cursor
+        else:
+            out.append(value[cursor:start])
+            out.append("***")
+        cursor = end
+    out.append(value[cursor:])
+    return "".join(out)
 
 
 def _redact_header_name(name: object) -> str:

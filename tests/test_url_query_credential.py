@@ -163,6 +163,27 @@ _PARITY_CASES = [
     ("no userinfo", "http://proxy.example.invalid:3128/path?x=1#f"),
     ("no userinfo, no scheme", "proxy.example.invalid:3128"),
     ("user, no password", "https://token@h.example.invalid/x"),
+    ("empty password", "http://user:@proxy.example.invalid:3128"),
+    ("empty user", "http://:pw-empty-user@proxy.example.invalid:3128"),
+    # Review of f62c0df1b6: a ":" and a later "@" made the proxy reader's USER swallow the query.
+    (
+        "query key inside the proxy user",
+        "https://api.example.invalid/v1/export?api_key=SYNTHETIC-12&from=2026-01-01T00:00:00Z"
+        "&notify=ops@example.invalid",
+    ),
+    (
+        "query key, at-time-email",
+        "https://h.example.invalid/x?client_secret=SYNTHETIC-13&at=10:00&by=a@b",
+    ),
+    # ... and a "?" in the fragment or a late value sent the leftover down the wrong path.
+    (
+        "swallowed query, ? in fragment",
+        "https://h.example.invalid:8443/x?email=a@b.example.invalid&key=SYNTHETIC-14#frag?z",
+    ),
+    (
+        "swallowed query, ? in a value",
+        "https://h.example.invalid:8443/x?email=a@b&key=SYNTHETIC-15&q=what?",
+    ),
 ]
 
 
@@ -172,19 +193,29 @@ def test_the_userinfo_mask_hides_every_password_urllib_reads(case: str, url: str
     PR 1912: a hand-rolled rule showed ``user:1234/5@proxy``, whose password urllib reads as
     ``1234/5``. Whatever password urllib reads must never appear in the masked view, and a URL in
     which it reads none must come back unchanged apart from a masked query key."""
+    import urllib.parse
     import urllib.request
 
     from messagefoundry.config.wiring import redacted_settings
     from messagefoundry.secretscrub import mask_credential_query
 
     _scheme, _user, password, _hostport = urllib.request._parse_proxy(url)  # type: ignore[attr-defined]
-    shown = redacted_settings({"proxy_url": url})["proxy_url"]
-    assert "SYNTHETIC" not in shown, case
-    if password:
-        assert password not in shown, case
-        assert ":***@" in shown, case
-    else:
-        assert shown == mask_credential_query(url), case
+    for key in ("proxy_url", "url"):  # a proxy key and a dialled-URL key mask alike
+        shown = redacted_settings({key: url})[key]
+        # Every query credential the detector names stays hidden, whichever reader cut the URL.
+        assert "SYNTHETIC" not in shown, (case, shown)
+        for name, val in urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query):
+            if name in credential_query_params(url) and val:
+                assert val not in shown, (case, name, shown)
+        if password:
+            assert password not in shown, (case, shown)
+            assert "***" in shown, case
+        elif "@" not in url or case in (
+            "user, no password",
+            "path @ with no port",
+            "empty password",
+        ):
+            assert shown == mask_credential_query(url), case
 
 
 def test_the_parser_mirror_agrees_with_urllib_over_generated_strings() -> None:
@@ -208,13 +239,54 @@ def test_the_parser_mirror_agrees_with_urllib_over_generated_strings() -> None:
                 assert got is None, value
                 continue
             compared += 1
-            if password is None:
+            if not password:  # none, or empty: no secret to mask
                 assert got is None, value
             else:
                 with_password += 1
                 assert got is not None and got[1] == user and got[2].startswith(hostport), value
     # Liveness: the generator must reach both arms, or the agreement above says nothing.
     assert compared > 10000 and with_password > 1000, (compared, with_password)
+
+
+def test_a_query_span_nested_inside_a_password_merges_into_one_mask() -> None:
+    """The proxy reader's password ``x?key=S&tail`` contains a query segment's value. The two spans
+    must merge; a merge that stepped back to the inner span's end would show ``&tail``."""
+    from messagefoundry.config.wiring import redacted_settings
+
+    url = "http://user:x?key=SYNTHETIC-16&tail@proxy.example.invalid:3128"
+    assert redacted_settings({"proxy_url": url})["proxy_url"] == (
+        "http://user:***@proxy.example.invalid:3128"
+    )
+
+
+def test_the_composed_mask_never_shows_a_named_key_or_a_read_password() -> None:
+    """The property the review of f62c0df1b6 asked for, over the COMPOSED mask: wherever a seeded
+    generator puts ``key=QZXJ`` among the characters that move every reader's spans, a value the
+    detector names, or one inside a password urllib reads, is never shown."""
+    import random
+    import urllib.request
+
+    from messagefoundry.config.wiring import redacted_settings
+
+    rng = random.Random(14_2_1)
+    named = in_password = 0
+    for _ in range(20000):
+        noise = "h:/@?#&=1."
+        head = "".join(rng.choice(noise) for _ in range(rng.randint(0, 10)))
+        tail = "".join(rng.choice(noise.replace("=", "")) for _ in range(rng.randint(0, 10)))
+        url = f"http://{head}{rng.choice('?&')}key=QZXJ{tail}"
+        shown = redacted_settings({"proxy_url": url})["proxy_url"]
+        if "key" in credential_query_params(url):
+            named += 1
+            assert "QZXJ" not in shown, (url, shown)
+        try:
+            password = urllib.request._parse_proxy(url)[2]  # type: ignore[attr-defined]
+        except ValueError:
+            continue
+        if password and "QZXJ" in password:
+            in_password += 1
+            assert "QZXJ" not in shown, (url, shown)
+    assert named > 1000 and in_password > 100, (named, in_password)
 
 
 @pytest.mark.parametrize(
