@@ -1778,6 +1778,28 @@ def _refuse_idp_revocation(
         guard.enforce_construction()
 
 
+def _resolve_oidc_credential(
+    provider: SecretProvider | None, *, ref: str | None, literal: str | None, setting: str
+) -> str:
+    """Resolve one ``[auth]`` OIDC client credential, naming the setting the operator wrote.
+
+    ``resolve_connector_secret`` names a reference ``<label>_secret``, which is the AD and SMTP
+    spelling. These references are ``<setting>_ref``, so the two refusals it would word are worded
+    here instead. A credential that resolves empty is refused, since it would send no credential.
+    """
+    if ref and provider is None:
+        raise SecretProviderError(
+            f"[auth].{setting}_ref is set but [secrets].provider is unset ('none'). Set "
+            "[secrets].provider (e.g. 'vault'), or remove the reference to use the "
+            "environment-sourced value."
+        )
+    value = resolve_connector_secret(provider, ref=ref, literal=literal, label=f"[auth].{setting}")
+    if not value:
+        named = f"{setting}_ref" if ref else setting
+        raise SecretProviderError(f"[auth].{named} resolved to an empty value")
+    return value
+
+
 def oidc_client_auth_from_settings(
     settings: AuthSettings, secret_provider: SecretProvider | None
 ) -> oidc.ClientAuthentication:
@@ -1793,29 +1815,24 @@ def oidc_client_auth_from_settings(
     messages carries a credential.
     """
     if not settings.oidc_private_key_jwt:
-        secret = resolve_connector_secret(
+        secret = _resolve_oidc_credential(
             secret_provider,
             ref=settings.oidc_client_secret_ref,
             literal=settings.oidc_client_secret,
-            label="[auth].oidc_client_secret",
+            setting="oidc_client_secret",
         )
-        # A reference that resolves empty would otherwise send no client credential at all.
-        if not secret:
-            raise SecretProviderError("[auth].oidc_client_secret resolved to an empty value")
         return oidc.ClientSecretPost(secret)
-    key = resolve_connector_secret(
+    key = _resolve_oidc_credential(
         secret_provider,
         ref=settings.oidc_client_private_key_ref,
         literal=settings.oidc_client_private_key,
-        label="[auth].oidc_client_private_key",
+        setting="oidc_client_private_key",
     )
     audience = (
         settings.oidc_issuer
         if settings.oidc_client_assertion_audience == "issuer"
         else settings.oidc_token_endpoint
     )
-    if not key:
-        raise SecretProviderError("[auth].oidc_client_private_key resolved to an empty value")
     # Unreachable while the settings validator holds, since both callers run only with oidc_enabled
     # set. Kept so a future caller's gap fails here, by name, not in the signer as an empty string.
     if not settings.oidc_client_id or not audience:

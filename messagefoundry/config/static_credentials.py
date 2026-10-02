@@ -28,11 +28,12 @@ present the credential, and only when the engine would actually open it (a conne
   refused a static password but passed the same hop with the password deleted would reward making the
   hop weaker.
 
-A hop that presents a compliant credential and no static one is not reported. The compliant kinds are
-a client certificate (mTLS), an SSH private key, SMART Backend Services (a signed assertion), OAuth2
-client credentials (a short-term bearer token), a delegated database identity (Windows Integrated
-or Entra), and the OIDC relying party's ``private_key_jwt`` assertion (BACKLOG #296), which sends a
-short-lived signed assertion on the ``[auth]`` token request in place of the client secret. OAuth2 client credentials count as compliant by the 2026-08-22 owner ruling, which
+A hop that presents a compliant credential and no static one is not reported. The compliant kinds
+include at least a client certificate (mTLS), an SSH private key, SMART Backend Services (a signed
+assertion), OAuth2 client credentials (a short-term bearer token), a delegated database identity
+(Windows Integrated or Entra), and the OIDC relying party's ``private_key_jwt`` assertion (BACKLOG
+#296), which sends a short-lived signed assertion on the ``[auth]`` token request in place of the
+client secret. OAuth2 client credentials count as compliant by the 2026-08-22 owner ruling, which
 classified the SMART and OAuth2 composition helpers as giving ``Rest()``, ``FHIR()`` and
 ``FhirLookup()`` a compliant kind. The OAuth2 token request itself still carries a static
 ``client_secret``; that token hop is not enumerated separately. A ``FhirLookup`` can take SMART only:
