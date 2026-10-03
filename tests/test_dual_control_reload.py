@@ -30,7 +30,12 @@ from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import ApiSettings, ApprovalsSettings, AuthSettings
+from messagefoundry.config.settings import (
+    ApiSettings,
+    ApprovalsSettings,
+    AuthSettings,
+    EgressSettings,
+)
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
@@ -68,7 +73,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     # request can omit config_dir and the approver replays the same on-disk bundle.
     cfg = tmp_path / "cfg"
     _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
-    eng = await Engine.create(tmp_path / "dc.db", poll_interval=0.02, config_dir=cfg)
+    eng = await Engine.create(
+        tmp_path / "dc.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
@@ -346,7 +356,13 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
     preflight = ta.make_settings_anchor_preflight(
         ta.collect_anchor_specs(auth, ApiSettings()), store, enforcing=True
     )
-    engine = Engine(store, poll_interval=0.02, config_dir=cfg, settings_preflight=preflight)
+    engine = Engine(
+        store,
+        poll_interval=0.02,
+        config_dir=cfg,
+        settings_preflight=preflight,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = await _service(engine)
         await _add(service, "op", Role.ADMINISTRATOR)

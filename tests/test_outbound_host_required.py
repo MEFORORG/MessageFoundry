@@ -32,7 +32,9 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.transports import build_destination, build_source
+from tests._egress_policy import permitting
 
 #: The outbound network connectors under test, with the minimum settings each needs *besides* a host.
 _DIALING_DESTINATIONS: list[tuple[ConnectorType, dict[str, Any]]] = [
@@ -76,7 +78,7 @@ def test_dialing_destination_refuses_absent_host(
     """No ``host`` key at all: refuse, rather than substitute a loopback peer nobody configured."""
     config = Destination(name=f"OB_{kind.value.upper()}", type=kind, settings=dict(settings))
     with pytest.raises(ValueError, match="requires a 'host' setting"):
-        build_destination(config)
+        build_destination(config, egress=EgressSettings(deny_by_default=False))
 
 
 @pytest.mark.parametrize(
@@ -94,7 +96,7 @@ def test_dialing_destination_refuses_blank_host(
         name=f"OB_{kind.value.upper()}", type=kind, settings={**settings, "host": blank}
     )
     with pytest.raises(ValueError, match="requires a 'host' setting"):
-        build_destination(config)
+        build_destination(config, egress=EgressSettings(deny_by_default=False))
 
 
 @pytest.mark.parametrize(
@@ -110,7 +112,7 @@ def test_dialing_destination_builds_with_a_host(
         type=kind,
         settings={**settings, "host": "downstream.example.org"},
     )
-    connector = build_destination(config)
+    connector = build_destination(config, egress=EgressSettings(deny_by_default=False))
     assert connector.host == "downstream.example.org"  # type: ignore[attr-defined]
 
 
@@ -124,7 +126,7 @@ def test_sibling_destinations_still_refuse_absent_host(
     green suite means MLLP/TCP/X12 joined them rather than everyone quietly stopping."""
     config = Destination(name=f"OB_{kind.value.upper()}", type=kind, settings=dict(settings))
     with pytest.raises(ValueError, match="(?i)requires a 'host' setting"):
-        build_destination(config)
+        build_destination(config, egress=permitting(config.settings))
 
 
 @pytest.mark.parametrize(("kind", "settings"), _LISTENING_SOURCES, ids=_ids(_LISTENING_SOURCES))
@@ -136,7 +138,9 @@ def test_listening_source_still_defaults_to_loopback(
     back to loopback so an unauthenticated raw listener is never bound to every interface by accident.
     Requiring a host here instead of on the destination would be a security regression, so the rule
     being tightened above is asserted NOT to have reached this side."""
-    connector = build_source(Source(type=kind, settings=dict(settings)))
+    connector = build_source(
+        Source(type=kind, settings=dict(settings)), egress=EgressSettings(deny_by_default=False)
+    )
     assert connector.host == "127.0.0.1"  # type: ignore[attr-defined]
 
 
@@ -146,5 +150,8 @@ def test_listening_source_keeps_an_injected_bind_host(
 ) -> None:
     """The other half of the guard: the loopback fallback is a *fallback*, so a bind host the service
     injected still reaches the listener. A change that hard-coded loopback would pass the test above."""
-    connector = build_source(Source(type=kind, settings={**settings, "host": "10.0.0.5"}))
+    connector = build_source(
+        Source(type=kind, settings={**settings, "host": "10.0.0.5"}),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert connector.host == "10.0.0.5"  # type: ignore[attr-defined]

@@ -60,8 +60,8 @@ engine's own update check makes no network call: `[update_check].mode` accepts o
 | Outbound hop | Setting that names or limits the target | Read more |
 |---|---|---|
 | Outbound Connections, the `db_lookup` and `fhir_lookup` reads, and database-poll and remote-file inbound Connections | The `[egress].allowed_*` destination lists | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |
-| SMART and OAuth2 token endpoints | `[egress].allowed_http` | `_check_credential_token_url_egress` in `messagefoundry/pipeline/wiring_runner.py` |
-| A forward web proxy that the config names by address | `[egress].allowed_proxy` | `_check_forward_proxy_egress` in `messagefoundry/pipeline/wiring_runner.py` |
+| SMART and OAuth2 token endpoints | `[egress].allowed_http` | `_check_credential_token_url_egress` in `messagefoundry/transports/egress.py` |
+| A forward web proxy that the config names by address | `[egress].allowed_proxy` | `_check_forward_proxy_egress` in `messagefoundry/transports/egress.py` |
 | AI assistance broker | `[ai].allowed_endpoints` | [CONFIGURATION.md](CONFIGURATION.md#ai--ai-coding-assistance-policy) |
 | OpenID Connect identity provider | `[auth].oidc_allowed_endpoints` | [Infrastructure hops](ASVS-L2-PHASE0-CHANGES.md#53-infrastructure-hops) |
 | Alert webhook and alert email | `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts` | [Egress allow-lists](DEPLOYMENT.md#egress-allow-lists) |

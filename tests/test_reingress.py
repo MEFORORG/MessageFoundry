@@ -139,7 +139,12 @@ async def test_finalizer_sees_pending_response_row(store: MessageStore) -> None:
 
 
 def _check(reg: Registry) -> None:
-    build_check_registry(reg, inbound_bind_host="127.0.0.1", env_values={}, egress=EgressSettings())
+    build_check_registry(
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 def test_loopback_inbound_builds_with_ack_none() -> None:
@@ -457,7 +462,9 @@ async def test_response_worker_reingresses_and_routes_end_to_end(tmp_path: Any) 
             item.id, body=reply, outcome="accepted", reingress_to="IB_LOOP", now=101.0
         )
 
-        runner = RegistryRunner(reg, store, poll_interval=0.02)
+        runner = RegistryRunner(
+            reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+        )
         await runner.start()  # spawns IB_LOOP's response + router + transform workers
         try:
             child_mid = store._reingress_message_id(origin, "OB_X", 1, reply)
@@ -515,7 +522,9 @@ async def test_reingressed_handler_reads_origin_reply_via_response_get(tmp_path:
         await store.complete_with_response(
             item.id, body=reply, outcome="accepted", reingress_to="IB_LOOP", now=101.0
         )
-        runner = RegistryRunner(reg, store, poll_interval=0.02)
+        runner = RegistryRunner(
+            reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+        )
         await runner.start()
         try:
             for _ in range(200):
@@ -573,7 +582,9 @@ async def test_reingressed_handler_loses_response_view_after_retention_purge(tmp
             item.id, body=reply, outcome="accepted", reingress_to="IB_LOOP", now=101.0
         )
 
-        runner = RegistryRunner(reg, store, poll_interval=0.02)
+        runner = RegistryRunner(
+            reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+        )
         await runner.start()
         try:
             # Pass 1: the child is re-ingressed, its Handler reads the origin's reply, then raises —
@@ -655,7 +666,11 @@ async def test_max_correlation_depth_threads_from_engine_to_runner(tmp_path: Any
     # The [pipeline] max_correlation_depth setting flows Engine.create → RegistryRunner (review minor).
     from messagefoundry.pipeline import Engine
 
-    eng = await Engine.create(tmp_path / "cap.db", max_correlation_depth=3)
+    eng = await Engine.create(
+        tmp_path / "cap.db",
+        max_correlation_depth=3,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         runner = eng.add_registry(Registry())
         assert runner._max_correlation_depth == 3

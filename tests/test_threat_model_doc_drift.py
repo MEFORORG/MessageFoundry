@@ -969,11 +969,11 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.5 DR hook timeout = 30.0 s", s.dr.takeover_timeout_seconds, 30.0),
         ("15.1.5 web console served by default", s.api.serve_ui, True),
         (
-            # The MODEL default. `serve` sets it True on any PHI instance that leaves it unset, which
-            # is the posture the document credits; BACKLOG #1935's 2026-09-24 correction.
-            "15.1.5 [egress].deny_by_default model default is OFF (serve turns it ON for PHI)",
+            # The MODEL default. It was OFF with a serve-side flip (BACKLOG #1935's 2026-09-24
+            # correction); vault BACKLOG #2605 made it ON, so every entry point denies by default.
+            "15.1.5 [egress].deny_by_default model default is ON for every entry point",
             s.egress.deny_by_default,
-            False,
+            True,
         ),
         # BACKLOG #1243 removed `[egress].fhir_require_structured_params` along with the flat
         # '?'-query it gated, so its row is gone from here. This is a COUPLED edit —

@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.connections_file import load_connections_file
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.config.wiring import Registry, WiringError, load_config
 from messagefoundry.pipeline.wiring_runner import (
@@ -105,13 +106,23 @@ _TOML_ATTEST = f'tls_revocation_attested = true\ntls_revocation_attested_reason 
 
 
 def test_code_first_outbound_attestation_reaches_the_destination(tmp_path: Path) -> None:
-    dest = _dest_config(_code_first(tmp_path, ob_kwargs=_ATTEST).outbound["OB"], {})
+    dest = _dest_config(
+        _code_first(tmp_path, ob_kwargs=_ATTEST).outbound["OB"],
+        {},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
     assert dest.tls_revocation_attested is True
     assert dest.tls_revocation_attested_reason == _REASON
 
 
 def test_connections_toml_outbound_attestation_reaches_the_destination(tmp_path: Path) -> None:
-    dest = _dest_config(_toml(tmp_path, ob_extra=_TOML_ATTEST).outbound["OB"], {})
+    dest = _dest_config(
+        _toml(tmp_path, ob_extra=_TOML_ATTEST).outbound["OB"],
+        {},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
     assert dest.tls_revocation_attested is True
     assert dest.tls_revocation_attested_reason == _REASON
 
@@ -132,7 +143,12 @@ def test_an_undeclared_connection_carries_no_attestation(tmp_path: Path) -> None
     # CONTROL for the four above: the same graph without the keys builds unattested models, so a
     # True there is the declaration arriving and not a default that was always True.
     reg = _code_first(tmp_path)
-    assert _dest_config(reg.outbound["OB"], {}).tls_revocation_attested is False
+    assert (
+        _dest_config(
+            reg.outbound["OB"], {}, None, EgressSettings(deny_by_default=False)
+        ).tls_revocation_attested
+        is False
+    )
     assert _source_config(reg.inbound["IB"], "127.0.0.1", {}).tls_revocation_attested is False
 
 
@@ -186,12 +202,20 @@ def test_dest_config_mirrors_the_pair_for_the_smart_token_hop(tmp_path: Path) ->
     # The SMART token-endpoint provider reads a settings MAPPING, not the Destination, so the runner
     # mirrors the declaration into the resolved settings. Without the mirror an attested REST/FHIR
     # outbound with SMART auth would cross its data hop and be refused at its token hop.
-    attested = _dest_config(_toml(tmp_path, ob_extra=_TOML_ATTEST).outbound["OB"], {})
+    attested = _dest_config(
+        _toml(tmp_path, ob_extra=_TOML_ATTEST).outbound["OB"],
+        {},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
     assert attested.settings["tls_revocation_attested"] is True
     assert attested.settings["tls_revocation_attested_reason"] == _REASON
     # CONTROL: an undeclared outbound gains no keys, so the two above are the mirror firing.
     assert (
-        "tls_revocation_attested" not in _dest_config(_toml(tmp_path).outbound["OB"], {}).settings
+        "tls_revocation_attested"
+        not in _dest_config(
+            _toml(tmp_path).outbound["OB"], {}, None, EgressSettings(deny_by_default=False)
+        ).settings
     )
 
 

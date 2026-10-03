@@ -2069,9 +2069,10 @@ def _serve(args: argparse.Namespace) -> int:
     # re-assertion here would be unreachable dead code. No instance is exempt: the gate reads no
     # synthetic or dev condition, so a dev or loopback start is held to the same rule.
     #
-    # Open-egress posture (Q5b): on a PHI-carrying instance, outbound egress that is fully
-    # unrestricted — no [egress] allowlist AND deny_by_default off — lets a transform send PHI to any
-    # destination. The refuse/warn split is [security].enforcement, NOT the deployment tier: the branch
+    # Open-egress posture (Q5b): the gate catches two states with no [egress] allowlist declared.
+    # With [security].block_unlisted_outbound written false, egress is fully unrestricted and a
+    # transform could send PHI to any destination. With it left unset, the deny default (vault
+    # BACKLOG #2605) would refuse every outbound, and the gate says so. The refuse/warn split is [security].enforcement, NOT the deployment tier: the branch
     # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
     # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
     # enforcement = warn. No instance is exempt and none stays quiet: a dev or loopback instance is
@@ -2079,18 +2080,18 @@ def _serve(args: argparse.Namespace) -> int:
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
-    # _allowlist_for (pipeline/wiring_runner.py). ([egress].allowed_proxy is a ninth allowed_* key and
+    # _allowlist_for (transports/egress.py). ([egress].allowed_proxy is a ninth allowed_* key and
     # is deliberately NOT one of them: it gates a transport INTERMEDIARY rather than a destination, is
     # not in _allowlist_for, and is deny-by-default on its own terms — BACKLOG #1659 — so listing a
     # proxy says nothing about where PHI may be sent and must not satisfy this gate.)
     #
     # Counting only six here meant a mail-only or Direct-only instance could enumerate every
-    # destination it actually uses and still be refused as "UNRESTRICTED", with
-    # nothing in the refusal naming the two lists that did not count. allowed_smtp/allowed_direct are
-    # counted only when [security].block_unlisted_outbound was NOT set explicitly — precisely the state
-    # the flip below turns deny-by-default ON for, so such an instance still starts fail-closed. An
-    # instance that explicitly opted OUT of deny-by-default is deliberately unchanged: it cannot
-    # satisfy this gate on smtp/direct alone, because there the other six transports stay allow-any.
+    # destination it actually uses and still be refused, with nothing in the refusal naming the two
+    # lists that did not count. allowed_smtp/allowed_direct are counted only when
+    # [security].block_unlisted_outbound was NOT written -- the deny default then holds every other
+    # transport closed, so such an instance starts fail-closed. An instance that explicitly opted OUT
+    # of deny-by-default is deliberately unchanged: it cannot satisfy this gate on smtp/direct alone,
+    # because there the other six transports stay allow-any.
     eg = settings.egress
     listed = (
         eg.allowed_mllp
@@ -2100,57 +2101,73 @@ def _serve(args: argparse.Namespace) -> int:
         or eg.allowed_remote
         or eg.allowed_file_dirs
     )
-    if "deny_by_default" not in eg.model_fields_set:
+    deny_written = "deny_by_default" in eg.model_fields_set
+    if not deny_written:
         listed = listed or eg.allowed_smtp or eg.allowed_direct
-    egress_open = not eg.deny_by_default and not listed
+    # The gate reads whether the operator WROTE the switch, not only the field's value. The model
+    # default has been deny since vault BACKLOG #2605, so the value alone is true on a stock instance
+    # and this refusal would never fire. Without it a stock instance would start and fail every
+    # outbound as a degraded lane, rather than refusing here with one clear message. The two states
+    # the gate catches differ, and each message says which: written false is allow-any egress, and
+    # left unset with nothing declared is every outbound refused.
+    egress_open = not (deny_written and eg.deny_by_default) and not listed
     if egress_open:
-        # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when
-        # [security].block_unlisted_outbound was set explicitly (otherwise those two count above), so
-        # name that override rather than leaving the operator to wonder why a declared allowlist did
-        # not satisfy the gate.
-        mail_only_note = (
-            " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this gate "
-            "only when [security].block_unlisted_outbound is left unset — setting it false opts out "
-            "of the deny-by-default flip, which would leave every OTHER transport allow-any. Remove "
-            "that override (or set it true) and a mail-only/Direct-only allowlist is accepted."
-            if (eg.allowed_smtp or eg.allowed_direct)
-            else ""
-        )
-        if enforcing:
+        tier = f"{'production ' if production else ''}PHI instance ({env_name!r})"
+        if deny_written:
+            # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when the
+            # switch was written false (otherwise those two count above), so name that override
+            # rather than leaving the operator to wonder why a declared allowlist did not count.
+            mail_only_note = (
+                " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this "
+                "gate only when [security].block_unlisted_outbound is left unset — setting it false "
+                "opts out of the deny default, which would leave every OTHER transport allow-any. "
+                "Remove that override (or set it true) and a mail-only/Direct-only allowlist is "
+                "accepted."
+                if (eg.allowed_smtp or eg.allowed_direct)
+                else ""
+            )
+            if enforcing:
+                print(
+                    f"error: outbound egress is UNRESTRICTED on a {tier}; refusing to start — a "
+                    "transform could send PHI to any destination. Set "
+                    "[security].block_unlisted_outbound=true, or declare the permitted destinations "
+                    f"with per-transport [egress].allowed_* allowlists.{mail_only_note}",
+                    file=sys.stderr,
+                )
+                return 2
             print(
-                f"error: outbound egress is UNRESTRICTED on a "
-                f"{'production ' if production else ''}PHI instance "
-                f"({env_name!r}); refusing to start — a transform could send PHI to any "
-                "destination. Set [security].block_unlisted_outbound=true, or declare the permitted "
-                f"destinations with per-transport [egress].allowed_* allowlists.{mail_only_note}",
+                "warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
+                f"({env_name!r}) — a transform may send to any destination. Set "
+                "[security].block_unlisted_outbound=true, or declare per-transport "
+                f"[egress].allowed_* allowlists, to fail closed.{mail_only_note}",
                 file=sys.stderr,
             )
-            return 2
-        print(
-            f"warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
-            f"({env_name!r}) — a transform may send to any destination. Set "
-            "[security].block_unlisted_outbound or per-transport [egress].allowed_* allowlists to fail "
-            "closed.",
-            file=sys.stderr,
-        )
+        else:
+            if enforcing:
+                print(
+                    f"error: no outbound destination is declared on a {tier}; refusing to start — "
+                    "[security].block_unlisted_outbound is on by default, so every outbound would "
+                    "be refused. Declare the permitted destinations with per-transport "
+                    "[egress].allowed_* allowlists.",
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                f"warning: no outbound destination is declared on a {tier} — "
+                "[security].block_unlisted_outbound is on by default, so every outbound will be "
+                "refused. Declare the permitted destinations with per-transport "
+                "[egress].allowed_* allowlists.",
+                file=sys.stderr,
+            )
 
-    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): EVERY instance defaults to
-    # FAIL-CLOSED egress whenever the field is unset, in every environment, production or not.
-    # Unless the operator explicitly set [security].block_unlisted_outbound, turn
-    # it ON here so a transport whose per-type [egress].allowed_* list is EMPTY refuses every
-    # destination of that type — closing the gap the all-or-nothing open-egress gate above leaves (a
-    # partially-configured instance would otherwise allow-any the transports it did not list). The
-    # opt-out is EXPLICIT + audited: writing [security].block_unlisted_outbound=false restores the per-list opt-in
-    # (empty = allow-any) posture. Gated on ANY PHI instance (WP243/#243, ASVS 13.2.4/13.2.5 — broadened
-    # from production-only), and every instance is a PHI instance: the flip reads no synthetic or
-    # dev condition, so no instance is exempt. A dev, loopback or staging instance flips exactly as
-    # a production one does. Placed AFTER the open-egress gate. Under enforce, a fully-open instance
-    # hits that gate's refusal first. Under warn, it gets that gate's warning and then this flip
-    # closes egress. settings.egress is the same object later passed to
-    # create_managed_app, so the in-place flip threads through to the wiring_runner egress enforcement
-    # (no forbidden-file edit).
-    if "deny_by_default" not in settings.egress.model_fields_set:
-        settings.egress.deny_by_default = True
+    # Egress deny-by-default (#186c, ASVS 13.2.4/13.2.5): EVERY instance runs FAIL-CLOSED egress unless
+    # the operator wrote [security].block_unlisted_outbound=false, so a transport whose per-type
+    # [egress].allowed_* list is EMPTY refuses every destination of that type, including on a
+    # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
+    # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
+    # and this block only announces the posture, or audits the explicit opt-out. No instance is
+    # exempt: a dev, loopback or staging instance is held to it exactly as a production one is.
+    if not deny_written:
         # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
         # like the sibling posture gates rather than logging.info.
         print(
@@ -3367,7 +3384,7 @@ def _serve(args: argparse.Namespace) -> int:
     # suppresses the auto-bound and, under enforce, downgrades the refusal to a loud audited
     # warning. Placed after the exposure gates so an exposed instance's cleartext/MFA refusals
     # surface first.
-    # WP243 (#243, ASVS 14.2.7): the auto-bound mirrors the egress deny_by_default flip above. It
+    # WP243 (#243, ASVS 14.2.7): the auto-bound mirrors the egress deny default above. It
     # applies on every instance and on both dials (owner ruling 2026-07-30, at the AUTO-BOUND block
     # below). Only an UNSET window is defaulted (model_fields_set), so an explicit value —
     # including an explicit 0 — is respected; the audited keep-forever opt-out is
@@ -4095,9 +4112,10 @@ def _serve(args: argparse.Namespace) -> int:
                 ) from exc
             return filter_registry_for_shard(reg, shard_id)
 
-    # ADR 0118: reflect the serve-gate EFFECTIVE flips (egress deny-by-default, retention auto-bound) back
-    # into the [security] view so GET /security/posture reports what is actually in effect, not just the
-    # authored config. The internal egress/retention objects were mutated in place by the gates above.
+    # ADR 0118: reflect the EFFECTIVE values (egress deny-by-default, retention auto-bound) back into
+    # the [security] view so GET /security/posture reports what is actually in effect, not just the
+    # authored config. The retention object was mutated in place by the gate above; the egress value
+    # is the model default unless written (vault BACKLOG #2605), so its reflection is a plain copy.
     # The BIND is folded back the same way, one layer earlier: `_reconcile_effective_bind` in
     # config/settings.py does it inside load_settings, because `--host` is merged there. A third fold
     # belongs next to one of these two, not in a third place.
@@ -8001,7 +8019,11 @@ def _connection(args: argparse.Namespace) -> int:
         load_environment_values,
         resolve_values_base_dir,
     )
-    from messagefoundry.config.settings import hop_posture_from_ai, load_settings
+    from messagefoundry.config.settings import (
+        BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
+        hop_posture_from_ai,
+        load_settings,
+    )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
@@ -8078,7 +8100,26 @@ def _connection(args: argparse.Namespace) -> int:
             result = connections_edit.remove_connection(args.config, args.name, validate=validate)
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
-    except (WiringError, OSError) as exc:
+    except WiringError as exc:
+        message = str(exc)
+        # The deny default (vault BACKLOG #2605) refuses an unlisted outbound. With no
+        # --service-config, the IDE's usual call, the edit was checked against whatever settings
+        # load_settings found, so say where the list belongs rather than leave the analyst guessing.
+        if args.service_config is None and BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
+            # load_settings falls back to ./messagefoundry.toml, so say which case this was.
+            local = Path("messagefoundry.toml")
+            read = (
+                f"against {local.resolve()}, the settings file in the working directory"
+                if local.is_file()
+                else "with no instance settings file, since none was found"
+            )
+            message += (
+                f". No --service-config was given, so this edit was checked {read}. Pass "
+                "--service-config <path to the instance's messagefoundry.toml>, and list the "
+                "connection's host in that file's [egress] allowed_* list for its transport"
+            )
+        return _emit_error(message, as_json=args.json)
+    except OSError as exc:
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
     return 0

@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Loopback, Registry, build_inbound_connection
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -39,7 +40,9 @@ def _runner(store: MessageStore, content_type: ContentType) -> RegistryRunner:
         build_inbound_connection(LOOP, Loopback(), router="route_loop", content_type=content_type)
     )
     reg.add_router("route_loop", lambda msg: [])
-    return RegistryRunner(reg, store, poll_interval=0.02)
+    return RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
 
 
 def _json_body(chars: int) -> str:

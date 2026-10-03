@@ -40,7 +40,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, Registry, build_outbound_connection, env
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
@@ -141,7 +141,11 @@ async def seeded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterat
     """An engine holding one message with a summary, an error, metadata, a captured reply and a
     dead-lettered delivery — so every gated property has a non-null value to withhold."""
     bypass_view_raw_pairing_rule(monkeypatch)
-    engine = await Engine.create(tmp_path / "field_authz_sites.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "field_authz_sites.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         # require_mfa=False: this is a redaction test, not an MFA test — the step-up surfaces
         # (/messages/search, /search/layered) must not be blocked by the secure-by-default MFA gate.

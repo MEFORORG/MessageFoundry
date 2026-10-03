@@ -32,9 +32,9 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import FHIR, WiringError
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.fhir import (
     FhirDestination,
     _capture_outcome,
@@ -51,7 +51,10 @@ PATIENT_VERSIONED = json.dumps(
 
 def _dest(**over: object) -> FhirDestination:
     settings = FHIR(url=BASE, **over).settings  # type: ignore[arg-type]
-    d = build_destination(Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings))
+    d = build_destination(
+        Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(d, FhirDestination)
     return d
 
@@ -115,7 +118,10 @@ def _sent_bundle(req: urllib.request.Request) -> dict[str, Any]:
 def test_fhir_rejects_non_http_scheme() -> None:
     with pytest.raises(ValueError, match="http or https"):
         build_destination(
-            Destination(name="OB", type=ConnectorType.FHIR, settings=FHIR(url="ftp://x/y").settings)
+            Destination(
+                name="OB", type=ConnectorType.FHIR, settings=FHIR(url="ftp://x/y").settings
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -131,7 +137,8 @@ def test_fhir_cleartext_http_nonloopback_refused_without_escape(
                 name="OB",
                 type=ConnectorType.FHIR,
                 settings=FHIR(url="http://fhir.example.org/fhir").settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -142,7 +149,8 @@ def test_fhir_cleartext_http_loopback_allowed() -> None:
             name="OB",
             type=ConnectorType.FHIR,
             settings=FHIR(url="http://127.0.0.1:8080/fhir").settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, FhirDestination)
 
@@ -162,7 +170,8 @@ def test_fhir_cleartext_http_nonloopback_allowed_when_accepted(
                 settings=FHIR(url="http://fhir.example.org/fhir").settings,
                 cleartext_accepted=True,
                 cleartext_reason="legacy partner endpoint has no TLS",
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     assert isinstance(dest, FhirDestination)  # built (warns loudly + audits), not refused
 
@@ -299,7 +308,7 @@ def test_base_url_control_char_is_refused_at_construction() -> None:  # #1241
         settings={"url": "https://fhir.example.org/fhir\r\nX-Evil: 1"},
     )
     with pytest.raises(ValueError, match="control character"):
-        build_destination(bad)
+        build_destination(bad, egress=EgressSettings(deny_by_default=False))
 
 
 def test_invalid_url_from_urllib_is_a_permanent_dead_letter() -> None:  # #1241
@@ -814,7 +823,8 @@ async def test_dynamic_if_match_on_create_stays_a_header() -> None:
 
 def test_fhir_registered_in_registry() -> None:
     dest = build_destination(
-        Destination(name="OB", type=ConnectorType.FHIR, settings=FHIR(url=BASE).settings)
+        Destination(name="OB", type=ConnectorType.FHIR, settings=FHIR(url=BASE).settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, FhirDestination)
 
@@ -1146,7 +1156,10 @@ def test_path_form_is_refused_where_it_would_do_nothing(over: dict[str, str]) ->
         FHIR(url=BASE, update_url_form="path", **over)  # type: ignore[arg-type]
     settings = {**FHIR(url=BASE, **over).settings, "update_url_form": "path"}  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="update_url_form='path' applies only"):
-        build_destination(Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings))
+        build_destination(
+            Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 def test_unknown_update_url_form_is_refused() -> None:

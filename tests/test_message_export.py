@@ -24,7 +24,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
@@ -53,7 +53,7 @@ def test_messages_export_is_a_distinct_capability() -> None:
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     store = await MessageStore.open(tmp_path / "export.db", cipher=make_cipher(generate_key()))
-    eng = Engine(store)
+    eng = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
     yield eng
     await eng.stop()
 

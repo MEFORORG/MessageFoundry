@@ -20,6 +20,7 @@ import urllib.request
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import DICOMweb
 from messagefoundry.parsing import RawMessage
@@ -51,7 +52,8 @@ STORED_FAILED = json.dumps(
 def _dest(**over: object) -> DicomWebDestination:
     settings = DICOMweb(url=BASE, **over).settings  # type: ignore[arg-type]
     d = build_destination(
-        Destination(name="OB_DCMWEB", type=ConnectorType.DICOMWEB, settings=settings)
+        Destination(name="OB_DCMWEB", type=ConnectorType.DICOMWEB, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, DicomWebDestination)
     return d
@@ -104,14 +106,16 @@ def test_dicomweb_rejects_non_http_scheme() -> None:
         build_destination(
             Destination(
                 name="OB", type=ConnectorType.DICOMWEB, settings=DICOMweb(url="ftp://x/y").settings
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
 def test_dicomweb_requires_url() -> None:
     with pytest.raises(ValueError, match="requires a 'url'"):
         build_destination(
-            Destination(name="OB", type=ConnectorType.DICOMWEB, settings={"study_uid": "1.2.3"})
+            Destination(name="OB", type=ConnectorType.DICOMWEB, settings={"study_uid": "1.2.3"}),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -160,7 +164,8 @@ def test_dicomweb_base_url_control_char_rejected() -> None:  # #1241
                 name="OB",
                 type=ConnectorType.DICOMWEB,
                 settings=DICOMweb(url="https://pacs.example.org/dicom-web\r\nX-Evil: 1").settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -267,7 +272,8 @@ def test_dicomweb_cleartext_credentials_refused() -> None:
                 settings=DICOMweb(
                     url="http://pacs.example.org/dicom-web", bearer_token="t"
                 ).settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -283,7 +289,8 @@ def test_dicomweb_cleartext_http_nonloopback_refused_without_escape(
                 name="OB",
                 type=ConnectorType.DICOMWEB,
                 settings=DICOMweb(url="http://pacs.example.org/dicom-web").settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -294,7 +301,8 @@ def test_dicomweb_cleartext_http_loopback_allowed() -> None:
             name="OB",
             type=ConnectorType.DICOMWEB,
             settings=DICOMweb(url="http://127.0.0.1:8042/dicom-web").settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, DicomWebDestination)
 
@@ -314,7 +322,8 @@ def test_dicomweb_cleartext_http_nonloopback_allowed_when_accepted(
                 settings=DICOMweb(url="http://pacs.example.org/dicom-web").settings,
                 cleartext_accepted=True,
                 cleartext_reason="legacy partner endpoint has no TLS",
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     assert isinstance(dest, DicomWebDestination)  # built (warns loudly + audits), not refused
 

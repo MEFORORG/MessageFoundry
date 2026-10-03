@@ -19,6 +19,7 @@ import pytest
 
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.config.models import ConnectorType, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
     MLLP,
@@ -182,7 +183,9 @@ async def test_duplicate_inbound_port_isolates_the_loser(store: MessageStore) ->
     reg.add_inbound(build_inbound_connection("a", MLLP(port=port), router="r"))
     reg.add_inbound(build_inbound_connection("b", MLLP(port=port), router="r"))
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.running
@@ -205,6 +208,7 @@ async def test_inbound_on_reserved_api_port_isolated(store: MessageStore) -> Non
         store,
         poll_interval=0.02,
         reserved_bindings=((API_LISTENER_LABEL, "127.0.0.1", port),),
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -233,7 +237,14 @@ async def test_failed_outbound_isolated_retries_and_recovers(
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("bad_out", m))
     sink = _RecordingAlertSink()
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink, env_values={})
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         # Engine is up despite the broken outbound.
@@ -307,7 +318,9 @@ async def test_file_validate_directory_isolates_missing_dir(
     reg = Registry()
     reg.add_inbound(_file_inbound_validate(missing, validate=True))
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.running  # isolated, not fatal
@@ -328,7 +341,9 @@ async def test_file_validate_directory_off_defers_missing_dir(
     reg = Registry()
     reg.add_inbound(_file_inbound_validate(missing, validate=False))
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.running
@@ -365,7 +380,13 @@ async def test_file_outbound_validate_directory_isolates_missing_dir(
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("file_out", m))
     sink = _RecordingAlertSink()
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert runner.running  # isolated, not fatal
@@ -395,7 +416,9 @@ async def test_file_outbound_validate_directory_off_defers_missing_dir(
     reg.add_outbound(_file_outbound_validate(outdir, validate=False))
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("file_out", m))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         await runner.start()
         try:
@@ -427,7 +450,9 @@ async def test_valid_graph_starts_without_degradation(store: MessageStore, tmp_p
     )
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("file_out", m))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.running
@@ -456,7 +481,11 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_env_broken_outbound())
 
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(reg)
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
@@ -501,7 +530,9 @@ async def test_same_name_inbound_and_outbound_do_not_alias_the_failure(
     reg.add_inbound(_file_inbound(inbox, "SHARED"))
     reg.add_outbound(_env_broken_outbound("SHARED"))
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.running
@@ -536,7 +567,11 @@ async def test_connections_api_does_not_report_a_healthy_inbound_as_failed(tmp_p
     reg.add_outbound(_env_broken_outbound("SHARED"))
     reg.add_router("r", lambda m: [])
 
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(reg)
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
@@ -597,7 +632,11 @@ async def test_status_reports_failed_inbounds_and_scopes_their_names(tmp_path: P
     reg.add_router("r", lambda m: [])
 
     pw = "a-strong-test-passphrase"
-    engine = await Engine.create(tmp_path / "status.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "status.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(reg)
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))

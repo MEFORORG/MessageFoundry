@@ -42,17 +42,17 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry, WiringError
 from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
-from messagefoundry.pipeline.wiring_runner import (
-    _http_egress_allowed,
-    build_check_registry,
-    check_egress_allowed,
-    check_fhir_lookup_allowed,
-)
+from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.redaction import redact, safe_exc, safe_text
 from messagefoundry.support.redact import redact_log_line
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
+from messagefoundry.transports.egress import (
+    _http_egress_allowed,
+    check_egress_allowed,
+    check_fhir_lookup_allowed,
+)
 from messagefoundry.transports.fhir import FhirDestination, FhirLookupExecutor
 from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCredentialsProvider
 from messagefoundry.transports.rest import RestDestination, _redact_url
@@ -94,7 +94,12 @@ _DESTINATIONS: list[tuple[str, Any]] = [
     ("SOAP", lambda url: SoapDestination(_dest(ConnectorType.SOAP, url, soap_action="urn:x"))),
     ("FHIR", lambda url: FhirDestination(_dest(ConnectorType.FHIR, url))),
     ("DICOMweb", lambda url: DicomWebDestination(_dest(ConnectorType.DICOMWEB, url))),
-    ("FhirLookup", lambda url: FhirLookupExecutor({"FL_1793": {"url": url}})),
+    (
+        "FhirLookup",
+        lambda url: FhirLookupExecutor(
+            {"FL_1793": {"url": url}}, egress=EgressSettings(deny_by_default=False)
+        ),
+    ),
 ]
 
 
@@ -342,7 +347,10 @@ async def test_fhir_probe_classifies_a_real_invalid_url() -> None:
 async def test_fhir_lookup_read_and_probe_classify_a_real_invalid_url() -> None:
     from messagefoundry.config.fhir_lookup import FhirLookupError
 
-    executor = FhirLookupExecutor({"FL_1793": {"url": "http://127.0.0.1/fhir x"}})
+    executor = FhirLookupExecutor(
+        {"FL_1793": {"url": "http://127.0.0.1/fhir x"}},
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(FhirLookupError) as exc:
         await executor.read("FL_1793", "Patient/1")
     assert "rejected an invalid request value" in str(exc.value)

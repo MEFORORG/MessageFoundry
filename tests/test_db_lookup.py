@@ -31,10 +31,11 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
 )
 from messagefoundry.pipeline import dryrun, wiring_runner
-from messagefoundry.pipeline.wiring_runner import RegistryRunner, check_lookup_allowed
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus
 from messagefoundry.transports import database
 from messagefoundry.transports.database import DatabaseLookupExecutor
+from messagefoundry.transports.egress import check_lookup_allowed
 
 # --- a faked aioodbc pool/conn/cursor (no driver, no DB) ----------------------
 
@@ -164,7 +165,7 @@ async def test_executor_query_returns_rows_as_dicts(monkeypatch: pytest.MonkeyPa
     pool = _patch_pool(
         monkeypatch, rows=[("123", "Smith"), ("456", "Jones")], columns=["npi", "name"]
     )
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     rows = await ex.query("clarity", "SELECT npi, name FROM p WHERE mrn = :mrn", {"mrn": "M1"})
     assert rows == [{"npi": "123", "name": "Smith"}, {"npi": "456", "name": "Jones"}]
     # :name placeholders are translated to positional and bound in order.
@@ -177,20 +178,20 @@ async def test_executor_query_returns_rows_as_dicts(monkeypatch: pytest.MonkeyPa
 
 async def test_executor_empty_result(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_pool(monkeypatch, rows=[], columns=["npi"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     assert await ex.query("clarity", "SELECT npi FROM p WHERE mrn = :mrn", {"mrn": "X"}) == []
 
 
 async def test_executor_unknown_connection(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_pool(monkeypatch)
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError, match="no DatabaseLookup connection named 'nope'"):
         await ex.query("nope", "SELECT 1", {})
 
 
 async def test_executor_missing_param(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_pool(monkeypatch, columns=["npi"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError, match="missing parameter"):
         await ex.query("clarity", "SELECT npi FROM p WHERE mrn = :mrn", {})  # no 'mrn'
 
@@ -199,7 +200,7 @@ async def test_executor_db_error_is_phi_free(monkeypatch: pytest.MonkeyPatch) ->
     # A driver error carrying a SQLSTATE (args[0]) is wrapped as DbLookupError naming the connection +
     # state only — never the statement, params, or data.
     pool = _patch_pool(monkeypatch, columns=["npi"], error=Exception("08S01", "connection reset"))
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     secret_sql = "SELECT npi FROM patient WHERE ssn = :ssn"
     with pytest.raises(DbLookupError) as ei:
         await ex.query("clarity", secret_sql, {"ssn": "000-00-0000"})
@@ -211,7 +212,7 @@ async def test_executor_db_error_is_phi_free(monkeypatch: pytest.MonkeyPatch) ->
 
 async def test_executor_aclose_closes_pools(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _patch_pool(monkeypatch, columns=["x"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     await ex.query("clarity", "SELECT x", {})  # opens the pool lazily
     await ex.aclose()
     assert pool.closed is True
@@ -219,7 +220,9 @@ async def test_executor_aclose_closes_pools(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_executor_requires_server_and_database() -> None:
     with pytest.raises(ValueError, match="requires a 'database'"):
-        DatabaseLookupExecutor({"bad": {"server": "db.local"}})
+        DatabaseLookupExecutor(
+            {"bad": {"server": "db.local"}}, egress=EgressSettings(deny_by_default=False)
+        )
 
 
 # --- the row ceiling, charged at the fetch (BACKLOG #1730) --------------------
@@ -237,7 +240,7 @@ async def test_executor_refuses_a_result_over_max_rows_at_the_fetch(
     # all 10,000.
     rows = [(f"NPI{i}", f"SSN-{i}") for i in range(10_000)]
     pool = _patch_pool(monkeypatch, rows=rows, columns=["npi", "ssn"])
-    ex = DatabaseLookupExecutor(_capped(3))
+    ex = DatabaseLookupExecutor(_capped(3), egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError) as ei:
         await ex.query("clarity", "SELECT npi, ssn FROM patient WHERE mrn = :mrn", {"mrn": "M1"})
     msg = str(ei.value)
@@ -254,7 +257,7 @@ async def test_executor_returns_a_result_of_exactly_max_rows(
 ) -> None:
     # The boundary: max_rows rows is a full answer, not an overflow.
     pool = _patch_pool(monkeypatch, rows=[("1",), ("2",), ("3",)], columns=["npi"])
-    ex = DatabaseLookupExecutor(_capped(3))
+    ex = DatabaseLookupExecutor(_capped(3), egress=EgressSettings(deny_by_default=False))
     rows = await ex.query("clarity", "SELECT npi FROM p", {})
     assert rows == [{"npi": "1"}, {"npi": "2"}, {"npi": "3"}]
     assert pool.cursor_obj.fetched == 3
@@ -267,13 +270,20 @@ async def test_executor_ceiling_holds_when_the_driver_returns_short_batches(
     # short batch neither hides an overflow nor cuts a legal result short.
     under = _patch_pool(monkeypatch, rows=[(i,) for i in range(5)], columns=["n"], max_batch=2)
     assert (
-        len(await DatabaseLookupExecutor(_capped(5)).query("clarity", "SELECT n FROM t", {})) == 5
+        len(
+            await DatabaseLookupExecutor(
+                _capped(5), egress=EgressSettings(deny_by_default=False)
+            ).query("clarity", "SELECT n FROM t", {})
+        )
+        == 5
     )
     assert under.cursor_obj.fetched == 5
 
     over = _patch_pool(monkeypatch, rows=[(i,) for i in range(50)], columns=["n"], max_batch=2)
     with pytest.raises(DbLookupError, match="max_rows=5"):
-        await DatabaseLookupExecutor(_capped(5)).query("clarity", "SELECT n FROM t", {})
+        await DatabaseLookupExecutor(
+            _capped(5), egress=EgressSettings(deny_by_default=False)
+        ).query("clarity", "SELECT n FROM t", {})
     assert over.cursor_obj.fetched == 6
 
 
@@ -281,18 +291,29 @@ async def test_executor_default_ceiling_is_500(monkeypatch: pytest.MonkeyPatch) 
     # A lookup that sets no max_rows gets DEFAULT_DB_LOOKUP_MAX_ROWS: 500 rows pass, 501 refuse.
     assert database.DEFAULT_DB_LOOKUP_MAX_ROWS == 500
     _patch_pool(monkeypatch, rows=[(i,) for i in range(500)], columns=["n"])
-    assert len(await DatabaseLookupExecutor(_CONN).query("clarity", "SELECT n FROM t", {})) == 500
+    assert (
+        len(
+            await DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False)).query(
+                "clarity", "SELECT n FROM t", {}
+            )
+        )
+        == 500
+    )
 
     pool = _patch_pool(monkeypatch, rows=[(i,) for i in range(5_000)], columns=["n"])
     with pytest.raises(DbLookupError, match="max_rows=500"):
-        await DatabaseLookupExecutor(_CONN).query("clarity", "SELECT n FROM t", {})
+        await DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False)).query(
+            "clarity", "SELECT n FROM t", {}
+        )
     assert pool.cursor_obj.fetched == 501
 
 
 async def test_executor_max_rows_zero_removes_the_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     # The documented opt-out, same convention as poll_max_rows: 0 means no ceiling, read by fetchall.
     pool = _patch_pool(monkeypatch, rows=[(i,) for i in range(2_000)], columns=["n"])
-    rows = await DatabaseLookupExecutor(_capped(0)).query("clarity", "SELECT n FROM t", {})
+    rows = await DatabaseLookupExecutor(
+        _capped(0), egress=EgressSettings(deny_by_default=False)
+    ).query("clarity", "SELECT n FROM t", {})
     assert len(rows) == 2_000
     assert pool.cursor_obj.fetchall_calls == 1
 
@@ -304,7 +325,7 @@ def test_executor_refuses_a_bad_max_rows_at_construction(bad: Any) -> None:
     # Refused where serve and messagefoundry check build the executor, not at the first message. A
     # bool is an int to Python, so True would otherwise mean a ceiling of one row, and int(2.5) is 2.
     with pytest.raises(ValueError, match="DatabaseLookup 'clarity' max_rows") as ei:
-        DatabaseLookupExecutor(_capped(bad))
+        DatabaseLookupExecutor(_capped(bad), egress=EgressSettings(deny_by_default=False))
     # The value arrives env()-resolved, so the refusal withholds it, chain included (BACKLOG #1183).
     assert str(bad) not in str(ei.value)
     assert ei.value.__cause__ is None
@@ -313,7 +334,12 @@ def test_executor_refuses_a_bad_max_rows_at_construction(bad: Any) -> None:
 @pytest.mark.parametrize(("given", "rows_allowed"), [("7", 7), (7.0, 7), ("0", None)])
 def test_executor_reads_an_env_resolved_max_rows(given: Any, rows_allowed: int | None) -> None:
     # env() values arrive as strings; a whole float is a whole number.
-    assert DatabaseLookupExecutor(_capped(given))._max_rows["clarity"] == rows_allowed
+    assert (
+        DatabaseLookupExecutor(
+            _capped(given), egress=EgressSettings(deny_by_default=False)
+        )._max_rows["clarity"]
+        == rows_allowed
+    )
 
 
 # --- read-only statement gate, defence in depth (SEC-009 / ADR 0010) ---------
@@ -322,7 +348,7 @@ def test_executor_reads_an_env_resolved_max_rows(given: Any, rows_allowed: int |
 async def test_insert_lookup_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     # A write statement is rejected BEFORE it reaches the autocommit pool — the fake cursor never runs.
     pool = _patch_pool(monkeypatch, columns=["x"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
         await ex.query("clarity", "INSERT INTO t VALUES (1)", None)
     assert pool.cursor_obj.executed is None  # the write never reached/committed
@@ -341,7 +367,7 @@ async def test_insert_lookup_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 async def test_update_and_exec_rejected(monkeypatch: pytest.MonkeyPatch, stmt: str) -> None:
     pool = _patch_pool(monkeypatch, columns=["x"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
         await ex.query("clarity", stmt, None)
     assert pool.cursor_obj.executed is None
@@ -349,7 +375,7 @@ async def test_update_and_exec_rejected(monkeypatch: pytest.MonkeyPatch, stmt: s
 
 async def test_multi_statement_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _patch_pool(monkeypatch, columns=["x"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
         await ex.query("clarity", "SELECT 1; DROP TABLE t", None)
     assert pool.cursor_obj.executed is None
@@ -358,7 +384,7 @@ async def test_multi_statement_rejected(monkeypatch: pytest.MonkeyPatch) -> None
 async def test_select_with_leading_comment_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     # A leading comment preamble and a CTE both pass the gate and execute on the fake.
     pool = _patch_pool(monkeypatch, rows=[("123",)], columns=["npi"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     rows = await ex.query(
         "clarity", "-- comment\nSELECT npi FROM provider WHERE mrn = :mrn", {"mrn": "M1"}
     )
@@ -366,7 +392,7 @@ async def test_select_with_leading_comment_allowed(monkeypatch: pytest.MonkeyPat
     assert pool.cursor_obj.executed is not None
 
     pool2 = _patch_pool(monkeypatch, rows=[("1",)], columns=["c"])
-    ex2 = DatabaseLookupExecutor(_CONN)
+    ex2 = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     assert await ex2.query("clarity", "WITH cte AS (SELECT 1 AS c) SELECT * FROM cte", None) == [
         {"c": "1"}
     ]
@@ -376,7 +402,7 @@ async def test_select_with_leading_comment_allowed(monkeypatch: pytest.MonkeyPat
 async def test_trailing_semicolon_select_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     # A single trailing ';' (with only whitespace/comments after) is NOT a second statement.
     pool = _patch_pool(monkeypatch, rows=[("1",)], columns=["c"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     assert await ex.query("clarity", "SELECT 1 AS c ;  ", None) == [{"c": "1"}]
     assert pool.cursor_obj.executed is not None
 
@@ -416,7 +442,7 @@ async def test_write_shaped_select_and_cte_rejected(
     monkeypatch: pytest.MonkeyPatch, stmt: str
 ) -> None:
     pool = _patch_pool(monkeypatch, columns=["x"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
         await ex.query("clarity", stmt, None)
     assert pool.cursor_obj.executed is None  # the write never reached/committed
@@ -515,7 +541,7 @@ def test_check_lookup_allowed_denies_unlisted_host() -> None:
 
 def test_check_lookup_allowed_unrestricted_when_empty() -> None:
     check_lookup_allowed(
-        "clarity", {"server": "anything", "port": 1433}, EgressSettings()
+        "clarity", {"server": "anything", "port": 1433}, EgressSettings(deny_by_default=False)
     )  # no raise
 
 
@@ -553,7 +579,7 @@ async def test_audit_attacker_value_cannot_inject_a_write(monkeypatch: pytest.Mo
     # interpolated into SQL — so it can never become a `; DROP TABLE` / write. Pin: the value lands in
     # the positional params tuple and the SQL keeps its single placeholder, byte-for-byte.
     pool = _patch_pool(monkeypatch, rows=[], columns=["npi"])
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     hostile = "1; DROP TABLE patient; --"  # an attacker-influenced HL7 field value
     await ex.query("clarity", "SELECT npi FROM p WHERE mrn = :mrn", {"mrn": hostile})
     assert pool.cursor_obj.executed is not None
@@ -579,7 +605,7 @@ async def test_audit_query_runs_via_autocommit_readonly_pool(
         return real_pool
 
     monkeypatch.setattr(database, "_make_pool", spy_make_pool)
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     await ex.query("clarity", "SELECT npi FROM p WHERE mrn = :mrn", {"mrn": "M1"})
     assert seen["autocommit"] is True
 
@@ -653,7 +679,7 @@ async def test_a_pool_open_failure_is_a_lookup_error(
         )
 
     monkeypatch.setattr(database, "_make_pool", failing_make_pool)
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     for _ in range(2):
         with pytest.raises(DbLookupError) as err:
             await ex.query("clarity", _SECRET_SQL, {"ssn": _SECRET_VALUE})
@@ -675,7 +701,7 @@ async def test_a_missing_driver_extra_is_a_lookup_error_that_says_so(
     # A None entry in sys.modules makes the real `import aioodbc` raise ImportError, so the real
     # _import_aioodbc and _make_pool run.
     monkeypatch.setitem(sys.modules, "aioodbc", None)
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError) as err:
         await ex.query("clarity", _SECRET_SQL, {"ssn": _SECRET_VALUE})
     assert str(err.value) == (
@@ -695,7 +721,7 @@ async def test_a_failed_acquire_is_a_lookup_error(monkeypatch: pytest.MonkeyPatc
         raise OSError(f"link failure ({_SECRET_DSN})")
 
     monkeypatch.setattr(pool, "acquire", failing_acquire)
-    ex = DatabaseLookupExecutor(_CONN)
+    ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DbLookupError) as err:
         await ex.query("clarity", _SECRET_SQL, {"ssn": _SECRET_VALUE})
     assert str(err.value) == "db_lookup on 'clarity': could not open a connection (OSError)"

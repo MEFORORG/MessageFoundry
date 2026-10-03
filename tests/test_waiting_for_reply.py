@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     Registry,
@@ -103,7 +104,7 @@ def test_waiting_display_delay_threads_through_config() -> None:
     spec = ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 2700})
     oc = build_outbound_connection("OB", spec, waiting_display_delay=3.0)
     assert oc.waiting_display_delay == 3.0
-    dest = _dest_config(oc, {})
+    dest = _dest_config(oc, {}, None, EgressSettings(deny_by_default=False))
     assert dest.waiting_display_delay == 3.0
     assert MLLPDestination(dest).waiting_display_delay == 3.0
 
@@ -120,7 +121,9 @@ def test_negative_waiting_display_delay_rejected() -> None:
 async def test_runner_outbound_waiting_for_reply_duck_typed(tmp_path: Path) -> None:
     """``outbound_waiting_for_reply`` reads the live connector's marker; a connector without the method
     (File/REST/…) and an unknown name both report False (never raises)."""
-    eng = await Engine.create(tmp_path / "w.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "w.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         runner = eng.add_registry(Registry())
 

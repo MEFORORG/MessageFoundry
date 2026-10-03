@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import AckAfter, ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     Registry,
@@ -616,7 +617,9 @@ async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Pa
 
     item = await _claim_ingress(store, "IB")
     assert item is not None
-    await RegistryRunner(reg, store)._process_ingress_item("IB", item)
+    await RegistryRunner(
+        reg, store, egress=EgressSettings(deny_by_default=False)
+    )._process_ingress_item("IB", item)
 
     msg = await store.get_message(mid)
     assert msg is not None
@@ -1178,7 +1181,12 @@ async def test_ack_after_delivered_global_default_rejected_at_start(tmp_path: Pa
             )
         )
         reg.add_router("r", lambda m: [])
-        runner = RegistryRunner(reg, s, ack_after_default=AckAfter.DELIVERED)
+        runner = RegistryRunner(
+            reg,
+            s,
+            ack_after_default=AckAfter.DELIVERED,
+            egress=EgressSettings(deny_by_default=False),
+        )
         await runner.start()  # does NOT crash — the offending inbound is isolated
         try:
             assert runner.running
@@ -1234,7 +1242,7 @@ async def test_engine_refuses_backend_without_ingest_stage(tmp_path: Path) -> No
     s = await MessageStore.open(tmp_path / "x.db")
     s.supports_ingest_stage = False  # simulate a non-staged backend
     try:
-        engine = Engine(s)
+        engine = Engine(s, egress_settings=EgressSettings(deny_by_default=False))
         engine.add_registry(Registry())
         with pytest.raises(RuntimeError, match="staged ingress pipeline"):
             await engine.start()

@@ -46,7 +46,7 @@ from messagefoundry.api.protocol_headers import (
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 
 #: Environment variable holding the password for the two throwaway scan identities. It is OPTIONAL and
@@ -221,7 +221,10 @@ async def dast_target(
     root = db_dir if db_dir is not None else Path(tmp.name)
     password = _scan_password()
 
-    engine = await Engine.create(root / "dast.db", poll_interval=0.02)
+    # The stock deny policy, stated: the target declares no outbound, so nothing may dial out.
+    engine = await Engine.create(
+        root / "dast.db", poll_interval=0.02, egress_settings=EgressSettings()
+    )
     server: uvicorn.Server | None = None
     task: asyncio.Task[None] | None = None
     try:

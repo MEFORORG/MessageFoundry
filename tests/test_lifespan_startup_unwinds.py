@@ -47,7 +47,7 @@ import uvicorn
 
 import messagefoundry.api.app as appmod
 from messagefoundry.api import create_managed_app
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 
 
 async def _boom(*args: object, **kwargs: object) -> None:
@@ -62,6 +62,7 @@ app = create_managed_app(
     db_path=Path(sys.argv[1]) / "probe.db",
     poll_interval=0.05,
     auth_settings=AuthSettings(enabled=True),
+    egress_settings=EgressSettings(),
 )
 
 print("PROBE: starting uvicorn", flush=True)

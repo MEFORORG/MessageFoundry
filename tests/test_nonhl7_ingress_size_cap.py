@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.binary import is_marked
@@ -72,7 +73,7 @@ async def _rows(store: MessageStore) -> list[dict]:
 async def test_text_over_cap_records_error(store: MessageStore, monkeypatch) -> None:
     monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_JSON", ContentType.JSON)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     body = ("x" * 100).encode("utf-8")  # 100 chars > 64 cap
     ack = await runner._handle_inbound(reg.inbound["IB_JSON"], body)
@@ -89,7 +90,7 @@ async def test_text_over_cap_records_error(store: MessageStore, monkeypatch) -> 
 async def test_text_under_cap_received(store: MessageStore, monkeypatch) -> None:
     monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_JSON", ContentType.JSON)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_JSON"], b'{"a":1}')
     assert ack is None
@@ -102,7 +103,7 @@ async def test_text_under_cap_received(store: MessageStore, monkeypatch) -> None
 async def test_text_boundary_exact_cap_accepted(store: MessageStore, monkeypatch) -> None:
     monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_JSON", ContentType.JSON)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     # exactly len == cap is accepted (RECEIVED); cap + 1 is ERROR. The leading "{" satisfies the JSON
     # sniff so the ONLY thing separating these two bodies is their length.
@@ -121,7 +122,7 @@ async def test_text_boundary_exact_cap_accepted(store: MessageStore, monkeypatch
 async def test_binary_over_cap_records_error(store: MessageStore, monkeypatch) -> None:
     monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_DICOM", ContentType.DICOM)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     # INGEST-4: a NUL-bearing over-cap body must NOT be stored as a latin-1 view (a stored U+0000 is
     # rejected by Postgres at bind / truncated by SQLite/SQL Server). The over-cap ERROR raw is now the
@@ -147,7 +148,7 @@ async def test_binary_over_cap_nul_free_stays_plain_latin1(
     # intact), so the helper must keep the faithful, human-readable latin-1 view — NOT base64 everything.
     monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 64)
     reg = _registry("IB_DICOM", ContentType.DICOM)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     body = b"\xff\xfe" * 50  # 100 bytes > 64 cap, NO NUL
     ack = await runner._handle_inbound(reg.inbound["IB_DICOM"], body)
@@ -163,7 +164,7 @@ async def test_binary_over_cap_nul_free_stays_plain_latin1(
 async def test_binary_under_cap_received(store: MessageStore, monkeypatch) -> None:
     monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 200)
     reg = _registry("IB_DICOM", ContentType.DICOM)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     body = _dicom_body(4)  # 136 bytes: Part-10-shaped, under the 200-byte cap
     ack = await runner._handle_inbound(reg.inbound["IB_DICOM"], body)
@@ -176,7 +177,7 @@ async def test_binary_under_cap_received(store: MessageStore, monkeypatch) -> No
 async def test_binary_boundary_measured_on_raw_bytes(store: MessageStore, monkeypatch) -> None:
     monkeypatch.setattr(ingress_guards, "INGRESS_MAX_BYTES", 140)
     reg = _registry("IB_DICOM", ContentType.DICOM)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     # The cap is measured on the RAW bytes (pre-base64-inflation): 140 raw bytes is accepted even though
     # its base64 carriage form is larger; 141 raw bytes is rejected. Both are Part-10-shaped, so length
@@ -210,7 +211,7 @@ async def test_hl7_decode_error_nul_dead_letters_mfb64_and_naks(store: MessageSt
     # NUL + invalid-UTF-8 → the decode-error branch. Its raw view carries the NUL, so the helper escalates
     # to base64 carriage; an AR NAK is returned (a malformed body, exactly like the decode/parse errors).
     reg = _registry("IB_HL7", ContentType.HL7V2)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_HL7"], _HL7_DECODE_ERR_NUL)
 
@@ -226,7 +227,7 @@ async def test_hl7_decode_error_no_nul_stays_plain_latin1(store: MessageStore) -
     # NUL-FREE invalid-UTF-8 → decode-error branch, but the byte view has no NUL, so it stays the readable
     # latin-1 view (anti-over-rejection: only U+0000 escalates to base64).
     reg = _registry("IB_HL7", ContentType.HL7V2)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_HL7"], _HL7_DECODE_ERR_NO_NUL)
 
@@ -243,7 +244,7 @@ async def test_hl7_happy_body_with_nul_is_dead_lettered_not_received(store: Mess
     # this routed on SQLite (Python round-trip) and dropped the connection on Postgres. Now: ERROR + AR NAK
     # BEFORE any routing, on every backend; the exact bytes survive as base64 carriage.
     reg = _registry("IB_HL7", ContentType.HL7V2)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_HL7"], _HL7_HAPPY_NUL)
 
@@ -260,7 +261,7 @@ async def test_json_happy_body_with_nul_is_dead_lettered_no_ack(store: MessageSt
     # Twin for a non-HL7 text body: a JSON string value carrying a NUL. Same guard, but no HL7 ACK for a
     # non-HL7 content type (return None), consistent with the other non-HL7 error branches.
     reg = _registry("IB_JSON", ContentType.JSON)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_JSON"], _JSON_HAPPY_NUL)
 
@@ -275,7 +276,7 @@ async def test_json_happy_body_with_nul_is_dead_lettered_no_ack(store: MessageSt
 async def test_json_no_nul_still_received_not_over_rejected(store: MessageStore) -> None:
     # Regression: a NUL-FREE JSON body is unaffected — still RECEIVED, stored verbatim, not base64.
     reg = _registry("IB_JSON", ContentType.JSON)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_JSON"], _JSON_NO_NUL)
 
@@ -296,7 +297,7 @@ async def test_json_no_nul_still_received_not_over_rejected(store: MessageStore)
 
 async def test_http_decode_error_nul_dead_letters_mfb64_returns_none(store: MessageStore) -> None:
     reg = _registry("IB_HL7", ContentType.HL7V2)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     result = await runner._handle_inbound_http(reg.inbound["IB_HL7"], _HL7_DECODE_ERR_NUL)
 
@@ -310,7 +311,7 @@ async def test_http_decode_error_nul_dead_letters_mfb64_returns_none(store: Mess
 
 async def test_http_happy_body_with_nul_dead_letters_returns_none(store: MessageStore) -> None:
     reg = _registry("IB_HL7", ContentType.HL7V2)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     result = await runner._handle_inbound_http(reg.inbound["IB_HL7"], _HL7_HAPPY_NUL)
 
@@ -334,7 +335,7 @@ async def test_nul_dead_letter_does_not_log_or_persist_phi(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     reg = _registry("IB_HL7", ContentType.HL7V2)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     body = (
         f"MSH|^~\\&|S|F|R|F|20260101||ADT^A01|MSG1|P|2.5\rPID|1||MRN1^^^H^MR||{_PHI_CANARY}\x00\r"
     ).encode()

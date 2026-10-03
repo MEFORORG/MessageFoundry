@@ -42,7 +42,7 @@ from messagefoundry.auth.ldap import (
 )
 from messagefoundry.auth.notifications import USERNAME_CHANGED, SecurityEvent
 from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
@@ -1631,7 +1631,11 @@ async def test_the_reauth_route_says_the_directory_could_not_confirm_the_account
     """``POST /me/reauth`` names the directory when the re-bind judged no password (a row with no
     id, here), and keeps "re-verification failed" for a password the directory refused (the
     control). Both are 403, so neither sends the client back to sign-in."""
-    engine = await Engine.create(tmp_path / "reauth_directory.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "reauth_directory.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         assert isinstance(engine.store, MessageStore)
         own = _principal("jsmith", GUID_A_TEXT)

@@ -17,6 +17,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.config.fingerprint import config_fingerprint
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 
@@ -41,7 +42,11 @@ def _write_valid_config(cfg: Path, inbox: Path, outdir: Path) -> None:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "prov.db", poll_interval=0.05)
+    eng = await Engine.create(
+        tmp_path / "prov.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, InternalErrorPolicy, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     DatabaseLookupSpec,
@@ -137,7 +138,9 @@ class _HandoffSpy:
 
 
 async def _run(reg: Registry, store: MessageStore, **kw: Any) -> RegistryRunner:
-    runner = RegistryRunner(reg, store, poll_interval=0.02, **kw)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False), **kw
+    )
     await runner.start()
     return runner
 

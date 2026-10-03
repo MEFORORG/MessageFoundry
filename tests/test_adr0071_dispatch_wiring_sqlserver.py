@@ -44,6 +44,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -120,6 +121,7 @@ async def _runner_with_fusion(store: Any, reg: Registry | None = None) -> Regist
         fuse_thread_hops=True,
         claim_mode="pooled",
         pooled_fusing_workers=1,
+        egress=EgressSettings(deny_by_default=False),
     )
     runner._loop = asyncio.get_running_loop()
     runner._fusion_active = await runner._activate_fusion()

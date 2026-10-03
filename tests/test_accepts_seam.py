@@ -35,6 +35,7 @@ from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.response import response_get
 from messagefoundry.config.run_context import RunContext, run_contexts
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.state import state_get
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -162,7 +163,7 @@ async def test_no_accepts_materializes_every_routed_row(
     store: MessageStore, tmp_path: Path
 ) -> None:
     reg = _reg(tmp_path, handlers={"a": lambda m: Send("OB", str(m)), "b": lambda m: None})
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     item = await _claimed(store)
     await runner._process_ingress_item("IB", item)
     assert await _routed_rows(store, item.message_id) == ["a", "b"]  # both, as today
@@ -180,7 +181,7 @@ async def test_accepts_declines_before_a_routed_row_exists(
     """The ADR 0084 forcing case: SELECT 20, accept 4. The 16 decliners must never reach the store —
     that is the whole seam (each routed row they'd have cost is 2 durable transactions)."""
     reg = _hub(tmp_path, selected=20, accepting=4)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     seen: list[list[str]] = []
     real = store.route_handoff
@@ -276,7 +277,9 @@ async def test_accepts_raise_is_a_content_error(store: MessageStore, tmp_path: P
 
     async def _run(reg: Registry) -> tuple[str, list[tuple[str, str]]]:
         item = await _claimed(store)
-        await RegistryRunner(reg, store)._process_ingress_item("IB", item)
+        await RegistryRunner(
+            reg, store, egress=EgressSettings(deny_by_default=False)
+        )._process_ingress_item("IB", item)
         assert await _routed_rows(store, item.message_id) == []  # no routed row materialized
         return await _router_stage_state(store, item.message_id)
 
@@ -313,7 +316,9 @@ async def test_accepts_raise_is_a_content_error_on_the_fused_twin(
     """AC-4, fused twin (ADR 0071). The filter lives in route_only, so the fused path's CONTENT
     boundary classifies a predicate raise as ``route_exc`` for free — the handoff is never attempted."""
     reg = _reg(tmp_path, handlers={"h": lambda m: Send("OB", str(m))}, accepts={"h": _boom})
-    runner = RegistryRunner(reg, store, claim_mode="pooled")
+    runner = RegistryRunner(
+        reg, store, claim_mode="pooled", egress=EgressSettings(deny_by_default=False)
+    )
     fake_pool = _FakeSyncPool()
     store.sync_handoff_pool = lambda stage: fake_pool  # type: ignore[attr-defined]
     runner._fuse_route_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="t-fuse")
@@ -342,7 +347,9 @@ async def test_fused_twin_declines_without_materializing_a_row(
     """The fused twin picks the seam up with zero changes of its own: it hands off only the survivors,
     and an all-declined message falls to UNROUTED on its existing disposition line."""
     reg = _hub(tmp_path, selected=20, accepting=4)
-    runner = RegistryRunner(reg, store, claim_mode="pooled")
+    runner = RegistryRunner(
+        reg, store, claim_mode="pooled", egress=EgressSettings(deny_by_default=False)
+    )
     handed: list[list[str]] = []
 
     def _route_handoff_sync(conn: Any, **kw: Any) -> bool:
@@ -372,7 +379,9 @@ async def test_fused_twin_declines_without_materializing_a_row(
 
 async def test_fused_twin_all_declined_is_unrouted(store: MessageStore, tmp_path: Path) -> None:
     reg = _hub(tmp_path, selected=20, accepting=0)
-    runner = RegistryRunner(reg, store, claim_mode="pooled")
+    runner = RegistryRunner(
+        reg, store, claim_mode="pooled", egress=EgressSettings(deny_by_default=False)
+    )
     store.sync_handoff_pool = lambda stage: _FakeSyncPool()  # type: ignore[attr-defined]
     store.route_handoff_sync = lambda conn, **kw: True  # type: ignore[attr-defined]
     runner._fuse_route_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="t-fuse")
@@ -441,7 +450,7 @@ async def test_accepts_lookup_dead_letters_on_the_live_path(
         return True
 
     reg = _reg(tmp_path, handlers={"h": lambda m: Send("OB", str(m))}, accepts={"h": _db})
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     item = await _claimed(store)
     await runner._process_ingress_item("IB", item)
     fetched = await store.get_message(item.message_id)
@@ -470,7 +479,7 @@ async def test_accepts_makes_a_multi_select_message_inline_eligible(
         accepts={"b": lambda m: False, "c": lambda m: False},  # 'a' has no predicate → always kept
         inline=True,
     )
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     runner._recompute_inline_ok()  # no live lookups + ack_after=ingest + FILE ⇒ eligible
     assert runner._inline_ok["IB"] is True
 

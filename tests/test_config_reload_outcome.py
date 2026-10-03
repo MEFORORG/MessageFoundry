@@ -31,6 +31,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.cluster import NullCoordinator
@@ -145,7 +146,9 @@ async def test_post_swap_reference_sync_failure_reports_degraded_and_new_graph_i
         new_cfg, inbound_name="IB_NEW", outbound_name="OUT_NEW", inbox=new_in, outdir=new_out
     )
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
     try:
@@ -194,7 +197,10 @@ async def test_post_swap_cluster_propagate_failure_reports_degraded_and_new_grap
     )
 
     eng = await Engine.create(
-        tmp_path / "e.db", poll_interval=0.02, coordinator=_BumpFailsCoordinator()
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        coordinator=_BumpFailsCoordinator(),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
@@ -230,7 +236,9 @@ async def test_unreadable_bundle_applies_and_names_the_fingerprint_step(
         new_cfg, inbound_name="IB_NEW", outbound_name="OUT_NEW", inbox=new_in, outdir=new_out
     )
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
     try:
@@ -274,7 +282,9 @@ async def test_fingerprint_is_taken_before_the_swap(
         new_cfg, inbound_name="IB_NEW", outbound_name="OUT_NEW", inbox=new_in, outdir=new_out
     )
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
     try:
@@ -327,7 +337,9 @@ async def test_pre_swap_wiring_error_still_fails_and_leaves_the_old_graph_live(
         old_cfg, inbound_name="IB_OLD", outbound_name="OUT_OLD", inbox=old_in, outdir=old_out
     )
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
     try:
@@ -367,7 +379,9 @@ async def test_pre_swap_connector_build_failure_still_fails_and_leaves_the_old_g
         old_cfg, inbound_name="IB_OLD", outbound_name="OUT_OLD", inbox=old_in, outdir=old_out
     )
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
     try:
@@ -402,7 +416,9 @@ async def test_clean_reload_reports_plain_success(tmp_path: Path) -> None:
         new_cfg, inbound_name="IB_NEW", outbound_name="OUT_NEW", inbox=new_in, outdir=new_out
     )
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
     try:
@@ -436,7 +452,9 @@ async def test_reload_wrapper_still_returns_the_registry(tmp_path: Path) -> None
         new_cfg, inbound_name="IB_NEW", outbound_name="OUT_NEW", inbox=new_in, outdir=new_out
     )
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
     try:
@@ -465,7 +483,9 @@ async def test_dry_run_reports_not_applied_and_swaps_nothing(tmp_path: Path) -> 
         new_cfg, inbound_name="IB_NEW", outbound_name="OUT_NEW", inbox=new_in, outdir=new_out
     )
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(old_cfg))
     await eng.start()
     try:
@@ -527,6 +547,7 @@ async def test_reload_refuses_a_graph_the_shard_filter_emptied(tmp_path: Path) -
         tmp_path / "e.db",
         poll_interval=0.02,
         registry_filter=lambda reg: filter_registry_for_shard(reg, "b"),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     eng.add_registry(load_config(old_cfg))
     await eng.start()

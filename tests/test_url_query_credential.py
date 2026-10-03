@@ -4,7 +4,7 @@
 
 The vault re-read of 2026-10-01 found it accepted with no line anywhere: ``refuse_url_credentials``
 covers the userinfo and never the query. It is WARNED and reported rather than refused; the reason is
-on ``pipeline.wiring_runner.warn_url_query_credentials``. Every positive arm has a benign-parameter
+on ``transports.egress.warn_url_query_credentials``. Every positive arm has a benign-parameter
 control, so a test is not green because the detector names every parameter.
 """
 
@@ -24,8 +24,8 @@ from messagefoundry.config.wiring import (
     build_outbound_connection,
     query_credential_hops,
 )
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.secretscrub import credential_query_params
+from messagefoundry.transports.egress import check_egress_allowed
 
 _MARK = "carries a credential in its query string"
 
@@ -376,7 +376,8 @@ def test_build_warns_naming_the_connection_and_parameter_never_the_value(
 ) -> None:
     with caplog.at_level(logging.WARNING):
         check_egress_allowed(
-            _rest("https://p.example.invalid/x?key=SYNTHETIC-SECRET-2&fmt=json"), EgressSettings()
+            _rest("https://p.example.invalid/x?key=SYNTHETIC-SECRET-2&fmt=json"),
+            EgressSettings(deny_by_default=False),
         )
     [line] = [r.getMessage() for r in caplog.records if _MARK in r.getMessage()]
     assert "'OB_REST'" in line and "(parameter(s) key)" in line
@@ -386,7 +387,8 @@ def test_build_warns_naming_the_connection_and_parameter_never_the_value(
 def test_build_with_a_benign_query_is_silent(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING):
         check_egress_allowed(
-            _rest("https://p.example.invalid/x?fmt=json&keyword=lab"), EgressSettings()
+            _rest("https://p.example.invalid/x?fmt=json&keyword=lab"),
+            EgressSettings(deny_by_default=False),
         )
     assert not [r for r in caplog.records if _MARK in r.getMessage()]
 
@@ -429,14 +431,14 @@ def test_reader_lists_only_the_credentialed_url_and_no_value() -> None:
 def test_reader_and_build_cover_a_fhir_lookup(caplog: pytest.LogCaptureFixture) -> None:
     """A FhirLookup dials its ``url`` too, through its own egress check, so both surfaces reach it."""
     from messagefoundry.config.wiring import FhirLookupSpec
-    from messagefoundry.pipeline.wiring_runner import check_fhir_lookup_allowed
+    from messagefoundry.transports.egress import check_fhir_lookup_allowed
 
     reg = _registry()
     url = "https://fhir.example.invalid/R4?api_key=SYNTHETIC-6"
     reg.add_fhir_lookup(FhirLookupSpec(name="LK", settings={"url": url}))
     assert ("fhir_lookup:LK", "api_key") in query_credential_hops(reg)
     with caplog.at_level(logging.WARNING):
-        check_fhir_lookup_allowed("LK", {"url": url}, EgressSettings())
+        check_fhir_lookup_allowed("LK", {"url": url}, EgressSettings(deny_by_default=False))
     [line] = [r.getMessage() for r in caplog.records if _MARK in r.getMessage()]
     assert "FhirLookup 'LK'" in line and "SYNTHETIC" not in line
 

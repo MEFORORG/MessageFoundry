@@ -25,6 +25,7 @@ import pytest
 import messagefoundry
 from messagefoundry.api import create_app
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -216,7 +217,10 @@ async def test_socket_destination_test_connection(conn_type: ConnectorType) -> N
     settings = {"host": "127.0.0.1", "port": port, "connect_timeout": 5.0}
     if conn_type is ConnectorType.TCP:
         settings["framing"] = "stx_etx"
-    dest = build_destination(Destination(name="OB", type=conn_type, settings=settings))
+    dest = build_destination(
+        Destination(name="OB", type=conn_type, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     try:
         await dest.test_connection()  # reachable → no raise
     finally:
@@ -225,7 +229,10 @@ async def test_socket_destination_test_connection(conn_type: ConnectorType) -> N
     # ...and a dead port fails closed.
     dead = await _dead_port()
     bad = {**settings, "port": dead}
-    dest2 = build_destination(Destination(name="OB", type=conn_type, settings=bad))
+    dest2 = build_destination(
+        Destination(name="OB", type=conn_type, settings=bad),
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(DeliveryError):
         await dest2.test_connection()
 
@@ -236,12 +243,14 @@ async def test_socket_destination_test_connection(conn_type: ConnectorType) -> N
 async def test_file_connectors_test_connection_writable(tmp_path: Path) -> None:
     d = tmp_path / "out"
     dest = build_destination(
-        Destination(name="OB", type=ConnectorType.FILE, settings={"directory": str(d)})
+        Destination(name="OB", type=ConnectorType.FILE, settings={"directory": str(d)}),
+        egress=EgressSettings(deny_by_default=False),
     )
     await dest.test_connection()  # creates the dir + probes a write
     assert d.is_dir()
     src = build_source(
-        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")})
+        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")}),
+        egress=EgressSettings(deny_by_default=False),
     )
     await src.test_connection()
 
@@ -253,7 +262,8 @@ async def test_file_destination_test_connection_unwritable(tmp_path: Path) -> No
     dest = build_destination(
         Destination(
             name="OB", type=ConnectorType.FILE, settings={"directory": str(blocker / "sub")}
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     with pytest.raises(DeliveryError, match="not writable"):
         await dest.test_connection()
@@ -265,7 +275,10 @@ async def test_file_destination_test_connection_unwritable(tmp_path: Path) -> No
 async def test_listen_sources_test_connection_not_supported() -> None:
     mllp = MLLPSource(Source(type=ConnectorType.MLLP, settings={"port": 0}))
     tcp = TcpSource(Source(type=ConnectorType.TCP, settings={"port": 0, "framing": "stx_etx"}))
-    timer = build_source(Source(type=ConnectorType.TIMER, settings={"body": "x", "run_once": True}))
+    timer = build_source(
+        Source(type=ConnectorType.TIMER, settings={"body": "x", "run_once": True}),
+        egress=EgressSettings(deny_by_default=False),
+    )
     for src in (mllp, tcp, timer):
         with pytest.raises(TestNotSupportedError):
             await src.test_connection()
@@ -540,7 +553,11 @@ async def test_http_probe_unreachable(cls: type) -> None:
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

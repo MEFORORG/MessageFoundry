@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from messagefoundry.config import settings
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
@@ -179,6 +180,7 @@ async def test_the_runner_hands_each_session_the_graph_it_is_serving(
             store,
             sandbox_policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS),
             sandbox_config_source=(config_dir, None),
+            egress=EgressSettings(deny_by_default=False),
         )
         first = runner._sandbox_for("IB_PARITY")
         second = runner._sandbox_for("IB_OTHER")

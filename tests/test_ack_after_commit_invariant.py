@@ -46,6 +46,7 @@ from typing import Any, NoReturn
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
@@ -96,7 +97,9 @@ def inbound(store: MessageStore) -> tuple[RegistryRunner, InboundConnection]:
         )
     )
     reg.add_router("r", lambda m: [])  # no worker runs, so routing is never reached
-    return RegistryRunner(reg, store), reg.inbound[_INBOUND]
+    return RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)), reg.inbound[
+        _INBOUND
+    ]
 
 
 async def _raise_injected(*args: Any, **kwargs: Any) -> NoReturn:

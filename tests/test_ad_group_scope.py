@@ -18,7 +18,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, _allowed_channels
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
 from tests._admin_account import create_local_user_chosen
@@ -438,7 +438,11 @@ async def test_an_identical_manual_scope_is_taken_over_without_a_revoke(tmp_path
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

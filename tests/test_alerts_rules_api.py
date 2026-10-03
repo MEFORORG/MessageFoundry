@@ -30,6 +30,7 @@ from messagefoundry.config.settings import (
     AlertSeverity,
     AlertsSettings,
     AuthSettings,
+    EgressSettings,
 )
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
@@ -78,7 +79,11 @@ def _alerts_with_secrets() -> AlertsSettings:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "alerts.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "alerts.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.started_at = 1.0
     yield eng
     await eng.stop()
@@ -256,7 +261,10 @@ def test_alerts_rules_lifespan_plumbs_alerts_settings(tmp_path: Path) -> None:
         ]
     )
     app = create_managed_app(
-        db_path=tmp_path / "managed.db", alerts_settings=alerts, allow_no_auth=True
+        db_path=tmp_path / "managed.db",
+        alerts_settings=alerts,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with TestClient(app) as tc:
         r = tc.get("/alerts/rules")

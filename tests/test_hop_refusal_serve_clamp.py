@@ -19,6 +19,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    EgressSettings,
     SqlAuth,
     StoreBackend,
     StoreSettings,
@@ -58,7 +59,13 @@ async def test_serve_refuses_prod_phi_cleartext_tcp_outbound(store: MessageStore
     # raw guard no-op'd when unstamped, so it shipped PHI in cleartext with no refusal.
     reg = Registry()
     reg.add_outbound(build_outbound_connection("OB_TCP", Tcp(host=REMOTE, port=5000)))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=PROD_PHI)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        hop_posture=PROD_PHI,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         degraded = runner.degraded_outbound()
@@ -85,7 +92,13 @@ async def test_serve_allows_declared_cleartext_http_outbound(store: MessageStore
             cleartext_reason="legacy partner endpoint has no TLS",
         )
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=PROD_PHI)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        hop_posture=PROD_PHI,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert runner.outbound_failed("OB_REST") is None  # lane built + live, not refused
@@ -100,7 +113,13 @@ async def test_serve_degrades_synthetic_cleartext_http_outbound(store: MessageSt
     reg.add_outbound(
         build_outbound_connection("OB_REST", Rest(url="http://partner.example.com/ingest"))
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=SYNTHETIC_ENFORCING)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        hop_posture=SYNTHETIC_ENFORCING,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert "OB_REST" in runner.degraded_outbound()
@@ -114,7 +133,13 @@ async def test_serve_prod_phi_still_refuses_cleartext_http(store: MessageStore) 
     reg.add_outbound(
         build_outbound_connection("OB_REST", Rest(url="http://partner.example.com/ingest"))
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=PROD_PHI)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        hop_posture=PROD_PHI,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert "OB_REST" in runner.degraded_outbound()
@@ -128,7 +153,13 @@ async def test_reload_rebuild_stamps_posture_no_spurious_refusal(store: MessageS
     # intake is quiesced ("connector builds here cannot fail"). With stamping the reload swaps cleanly.
     reg0 = Registry()
     reg0.add_outbound(build_outbound_connection("OB_TCP", Tcp(host="127.0.0.1", port=5000)))
-    runner = RegistryRunner(reg0, store, poll_interval=0.02, hop_posture=SYNTHETIC)
+    runner = RegistryRunner(
+        reg0,
+        store,
+        poll_interval=0.02,
+        hop_posture=SYNTHETIC,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         reg1 = Registry()

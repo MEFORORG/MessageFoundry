@@ -28,7 +28,7 @@ from messagefoundry.config.ai_policy import (
     EffectivePolicy,
     resolve_effective_policy,
 )
-from messagefoundry.config.settings import AiSettings, AuthSettings, load_settings
+from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings, load_settings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 
@@ -302,7 +302,11 @@ PW = "Sup3rSecret!!"
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "ai_policy.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "ai_policy.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

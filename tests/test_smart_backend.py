@@ -27,9 +27,9 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import FHIR, MLLP, Rest, WiringError, redacted_settings
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.fhir import FhirDestination
 from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.signing import (
@@ -522,7 +522,8 @@ def _smart_fhir(pem: str) -> FhirDestination:
         FHIR(url=FHIR_BASE), token_url=TOKEN_URL, client_id="c", private_key=pem
     )
     dest = build_destination(
-        Destination(name="OB", type=ConnectorType.FHIR, settings=spec.settings)
+        Destination(name="OB", type=ConnectorType.FHIR, settings=spec.settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, FhirDestination)
     return dest
@@ -547,7 +548,10 @@ def test_cleartext_data_url_with_smart_refused(rsa_pem: str) -> None:
         private_key=rsa_pem,
     )
     with pytest.raises(ValueError, match="cleartext http"):
-        build_destination(Destination(name="OB", type=ConnectorType.FHIR, settings=spec.settings))
+        build_destination(
+            Destination(name="OB", type=ConnectorType.FHIR, settings=spec.settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 async def test_fhir_401_invalidates_token(rsa_pem: str) -> None:
@@ -564,7 +568,8 @@ async def test_rest_injects_smart_bearer(rsa_pem: str) -> None:
         Rest(url=REST_URL), token_url=TOKEN_URL, client_id="c", private_key=rsa_pem
     )
     dest = build_destination(
-        Destination(name="OB", type=ConnectorType.REST, settings=spec.settings)
+        Destination(name="OB", type=ConnectorType.REST, settings=spec.settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, RestDestination)
     dest._token_provider._opener = _token_opener()  # type: ignore[union-attr]
@@ -576,7 +581,8 @@ async def test_rest_injects_smart_bearer(rsa_pem: str) -> None:
 
 async def test_plain_fhir_has_no_token_provider() -> None:
     dest = build_destination(
-        Destination(name="OB", type=ConnectorType.FHIR, settings=FHIR(url=FHIR_BASE).settings)
+        Destination(name="OB", type=ConnectorType.FHIR, settings=FHIR(url=FHIR_BASE).settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, FhirDestination)
     assert dest._token_provider is None

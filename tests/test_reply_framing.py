@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
@@ -172,7 +173,8 @@ def _soap(url: str) -> SoapDestination:
             name="OB_SOAP",
             type=ConnectorType.SOAP,
             settings=Soap(url=url, capture_response=True).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, SoapDestination)
     return d
@@ -184,7 +186,8 @@ def _rest(url: str) -> RestDestination:
             name="OB_REST",
             type=ConnectorType.REST,
             settings=Rest(url=url, capture_response=True).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, RestDestination)
     return d
@@ -192,7 +195,8 @@ def _rest(url: str) -> RestDestination:
 
 def _fhir(url: str) -> FhirDestination:
     d = build_destination(
-        Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=FHIR(url=url).settings)
+        Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=FHIR(url=url).settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, FhirDestination)
     return d

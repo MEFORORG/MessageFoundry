@@ -409,8 +409,14 @@ def test_a_rejected_scenario_fails_when_the_sink_accepts_the_recipient(
 @pytest.mark.parametrize(
     "toml",
     [
-        pytest.param('[egress]\nallowed_http = ["127.0.0.1"]\n', id="no-recipient-domains"),
+        # Each carries the same opt-out as HARNESS_EGRESS_TOML, so the relay host passes and only
+        # the recipient-domain gate can refuse (the model default denies, vault BACKLOG #2605).
         pytest.param(
+            '[security]\nblock_unlisted_outbound = false\n[egress]\nallowed_http = ["127.0.0.1"]\n',
+            id="no-recipient-domains",
+        ),
+        pytest.param(
+            "[security]\nblock_unlisted_outbound = false\n"
             '[egress]\nallowed_http = ["127.0.0.1"]\nallowed_recipient_domains = ["other.invalid"]\n',
             id="another-domain",
         ),

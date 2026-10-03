@@ -42,6 +42,7 @@ from typing import Any, TypeVar
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Database
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.database import _build_dsn, _login_timeout, _make_pool
@@ -133,7 +134,8 @@ async def test_destination_writes_row(pool: Any, table: str) -> None:
             settings=Database(
                 **_conn(), statement=f"INSERT INTO {table} (mrn, val) VALUES (:mrn, :val)"
             ).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     try:
         result = await _bounded(dest.send(json.dumps({"mrn": "M1", "val": "V1"})))

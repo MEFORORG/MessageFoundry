@@ -345,7 +345,7 @@ def test_smtp_host_alone_is_not_a_hop() -> None:
 def test_the_http_family_matches_the_runner() -> None:
     """``config`` cannot import ``pipeline``, so the tuple is restated; pin the two equal."""
     from messagefoundry.config import static_credentials
-    from messagefoundry.pipeline.wiring_runner import _HTTP_FAMILY_DEST_TYPES
+    from messagefoundry.transports.egress import _HTTP_FAMILY_DEST_TYPES
 
     assert frozenset(_HTTP_FAMILY_DEST_TYPES) == static_credentials._HTTP_FAMILY
 

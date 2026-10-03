@@ -31,7 +31,7 @@ from messagefoundry.auth import reconcile, totp
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe, LdapError
 from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import MessageStore
@@ -474,7 +474,11 @@ async def test_the_route_says_the_directory_could_not_confirm_the_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The API answers 403, not the wrong-code 401, and names the directory as the reason."""
-    engine = await Engine.create(tmp_path / "mfa_directory.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "mfa_directory.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         e = await _enrolled_directory_session(engine.store, monkeypatch)
         e.directory.answer = DirectoryAnswer.DISABLED

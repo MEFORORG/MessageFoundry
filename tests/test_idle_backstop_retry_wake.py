@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -86,12 +87,24 @@ def _registry(inbox: Path, out_dir: Path) -> Registry:
 
 
 def test_idle_backstop_is_poll_interval_when_wake_off(store: MessageStore) -> None:
-    r = RegistryRunner(Registry(), store, poll_interval=0.25, per_lane_wake=False)
+    r = RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.25,
+        per_lane_wake=False,
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert r._idle_backstop == 0.25  # byte-identical to pre-WS-C
 
 
 def test_idle_backstop_is_long_safety_net_when_wake_on(store: MessageStore) -> None:
-    r = RegistryRunner(Registry(), store, poll_interval=0.25, per_lane_wake=True)
+    r = RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.25,
+        per_lane_wake=True,
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert r._idle_backstop == _PER_LANE_IDLE_BACKSTOP_SECONDS == 30.0
 
 
@@ -138,6 +151,7 @@ async def test_transient_failure_on_idle_lane_retries_on_schedule(
         poll_interval=0.05,
         per_lane_wake=True,
         delivery_defaults=RetryPolicy(backoff_seconds=0.2, backoff_multiplier=1.0),
+        egress=EgressSettings(deny_by_default=False),
     )
     await r.start()
     try:

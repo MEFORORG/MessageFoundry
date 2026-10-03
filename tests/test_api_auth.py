@@ -23,7 +23,7 @@ from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
-from messagefoundry.config.settings import AiSettings, AuthSettings, StoreSettings
+from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings, StoreSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
@@ -47,7 +47,11 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "auth_api.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "auth_api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
@@ -2047,7 +2051,9 @@ async def test_security_posture_encrypted_exposes_fingerprint_not_key_bytes(
     # raw key bytes (or its base64) MUST NOT appear anywhere in the response (SECRET-1).
     key_b64 = generate_key()
     store = await MessageStore.open(tmp_path / "enc.db", cipher=make_cipher(key_b64))
-    enc_engine = Engine(store, poll_interval=0.02)
+    enc_engine = Engine(
+        store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         service = AuthService(enc_engine.store, AuthSettings(require_mfa=False))
         await service.initialize()

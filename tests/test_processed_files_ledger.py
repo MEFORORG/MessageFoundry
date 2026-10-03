@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -112,7 +113,9 @@ async def test_leave_in_place_ingests_once_across_polls(
     )
     reg.add_router("r", lambda m: [])  # UNROUTED — still counted RECEIVED (count-and-log)
     expected_key = _expected_key(share, share / "a.hl7")
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         await _wait_count(store, "file_in", 1)

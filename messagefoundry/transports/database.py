@@ -64,6 +64,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    EgressSettings,
     weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
@@ -1998,8 +1999,16 @@ class DatabaseLookupExecutor:
     :func:`_build_connection` dialect dispatcher, so the ``generic`` ODBC dialect the DATABASE connector
     accepts is not reachable from here (ADR 0010, "SQL Server backend only")."""
 
-    def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
+    def __init__(
+        self, connections: Mapping[str, Mapping[str, Any]], *, egress: EgressSettings
+    ) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
+        # `egress` is required and every server is checked against it here, before any DSN is built,
+        # so no caller can construct an executor that dials an unchecked host (vault BACKLOG #2605).
+        from messagefoundry.transports.egress import check_lookup_allowed
+
+        for cname, s in connections.items():
+            check_lookup_allowed(cname, s, egress)
         self._dsn: dict[str, str] = {}
         self._pool_max: dict[str, int] = {}
         self._login_timeout: dict[str, int | None] = {}

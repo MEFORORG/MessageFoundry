@@ -50,6 +50,7 @@ import pytest
 from messagefoundry.auth.oidc.flow import _MAX_TOKEN_RESPONSE_BYTES as _OIDC_TOKEN_BOUND
 from messagefoundry.config.fhir_lookup import FhirLookupError
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
@@ -256,7 +257,8 @@ def test_the_bare_read_pattern_can_still_find_one() -> None:
 
 def _rest() -> RestDestination:
     d = build_destination(
-        Destination(name="OB_REST", type=ConnectorType.REST, settings=Rest(url=REST_URL).settings)
+        Destination(name="OB_REST", type=ConnectorType.REST, settings=Rest(url=REST_URL).settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, RestDestination)
     return d
@@ -264,7 +266,8 @@ def _rest() -> RestDestination:
 
 def _soap() -> SoapDestination:
     d = build_destination(
-        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=Soap(url=SOAP_URL).settings)
+        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=Soap(url=SOAP_URL).settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, SoapDestination)
     return d
@@ -272,7 +275,8 @@ def _soap() -> SoapDestination:
 
 def _fhir() -> FhirDestination:
     d = build_destination(
-        Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=FHIR(url=FHIR_BASE).settings)
+        Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=FHIR(url=FHIR_BASE).settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, FhirDestination)
     return d
@@ -284,7 +288,8 @@ def _dicomweb() -> DicomWebDestination:
             name="OB_DCMWEB",
             type=ConnectorType.DICOMWEB,
             settings=DICOMweb(url=DICOMWEB_BASE).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, DicomWebDestination)
     return d
@@ -407,7 +412,9 @@ def test_dicomweb_probe_refuses_an_unbounded_drain() -> None:
 def test_fhir_lookup_read_is_byte_bounded_and_raises_to_the_handler() -> None:
     """The one egress read a Handler's own query shapes. It runs inside a transform, so there is no
     message to dead-letter: the Handler must see a FhirLookupError, not a DeliveryError."""
-    ex = FhirLookupExecutor({"epic": {"url": FHIR_BASE}})
+    ex = FhirLookupExecutor(
+        {"epic": {"url": FHIR_BASE}}, egress=EgressSettings(deny_by_default=False)
+    )
     resp = _UnboundedResp()
     ex._opener["epic"] = _FakeOpener(resp)  # type: ignore[assignment]
     with pytest.raises(FhirLookupError, match="bound"):
@@ -416,7 +423,9 @@ def test_fhir_lookup_read_is_byte_bounded_and_raises_to_the_handler() -> None:
 
 
 def test_fhir_lookup_probe_is_byte_bounded() -> None:
-    ex = FhirLookupExecutor({"epic": {"url": FHIR_BASE}})
+    ex = FhirLookupExecutor(
+        {"epic": {"url": FHIR_BASE}}, egress=EgressSettings(deny_by_default=False)
+    )
     ex._opener["epic"] = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
     with pytest.raises(FhirLookupError, match="bound"):
         ex._probe("epic")
@@ -424,7 +433,9 @@ def test_fhir_lookup_probe_is_byte_bounded() -> None:
 
 def test_a_lookup_refusal_never_echoes_the_query() -> None:
     """A lookup URL can carry PHI, so the refusal names the redacted base and the bound only."""
-    ex = FhirLookupExecutor({"epic": {"url": FHIR_BASE}})
+    ex = FhirLookupExecutor(
+        {"epic": {"url": FHIR_BASE}}, egress=EgressSettings(deny_by_default=False)
+    )
     ex._opener["epic"] = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
     with pytest.raises(FhirLookupError) as err:
         ex._get("epic", f"{FHIR_BASE}/Patient?family=Synthetic&birthdate=1970-01-01")
@@ -821,7 +832,9 @@ def test_the_ai_broker_maps_a_truncated_reply_onto_its_own_error_type() -> None:
 def test_fhir_lookup_maps_a_truncated_reply_onto_fhir_lookup_error() -> None:
     """This read runs inside a Handler, and the sandbox worker catches only (DbLookupError,
     FhirLookupError) -- a raw DeliveryError is reclassified as a handler crash."""
-    ex = FhirLookupExecutor({"epic": {"url": FHIR_BASE}})
+    ex = FhirLookupExecutor(
+        {"epic": {"url": FHIR_BASE}}, egress=EgressSettings(deny_by_default=False)
+    )
     ex._opener["epic"] = _FakeOpener(_wire(_FIXED_TRUNCATED))  # type: ignore[assignment]
     # _get, not read: read is a coroutine, and calling it unawaited would build a coroutine object,
     # run nothing, and pass this arm for the wrong reason. _get is the sync body that reads.
@@ -964,7 +977,9 @@ def test_each_destination_names_its_connection_and_not_its_host() -> None:
 
 
 def test_the_lookup_the_token_endpoint_and_the_ai_broker_name_no_host(ec_pem: str) -> None:
-    ex = FhirLookupExecutor({"epic": {"url": FHIR_BASE}})
+    ex = FhirLookupExecutor(
+        {"epic": {"url": FHIR_BASE}}, egress=EgressSettings(deny_by_default=False)
+    )
     ex._opener["epic"] = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
     for call, expected in (
         (

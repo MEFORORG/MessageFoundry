@@ -38,6 +38,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
@@ -262,7 +263,11 @@ async def test_the_posture_route_reports_what_the_open_store_observed(tmp_path: 
     from messagefoundry.pipeline import Engine
     from tests.test_api_security_posture import _add_viewer, _app_and_client, _service, _token
 
-    engine = await Engine.create(tmp_path / "posture.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "posture.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = await _service(engine)
         await _add_viewer(service, "vw")

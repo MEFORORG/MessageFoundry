@@ -30,6 +30,7 @@ from messagefoundry import code_set
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.code_sets import activated as codesets_activated
 from messagefoundry.config.models import AckMode, ConnectorType, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -235,7 +236,9 @@ async def test_fanout_mixed_outcome_finalizes_error(store: MessageStore, tmp_pat
     reg.add_router("r", _route)
     reg.add_handler("fan", _fan)
 
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     runner._destinations["OB_BAD"] = _RejectingDestination()  # make the sibling fail permanently
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))

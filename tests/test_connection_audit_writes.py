@@ -30,7 +30,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -122,7 +122,12 @@ async def toml_engine(tmp_path: Path) -> AsyncIterator[Engine]:
     cfg.mkdir()
     (cfg / "logic.py").write_text(LOGIC_PY, encoding="utf-8")
     (cfg / "connections.toml").write_text(CONNECTIONS_TOML, encoding="utf-8")
-    eng = await Engine.create(tmp_path / "flag.db", poll_interval=0.02, config_dir=cfg)
+    eng = await Engine.create(
+        tmp_path / "flag.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     # Attach the graph WITHOUT starting listeners -- no socket binds needed here.
     eng.add_registry(load_config(cfg))
     try:
@@ -199,7 +204,11 @@ async def test_credential_test_route_audits_under_the_acting_user(
 
     share = tmp_path / "share"
     share.mkdir()
-    eng = await Engine.create(tmp_path / "cred.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "cred.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         reg = Registry()
         reg.add_inbound(

@@ -29,6 +29,7 @@ import pytest
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext, run_contexts
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline import sandbox as sandbox_mod
@@ -1535,7 +1536,11 @@ def test_the_sandbox_mode_default_is_off_and_lives_in_exactly_one_place() -> Non
     assert ServiceSettings().sandbox.mode == "off"
 
     # An Engine handed no [sandbox] section renders the SAME mode, not a quietly different one.
-    engine = Engine(store=None, sandbox_settings=None)  # type: ignore[arg-type]
+    engine = Engine(
+        store=None,  # type: ignore[arg-type]
+        sandbox_settings=None,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     assert engine._sandbox_settings.mode == "off"
 
     # SandboxPolicy must have NO default for `mode`, so it can never contradict the setting.

@@ -28,6 +28,7 @@ import pytest
 
 from messagefoundry.api.app import create_managed_app
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -111,7 +112,12 @@ async def test_default_mode_constructs_pooled_dispatchers(
     # one StageDispatcher per core stage and NO per-lane router/transform/delivery workers.
     inbox = tmp_path / "in"
     inbox.mkdir()
-    runner = RegistryRunner(_reg(inbox, tmp_path / "out"), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _reg(inbox, tmp_path / "out"),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert runner._claim_mode == "pooled"
     assert runner._dispatchers == {}  # not built until start()
     await runner.start()
@@ -137,7 +143,11 @@ async def test_explicit_per_lane_constructs_zero_pooled_objects(
     inbox = tmp_path / "in"
     inbox.mkdir()
     runner = RegistryRunner(
-        _reg(inbox, tmp_path / "out"), store, poll_interval=0.02, claim_mode="per_lane"
+        _reg(inbox, tmp_path / "out"),
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
     )
     assert runner._claim_mode == "per_lane"
     assert runner._dispatchers == {}  # before start
@@ -172,7 +182,12 @@ async def test_pooled_start_fails_closed_on_the_rcsi_gate_with_no_override(
     monkeypatch.setattr(store, "require_rcsi_for_pooled", _rcsi_off)
     inbox = tmp_path / "in"
     inbox.mkdir()
-    runner = RegistryRunner(_reg(inbox, tmp_path / "out"), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _reg(inbox, tmp_path / "out"),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT"):
         await runner.start()
     # The partial start was unwound: the listener and destination built before the gate are gone.
@@ -194,6 +209,7 @@ async def test_pooled_sqlite_end_to_end_smoke(store: MessageStore, tmp_path: Pat
         store,
         claim_mode="pooled",
         pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     collector = _Collector()

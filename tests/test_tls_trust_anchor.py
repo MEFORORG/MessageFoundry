@@ -26,7 +26,12 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import ServiceSettings, TlsSettings, load_settings
+from messagefoundry.config.settings import (
+    EgressSettings,
+    ServiceSettings,
+    TlsSettings,
+    load_settings,
+)
 from messagefoundry.config.tls_policy import (
     TrustAnchor,
     TrustAnchorPolicy,
@@ -348,7 +353,8 @@ def _http_dest(ctype: ConnectorType, settings: dict[str, object], **over: object
     from messagefoundry.transports.base import build_destination
 
     return build_destination(
-        Destination(name="OB", type=ctype, settings=settings, **over)  # type: ignore[arg-type]
+        Destination(name="OB", type=ctype, settings=settings, **over),  # type: ignore[arg-type]
+        egress=EgressSettings(deny_by_default=False),
     )
 
 
@@ -484,6 +490,7 @@ def test_the_fhir_lookup_executor_honours_the_internal_ca(tmp_path: Path) -> Non
     ex = FhirLookupExecutor(
         {"L": {"url": "https://fhir.internal.example.org/fhir"}},
         trust_anchor_policy=_internal_policy(ca),
+        egress=EgressSettings(deny_by_default=False),
     )
     ctx = _opener_context(ex._opener["L"])
     assert ctx is not None
@@ -491,7 +498,10 @@ def test_the_fhir_lookup_executor_honours_the_internal_ca(tmp_path: Path) -> Non
 
 
 def test_the_fhir_lookup_executor_default_is_the_shared_opener() -> None:
-    ex = FhirLookupExecutor({"L": {"url": "https://fhir.example.org/fhir"}})
+    ex = FhirLookupExecutor(
+        {"L": {"url": "https://fhir.example.org/fhir"}},
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert ex._opener["L"] is rest._NO_REDIRECT_OPENER
 
 
@@ -688,6 +698,7 @@ def test_the_fhir_lookup_token_hop_honours_the_internal_ca(tmp_path: Path) -> No
     ex = FhirLookupExecutor(
         {"L": {"url": "https://fhir.internal.example.org/fhir", **_smart_settings()}},
         trust_anchor_policy=_internal_policy(ca),
+        egress=EgressSettings(deny_by_default=False),
     )
     ctx = _opener_context(_token_opener(ex._token["L"]))
     assert ctx is not None

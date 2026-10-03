@@ -36,6 +36,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -226,7 +227,11 @@ async def test_delivery_records_and_emits_when_enabled(
     inbox.mkdir()
     outdir.mkdir()
     runner = RegistryRunner(
-        _reg(inbox, outdir), store, claim_mode="pooled", pooled_sweep_interval=0.05
+        _reg(inbox, outdir),
+        store,
+        claim_mode="pooled",
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     assert runner._delivery_phase_timing is True
     await runner.start()
@@ -265,7 +270,11 @@ async def test_delivery_untouched_when_disabled(
     inbox.mkdir()
     outdir.mkdir()
     runner = RegistryRunner(
-        _reg(inbox, outdir), store, claim_mode="pooled", pooled_sweep_interval=0.05
+        _reg(inbox, outdir),
+        store,
+        claim_mode="pooled",
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     assert runner._delivery_phase_timing is False
     await runner.start()

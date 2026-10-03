@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.binary import is_marked
@@ -106,7 +107,7 @@ async def test_mismatch_dead_letters_on_every_network_source(
     # The residual BACKLOG #1109 names, on each source that reaches the shared handler: a
     # content_type=json inbound handed a body that is not JSON.
     reg = _registry(ContentType.JSON, source=source)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_TEST"], b"%PDF-1.7 not json at all")
 
@@ -124,7 +125,7 @@ async def test_http_listener_mismatch_dead_letters_and_returns_no_receipt(
     # The HTTP listener's own handler (ADR 0023): the same guard, but the receipt is None (the source
     # answers it with a 422, ADR 0154 amendment 2026-09-26) rather than a wire ACK.
     reg = _registry(ContentType.JSON, source=ConnectorType.HTTP)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     result = await runner._handle_inbound_http(reg.inbound["IB_TEST"], b"<not>json</not>")
 
@@ -148,7 +149,7 @@ async def test_text_content_types_reject_a_contradicting_body(
     store: MessageStore, content_type: ContentType, body: bytes
 ) -> None:
     reg = _registry(content_type)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     assert await runner._handle_inbound(reg.inbound["IB_TEST"], body) is None
     row = await _one_row(store)
@@ -171,7 +172,7 @@ async def test_conformant_text_body_is_still_received(
 ) -> None:
     # The anti-over-rejection control. Without it a blanket reject would satisfy every test above.
     reg = _registry(content_type)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     assert await runner._handle_inbound(reg.inbound["IB_TEST"], body) is None
     row = await _one_row(store)
@@ -183,7 +184,7 @@ async def test_leading_whitespace_does_not_cause_a_false_reject(store: MessageSt
     # text_sniff_head strips leading whitespace/BOM in str space before it takes its head, so a body
     # padded far past the head length still sniffs on its first SIGNIFICANT character.
     reg = _registry(ContentType.JSON)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(reg.inbound["IB_TEST"], (" " * 500 + '{"a":1}').encode("utf-8"))
 
@@ -195,7 +196,7 @@ async def test_leading_whitespace_does_not_cause_a_false_reject(store: MessageSt
 
 async def test_dicom_inbound_rejects_a_body_without_the_part10_magic(store: MessageStore) -> None:
     reg = _registry(ContentType.DICOM)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     body = b"%PDF-1.7 " + b"a" * 200  # long enough to clear the 132-byte length floor, wrong magic
 
     assert await runner._handle_inbound(reg.inbound["IB_TEST"], body) is None
@@ -207,7 +208,7 @@ async def test_dicom_inbound_rejects_a_body_without_the_part10_magic(store: Mess
 async def test_dicom_mismatch_with_a_nul_is_carried_as_base64(store: MessageStore) -> None:
     # INGEST-4: the ERROR raw for a rejected BINARY body must never put a U+0000 in the store column.
     reg = _registry(ContentType.DICOM)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     body = b"\x00\xff" * 100  # 200 bytes, no DICM magic, carries NULs
 
     await runner._handle_inbound(reg.inbound["IB_TEST"], body)
@@ -219,7 +220,7 @@ async def test_dicom_mismatch_with_a_nul_is_carried_as_base64(store: MessageStor
 
 async def test_conformant_dicom_is_still_received(store: MessageStore) -> None:
     reg = _registry(ContentType.DICOM)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(reg.inbound["IB_TEST"], _DICOM_BODY)
 
@@ -234,7 +235,7 @@ async def test_signatureless_types_stay_accepted_unchecked(
     # has a reliable leading signature and both are admitted as-is. Pinned so the sniff cannot quietly
     # grow a rule for them.
     reg = _registry(content_type)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(reg.inbound["IB_TEST"], b"%PDF-1.7 arbitrary bytes")
 
@@ -252,7 +253,7 @@ async def test_hl7_inbound_still_reports_a_parse_error_not_a_content_mismatch(
     # strictly stronger), and it NAKs. A mismatch reason appearing here would mean a weaker duplicate
     # check had been added in front of it.
     reg = _registry(ContentType.HL7V2)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_TEST"], b'{"a":1}')
 
@@ -265,7 +266,7 @@ async def test_hl7_inbound_still_reports_a_parse_error_not_a_content_mismatch(
 
 async def test_conformant_hl7_is_unaffected(store: MessageStore) -> None:
     reg = _registry(ContentType.HL7V2)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(reg.inbound["IB_TEST"], _HL7_BODY)
 
@@ -280,7 +281,7 @@ async def test_utf16_json_inbound_is_not_falsely_quarantined(store: MessageStore
     # the ORIGINAL bytes (what the file sources do, having no declared encoding) would reject this
     # legitimate body, whose first bytes are a BOM and an interleaved NUL rather than "{".
     reg = _registry(ContentType.JSON, settings={"encoding": "utf-16"})
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(reg.inbound["IB_TEST"], '{"a":1}'.encode("utf-16"))
 
@@ -292,7 +293,7 @@ async def test_utf16_json_inbound_is_not_falsely_quarantined(store: MessageStore
 async def test_utf16_non_json_body_is_still_rejected(store: MessageStore) -> None:
     # The control for the test above: encoding-independence must not become encoding-blindness.
     reg = _registry(ContentType.JSON, settings={"encoding": "utf-16"})
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(reg.inbound["IB_TEST"], "plain prose, not json".encode("utf-16"))
 
@@ -315,7 +316,7 @@ async def test_mismatch_does_not_log_or_persist_phi(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     reg = _registry(ContentType.JSON)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     body = f"PID|1||MRN1^^^H^MR||{_PHI_CANARY}".encode()  # not JSON -> rejected
 
     with caplog.at_level(logging.DEBUG):

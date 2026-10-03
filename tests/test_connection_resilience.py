@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -125,7 +126,12 @@ async def test_hung_outbound_does_not_block_graceful_stop(
     # which unblocks the hung await, so teardown completes promptly (no leaked/hung task).
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
-    runner = RegistryRunner(_file_in_reg(inbox, outdir), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _file_in_reg(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     hung = _HangingDestination()
     runner._destinations["out"] = hung  # swap in the wedged connector (worker re-resolves per item)
@@ -146,7 +152,9 @@ async def test_problem_connection_does_not_block_engine_restart(
     # the same graph (the listener rebinds, workers respawn) — "doesn't block its restart" (#37).
     outdir = tmp_path / "out"
     reg = _mllp_in_reg(outdir)
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     port = runner._sources["mllp_in"].sockport  # type: ignore[attr-defined]
     hung = _HangingDestination()
@@ -157,7 +165,9 @@ async def test_problem_connection_does_not_block_engine_restart(
     await asyncio.wait_for(runner.stop(), timeout=5.0)  # clean stop despite the wedged connection
     assert not runner.running and runner._sources == {} and runner._workers == {}
 
-    runner2 = RegistryRunner(reg, store, poll_interval=0.02)  # fresh start of the same graph
+    runner2 = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )  # fresh start of the same graph
     await asyncio.wait_for(runner2.start(), timeout=5.0)
     try:
         assert runner2.running and runner2.inbound_running("mllp_in")

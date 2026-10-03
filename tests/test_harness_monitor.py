@@ -26,6 +26,8 @@ import httpx
 import pytest
 import uvicorn
 
+from messagefoundry.config.settings import EgressSettings
+
 pytest.importorskip("PySide6")
 
 from harness import monitor  # noqa: E402
@@ -103,6 +105,7 @@ def _serve(
         config_dir=tmp_path / "config",
         poll_interval=0.05,
         allow_no_auth=True,  # the monitor reads the API with no session
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     port = _free_port()
     uv = uvicorn.Server(

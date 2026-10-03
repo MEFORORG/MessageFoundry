@@ -28,6 +28,7 @@ from messagefoundry.config.settings import (
     AlertRule,
     AlertSeverity,
     ApprovalsSettings,
+    EgressSettings,
     load_settings,
 )
 from messagefoundry.connection_names import is_connection_name
@@ -52,7 +53,11 @@ class _Clock:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "dwell.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "dwell.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

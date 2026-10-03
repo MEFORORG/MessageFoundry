@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -93,7 +94,12 @@ def _reg() -> Registry:
 
 async def _runner_with_fusion(store: Any) -> RegistryRunner:
     runner = RegistryRunner(
-        _reg(), store, fuse_thread_hops=True, claim_mode="pooled", pooled_fusing_workers=1
+        _reg(),
+        store,
+        fuse_thread_hops=True,
+        claim_mode="pooled",
+        pooled_fusing_workers=1,
+        egress=EgressSettings(deny_by_default=False),
     )
     runner._loop = asyncio.get_running_loop()
     runner._fusion_active = await runner._activate_fusion()
@@ -144,7 +150,12 @@ async def _events(store: Any, mid: str) -> list[tuple[Any, Any, Any]]:
 
 async def test_activate_and_teardown_fusion_on_live_ss(store: Any) -> None:
     runner = RegistryRunner(
-        _reg(), store, fuse_thread_hops=True, claim_mode="pooled", pooled_fusing_workers=2
+        _reg(),
+        store,
+        fuse_thread_hops=True,
+        claim_mode="pooled",
+        pooled_fusing_workers=2,
+        egress=EgressSettings(deny_by_default=False),
     )
     runner._loop = asyncio.get_running_loop()
     runner._fusion_active = await runner._activate_fusion()
@@ -221,7 +232,12 @@ async def test_fused_route_unrouted_when_no_handler(store: Any) -> None:
     reg.add_router("r", lambda m: [])
     reg.add_handler("h", lambda m: Send("OB1", "OUTBODY"))
     runner = RegistryRunner(
-        reg, store, fuse_thread_hops=True, claim_mode="pooled", pooled_fusing_workers=1
+        reg,
+        store,
+        fuse_thread_hops=True,
+        claim_mode="pooled",
+        pooled_fusing_workers=1,
+        egress=EgressSettings(deny_by_default=False),
     )
     runner._loop = asyncio.get_running_loop()
     runner._fusion_active = await runner._activate_fusion()

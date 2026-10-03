@@ -42,7 +42,12 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.loaded_crls import held_crl_copies
-from messagefoundry.config.settings import CertMonitorSettings, StoreBackend, StoreSettings
+from messagefoundry.config.settings import (
+    CertMonitorSettings,
+    EgressSettings,
+    StoreBackend,
+    StoreSettings,
+)
 from messagefoundry.config.tls_policy import (
     TrustAnchor,
     build_verifying_client_context,
@@ -411,7 +416,9 @@ def test_the_engine_monitor_watches_unlisted_held_copies(tmp_path: Path) -> None
 
     async def _go() -> bool:
         eng = await Engine.create(
-            tmp_path / "held.db", cert_monitor_settings=CertMonitorSettings(warn_days=30)
+            tmp_path / "held.db",
+            cert_monitor_settings=CertMonitorSettings(warn_days=30),
+            egress_settings=EgressSettings(deny_by_default=False),
         )
         try:
             await eng.start()

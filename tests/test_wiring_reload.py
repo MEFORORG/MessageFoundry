@@ -18,6 +18,7 @@ import pytest
 
 from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -138,7 +139,12 @@ async def test_reload_swaps_router_and_handler(store: MessageStore, tmp_path: Pa
     inbox.mkdir()
 
     # v1: the router forwards nowhere → the first message is logged UNROUTED, never delivered.
-    runner = RegistryRunner(_registry(inbox, outdir, lambda m: [], {}), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _registry(inbox, outdir, lambda m: [], {}),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -159,7 +165,12 @@ async def test_reload_changes_outbound_directory(store: MessageStore, tmp_path: 
     inbox, out_a, out_b = tmp_path / "in", tmp_path / "outA", tmp_path / "outB"
     inbox.mkdir()
 
-    runner = RegistryRunner(_deliver_registry(inbox, out_a), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _deliver_registry(inbox, out_a),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -187,7 +198,12 @@ async def test_reload_rebuilds_an_outbound_whose_hop_attestation_alone_changed(
 
     inbox, out = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
-    runner = RegistryRunner(_deliver_registry(inbox, out), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _deliver_registry(inbox, out),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         first = runner._destinations["file_out"]
@@ -222,7 +238,9 @@ async def test_reload_rebuilds_an_outbound_whose_revocation_attestation_alone_ch
         tls_revocation_attested=True,
         tls_revocation_attested_reason="partner PKI runs OCSP at the site edge",
     )
-    runner = RegistryRunner(attested, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        attested, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         first = runner._destinations["file_out"]
@@ -238,7 +256,9 @@ async def test_reload_preserves_inflight_outbox(store: MessageStore, tmp_path: P
     reg.add_outbound(
         OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path)}))
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_limit=20)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, claim_limit=20, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     gate = _Gate()
     runner._destinations["out"] = gate  # block delivery so rows are in-flight across the reload
@@ -271,7 +291,12 @@ async def test_reload_build_check_rejects_bad_connector(
     """A new config whose connector can't be built is rejected BEFORE quiesce — old graph intact."""
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
-    runner = RegistryRunner(_deliver_registry(inbox, outdir), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _deliver_registry(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
 
     bad = _registry(inbox, outdir, lambda m: ["h"], {"h": lambda m: Send("file_out", m)})
@@ -295,7 +320,9 @@ async def test_route_to_unknown_outbound_is_error(store: MessageStore, tmp_path:
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     reg = _registry(inbox, outdir, lambda m: ["h"], {"h": lambda m: Send("nope", m)})
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -312,7 +339,9 @@ async def test_reload_removed_outbound_keeps_draining(store: MessageStore, tmp_p
     reg.add_outbound(
         OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path)}))
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     rec = _Recorder()
     runner._destinations["out"] = rec
@@ -362,7 +391,9 @@ def _write_valid_config(cfg: Path, inbox: Path, outdir: Path) -> None:
 async def test_engine_reload_invalid_config_leaves_graph_untouched(tmp_path: Path) -> None:
     inbox, outdir, good = tmp_path / "in", tmp_path / "out", tmp_path / "good"
     _write_valid_config(good, inbox, outdir)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(good))
     await eng.start()
     try:
@@ -387,7 +418,9 @@ async def test_engine_reload_invalid_config_leaves_graph_untouched(tmp_path: Pat
 
 
 async def test_engine_reload_missing_dir_raises(tmp_path: Path) -> None:
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     await eng.start()
     try:
         with pytest.raises(FileNotFoundError):
@@ -397,7 +430,9 @@ async def test_engine_reload_missing_dir_raises(tmp_path: Path) -> None:
 
 
 async def test_engine_reload_empty_dir_refused(tmp_path: Path) -> None:
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     await eng.start()
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -431,7 +466,9 @@ def _write_bad_connector_config(cfg: Path, inbox: Path) -> None:
 
 async def test_engine_reload_no_runner_start_failure_resets(tmp_path: Path) -> None:
     """If the first (no-runner) reload fails to start, the runner ref is cleared so a retry works."""
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     await eng.start()
     assert eng.registry_runner is None
     try:
@@ -452,7 +489,9 @@ async def test_engine_reload_no_runner_start_failure_resets(tmp_path: Path) -> N
 async def test_engine_reload_starts_graph_when_none_loaded(tmp_path: Path) -> None:
     inbox, outdir, good = tmp_path / "in", tmp_path / "out", tmp_path / "good"
     _write_valid_config(good, inbox, outdir)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     await eng.start()  # no registry added
     assert eng.registry_runner is None
     try:
@@ -487,7 +526,9 @@ async def test_engine_reload_dry_run_validates_without_swapping(tmp_path: Path) 
     """dry_run validates the candidate graph but never swaps the live one (the promote pre-flight)."""
     inbox, outdir, live = tmp_path / "in", tmp_path / "out", tmp_path / "live"
     _write_valid_config(live, inbox, outdir)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(live))
     await eng.start()
     try:
@@ -519,7 +560,9 @@ async def test_engine_reload_dry_run_rejects_missing_env_value(tmp_path: Path) -
     """dry_run resolves env() against THIS instance's values, so a key the target lacks fails loud."""
     inbox, outdir, live = tmp_path / "in", tmp_path / "out", tmp_path / "live"
     _write_valid_config(live, inbox, outdir)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)  # no env_values defined
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )  # no env_values defined
     eng.add_registry(load_config(live))
     await eng.start()
     try:
@@ -539,7 +582,10 @@ async def test_reload_regathers_env_values_no_restart(tmp_path: Path) -> None:
     a missing key) takes effect without a service restart — the WiringError's own remedy works (M-23)."""
     values = {"peer_host": "10.0.0.1", "peer_port": "6661"}
     eng = await Engine.create(
-        tmp_path / "e.db", poll_interval=0.02, env_values_provider=lambda: dict(values)
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        env_values_provider=lambda: dict(values),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     await eng.start()
     try:
@@ -564,6 +610,7 @@ async def test_engine_reload_dry_run_resolves_present_env_value(tmp_path: Path) 
         tmp_path / "e.db",
         poll_interval=0.02,
         env_values={"peer_host": "10.0.0.9", "peer_port": "6661"},
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     await eng.start()  # no graph yet
     try:
@@ -599,7 +646,13 @@ async def test_reload_and_dr_notify_do_not_resume_paused_outbound(
     reg.add_outbound(
         OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path)}))
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode=claim_mode)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     rec = _Recorder()
     runner._destinations["out"] = rec
@@ -685,7 +738,10 @@ async def test_reload_wraps_an_unreadable_env_value_file_as_a_wiring_error(tmp_p
     env_file.write_text('peer_host = "10.0.0.1"\n', encoding="utf-8")
 
     eng = await Engine.create(
-        tmp_path / "e.db", poll_interval=0.02, env_values_provider=_raw_values_provider(tmp_path)
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        env_values_provider=_raw_values_provider(tmp_path),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     eng.add_registry(load_config(live))
     await eng.start()
@@ -734,7 +790,12 @@ async def test_reload_passes_a_providers_own_wiring_error_through_unwrapped(tmp_
             raise WiringError(message)
         return {"peer_host": "10.0.0.1"}
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, env_values_provider=provider)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        env_values_provider=provider,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(live))
     await eng.start()
     try:
@@ -762,7 +823,10 @@ async def test_reload_wraps_a_deeply_nested_env_value_file(tmp_path: Path) -> No
     env_file.write_text('peer_host = "10.0.0.1"\n', encoding="utf-8")
 
     eng = await Engine.create(
-        tmp_path / "e.db", poll_interval=0.02, env_values_provider=_raw_values_provider(tmp_path)
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        env_values_provider=_raw_values_provider(tmp_path),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     eng.add_registry(load_config(live))
     await eng.start()
@@ -806,7 +870,12 @@ async def test_reload_wraps_a_provider_that_returns_a_non_mapping(
         # returns the non-mapping. The cast keeps the declared return type honest at the seam.
         return cast(dict[str, Any], bad) if armed else {"peer_host": "10.0.0.1"}
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, env_values_provider=provider)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        env_values_provider=provider,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(live))
     await eng.start()
     try:

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 _TOML = """
@@ -300,7 +301,11 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "posture.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "posture.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

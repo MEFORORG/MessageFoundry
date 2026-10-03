@@ -37,7 +37,12 @@ from pydantic import ValidationError
 from messagefoundry import logging_guard
 from messagefoundry.api.app import _outbound_down_detail
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import LoggingSettings, LogWriteFailurePolicy, load_settings
+from messagefoundry.config.settings import (
+    EgressSettings,
+    LoggingSettings,
+    LogWriteFailurePolicy,
+    load_settings,
+)
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -545,7 +550,13 @@ def _graph(store: MessageStore, sink: _RecordingSink) -> tuple[RegistryRunner, _
     reg.add_outbound(
         OutboundConnection(OUTBOUND, ConnectionSpec(ConnectorType.MLLP, {"host": "h", "port": 1}))
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
     source = _StubSource()
     runner._sources[INBOUND] = source  # type: ignore[assignment]
     return runner, source
@@ -650,7 +661,9 @@ async def test_the_runner_subscribes_at_start_and_unsubscribes_at_stop(store: Me
     # still passes — the "green signal that means nothing" shape (ADR 0158).
     guard = LogWriteGuard()
     set_active_guard(guard)
-    runner = RegistryRunner(Registry(), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        Registry(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert guard._escalation == runner._on_log_sink_event
@@ -896,6 +909,7 @@ def _e2e_runner(
         poll_interval=0.02,
         claim_mode=claim_mode,
         alert_sink=alert_sink,
+        egress=EgressSettings(deny_by_default=False),
     )
 
 
@@ -1286,7 +1300,13 @@ async def test_a_runner_started_into_a_dead_log_comes_up_halted(
     guard = active_guard()
     assert guard is not None and not guard.can_log(), "the rig never made the process unable to log"
 
-    runner = RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
+    runner = RegistryRunner(
+        _e2e_registry(outdir),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert runner._log_write_stopped, "start cleared the halt against an unwritable log"
@@ -1393,7 +1413,13 @@ async def test_a_reload_that_re_deploys_a_parked_lane_is_refused_into_a_dead_log
     logdir.mkdir()
     parked = _e2e_registry(outdir, outbound_auto_start=False)  # engine-parked at boot
     configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
-    runner = RegistryRunner(parked, store, poll_interval=0.02, claim_mode=claim_mode)
+    runner = RegistryRunner(
+        parked,
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert OUTBOUND in runner._gate_parked, "the rig never engine-parked the lane"
@@ -1658,6 +1684,7 @@ async def test_a_reload_that_adds_an_outbound_into_a_dead_log_lands_it_paused(
         store,
         poll_interval=0.02,
         claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
     )
     await seeding.start()
     try:
@@ -1772,7 +1799,13 @@ async def test_a_reload_that_retargets_a_lane_during_a_halt_still_rebuilds_its_c
     for directory in (outdir, newdir, logdir):
         directory.mkdir()
     configure_logging("INFO", log_file=LogFile(path=str(logdir / "engine.log")))
-    runner = RegistryRunner(_e2e_registry(outdir), store, poll_interval=0.02, claim_mode=claim_mode)
+    runner = RegistryRunner(
+        _e2e_registry(outdir),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         lane = runner._destinations[OUTBOUND]

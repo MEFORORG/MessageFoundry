@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     Loopback,
     Registry,
@@ -95,7 +96,10 @@ class _FakeOpener:
 
 def _rest(**over: object) -> RestDestination:
     settings = Rest(url=URL, **over).settings  # type: ignore[arg-type]
-    d = build_destination(Destination(name="OB_REST", type=ConnectorType.REST, settings=settings))
+    d = build_destination(
+        Destination(name="OB_REST", type=ConnectorType.REST, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(d, RestDestination)
     return d
 
@@ -233,7 +237,9 @@ async def test_reingressed_handler_reads_response_headers_via_response_get(tmp_p
             reingress_to="IB_LOOP",
             now=101.0,
         )
-        runner = RegistryRunner(reg, store, poll_interval=0.02)
+        runner = RegistryRunner(
+            reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+        )
         await runner.start()
         try:
             for _ in range(200):

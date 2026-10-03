@@ -10,12 +10,17 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "events.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "events.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

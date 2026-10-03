@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Timer, build_inbound_connection
 from messagefoundry.transports import build_source
 from messagefoundry.transports.timer import TimerSource, _CronSchedule
@@ -40,7 +41,10 @@ def _fast_cron() -> _FastCron:
 
 
 def _timer(**settings: object) -> TimerSource:
-    src = build_source(Source(type=ConnectorType.TIMER, settings=dict(settings)))
+    src = build_source(
+        Source(type=ConnectorType.TIMER, settings=dict(settings)),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(src, TimerSource)  # registry resolved a TIMER source
     return src
 
@@ -510,7 +514,10 @@ def test_timer_factory_builds_connection_spec() -> None:
 
 
 def test_build_source_returns_timer_source() -> None:
-    src = build_source(Source(type=ConnectorType.TIMER, settings={"body": "X", "run_once": True}))
+    src = build_source(
+        Source(type=ConnectorType.TIMER, settings={"body": "X", "run_once": True}),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(src, TimerSource)
 
 
