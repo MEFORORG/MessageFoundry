@@ -1729,7 +1729,7 @@ def create_app(
     # which refuses a caller with no identity BEFORE FastAPI reads the request body. Set before the
     # first route is added, and on the router because ``FastAPI()`` takes no route class. The class
     # says what it does not cover; a route reached through ``include_router`` is one. The engine
-    # includes no router, and tests/test_preauth_malformed_body.py fails on the first that is added.
+    # includes no router; refuse_undeclared_route refuses a route whose gate only an include adds.
     app.router.route_class = AuthenticatedBeforeBodyRoute
     if engine is not None:
         app.state.engine = engine

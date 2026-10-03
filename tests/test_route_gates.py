@@ -353,6 +353,18 @@ def test_the_walk_descends_into_an_included_router() -> None:
     assert not [key for key in rows if key[1] == ""], rows
 
 
+def test_an_included_websocket_reads_the_gate_its_include_adds() -> None:
+    """FastAPI serves an included WebSocket through a rebuilt route that carries the include's
+    dependencies, and the engine's refusal reads that rebuilt route, so the walk reads it too."""
+    sub = APIRouter()
+    sub.add_api_websocket_route("/ws/included", _dependency_gated)
+    app = FastAPI()
+    app.include_router(sub, dependencies=[Depends(require_ws_probe(Permission.FILES_BROWSE))])
+    (row,) = _ws_rows(app)
+    assert row.path == "/ws/included"
+    assert row.gates == ("require_ws_probe",), row
+
+
 def test_the_walk_descends_into_a_mounted_application_with_routes() -> None:
     inner = FastAPI(openapi_url=None)
     inner.add_api_route("/inner", _ok)

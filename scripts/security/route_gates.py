@@ -406,7 +406,7 @@ def _effective_routes(routes: Sequence[BaseRoute]) -> Iterator[tuple[BaseRoute, 
             yield original, context
         else:
             # A non-API route reached through an include is served by a rebuilt copy that carries
-            # the include's prefix.
+            # the include's prefix and, for a WebSocket, its dependencies.
             yield original, getattr(context, "starlette_route", None) or original
 
 
@@ -431,8 +431,11 @@ def _walk(routes: Sequence[BaseRoute], prefix: str, app: FastAPI) -> Iterator[Ro
                     permissions=gate[1] if gate else (),
                     gates=(gate[0],) if gate else (),
                 )
-        elif isinstance(route, APIWebSocketRoute):
-            names, perms = websocket_gates(route, app)
+        elif isinstance(effective, APIWebSocketRoute):
+            # A WebSocket reached through an include is served by a rebuilt route that carries the
+            # include's dependencies, and that rebuilt route is what the engine's refusal reads, so
+            # the walk reads it too.
+            names, perms = websocket_gates(effective, app)
             yield RouteRow(method=WS_METHOD, path=path, permissions=perms, gates=names)
         elif isinstance(effective, Mount) and effective.routes:
             # A mounted application with routes of its own. Its routes are walked under the mount's
@@ -478,7 +481,7 @@ def full_surface_app(**kwargs: Any) -> FastAPI:
     """A ``create_app(**kwargs)`` with every flag in :data:`ROUTE_REGISTERING_FLAGS` on, so a route
     that only one flag registers is walked too."""
     flags: dict[str, Any] = dict.fromkeys(ROUTE_REGISTERING_FLAGS, True)
-    return create_app(**flags, **kwargs)
+    return create_app(**{**flags, **kwargs})
 
 
 def gated_http_rows(app: FastAPI | None = None) -> list[RouteRow]:

@@ -600,8 +600,10 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     already runs the gate before it reads anything; one with no gate; and one whose gate is not
     this module's (the web console's ``require_ui*``, whose routes declare no body).
 
-    WHAT IT DOES NOT COVER, at least. The engine has none of these, and this list is the one
-    place they are stated:
+    A body-taking route that declares no authorization is refused early too, with the answer
+    :func:`refuse_undeclared_route` gives.
+
+    WHAT IT DOES NOT COVER, at least. This list is the one place they are stated:
 
     * A route reached through ``include_router``. It is served by that router's route class,
       and FastAPI serves it from the include's own context. So a gate that the include call
@@ -610,7 +612,8 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     * A gate nested inside another dependency. Only a route's top-level dependencies are read,
       which is also all ``scripts/security/route_gates.py`` reads.
     * A dependency that sits ahead of the gate and carries no mark. The gate's refusal answers
-      before it, so a caller with no identity never reaches it.
+      before it, so a caller with no identity never reaches it. ``refuse_undeclared_route`` is one
+      on every route, and it never refuses a route that has a gate.
 
     The refusal is not a copy of the gate's. The step raises the same ``HTTPException`` from the
     same function the gate calls, and it travels through the same exception handlers and the same
@@ -624,6 +627,15 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
         # ``body_field`` is the very condition FastAPI reads a body on before it solves
         # dependencies, so it is FastAPI's test and not a second opinion kept here.
         steps = steps_before_body(self.dependant) if self.body_field is not None else ()
+        if (
+            not steps
+            and self.body_field is not None
+            and any(d.call is refuse_undeclared_route for d in self.dependant.dependencies)
+            and not route_is_declared(self, websocket=False)
+        ):
+            # Vault BACKLOG #2604: a route that declares no authorization is refused before its
+            # body is read too, so a malformed body cannot tell a caller that the route exists.
+            steps = ((refuse_undeclared_route, refuse_undeclared_route),)
         if not steps:
             return handler
         provider = self.dependency_overrides_provider

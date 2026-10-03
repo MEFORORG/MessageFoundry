@@ -26,6 +26,7 @@ import httpx
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 from fastapi.routing import APIRoute, APIWebSocketRoute
+from pydantic import BaseModel
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -202,6 +203,10 @@ def require_nothing(*permissions: Permission) -> Any:
     return dependency
 
 
+class _Body(BaseModel):
+    value: int
+
+
 def _planted_app(**kwargs: Any) -> FastAPI:
     app = create_app(**kwargs)
 
@@ -230,6 +235,10 @@ def _planted_app(**kwargs: Any) -> FastAPI:
     @app.get("/zz/in-body-on-http")
     @authorizes_in_body("only a WebSocket may say this")
     async def in_body_on_http() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    @app.post("/zz/undeclared-with-body")
+    async def undeclared_with_body(body: _Body) -> dict[str, str]:
         return {"ok": "reached"}
 
     sub = APIRouter()
@@ -279,6 +288,22 @@ async def test_a_route_that_declares_no_authorization_is_refused(
     transport = httpx.ASGITransport(app=planted_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         response = await client.get(path)
+    assert response.status_code == 403, response.text
+    assert response.json() == {"detail": UNDECLARED_ROUTE_DETAIL}
+
+
+@pytest.mark.parametrize("content", [b"{not json", b'{"value": 1}', b""])
+async def test_an_undeclared_route_with_a_body_is_refused_before_the_body_is_read(
+    content: bytes, planted_app: FastAPI
+) -> None:
+    """A malformed body gets the same refusal as a good one, so the parser never answers first."""
+    transport = httpx.ASGITransport(app=planted_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        response = await client.post(
+            "/zz/undeclared-with-body",
+            content=content,
+            headers={"Content-Type": "application/json"},
+        )
     assert response.status_code == 403, response.text
     assert response.json() == {"detail": UNDECLARED_ROUTE_DETAIL}
 

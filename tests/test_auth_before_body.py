@@ -171,8 +171,9 @@ def _live_and_control(build: Callable[[], FastAPI]) -> tuple[FastAPI, FastAPI]:
 
 
 def _api_gate(route: APIRoute) -> Callable[..., Any] | None:
-    """The route's JSON API gate, read by ``route_gates`` and NOT by the engine's own marker, so
-    the two derivations can disagree. ``None`` for no gate and for the console's ``require_ui*``."""
+    """The route's JSON API gate, read by ``route_gates`` from the gate mark and NOT from the
+    before-body marker, so the two derivations can disagree. ``_gate()`` sets both marks, so a
+    factory that skips it carries neither, and the engine refuses its routes (vault BACKLOG #2604). ``None`` for no gate and for the console's ``require_ui*``."""
     for dependency in route.dependant.dependencies:
         found = route_gates.gate_of(dependency.call)
         if found is not None:
