@@ -53,8 +53,12 @@ send the Handler's body outside the organisation through a permitted relay.
   `atext` and dots, without `%` and `!`, which some relays route on, without `|` and `/`,
   which some servers read as pipe or file delivery, and without `=` and `?`, so no RFC 2047
   encoded word can form. A leading `-` is refused. The addresses are split with
-  `email.utils.getaddresses`, which does not decode encoded words, and the `To:` header is
-  written from the checked strings as `Address` objects, so no later parse decodes them. `smtplib` writes an address it cannot re-read onto the `RCPT TO`
+  `email.utils.getaddresses`, which does not decode encoded words. The `To:` header is built
+  from the checked strings, but `policy.default` still parses and folds it, and that step does
+  decode encoded words. So construction folds the header under both send policies and refuses
+  any result that is not exactly the checked list. The allowlist keeps encoded words out, and
+  that comparison is the second control if the allowlist is ever widened. Construction also
+  refuses a control character in `subject` or `sender`, which would otherwise fail every send. `smtplib` writes an address it cannot re-read onto the `RCPT TO`
   line raw, so a looser rule could put a mailbox there other than the one checked. The domain must
   be an ASCII host name; an internationalized domain is listed in its `xn--` form. Construction
   applies the same rule, so a build path that skipped the check still sends nothing.

@@ -755,7 +755,7 @@ async def test_an_encoded_word_local_part_is_refused_at_the_gate(
     assert wire.rcpt_lines == []
 
 
-async def test_the_to_line_is_written_from_the_checked_strings(wire: _WireCapture) -> None:
+async def test_the_to_line_names_exactly_the_checked_addresses(wire: _WireCapture) -> None:
     # Every character the allowlist admits, so a decoding or quoting step would show here.
     local = "a#b$c&d'e*f+g-h^i_j`k{l}m~n.o"
     dest = _wire_dest(wire.port, [local + "@hospital.example", "plain@hospital.example"])
@@ -768,6 +768,30 @@ async def test_the_to_line_is_written_from_the_checked_strings(wire: _WireCaptur
     [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
     expected = "To: " + local + "@hospital.example, plain@hospital.example"
     assert to_line.rstrip(b"\r\n") == expected.encode()
+
+
+def test_a_to_header_that_parses_differently_is_refused_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Simulates a later widening of the local-part allowlist: with the address rule switched off,
+    # an encoded-word local part reaches the To: header, whose parse would decode it. The
+    # construction-time comparison must refuse it, so the allowlist is not the only control.
+    import messagefoundry.transports.email as email_mod
+
+    monkeypatch.setattr(email_mod, "envelope_address_problem", lambda _address: None)
+    dest = _wire_dest(2525, [_ENCODED_LOCAL[0]])
+    with pytest.raises(ValueError, match="does not match the checked recipients"):
+        EmailDestination(dest)
+
+
+@pytest.mark.parametrize("field", ["subject", "sender"])
+def test_a_control_character_in_a_header_setting_is_refused_at_load(field: str) -> None:
+    # Refused at construction, not dead-lettered as an internal error at every send.
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    value = "x" + chr(13) + chr(10) + "y" if field == "subject" else "e" + chr(10) + "@h.example"
+    dest.settings[field] = value
+    with pytest.raises(ValueError, match="control character"):
+        EmailDestination(dest)
 
 
 @pytest.mark.parametrize("value", _NON_ROUND_TRIP, ids=["parameter-after-mailbox", "stray-angle"])

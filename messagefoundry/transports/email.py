@@ -43,12 +43,12 @@ There is **no email source yet** — an inbound IMAP/POP read + M365/Google XOAU
 from __future__ import annotations
 
 import asyncio
+import email.policy
 import logging
 import smtplib
 import ssl
 import string
 from collections.abc import Mapping
-from email.errors import MessageError
 from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import getaddresses, parseaddr
@@ -99,16 +99,11 @@ def envelope_recipients(value: Any) -> list[str]:
     One entry can hold several addresses, so this splits the entries joined with ``", "`` rather
     than reading one address per entry. It uses :func:`email.utils.getaddresses`, which does NOT
     decode RFC 2047 encoded words, so the text checked is the text sent. The destination passes
-    this list to ``send_message`` as ``to_addrs`` and builds ``To:`` from it without re-parsing, and
-    the ``[egress]`` recipient-domain check (vault BACKLOG #2616) checks the same list, so neither
-    the RCPT set nor the header can hold an address the check did not see. An address the parser
-    cannot read comes back as ``""``. Raises :class:`ValueError` for an empty or unparseable
-    setting, as construction does."""
-    joined = ", ".join(_as_recipients(value))
-    try:
-        return [addr for _, addr in getaddresses([joined])]
-    except (MessageError, IndexError) as exc:
-        raise ValueError("Email destination 'recipients' is not a readable address list") from exc
+    this list to ``send_message`` as ``to_addrs`` and builds ``To:`` from it, and the ``[egress]``
+    recipient-domain check (vault BACKLOG #2616) checks the same list. An address the parser cannot
+    read comes back as ``""``, which :func:`envelope_address_problem` refuses. Raises
+    :class:`ValueError` for an empty setting, as construction does."""
+    return [addr for _, addr in getaddresses([", ".join(_as_recipients(value))])]
 
 
 #: What a recipient's local part may hold, between dots: RFC 5322 ``atext`` without ``%`` and ``!``,
@@ -181,6 +176,13 @@ class EmailDestination(DestinationConnector):
             if problem is not None:
                 raise ValueError(f"Email destination: a recipient {problem}")
         self.subject = str(s.get("subject", ""))
+        for name, value in (("subject", self.subject), ("sender", self.sender)):
+            # A control character in a header value would raise inside _build_message at every
+            # send, where it dead-letters as an internal error. Refuse it here, at load.
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+                raise ValueError(f"Email destination '{name}' holds a control character")
+        # Build the To: header once now and refuse a mismatch here rather than at send time.
+        self._to_header()
         username = s.get("username")
         password = s.get("password")
         self.username: str | None = str(username) if username else None
@@ -355,18 +357,40 @@ class EmailDestination(DestinationConnector):
         await asyncio.to_thread(self._send, payload)
         return None
 
+    def _to_header(self) -> list[Address]:
+        """The ``To:`` addresses, built from the checked envelope list rather than the raw setting.
+
+        ``policy.default`` still parses whatever a header is given, Address objects included, and
+        that parser decodes RFC 2047 encoded words. Two things keep it from naming an unchecked
+        address. :data:`_LOCAL_ATEXT` admits no ``=`` or ``?``, so no encoded word can form. And this
+        method sets the header on a scratch message and folds it under both policies the send can
+        use (``SMTP`` and ``SMTPUTF8``), which is the text the generator writes. It refuses any
+        result that is not exactly the checked list, so a later widening of that allowlist fails
+        closed at construction instead of reaching the wire."""
+        addresses = [
+            Address(username=local, domain=domain)
+            for local, _, domain in (address.rpartition("@") for address in self._envelope)
+        ]
+        probe = EmailMessage()
+        probe["To"] = addresses
+        header = probe["To"]
+        expected = ", ".join(self._envelope)
+        # Folding breaks the line only after a comma, so dropping each CRLF leaves the joined text.
+        written = [
+            header.fold(policy=pol).partition(":")[2].replace("\r\n", "").strip()
+            for pol in (email.policy.SMTP, email.policy.SMTPUTF8)
+        ]
+        if str(header) != expected or any(text != expected for text in written):
+            raise ValueError(
+                "Email destination: the To header does not match the checked recipients"
+            )
+        return addresses
+
     def _build_message(self, payload: str) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = self.subject
         msg["From"] = self.sender
-        # The checked envelope list, not the raw setting, so every address a reader sees was
-        # checked. Handed over as Address objects, so the header is written from those strings and
-        # never re-parsed: a string here would go through policy.default's parser, which decodes
-        # RFC 2047 encoded words and could add an address the check never saw.
-        msg["To"] = [
-            Address(username=local, domain=domain)
-            for local, _, domain in (address.rpartition("@") for address in self._envelope)
-        ]
+        msg["To"] = self._to_header()
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
         msg.set_content(payload, charset=self.encoding)
