@@ -6,6 +6,15 @@
 # Keep hook versions roughly in step with CI (.github/workflows/security.yml) and pyproject. Ruff's
 # `rev` below is the exception and is NOT a judgement call: tests/test_lint_scope_parity.py fails if
 # it drifts from constraints.lock or off pyproject's deliberate version cap.
+#
+# EVERY REMOTE HOOK REPOSITORY IS PINNED BY COMMIT, NOT BY TAG (vault BACKLOG #2631, limb 4). A tag
+# can be moved to other code after it is reviewed; a commit cannot. Each `rev:` is the 40-character
+# commit its tag named when it was pinned, and the tag rides beside it as `# frozen: <tag>`, the
+# form `pre-commit autoupdate --freeze` writes. So move a rev with `--freeze`, never by hand-typing
+# a tag back in. The version tests read the tag from that comment, and
+# tests/test_lint_scope_parity.py fails on a rev that is not a commit or has no `# frozen:` tag.
+# Each commit was read with `git ls-remote <repo> refs/tags/<tag>` (the peeled `^{}` line for an
+# annotated tag) when it was pinned.
 repos:
   # RUFF, from a pre-commit-managed environment pinned to the version constraints.lock installs.
   #
@@ -31,7 +40,8 @@ repos:
   #
   # THE VERSION CONCERN IS REAL AND IS NOW HELD BY A TEST rather than by a shared interpreter:
   # tests/test_lint_scope_parity.py::test_ruff_hook_pin_matches_the_lock_and_the_cap asserts this
-  # `rev` equals constraints.lock's `ruff==` pin and satisfies pyproject's `ruff>=0.4,<0.16` cap.
+  # rev's `# frozen:` tag equals constraints.lock's `ruff==` pin and satisfies pyproject's
+  # `ruff>=0.4,<0.16` cap.
   # Move pyproject, uv.lock, constraints.lock, requirements.lock and this rev together. A bare
   # `pre-commit autoupdate` walks this rev to the newest upstream tag with no idea the cap exists
   # (v0.16.0 through v0.16.3 are already published), and that test is at least the main thing that
@@ -79,7 +89,7 @@ repos:
   # rewrites a file fails the run, and the retry re-runs everything), so that is not worth bundling
   # an unrelated behavior change into this one.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.22
+    rev: 2700fd5671c633760d912769c041bfcde2b9a01b  # frozen: v0.15.22
     hooks:
       - id: ruff-format
       - id: ruff-check
@@ -272,12 +282,12 @@ repos:
         always_run: true
 
   # Secret scanning — blocks a commit that would introduce a credential/token/key.
-  # (rev is verified by `pre-commit autoupdate` on first install; a wrong tag fails loudly there,
-  # never silently in CI. Run it TARGETED -- `pre-commit autoupdate --repo
-  # https://github.com/gitleaks/gitleaks` -- because a bare `autoupdate` also walks the ruff rev
-  # above, which is pinned to constraints.lock and capped below 0.16 by pyproject.)
+  # (A wrong rev fails loudly when pre-commit first clones it, never silently in CI. Move it TARGETED
+  # -- `pre-commit autoupdate --freeze --repo https://github.com/gitleaks/gitleaks` -- because a bare
+  # `autoupdate` also walks the ruff rev above, which is pinned to constraints.lock and capped below
+  # 0.16 by pyproject.)
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.18.4
+    rev: 02808f45d038526bfcceebcbf6421c1047997ff9  # frozen: v8.18.4
     hooks:
       - id: gitleaks
 
@@ -308,7 +318,7 @@ repos:
   # every `run:` body is a real question, but it is a separate PR that also clears the backlog — not a
   # side effect of which tools happen to be installed. Keep both sides carrying this flag.
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.12
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # frozen: v1.7.12
     hooks:
       - id: actionlint
         args: ["-shellcheck="]
@@ -326,7 +336,7 @@ repos:
   #                             so a `# nosec` cannot be added. Its findings are its own stdlib XML
   #                             imports, which are what it hardens; see the README in that directory.
   - repo: https://github.com/PyCQA/bandit
-    rev: 1.9.4
+    rev: 92ae8b82fb422a639f0ed8d99e96cea769594e08  # frozen: 1.9.4
     hooks:
       - id: bandit
         args: ["--skip", "B101,B110,B404,B608"]
