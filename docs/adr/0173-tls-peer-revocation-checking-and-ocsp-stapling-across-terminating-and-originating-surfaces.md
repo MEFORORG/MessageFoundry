@@ -950,7 +950,7 @@ the expiry monitor keeps judging the held copy. The start rules now also refuse 
 for some issuer is not in effect yet, at a start and at a reload, because OpenSSL would pick it and
 refuse every peer. Both allow five minutes of clock skew (`CRL_CLOCK_SKEW_SECONDS`). The signature
 check sees only the hop's own trust store, so a CRL issued by an intermediate the peer sends is
-refused until that intermediate is in the hop's CA file. A context only gains CRLs, so `[cert_monitor].crl_max_reloads` (default 10,000)
+refused, retried every pass, and applied by a restart. A context only gains CRLs, so `[cert_monitor].crl_max_reloads` (default 10,000)
 caps the reloads one context takes for one file; past it, a restart applies the file. Nothing is fetched: this reads the configured file
 only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are untouched.
 

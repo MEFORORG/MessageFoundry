@@ -435,12 +435,24 @@ def judge_crl_bytes(
             "remove it if a newer CRL for that issuer is already in the file"
         )
     blocks = tuple(block for _, block in judged)
-    if require_in_effect and (first := crl_not_in_effect(blocks, now=now)) is not None:
+    if not require_in_effect:
+        return facts, blocks
+    if (first := crl_not_in_effect(blocks, now=now)) is not None:
         raise CrlNotInEffect(
             f"{label} holds a CRL (issuer {first.issuer!r}) that does not take effect until "
             f"{first.this_update.isoformat()}, and no CRL from that issuer that is in effect now. "
             "Loaded now, it would refuse EVERY peer certificate it judges with 'CRL is not yet "
             "valid'. Give a CRL that is in effect now, or wait until then"
+        )
+    if (early := crl_not_in_effect(blocks, now=now, skew=0.0)) is not None:
+        # Inside the skew window. OpenSSL allows no skew, so say why peers fail until then.
+        logger.warning(
+            "%s holds a CRL (issuer %r) that takes effect at %s, a little after this host's clock "
+            "reads now. It is accepted as clock skew, but until then every peer that CRL judges "
+            "fails with 'CRL is not yet valid'",
+            label,
+            early.issuer,
+            early.this_update.isoformat(),
         )
     return facts, blocks
 
@@ -462,17 +474,25 @@ class CrlNotInEffect(ValueError):
     CRL judges with ``CRL is not yet valid``. A start refuses it with this error's message."""
 
 
-def crl_in_effect(block: CrlBlock, *, now: float) -> bool:
-    """Whether ``block`` is in effect at ``now``, allowing :data:`CRL_CLOCK_SKEW_SECONDS`."""
-    return block.this_update.timestamp() <= now + CRL_CLOCK_SKEW_SECONDS
+def crl_in_effect(block: CrlBlock, *, now: float, skew: float = CRL_CLOCK_SKEW_SECONDS) -> bool:
+    """Whether ``block`` is in effect at ``now``, allowing ``skew`` seconds."""
+    return block.this_update.timestamp() <= now + skew
 
 
-def crl_not_in_effect(blocks: Sequence[CrlBlock], *, now: float) -> CrlBlock | None:
-    """The earliest CRL in ``blocks`` from an issuer with no CRL in effect at ``now``, or ``None``
-    when every issuer has one in effect."""
-    in_effect = {block.issuer for block in blocks if crl_in_effect(block, now=now)}
-    pending = [block for block in blocks if block.issuer not in in_effect]
-    return min(pending, key=lambda block: block.this_update, default=None)
+def crl_not_in_effect(
+    blocks: Sequence[CrlBlock], *, now: float, skew: float = CRL_CLOCK_SKEW_SECONDS
+) -> CrlBlock | None:
+    """The CRL that decides when every issuer in ``blocks`` has one in effect, or ``None`` when each
+    does at ``now``. For each issuer with none in effect, its earliest CRL counts; of those, the
+    latest decides, since the file is whole only once that one takes effect."""
+    in_effect = {block.issuer for block in blocks if crl_in_effect(block, now=now, skew=skew)}
+    earliest: dict[str, CrlBlock] = {}
+    for block in blocks:
+        if block.issuer in in_effect:
+            continue
+        if block.issuer not in earliest or block.this_update < earliest[block.issuer].this_update:
+            earliest[block.issuer] = block
+    return max(earliest.values(), key=lambda block: block.this_update, default=None)
 
 
 def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:

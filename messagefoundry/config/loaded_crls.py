@@ -177,6 +177,13 @@ def record_crl_load(
             _HELD[ctx] = tuple(_merged(again, held) if load is again else load for load in loads)
 
 
+def _both(old: str | None, new: str | None) -> str | None:
+    """Both settings' names, so a message about the file points at each knob that loads it."""
+    if old is None or new is None or new in old.split(" and "):
+        return old or new
+    return f"{old} and {new}"
+
+
 def _merged(old: HeldCrl, new: HeldCrl) -> HeldCrl:
     """One record for a context that loaded one file twice: it holds the CRLs of both loads.
 
@@ -192,7 +199,7 @@ def _merged(old: HeldCrl, new: HeldCrl) -> HeldCrl:
         fingerprint=new.fingerprint,
         facts=soonest_crl([old.facts, new.facts]),
         file_path=new.file_path,
-        setting=old.setting or new.setting,
+        setting=_both(old.setting, new.setting),
         blocks=blocks,
         configured_path=old.configured_path or new.configured_path,
         reloads=old.reloads,

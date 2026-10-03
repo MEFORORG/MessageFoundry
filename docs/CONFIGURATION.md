@@ -1333,11 +1333,11 @@ issuer. The engine applies a replaced file only when all three of these hold:
    and has not expired. The file carries no certificate the hop does not already trust.
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so a badly signed CRL would load and then fail every
-   handshake it judges. The reload cannot see an intermediate CA that the peer sends in its handshake.
-   So if an intermediate issues the CRL, add that intermediate to the hop's CA file and restart once.
-   Later reloads can then verify the CRL. A CA the hop reads from a CA directory or the system store
-   may also be out of the reload's sight; a restart applies the file then. The engine checks again
-   every pass, because a CA directory adds a CA only when a handshake first needs it.
+   handshake it judges. The reload cannot see an intermediate CA that the peer sends in its handshake,
+   and may not see a CA in a CA directory or the system store. A restart applies such a file. Where
+   the hop has its own CA file, adding the issuing intermediate to it lets later reloads verify the
+   CRL without a restart. The engine checks again every pass, because a CA directory adds a CA only
+   when a handshake first needs it.
 3. For each CRL the hop holds, the file carries the same CRL or a newer one from the same issuer.
    The newer CRL was issued later, is already in effect and runs at least as long. It also has the
    same scope, signing key and critical extensions.
@@ -1347,15 +1347,18 @@ what to do. A file failing rule 1 would also stop the engine starting, so fix th
 CRL fails its signature check under rule 2 loads at a start but fails every handshake it judges. Fix
 that too. A file failing only rule 3 needs a restart to apply. Examples are a rollback to an older CRL,
 a file that drops an issuer, and a CRL signed under a new key. When the hops holding one file need
-different things, the ERROR names the strongest: fix the file, then restart, then wait.
+different things, the ERROR names the strongest: fix the file, then restart, then wait. When it names
+a restart for a file that is not in effect yet, it also says not to restart before that time.
 
 **A CRL that is not in effect yet is the exception: wait.** The engine applies it once it takes effect.
 Do not restart before then. A start refuses a file whose only CRL for some issuer is not in effect yet,
-because a hop would refuse every peer with it. One exception to the wait: the hop's copy may lapse
-before the new CRL takes effect. Waiting then leaves a gap in which every peer is refused. So the
-engine says to fix the file with a CRL that is in effect now. A start and a reload both allow five
-minutes of clock skew, so a CRL from a CA whose clock runs a little ahead still counts as in effect.
-At a start, such a CRL refuses every peer it judges until its `thisUpdate` passes.
+because a hop would refuse every peer with it. Nothing else in the file reaches the hop either, so to
+apply the rest of it now, take that CRL out. One exception to the wait: some CRL the hop holds may
+lapse before the new CRL takes effect. Waiting then leaves a gap in which its peers are refused. So
+the engine says to fix the file with a CRL that is in effect now. A start and a reload both allow
+five minutes of clock skew, so a CRL from a CA whose clock runs a little ahead still counts as in
+effect. At a start, such a CRL refuses every peer it judges until its `thisUpdate` passes, and the
+engine logs a WARNING that says so.
 
 A reload changes what the next full TLS handshake checks. An established connection is not checked
 again, nor is a session resumed from an earlier handshake. So a newly revoked partner that stays

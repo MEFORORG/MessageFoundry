@@ -54,6 +54,7 @@ from messagefoundry.config.tls_policy import (
     CrlNotInEffect,
     TrustAnchor,
     build_verifying_client_context,
+    crl_not_in_effect,
     harden_crl_check,
 )
 from messagefoundry.pipeline import crl_reload
@@ -524,7 +525,7 @@ def test_the_runner_reloads_off_the_loop_and_stops() -> None:
         seen.append(threading.current_thread().name)
 
     async def drive() -> None:
-        runner = CrlReloadRunner(interval_seconds=0.01, reload=fake)
+        runner = CrlReloadRunner(interval_seconds=0.01, reload=fake, skip_when_idle=False)
         runner.start()
         runner.start()  # idempotent
         for _ in range(200):
@@ -727,7 +728,9 @@ def test_stop_does_not_wait_for_a_hung_pass() -> None:
         release.wait(10)
 
     async def drive() -> float:
-        runner = CrlReloadRunner(interval_seconds=0.01, reload=hung, stop_timeout_seconds=0.1)
+        runner = CrlReloadRunner(
+            interval_seconds=0.01, reload=hung, stop_timeout_seconds=0.1, skip_when_idle=False
+        )
         runner.start()
         await asyncio.sleep(0.1)  # the pass is now blocked in its worker thread
         started = time.monotonic()
@@ -848,6 +851,8 @@ def test_a_wait_never_outranks_a_context_at_the_cap(pki: _Pki) -> None:
     assert outcome is not None and outcome.refusal is not None
     assert outcome.refusal.remedy == RESTART and "reloads" in outcome.refusal.reason
     assert not outcome.refusal.sticky  # the other hop's wait is still retried
+    # And it does not send the operator into a start that refuses the same file.
+    assert "a start until then refuses this file too" in outcome.refusal.reason
     assert _accepts(capped, pki.server()) and _accepts(fresh, pki.server())
 
 
@@ -879,11 +884,16 @@ def test_the_superseding_rule_reports_a_restart_over_a_wait_and_the_last_lapse()
 
 
 @pytest.mark.parametrize(("minutes", "starts"), [(2, True), (10, False)])
-def test_a_start_allows_five_minutes_of_clock_skew(pki: _Pki, minutes: int, starts: bool) -> None:
+def test_a_start_allows_five_minutes_of_clock_skew(
+    pki: _Pki, caplog: pytest.LogCaptureFixture, minutes: int, starts: bool
+) -> None:
     assert CRL_CLOCK_SKEW_SECONDS == 300
     pki.crl.write_bytes(pki.crl_pem(issued=_in_minutes(minutes), lasts=60 * _DAY))
     if starts:
-        assert pki.outbound_hop().verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.config.tls_policy"):
+            assert pki.outbound_hop().verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+        # OpenSSL allows no skew, so the start says why peers fail for those minutes.
+        assert "accepted as clock skew" in caplog.text
     else:
         with pytest.raises(CrlNotInEffect, match="does not take effect until"):
             pki.outbound_hop()
@@ -908,8 +918,9 @@ def test_a_reload_allows_five_minutes_of_clock_skew(pki: _Pki, minutes: int, app
 
 def test_one_context_loading_one_file_twice_is_one_record_and_one_reload(pki: _Pki) -> None:
     hop = pki.outbound_hop()
-    harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
-    assert len(held_crl_copies(pki.crl)) == 1
+    harden_crl_check(hop, str(pki.crl), setting="[api].other_crl_file")
+    (held,) = held_crl_copies(pki.crl)
+    assert held.setting == "[tls].crl_file and [api].other_crl_file"  # both knobs are named
     pki.crl.write_bytes(_fresher(pki))
 
     outcome = _reload(pki)
@@ -953,3 +964,32 @@ def test_the_runner_starts_no_thread_while_no_crl_is_held(
     assert reload_refusal(pki.crl, (1, 2)) is None
     asyncio.run(drive(hold=True))
     assert calls  # control: the same runner works once a CRL is held
+
+
+def test_a_wait_reports_any_held_crl_that_lapses_first() -> None:
+    # The file refreshes issuer a and adds issuer b, whose only CRL starts in 10 days. Nothing in
+    # the file reaches the hop until then, and the hop's copy of a lapses in 5.5 days.
+    now = _NOW.timestamp()
+    held = [_block("CN=a", 2, 5.5, b"a")]
+    new = [_block("CN=a", 1, 60, b"a2"), _block("CN=b", -10, 60, b"b")]
+    verdict = supersede_refusal(held, new, now=now)
+    assert verdict is not None and verdict[1] == LAPSES_FIRST
+    assert "'CN=a' lapses earlier" in verdict[0] and "'CN=b'" in verdict[0]
+    # And the wait names when the WHOLE file applies, the latest issuer's CRL, not the earliest.
+    later = [
+        _block("CN=a", 1, 60, b"a2"),
+        _block("CN=b", -2, 60, b"b"),
+        _block("CN=c", -4, 60, b"c"),
+    ]
+    verdict = supersede_refusal([_block("CN=a", 2, 30, b"a")], later, now=now)
+    assert verdict is not None and verdict[1] == WAIT and "'CN=c'" in verdict[0]
+    unmet = crl_not_in_effect(later, now=now)
+    assert unmet is not None and unmet.issuer == "CN=c"
+
+
+def test_a_held_crl_that_lapses_outranks_a_restart() -> None:
+    refusals = crl_reload._Refusals()
+    refusals.add("capped", RESTART)
+    refusals.add("lapses", LAPSES_FIRST)
+    refusals.add("waits", WAIT)
+    assert refusals.strongest == ("lapses", LAPSES_FIRST)
