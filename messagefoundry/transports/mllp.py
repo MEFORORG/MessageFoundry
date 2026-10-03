@@ -79,6 +79,13 @@ from messagefoundry.parsing._builtin_hl7 import DelimiterRewriteRefused
 from messagefoundry.parsing.message import emit_raw_separators, reencode_with_separators
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
+from messagefoundry.transports.admission import (
+    ListenerAdmission,
+    frame_seconds_left,
+)
+from messagefoundry.transports.admission import (
+    read_budget as _shared_read_budget,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -87,7 +94,6 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     intake_open,
-    peer_ip_allowed,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -1833,31 +1839,21 @@ class MLLPSource(SourceConnector):
         self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
-        self._active = 0
-        #: Live connections per peer address, for `max_connections_per_host`. Keyed by IP string; a
-        #: peer whose address the socket cannot report (`_peer_host` -> None) is never counted and
-        #: never refused by that cap.
-        #:
-        #: A host is DROPPED at zero rather than left sitting at 0. This table is keyed by an
-        #: attacker-chosen value, so a peer cycling source addresses would otherwise grow it without
-        #: bound — the table would become a memory leak inside a control whose whole subject is
-        #: bounded resources. Dropping at zero holds it to the live connections, which
-        #: `max_connections` already bounds. **That is a bound on the TABLE, not a claim about the
-        #: cap:** a peer with many source addresses gets a fresh per-host budget for each one and is
-        #: bounded by `max_connections` alone. See DEFAULT_MAX_CONNECTIONS_PER_HOST.
-        self._per_host: dict[str, int] = {}
-        #: Hosts already warned about their per-host cap this episode, cleared with the count above.
-        #: See `_log_host_capacity_once` for why the refusal is not logged per attempt.
-        self._host_capacity_warned: set[str] = set()
+        #: The pre-read admission shared with the raw-TCP, X12 and HTTP listeners (vault BACKLOG
+        #: #2606): the stop flag, the allowlist, both connection caps, the live counts per peer
+        #: address and the throttled refusal log. A peer whose address the socket cannot report
+        #: (`_peer_host` -> None) is never counted and never refused by the per-host cap.
+        self._admission = ListenerAdmission(
+            transport="MLLP",
+            max_connections=self.max_connections,
+            max_connections_per_host=self.max_connections_per_host,
+            source_ip_allowlist=self.source_ip_allowlist,
+        )
         # Live client writers + their handler tasks, so stop()/reload can actively close established
         # connections (a peer may hold one open for weeks) and bound the wait — server.wait_closed()
         # alone hangs on a still-connected sender on py3.12.1+ and is a no-op quiesce on 3.11 (H-2).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
-        # True from the start of stop() until the next start() (BACKLOG #1606). `_on_client` refuses
-        # a connection that arrives while it is set, and a TLS connection whose handshake finishes
-        # while it is set, so a stopped listener never reads one.
-        self._stopping = False
         # True while this listener runs TLS handshakes itself, after its own checks (BACKLOG #1606);
         # set at start() from the running loop, see `_upgrades_tls_itself`.
         self._upgrade_tls = False
@@ -1867,6 +1863,18 @@ class MLLPSource(SourceConnector):
         # semaphore object it acquired, never whatever this attribute names by then.
         self._inflight: asyncio.Semaphore | None = None
 
+    @property
+    def _stopping(self) -> bool:
+        """True from the start of stop() until the next start() (BACKLOG #1606). `_on_client` refuses
+        a connection that arrives while it is set, and a TLS connection whose handshake finishes
+        while it is set, so a stopped listener never reads one. Held by the shared admission
+        (vault BACKLOG #2606), which the other socket listeners read it from too."""
+        return self._admission.stopping
+
+    @_stopping.setter
+    def _stopping(self, value: bool) -> None:
+        self._admission.stopping = value
+
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
     ) -> None:
@@ -1874,7 +1882,7 @@ class MLLPSource(SourceConnector):
         # a load balancer / per-node ports distribute inbound connections), so there is no
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
-        self._stopping = False  # a restart of this same instance serves again (see __init__)
+        self._stopping = False  # a restart of this same instance serves again (see `_stopping`)
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None
         )
@@ -2085,13 +2093,12 @@ class MLLPSource(SourceConnector):
         # Clear the per-host tables with them. A client task cancelled past its grace above, or one
         # the runner ABANDONS when a stop() overruns (wiring_runner's demotion path leaves the drain
         # running and reuses this same instance at the next promotion), never runs its `finally` —
-        # so a stale count would survive into the restarted listener, and `_release`'s own docstring
-        # names what that costs: "a per-host count left behind by a missed release locks that peer
-        # out permanently". A straggler that does run later decrements a missing key, which
-        # `_release` already treats as a no-op. `_active` keeps its existing behaviour: it is read
-        # by the global cap that predates this row, and resetting it here would be a separate change.
-        self._per_host.clear()
-        self._host_capacity_warned.clear()
+        # so a stale count would survive into the restarted listener, and `release`'s own docstring
+        # names what that costs: a per-host count left behind by a missed release locks that peer
+        # out. A straggler that does run later decrements a missing key, which `release` already
+        # treats as a no-op. `active` keeps its existing behaviour: it is read by the global cap
+        # that predates this row, and resetting it here would be a separate change.
+        self._admission.reset()
         # Now that no client handlers are in flight, this should complete promptly — but on the Windows
         # ProactorEventLoop a still-pending overlapped accept/read can make wait_closed() never return,
         # which (on the suite's single shared session loop) wedges every subsequent test with no output
@@ -2226,64 +2233,6 @@ class MLLPSource(SourceConnector):
         await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
         return owed, nak
 
-    def _at_host_capacity(self, peer_host: str | None) -> bool:
-        """Whether this peer address already holds every connection ``max_connections_per_host``
-        allows it (BACKLOG #1725). Always ``False`` when the cap is off or the socket could not
-        report an address — a cap that cannot name its subject must not refuse anybody."""
-        if self.max_connections_per_host is None or peer_host is None:
-            return False
-        return self._per_host.get(peer_host, 0) >= self.max_connections_per_host
-
-    def _log_host_capacity_once(self, writer: asyncio.StreamWriter, peer_host: str) -> None:
-        """Warn the FIRST time a host hits its cap, then stay quiet until it has no connections left.
-
-        Clearing at zero rather than the moment the host drops back under the cap is deliberate: a
-        peer oscillating on the boundary — close one, open two — would otherwise earn a line per
-        cycle, which is connection churn and unbounded. Requiring a full disconnect makes one line
-        per episode a real bound rather than a slower leak.
-
-        A peer that loops ``connect()`` against a budget it has already filled is refused as fast as
-        it can open sockets, so a line per refusal would let an unauthenticated peer fill the log
-        volume — the service's stdout is captured to files under NSSM. That turns the defense into an
-        amplifier for the very flood it exists to stop. The global ``max_connections`` refusal logs
-        nothing at all for the same reason; one line per episode is the middle ground, and the
-        `at_capacity` event still records every individual refusal for anyone counting them.
-
-        The warned set is keyed and cleared exactly like :attr:`_per_host`, so it inherits that
-        table's bound and adds no second population to leak.
-        """
-        if peer_host in self._host_capacity_warned:
-            return
-        self._host_capacity_warned.add(peer_host)
-        logger.warning(
-            "MLLP connections from %s refused: %s holds max_connections_per_host (%d). Further "
-            "refusals for this host are not logged until it has no connections left.",
-            writer.get_extra_info("peername"),
-            peer_host,
-            self.max_connections_per_host,
-        )
-
-    def _admit(self, peer_host: str | None) -> None:
-        """Take one connection slot, globally and (when the peer has an address) for that host."""
-        self._active += 1
-        if peer_host is not None:
-            self._per_host[peer_host] = self._per_host.get(peer_host, 0) + 1
-
-    def _release(self, peer_host: str | None) -> None:
-        """Give both slots back. Paired with :meth:`_admit` in one place so the two counters cannot
-        drift — a per-host count left behind by a missed release locks that peer out permanently."""
-        self._active -= 1
-        if peer_host is None:
-            return
-        remaining = self._per_host.get(peer_host, 0) - 1
-        if remaining > 0:
-            self._per_host[peer_host] = remaining
-        else:
-            self._per_host.pop(peer_host, None)
-            # Dropped together with the count, so the next episode for this host warns again and
-            # neither table outlives the connections it describes.
-            self._host_capacity_warned.discard(peer_host)
-
     def _log_frame_deadline(self, writer: asyncio.StreamWriter) -> None:
         """Say which bound dropped the connection (BACKLOG #1725). The `closed` event's reason says
         `frame_deadline`, but only when connection-event capture is on; this line lands either way,
@@ -2291,7 +2240,8 @@ class MLLPSource(SourceConnector):
         place. Socket metadata only — no frame bytes, which is the whole point of the partial frame
         this drops.
 
-        Unthrottled, unlike :meth:`_log_host_capacity_once`, and the difference is the rate rather
+        Unthrottled, unlike the per-host refusal line in :mod:`~messagefoundry.transports.admission`,
+        and the difference is the rate rather
         than a difference of opinion. A refused connection is free to the peer, so that path could be
         driven as fast as it could call ``connect()``. Reaching this one costs a connection held for
         ``max_frame_seconds``, so the caps already bound it: at the defaults, 32 lines per minute per
@@ -2309,11 +2259,10 @@ class MLLPSource(SourceConnector):
 
         ``None`` means "this bound has nothing to say" — either ``max_frame_seconds`` is off or no
         frame is open. The result may be NEGATIVE, and the sign is the answer: at or below zero the
-        frame has outlived its budget, which is what both callers test.
+        frame has outlived its budget, which is what both callers test. The arithmetic is shared with
+        the raw-TCP and X12 listeners (vault BACKLOG #2606).
         """
-        if frame_opened_at is None or self.max_frame_seconds is None:
-            return None
-        return self.max_frame_seconds - (time.monotonic() - frame_opened_at)
+        return frame_seconds_left(frame_opened_at, self.max_frame_seconds)
 
     def _read_budget(self, frame_left: float | None) -> float | None:
         """How long the next read may block: the idle bound, the open frame's remaining life, or the
@@ -2329,11 +2278,7 @@ class MLLPSource(SourceConnector):
         ``idle_timeout``. The guard sits in ``__init__`` rather than as a clamp here, because a clamp
         would turn a typo into a silent bound.
         """
-        if frame_left is None:
-            return self.receive_timeout
-        if self.receive_timeout is None:
-            return frame_left
-        return min(self.receive_timeout, frame_left)
+        return _shared_read_budget(self.receive_timeout, frame_left)
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
@@ -2367,29 +2312,16 @@ class MLLPSource(SourceConnector):
         # already closed.
         handshaking = False
         try:
-            if self.source_ip_allowlist is not None:
-                peer = writer.get_extra_info("peername")
-                if not peer_ip_allowed(peer, self.source_ip_allowlist):
-                    logger.warning(
-                        "MLLP connection from %s refused: not in source_ip_allowlist", peer
-                    )
-                    await self._emit_event("peer_not_allowlisted", peer_host=peer_host)
-                    return  # not allowlisted — refuse (closed in the outer finally; _active untouched)
-            if self.max_connections is not None and self._active >= self.max_connections:
-                await self._emit_event("at_capacity", peer_host=peer_host)
-                return  # at capacity — refuse the new client (closed in the outer finally)
-            if peer_host is not None and self._at_host_capacity(peer_host):
-                # Same refusal, a different budget: this peer address already holds its share
-                # (BACKLOG #1725). Deliberately the SAME `at_capacity` kind rather than a new one —
-                # the connection event vocabulary is asserted against the emit sites and mirrored in
-                # the web console filter, and what an operator needs here is WHICH cap refused them,
-                # which the reason carries. The counter is not incremented, as above.
-                self._log_host_capacity_once(writer, peer_host)
-                await self._emit_event(
-                    "at_capacity", peer_host=peer_host, reason="max_connections_per_host"
-                )
-                return  # at per-host capacity — refuse (closed in the outer finally)
-            self._admit(peer_host)
+            # The allowlist, the global cap and the per-host cap (BACKLOG #1725), decided by the
+            # admission shared with the other socket listeners (vault BACKLOG #2606). A per-host
+            # refusal is the SAME `at_capacity` kind with a `max_connections_per_host` reason. A
+            # refused connection takes no slot, so nothing is released.
+            refusal = self._admission.check(writer, peer_host)
+            if refusal is not None:
+                if refusal.kind is not None:
+                    await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
+                return  # refused (closed in the outer finally)
+            self._admission.admit(peer_host)
             # The `established` emit sits INSIDE the try whose finally releases the slot. It is
             # fail-soft against `Exception` but not against `CancelledError`, and stop() cancels
             # straggling client tasks — so a cancellation delivered here used to escape past
@@ -2555,7 +2487,7 @@ class MLLPSource(SourceConnector):
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._release(peer_host)
+                self._admission.release(peer_host)
         finally:
             self._clients.discard(writer)
             if task is not None:
