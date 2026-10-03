@@ -849,3 +849,41 @@ an older engine may still hold one.
 
 This note does not claim any alert's state. If a new `py/clear-text-storage-sensitive-data` alert
 appears, it is not this one: triage it as new, under the convergence rule above.
+
+## Amendment — 2026-10-03: a source NAMED like a password is fixed at the source (vault BACKLOG #1133)
+
+`py/clear-text-logging-sensitive-data` decides that a value is a password partly by the name of its
+source. The 2026-09-16 amendment names two axes: what the sink renders, and which mapping a value was
+read from. This is a third: what the source is called. Three notes in
+`messagefoundry/config/settings.py` hit it, and each now points here rather than stating the rule.
+
+### What the heuristic reads
+
+| Name | What it holds | Alerts it raised |
+|---|---|---|
+| `mfa` as a separate word, such as `mfa_verify_min_elapsed_seconds` or `OIDC_MFA_CLAIM_EXCEPTION` | A number, or a fixed sentence | Two on PR 1842; 241, 242 and 248 to 251 on PR 1959 |
+| `trusted_proxies` | A list of proxy addresses | 122, dismissed under *Misclassified value*; 209 on `main` |
+
+PR 1959's repair comment read the `mfa` pattern at CodeQL 2.27.1 as `([_-]|\b)mfa([_-]|\b)`. That
+reading is attributed to that pull request and was not re-measured here.
+
+### The rule
+
+1. Where the engine chooses the name, a module constant or a helper, choose one the heuristic does
+   not read. PR 1959 renamed the two `OIDC_MFA_*` names to `OIDC_SECOND_FACTOR_CLAIM_EXCEPTION` and
+   `oidc_second_factor_claim_exception()`, with the text and behaviour unchanged.
+2. Where an operator writes the name, a config field, the name stays. The log text carries a literal
+   that the value selects, never the value. The `mfa_verify_min_elapsed_seconds` floor entry and its
+   `_floor_verdict` are the worked example.
+3. Prefer either fix to a dismissal for a new alert of this class. Options considered 3 still holds:
+   nothing is suppressed.
+
+`tests/test_security_config.py::test_no_logged_settings_text_is_named_like_a_password` guards rule 1
+for the module-level names in `config.settings`, because CodeQL is not a required check. It reaches
+no other module and no config field. Rule 2 has no guard but a reader.
+
+### The discriminator
+
+A name match is the false case only while the logged value carries no secret: a fixed sentence, a
+verdict literal, or an address list. A value read from a real credential reaching a log sink is
+real, whatever the source is called.

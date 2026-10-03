@@ -6961,7 +6961,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     # py/clear-text-logging-sensitive-data reads an attribute named mfa_* as a password source, and
     # these entries reach the serve WARNING and `security show` stdout, so quoting the number raised
     # two alerts on PR 1842. The value only picks a literal verdict (_floor_verdict), which carries
-    # no data from it. The operator loses nothing they did not set themselves.
+    # no data from it. The operator loses nothing they did not set themselves. ADR 0034's 2026-10-03
+    # amendment states the wider rule once, for this note and the two below that cite it.
     step_field = "mfa_verify_min_elapsed_seconds"
     step_verdict = _floor_verdict(step_field, auth.mfa_verify_min_elapsed_seconds)
     if step_verdict == "off":
@@ -7038,9 +7039,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 #: The one sign-in that proves a second factor without an enrolled one, worded once for the MFA
 #: advisories here and the exposure texts in ``__main__._serve``. ``_check_mfa_gate`` checks the
 #: amr/acr claim, and the OIDC mint stamps the session verified, only while this setting is on.
-#: Neither this name nor the helper's below may hold ``mfa`` as a separate word. CodeQL reads such a
-#: name as a password source (the ``mfa_verify_min_elapsed_seconds`` note above, same cause), so
-#: every log line carrying this fixed sentence would raise ``py/clear-text-logging-sensitive-data``.
+#: Neither this name nor the helper's below may hold ``mfa`` as a separate word: CodeQL would read it
+#: as a password, and every log line carrying this fixed sentence would raise an alert. A config
+#: field cannot be renamed, so the ``mfa_verify_min_elapsed_seconds`` note above quotes a literal
+#: instead; a name the engine chooses is renamed. ADR 0034's 2026-10-03 amendment states that rule,
+#: and ``test_no_logged_settings_text_is_named_like_a_password`` guards this module's names.
 OIDC_SECOND_FACTOR_CLAIM_EXCEPTION = (
     "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
 )
@@ -7208,7 +7211,7 @@ def security_loosenings(
             (
                 "enforcement",
                 "the security REFUSE/WARN dial is at 'warn' — posture weakenings (cleartext/verify-off "
-                "hops, keyless PHI, open egress, single-factor admin at exposure) are WARNED + audited "
+                "hops, keyless PHI, open egress, single-factor sign-in at exposure) are WARNED + audited "
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
                 "--allow-insecure-bind escapes are honored",
             )
@@ -7292,7 +7295,8 @@ def security_loosenings(
                 "an account with no second factor enrolled is single-factor, so a Kerberos session "
                 "enters on a ticket that asserts no strength. An enrolled account owes its factor "
                 "only while it keeps one, and its holder may remove the last. Where "
-                f"{OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}, that claim stands in for the enrolled factor",
+                f"{OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}, that claim counts as the second factor, whether or "
+                "not one is enrolled",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7472,7 +7476,8 @@ def security_loosenings(
     # source address poisons the audit trail either way.
     # CodeQL's name heuristic reads `trusted_proxies` as a secret (main's alert 209 is that source on
     # an INFO line). The entries reach the serve WARNING and stdout below; no flow is reported today,
-    # but a refactor of the helper may raise one. Fix it at the source, as the MFA floor above does.
+    # but a refactor of the helper may raise one. Fix it at the source, as the MFA floor above does
+    # (ADR 0034's 2026-10-03 amendment).
     trust_all = _trust_every_peer_entries(api.trusted_proxies)
     if trust_all:
         out.append(

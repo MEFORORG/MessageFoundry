@@ -1454,6 +1454,79 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
     assert "amr/acr" not in audit  # OIDC is off here: the audit record names no exception
 
 
+# The smallest config that turns OIDC on, with its claim gate on: OIDC needs an AD directory, the
+# pinned endpoints and the two secrets from the environment. Dotted root keys, because `_expose_toml`
+# puts `relax` ahead of its own tables and an `[auth]` header there would swallow the next keys.
+_OIDC_CLAIM_ON = (
+    "auth.ad_enabled = true\n"
+    'auth.ad_server = "ldaps://dc.example.com:636"\n'
+    'auth.ad_domain = "example.com"\n'
+    'auth.ad_user_search_base = "OU=Users,DC=example,DC=com"\n'
+    'auth.ad_bind_dn = "CN=svc,DC=example,DC=com"\n'
+    "auth.oidc_enabled = true\n"
+    "auth.oidc_require_mfa_claim = true\n"
+    'auth.oidc_issuer = "https://idp.example.com"\n'
+    'auth.oidc_client_id = "mefor-console"\n'
+    'auth.oidc_authorization_endpoint = "https://idp.example.com/authorize"\n'
+    'auth.oidc_token_endpoint = "https://idp.example.com/token"\n'
+    'auth.oidc_jwks_uri = "https://idp.example.com/jwks"\n'
+    'auth.oidc_allowed_endpoints = ["idp.example.com"]\n'
+)
+_OIDC_EXCEPTION = (
+    ", unless an OIDC sign-in carries an amr/acr claim checked while "
+    "[auth].oidc_require_mfa_claim is on"
+)
+
+
+@pytest.mark.parametrize(
+    ("enforcement", "relax", "needle"),
+    [
+        (None, "", "refusing to start"),
+        ("warn", "", "warning: "),
+        (None, "security.allow_single_factor_admin_when_exposed = true\n", "AUDIT:"),
+    ],
+)
+def test_serve_names_the_oidc_exception_when_oidc_and_its_claim_gate_are_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    enforcement: str | None,
+    relax: str,
+    needle: str,
+) -> None:
+    """Vault BACKLOG #1133. The OIDC-off tests above prove the exposure texts stay quiet about the
+    exception; this is the other arm, end to end through ``_serve``. RED when the refusal, the
+    warning or the AUDIT line drops the exception with OIDC and its claim gate on, and RED when the
+    refusal's AD-only parenthetical names it too: that clause describes a deployment with no OIDC."""
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    monkeypatch.setenv("MEFOR_AUTH_AD_BIND_PASSWORD", "s3cret")
+    monkeypatch.setenv("MEFOR_AUTH_OIDC_CLIENT_SECRET", "client-s3cret")
+    monkeypatch.chdir(tmp_path)
+    _expose_toml(
+        tmp_path,
+        enforcement=enforcement,
+        relax=_OIDC_CLAIM_ON + relax,
+        public_origin="https://mefor.example.org",
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
+    main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"])
+    captured = capsys.readouterr()
+    # The AUDIT line rides the logging path (stdout); the refusal and the warning print to stderr.
+    line = next(
+        text
+        for text in (captured.out + captured.err).splitlines()
+        if needle in text and "[security].require_mfa" in text and "off" in text
+    )
+    assert line.count(_OIDC_EXCEPTION) == 1, line
+    if needle == "refusing to start":
+        assert f"over the network{_OIDC_EXCEPTION}. Enable" in line
+        assert "each enrolls an engine factor); or set" in line
+
+
 def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

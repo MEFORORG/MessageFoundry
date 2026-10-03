@@ -20,7 +20,8 @@
    see the `enforcement = warn` deviation below). **Two of these controls may be lifted while staying at
    `enforce`, but only behind a dedicated acknowledgment switch that does nothing else** (the No-loosen
    carve-out, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5 as amended, [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)):
-   `allow_single_factor_admin_when_exposed` (single-factor admin at exposure) and
+   `allow_single_factor_admin_when_exposed` (single-factor sign-in at exposure, for every account with
+   no second factor enrolled) and
    `allow_unencrypted_phi_under_strict_enforcement` (keyless PHI under strict enforcement, which *also*
    requires `allow_unencrypted_phi`). Each defaults `false` — byte-identical to today's refusal — and when set
    drops the refusal to a **loud, audited warning** (the same warn-and-start `enforcement = warn` takes
@@ -347,7 +348,7 @@ false premise.
 - **Still refused:** nothing. This switch is advisory-only — it changes what is recorded, never what is
   permitted, so no serve gate keys on it at any posture.
 
-### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-admin refusal
+### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-at-exposure refusal
 - **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)
   whose admin surface is exposed (off-loopback bind or a declared reverse proxy) with `require_mfa` off,
   MessageFoundry normally **refuses to start**. Every account with no second factor enrolled,
@@ -370,12 +371,13 @@ false premise.
 - **When acceptable:** a production exposure where the second factor is supplied by a **compensating control
   outside MessageFoundry** — an authenticating reverse proxy / mTLS admin gateway. AD/Kerberos MFA
   delegated to the directory is **no longer** one of them: BACKLOG #1144 retired that delegation, so
-  this flag gates every Administrator, directory ones included.
+  this flag reaches every account with no second factor enrolled, directory ones included, and not
+  only Administrators.
 - **Compensating controls:** front the admin surface with an MFA-enforcing proxy; prefer `require_mfa = true`
   (native TOTP); enable `admin_new_ip_step_up`. A startup **AUDIT** line records the override and the posture
   view (`GET /security/posture`) names it.
 - **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, auth off on
-  any bind, open egress, unbounded retention) — this ack lifts **only** the single-factor-admin refusal,
+  any bind, open egress, unbounded retention) — this ack lifts **only** the single-factor-at-exposure refusal,
   and only at exposure. `require_mfa` off on a **loopback** bind was never refused (no exposure), so this ack
   is a no-op there.
 
@@ -450,7 +452,7 @@ is refused, so an opt-out does nothing and is not reported.
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
-  off-box bind, open-egress, and single-factor-admin-at-exposure refusals downgrade to loud audited warnings,
+  off-box bind, open-egress, and single-factor-at-exposure refusals downgrade to loud audited warnings,
   and an explicitly-zeroed PHI retention window warns rather than refusing. (The 30-day auto-bound of an
   **unset** window is not part of this dial — it applies under `enforce` too.) Named once by
   `security_loosenings()` and in `GET /security/posture`.
