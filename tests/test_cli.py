@@ -1140,9 +1140,11 @@ def test_serve_config_twin_alone_names_itself_in_both_bind_arms(
 
 # --- MFA-at-exposure posture (sec-mfa-on; off-loopback bind + [auth].require_mfa) ----------------
 #
-# An exposed (non-loopback) PHI bind with require_mfa off is single-factor over the network: refuse on
-# a production PHI instance, warn on a non-production PHI instance, stay quiet on synthetic. These
-# reach the MFA gate through a declared TLS-terminating reverse proxy (Posture-B) — #200 (ADR 0092)
+# An exposed instance with require_mfa off is single-factor over the network for every account with no
+# factor enrolled. The split is [security].enforcement, not the tier: under enforce (the default) it
+# refuses unless allow_single_factor_admin_when_exposed is set, which downgrades it to an audited
+# warning, and under enforcement = warn it warns. No instance stays quiet: the synthetic declaration
+# that used to silence it is retired (BACKLOG #1279). These reach the MFA gate through a declared TLS-terminating reverse proxy (Posture-B) — #200 (ADR 0092)
 # clamped --allow-insecure-bind so it can no longer wave a PRODUCTION-PHI cleartext bind past the
 # exposed-gate, so an exposed prod bind now exposes via a real TLS-terminated proxy — with the keyless
 # and open-egress gates pre-satisfied (a key + [egress].deny_by_default), so only the MFA posture is
@@ -1233,8 +1235,10 @@ def _expose_toml(
 
 # --- #186/#188 secure-by-default serve gates (retention / egress deny-by-default / security notify) --
 #
-# These gates mirror the sanctioned open-egress / MFA-at-exposure posture: a PRODUCTION PHI instance
-# REFUSES to start, a non-production PHI instance (staging) WARNS, a synthetic instance (dev) is quiet.
+# These gates mirror the sanctioned open-egress posture: a PRODUCTION PHI instance REFUSES to start, a
+# non-production PHI instance (staging) WARNS, a synthetic instance (dev) is quiet. The MFA-at-exposure
+# gate no longer belongs in that list: it splits on [security].enforcement, never on the tier, and no
+# instance stays quiet on it (the MFA-at-exposure section above).
 # The building blocks below let a PRODUCTION PHI serve pass every PRIOR gate so exactly one new gate is
 # under test per case (a locked-down egress, a bounded retention, and a real SMTP channel). See
 # messagefoundry/__main__.py.
@@ -1296,12 +1300,15 @@ def test_serve_refuses_exposed_without_mfa_in_prod(
     err = capsys.readouterr().err
     assert "require_mfa off; refusing to start" in err
     # Vault BACKLOG #2798 amendment: with require_mfa off the un-enrolled accounts are single-factor,
-    # not the Administrator role alone, and an OIDC sign-in with a checked claim is the exception.
+    # not the Administrator role alone. Vault BACKLOG #1133: this config has OIDC off, so no OIDC
+    # sign-in is an exception and the refusal must not name one (oidc_second_factor_claim_exception).
     assert (
         "every account with no second factor enrolled, Administrators included, would "
-        "authenticate with a single factor over the network, unless an OIDC sign-in carries a "
-        "checked amr/acr claim" in err
+        "authenticate with a single factor over the network. Enable" in err
     )
+    assert "each enrolls an engine factor); or set" in err
+    refusal = next(line for line in err.splitlines() if "refusing to start" in line)
+    assert "amr/acr" not in refusal
 
 
 def test_serve_warns_exposed_without_mfa_in_staging(
@@ -1325,9 +1332,12 @@ def test_serve_warns_exposed_without_mfa_in_staging(
     assert "refusing to start" not in err  # warned, did not refuse
     # Vault BACKLOG #2798: with require_mfa off the scope is not read, so the warning must not name it.
     assert (
-        "every account with no second factor enrolled is single-factor over the network, unless "
-        "an OIDC sign-in carries a checked amr/acr claim" in err
+        "every account with no second factor enrolled is single-factor over the network. Enable"
+        in err
     )
+    warning = next(line for line in err.splitlines() if "with [security].require_mfa off" in line)
+    assert "require_mfa_scope" not in warning
+    assert "amr/acr" not in warning  # OIDC is off here, so there is no claim exception to name
 
 
 def test_serve_exposed_without_mfa_refuses_on_dev_too(
@@ -1430,9 +1440,18 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
         main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
         == 0
     )
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
+    err = captured.err
     assert "require_mfa off" in err and "single-factor" in err
     assert "refusing to start" not in err  # the ack downgraded refuse -> warn
+    # Vault BACKLOG #2798: the AUDIT line rides the logging path (stdout), so read both streams. RED on
+    # the "every account in require_mfa_scope" wording, a scope the gate does not read here.
+    both = captured.out + captured.err
+    audit = next(line for line in both.splitlines() if "AUDIT:" in line and "require_mfa" in line)
+    assert (
+        "every account with no second factor enrolled is single-factor over the network." in audit
+    )
+    assert "amr/acr" not in audit  # OIDC is off here: the audit record names no exception
 
 
 def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
@@ -2159,6 +2178,12 @@ def test_undeclared_proxy_warns_about_single_factor_admin(
     assert rc == 0, "an UNDECLARED proxy is an inference — it must warn, never refuse"
     err = capsys.readouterr().err
     assert "UNDECLARED reverse proxy" in err and "single-factor over the network" in err
+    # Vault BACKLOG #2798: the accounts this frees are the un-enrolled ones, not a scope the gate
+    # does not read with require_mfa off. RED on the "every account in require_mfa_scope" wording.
+    assert (
+        "every account with no second factor enrolled is single-factor over the network, and the "
+        "MFA-at-exposure refusal cannot see it" in err
+    )
     assert "proxy posture is undeclared" not in err, (
         "the ADR 0068 §8 heuristic fired after all — re-check whether this arm is still needed, and "
         "correct the docs either way"
