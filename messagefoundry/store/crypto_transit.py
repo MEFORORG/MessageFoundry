@@ -60,6 +60,7 @@ from messagefoundry.store.keyprovider_vault import (
     _EXTRA,
     TRANSIT_KEY_TYPES_AUDIT,
     TRANSIT_KEY_TYPES_DATA,
+    TRANSIT_MOUNT,
     _build_client,
     require_transit_key_type,
 )
@@ -212,13 +213,10 @@ class TransitCipher(_UnmarkedPolicy):
         return self.audit_hmac
 
 
-def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
-    """Construct the Transit cipher from the environment, failing **closed** at startup.
-
-    ``settings`` is accepted for signature parity with ``make_cipher``/``build_store_cipher`` (the Vault
-    address/token/key are env-only secrets/provisioning outputs, like the KEK-unwrap provider). A missing
-    key name, a missing extra, or an unreachable/unknown Transit key raises :class:`KeyProviderError` so
-    ``open_store`` refuses to start rather than degrading to plaintext."""
+def _key_names() -> tuple[str, str]:
+    """The Transit data key and audit key from the environment, read in one place for the cipher
+    and for :func:`transit_cipher_required_capabilities`. Raises :class:`KeyProviderError` when the
+    data-key name is not set."""
     key_name = os.environ.get(_ENV_TRANSIT_KEY)
     if not key_name:
         raise KeyProviderError(
@@ -226,8 +224,18 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
             f"supply the Transit data-key name via the environment."
         )
     # Optional dedicated audit-HMAC key; unset ⇒ reuse the data key. Either way the type is checked
-    # below — see the _ENV_AUDIT_KEY comment above for which types each use admits and why.
-    audit_key = os.environ.get(_ENV_AUDIT_KEY) or key_name
+    # at build — see the _ENV_AUDIT_KEY comment above for which types each use admits and why.
+    return key_name, os.environ.get(_ENV_AUDIT_KEY) or key_name
+
+
+def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
+    """Construct the Transit cipher from the environment, failing **closed** at startup.
+
+    ``settings`` is accepted for signature parity with ``make_cipher``/``build_store_cipher`` (the Vault
+    address/token/key are env-only secrets/provisioning outputs, like the KEK-unwrap provider). A missing
+    key name, a missing extra, or an unreachable/unknown Transit key raises :class:`KeyProviderError` so
+    ``open_store`` refuses to start rather than degrading to plaintext."""
+    key_name, audit_key = _key_names()
     addr = os.environ.get(_ENV_ADDR)
     token = os.environ.get(_ENV_TOKEN)
     # OUTSIDE the try on purpose. `_build_client` asserts this hop's TLS suites (ADR 0180) and raises
@@ -283,3 +291,23 @@ def build_transit_cipher(settings: StoreSettings) -> TransitCipher:
     return TransitCipher(
         client, key_name, audit_key=audit_key, allow_unmarked=settings.allow_unmarked_ciphertext
     )
+
+
+def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
+    """Every Vault path the Transit cipher calls, with the capability each call needs (BACKLOG #305).
+
+    Kept beside the calls so the two cannot drift. :func:`build_transit_cipher` reads each key's
+    metadata (``transit/keys/<key>``, read); :meth:`TransitCipher.encrypt` and
+    :meth:`TransitCipher.decrypt` update ``transit/encrypt/<data key>`` and
+    ``transit/decrypt/<data key>``; :meth:`TransitCipher.audit_hmac` updates
+    ``transit/hmac/<audit key>``, which is the data key when no audit key is set. Raises
+    :class:`KeyProviderError` when the data-key name is not set, as the cipher itself does."""
+    key_name, audit_key = _key_names()
+    read, update = frozenset({"read"}), frozenset({"update"})
+    return {
+        f"{TRANSIT_MOUNT}/keys/{key_name}": read,
+        f"{TRANSIT_MOUNT}/encrypt/{key_name}": update,
+        f"{TRANSIT_MOUNT}/decrypt/{key_name}": update,
+        f"{TRANSIT_MOUNT}/keys/{audit_key}": read,
+        f"{TRANSIT_MOUNT}/hmac/{audit_key}": update,
+    }

@@ -29,6 +29,7 @@ is contained as a typed ``Any`` local here (never a repo-wide ignore).
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.secretprovider import SecretProviderError
@@ -151,6 +152,11 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     return client
 
 
+def _kv_mount() -> str:
+    """The KV v2 mount every read goes to: ``MEFOR_SECRETS_VAULT_KV_MOUNT``, else ``secret``."""
+    return os.environ.get(_ENV_KV_MOUNT) or "secret"
+
+
 def _split_ref(ref: str) -> tuple[str, str]:
     """Split a ``<path>#<field>`` reference into ``(path, field)``; ``field`` defaults to ``value``."""
     path, sep, field = ref.partition("#")
@@ -172,7 +178,7 @@ class VaultSecretProvider:
 
     def resolve(self, ref: str) -> str:
         path, field = _split_ref(ref)
-        mount = os.environ.get(_ENV_KV_MOUNT) or "secret"
+        mount = _kv_mount()
         addr = os.environ.get(_ENV_ADDR)
         token = os.environ.get(_ENV_TOKEN)
         # OUTSIDE the try on purpose. The TLS suite assertion inside `_build_client` raises
@@ -210,3 +216,60 @@ class VaultSecretProvider:
 def build_provider(settings: SecretsSettings) -> VaultSecretProvider:
     """The dispatch entrypoint ``secretprovider._load_external_provider`` imports and calls by name."""
     return VaultSecretProvider(settings)
+
+
+# --- what this hop's token must be able to do (BACKLOG #305, ASVS 13.2.2) ---------------------------
+
+
+def secrets_vault_token() -> str:
+    """The connector-secret token named in ``MEFOR_SECRETS_VAULT_TOKEN``, for ``check-privileges``.
+
+    **It refuses when that variable is unset, where the provider does not.** Given no token, hvac
+    reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is the operator's
+    own token, and the check would judge it, or read a secret with it, as the engine's. Raises
+    :class:`SecretProviderError`, which the probe reports as not observed."""
+    token = os.environ.get(_ENV_TOKEN)
+    if not token:
+        raise SecretProviderError(
+            f"{_ENV_TOKEN} is not set, so the connector-secret token is not known. The check reads "
+            f"only the token named there, never VAULT_TOKEN or ~/.vault-token; run it with the "
+            f"service's environment"
+        )
+    return token
+
+
+def secrets_vault_address() -> str:
+    """The connector-secret Vault named in ``MEFOR_SECRETS_VAULT_ADDR``, for ``check-privileges``.
+
+    **It refuses when that variable is unset, where the provider does not.** Given no address, hvac
+    reads ``VAULT_ADDR``: in an operator's shell that may be another Vault, which would then receive
+    the engine's token. Raises :class:`SecretProviderError`, which the probe reports as not
+    observed. The provider keeps its documented fallback (docs/CONFIGURATION.md)."""
+    addr = os.environ.get(_ENV_ADDR)
+    if not addr:
+        raise SecretProviderError(
+            f"{_ENV_ADDR} is not set, so the connector-secret Vault is not known. The check sends "
+            f"the token only to the address named there, never VAULT_ADDR; run it with the "
+            f"service's environment"
+        )
+    return addr
+
+
+def secrets_vault_client(address: str, token: str) -> Any:
+    """The connector-secret hop's Vault client, built by the same :func:`_build_client`
+    :meth:`VaultSecretProvider.resolve` uses: same TLS narrowing, same anchor, no redirects, and the
+    same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
+    own grants through it and changes nothing. Take ``address`` from :func:`secrets_vault_address`
+    and ``token`` from :func:`secrets_vault_token`; both refuse an unset variable, and the client
+    uses exactly the values they returned."""
+    return _build_client(address, token)
+
+
+def kv_required_capabilities(refs: Iterable[str]) -> dict[str, frozenset[str]]:
+    """The KV v2 path each reference in ``refs`` reads, with the one capability it needs.
+
+    hvac's ``read_secret_version`` is a GET of ``<mount>/data/<path>``, so that path and ``read`` are
+    the whole grant; kept beside :meth:`VaultSecretProvider.resolve` so the two cannot drift. A
+    malformed reference raises :class:`SecretProviderError`, as resolving it would."""
+    mount = _kv_mount()
+    return {f"{mount}/data/{_split_ref(ref)[0]}": frozenset({"read"}) for ref in refs}

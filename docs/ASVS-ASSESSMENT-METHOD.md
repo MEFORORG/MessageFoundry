@@ -149,7 +149,7 @@ These are the real disputes. They are here so the next assessor reaches the same
 |---|---|---|
 | **5.4.3** | `na` | **Rule 1, and it moved for the same reason 11.7.1 did.** Antivirus scanning of inbound content is an **enterprise-provided** control — the deploying organisation's AV/EDR/ICAP stack over the drop directory, the SFTP landing zone and the upload path — so the verb's subject is outside the declared scope of §2. **NOTE:** Previously scored `fail` under rule 3 and cited here as the worked example of one, on the reasoning that *a scan hook exists but its only shipped implementation is `_no_scan` and there is no configuration key at all, so an operator must author the scanner*. **That reasoning is still true of the code** — it simply answers rule 3's question, and rule 1 runs first. ⛔ **This `na` is WEAKER than 11.7.1's and its rationale says so on the cell:** the engine *does* ship a scan seam, so this is a control the product **could** implement, which makes the verdict conditional on the enterprise actually covering those paths. It therefore carries a **deployment requirement**, and a consult to test that premise on outbound-initiated SFTP pulls is filed in the ledger. **CLOSED by owner decision (2026-08-02); do not re-derive it.** |
 | **15.2.5** | `partial` | Rule 5, **not** rule 3. `[sandbox].mode` ships `off`, but `subprocess` mode is real and was verified by executing it. A working control that ships off. |
-| **11.7.1** | `na` | **Rule 1 — the hardest call in this table, and it moved.** The verb is *"full memory encryption is in use"*: a property of the **CPU, firmware and hypervisor**, not of the three software artifacts in §2. Outside the declared scope, so rule 1 fires before rule 3 is ever reached. **The objection this has to answer, because it is a good one:** ADR 0152's rungs 1–2 *do* ship in-engine, so the engine is not silent on this cell. But that code **reports on and gates against** the platform property — it never provides it. Reporting is not implementing (§2's first guard). **NOTE:** Previously scored `fail` under rule 3 and cited here as the worked example of one. That reading was not wrong on its own terms; it answered *"does code implement the verb"* without first asking *"is the verb's subject in scope"*, and rule 1 runs first. **This cell has moved four times in eighteen days — it is CLOSED by owner decision (2026-08-02); do not re-derive it.** ⛔ It buys **no** Level 3 claim: see §2.1. |
+| **11.7.1** | `na` | **Rule 1 — the hardest call in this table, and it moved.** The verb is *"full memory encryption is in use"*: a property of the **CPU, firmware and hypervisor**, not of the software artifacts in §2. Outside the declared scope, so rule 1 fires before rule 3 is ever reached. **The objection this has to answer, because it is a good one:** ADR 0152's rungs 1–2 *do* ship in-engine, so the engine is not silent on this cell. But that code **reports on and gates against** the platform property — it never provides it. Reporting is not implementing (§2's first guard). **NOTE:** Previously scored `fail` under rule 3 and cited here as the worked example of one. That reading was not wrong on its own terms; it answered *"does code implement the verb"* without first asking *"is the verb's subject in scope"*, and rule 1 runs first. **This cell has moved four times in eighteen days — it is CLOSED by owner decision (2026-08-02); do not re-derive it.** ⛔ It buys **no** Level 3 claim: see §2.1. |
 | **3.7.3** | `pass` | **Rule 4 — and this row is CORRECTED 2026-08-16.** It stood here as the table's worked example of a rule-3 `fail`, on the reasoning that there was *one off-site navigation, a bare 303, no interstitial and no cancel*. That described the code accurately when it was written. The interstitial was then **built**, and the record has carried this cell as `pass` since 2026-08-03 while this row went on saying `fail` — a worked example teaching the wrong answer for thirteen days. `[security].external_link_interstitial` ships `True` and `[security].organization_domains` ships **empty**, which is the strict position, so every absolute off-site destination is interstitialed out of the box and the verb is satisfied by a shipped default (`messagefoundry/config/settings.py:3743,3746`). **No live worked example of rule 3 remains in this table** — 5.4.3 and 11.7.1 both left it under rule 1 — and that is said plainly rather than patched with a substitute, because a stale example is worse than a missing one. |
 | **10.5.5** | `na` | Rule 1. The requirement is conditional — *"**when using** OIDC back-channel logout"* — and the precondition is false and unreachable by configuration. **Building it would create applicability.** |
 | **12.2.2** | `na` | Rule 1. No external-facing services on the declared scope. *Also a scoping error worth remembering: this row spent months scoring 12.3.1's verb.* |
@@ -170,11 +170,41 @@ These are the real disputes. They are here so the next assessor reaches the same
 
 Per ASVS's guidance, stated as what **is** included rather than what is excluded.
 
-**Included:** the MessageFoundry engine, the web console, and the IDE extension, assessed as source,
-at a named commit, against **all 345 ASVS 5.0.0 requirements** at **Level 3**.
+**Included:** the MessageFoundry engine, the web console, the IDE extension, the test harness
+(`harness/`, distributed separately as the harness wheel), and the operator-run scripts, assessed as
+source, at a named commit, against **all 345 ASVS 5.0.0 requirements** at **Level 3**. The
+operator-run scripts are `scripts/service/`, less the one file named below, and any script the
+operator documentation tells a deployer to run; the rest of `scripts/` (CI, development, ASVS, benchmark, coordination and release
+tooling) is not included, and neither is `tee/`, the tee relay.
+
+Each part of that rests on an owner ruling of 2026-10-02, recorded in the vault as
+`docs/security/ASVS-OWNER-RULINGS-2026-10-02-1130.md`:
+
+* **R1** brought the harness in.
+* **R3** answered *"Only operator-run"* for `scripts/`, choosing the option the scope sentence above
+  states. Outside `scripts/service/`, its excluded kinds are categories of function, not directory
+  names, so a script elsewhere is classified by whether the operator documentation tells a deployer
+  to run it, not by the folder it sits in.
+* **R4** answered *"No"* for `tee/`, the tee relay. It ships in no wheel, and it is outside the
+  scope although `docs/TEE-RELAY.md` tells a site to run it.
+
+**Two files are classified by a Manager's reading, not by the owner, and the owner may overrule
+it.** That reading is recorded in the same vault file, under R3. Both are out:
+
+* `scripts/service/measure-store-access.ps1` sits under `scripts/service/`, but
+  `docs/DANGEROUS-FUNCTIONALITY.md` calls it *"A CI measurement, not a deployment step"*. That
+  document also says how to run it, on a disposable host, which a later reading may weigh
+  differently.
+* `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate. The engine's
+  `messagefoundry/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
+  engine code path calls that check. `anon/leak.py` itself, and the hazard of a by-path load, are
+  engine code and stay inside the scope through the engine. **The reading covers engine call paths
+  only.** The harness's `CaptureSink` takes an optional anonymizer, and its code comment suggests
+  wiring `anonymize_checked` there, which would reach the same load from the harness. The vault file
+  names that wiring as a reason to revisit this reading; until someone does, treat it as open.
 
 **The boundary that phrase implies, stated explicitly because it decides verdicts.** The subject of
-this assessment is those three **software artifacts**. It is not the host, the hypervisor, the CPU, the
+this assessment is those five **software artifacts**. It is not the host, the hypervisor, the CPU, the
 firmware, or the network the operator deploys onto. Where a requirement's **verb** names a property of
 that substrate rather than of the software, the requirement is outside the declared scope and takes
 `na` under rule 1 — with the rationale written, as always.

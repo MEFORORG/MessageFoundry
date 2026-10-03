@@ -118,6 +118,84 @@ def test_the_sink_answers_its_configured_status_and_still_records_the_attempt() 
     assert sop_instance_uid(records[0].payload) == uids[0]
 
 
+def _grown(payload: bytes, filler: int, *, deflated: bool = False) -> bytes:
+    """``payload`` grown by one zero-filled OB element (no PHI; nothing reads it), optionally saved as
+    Deflated Explicit VR LE so it is small on the wire and large once inflated."""
+    from io import BytesIO
+
+    from pydicom import dcmread
+    from pydicom.uid import DeflatedExplicitVRLittleEndian
+
+    ds = dcmread(BytesIO(payload))
+    ds.EncapsulatedDocument = b"\x00" * filler  # (0042,0011) OB
+    if deflated:
+        ds.file_meta.TransferSyntaxUID = DeflatedExplicitVRLittleEndian
+    out = BytesIO()
+    ds.save_as(out, enforce_file_format=True)
+    return out.getvalue()
+
+
+def test_the_sink_cap_defaults_to_the_engine_message_cap() -> None:
+    from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+
+    assert DimseSink().max_object_bytes == DEFAULT_MAX_MESSAGE_BYTES
+    with pytest.raises(ValueError, match="positive"):
+        DimseSink(max_object_bytes=0)
+
+
+def test_the_sink_refuses_an_over_cap_object_before_decode_and_records_the_refusal() -> None:
+    """ASVS 5.1.1: an object over ``max_object_bytes`` is answered CANNOT_UNDERSTAND whatever status
+    the sink was told to give, recorded with an empty payload and a reason, and never decoded. The
+    first object, under the cap, is the positive control on the same association settings."""
+    (small,), (small_uid,) = make_datasets(1)
+    (base,), (big_uid,) = make_datasets(1)
+    big = _grown(base, 64 * 1024)
+    with DimseSink(max_object_bytes=len(small) + 1024) as sink:
+        out = _driver_for(sink).inject([small, big])
+        records = sink.wait_for(lambda rs: len(rs) == 2, 5.0)
+    assert [status_of(o) for o in out] == [0, CANNOT_UNDERSTAND]
+    assert sop_instance_uid(records[0].payload) == small_uid and "refused" not in records[0].meta
+    assert records[1].payload == b""
+    assert records[1].meta["sop_instance_uid"] == big_uid
+    assert records[1].meta["status"] == f"{CANNOT_UNDERSTAND:04X}"
+    assert "-byte cap; not decoded" in records[1].meta["refused"]
+    assert "decode_error" not in records[1].meta
+
+
+def test_the_sink_charges_the_re_encoded_object_too() -> None:
+    """The raw Data Set leaves out the preamble, DICM and file meta, so an object can pass the raw
+    charge and still be over the cap once re-encoded; the engine's SCP charges both, and so does this."""
+    (payload,), _ = make_datasets(1)
+    with DimseSink(max_object_bytes=len(payload) - 1) as sink:
+        (out,) = _driver_for(sink).inject([payload])
+        (record,) = sink.wait_for(lambda rs: len(rs) == 1, 5.0)
+    assert status_of(out) == CANNOT_UNDERSTAND
+    assert record.payload == b"" and "re-encoded" in record.meta["refused"]
+
+
+def test_the_sink_refuses_a_deflated_object_that_inflates_past_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Deflated object small on the wire is inflated in bounded memory before decode; one that
+    inflates past the inflate ceiling is refused. The ceiling is lowered so the test object stays
+    small; the sink reads it when the object arrives, as the engine's SCP does."""
+    import harness.sinks.dimse as dimse_sink
+
+    mib = 1024 * 1024
+    monkeypatch.setattr(dimse_sink, "DEFAULT_MAX_INFLATED_BYTES", mib)
+    (base,), _ = make_datasets(1)
+    bomb = _grown(base, 2 * mib, deflated=True)
+    under = _grown(base, mib // 2, deflated=True)
+    assert len(bomb) < mib, "only its inflate is large"
+    with DimseSink() as sink:
+        out = _driver_for(sink).inject([under, bomb])
+        records = sink.wait_for(lambda rs: len(rs) == 2, 10.0)
+    assert [status_of(o) for o in out] == [0, CANNOT_UNDERSTAND]
+    assert records[0].payload and "refused" not in records[0].meta
+    assert records[1].payload == b""
+    assert records[1].meta["refused"] == f"inflates past the {mib}-byte cap; not decoded"
+
+
 def test_the_sink_refuses_an_association_addressed_to_another_ae() -> None:
     """Negative control: the sink requires its own AE title, so the graph's called_ae_title is
     load-bearing, not decoration."""

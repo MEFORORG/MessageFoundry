@@ -2003,8 +2003,12 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
         "Nor is the mTLS service-identity plane: a certificate identity is admitted on one route "
         "only, `GET /service/identity`",
         "why neither AD nor mTLS is a third",
-        "An account that has enrolled a factor still owes it under either setting; an OIDC sign-in "
-        "meets it while `[auth].oidc_require_mfa_claim` is on, the default.",
+        # An enrolled factor binds only while it is kept: with the requirement off, or outside the
+        # scope, the removal guards (_mfa_required_for with second_factor_enrolled=False) let the
+        # holder remove the last one.
+        "An account that has enrolled a factor owes it while it keeps one, under either setting, "
+        "and an OIDC sign-in meets it while `[auth].oidc_require_mfa_claim` is on, the default.",
+        "the holder may remove its last factor.",
     ):
         assert token in security, f"docs/SECURITY.md must state {token!r} (BACKLOG #1133)."
     local_row = next(r for r in _primary_table()[1:] if r[0].startswith("**Local**"))

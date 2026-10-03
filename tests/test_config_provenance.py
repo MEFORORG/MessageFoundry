@@ -119,8 +119,6 @@ async def test_provenance_drift_compares_the_digests_in_constant_time(
     """
     import hmac
 
-    import messagefoundry.api.app as app_mod
-
     cfg = tmp_path / "cfg"
     _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
     assert (await client.post("/config/reload", json={"config_dir": str(cfg)})).status_code == 200
@@ -137,7 +135,9 @@ async def test_provenance_drift_compares_the_digests_in_constant_time(
     assert (await client.get("/config/provenance")).json()["drift"] is False
     assert (loaded_fp, loaded_fp) in seen, f"the drift compare never reached compare_digest: {seen}"
 
-    monkeypatch.setattr(app_mod, "config_fingerprint_detail", lambda _target: {})
+    monkeypatch.setattr(
+        "messagefoundry.config.fingerprint.config_fingerprint_detail", lambda _target: {}
+    )
     assert (await client.get("/config/provenance")).json()["drift"] is True
 
 

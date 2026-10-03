@@ -27,8 +27,15 @@ import json
 import sys
 from pathlib import Path
 
-from harness.frame_cap import max_frame_bytes_arg
-from harness.reconcile.compare import DEFAULT_KEY, ReconcileResult, load_messages, reconcile
+from harness.frame_cap import max_frame_bytes_arg, positive_bytes_arg
+from harness.reconcile.compare import (
+    DEFAULT_KEY,
+    DEFAULT_MAX_LOAD_FILE_BYTES,
+    LoadError,
+    ReconcileResult,
+    load_messages,
+    reconcile,
+)
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
 from messagefoundry.console_streams import harden_console_streams
@@ -83,9 +90,22 @@ async def _run_capture(args: argparse.Namespace) -> int:
 
 
 def _run_compare(args: argparse.Namespace) -> int:
+    try:
+        mefor = load_messages(args.mefor, max_file_bytes=args.max_file_bytes)
+        corepoint = load_messages(args.corepoint, max_file_bytes=args.max_file_bytes)
+    except LoadError as exc:
+        hint = "; --max-file-bytes changes the cap" if exc.over_cap else ""
+        print(f"compare: {exc}{hint}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        # Unreadable or undecodable input is exit 2 too: 1 means "the outputs differ". A malformed
+        # JSONL line is a LoadError above, which names the line and never its content.
+        # By class only: a decode or JSON error can quote the input, which may be a message.
+        print(f"compare: an input could not be read ({type(exc).__name__})", file=sys.stderr)
+        return 2
     result: ReconcileResult = reconcile(
-        load_messages(args.mefor),
-        load_messages(args.corepoint),
+        mefor,
+        corepoint,
         connection=args.connection,
         key=args.key,
         rules=_rules_from_args(args),
@@ -155,6 +175,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     cmp.add_argument("--ignore-segment", action="append", help="segment id dropped from both sides")
     cmp.add_argument("--report-json", help="write the structured report here")
+    cmp.add_argument(
+        "--max-file-bytes",
+        type=positive_bytes_arg,
+        default=DEFAULT_MAX_LOAD_FILE_BYTES,
+        help="largest input file read; a bigger one is refused, never read whole "
+        "(default: %(default)s, 64 times the engine's per-message cap)",
+    )
 
     args = parser.parse_args(argv)
     if args.cmd == "capture":

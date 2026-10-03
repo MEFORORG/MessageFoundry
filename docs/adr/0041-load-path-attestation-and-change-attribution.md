@@ -90,7 +90,10 @@ Add the attribution + runtime-integrity layer on top of ADR 0036. Three sub-deci
 ### D1 — Config fingerprint in the reload (and startup) audit  *(built in this change)*
 
 Record a **content fingerprint** of the loaded bundle in the `config_reload` / `config_reload_check`
-audit detail (and, as a follow-on, a `service_started` row at boot). The fingerprint is a stable SHA-256
+audit detail, and in a `config_loaded` row at each start. *(The start row was drafted here as a
+`service_started` follow-on and was not written until vault BACKLOG #2597; it carries the same
+fingerprint, the active `security_loosenings()` switches, and the engine shard and cluster node, and
+it sets the baseline `GET /config/provenance` compares against.)* The fingerprint is a stable SHA-256
 over the **content** of every file the loader consumes — all `*.py` (**including `_*.py` helpers**, the
 same candidate set ADR 0036 scans), `connections.toml`, `codesets/*`, and `environments/*.toml` —
 order-independent and **path-relative** (a per-file `relpath + sha256(bytes)` Merkle fold, scheme-versioned

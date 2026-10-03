@@ -575,6 +575,16 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         "oidc_client_id",
         "oidc_client_secret",
         "oidc_client_secret_ref",
+        # BACKLOG #296: how the engine authenticates ITSELF to the token endpoint, and with what key.
+        # They decide what the engine presents to the IdP, not whether a request it receives is allowed.
+        "oidc_token_endpoint_auth_method",
+        "oidc_client_private_key",
+        "oidc_client_private_key_ref",
+        "oidc_client_private_key_password",
+        "oidc_client_assertion_algorithm",
+        "oidc_client_assertion_key_id",
+        "oidc_client_assertion_audience",
+        "oidc_client_certificate",
         "oidc_authorization_endpoint",
         "oidc_token_endpoint",
         "oidc_jwks_uri",
