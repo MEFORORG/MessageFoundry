@@ -141,7 +141,9 @@ this originally read "remote/https", see the amendment below*. Multi-shard /
 `supervise` is **unsupported-and-detected**. Open Console = `os.startfile(url + "/ui")`, gated by the /ui probe;
 Open Repo = the resolved `code` CLI on `repo_path`; both disable cleanly when unavailable. Launch / autostart pin
 the **absolute repo-venv `pythonw.exe`** (the real risk is the *wrong interpreter*, not cwd — the editable
-install exposes the repo root on `sys.path`), self-healing a stale Run-key value; autostart is **opt-in**. Single
+install exposes the repo root on `sys.path` -- *superseded for autostart by the 2026-10-02 amendment's
+vault BACKLOG #2822 and #2837 note: the working directory is a risk too, and the login start now
+carries `-P`*), self-healing a stale Run-key value; autostart is **opt-in**. Single
 instance via a `Local\` mutex; `NIM_DELETE` in `finally` and on `WM_ENDSESSION`; a top-level crash handler that
 logs, removes the icon, and exits nonzero; `TaskbarCreated` re-add.
 
@@ -408,3 +410,23 @@ is accepted because `childenv` imports only the standard library, so it brings n
 tray must never import. `tests/test_tray_branding.py` pins the command line and the environment.
 
 The **Must never import** list is unchanged.
+
+**Narrowed the same day by vault BACKLOG #2822 and #2837.** Autostart's login command now carries
+`childenv.CHILD_INTERPRETER_FLAGS`. An engine installed into site-packages gets the short
+`-m messagefoundry.tray` form. A checkout, editable installs included, keeps the bootstrap script,
+which pins the build by its location. So the login start no longer depends on the folder Windows
+starts it in. The bootstrap form can pass the 260 characters Microsoft documents for a Run value,
+and enabling then refuses. `docs/DANGEROUS-FUNCTIONALITY.md` section 3 holds both forms, the
+measurements and the refusal.
+
+The limit above now holds only for a tray started by hand, as `messagefoundry-tray` or
+`pythonw -m messagefoundry.tray`. **That limit stays, by decision: this item does not route a hand
+start through the bootstrap or give it the options.** `docs/DANGEROUS-FUNCTIONALITY.md` section 3
+says what a hand start keeps, with the measurement. Its section 4 says what the login start still
+inherits from the user's environment.
+
+`tests/test_tray_shell.py` pins both forms, reads each back through Windows' own parser, and pins
+the 260-character refusal.
+`tests/test_tray_branding.py` starts a real process from that command, and a real branded child
+through `relaunch_branded`. `tests/test_dependency_boundaries.py` pins what `tray.branding`,
+`tray.autostart` and the bootstrap import, on every interpreter, the 3.14 floor included.
