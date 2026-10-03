@@ -65,7 +65,7 @@ send the Handler's body outside the organisation through a permitted relay.
 - **The transport sends to the checked list.** `EmailDestination` passes the same
   `envelope_recipients` list to `send_message` as `to_addrs`, so a header added later cannot
   widen the RCPT set past what the gate saw.
-- **Not covered: the envelope sender.** Bounces go to `sender`, and the list does not gate it.
+- **The envelope sender gets the address rule, not the domain list.** Bounces go to `sender`. Construction holds it to the same plain-address rule as each recipient, builds `From:` from the checked text, and passes that text to `send_message` as `from_addr`, so `smtplib` never derives `MAIL FROM` from a parse of the header (vault BACKLOG #2841). The list does not gate its domain; whether it should is an open question.
 - **Deny-by-default on its own terms.** An empty list refuses every EMAIL destination, whatever
   `[security].block_unlisted_outbound` says. This is the `allowed_proxy` shape, not D4's opt-in shape: a
   permissive-when-empty recipient list would leave the gate off on exactly the default posture.

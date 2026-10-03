@@ -131,8 +131,8 @@ def envelope_address_problem(address: str) -> str | None:
     size limits: a dot-separated local part of :data:`_LOCAL_ATEXT` that does not start with ``-``,
     and a hostname-shaped domain. ``smtplib`` writes an address it cannot re-read onto the
     ``RCPT TO`` line raw, so anything looser could put a mailbox there that is not the one checked.
-    Both the ``[egress]`` recipient-domain check and construction call this. The text names no part
-    of the address."""
+    Both the ``[egress]`` recipient-domain check and construction call this, and construction
+    applies it to the sender too, which is ``MAIL FROM``. The text names no part of the address."""
     if parseaddr(address)[1] != address:
         return "does not read back as the same address"
     local, at, domain = address.rpartition("@")
@@ -188,8 +188,14 @@ class EmailDestination(DestinationConnector):
             # alphabet covers, plus three outside it, named in _UNICODE_LINE_BREAKS.
             if has_control_char(value) or any(ch in _UNICODE_LINE_BREAKS for ch in value):
                 raise ValueError(f"Email destination '{name}' holds a control character")
-        # Build the To: addresses once, refusing a mismatch here rather than at send time.
-        self._to_addresses = self._to_header()
+        # The sender is MAIL FROM, where bounces go, so it gets the recipients' rule: one plain
+        # address that reads back unchanged (vault BACKLOG #2841). Its domain is not gated.
+        problem = envelope_address_problem(self.sender)
+        if problem is not None:
+            raise ValueError(f"Email destination: the sender {problem}")
+        # Build the From: and To: addresses once, refusing a mismatch here rather than at send time.
+        self._from_addresses = self._checked_header("From", [self.sender], "sender")
+        self._to_addresses = self._checked_header("To", self._envelope, "recipients")
         username = s.get("username")
         password = s.get("password")
         self.username: str | None = str(username) if username else None
@@ -364,8 +370,10 @@ class EmailDestination(DestinationConnector):
         await asyncio.to_thread(self._send, payload)
         return None
 
-    def _to_header(self) -> list[Address]:
-        """The ``To:`` addresses, built from the checked envelope list rather than the raw setting.
+    @staticmethod
+    def _checked_header(field: str, checked: list[str], what: str) -> list[Address]:
+        """The ``From:`` or ``To:`` addresses, built from checked address strings rather than from
+        the raw setting.
 
         ``policy.default`` still parses whatever a header is given, Address objects included, and
         that parser decodes RFC 2047 encoded words. Two things keep it from naming an unchecked
@@ -376,12 +384,12 @@ class EmailDestination(DestinationConnector):
         closed at construction instead of reaching the wire."""
         addresses = [
             Address(username=local, domain=domain)
-            for local, _, domain in (address.rpartition("@") for address in self._envelope)
+            for local, _, domain in (address.rpartition("@") for address in checked)
         ]
         probe = EmailMessage()
-        probe["To"] = addresses
-        header = probe["To"]
-        expected = ", ".join(self._envelope)
+        probe[field] = addresses
+        header = probe[field]
+        expected = ", ".join(checked)
         # Folding breaks the line only after a comma, so dropping each CRLF leaves the joined text.
         written = [
             header.fold(policy=pol).partition(":")[2].replace("\r\n", "").strip()
@@ -389,14 +397,14 @@ class EmailDestination(DestinationConnector):
         ]
         if str(header) != expected or any(text != expected for text in written):
             raise ValueError(
-                "Email destination: the To header does not match the checked recipients"
+                f"Email destination: the {field} header does not match the checked {what}"
             )
         return addresses
 
     def _build_message(self, payload: str) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = self.subject
-        msg["From"] = self.sender
+        msg["From"] = self._from_addresses
         msg["To"] = self._to_addresses
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
@@ -446,7 +454,9 @@ class EmailDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="EMAIL outbound",
                     )
-                smtp.send_message(msg, to_addrs=self._envelope)
+                # Both halves of the envelope are passed explicitly. Left to itself, smtplib derives
+                # MAIL FROM from a parse of the From header, which decodes encoded words.
+                smtp.send_message(msg, from_addr=self.sender, to_addrs=self._envelope)
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --
