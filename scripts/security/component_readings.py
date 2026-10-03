@@ -11,9 +11,12 @@ exposure. This script supplies the other reading: each component measured on tho
 public metadata only.
 
 THE POPULATION is every name in ``security/runtime-closure-sqlserver.txt``: the core runtime closure
-plus the two names the ``sqlserver`` extra adds, which is everything the page assesses. It is the
-whole assessed closure, not only the designated set, because a component can be risky by maintenance
-or history even where the exposure criterion did not designate it.
+plus the two names the ``sqlserver`` extra adds. It is not only the designated set, because a
+component can be risky by maintenance or history even where the exposure criterion did not designate
+it. It is NOT everything the page assesses: the names ``security/runtime-closure-harness.txt`` adds
+are outside it, and the page's ``harness`` section reads them by hand and names what it did not
+read. ``tests/test_risky_component_designation.py`` goes red when a reading of one of them appears,
+so the page's account of that gap is rewritten in the same change.
 
 THE SOURCES, and nothing else:
 
@@ -596,9 +599,10 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         "### What is read, and the test for each example",
         "",
         f"All {size} distributions in the `sqlserver` closure are read: the {core} in the core "
-        f"closure and the {size - core} the extra adds. That is the whole assessed set, not only "
-        "the designated part. A library can be risky on these examples even where the tiers did "
-        "not designate it.",
+        f"closure and the {size - core} the extra adds. That is not only the designated part. A "
+        "library can be risky on these examples even where the tiers did not designate it. The "
+        "names the `harness` extra adds are not in this snapshot. The `harness` section above "
+        "reads them itself, and says what it could not read.",
         "",
         "| Example | A component is risky on it when | Source |",
         "|---|---|---|",

@@ -7,7 +7,8 @@ Each closure file is a denominator for ``docs/RISKY-COMPONENTS.md``. Its pin lin
 exported lock, one ``name==version`` per package, sorted, with markers and hashes dropped:
 
 * ``security/runtime-closure-core.txt`` copies ``docker/locks/requirements-core.lock``;
-* ``security/runtime-closure-sqlserver.txt`` copies ``docker/locks/requirements-sqlserver.lock``.
+* ``security/runtime-closure-sqlserver.txt`` copies ``docker/locks/requirements-sqlserver.lock``;
+* ``security/runtime-closure-harness.txt`` copies ``security/locks/requirements-harness.lock``.
 
 ``tests/test_risky_component_designation.py`` holds each copy to its lock, and uses this module to
 do it, so the gate and the regenerator read a lock the same way.
@@ -40,12 +41,16 @@ CLOSURE = ROOT / "security" / "runtime-closure-core.txt"
 CORE_LOCK = ROOT / "docker" / "locks" / "requirements-core.lock"
 SQLSERVER_CLOSURE = ROOT / "security" / "runtime-closure-sqlserver.txt"
 SQLSERVER_LOCK = ROOT / "docker" / "locks" / "requirements-sqlserver.lock"
+HARNESS_CLOSURE = ROOT / "security" / "runtime-closure-harness.txt"
+#: Not under docker/locks: no image installs it. It exists to be the harness closure's source.
+HARNESS_LOCK = ROOT / "security" / "locks" / "requirements-harness.lock"
 
 #: Each closure file and the lock it copies. A run with no arguments rewrites all of them, which is
 #: what the Dependabot lock-resync workflow relies on.
 PAIRS: tuple[tuple[Path, Path], ...] = (
     (CLOSURE, CORE_LOCK),
     (SQLSERVER_CLOSURE, SQLSERVER_LOCK),
+    (HARNESS_CLOSURE, HARNESS_LOCK),
 )
 
 #: A plain pin at the start of a lock line: a PEP 508 name, ``==`` but never ``===``, then a version
