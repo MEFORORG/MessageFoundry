@@ -62,6 +62,26 @@ def test_drop_worker_writes_pollable_files(qapp: Any, tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*.part"))  # temp files cleaned up by the atomic rename
 
 
+def test_drop_worker_keeps_a_traversal_control_id_inside_the_directory(
+    qapp: Any, tmp_path: Path
+) -> None:
+    # The control id is the message's own MSH-10 (ASVS 5.3.2): it once joined onto the directory raw.
+    inner = tmp_path / "inner"
+    items = [
+        SendItem(1, "ADT", "A01", "../escaped", _MSG),
+        SendItem(2, "ADT", "A01", "/abs/x", _MSG),
+        SendItem(3, "ADT", "A01", "", _MSG),
+    ]
+    results: list[Any] = []
+    worker = FileDropWorker(str(inner), items, rate=0.0)
+    worker.result.connect(results.append)
+    worker.run()
+
+    assert [r.error for r in results] == ["", "", ""]
+    assert sorted(p.name for p in inner.iterdir()) == ["_abs_x.hl7", "_escaped.hl7", "message.hl7"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["inner"]
+
+
 def test_watcher_reports_new_files_only(qapp: Any, tmp_path: Path) -> None:
     (tmp_path / "old.hl7").write_text(_MSG, encoding="utf-8")  # pre-existing: must be ignored
     watcher = FolderWatcher()
