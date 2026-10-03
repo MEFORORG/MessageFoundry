@@ -139,6 +139,8 @@ __all__ = [
     "KEYLESS_REFUSED_BY_NO_OPT_OUT",
     "KEYLESS_REFUSED_BY_NO_STRICT_ACK",
     "KEYLESS_REFUSED_BY_UNREAD_KEY",
+    "OIDC_SECOND_FACTOR_CLAIM_EXCEPTION",
+    "oidc_second_factor_claim_exception",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -6802,6 +6804,29 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     return out
 
 
+#: The one sign-in that proves a second factor without an enrolled one, worded once for the MFA
+#: advisories here and the exposure texts in ``__main__._serve``. ``_check_mfa_gate`` checks the
+#: amr/acr claim, and the OIDC mint stamps the session verified, only while this setting is on.
+#: Neither this name nor the helper's below may hold ``mfa`` as a separate word. CodeQL reads such a
+#: name as a password source (the ``mfa_verify_min_elapsed_seconds`` note above, same cause), so
+#: every log line carrying this fixed sentence would raise ``py/clear-text-logging-sensitive-data``.
+OIDC_SECOND_FACTOR_CLAIM_EXCEPTION = (
+    "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
+)
+
+
+def oidc_second_factor_claim_exception(auth: AuthSettings) -> str:
+    """``", unless <OIDC_SECOND_FACTOR_CLAIM_EXCEPTION>"`` when THIS instance has that exception,
+    else ``""``.
+
+    For the startup texts, which describe one running config rather than a switch. With OIDC off, or
+    with the claim gate off, every OIDC session mints unverified, so naming the exception there would
+    tell an auditor reading the AUDIT line that OIDC users are covered when none are."""
+    if auth.oidc_enabled and auth.oidc_require_mfa_claim:
+        return f", unless {OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}"
+    return ""
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -7034,9 +7059,9 @@ def security_loosenings(
             (
                 "require_mfa",
                 "an account with no second factor enrolled is single-factor, so a Kerberos session "
-                "enters on a ticket that asserts no strength. An enrolled account must still "
-                "satisfy its factor, and an OIDC sign-in still needs a checked amr/acr claim while "
-                "[auth].oidc_require_mfa_claim is on",
+                "enters on a ticket that asserts no strength. An enrolled account owes its factor "
+                "only while it keeps one, and its holder may remove the last. Where "
+                f"{OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}, that claim stands in for the enrolled factor",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7046,9 +7071,8 @@ def security_loosenings(
             (
                 "require_mfa_scope",
                 "a local account without the Administrator role is single-factor until it enrolls "
-                "a second factor. Administrators and directory accounts still owe one; an OIDC "
-                "sign-in meets it with an amr/acr claim checked while "
-                "[auth].oidc_require_mfa_claim is on",
+                "a second factor. Administrators and directory accounts still owe one, unless "
+                f"{OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:
@@ -7058,7 +7082,7 @@ def security_loosenings(
                 "an EXPOSED instance under enforcement = enforce may start with "
                 "[security].require_mfa off, on an audited warning instead of the refusal. Every "
                 "account with no second factor enrolled is then single-factor over the network, "
-                "unless an OIDC sign-in carries a checked amr/acr claim",
+                f"unless {OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}",
             )
         )
     if not sec.encrypt_stored_data:
