@@ -13,6 +13,7 @@ start a forged ``PASS`` line.
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import unicodedata
 from pathlib import Path
@@ -144,9 +145,16 @@ def _b64u_uint(v: int) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
+@functools.cache
+def _public_numbers() -> rsa.RSAPublicNumbers:
+    # One key for the whole file; the key id is what these tests vary, not the key.
+    return (
+        rsa.generate_private_key(public_exponent=65537, key_size=3072).public_key().public_numbers()
+    )
+
+
 def _jwks(kid: str) -> bytes:
-    numbers = rsa.generate_private_key(public_exponent=65537, key_size=3072).public_key()
-    n = numbers.public_numbers()
+    n = _public_numbers()
     key = {"kty": "RSA", "kid": kid, "use": "sig", "alg": "RS256", "n": _b64u_uint(n.n)}
     key["e"] = _b64u_uint(n.e)
     return json.dumps({"keys": [key]}).encode()
@@ -167,15 +175,6 @@ def test_verify_console_escapes_a_hostile_jwks_kid_and_keeps_the_em_dash() -> No
     assert len(console.splitlines()) == 2 + 2
 
 
-def test_verify_reports_on_disk_keep_the_value_as_it_was() -> None:
-    # The JSON and Markdown reports are files, not a terminal, and this change leaves them as they
-    # were. That is a statement of scope, not a claim that the Markdown table is safe: it escapes
-    # only "|", so a newline in a detail still starts a row of its own there.
-    row = CheckResult("fed.jwks", "JWKS", Status.PASS, f"1 key(s): {_HOSTILE}")
-    assert json.loads(render_json([row]))["results"][0]["detail"] == row.detail
-    assert row.detail in render_markdown([row])
-
-
 def test_verify_console_leaves_every_engine_detail_without_peer_text_alone() -> None:
     rows = [
         CheckResult("host.python", "Python 3.14+", Status.PASS, "3.14.0 \u2014 ok"),
@@ -187,6 +186,78 @@ def test_verify_console_leaves_every_engine_detail_without_peer_text_alone() -> 
     assert "title with \u00e9" in console
     assert "C:\\Program Files\\app" in console
     assert "C:\\Users\\svc not writable" in console
+
+
+def test_verify_json_report_keeps_the_value_as_it_was() -> None:
+    # The JSON report is data, not a terminal or a rendered page, so it carries the value whole.
+    row = CheckResult("fed.jwks", "JWKS", Status.PASS, f"1 key(s): {_HOSTILE}")
+    assert json.loads(render_json([row]))["results"][0]["detail"] == row.detail
+
+
+def _table_rows(md: str) -> list[str]:
+    return [line for line in md.splitlines() if line.startswith("|")][2:]  # past header + rule
+
+
+def test_verify_markdown_neutralises_a_hostile_jwks_kid_in_one_row() -> None:
+    from messagefoundry.verify.federation import _jwks_row
+
+    kid = (
+        f"{_HOSTILE}\n| fed.replay | forged | PASS | ok |\r"
+        "<img src=x onerror=alert(1)>&#x202e;![x](https://e.invalid/b.png)"
+        "`<b>`$\\color{green}PASS$a\\|b"
+    )
+    _keys, row = _jwks_row(_jwks(kid))
+    assert kid in row.detail  # the RESULT keeps the value
+    # The same text as a title too: every cell gets the rule, not only the detail.
+    md = render_markdown([CheckResult(row.id, kid, row.status, row.detail)])
+    rows = _table_rows(md)
+    assert len(rows) == 1  # the kid's newline did not start a forged row
+    # Four cells and no more: every pipe the peer sent, even after its own backslash, is inert.
+    assert rows[0].count("|") == 5
+    assert not any(ch in md for ch in "\x1b\u009b\u202e\u2066\r<")
+    assert not any(ch in rows[0] for ch in "`$")  # the header keeps its own code span
+    for cell in rows[0].split(" | ")[1::2]:  # the title and the detail
+        assert _HOSTILE_SHOWN in cell
+        assert "\\x0a&#124; fed.replay &#124; forged" in cell
+        assert "&lt;img src=x onerror=alert(1)&gt;" in cell
+        assert "&amp;#x202e;" in cell  # a peer's reference cannot decode to the control
+        assert "![x]&#40;https://e.invalid/b.png)" in cell  # no image to fetch on view
+        assert "&#96;&lt;b&gt;&#96;" in cell  # no code span, so the references still decode
+        assert (
+            "&#36;\\color{green}PASS&#36;" in cell
+        )  # no math; a backslash before a letter is kept
+        assert "a\\\\&#124;b" in cell  # doubled, so Markdown shows the one backslash sent
+
+
+def test_verify_markdown_leaves_ordinary_engine_text_readable() -> None:
+    rows = [
+        CheckResult("host.python", "Python 3.14+", Status.PASS, "3.14.0 \u2014 ok"),
+        CheckResult("host.writable", "w", Status.FAIL, "C:\\Users\\svc not writable"),
+        CheckResult("store.path", "t", Status.FAIL, "check [store].path; RECEIVED->ROUTED"),
+        CheckResult("store.connect", "t", Status.FAIL, "run `messagefoundry serve` once"),
+    ]
+    md = render_markdown(rows)
+    assert "| host.python | Python 3.14+ | PASS | 3.14.0 \u2014 ok |" in md
+    assert "| C:\\Users\\svc not writable |" in md
+    assert "check [store].path; RECEIVED-&gt;ROUTED" in md
+    # The engine's own code span renders as plain backticks: a code span would stop the references
+    # inside it from decoding, so no cell may open one.
+    assert "run &#96;messagefoundry serve&#96; once" in md
+    assert len(_table_rows(md)) == 4
+
+
+@pytest.mark.parametrize(
+    ("text", "written"),
+    [
+        ("\\\\srv\\share", "\\\\\\\\srv\\share"),  # a UNC path renders as typed
+        ("MSH|^~\\&|", "MSH&#124;^~\\\\&amp;&#124;"),  # the backslash before & survives
+        ("p\\", "p\\"),  # a lone trailing backslash is literal already
+    ],
+)
+def test_verify_markdown_doubles_only_the_backslashes_markdown_would_eat(
+    text: str, written: str
+) -> None:
+    assert f"| {written} |" in render_markdown([CheckResult("a", "t", Status.PASS, text)])
 
 
 # --- harness one-line verdicts ------------------------------------------------------------------

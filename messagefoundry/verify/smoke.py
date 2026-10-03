@@ -204,8 +204,8 @@ def smoke_self(
         # An unknown `--inbound` name or a config with no inbound is a defect, so it FAILs below.
         # `_classify_self_smoke` tells an operator to re-point `--inbound`, so a typo in that remedy
         # must not read green (BACKLOG #1707). The detail names the flag, or the operator is told to
-        # choose with no word on how. NAME, not `<name>`: a Markdown report reads that as an HTML tag
-        # and drops it.
+        # choose with no word on how. NAME, not `<name>`, so a viewer that renders the detail as
+        # HTML cannot read it as a tag; the Markdown report escapes `<` now, but other sinks may not.
         return CheckResult(rid, title, Status.SKIP, f"{exc}; pass --inbound NAME to pick one")
     except (UnknownInboundError, NoInboundError) as exc:
         # Connection names and operator input only, never message content, so nothing to redact.
