@@ -537,7 +537,7 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
     4). A target delimiter that sits literally in a leaf is escaped with the target escape character.
     A separator escape (``\\F\\``, ``\\S\\``, ``\\R\\``, ``\\T\\``, ``\\E\\``) names a delimiter of
     the set it is read under, so it is decoded against the source set and re-escaped against the
-    target set; other escapes (``\\H\\``, ``\\Xhh\\`` …) keep their text under the target escape
+    target set; other escapes (``\\H\\``, ``\\Xhh\\`` and the rest) keep their text under the target escape
     character. Crucially we do **not** round-trip leaves through a general ``unescape``/``escape``
     pair (python-hl7's corrupted code points above U+007F — accented/CJK names — and would silently
     mangle PHI; the same quirk :class:`~messagefoundry.parsing.message.Message` avoids): a character
