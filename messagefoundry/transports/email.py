@@ -66,6 +66,7 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -112,6 +113,10 @@ def envelope_recipients(value: Any) -> list[str]:
 #: an address can form an RFC 2047 encoded word that a later parse would decode. An allowlist, not
 #: a denylist, so a character nobody thought of is refused rather than passed (vault BACKLOG #2616).
 _LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-^_`{}~")
+#: The line breaks ``str.splitlines()`` honours beyond C0 and DEL (NEL, LINE SEPARATOR, PARAGRAPH
+#: SEPARATOR). ``policy.default`` refuses a header value holding one, so a subject or sender with
+#: one would fail every send. The shared ``controlchars`` alphabet is deliberately blind to them.
+_UNICODE_LINE_BREAKS = frozenset("\u0085\u2028\u2029")
 #: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address.
 _MAX_LOCAL = 64
 _MAX_ADDRESS = 254
@@ -179,11 +184,9 @@ class EmailDestination(DestinationConnector):
         for name, value in (("subject", self.subject), ("sender", self.sender)):
             # A control character in a header value would raise inside _build_message at every
             # send, where it dead-letters as an internal error. Refuse it here, at load.
-            # policy.default refuses every str.splitlines() separator, which includes U+0085,
-            # U+2028 and U+2029 as well as the C0 controls, so test for both.
-            if any(
-                ord(ch) < 32 or ord(ch) == 127 or len(f"a{ch}b".splitlines()) > 1 for ch in value
-            ):
+            # policy.default refuses every str.splitlines() separator: the C0 controls the shared
+            # alphabet covers, plus three outside it, named in _UNICODE_LINE_BREAKS.
+            if has_control_char(value) or any(ch in _UNICODE_LINE_BREAKS for ch in value):
                 raise ValueError(f"Email destination '{name}' holds a control character")
         # Build the To: addresses once, refusing a mismatch here rather than at send time.
         self._to_addresses = self._to_header()
