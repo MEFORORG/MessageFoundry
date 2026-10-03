@@ -99,6 +99,7 @@ def test_relaunch_hands_over_to_a_child_started_like_every_other_python_child(
     kept = str(tmp_path / "site")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([".", kept]))
     monkeypatch.setenv("MF_2801_ORDINARY", "crosses")
+    monkeypatch.setenv("PYTHONFAULTHANDLER", "1")
     started: list[tuple[Any, dict[str, Any]]] = []
 
     class _Alive:
@@ -122,6 +123,8 @@ def test_relaunch_hands_over_to_a_child_started_like_every_other_python_child(
     env = kwargs["env"]
     assert env["PYTHONPATH"] == kept
     assert env["MF_2801_ORDINARY"] == "crosses"  # the tray keeps the user's environment
+    # ...less the one variable that stops a pythonw child with no stderr from starting.
+    assert not [name for name in env if name.upper() == "PYTHONFAULTHANDLER"]
 
 
 # --- Real children through the bootstrap (vault BACKLOG #2822) -----------------------------------
@@ -248,23 +251,43 @@ def test_the_relaunch_starts_a_real_branded_child_through_the_bootstrap(
     monkeypatch.setenv("PYTHONPATH", str(probe_dir))
     for name in _FLAG_STAND_INS:
         monkeypatch.delenv(name, raising=False)
+    # CI sets this; a pythonw child with no stderr then exits 1 before any code runs. The relaunch
+    # must drop it (vault BACKLOG #2822, PR 1962's red on windows-2022 and windows-2025).
+    monkeypatch.setenv("PYTHONFAULTHANDLER", "1")
     real_popen = subprocess.Popen
-    children: list[subprocess.Popen[bytes]] = []
+    children: list[tuple[subprocess.Popen[bytes], list[str], dict[str, Any]]] = []
 
     def _popen(argv: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
         assert argv[-1] == "messagefoundry.tray", argv
-        child = real_popen([*argv[:-1], _PROBE_MODULE, str(report)], **kwargs)  # noqa: S603
-        children.append(child)
+        probe_argv = [*argv[:-1], _PROBE_MODULE, str(report)]
+        child = real_popen(probe_argv, **kwargs)  # noqa: S603
+        children.append((child, probe_argv, kwargs))
         return child
 
     monkeypatch.setattr(subprocess, "Popen", _popen)
     monkeypatch.setattr(branding, "ensure_branded_launcher", lambda *a, **k: branded)
     try:
         branding.relaunch_branded()  # the probe may outlive the grace window or not; either is fine
-        [child] = children
-        assert child.wait(timeout=50) == 0
+        [(child, probe_argv, kwargs)] = children
+        code = child.wait(timeout=50)
+        if code != 0:
+            # The child is a pythonw copy, so it had no stderr to read. Run the same start again
+            # with stderr captured. A rerun that passes says the failure needs a missing stderr.
+            # real_popen, because subprocess.run would reach the patched Popen above.
+            again = real_popen(  # noqa: S603 - the same command line the relaunch built
+                probe_argv,
+                env=kwargs.get("env"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            _out, err = again.communicate(timeout=50)
+            pytest.fail(
+                f"branded child exited {code}; the same start with stderr captured exited "
+                f"{again.returncode}, stderr: {err[-2000:]!r}"
+            )
     finally:
-        for started in children:  # an orphan would hold the copied runtime in tmp_path open
+        for started, _argv, _kwargs in children:  # an orphan would hold tmp_path's runtime open
             if started.poll() is None:
                 started.kill()
                 started.wait(timeout=30)
