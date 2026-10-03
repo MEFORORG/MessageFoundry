@@ -1300,7 +1300,7 @@ def test_serve_refuses_exposed_without_mfa_in_prod(
     assert "require_mfa off; refusing to start" in err
     # Vault BACKLOG #2798 amendment: with require_mfa off the un-enrolled accounts are single-factor,
     # not the Administrator role alone. Vault BACKLOG #1133: this config has OIDC off, so no OIDC
-    # sign-in is an exception and the refusal must not name one (oidc_mfa_claim_exception).
+    # sign-in is an exception and the refusal must not name one (oidc_second_factor_claim_exception).
     assert (
         "every account with no second factor enrolled, Administrators included, would "
         "authenticate with a single factor over the network. Enable" in err

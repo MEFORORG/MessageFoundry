@@ -31,7 +31,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     keyless_opt_out_refusal,
     load_settings,
-    oidc_mfa_claim_exception,
+    oidc_second_factor_claim_exception,
     security_loosenings,
 )
 
@@ -463,7 +463,7 @@ def test_startup_texts_name_the_oidc_exception_only_where_it_exists(
     auth = AuthSettings.model_construct(
         oidc_enabled=oidc_enabled, oidc_require_mfa_claim=claim_gate
     )
-    assert oidc_mfa_claim_exception(auth) == expected
+    assert oidc_second_factor_claim_exception(auth) == expected
 
 
 def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:

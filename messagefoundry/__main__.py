@@ -1737,7 +1737,7 @@ def _serve(args: argparse.Namespace) -> int:
         SyslogProtocol,
         forward_hop_disposition,
         hop_posture_from_ai,
-        oidc_mfa_claim_exception,
+        oidc_second_factor_claim_exception,
         security_loosenings,
     )
     from messagefoundry.config.tls_policy import (
@@ -3141,8 +3141,8 @@ def _serve(args: argparse.Namespace) -> int:
     # single-factor admin surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
     admin_exposed = instance_exposed
     # Empty unless this config has the OIDC claim exception, so an AUDIT line never names one that
-    # does not exist here (settings.oidc_mfa_claim_exception says why).
-    oidc_exception = oidc_mfa_claim_exception(settings.auth)
+    # does not exist here (settings.oidc_second_factor_claim_exception says why).
+    oidc_exception = oidc_second_factor_claim_exception(settings.auth)
     if admin_exposed and not settings.auth.require_mfa:
         exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
