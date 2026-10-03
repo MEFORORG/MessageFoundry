@@ -150,9 +150,15 @@ open points settled below.
   `reencode`. `NegativeAckError` is a `DeliveryError`, so a caller catching the latter is
   unaffected. *Added 2026-10-02, on merging ADR 0205's repair:* MLLP's `send()` and its
   `check_frame` now share one rewrite step, `_rewrite_for_wire`, and the permanent refusal lives
-  there. So a simulate (shadow) outbound dead-letters a payload the rewrite refuses, as a live send
-  does. ADR 0205's note that shadow completes such a row, while a live send retries it, described
-  the retryable refusal this ADR replaced.
+  there. So on a single-row send a simulate (shadow) outbound dead-letters a payload the rewrite
+  refuses, as a live send does. ADR 0205's note that shadow completes such a row, while a live
+  send retries it, described the retryable refusal this ADR replaced. Two batch gaps stay open.
+  A live MLLP batch rewrites the whole envelope in `send()`, so one member the target set cannot
+  carry dead-letters every member of that batch at once; before this ADR that member was not
+  refused at all, and its leaf became structure. A shadow batch checks members with
+  `rewrite=False` and never rewrites the envelope, so it marks that batch `PROCESSED`. A
+  per-member rewrite check was
+  dropped under ADR 0205 because it refused a member with no `MSH` that the envelope carries.
 - **RemoteFileSource (rule 5): it splits, like the File source.** It reads whole files, as the File
   source does, and a remote drop is where a partner's batch file arrives: several `MSH` messages, with
   or without an `FHS`/`BHS` envelope, the shape `samples/messages/adt_batch.hl7` holds. Refusing would
