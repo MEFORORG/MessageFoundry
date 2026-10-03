@@ -6,7 +6,9 @@
     need. So is a token that can write a policy, mint a token, or export a store key.
   - One token serving both the store and the connector secrets is judged on both grants together.
   - The check reads only the token in `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN`. It
-    never uses `VAULT_TOKEN` or `~/.vault-token`. It never prints the token, its id or its accessor.
+    sends it only to the address in `MEFOR_STORE_VAULT_ADDR` or `MEFOR_SECRETS_VAULT_ADDR`. It never
+    uses `VAULT_TOKEN`, `~/.vault-token` or `VAULT_ADDR`, which the engine itself still falls back
+    to. It never prints the token, its id or its accessor.
   - For the AD bind account, it runs the LDAP "Who am I?" operation and reads the account's own
     groups. Membership of an administrative group it knows is an over-grant.
   - That proves identity and group membership, not rights. Delegated directory ACLs are not read,

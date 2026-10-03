@@ -218,7 +218,7 @@ _TRANSIT_KEY_ADMIN = (
 
 
 def vault_admin_paths(
-    required: Mapping[str, frozenset[str]], policies: Iterable[str]
+    required: Mapping[str, frozenset[str]], policies: Iterable[str], *, transit_mount: str
 ) -> tuple[str, ...]:
     """Every path to ask a token about that the engine never calls, in a fixed order.
 
@@ -231,10 +231,17 @@ def vault_admin_paths(
     for policy in policies:
         if policy != "root":  # root is judged on its own, and has no path to write
             out += [f"sys/policies/acl/{policy}", f"sys/policy/{policy}"]
+    # ``transit_mount`` is the caller's: the Transit mount the providers call, so this module stays
+    # free of the Vault provider imports.
+    prefix = f"{transit_mount}/keys/"
     for path in required:
-        mount, kind, key = (path.split("/", 2) + ["", ""])[:3]
-        if kind == "keys" and key:  # a Transit key's metadata path: <mount>/keys/<key>
-            out += [template.format(mount=mount, key=key) for template in _TRANSIT_KEY_ADMIN]
+        # Only the Transit mount's key metadata path, <mount>/keys/<key> with no further segment:
+        # a KV path whose mount happens to contain "keys" is not a Transit key.
+        key = path.removeprefix(prefix)
+        if path.startswith(prefix) and key and "/" not in key:
+            out += [
+                template.format(mount=transit_mount, key=key) for template in _TRANSIT_KEY_ADMIN
+            ]
     return tuple(dict.fromkeys(out))
 
 
@@ -394,7 +401,10 @@ def vault_hop(
             "paths the engine does not call were read only for the administrative ones; "
             "attest the rest of the policy by hand"
         )
-    return HopPrivilege(consumer.hop, state, consumer.identity, consumer.minimal, ". ".join(parts))
+    # printable() over the whole text, once, at the output boundary: a policy name reaches it inside
+    # an administrative PATH as well as in the policy list, and a per-field call misses the next one.
+    detail = printable(". ".join(parts))
+    return HopPrivilege(consumer.hop, state, consumer.identity, consumer.minimal, detail)
 
 
 def _vault_hops(
@@ -436,11 +446,14 @@ _ADMIN_WELL_KNOWN_SIDS: dict[str, str] = {
 #: different question (may this owner write the config directory, which includes the built-in
 #: Administrator ACCOUNT, RID 500), it is private, and it carries no group names to print.
 _ADMIN_DOMAIN_RIDS: dict[int, str] = {
+    498: "Enterprise Read-only Domain Controllers",
     512: "Domain Admins",
     516: "Domain Controllers",
     518: "Schema Admins",
     519: "Enterprise Admins",
     520: "Group Policy Creator Owners",
+    521: "Read-only Domain Controllers",
+    522: "Cloneable Domain Controllers",
     526: "Key Admins",
     527: "Enterprise Key Admins",
 }
@@ -502,16 +515,26 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     reading = probe()
     transitive = bool(reading.group_sids)
     by_sid = {g for sid in reading.group_sids if (g := administrative_group(sid))}
-    # The canonical spelling, never the directory's, so nothing remote reaches the output. Read on
-    # both paths: it is the only read that can see DnsAdmins.
+    # The canonical spelling, never the directory's, so nothing remote reaches the output. With
+    # tokenGroups read, a name match counts only for a group with no fixed SID (DnsAdmins): the SID
+    # read already settled the rest, and an ordinary group that happens to be NAMED Administrators
+    # in some OU must not read as the BUILTIN one. Without it, every name and the primary group
+    # count, because nothing better was read.
+    names = set(_ADMIN_NAME_ONLY) if transitive else None
     direct = {
-        _ADMIN_GROUP_NAMES[c.lower()] for c in reading.member_of if c.lower() in _ADMIN_GROUP_NAMES
+        _ADMIN_GROUP_NAMES[c.lower()]
+        for c in reading.member_of
+        if c.lower() in _ADMIN_GROUP_NAMES
+        and (names is None or _ADMIN_GROUP_NAMES[c.lower()] in names)
     }
-    if reading.primary_group_rid in _ADMIN_DOMAIN_RIDS:
+    if not transitive and reading.primary_group_rid in _ADMIN_DOMAIN_RIDS:
         direct.add(_ADMIN_DOMAIN_RIDS[reading.primary_group_rid])
     problems = [reading.problem] if reading.problem is not None else []
     if reading.bound and reading.authzid is None:
-        problems.append("Who am I returned no identity, so the bound identity is not proven")
+        problems.append(
+            reading.whoami_error
+            or "Who am I returned no identity, so the bound identity is not proven"
+        )
     if reading.problem is None and not transitive:
         problems.append(
             "nested group membership not read: tokenGroups came back empty, so only the direct "
@@ -533,7 +556,8 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
         parts.append("in none of the administrative groups the check knows (transitive read)")
     parts += [f"could not observe: {printable(p)}" for p in problems]
     parts.append(_LDAP_RIGHTS_NOT_READ)
-    return HopPrivilege("ldap", state, identity, minimal, ". ".join(parts))
+    # As for a Vault hop: one printable() over everything the directory or ldap3 supplied.
+    return HopPrivilege("ldap", state, identity, minimal, printable(". ".join(parts)))
 
 
 # --- the hops the engine cannot probe ---------------------------------------------------------

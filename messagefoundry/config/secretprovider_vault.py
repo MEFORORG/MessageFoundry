@@ -238,12 +238,30 @@ def secrets_vault_token() -> str:
     return token
 
 
+def secrets_vault_address() -> str:
+    """The connector-secret Vault named in ``MEFOR_SECRETS_VAULT_ADDR``, for ``check-privileges``.
+
+    **It refuses when that variable is unset, where the provider does not.** Given no address, hvac
+    reads ``VAULT_ADDR``: in an operator's shell that may be another Vault, which would then receive
+    the engine's token. Raises :class:`SecretProviderError`, which the probe reports as not
+    observed. The provider keeps its documented fallback (docs/CONFIGURATION.md)."""
+    addr = os.environ.get(_ENV_ADDR)
+    if not addr:
+        raise SecretProviderError(
+            f"{_ENV_ADDR} is not set, so the connector-secret Vault is not known. The check sends "
+            f"the token only to the address named there, never VAULT_ADDR; run it with the "
+            f"service's environment"
+        )
+    return addr
+
+
 def secrets_vault_client(token: str) -> Any:
     """The connector-secret hop's Vault client for ``token``, built by the same :func:`_build_client`
     :meth:`VaultSecretProvider.resolve` uses: same TLS narrowing, same anchor, no redirects, and the
     same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
-    own grants through it and changes nothing. Take ``token`` from :func:`secrets_vault_token`."""
-    return _build_client(os.environ.get(_ENV_ADDR), token)
+    own grants through it and changes nothing. Take ``token`` from :func:`secrets_vault_token`; the
+    address comes from :func:`secrets_vault_address`, which refuses an unset one."""
+    return _build_client(secrets_vault_address(), token)
 
 
 def kv_required_capabilities(refs: Iterable[str]) -> dict[str, frozenset[str]]:

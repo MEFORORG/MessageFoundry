@@ -101,13 +101,23 @@ def _why(exc: BaseException) -> str:
         return strip_control_chars(str(exc))
     name = type(exc).__name__
     # hvac maps a 403 to Forbidden; say what it means without importing hvac here.
-    return f"permission denied ({name})" if name == "Forbidden" else name
+    if name == "Forbidden":
+        return f"permission denied ({name})"
+    if type(exc) is ValueError:
+        # Exactly ValueError, not a subclass: the probe's own shape refusals and the TLS-suite
+        # assertion raise it with engine-written text. A subclass, such as a JSON decode error,
+        # can quote what the server sent, so it keeps the type name alone.
+        return f"{name}: {strip_control_chars(str(exc))[:200]}"
+    return name
 
 
 def _strings(value: object) -> tuple[str, ...]:
+    """The string members of a Vault list, kept EXACTLY as Vault sent them. A policy name is also
+    a path the probe asks about, so altering it here would ask about a different policy. Every
+    printed or logged text goes through ``printable()`` at the output boundary instead."""
     if not isinstance(value, (list, tuple)):
         return ()
-    return tuple(strip_control_chars(v) for v in value if isinstance(v, str))
+    return tuple(v for v in value if isinstance(v, str))
 
 
 def read_vault_token(
@@ -161,7 +171,9 @@ def read_vault_token(
     except Exception as exc:  # Vault answered and refused, or answered in an unexpected shape
         problems.append(_problem(f"token lookup-self failed: {_why(exc)}"))
 
-    admin = vault_admin_paths(needed, policies)
+    from messagefoundry.store.keyprovider_vault import TRANSIT_MOUNT
+
+    admin = vault_admin_paths(needed, policies, transit_mount=TRANSIT_MOUNT)
     capabilities: dict[str, tuple[str, ...]] = {}
     paths = [*needed, *admin]
     try:
@@ -229,17 +241,23 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
 def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> BindAccountReading:
     """Build the AD authenticator with the arguments ``AuthService`` gives it and read its bind
     account. The bind password resolves through ``[secrets]`` as it does under ``serve``, except
-    that a Vault-held password is read only with the token in ``MEFOR_SECRETS_VAULT_TOKEN``, never
-    one hvac would substitute. Any failure comes back in ``problem``; this never raises."""
+    that a Vault-held password is read only with the token in ``MEFOR_SECRETS_VAULT_TOKEN`` from the
+    Vault in ``MEFOR_SECRETS_VAULT_ADDR``, never ones hvac would substitute. Any failure comes back in ``problem``; this never raises."""
     from messagefoundry.auth.ldap import BindAccountReading, LdapAuthenticator
     from messagefoundry.config.secretprovider import resolve_secret_provider
     from messagefoundry.config.settings import SecurityEnforcement
 
     try:
         if settings.auth.ad_bind_password_secret and settings.secrets.provider == "vault":
-            from messagefoundry.config.secretprovider_vault import secrets_vault_token
+            from messagefoundry.config.secretprovider_vault import (
+                secrets_vault_address,
+                secrets_vault_token,
+            )
 
-            secrets_vault_token()  # refuses before any read when the engine's token is unset
+            # Refuse before any read when the engine's token or address is unset, so hvac never
+            # substitutes VAULT_TOKEN, or sends the engine's token to VAULT_ADDR.
+            secrets_vault_token()
+            secrets_vault_address()
         authenticator = LdapAuthenticator(
             settings.auth,
             secret_provider=resolve_secret_provider(settings.secrets),

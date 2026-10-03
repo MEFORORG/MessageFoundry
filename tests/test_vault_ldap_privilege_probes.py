@@ -73,6 +73,10 @@ _ACCESSOR = "synthetic-accessor-305"
 _KEK = "mefor-kek"
 #: Low entropy on purpose, so the secret scanner reads it as the fixture it is.
 _BIND_SECRET = "bind-bind-bind-bind"
+#: A Vault address that names no real host. The sentinel below is what an operator shell might
+#: hold in VAULT_ADDR; no test may ever build a client for it.
+_VAULT_ADDR = "https://vault.mefor.invalid:8200"
+_OPERATOR_ADDR = "https://operator-vault.invalid:8200"
 
 _KEK_PATHS = {
     f"transit/keys/{_KEK}": frozenset({"read"}),
@@ -98,6 +102,7 @@ class _FakeVault:
         accessor: str = _ACCESSOR,
     ) -> None:
         self.asked: list[str] = []
+        self.unanswered: set[str] = set()
         self._accessor = accessor
         self._policies = list(policies)
         self._caps = caps or {}
@@ -127,7 +132,9 @@ class _FakeVault:
                 if outer._caps_error is not None:
                     raise outer._caps_error
                 outer.asked.extend(paths)
-                answer = {p: outer._caps.get(p, ["deny"]) for p in paths}
+                answer = {
+                    p: outer._caps.get(p, ["deny"]) for p in paths if p not in outer.unanswered
+                }
                 return {**answer, "data": answer}
 
         self.auth = _Auth()
@@ -161,7 +168,10 @@ def test_a_least_privilege_token_reads_clean_and_shows_no_secret() -> None:
     assert _TOKEN not in _out(hop) and _ACCESSOR not in _out(hop)
     # The one capabilities read asked about the engine's paths and the administrative ones.
     policies = ("default", "mefor-store")
-    assert set(vault.asked) == {*_KEK_PATHS, *vault_admin_paths(_KEK_PATHS, policies)}
+    assert set(vault.asked) == {
+        *_KEK_PATHS,
+        *vault_admin_paths(_KEK_PATHS, policies, transit_mount="transit"),
+    }
     assert set(VAULT_ADMIN_PATHS) <= set(vault.asked)
 
 
@@ -225,11 +235,40 @@ def test_the_older_policy_endpoint_and_identity_groups_are_administrative(path: 
     assert f"{path} grants update; the engine never calls it" in hop.detail
 
 
+_HOSTILE = "mefor\u202etoor\x9b31m\x1b"
+
+
+def _clean(text: str) -> bool:
+    return not any(ch in text for ch in ("\u202e", "\x9b", "\x1b"))
+
+
 def test_a_policy_name_cannot_drive_the_terminal_or_reorder_the_line() -> None:
-    hostile = "mefor\u202etoor\x9b31m\x1b"
-    hop = vault_hop(_STORE, _reading(_FakeVault(policies=(hostile,), caps=_least_caps())))
-    assert "\u202e" not in hop.detail and "\x9b" not in hop.detail and "\x1b" not in hop.detail
+    hop = vault_hop(_STORE, _reading(_FakeVault(policies=(_HOSTILE,), caps=_least_caps())))
+    assert _clean(hop.detail)
     assert "token policies [mefortoor31m]" in hop.detail
+
+
+def test_a_hostile_policy_name_inside_a_granted_path_is_printed_and_logged_clean(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The name reaches the output a second way: inside the policy-write PATH the check asks
+    about. The fake GRANTS that path, so the over-grant line that names it is printed, and it
+    answers nothing for the older endpoint, so a problem naming that path is logged too."""
+    from messagefoundry.privilege_check import render_text
+
+    granted = f"sys/policies/acl/{_HOSTILE}"
+    vault = _FakeVault(policies=(_HOSTILE,), caps=_least_caps() | {granted: ["update"]})
+    vault.unanswered = {f"sys/policy/{_HOSTILE}"}
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.privilege_probes"):
+        hop = vault_hop(_STORE, _reading(vault))
+    assert hop.state is HopState.OVER_GRANTED
+    assert "sys/policies/acl/mefortoor31m grants update" in hop.detail
+    for line in render_text([hop]):
+        print(line)
+    printed = capsys.readouterr().out
+    assert "sys/policies/acl/mefortoor31m" in printed and _clean(printed)
+    assert "capabilities-self returned nothing for sys/policy/mefortoor31m" in caplog.text
+    assert _clean(caplog.text)
 
 
 def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> None:
@@ -279,6 +318,26 @@ def test_a_probe_problem_is_logged_without_the_token(caplog: pytest.LogCaptureFi
         _reading(_FakeVault(lookup_error=error))
     assert "check-privileges: token lookup-self failed: ConnectionError" in caplog.text
     assert _TOKEN not in caplog.text
+
+
+def test_a_kv_mount_named_like_keys_is_not_read_as_a_transit_key() -> None:
+    paths = vault_admin_paths(
+        {"mefor/keys/data/ad": frozenset({"read"})}, (), transit_mount="transit"
+    )
+    assert not any("/config" in p or "/export/" in p or "/backup/" in p for p in paths)
+    # The control: the Transit mount's own key path does get its key-admin paths.
+    assert f"transit/keys/{_KEK}/config" in vault_admin_paths(
+        _KEK_PATHS, (), transit_mount="transit"
+    )
+
+
+def test_a_value_error_keeps_its_own_text_and_a_subclass_does_not() -> None:
+    from messagefoundry.privilege_probes import _why
+
+    assert _why(ValueError("lookup-self returned no data")) == (
+        "ValueError: lookup-self returned no data"
+    )
+    assert _why(json.JSONDecodeError("server body here", "doc", 0)) == "JSONDecodeError"
 
 
 def test_a_missing_capability_is_noted_and_is_not_an_over_grant() -> None:
@@ -458,6 +517,7 @@ def test_the_transit_cipher_probe_asks_about_the_cipher_paths(
 ) -> None:
     vault = _FakeVault()
     monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _TOKEN)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _VAULT_ADDR)
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-data")
     monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
     monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t: vault)
@@ -631,6 +691,57 @@ def test_the_wider_administrative_groups_are_over_grants(
     assert f"member of {group} (transitive" in hop.detail
 
 
+def test_an_ordinary_group_named_administrators_is_not_the_builtin_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With tokenGroups read, the SIDs settle the fixed-SID groups: an OU group that is merely
+    NAMED Administrators is not BUILTIN\\Administrators."""
+    raw = {
+        "tokenGroups": [_sid(*_DOMAIN, 513), _sid(*_DOMAIN, 1105)],
+        "memberOf": [b"CN=Administrators,OU=App,DC=example,DC=com"],
+        "primaryGroupID": [b"512"],
+    }
+    hop = _judge(_read(monkeypatch, _FakeLdapConn(raw)))
+    assert hop.state is HopState.CLEAN
+
+
+@pytest.mark.parametrize(
+    ("rid", "group"),
+    [
+        (498, "Enterprise Read-only Domain Controllers"),
+        (521, "Read-only Domain Controllers"),
+        (522, "Cloneable Domain Controllers"),
+    ],
+)
+def test_the_read_only_and_cloneable_controller_groups_are_over_grants(
+    monkeypatch: pytest.MonkeyPatch, rid: int, group: str
+) -> None:
+    raw = {"tokenGroups": [_sid(*_DOMAIN, 513), _sid(*_DOMAIN, rid)]}
+    hop = _judge(_read(monkeypatch, _FakeLdapConn(raw)))
+    assert hop.state is HopState.OVER_GRANTED
+    assert f"member of {group} (transitive" in hop.detail
+
+
+def test_a_who_am_i_that_raises_after_a_good_bind_is_not_a_bind_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ldap3
+
+    conn = _FakeLdapConn({"tokenGroups": [_sid(*_DOMAIN, 513)]})
+
+    def _raise() -> str:
+        raise ldap3.core.exceptions.LDAPExtensionError("unsupported")
+
+    conn.extend = type("E", (), {"standard": type("S", (), {"who_am_i": staticmethod(_raise)})()})()
+    reading = _read(monkeypatch, conn)
+    assert reading.bound is True and reading.group_sids  # the group read still ran
+    assert reading.whoami_error == "Who am I failed: LDAPExtensionError"
+    hop = _judge(reading)
+    assert hop.state is HopState.UNOBSERVABLE
+    assert "Who am I failed: LDAPExtensionError" in hop.detail
+    assert "bind probe" not in hop.detail
+
+
 def test_dnsadmins_is_found_by_direct_membership_beside_a_clean_sid_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -769,6 +880,7 @@ def _cli(
     _clear_env(monkeypatch)
     _sqlite_probe(monkeypatch)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _TOKEN)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _VAULT_ADDR)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
     monkeypatch.setattr(keyprovider_vault, "_build_client", build)
     return ["check-privileges", "--service-config", str(_vault_toml(tmp_path)), "--json"]
@@ -821,6 +933,60 @@ def test_cli_never_judges_a_fallback_token_when_the_engines_is_unset(
     assert hop["state"] == "unobservable"
     assert "MEFOR_STORE_VAULT_TOKEN is not set" in hop["detail"]
     assert built == []
+
+
+def test_the_store_probe_never_sends_the_token_to_vault_addr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With MEFOR_STORE_VAULT_ADDR unset, hvac would read VAULT_ADDR, which in an operator's shell
+    may be another Vault. The probe refuses before any client is built."""
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _TOKEN)
+    monkeypatch.delenv("MEFOR_STORE_VAULT_ADDR", raising=False)
+    monkeypatch.setenv("VAULT_ADDR", _OPERATOR_ADDR)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
+    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t: pytest.fail(f"built {a}"))
+    with pytest.raises(KeyProviderError, match="MEFOR_STORE_VAULT_ADDR is not set"):
+        keyprovider_vault.store_vault_client(_TOKEN)
+    reading = probe_vault(_STORE)
+    assert any("MEFOR_STORE_VAULT_ADDR is not set" in p for p in reading.problems)
+    assert not reading.looked_up
+
+
+def test_the_secrets_probe_never_sends_the_token_to_vault_addr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.config.secretprovider import SecretProviderError
+
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_TOKEN", _TOKEN)
+    monkeypatch.delenv("MEFOR_SECRETS_VAULT_ADDR", raising=False)
+    monkeypatch.setenv("VAULT_ADDR", _OPERATOR_ADDR)
+    monkeypatch.setattr(
+        secretprovider_vault, "_build_client", lambda a, t: pytest.fail(f"built {a}")
+    )
+    with pytest.raises(SecretProviderError, match="MEFOR_SECRETS_VAULT_ADDR is not set"):
+        secretprovider_vault.secrets_vault_client(_TOKEN)
+    kv = VaultConsumer("vault.secrets", "kv", "kv", "kv", ("mefor/ad",))
+    reading = probe_vault(kv)
+    assert any("MEFOR_SECRETS_VAULT_ADDR is not set" in p for p in reading.problems)
+
+
+def test_the_ldap_probe_never_reads_the_bind_password_from_vault_addr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_SECRETS_VAULT_TOKEN", _TOKEN)
+    monkeypatch.delenv("MEFOR_SECRETS_VAULT_ADDR", raising=False)
+    monkeypatch.setenv("VAULT_ADDR", _OPERATOR_ADDR)
+    monkeypatch.setattr(
+        secretprovider_vault, "_build_client", lambda a, t: pytest.fail(f"built {a}")
+    )
+    auth = _ad_settings().model_dump() | {
+        "ad_bind_password": None,
+        "ad_bind_password_secret": "mefor/ad",
+    }
+    settings = ServiceSettings.model_validate({"auth": auth, "secrets": {"provider": "vault"}})
+    reading = read_ldap_bind(settings, None)
+    assert reading.bound is False
+    assert reading.problem is not None and "MEFOR_SECRETS_VAULT_ADDR is not set" in reading.problem
 
 
 def test_the_secrets_probe_refuses_an_unset_token_too(monkeypatch: pytest.MonkeyPatch) -> None:

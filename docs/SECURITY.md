@@ -603,7 +603,8 @@ except that a Vault token missing a capability the engine calls is noted.
 - **Each Vault token.** The command reads the token's own policies, TTL and renewability
   (`auth/token/lookup-self`), then its capabilities (`sys/capabilities-self`) on each path the engine
   calls and on administrative paths it never calls. The token, its id and its accessor are
-  never printed. It reads only the token in `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN`.
+  never printed. It reads only the token in `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN`,
+  and sends it only to the Vault in `MEFOR_STORE_VAULT_ADDR` or `MEFOR_SECRETS_VAULT_ADDR`.
 - **The AD bind account.** The command binds as the service account and asks the directory who it
   is (the RFC 4532 "Who am I?" operation). It then reads that account's own `tokenGroups`, which AD
   computes over every nested and primary group, and flags an administrative group. Who am I proves
@@ -661,14 +662,16 @@ read by hand.
 The AD bind account is **over-granted** when it is in an administrative group the check knows.
 These are at least:
 
-- **By fixed SID**, read from `tokenGroups`: Domain Admins, Domain Controllers, Schema Admins,
-  Enterprise Admins, Group Policy Creator Owners, Key Admins and Enterprise Key Admins in its
+- **By fixed SID**, read from `tokenGroups`: Domain Admins, Domain Controllers, Read-only Domain
+  Controllers, Cloneable Domain Controllers, Schema Admins, Enterprise Admins, Enterprise Read-only
+  Domain Controllers, Group Policy Creator Owners, Key Admins and Enterprise Key Admins in its
   domain; Administrators, Account Operators, Server Operators, Print Operators and Backup Operators
   in BUILTIN; and Enterprise Domain Controllers. A SID does not change with the language, so a
   localised group name does not hide one.
 - **By name only**: DnsAdmins. It has no fixed SID; the DNS role gives it an ordinary one when it is
   installed. So it is found only in the direct `memberOf`, and a nested DnsAdmins membership is not
-  seen.
+  seen. When `tokenGroups` was read, a direct `memberOf` name counts only for DnsAdmins: an
+  ordinary group that is merely named Administrators is not the BUILTIN one.
 
 A clean LDAP hop means none of these groups, not no powerful group: a group outside the list, such
 as one an Exchange install creates with rights on the domain, is not flagged.
@@ -686,9 +689,11 @@ client the engine builds for that hop, with its TLS, trust anchor and cleartext 
 command with the service's environment, so the Vault tokens and the AD bind password are the
 engine's own:
 
-- **A Vault hop whose `MEFOR_*_VAULT_TOKEN` is unset is not observed.** The engine itself would fall
-  back to `VAULT_TOKEN` or `~/.vault-token` there. The check does not: in an operator's shell that
-  token is the operator's own, and judging it as the engine's would report on the wrong token.
+- **A Vault hop whose `MEFOR_*_VAULT_TOKEN` or `MEFOR_*_VAULT_ADDR` is unset is not observed.**
+  The engine itself would fall back to `VAULT_TOKEN`, `~/.vault-token` or `VAULT_ADDR` there. The
+  check does not. In an operator's shell those are the operator's own: judging that token as the
+  engine's reports on the wrong token, and sending the engine's token to that address would hand
+  it to a different Vault. A Vault-held AD bind password is read under the same rule.
 - **Each run binds to AD as the service account.** A wrong or stale bind password is a failed bind,
   and each one counts toward the domain's account lockout threshold. Repeated runs with the wrong
   password can lock the account the running engine uses. Check the password before you run the

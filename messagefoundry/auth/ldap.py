@@ -160,6 +160,9 @@ class BindAccountReading:
     problem: str | None = None
     #: False when no bind was made at all, so nothing here was read from the directory.
     bound: bool = True
+    #: Why Who am I failed after a good bind, when it raised rather than answering. ``None`` when
+    #: it answered, even with no identity.
+    whoami_error: str | None = None
 
 
 class _Lookup(NamedTuple):
@@ -993,7 +996,13 @@ class LdapAuthenticator:
         # bound when it entered, which auto_bind makes every one here, so the session would stay
         # open until the object is collected.
         try:
-            who = _authzid_text(svc.extend.standard.who_am_i())
+            # Its own try: the bind has already succeeded here, so a failed Who am I is not a bind
+            # failure, and the group read still runs.
+            whoami_error: str | None = None
+            try:
+                who = _authzid_text(svc.extend.standard.who_am_i())
+            except ldap3.core.exceptions.LDAPException as exc:
+                who, whoami_error = None, f"Who am I failed: {type(exc).__name__}"
             try:
                 _search(
                     svc,
@@ -1006,7 +1015,9 @@ class LdapAuthenticator:
             except (ldap3.core.exceptions.LDAPException, LdapError) as exc:
                 # An LdapError is a refused referral, whose text is the engine's own.
                 why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
-                return BindAccountReading(who, problem=f"group membership not read: {why}")
+                return BindAccountReading(
+                    who, problem=f"group membership not read: {why}", whoami_error=whoami_error
+                )
             entry = svc.entries[0] if svc.entries else None
             result = svc.result if isinstance(svc.result, dict) else {}
         except ldap3.core.exceptions.LDAPException as exc:
@@ -1023,6 +1034,7 @@ class LdapAuthenticator:
                 who,
                 problem=f"group membership not read: the base read of [auth].ad_bind_dn returned "
                 f"no entry ({why}); the read needs a distinguished name the account may read",
+                whoami_error=whoami_error,
             )
         raw = entry["tokenGroups"].raw_values if "tokenGroups" in entry else ()
         sids = tuple(
@@ -1034,6 +1046,7 @@ class LdapAuthenticator:
             group_sids=sids,
             member_of=tuple(cn for dn in _multi(entry, "memberOf") if (cn := _cn_of(dn))),
             primary_group_rid=int(rid) if rid and rid.isascii() and rid.isdigit() else None,
+            whoami_error=whoami_error,
         )
 
 
