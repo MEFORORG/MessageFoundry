@@ -48,6 +48,7 @@ __all__ = [
     "hook_environment",
     "outside_engine_namespace",
     "python_child_argv",
+    "python_module_argv",
     "worker_environment",
 ]
 
@@ -58,8 +59,9 @@ ENGINE_ENV_PREFIX: Final = "MEFOR_"
 #: The interpreter options every Python child is started with. Each child starts a script,
 #: :data:`_BOOTSTRAP`, and a script start puts the script's own directory first on the import path
 #: and never the working directory. ``-P`` drops that directory, which is this package's own, so
-#: a module in it cannot stand in for a top-level module the child imports. (For ``-m`` and ``-c``
-#: starts, ``-P`` drops the working directory instead; no child here starts that way.)
+#: a module in it cannot stand in for a top-level module the child imports. For ``-m`` and ``-c``
+#: starts, ``-P`` drops the working directory instead. The engine starts no child that way; the
+#: tray's short login command, from :func:`python_module_argv`, is a ``-m`` start.
 #: ``-X disable-remote-debug`` starts the child with the interpreter's remote debugging disabled.
 #: The option is spelled with hyphens; the interpreter accepts and ignores other spellings, which is
 #: why ``tests/test_child_process_environment.py`` reads the result off a real child.
@@ -209,6 +211,18 @@ def python_child_argv(module: str, *, executable: str | None = None) -> list[str
     working directory on the child's import path.
     """
     return [executable or sys.executable, *CHILD_INTERPRETER_FLAGS, _BOOTSTRAP, module]
+
+
+def python_module_argv(module: str, *, executable: str | None = None) -> list[str]:
+    """``python -m module`` with :data:`CHILD_INTERPRETER_FLAGS`, and no bootstrap.
+
+    Shorter than :func:`python_child_argv`, and only for a package the interpreter can import on
+    its own, from site-packages or a ``.pth`` entry. ``-P`` drops the working directory from a
+    ``-m`` start, so a source checkout that is not installed cannot be found this way. Nothing
+    pins this build either: the first ``messagefoundry`` on the import path answers, so an absolute
+    ``PYTHONPATH`` entry naming another copy wins. The tray's login command is the one user.
+    """
+    return [executable or sys.executable, *CHILD_INTERPRETER_FLAGS, "-m", module]
 
 
 def _without_working_directory_entries(env: dict[str, str]) -> dict[str, str]:

@@ -41,7 +41,10 @@ friendly note and exits.
 
 To **start it automatically at login**, use the tray's **Start at Login** menu item (opt-in, off by
 default). It writes an `HKCU\…\Run` entry pinning the absolute `pythonw.exe` you launched with, so it
-keeps resolving after a reboot.
+keeps resolving after a reboot. The entry carries the interpreter options the engine's own Python
+children get. So the folder Windows starts it in is not on its import path. A command too long for
+a Run entry is refused, with a notice. `docs/DANGEROUS-FUNCTIONALITY.md` section 3 gives the two
+forms of the command, the length limit, and what a tray you start by hand lacks.
 
 ## What the icon shows
 
