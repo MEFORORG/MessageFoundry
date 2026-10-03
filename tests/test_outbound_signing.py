@@ -419,7 +419,12 @@ def test_dest_config_assembles_sign_with_env_resolution(ec_pem: str) -> None:
         key_id="acme-2026",
     )
     oc = OutboundConnection(name="OB_ACME", spec=spec)
-    dest_cfg = _dest_config(oc, {"acme_url": REST_URL, "acme_sign_key": ec_pem})
+    dest_cfg = _dest_config(
+        oc,
+        {"acme_url": REST_URL, "acme_sign_key": ec_pem},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
 
     assert dest_cfg.sign is not None
     assert dest_cfg.sign.algorithm is SignatureAlgorithm.ES256
@@ -434,7 +439,8 @@ async def test_with_signing_end_to_end_through_the_connector(ec_pem: str) -> Non
     spec = with_signing(Rest(url=env("u")), private_key=env("k"), algorithm="ES256")
     oc = OutboundConnection(name="OB", spec=spec)
     dest = build_destination(
-        _dest_config(oc, {"u": REST_URL, "k": ec_pem}), egress=EgressSettings(deny_by_default=False)
+        _dest_config(oc, {"u": REST_URL, "k": ec_pem}, None, EgressSettings(deny_by_default=False)),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, RestDestination)
     opener = _FakeOpener()

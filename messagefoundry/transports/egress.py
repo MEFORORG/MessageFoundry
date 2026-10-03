@@ -117,26 +117,33 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
             )
 
 
-def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressSettings) -> None:
+def check_lookup_allowed(
+    name: str,
+    settings: Mapping[str, Any],
+    egress: EgressSettings,
+    *,
+    label: str = "DatabaseLookup",
+) -> None:
     """Fail-closed connect-allowlist for a ``DatabaseLookup`` (it dials out to a SQL host for a live,
     read-only ``db_lookup``). Reuses ``[egress].allowed_db`` (opt-in; an empty list = unrestricted), like
     the DATABASE source — checked at load/reload/start so the engine is never pointed at a non-allowlisted
     server. ``settings`` are the already-``env()``-resolved connection settings. Under
-    ``[egress].deny_by_default`` an empty ``allowed_db`` refuses the lookup outright."""
+    ``[egress].deny_by_default`` an empty ``allowed_db`` refuses the lookup outright. ``label`` names
+    the kind of dial-out in a refusal: a DATABASE reference source shares this rule."""
     if egress.deny_by_default and not egress.allowed_db:
         raise WiringError(
-            f"DatabaseLookup {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
-            "[egress].allowed_db is empty — list the lookup server to permit it"
+            f"{label} {name!r}: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+            "[egress].allowed_db is empty — list the server to permit it"
         )
     if egress.allowed_db:
         host = str(settings.get("server", ""))
         port = settings.get("port", 1433)
         if not host_port_allowed(host, port, egress.allowed_db):  # same host[:port] matching
             log.warning(
-                "connect denied: DatabaseLookup %r server %r not in [egress].allowed_db", name, host
+                "connect denied: %s %r server %r not in [egress].allowed_db", label, name, host
             )
             raise WiringError(
-                f"DatabaseLookup {name!r}: server {host!r} is not in the [egress].allowed_db allowlist"
+                f"{label} {name!r}: server {host!r} is not in the [egress].allowed_db allowlist"
             )
 
 

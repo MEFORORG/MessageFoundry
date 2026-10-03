@@ -209,7 +209,12 @@ def test_the_smart_token_hop_of_an_outbound_names_the_connection(
 ) -> None:
     toml_attest = f'tls_revocation_attested = true\ntls_revocation_attested_reason = "{_REASON}"\n'
     # `_dest_config` is the mirror a running engine uses; the provider sees only its settings.
-    dest = _dest_config(_toml(tmp_path, ob_extra=toml_attest).outbound["OB"], {})
+    dest = _dest_config(
+        _toml(tmp_path, ob_extra=toml_attest).outbound["OB"],
+        {},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         token_provider_from_settings({**dest.settings, **_smart(smart_key)})
     assert "connection 'OB';" in _audit(caplog)
@@ -226,7 +231,7 @@ def test_the_smart_token_hop_of_a_fhir_lookup_names_the_lookup(
     )
     spec = load_config(tmp_path, allow_empty=True).fhir_lookups["epic"]
     # The settings the runner hands the lookup executor, which is where the SMART provider is built.
-    settings = _fhir_lookup_settings(spec, {}, None)
+    settings = _fhir_lookup_settings(spec, {}, EgressSettings(deny_by_default=False))
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         token_provider_from_settings({**settings, **_smart(smart_key)})
     assert "connection 'fhir_lookup:epic';" in _audit(caplog)
@@ -331,7 +336,9 @@ outbound(
         encoding="utf-8",
     )
     reg = load_config(tmp_path, allow_empty=True)
-    raw = _dest_config(reg.outbound["OB_RAW"], {}).settings
+    raw = _dest_config(
+        reg.outbound["OB_RAW"], {}, None, EgressSettings(deny_by_default=False)
+    ).settings
     assert not any(
         k in raw
         for k in (
@@ -345,7 +352,9 @@ outbound(
     # The spoofed outbound's SMART token hop is refused, as an undeclared one is.
     with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         token_provider_from_settings({**raw, **_smart(smart_key)})
-    declared = _dest_config(reg.outbound["OB_DECLARED"], {}).settings
+    declared = _dest_config(
+        reg.outbound["OB_DECLARED"], {}, None, EgressSettings(deny_by_default=False)
+    ).settings
     assert declared["connection_name"] == "OB_DECLARED"
     assert declared["tls_revocation_attested_reason"] == "declared"
     assert "cleartext_accepted" not in declared  # its raw key went; nothing declared it

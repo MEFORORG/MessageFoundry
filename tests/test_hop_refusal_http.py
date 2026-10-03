@@ -353,7 +353,11 @@ def test_fhir_lookup_declared_read_allowed_on_prod(
     with active_hop_posture(_PROD):
         # The settings the runner hands the executor: the spec's typed declarations, mirrored.
         ex = FhirLookupExecutor(
-            {"L": _fhir_lookup_settings(reg.fhir_lookups["L"], {}, None)},
+            {
+                "L": _fhir_lookup_settings(
+                    reg.fhir_lookups["L"], {}, EgressSettings(deny_by_default=False)
+                )
+            },
             egress=EgressSettings(deny_by_default=False),
         )
     assert ex.connections == frozenset({"L"})

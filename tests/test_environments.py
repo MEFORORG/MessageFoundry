@@ -332,7 +332,12 @@ def test_build_resolves_env_outbound(tmp_path: Path) -> None:
         """,
     )
     reg = load_config(d)
-    dest = _dest_config(reg.outbound["OB"], {"peer_host": "10.0.0.2", "peer_port": "6000"})
+    dest = _dest_config(
+        reg.outbound["OB"],
+        {"peer_host": "10.0.0.2", "peer_port": "6000"},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
     assert dest.settings["host"] == "10.0.0.2"
     assert dest.settings["port"] == 6000
 

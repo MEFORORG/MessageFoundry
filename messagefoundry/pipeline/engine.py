@@ -1796,7 +1796,6 @@ class Engine:
                 "no config directory is configured — a connection flag cannot be persisted"
             )
         cfg_dir: Path = config_dir
-        egress = self._egress_settings
 
         def _write() -> None:
             entries = connections_edit.list_connections(cfg_dir)
@@ -1824,7 +1823,7 @@ class Engine:
                     registry,
                     inbound_bind_host=self._inbound_bind_host,
                     env_values=self._env_values,
-                    egress=egress,
+                    egress=self._egress_settings,
                     reserved_bindings=self._reserved_bindings,
                     posture=self._hop_posture,
                     trust_anchor_policy=self._trust_anchor_policy,

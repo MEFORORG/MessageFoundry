@@ -202,7 +202,6 @@ from messagefoundry.transports.base import (
     SyncReplyResolver,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
-from messagefoundry.transports.egress import check_source_allowed
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 
@@ -1078,8 +1077,8 @@ class RegistryRunner:
         # Where the delivery workers report operational stalls (a stopped connection, a building
         # backlog). Defaults to the logging sink until a real notifier is wired (docs/BACKLOG.md item 5).
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
-        # Fail-closed outbound destination allowlist (WP-11c); empty = unrestricted. Enforced at
-        # build_check (config load/reload) and start, so a non-allowed destination is refused.
+        # Fail-closed outbound destination allowlist (WP-11c). Enforced at build_check (config
+        # load/reload) and start, so a non-allowed destination is refused.
         # Required, with no fallback (vault BACKLOG #2605): an embedder that omitted it used to get
         # allow-all. Every connector this runner builds goes through a seam that checks this policy.
         self._egress = egress
@@ -3082,7 +3081,6 @@ class RegistryRunner:
         # source.start() bind below classifies that OSError into the same PortConflictError.
         self._guard_port_conflict(ic)
         source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
-        check_source_allowed(source_cfg, ic.name, self._egress)  # fail-closed connect allowlist
         # Exposed-gate (ADR 0002 §0 / ADR 0025 §9): refuse a non-loopback MLLP or DICOM SCP listener
         # without TLS at start, and a non-loopback raw-TCP/X12 listener (plaintext-only — no TLS option)
         # at start (cleartext PHI on the wire). Each guard no-ops for the other's type.
@@ -8694,13 +8692,11 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
     )
 
 
-def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings | None) -> None:
+def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings) -> None:
     """Fill the site-wide ``[egress]`` forward-proxy default into a connection's resolved settings when it
     set no per-connection proxy (ADR 0126, #112/#128). A per-connection ``proxy_url`` / ``proxy_no_proxy``
-    wins verbatim; only an ABSENT value inherits the ``egress`` default. ``None`` egress / no default →
-    byte-identical, so a graph without an ``[egress].proxy_url`` is unchanged."""
-    if egress is None:
-        return
+    wins verbatim; only an ABSENT value inherits the ``egress`` default. With no default set, a
+    graph without an ``[egress].proxy_url`` is unchanged."""
     if egress.proxy_url and not settings.get("proxy_url"):
         settings["proxy_url"] = egress.proxy_url
     if egress.proxy_no_proxy and not settings.get("proxy_no_proxy"):
@@ -8753,15 +8749,15 @@ def _mirror_declarations(
 
 
 def _fhir_lookup_settings(
-    spec: FhirLookupSpec, env_values: Mapping[str, Any], egress: EgressSettings | None
+    spec: FhirLookupSpec, env_values: Mapping[str, Any], egress: EgressSettings
 ) -> dict[str, Any]:
     """The resolved settings the read executor gets for one ``FhirLookup`` (ADR 0043).
 
     Resolves ``env()``, merges the site-wide forward proxy (ADR 0126), and mirrors the spec's typed
     declarations (see :func:`_mirror_declarations`). The name carries the ``fhir_lookup:`` prefix, so
     a lookup's record cannot be mistaken for an outbound of the same name. The one builder for both
-    the live executor and the check build, so the two cannot differ. The egress allowlist check stays
-    with each caller."""
+    the live executor and the check build, so the two cannot differ. The egress allowlist check runs
+    in :class:`~messagefoundry.transports.fhir.FhirLookupExecutor` itself."""
     settings = resolve_env_settings(spec.settings, env_values)
     _apply_egress_proxy_default(settings, egress)
     _mirror_declarations(
@@ -8787,8 +8783,8 @@ def _fhir_lookup_settings(
 def _dest_config(
     oc: OutboundConnection,
     env_values: Mapping[str, Any],
-    trust_anchor_policy: TrustAnchorPolicy | None = None,
-    egress: EgressSettings | None = None,
+    trust_anchor_policy: TrustAnchorPolicy | None,
+    egress: EgressSettings,
 ) -> Destination:
     # Resolve env() first so any signing key/password ref is materialized here, then assemble the
     # typed signing config (ASVS 4.1.5, ADR 0018) from the resolved sign_* settings. None = signing
@@ -8955,7 +8951,6 @@ def _build_check_connectors(
         if not ic.deployed:
             continue
         source_cfg = _source_config(ic, inbound_bind_host, env_values)
-        check_source_allowed(source_cfg, ic.name, egress)
         # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
         # responses, and resolve to a lane that can actually serve concurrent callers.
         check_http_sync_reply(ic, registry, delivery=delivery)

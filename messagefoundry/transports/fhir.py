@@ -7,7 +7,7 @@
 :mod:`messagefoundry.transports.soap` does — rather than wrapping ``RestDestination``: the no-redirect,
 http(s)-only, TLS-verifying opener (a 3xx can't divert a PHI-bearing request; ASVS 15.3.2), the
 cleartext-credential refusal, the outbound length limits, and the optional detached-JWS signer. The
-fail-closed ``[egress].allowed_http`` host gate is enforced by the runner (it folds FHIR into the
+fail-closed ``[egress].allowed_http`` host gate is enforced by ``build_destination`` (it folds FHIR into the
 REST/SOAP arm — see transports.egress ``_allowlist_for``/``check_egress_allowed``).
 
 **FHIR-specific layer (on top of REST):**

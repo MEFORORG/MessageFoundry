@@ -39,17 +39,16 @@ from uuid import uuid4
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.models import hop_attestation_from_settings
 from messagefoundry.config.settings import (
-    BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
     EgressSettings,
     ReferenceSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, current_hop_posture
-from messagefoundry.config.wiring import ReferenceSpec, resolve_env_settings
+from messagefoundry.config.wiring import ReferenceSpec, WiringError, resolve_env_settings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
 from messagefoundry.store.base import DEFAULT_STORE_ACQUIRE_TIMEOUT, acquire_pooled
-from messagefoundry.transports.egress import host_port_allowed
+from messagefoundry.transports.egress import check_lookup_allowed
 
 __all__ = ["ReferenceSyncRunner", "ReferenceSyncError"]
 
@@ -143,19 +142,11 @@ async def _load_database_source(
 
     server = str(settings.get("server", ""))
     # `egress` is required (vault BACKLOG #2605): a caller that passed none used to skip this check.
-    # Under deny-by-default an empty allowed_db refuses the dial-out outright, in parity with the
-    # DATABASE source and db_lookup gates in transports/egress.py.
-    if egress.deny_by_default and not egress.allowed_db:
-        raise ReferenceSyncError(
-            f"DATABASE reference source: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
-            "[egress].allowed_db is empty — list the reference server to permit it"
-        )
-    if egress.allowed_db and not host_port_allowed(
-        server, settings.get("port", 1433), egress.allowed_db
-    ):
-        raise ReferenceSyncError(
-            f"DATABASE reference server {server!r} is not in the [egress].allowed_db allowlist"
-        )
+    # The same [egress].allowed_db rule as a db_lookup, so the two cannot drift.
+    try:
+        check_lookup_allowed(name or server, settings, egress, label="DATABASE reference source")
+    except WiringError as exc:
+        raise ReferenceSyncError(str(exc)) from exc
     key_col = settings.get("key_column")
     value_col = settings.get("value_column")
     statement = str(settings.get("statement", ""))

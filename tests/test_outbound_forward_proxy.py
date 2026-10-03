@@ -700,7 +700,7 @@ def test_egress_default_proxy_is_gated_by_allowed_proxy() -> None:
     """
     oc = OutboundConnection("OB", Rest(url=HTTPS_DEST))
     unlisted = EgressSettings(allowed_http=["api.example.com"], proxy_url=PROXY)
-    dest = _dest_config(oc, {}, egress=unlisted)
+    dest = _dest_config(oc, {}, None, egress=unlisted)
     assert dest.settings["proxy_url"] == PROXY  # the copy-in happened before the gate sees it
     with pytest.raises(WiringError, match="allowed_proxy"):
         check_egress_allowed(dest, unlisted)
@@ -708,7 +708,7 @@ def test_egress_default_proxy_is_gated_by_allowed_proxy() -> None:
     listed = EgressSettings(
         allowed_http=["api.example.com"], proxy_url=PROXY, allowed_proxy=["proxy.example.com:3128"]
     )
-    check_egress_allowed(_dest_config(oc, {}, egress=listed), listed)  # no raise
+    check_egress_allowed(_dest_config(oc, {}, None, egress=listed), listed)  # no raise
 
 
 # --- FhirLookup read executor honours the proxy --------------------------------------------------

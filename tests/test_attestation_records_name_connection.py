@@ -190,7 +190,9 @@ def _lookup(tmp_path: Path, extra: str = "") -> Registry:
 def test_a_lookup_mirror_names_the_lookup_namespace(tmp_path: Path) -> None:
     # An outbound may also be named "epic". The lookup's records must still be told apart from its.
     reg = _lookup(tmp_path, f', cleartext_accepted=True, cleartext_reason="{_REASON}"')
-    settings = _fhir_lookup_settings(reg.fhir_lookups["epic"], {}, None)
+    settings = _fhir_lookup_settings(
+        reg.fhir_lookups["epic"], {}, EgressSettings(deny_by_default=False)
+    )
     assert settings["connection_name"] == "fhir_lookup:epic"
 
 
@@ -201,7 +203,9 @@ def test_raw_cleartext_keys_on_a_lookup_are_not_honoured(tmp_path: Path) -> None
     reg.fhir_lookups["epic"].settings.update(
         {"cleartext_accepted": True, "cleartext_reason": "spoofed", "connection_name": "X"}
     )
-    settings = _fhir_lookup_settings(reg.fhir_lookups["epic"], {}, None)
+    settings = _fhir_lookup_settings(
+        reg.fhir_lookups["epic"], {}, EgressSettings(deny_by_default=False)
+    )
     assert "cleartext_accepted" not in settings and "cleartext_reason" not in settings
     assert settings["connection_name"] == "fhir_lookup:epic"
     assert accepted_cleartext_hops(reg) == []
@@ -210,7 +214,9 @@ def test_raw_cleartext_keys_on_a_lookup_are_not_honoured(tmp_path: Path) -> None
 def test_a_declared_lookup_is_still_honoured_and_reported(tmp_path: Path) -> None:
     # CONTROL for the one above: the typed declaration still reaches the executor and the report.
     reg = _lookup(tmp_path, f', cleartext_accepted=True, cleartext_reason="{_REASON}"')
-    settings = _fhir_lookup_settings(reg.fhir_lookups["epic"], {}, None)
+    settings = _fhir_lookup_settings(
+        reg.fhir_lookups["epic"], {}, EgressSettings(deny_by_default=False)
+    )
     assert settings["cleartext_accepted"] is True and settings["cleartext_reason"] == _REASON
     assert accepted_cleartext_hops(reg) == [("fhir_lookup:epic", _REASON)]
 
@@ -295,7 +301,9 @@ def test_an_undeclared_smart_token_hop_refusal_names_its_connection(
 ) -> None:
     # The name used to ride only with a declaration, so the REFUSING case -- nothing declared -- had
     # none. The runner now mirrors it for every outbound.
-    dest = _dest_config(_toml(tmp_path).outbound["OB"], {})
+    dest = _dest_config(
+        _toml(tmp_path).outbound["OB"], {}, None, EgressSettings(deny_by_default=False)
+    )
     smart = {
         "smart_token_url": f"https://{_HOST}/token",
         "smart_client_id": "cid",
@@ -408,14 +416,18 @@ def test_a_cleartext_smart_token_refusal_names_its_connection(
     tmp_path: Path, smart_key: str
 ) -> None:
     # This seam catches InsecureHopRefused and re-raises its own error, which used to drop the name.
-    dest = _dest_config(_toml(tmp_path).outbound["OB"], {})
+    dest = _dest_config(
+        _toml(tmp_path).outbound["OB"], {}, None, EgressSettings(deny_by_default=False)
+    )
     with active_hop_posture(_ENFORCING), pytest.raises(SmartAuthError) as exc:
         token_provider_from_settings({**dest.settings, **_smart_http(smart_key)})
     assert "connection 'OB';" in str(exc.value)
 
 
 def test_a_cleartext_digest_refusal_names_its_connection(tmp_path: Path) -> None:
-    dest = _dest_config(_toml(tmp_path).outbound["OB"], {})
+    dest = _dest_config(
+        _toml(tmp_path).outbound["OB"], {}, None, EgressSettings(deny_by_default=False)
+    )
     digest = {"http_auth": "digest", "http_auth_user": "u", "http_auth_password": "p"}
     with active_hop_posture(_ENFORCING), pytest.raises(HttpAuthError) as exc:
         digest_handler_from_settings({**dest.settings, **digest}, url=f"http://{_HOST}/x")
@@ -446,7 +458,7 @@ def test_a_lookup_mutated_into_both_claims_is_refused_where_the_executor_reads_i
         {"tls_hop_attested": True, "tls_hop_attested_reason": "x"}
     )
     with pytest.raises(WiringError, match="opposite claims"):
-        _fhir_lookup_settings(reg.fhir_lookups["epic"], {}, None)
+        _fhir_lookup_settings(reg.fhir_lookups["epic"], {}, EgressSettings(deny_by_default=False))
 
 
 def test_a_lookup_spec_with_one_claim_loads() -> None:

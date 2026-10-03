@@ -83,7 +83,12 @@ def _destination_opener(
     spec: ConnectionSpec, policy: TrustAnchorPolicy | None = None
 ) -> urllib.request.OpenerDirector:
     """Build ``spec`` the way the runner does -- ``_dest_config`` then the connector registry."""
-    config = _dest_config(build_outbound_connection("OB", spec), {}, trust_anchor_policy=policy)
+    config = _dest_config(
+        build_outbound_connection("OB", spec),
+        {},
+        trust_anchor_policy=policy,
+        egress=EgressSettings(deny_by_default=False),
+    )
     opener: urllib.request.OpenerDirector = build_destination(
         config, egress=EgressSettings(deny_by_default=False)
     )._opener  # type: ignore[attr-defined]
@@ -196,7 +201,7 @@ def test_a_named_ca_is_the_lookup_hops_only_anchor(tmp_path: Path) -> None:
     ca = _ca_pem(tmp_path, "mefor-lookup-ca")
     spec = FhirLookup("L", url="https://fhir.internal.example.org/fhir", tls_ca_file=ca)
     ex = FhirLookupExecutor(
-        {"L": _fhir_lookup_settings(spec, {}, None)},
+        {"L": _fhir_lookup_settings(spec, {}, EgressSettings(deny_by_default=False))},
         trust_anchor_policy=_pinned(tmp_path),
         egress=EgressSettings(deny_by_default=False),
     )
@@ -277,7 +282,7 @@ def test_without_a_ca_the_destination_keeps_the_shared_opener(factory: str) -> N
 def test_without_a_ca_the_lookup_keeps_the_shared_opener() -> None:
     spec = FhirLookup("L", url="https://fhir.internal.example.org/fhir")
     ex = FhirLookupExecutor(
-        {"L": _fhir_lookup_settings(spec, {}, None)},
+        {"L": _fhir_lookup_settings(spec, {}, EgressSettings(deny_by_default=False))},
         trust_anchor_policy=TrustAnchorPolicy(),
         egress=EgressSettings(deny_by_default=False),
     )
