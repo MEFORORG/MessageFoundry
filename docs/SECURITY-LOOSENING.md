@@ -20,8 +20,7 @@
    see the `enforcement = warn` deviation below). **Two of these controls may be lifted while staying at
    `enforce`, but only behind a dedicated acknowledgment switch that does nothing else** (the No-loosen
    carve-out, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5 as amended, [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)):
-   `allow_single_factor_admin_when_exposed` (single-factor sign-in at exposure, for every account with
-   no second factor enrolled) and
+   `allow_single_factor_admin_when_exposed` (single-factor sign-in at exposure) and
    `allow_unencrypted_phi_under_strict_enforcement` (keyless PHI under strict enforcement, which *also*
    requires `allow_unencrypted_phi`). Each defaults `false` — byte-identical to today's refusal — and when set
    drops the refusal to a **loud, audited warning** (the same warn-and-start `enforcement = warn` takes
@@ -378,8 +377,8 @@ false premise.
   view (`GET /security/posture`) names it.
 - **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, auth off on
   any bind, open egress, unbounded retention) — this ack lifts **only** the single-factor-at-exposure refusal,
-  and only at exposure. `require_mfa` off on a **loopback** bind was never refused (no exposure), so this ack
-  is a no-op there.
+  and only at exposure. `require_mfa` off on a **loopback** bind with no declared proxy is not refused
+  (no exposure), so this ack is a no-op there.
 
 ### `allow_unencrypted_phi_under_strict_enforcement = true` — permit keyless PHI under strict enforcement
 - **What you lose:** a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)

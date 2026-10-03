@@ -7040,7 +7040,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 #: advisories here and the exposure texts in ``__main__._serve``. ``_check_mfa_gate`` checks the
 #: amr/acr claim, and the OIDC mint stamps the session verified, only while this setting is on.
 #: Neither this name nor the helper's below may hold ``mfa`` as a separate word: CodeQL would read it
-#: as a password and raise an alert on every log line carrying this fixed sentence. See ADR 0034's
+#: as a password and raise ``py/clear-text-logging-sensitive-data`` on every log line carrying this
+#: fixed sentence. See ADR 0034's
 #: 2026-10-03 amendment; ``test_no_logged_settings_text_is_named_like_a_password`` guards it.
 OIDC_SECOND_FACTOR_CLAIM_EXCEPTION = (
     "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"

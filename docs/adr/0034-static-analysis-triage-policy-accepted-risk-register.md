@@ -870,8 +870,9 @@ reading is attributed to that pull request and was not re-measured here.
 ### The rule
 
 1. Where the engine chooses the name, a module constant or a helper, choose one the heuristic does
-   not read. PR 1959 renamed the two `OIDC_MFA_*` names to `OIDC_SECOND_FACTOR_CLAIM_EXCEPTION` and
-   `oidc_second_factor_claim_exception()`, with the text and behaviour unchanged.
+   not read. PR 1959 renamed `OIDC_MFA_CLAIM_EXCEPTION` and `oidc_mfa_claim_exception()` to
+   `OIDC_SECOND_FACTOR_CLAIM_EXCEPTION` and `oidc_second_factor_claim_exception()`, with the text and
+   behaviour unchanged.
 2. Where an operator writes the name, a config field, the name stays. Where the value adds nothing
    the operator needs, the log text carries a literal that the value selects instead. The
    `mfa_verify_min_elapsed_seconds` floor entry and its `_floor_verdict` are the worked example.

@@ -1474,6 +1474,7 @@ _OIDC_EXCEPTION = (
         # The ack logs the AUDIT line, then falls through to the same warning `enforcement = warn` prints.
         ("security.allow_single_factor_admin_when_exposed = true\n", ("AUDIT:", "warning: ")),
     ],
+    ids=["refuse", "ack"],
 )
 def test_serve_names_the_oidc_exception_when_oidc_and_its_claim_gate_are_on(
     tmp_path: Path,
@@ -1540,8 +1541,9 @@ def test_serve_undeclared_proxy_warning_names_the_oidc_exception(
     monkeypatch.setattr(
         "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
     )
-    main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"])
+    rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"])
     err = capsys.readouterr().err
+    assert rc == 0, err  # an inference warns and never refuses
     line = next(text for text in err.splitlines() if "UNDECLARED reverse proxy" in text)
     assert line.count(f"over the network{_OIDC_EXCEPTION}, and") == 1, line
 

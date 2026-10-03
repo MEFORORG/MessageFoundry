@@ -492,9 +492,9 @@ def test_no_logged_settings_text_is_named_like_a_password() -> None:
     ``mfa`` as a separate word in its name, as ``OIDC_MFA_CLAIM_EXCEPTION`` did on PR 1959.
 
     CodeQL is not a required check, so before this test the rule lived only in a comment. Scoped to
-    the names bound in this module, ``__all__`` among them; an imported text counts too, because it
-    reaches a log line from here all the same. ADR 0034's 2026-10-03 amendment holds the rule and
-    says what this guard does not see."""
+    the names bound in this module, ``__all__`` among them. An imported text constant counts too;
+    a helper counts only when defined here and annotated ``-> str``. ADR 0034's 2026-10-03
+    amendment holds the rule and says what this guard does not see."""
     # Positive control: the two names PR 1959 renamed away from, and the names it chose instead.
     assert _named_like_a_password_and_logged("OIDC_MFA_CLAIM_EXCEPTION", "a fixed sentence")
     assert _named_like_a_password_and_logged(
