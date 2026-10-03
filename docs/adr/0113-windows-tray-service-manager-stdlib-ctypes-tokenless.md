@@ -412,9 +412,9 @@ tray must never import. `tests/test_tray_branding.py` pins the command line and 
 The **Must never import** list is unchanged.
 
 **Narrowed the same day by vault BACKLOG #2822 and #2837.** Autostart's login command now carries
-`childenv.CHILD_INTERPRETER_FLAGS`. An installed engine gets `-m messagefoundry.tray`, where `-P`
-keeps the working directory off the path. A source checkout gets the bootstrap script, because a
-`-P -m` start there cannot find the package. So the login start no longer depends on the folder
+`childenv.CHILD_INTERPRETER_FLAGS`. An installed engine, editable installs included, gets
+`-m messagefoundry.tray`, where `-P` keeps the working directory off the path. A checkout that is not
+installed gets the bootstrap script, because a `-P -m` start there cannot find the package. So the login start no longer depends on the folder
 Windows starts it in.
 
 The bootstrap form can pass the 260 characters Windows documents for a Run value, which is why the

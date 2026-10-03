@@ -791,11 +791,12 @@ def test_the_guard_sees_the_calls_it_is_about() -> None:
 
 
 def test_one_function_builds_the_command_line_of_a_python_child() -> None:
-    """``python_child_argv`` is where the interpreter flags are added, so a Python child started any
-    other way would start without them. Two tray modules also name the executable.
-    ``tray/branding.py`` reads it to place the branded launcher and to tell whether it is running
-    under it. ``tray/autostart.py`` reads it to find ``pythonw.exe`` for the login command, which
-    it then builds with ``python_child_argv`` (vault BACKLOG #2822)."""
+    """``childenv`` is where the interpreter flags are added: ``python_child_argv``, and
+    ``python_module_argv`` for the tray's short login command. A Python child started any other way
+    would start without them. Two tray modules also name the executable. ``tray/branding.py`` reads
+    it to place the branded launcher and to tell whether it is running under it.
+    ``tray/autostart.py`` reads it to find ``pythonw.exe`` for the login command, which it then
+    builds with one of the two (vault BACKLOG #2822, #2837)."""
     names_the_interpreter = {
         rel
         for rel, source in _scanned_sources().items()

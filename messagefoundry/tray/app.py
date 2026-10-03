@@ -121,7 +121,7 @@ class TrayApp:
         elif action is Action.VIEW_LOG:
             self._view_log()
         elif action is Action.TOGGLE_AUTOSTART:
-            autostart.set_autostart(not autostart.is_autostart_enabled())
+            self._toggle_autostart()
         elif action is Action.EDIT_SETTINGS:
             self._edit_settings()
         elif action is Action.EXIT:
@@ -137,6 +137,15 @@ class TrayApp:
             # "[redacted] refused", as the test suite's filtered handlers once showed.
             log.warning("Console not opened: %s", exc)
             self._shell.request_notify("MessageFoundry", f"Console not opened: {exc}")
+
+    def _toggle_autostart(self) -> None:
+        wanted = not autostart.is_autostart_enabled()
+        if autostart.set_autostart(wanted) != wanted:
+            # set_autostart logged the length and the limit to tray.log (vault BACKLOG #2837).
+            self._shell.request_notify(
+                "MessageFoundry",
+                "Autostart not turned on: the login command is too long. See tray.log.",
+            )
 
     def _open_repo(self) -> None:
         if self._config.repo_path and self._vscode:

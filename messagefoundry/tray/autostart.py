@@ -11,13 +11,13 @@ working directory of a Run-key start (vault BACKLOG #2822).
 So the command carries :data:`~messagefoundry.childenv.CHILD_INTERPRETER_FLAGS`, which include
 ``-P``, and takes one of two forms:
 
-* **Installed** (the package sits in a site-packages folder): ``-m messagefoundry.tray``. On a
-  ``-m`` start, ``-P`` drops the working directory, and the interpreter finds the package in
-  site-packages. This is the short form.
-* **Source checkout** (anything else, editable installs included): the child bootstrap script by
-  its absolute path, as :func:`~messagefoundry.childenv.python_child_argv` builds it. ``-P`` on a
-  ``-m`` start cannot find a package that is not installed; the bootstrap finds it from its own
-  location.
+* Where the interpreter can import the package on its own, from a site-packages folder or a
+  ``.pth`` entry in one (an editable install), the short form from
+  :func:`~messagefoundry.childenv.python_module_argv`: ``-m messagefoundry.tray``. On a ``-m``
+  start, ``-P`` drops the working directory.
+* Anywhere else, the child bootstrap script by its absolute path, from
+  :func:`~messagefoundry.childenv.python_child_argv`. A ``-P -m`` start cannot find a package the
+  interpreter has not been told about; the bootstrap finds it from its own location.
 
 Windows documents a Run value as a command line of at most :data:`RUN_VALUE_LIMIT` characters
 (vault BACKLOG #2837). Enabling refuses a longer command: it logs a warning, removes any value
@@ -38,7 +38,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, python_child_argv
+from messagefoundry.childenv import python_child_argv, python_module_argv
 from messagefoundry.tray import ENTRY_MODULE
 
 log = logging.getLogger("messagefoundry.tray.autostart")
@@ -47,11 +47,8 @@ _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _VALUE_NAME = "MessageFoundryTray"
 
 #: The longest command line Microsoft documents for a Run or RunOnce value ("Run and RunOnce
-#: Registry Keys", learn.microsoft.com).
+#: Registry Keys", learn.microsoft.com: "no longer than 260 characters").
 RUN_VALUE_LIMIT = 260
-
-#: The folder that holds the ``messagefoundry`` package this module belongs to.
-_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 
 def pythonw_executable(executable: str | None = None) -> str:
@@ -65,38 +62,60 @@ def _norm(path: str | Path) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
-def installed_in_site_packages(package_root: Path = _PACKAGE_ROOT) -> bool:
-    """Whether the package sits in one of this interpreter's site-packages folders, where a ``-P``
-    ``-m`` start finds it. False for a source checkout, editable installs included."""
-    sites = list(site.getsitepackages())
-    if site.ENABLE_USER_SITE:
+def _pth_paths(site_dir: str) -> set[str]:
+    """The folders the ``.pth`` files in ``site_dir`` add to the path, read the way ``site`` reads
+    them but never executed: comment and ``import`` lines are skipped."""
+    found: set[str] = set()
+    with contextlib.suppress(OSError):
+        for pth in Path(site_dir).glob("*.pth"):
+            with contextlib.suppress(OSError):
+                for line in pth.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                    entry = line.strip()
+                    if entry and not entry.startswith(("#", "import ", "import\t")):
+                        found.add(_norm(os.path.join(site_dir, entry)))
+    return found
+
+
+def installed_in_site_packages(package_root: Path | None = None) -> bool:
+    """Whether the running interpreter imports the package from its site configuration, with no
+    working directory and no bootstrap: the folder holding it is a site-packages folder, or a
+    ``.pth`` file in one names it. A source checkout run any other way is not."""
+    root = _norm(package_root or Path(__file__).resolve().parents[2])
+    sites = [entry for entry in site.getsitepackages() if entry]
+    if site.ENABLE_USER_SITE and site.getusersitepackages():
         sites.append(site.getusersitepackages())
-    return _norm(package_root) in {_norm(entry) for entry in sites if entry}
+    return any(root == _norm(entry) or root in _pth_paths(entry) for entry in sites)
 
 
 def launcher_command(pythonw: str | None = None, *, installed: bool | None = None) -> str:
     """The HKCU Run command string, quoted by ``subprocess.list2cmdline`` the way the Windows
-    command-line parser reads it back. ``installed`` defaults to
-    :func:`installed_in_site_packages`; the module docstring describes both forms."""
+    command-line parser reads it back. ``installed`` defaults to :func:`installed_in_site_packages`
+    for the RUNNING interpreter, so pass ``pythonw`` only for that interpreter or with
+    ``installed``. The module docstring describes both forms."""
     exe = pythonw or pythonw_executable()
     if installed is None:
         installed = installed_in_site_packages()
-    if installed:
-        argv = [exe, *CHILD_INTERPRETER_FLAGS, "-m", ENTRY_MODULE]
-    else:
-        argv = python_child_argv(ENTRY_MODULE, executable=exe)
-    return subprocess.list2cmdline(argv)
+    build = python_module_argv if installed else python_child_argv
+    return subprocess.list2cmdline(build(ENTRY_MODULE, executable=exe))
+
+
+def _windows_length(command: str) -> int:
+    """Length as Windows counts it, in UTF-16 code units: a character outside the Basic
+    Multilingual Plane counts twice."""
+    return len(command.encode("utf-16-le")) // 2
 
 
 def checked_launcher_command() -> str | None:
     """:func:`launcher_command`, or ``None`` with a logged warning when it is longer than
     :data:`RUN_VALUE_LIMIT`."""
     command = launcher_command()
-    if len(command) > RUN_VALUE_LIMIT:
+    length = _windows_length(command)
+    if length > RUN_VALUE_LIMIT:
+        # Lower case on purpose: tray.log's redactor reads a run of capitalized words as a name.
         log.warning(
-            "Start at Login was not turned on: the login command is %d characters, and Windows "
-            "documents %d as the longest a Run value may be. Install the tray in a shorter folder.",
-            len(command),
+            "autostart not turned on: the login command is %d characters, over the %d that Windows "
+            "documents for a Run value; install the tray in a shorter folder",
+            length,
             RUN_VALUE_LIMIT,
         )
         return None

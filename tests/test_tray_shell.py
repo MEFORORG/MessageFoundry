@@ -117,7 +117,38 @@ def test_installed_means_the_package_sits_in_a_site_packages_folder(
     monkeypatch.setattr(site, "getsitepackages", lambda: [str(site_packages)])
     monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
     assert autostart.installed_in_site_packages(site_packages) is True
-    assert autostart.installed_in_site_packages(tmp_path / "checkout") is False
+    checkout = tmp_path / "checkout"
+    assert autostart.installed_in_site_packages(checkout) is False
+    # An editable install names the checkout in a .pth file; comment and import lines are skipped.
+    (site_packages / "_editable.pth").write_text(
+        f"# {checkout}\nimport sys\n{checkout}\n", encoding="utf-8"
+    )
+    assert autostart.installed_in_site_packages(checkout) is True
+    assert autostart.installed_in_site_packages(tmp_path / "elsewhere") is False
+
+
+def test_the_length_check_counts_utf16_code_units(monkeypatch: pytest.MonkeyPatch) -> None:
+    # One character outside the Basic Multilingual Plane counts as two UTF-16 code units.
+    beyond_bmp = "\U0001f600"
+    monkeypatch.setattr(autostart, "launcher_command", lambda *a, **k: "x" * 258 + beyond_bmp)
+    assert autostart.checked_launcher_command() is not None  # 259 characters, 260 units
+    monkeypatch.setattr(autostart, "launcher_command", lambda *a, **k: "x" * 259 + beyond_bmp)
+    assert autostart.checked_launcher_command() is None  # 260 characters, 261 units
+
+
+def test_the_menu_says_so_when_autostart_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry.tray.app import TrayApp
+
+    notes: list[tuple[str, str]] = []
+    app = TrayApp.__new__(TrayApp)
+    app._shell = types.SimpleNamespace(request_notify=lambda t, b: notes.append((t, b)))  # type: ignore[assignment]
+    monkeypatch.setattr(autostart, "is_autostart_enabled", lambda: False)
+    monkeypatch.setattr(autostart, "set_autostart", lambda enabled: False)
+    app._toggle_autostart()
+    assert len(notes) == 1 and "too long" in notes[0][1]
+    monkeypatch.setattr(autostart, "set_autostart", lambda enabled: enabled)
+    app._toggle_autostart()
+    assert len(notes) == 1
 
 
 @pytest.mark.parametrize(("length", "written"), [(260, True), (261, False)])

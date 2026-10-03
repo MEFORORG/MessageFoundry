@@ -48,6 +48,7 @@ __all__ = [
     "hook_environment",
     "outside_engine_namespace",
     "python_child_argv",
+    "python_module_argv",
     "worker_environment",
 ]
 
@@ -209,6 +210,18 @@ def python_child_argv(module: str, *, executable: str | None = None) -> list[str
     working directory on the child's import path.
     """
     return [executable or sys.executable, *CHILD_INTERPRETER_FLAGS, _BOOTSTRAP, module]
+
+
+def python_module_argv(module: str, *, executable: str | None = None) -> list[str]:
+    """``python -m module`` with :data:`CHILD_INTERPRETER_FLAGS`, and no bootstrap.
+
+    Shorter than :func:`python_child_argv`, and only for a package the interpreter can import on
+    its own, from site-packages or a ``.pth`` entry. ``-P`` drops the working directory from a
+    ``-m`` start, so a source checkout that is not installed cannot be found this way. Nothing
+    pins this build either: the first ``messagefoundry`` on the import path answers, so an absolute
+    ``PYTHONPATH`` entry naming another copy wins. The tray's login command is the one user.
+    """
+    return [executable or sys.executable, *CHILD_INTERPRETER_FLAGS, "-m", module]
 
 
 def _without_working_directory_entries(env: dict[str, str]) -> dict[str, str]:

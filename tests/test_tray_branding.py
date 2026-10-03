@@ -183,16 +183,19 @@ def _without_flag_stand_ins(probe_dir: Path) -> dict[str, str]:
 
 
 @_WINDOWS_ONLY
-@pytest.mark.parametrize("installed", [False, True], ids=["checkout", "installed"])
+@pytest.mark.parametrize(
+    "installed", [False, True, None], ids=["checkout", "installed", "as-classified"]
+)
 def test_the_login_command_starts_a_real_first_process_with_the_flags(
-    tmp_path: Path, installed: bool
+    tmp_path: Path, installed: bool | None
 ) -> None:
-    """The Run-key string itself, in each form, parsed by Windows, from a working directory holding
-    a decoy. Red before vault BACKLOG #2822: a plain ``-m`` put the working directory first and the
-    decoy answered."""
+    """The Run-key string itself, parsed by Windows, from a working directory holding a decoy. Red
+    before vault BACKLOG #2822: a plain ``-m`` put the working directory first and the decoy
+    answered. ``None`` takes the form ``installed_in_site_packages`` picks for this interpreter, so
+    a short form chosen where ``-P -m`` cannot import the package fails here (vault BACKLOG #2837)."""
     probe_dir, cwd, report = _probe_layout(tmp_path)
     env = _without_flag_stand_ins(probe_dir)
-    if installed:
+    if installed is True:
         # The short form needs the package on the interpreter's own path, as an install puts it.
         control = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
             [sys.executable, "-P", "-c", "import messagefoundry; print(messagefoundry.__file__)"],
@@ -215,6 +218,8 @@ def test_the_login_command_starts_a_real_first_process_with_the_flags(
         command, cwd=cwd, env=env, capture_output=True, text=True, timeout=50, check=False
     )
     assert done.returncode == 0, done.stderr
+    if installed is None:
+        installed = autostart.installed_in_site_packages()
     if installed:
         seen = _assert_this_build_with_the_flags(report)
         assert seen["orig_argv"][-3:-2] == ["-m"], seen["orig_argv"]
