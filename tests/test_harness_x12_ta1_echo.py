@@ -58,7 +58,7 @@ def test_the_hostile_interchange_frames_and_peeks_its_isa13_by_offset() -> None:
     assert isa13_of(wire) == _HOSTILE_ISA13
     assert not is_control_number(_HOSTILE_ISA13)
     assert is_control_number("000000001")
-    assert not is_control_number("00000000١")  # a non-ASCII digit is not an X12 digit
+    assert not is_control_number("00000000\u0661")  # a non-ASCII digit is not an X12 digit
 
 
 def test_ta1_refuses_an_acknowledged_value_that_is_not_nine_digits() -> None:
@@ -78,6 +78,7 @@ def test_an_accepting_sink_does_not_answer_a_hostile_isa13() -> None:
     assert out.reply is None  # before the fix: a TA1 whose TA1-04 parsed as "R"
     assert [r.payload for r in records] == [wire]  # still recorded, as everything received is
     assert records[0].meta["isa13"] == _HOSTILE_ISA13
+    assert records[0].meta["ta1"] == "withheld: ISA13 is not nine digits"
 
 
 def _dest(port: int) -> X12Destination:

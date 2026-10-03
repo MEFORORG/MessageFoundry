@@ -25,7 +25,8 @@ engine reads exactly one reply frame even when an echoed MSH-10 held one. The Se
 a payload with `frame_checked` before it opens a connection and shows `not sent:` with the byte and
 its position; the load sender refuses it on its open connection and counts it in `refused_sends`.
 The Compose tab refuses one the same way by default; it sends one only when the operator ticks its
-**Send MLLP frame bytes unchecked** box, for testing the engine's ingress refusal. The modules that frame unchecked are listed, with the
+**Send MLLP frame bytes unchecked** box, for testing the engine's ingress refusal, and the box
+clears after that one send. The modules that frame unchecked are listed, with the
 number of bare uses each makes and why, in `_DELIBERATE` in `tests/test_harness_frame_bytes.py`.
 That test reads imports and attribute uses of `frame`; it does not see a frame assembled by hand.
 
@@ -47,7 +48,8 @@ That test reads imports and attribute uses of `frame`; it does not see a frame a
   wrong-version) over MLLP with an explicit **ACK expectation** (Accept / Reject / No ACK), flagged
   against the actual reply — or drop it as a file. This reaches the ERROR / AR / AE / strict-
   validation paths the generators can't. A message holding an MLLP frame byte is refused with
-  `not sent:` unless the opt-in **Send MLLP frame bytes unchecked** box is ticked.
+  `not sent:` unless the opt-in **Send MLLP frame bytes unchecked** box is ticked; it covers one
+  send.
 - **Monitor** — connect to a running engine's API (reusing the console's sign-in) and observe what
   it did: live outbox stats + a connections table (polled off the UI thread), the message store
   with per-message disposition and full delivery/audit trail, the dead-letter queue with scoped +

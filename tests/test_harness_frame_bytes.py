@@ -252,7 +252,7 @@ def test_send_tab_still_sends_a_clean_payload(listener: socket.socket) -> None:
 
 
 def test_compose_framer_still_sends_a_hostile_payload(listener: socket.socket) -> None:
-    # The Compose tab passes the bare frame on purpose; the worker must honour it.
+    # The Compose tab passes the bare frame when the operator opts in; the worker must honour it.
     receiver_mod = pytest.importorskip("harness.mllp")
     payload = _message(_HOSTILE_IDS["start_byte"])
     item = receiver_mod.SendItem(1, "ADT", "A01", "X", payload)

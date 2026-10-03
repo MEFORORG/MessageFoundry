@@ -220,7 +220,51 @@ def test_the_printed_ack_shows_control_characters_as_escapes(
     assert not any(ch < " " and ch not in "\n\t" or "\x7f" <= ch < "\xa0" for ch in out)
 
 
-def test_printable_leaves_ordinary_text_alone() -> None:
-    # Control: a clean ACK prints exactly as before, CR as newline, non-ASCII text kept.
+def test_printable_output_is_ascii_and_cannot_be_forged() -> None:
     printable = _load()._printable
-    assert printable(b"MSH|^~\\&|A\rMSA|AA|X\t\xc3\xa9\r") == "MSH|^~\\&|A\nMSA|AA|X\té\n"
+    # Control: printable ASCII, tab and CR (as a newline) print as themselves.
+    assert printable(b"MSA|AA|X\tY\r") == "MSA|AA|X\tY\n"
+    # A backslash is doubled, so text spelling an escape cannot pass for an escaped control byte.
+    assert printable(b"\x1b" + b"\\x1b") == "\\x1b\\\\x1b"
+    # A bidirectional override, a non-ASCII letter and a byte that is not UTF-8 are escaped too,
+    # so what the operator reads is in byte order and a cp1252 console can always encode it.
+    shown = printable("A\u202eB\u00e9".encode() + b"\xff" + "\U0001f600".encode())
+    assert shown == "A\\u202eB\\xe9\\ufffd\\U0001f600"
+    assert shown.encode("ascii").decode("cp1252") == shown
+
+
+def test_an_ack_over_the_frame_cap_is_refused_not_buffered(
+    listener: socket.socket,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A peer that never ends its frame is cut off at the cap, as the harness Send tab does.
+    path = tmp_path / "clean.hl7"
+    path.write_bytes(_CLEAN.encode("utf-8"))
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(5)
+            received = b""
+            while not received.endswith(bytes([EB, CR])):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                received += chunk
+            conn.sendall(bytes([SB]) + b"MSH|" + b"x" * 200)  # never sends the end byte
+            conn.recv(1)  # hold the connection open until the script closes it
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    module = _load()
+    monkeypatch.setattr(module, "DEFAULT_MAX_FRAME_BYTES", 64)
+    status = module.main([str(path), "--port", _port(listener), "--timeout", "5"])
+    thread.join(5)
+
+    assert status == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("send_mllp: reply refused: frame exceeded 64 bytes")
+    assert "MSH" not in captured.err

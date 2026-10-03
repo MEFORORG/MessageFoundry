@@ -244,6 +244,7 @@ def test_compose_sends_the_frame_byte_when_the_operator_opts_in(qapp: Any) -> No
         panel._expect.setCurrentText(_NONE)
         _send_and_wait(panel, qapp)
         thread.join(timeout=5.0)
+        assert not panel._raw_frame.isChecked()  # the opt-in covers one send, then clears
     finally:
         server.close()
     # The bare frame went out: the payload's own 0x0B sits inside the frame, as the operator asked.

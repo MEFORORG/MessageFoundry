@@ -23,10 +23,14 @@ It sends the whole file as ONE frame. A listener takes one message per frame and
 ``samples/messages/adt_batch.hl7``, five messages with no envelope, is refused here. Drop a batch
 file in a ``File(...)`` inbox instead, which splits it into one message each.
 
-The ACK is the peer's text, printed to a terminal, so every control character in it except newline
-and tab -- C0, DEL and C1, after CR becomes a newline -- is printed as a visible ``\\xNN`` escape. A
-peer could otherwise move the cursor, retitle the window or rewrite what was printed above it with
-an escape sequence (ASVS 1.1.2).
+The ACK is the peer's text, printed to a terminal, so it is printed as printable ASCII, newline and
+tab only (ASVS 1.1.2). CR becomes a newline; a backslash is doubled; every other character -- a C0
+or C1 control such as ESC, DEL, a bidirectional override, any non-ASCII letter -- is printed as a
+visible ``\\xNN``, ``\\uNNNN`` or ``\\UNNNNNNNN`` escape, and a byte that is not UTF-8 as U+FFFD,
+``\\ufffd``. A peer could otherwise move the cursor, retitle the window, rewrite what was printed
+above it or reorder what it shows, and a character a Windows console cannot encode would stop the
+print. The reply is also read under the engine's frame cap, so a peer that never ends its frame
+cannot grow it without bound.
 """
 
 from __future__ import annotations
@@ -37,24 +41,35 @@ import contextlib
 import sys
 from pathlib import Path
 
-from messagefoundry.mllpcodec import FramePayloadError, MLLPDecoder, frame_checked
+from messagefoundry.mllpcodec import (
+    DEFAULT_MAX_FRAME_BYTES,
+    FramePayloadError,
+    MLLPDecoder,
+    MLLPFrameError,
+    frame_checked,
+)
 from messagefoundry.parsing import normalize
 
 #: The exit status for a refused file. Not 2, which argparse uses for a usage error.
 _REFUSED = 3
 
-#: Each C0 control but newline and tab, DEL, and each C1 control, mapped to a visible escape.
-_CONTROL_ESCAPES = {
-    code: f"\\x{code:02x}"
-    for code in (*range(0x20), 0x7F, *range(0x80, 0xA0))
-    if chr(code) not in "\n\t"
-}
+
+def _escape(char: str) -> str:
+    """``char`` as it is printed: itself when printable ASCII, newline or tab, else an escape."""
+    if char == "\\":
+        return "\\\\"  # doubled, so a literal "\\x1b" in the ACK cannot pass for an escaped ESC
+    if char in "\n\t" or " " <= char <= "~":
+        return char
+    code = ord(char)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
 
 
 def _printable(ack: bytes) -> str:
-    """The ACK as text that is safe to print to a terminal: CR as a newline, every other control
-    character but tab as ``\\xNN``."""
-    return ack.decode("utf-8", errors="replace").replace("\r", "\n").translate(_CONTROL_ESCAPES)
+    """The ACK as text that is safe to print to any terminal: see the module docstring."""
+    text = ack.decode("utf-8", errors="replace").replace("\r", "\n")
+    return "".join(_escape(char) for char in text)
 
 
 async def _send(host: str, port: int, wire: bytes, timeout: float) -> bytes:
@@ -63,7 +78,7 @@ async def _send(host: str, port: int, wire: bytes, timeout: float) -> bytes:
     try:
         writer.write(wire)
         await writer.drain()
-        decoder = MLLPDecoder()
+        decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
         while True:
             chunk = await asyncio.wait_for(reader.read(4096), timeout)
             if not chunk:
@@ -92,7 +107,11 @@ def main(argv: list[str] | None = None) -> int:
     except FramePayloadError as exc:
         print(f"send_mllp: {exc}", file=sys.stderr)
         return _REFUSED
-    ack = asyncio.run(_send(args.host, args.port, wire, args.timeout))
+    try:
+        ack = asyncio.run(_send(args.host, args.port, wire, args.timeout))
+    except MLLPFrameError as exc:  # the cap, named by size only: the reply's content is not quoted
+        print(f"send_mllp: reply refused: {exc}", file=sys.stderr)
+        return 1
     print("--- ACK ---")
     print(_printable(ack))
     return 0

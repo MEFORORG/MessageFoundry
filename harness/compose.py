@@ -15,7 +15,8 @@ MLLP start or end byte would not arrive as one message, so it is refused before 
 the result reads ``not sent:`` with the byte and its position, never the content. An operator can
 paste a real message here, so the default must not split one. Sending such bytes is still one of
 the malformations this tab exists for (ADR 0205 rule 4 refuses them at ingress), so the clearly
-labelled opt-in checkbox switches to the bare framer for that send.
+labelled opt-in checkbox switches to the bare framer for one send: it clears itself when that send
+starts, so a message pasted afterwards is checked again unless the operator ticks it again.
 """
 
 from __future__ import annotations
@@ -173,6 +174,7 @@ class ComposePanel(QWidget):
                 expect_ack=self._pending_expect != _NONE,
                 framer=self._framer(),
             )
+            self._raw_frame.setChecked(False)  # one send per tick: see the module docstring
             worker.result.connect(self._on_mllp_result)
         else:
             worker = FileDropWorker(self._dir.text().strip(), [item], rate=0.0)

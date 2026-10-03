@@ -73,10 +73,18 @@ class X12Sink(Sink):
             try:
                 for interchange in reader.feed(chunk):
                     control = isa13_of(interchange)
-                    self._add(Record(interchange, {"peer": peer, "isa13": control or ""}))
-                    # Never echo an ISA13 that is not nine digits: see the module docstring.
-                    if self.ta1 is not None and control is not None and is_control_number(control):
-                        conn.sendall(build_ta1(control, self.ta1))
+                    meta = {"peer": peer, "isa13": control or ""}
+                    reply: bytes | None = None
+                    if self.ta1 is not None and control is not None:
+                        # Never echo an ISA13 that is not nine digits (see the module docstring).
+                        # The record says so, so a run whose engine then times out shows why.
+                        if is_control_number(control):
+                            reply = build_ta1(control, self.ta1)
+                        else:
+                            meta["ta1"] = "withheld: ISA13 is not nine digits"
+                    self._add(Record(interchange, meta))
+                    if reply is not None:
+                        conn.sendall(reply)
             except X12FrameError:
                 return  # over the cap: drop the connection, as the engine's own listener does
             except OSError:
