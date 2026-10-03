@@ -226,6 +226,8 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/parsing/xml/_deps.py": _VERIFY_ONLY,
     "messagefoundry/pipeline/cert_expiry.py": "reads PUBLIC certificate facts to alarm on expiry; "
     "it loads no key",
+    "messagefoundry/pipeline/crl_reload.py": "adds a replaced CRL file to live TLS contexts and "
+    "verifies its signature against the hop's PUBLIC CA certificates; it loads no key (BACKLOG #299)",
     "messagefoundry/pipeline/sharding.py": _KEYLESS,
     "messagefoundry/pipeline/sandbox.py": _EPHEMERAL,
     "messagefoundry/pipeline/alert_sinks.py": _POSTURE_ONLY,
