@@ -1002,7 +1002,8 @@ class LdapAuthenticator:
             try:
                 who = _authzid_text(svc.extend.standard.who_am_i())
             except ldap3.core.exceptions.LDAPException as exc:
-                who, whoami_error = None, f"Who am I failed: {type(exc).__name__}"
+                who = None
+                whoami_error = f"Who am I failed: {type(exc).__name__}: {str(exc)[:200]}"
             try:
                 _search(
                     svc,

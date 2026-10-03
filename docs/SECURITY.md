@@ -691,9 +691,9 @@ engine's own:
 
 - **A Vault hop whose `MEFOR_*_VAULT_TOKEN` or `MEFOR_*_VAULT_ADDR` is unset is not observed.**
   The engine itself would fall back to `VAULT_TOKEN`, `~/.vault-token` or `VAULT_ADDR` there. The
-  check does not. In an operator's shell those are the operator's own: judging that token as the
-  engine's reports on the wrong token, and sending the engine's token to that address would hand
-  it to a different Vault. A Vault-held AD bind password is read under the same rule.
+  check does not. In an operator's shell those values are the operator's own. Judging that token
+  as the engine's would report on the wrong token. Sending the engine's token to that address
+  would hand it to a different Vault. A Vault-held AD bind password is read under the same rule.
 - **Each run binds to AD as the service account.** A wrong or stale bind password is a failed bind,
   and each one counts toward the domain's account lockout threshold. Repeated runs with the wrong
   password can lock the account the running engine uses. Check the password before you run the

@@ -20,7 +20,9 @@ no client of its own:
 address, an unreachable server, a 403 on the lookup -- comes back as a problem string, which the
 read-out reports as ``unobservable``. **Nothing secret is kept:** never the token, its accessor or
 its id, and never a bind password. A problem names the exception type, or the engine's own fixed
-refusal text, never a server's error body.
+refusal text, or the first 200 characters of a plain ``ValueError`` (the probe's own shape checks
+and the TLS-suite assertion raise those). It never carries a server's error body: a subclass of
+``ValueError``, such as a JSON decode error, keeps its type name alone.
 """
 
 from __future__ import annotations
@@ -124,19 +126,34 @@ def read_vault_token(
     token: Callable[[], str],
     build_client: Callable[[str], Any],
     required: Callable[[], Mapping[str, frozenset[str]]],
+    address: Callable[[], str] | None = None,
 ) -> VaultTokenReading:
     """Read one token's own policies and capabilities through the engine's client for that hop.
 
     ``token`` returns the token named in the hop's own variable and refuses when it is unset, so
-    hvac never substitutes ``VAULT_TOKEN``. ``build_client`` is the hop's own constructor, and
-    ``required`` names the paths the engine calls on it; all three live beside the calls they
-    describe (``store/keyprovider_vault.py``, ``store/crypto_transit.py``,
-    ``config/secretprovider_vault.py``)."""
+    hvac never substitutes ``VAULT_TOKEN``; ``address`` does the same for ``VAULT_ADDR``. Both are
+    asked before the client is built, so an operator missing both learns of both in one run.
+    ``build_client`` is the hop's own constructor, and ``required`` names the paths the engine calls
+    on it; all of them live beside the calls they describe (``store/keyprovider_vault.py``,
+    ``store/crypto_transit.py``, ``config/secretprovider_vault.py``)."""
     problems: list[str] = []
+    unset: list[str] = []
+    named = ""
+    for source in (token, address):
+        if source is None:
+            continue
+        try:
+            value = source()
+        except Exception as exc:  # an unset variable: reported, never raised
+            unset.append(_why(exc))
+            continue
+        if source is token:
+            named = value
+    if unset:
+        return VaultTokenReading(problems=tuple(_problem(f"no Vault client: {u}") for u in unset))
     try:
-        named = token()
         client = build_client(named)
-    except Exception as exc:  # an unset token or a refused client: reported, never raised
+    except Exception as exc:  # a refused client: reported, never raised
         return VaultTokenReading(problems=(_problem(f"no Vault client: {_why(exc)}"),))
     token_ref = hashlib.sha256(named.encode("utf-8")).hexdigest()
     try:
@@ -185,7 +202,9 @@ def read_vault_token(
         for path in paths:
             caps = body.get(path)
             if isinstance(caps, list):
-                capabilities[path] = _strings(caps)
+                # Capabilities are a fixed vocabulary compared against, never sent back, so they
+                # are normalised here; a stray character cannot make "read" read as excess.
+                capabilities[path] = tuple(printable(c) for c in _strings(caps))
             else:
                 problems.append(_problem(f"capabilities-self returned nothing for {path}"))
     except Exception as exc:  # Vault refused or could not be reached: reported, never raised
@@ -211,6 +230,7 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
     if kind == "kv":
         from messagefoundry.config.secretprovider_vault import (
             kv_required_capabilities,
+            secrets_vault_address,
             secrets_vault_client,
             secrets_vault_token,
         )
@@ -219,9 +239,11 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
             secrets_vault_token,
             secrets_vault_client,
             lambda: kv_required_capabilities(consumer.refs),
+            secrets_vault_address,
         )
     from messagefoundry.store.keyprovider_vault import (
         kek_required_capabilities,
+        store_vault_address,
         store_vault_client,
         store_vault_token,
     )
@@ -230,10 +252,15 @@ def probe_vault(consumer: VaultConsumer) -> VaultTokenReading:
         from messagefoundry.store.crypto_transit import transit_cipher_required_capabilities
 
         return read_vault_token(
-            store_vault_token, store_vault_client, transit_cipher_required_capabilities
+            store_vault_token,
+            store_vault_client,
+            transit_cipher_required_capabilities,
+            store_vault_address,
         )
     if kind == "kek":
-        return read_vault_token(store_vault_token, store_vault_client, kek_required_capabilities)
+        return read_vault_token(
+            store_vault_token, store_vault_client, kek_required_capabilities, store_vault_address
+        )
     # Unreachable while VaultKind has three members; a fourth must be routed here, not defaulted.
     raise ValueError(f"no Vault probe for consumer kind {kind!r}")
 
@@ -244,7 +271,7 @@ def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> Bin
     that a Vault-held password is read only with the token in ``MEFOR_SECRETS_VAULT_TOKEN`` from the
     Vault in ``MEFOR_SECRETS_VAULT_ADDR``, never ones hvac would substitute. Any failure comes back in ``problem``; this never raises."""
     from messagefoundry.auth.ldap import BindAccountReading, LdapAuthenticator
-    from messagefoundry.config.secretprovider import resolve_secret_provider
+    from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
     from messagefoundry.config.settings import SecurityEnforcement
 
     try:
@@ -255,9 +282,20 @@ def read_ldap_bind(settings: ServiceSettings, posture: HopPosture | None) -> Bin
             )
 
             # Refuse before any read when the engine's token or address is unset, so hvac never
-            # substitutes VAULT_TOKEN, or sends the engine's token to VAULT_ADDR.
-            secrets_vault_token()
-            secrets_vault_address()
+            # substitutes VAULT_TOKEN, or sends the engine's token to VAULT_ADDR. Both are asked,
+            # so one run names both, and the operator does not bind again just to learn the second.
+            unset = []
+            for source in (secrets_vault_token, secrets_vault_address):
+                try:
+                    source()
+                except SecretProviderError as exc:
+                    unset.append(_why(exc))
+            if unset:
+                return BindAccountReading(
+                    None,
+                    problem=_problem("AD bind probe not run: " + "; ".join(unset)),
+                    bound=False,
+                )
         authenticator = LdapAuthenticator(
             settings.auth,
             secret_provider=resolve_secret_provider(settings.secrets),

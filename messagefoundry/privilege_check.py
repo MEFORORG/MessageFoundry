@@ -328,7 +328,7 @@ def printable(text: str) -> str:
 
 
 def _caps(caps: Iterable[str]) -> str:
-    return ", ".join(sorted(printable(c) for c in caps)) or "none"
+    return ", ".join(sorted(caps)) or "none"
 
 
 def vault_hop(
@@ -348,7 +348,9 @@ def vault_hop(
     no over-grant was seen. Over-grant wins, as it does in the exit code."""
     over: list[str] = []
     notes: list[str] = []
-    if "root" in reading.policies:
+    # Judged on the printed form too: a name that only LOOKS like root once its invisible
+    # characters are dropped would otherwise print as "root" while being judged as something else.
+    if any(p == "root" or printable(p) == "root" for p in reading.policies):
         over.append("the token carries the root policy")
     for path, needed in reading.required.items():
         if path not in reading.capabilities:
@@ -382,8 +384,7 @@ def vault_hop(
             ttl = f"ttl {reading.ttl}s"
         renew = {True: "renewable", False: "not renewable", None: "renewability not reported"}
         seen.append(
-            f"token policies [{', '.join(printable(p) for p in reading.policies)}], {ttl}, "
-            f"{renew[reading.renewable]}"
+            f"token policies [{', '.join(reading.policies)}], {ttl}, {renew[reading.renewable]}"
         )
     checked = [p for p in reading.required if p in reading.capabilities]
     if checked:
@@ -395,7 +396,7 @@ def vault_hop(
     else:
         state = HopState.CLEAN
     parts = [*(f"over-granted: {o}" for o in over), *seen, *notes]
-    parts += [f"could not observe: {printable(p)}" for p in reading.problems]
+    parts += [f"could not observe: {p}" for p in reading.problems]
     if state is HopState.CLEAN:
         parts.append(
             "paths the engine does not call were read only for the administrative ones; "
@@ -500,7 +501,8 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     """Probe and judge the bind account, when AD is configured.
 
     Over-granted: any administrative group the check knows, by SID from ``tokenGroups`` (every
-    nested and primary group), by name from the direct ``memberOf``, or by the ``primaryGroupID``.
+    nested and primary group), by the ``primaryGroupID``, or by name from the direct ``memberOf``.
+    Once ``tokenGroups`` was read, a name counts only for a group with no fixed SID (DnsAdmins).
     Clean: Who am I named the bound identity and the transitive read found none of them, which is
     not a claim that the account holds no other powerful group. Unobservable: the bind or a read
     failed, a bound Who am I named no identity, or only the direct read was possible and it found
@@ -518,16 +520,12 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     # The canonical spelling, never the directory's, so nothing remote reaches the output. With
     # tokenGroups read, a name match counts only for a group with no fixed SID (DnsAdmins): the SID
     # read already settled the rest, and an ordinary group that happens to be NAMED Administrators
-    # in some OU must not read as the BUILTIN one. Without it, every name and the primary group
-    # count, because nothing better was read.
-    names = set(_ADMIN_NAME_ONLY) if transitive else None
-    direct = {
-        _ADMIN_GROUP_NAMES[c.lower()]
-        for c in reading.member_of
-        if c.lower() in _ADMIN_GROUP_NAMES
-        and (names is None or _ADMIN_GROUP_NAMES[c.lower()] in names)
-    }
-    if not transitive and reading.primary_group_rid in _ADMIN_DOMAIN_RIDS:
+    # in some OU must not read as the BUILTIN one.
+    allowed = set(_ADMIN_NAME_ONLY) if transitive else set(_ADMIN_GROUP_NAMES.values())
+    direct = {g for c in reading.member_of if (g := _ADMIN_GROUP_NAMES.get(c.lower())) in allowed}
+    # The primary group is a RID, which no name can fake, so it counts on both paths: a tokenGroups
+    # read that somehow lacks the primary group must not turn a Domain Admins primary into clean.
+    if reading.primary_group_rid in _ADMIN_DOMAIN_RIDS:
         direct.add(_ADMIN_DOMAIN_RIDS[reading.primary_group_rid])
     problems = [reading.problem] if reading.problem is not None else []
     if reading.bound and reading.authzid is None:
@@ -554,7 +552,7 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     else:
         state = HopState.CLEAN
         parts.append("in none of the administrative groups the check knows (transitive read)")
-    parts += [f"could not observe: {printable(p)}" for p in problems]
+    parts += [f"could not observe: {p}" for p in problems]
     parts.append(_LDAP_RIGHTS_NOT_READ)
     # As for a Vault hop: one printable() over everything the directory or ldap3 supplied.
     return HopPrivilege("ldap", state, identity, minimal, printable(". ".join(parts)))

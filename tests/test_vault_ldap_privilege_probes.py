@@ -271,6 +271,32 @@ def test_a_hostile_policy_name_inside_a_granted_path_is_printed_and_logged_clean
     assert _clean(caplog.text)
 
 
+@pytest.mark.parametrize("lookalike", ["ro\x00ot", "r\u200boot", "root\u202e"])
+def test_a_policy_that_only_looks_like_root_is_judged_as_root(lookalike: str) -> None:
+    """The printed list would show "root"; the judgement must agree with what is printed."""
+    hop = vault_hop(_STORE, _reading(_FakeVault(policies=(lookalike,), caps=_least_caps())))
+    assert hop.state is HopState.OVER_GRANTED
+    assert "the token carries the root policy" in hop.detail
+
+
+def test_a_capability_with_a_stray_character_is_read_as_the_capability() -> None:
+    caps = {f"transit/keys/{_KEK}": ["read\x00"], f"transit/decrypt/{_KEK}": ["update"]}
+    hop = vault_hop(_STORE, _reading(_FakeVault(caps=caps)))
+    assert hop.state is HopState.CLEAN
+
+
+def test_an_unset_token_and_address_are_both_named_in_one_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MEFOR_STORE_VAULT_TOKEN", raising=False)
+    monkeypatch.delenv("MEFOR_STORE_VAULT_ADDR", raising=False)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
+    reading = probe_vault(_STORE)
+    joined = " ".join(reading.problems)
+    assert "MEFOR_STORE_VAULT_TOKEN is not set" in joined
+    assert "MEFOR_STORE_VAULT_ADDR is not set" in joined
+
+
 def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> None:
     kv_path = "secret/data/mefor/ad"
     caps = _least_caps() | {kv_path: ["read"]}
@@ -699,10 +725,21 @@ def test_an_ordinary_group_named_administrators_is_not_the_builtin_one(
     raw = {
         "tokenGroups": [_sid(*_DOMAIN, 513), _sid(*_DOMAIN, 1105)],
         "memberOf": [b"CN=Administrators,OU=App,DC=example,DC=com"],
-        "primaryGroupID": [b"512"],
+        "primaryGroupID": [b"513"],
     }
     hop = _judge(_read(monkeypatch, _FakeLdapConn(raw)))
     assert hop.state is HopState.CLEAN
+
+
+def test_a_domain_admins_primary_group_counts_even_beside_a_tokengroups_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A RID cannot be faked by naming a group, so the primary group counts on both paths, even
+    when a tokenGroups read somehow lacks it."""
+    raw = {"tokenGroups": [_sid(*_DOMAIN, 513)], "primaryGroupID": [b"512"]}
+    hop = _judge(_read(monkeypatch, _FakeLdapConn(raw)))
+    assert hop.state is HopState.OVER_GRANTED
+    assert "Domain Admins (direct memberOf)" in hop.detail
 
 
 @pytest.mark.parametrize(
@@ -735,10 +772,10 @@ def test_a_who_am_i_that_raises_after_a_good_bind_is_not_a_bind_failure(
     conn.extend = type("E", (), {"standard": type("S", (), {"who_am_i": staticmethod(_raise)})()})()
     reading = _read(monkeypatch, conn)
     assert reading.bound is True and reading.group_sids  # the group read still ran
-    assert reading.whoami_error == "Who am I failed: LDAPExtensionError"
+    assert reading.whoami_error == "Who am I failed: LDAPExtensionError: unsupported"
     hop = _judge(reading)
     assert hop.state is HopState.UNOBSERVABLE
-    assert "Who am I failed: LDAPExtensionError" in hop.detail
+    assert "Who am I failed: LDAPExtensionError: unsupported" in hop.detail
     assert "bind probe" not in hop.detail
 
 

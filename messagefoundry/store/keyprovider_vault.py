@@ -397,16 +397,13 @@ def store_vault_token() -> str:
     return token
 
 
-def store_vault_client(token: str) -> Any:
-    """The store hop's Vault client for ``token``, built by the same :func:`_build_client` the
-    providers use: same TLS narrowing, same anchor, no redirects, and the same cleartext-address
-    refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's own grants through it
-    and changes nothing. Take ``token`` from :func:`store_vault_token`.
+def store_vault_address() -> str:
+    """The store Vault named in ``MEFOR_STORE_VAULT_ADDR``, for ``check-privileges``.
 
-    **It refuses when ``MEFOR_STORE_VAULT_ADDR`` is unset, where the providers do not.** Given no
-    address, hvac reads ``VAULT_ADDR``: in an operator's shell that may be another Vault, which
-    would then receive the engine's token. Raises :class:`KeyProviderError`, which the probe reports
-    as not observed. The providers keep their documented fallback (docs/CONFIGURATION.md)."""
+    **It refuses when that variable is unset, where the providers do not.** Given no address, hvac
+    reads ``VAULT_ADDR``: in an operator's shell that may be another Vault, which would then receive
+    the engine's token. Raises :class:`KeyProviderError`, which the probe reports as not observed.
+    The providers keep their documented fallback (docs/CONFIGURATION.md)."""
     addr = os.environ.get(_ENV_ADDR)
     if not addr:
         raise KeyProviderError(
@@ -414,7 +411,16 @@ def store_vault_client(token: str) -> Any:
             f"only to the address named there, never VAULT_ADDR; run it with the service's "
             f"environment"
         )
-    return _build_client(addr, token)
+    return addr
+
+
+def store_vault_client(token: str) -> Any:
+    """The store hop's Vault client for ``token``, built by the same :func:`_build_client` the
+    providers use: same TLS narrowing, same anchor, no redirects, and the same cleartext-address
+    refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's own grants through it
+    and changes nothing. Take ``token`` from :func:`store_vault_token`; the address comes from
+    :func:`store_vault_address`, which refuses an unset one."""
+    return _build_client(store_vault_address(), token)
 
 
 def kek_required_capabilities() -> dict[str, frozenset[str]]:
