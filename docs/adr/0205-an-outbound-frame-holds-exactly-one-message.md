@@ -56,6 +56,14 @@ as the accepted draft wrote them except where a point below says otherwise.
    encoded bytes for the codec's start and end byte, and refuses; it never strips or escapes. It
    holds for every codec, preset or explicit. `FrameCodec.frame` itself is unchanged, because it
    also serves a client (the test harness) that frames hostile bytes on purpose.
+   - *Added 2026-10-03 (ASVS 1.1.2).* The judgement itself, which byte, at which position, and the
+     refusal's wording, moved to the client-importable leaf as `FrameCodec.find_frame_byte`, with
+     `FrameCodec.neutralise` for the reply path below. `check_frame_bytes` and `frame_reply`
+     delegate to them with no change in behaviour, so the engine and the test harness hold one
+     definition. The harness refuses with `FrameCodec.frame_checked` and neutralises with
+     `FrameCodec.frame_neutralised` (MLLP wrappers of both are in `messagefoundry.mllpcodec`). The
+     harness modules that still frame with the bare `frame`, on purpose, are named once, in
+     `_DELIBERATE` in `tests/test_harness_frame_bytes.py`.
    - *Deviation from the draft, and why.* The draft put the check in a wrapper "that all six send
      paths call". The build frames **once, in `send()`, before any dial**, and passes the framed
      bytes to the six paths (`_send_once`, `_send_once_no_ack`, `_send_persistent`,

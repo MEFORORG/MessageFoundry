@@ -29,7 +29,14 @@ from harness.load.correlator import Correlator
 from harness.load.failover_track import FailoverTracker
 from harness.load.metrics import LiveMetrics
 from harness.load.profile import Target
-from messagefoundry.mllpcodec import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder, MLLPFrameError, frame
+from messagefoundry.mllpcodec import (
+    DEFAULT_MAX_FRAME_BYTES,
+    FrameEncodeError,
+    FramePayloadError,
+    MLLPDecoder,
+    MLLPFrameError,
+    frame_checked,
+)
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +115,8 @@ class PersistentConnection:
         # How many sockets this side closed because the engine sent a reply frame over the MLLP cap
         # (ASVS 5.1.1). Not a drop: the engine did not close anything, this side refused the frame.
         self._frame_refusals = 0
+        # Payloads this connection refused to write (ADR 0205 rule 1); see `_write_loop`.
+        self._refused = 0
         # Called on every reply (ACK or NAK) while set, and None otherwise. The connscale reload probe
         # sets it only while it waits for the first reply after the reload, and clears it on that
         # reply, so the steady-state read path pays one None check (BACKLOG #1292).
@@ -267,12 +276,27 @@ class PersistentConnection:
             except TimeoutError:
                 continue  # idle wake to re-check the stop flag
             out, on_done = job
+            try:
+                wire = frame_checked(out.payload)
+            except (FramePayloadError, FrameEncodeError) as exc:
+                # A payload holding an MLLP start or end byte would not arrive as one message (ADR
+                # 0205 rule 1), so it is not written; nor is one that cannot be encoded. Counted
+                # apart from transport errors and released, so its closed-loop slot is not stranded.
+                # A generated corpus holds neither; a replay corpus can. The report notes the count;
+                # the log warns once per connection, not once per send.
+                self._m.counters.refused_sends += 1
+                self._refused += 1
+                if self._refused == 1:
+                    log.warning("load payload seq=%d not sent: %s", out.seq, exc)
+                if on_done is not None:
+                    on_done()
+                continue
             send_ns = time.perf_counter_ns()
             self._correlator.on_send(out.seq, send_ns)
             self._m.counters.sent += 1
             if self._expect_ack:
                 self._inflight.append((out.seq, send_ns, out.control_id, on_done))
-            writer.write(frame(out.payload))
+            writer.write(wire)
             if not self._expect_ack:
                 # No ACK expected: the message is "done" once written. Complete it BEFORE the drain
                 # await — there is no await between popping the job and here, so a cancel/disconnect at

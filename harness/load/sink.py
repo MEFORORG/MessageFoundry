@@ -12,8 +12,9 @@ the engine — so it does one tolerant :class:`~messagefoundry.parsing.peek.Peek
 (reused for both the control id and the ACK), batches replies per read, and logs nothing per message.
 
 Runs in the same event loop as the sender, so send and receive timestamps come from one monotonic
-clock — no cross-clock skew. Reuses the engine's own framing primitives (``frame`` / ``MLLPDecoder``
-/ ``build_ack``); it never touches the store.
+clock — no cross-clock skew. Reuses the engine's own framing primitives (``MLLPDecoder`` /
+``build_ack`` / ``frame_neutralised``, which frames an ACK echoing an MLLP frame byte as one frame,
+the rule the engine's own listeners reply by); it never touches the store.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from messagefoundry.mllpcodec import (
     MLLPDecoder,
     MLLPFrameError,
     build_ack,
-    frame,
+    frame_neutralised,
 )
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.peek import HL7PeekError
@@ -166,4 +167,4 @@ class CorrelationSink:
             # A delivery whose control id isn't one of this run's (foreign traffic on the sink port).
             self._m.counters.sink_received += 1
             self._m.counters.correlation_misses += 1
-        replies += frame(build_ack(peek, code="AA", ack_mode=self._ack_mode))
+        replies += frame_neutralised(build_ack(peek, code="AA", ack_mode=self._ack_mode))

@@ -174,7 +174,7 @@ def test_json_is_metrics_only_no_phi() -> None:
     )
     text = report.to_json()
     # 2→3: engine_side gained body_copies + copies_per_message (#207 loose end 2, ADR 0141).
-    assert '"schema_version": 3' in text
+    assert '"schema_version": 4' in text
     # No raw HL7 / control ids / PHI tokens ever reach the artifact.
     for forbidden in ("MSH|", "PID|", "\r", "MEFOR", "^~"):
         assert forbidden not in text

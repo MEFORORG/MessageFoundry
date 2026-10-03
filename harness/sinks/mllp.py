@@ -14,7 +14,7 @@ import socket
 from harness.endpoints import Endpoints
 from harness.sinks import LOOPBACK, Record, Sink
 from harness.sinks._tcp import LoopbackServer, recv_chunks
-from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, build_ack, frame
+from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, build_ack, frame_neutralised
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
 KIND = "mllp"
@@ -48,7 +48,9 @@ class MLLPSink(Sink):
                 for payload in decoder.feed(chunk):
                     self._add(Record(payload, {"peer": peer}))
                     if self.reply is not None:
-                        conn.sendall(frame(build_ack(payload, code=self.reply)))
+                        # Neutralised: an echoed header value holding a frame byte must not
+                        # split or extend the ACK frame (ADR 0205, as the engine's listeners).
+                        conn.sendall(frame_neutralised(build_ack(payload, code=self.reply)))
             except MLLPFrameError:
                 return  # over the cap: drop the connection, as the engine's own listener does
             except OSError:

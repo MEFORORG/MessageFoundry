@@ -39,6 +39,7 @@ from messagefoundry.generators import (
     _core,
     all_types,  # noqa: F401  (registers the built-in message types)
 )
+from messagefoundry.mllpcodec import frame
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 
 _COLUMNS = ["Time", "Transport", "Result", "Expected", "OK", "Error"]
@@ -154,6 +155,9 @@ class ComposePanel(QWidget):
                 timeout=10.0,
                 rate=0.0,
                 expect_ack=self._pending_expect != _NONE,
+                # Unchecked on purpose: a hand-edited message holding an MLLP frame byte is one of
+                # the malformations this tab exists to send (ADR 0205 rule 4 refuses it at ingress).
+                framer=frame,
             )
             worker.result.connect(self._on_mllp_result)
         else:

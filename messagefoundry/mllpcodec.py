@@ -38,7 +38,13 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from messagefoundry.framing import MLLP_CODEC, FrameDecoder, FrameError
+from messagefoundry.framing import (
+    MLLP_CODEC,
+    FrameDecoder,
+    FrameEncodeError,
+    FrameError,
+    FramePayloadError,
+)
 from messagefoundry.timezone import hl7_now
 
 if TYPE_CHECKING:
@@ -51,7 +57,11 @@ __all__ = [
     "DEFAULT_MAX_FRAME_BYTES",
     "AckMode",
     "MLLPFrameError",
+    "FramePayloadError",
+    "FrameEncodeError",
     "frame",
+    "frame_checked",
+    "frame_neutralised",
     "MLLPDecoder",
     "build_ack",
 ]
@@ -89,6 +99,25 @@ class MLLPFrameError(FrameError):
 def frame(payload: str | bytes, encoding: str = "utf-8") -> bytes:
     """Wrap a message in an MLLP block: ``SB payload EB CR`` (the VT/FS+CR codec preset)."""
     return MLLP_CODEC.frame(payload, encoding)
+
+
+def frame_checked(payload: str | bytes, encoding: str = "utf-8") -> bytes:
+    """:func:`frame`, refusing a payload that holds an MLLP frame byte, by the rule the engine's own
+    MLLP delivery refuses by (ADR 0205 rule 1), which is stated once, at
+    :meth:`~messagefoundry.framing.FrameCodec.find_frame_byte`.
+
+    Raises :class:`~messagefoundry.framing.FramePayloadError`, or
+    :class:`~messagefoundry.framing.FrameEncodeError` for a payload ``encoding`` cannot hold."""
+    return MLLP_CODEC.frame_checked(payload, encoding, transport="MLLP")
+
+
+def frame_neutralised(payload: str | bytes, encoding: str = "utf-8") -> bytes:
+    """:func:`frame` with each MLLP frame byte in the payload replaced by a space: always one frame.
+
+    For an acknowledgement, which echoes values from an inbound message that may hold a start byte
+    as data. The engine's listeners reply by the same rule
+    (:meth:`~messagefoundry.framing.FrameCodec.neutralise`)."""
+    return MLLP_CODEC.frame_neutralised(payload, encoding)
 
 
 class MLLPDecoder(FrameDecoder):
