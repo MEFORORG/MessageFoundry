@@ -218,6 +218,9 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/config/secretprovider_vault.py": "reads connector credentials from Vault KV over "
     "a verifying hop; the Vault token is a credential in the rotation schedule, and a key it fetches "
     "is governed by the row for the setting it fills",
+    "messagefoundry/privilege_probes.py": _KEYLESS + "; check-privileges reads each Vault "
+    "token's own policies through the providers' client builders, and the token is a credential "
+    "in the rotation schedule (BACKLOG #305)",
     "messagefoundry/credential.py": _KEYLESS + "; it compares a configured credential in constant "
     "time, and that credential is governed by the rotation schedule",
     "messagefoundry/integrity.py": _KEYLESS,

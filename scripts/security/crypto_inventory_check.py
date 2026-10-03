@@ -687,6 +687,22 @@ INVENTORY: dict[str, frozenset[str]] = {
             "messagefoundry.store.keyprovider",
         }
     ),
+    # BACKLOG #305 (ASVS 13.2.2): check-privileges reads each Vault token's own policies and
+    # capabilities through the providers' own client builders (store_vault_client, the Transit
+    # cipher's and the KEK's required-path helpers), so it carries their TLS narrowing, anchor and
+    # cleartext refusal and builds no client of its own. tls_policy and keyprovider are imported only
+    # to recognise the engine's fixed-text refusals (InsecureHopRefused, KeyProviderError). hashlib:
+    # a SHA-256 digest of each Vault token, held in memory only to tell whether two hops hold the
+    # same token, and never printed. No encrypt, decrypt, MAC or key load.
+    "messagefoundry/privilege_probes.py": frozenset(
+        {
+            "hashlib",
+            "messagefoundry.config.tls_policy",
+            "messagefoundry.store.crypto_transit",
+            "messagefoundry.store.keyprovider",
+            "messagefoundry.store.keyprovider_vault",
+        }
+    ),
     # --- non-messagefoundry roots (#283's _CRYPTO_SITES_OUTSIDE_THE_PACKAGE, now walked by this gate) ---
     # ASVS 3.4.7/3.4.8: mints the per-response CSP script nonce (secrets) stamped into <script> for the
     # effective-https /ui nonce-CSP. A single-use per-response nonce, not a stored key.
@@ -1234,6 +1250,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
         }
     ),
+    # BACKLOG #305: check-privileges digests each Vault token with SHA-256 to tell whether two hops
+    # hold the same token. An identity comparison held in memory, never printed or stored.
+    "messagefoundry/privilege_probes.py": frozenset({"hash:hashlib.sha256"}),
     # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
     # tls_policy.assert_hvac_tls_suites and mounts it, so a TLS context is built here now.
     "messagefoundry/store/keyprovider_vault.py": frozenset(

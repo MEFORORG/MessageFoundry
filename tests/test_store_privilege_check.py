@@ -458,6 +458,12 @@ def test_exit_codes_are_distinct_and_over_privilege_wins() -> None:
 
 
 def test_a_hop_the_engine_cannot_probe_says_so_and_never_fails_the_run() -> None:
+    """SMTP and the IdP have no probe and print as not probed. Vault and LDAP are probed; clean
+    stub readings stand in for them here, and tests/test_vault_ldap_privilege_probes.py covers
+    the probes themselves."""
+    from messagefoundry.auth.ldap import BindAccountReading
+    from messagefoundry.privilege_probes import VaultTokenReading
+
     settings = ServiceSettings.model_validate(
         {
             "store": {"key_provider": "vault"},
@@ -477,9 +483,16 @@ def test_a_hop_the_engine_cannot_probe_says_so_and_never_fails_the_run() -> None
             },
         }
     )
-    hops = {h.hop: h for h in settings_hops(settings)}
-    assert hops["vault"].state is HopState.NOT_PROBED
-    assert hops["ldap"].state is HopState.NOT_PROBED
+    hops = {
+        h.hop: h
+        for h in settings_hops(
+            settings,
+            vault_probe=lambda consumer: VaultTokenReading(looked_up=True),
+            ldap_probe=lambda: BindAccountReading(r"u:EXAMPLE\mefor-ldap", ("S-1-5-32-545",)),
+        )
+    }
+    assert hops["vault.store"].state is HopState.CLEAN
+    assert hops["ldap"].state is HopState.CLEAN
     assert hops["smtp"].state is HopState.NOT_PROBED
     assert hops["idp"].state is HopState.NOT_CONFIGURED
     assert "CN=mefor-ldap" in hops["ldap"].identity
@@ -677,7 +690,7 @@ def test_the_documented_exit_codes_match_the_code(capsys: pytest.CaptureFixture[
     security = " ".join((REPO / "docs" / "SECURITY.md").read_text(encoding="utf-8").split())
     assert (
         f"exits {EXIT_CLEAN} when every probe that ran was clean, {EXIT_OVER_PRIVILEGED} on an "
-        f"over-grant, {EXIT_UNOBSERVABLE} when the store probe could not read the principal, and "
+        f"over-grant, {EXIT_UNOBSERVABLE} when a probe could not read its principal, and "
         f"{EXIT_SETTINGS} when the settings do not load"
     ) in security
     with pytest.raises(SystemExit):
