@@ -27,6 +27,7 @@ from messagefoundry.api.request_timeout import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     TIMEOUT_STATE_ATTR,
 )
+from messagefoundry.api.security import public_route
 
 #: Long enough that no scheduling hiccup finishes it inside either deadline below, short enough that
 #: a RED run (middleware removed) is not a wait.
@@ -60,12 +61,14 @@ def _app_with_a_slow_route(timeout_seconds: float | None) -> tuple[object, list[
     finished: list[str] = []
 
     @app.get("/_test/slow")
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
     async def _slow() -> dict[str, str]:
         await asyncio.sleep(_SLOW_SECONDS)
         finished.append("slow")
         return {"status": "finished"}
 
     @app.get("/_test/fast")
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
     async def _fast() -> dict[str, str]:
         finished.append("fast")
         return {"status": "ok"}

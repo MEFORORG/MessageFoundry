@@ -157,15 +157,18 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     Update it to what discovery reports; never widen it to a membership check, because the whole
     value here is that an UNNOTICED import shows up as a failure rather than as nothing.
     ``initial_credential_window_hours`` and the two ``pending_credential_deadline`` helpers joined
-    with the initial-credential deadline surfaces (BACKLOG #1141, ASVS 6.4.5)."""
+    with the initial-credential deadline surfaces (BACKLOG #1141, ASVS 6.4.5). ``mark_route_gate`` and
+    ``public_route`` joined with the engine's deny-by-default route check (vault BACKLOG #2604)."""
     assert surface.security_symbols == (
         "client_ip",
         "enforce_phi_read_hop",
         "enforce_phi_read_pacing",
         "get_auth",
         "initial_credential_window_hours",
+        "mark_route_gate",
         "pending_credential_deadline",
         "pending_credential_deadline_for",
+        "public_route",
     )
 
 

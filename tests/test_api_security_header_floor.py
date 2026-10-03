@@ -50,6 +50,7 @@ from messagefoundry.api.header_floor import (
     request_host,
 )
 from messagefoundry.api.request_timeout import TIMEOUT_STATE_ATTR, RequestTimeoutMiddleware
+from messagefoundry.api.security import public_route
 from messagefoundry.config.settings import ApiSettings
 
 _BASELINE_NAMES = tuple(name.lower() for name, _ in BASELINE_SECURITY_HEADERS)
@@ -306,6 +307,7 @@ async def test_the_unhandled_500_carries_frame_ancestors_the_floor_cannot_reach(
     app = create_app(allow_no_auth=True)
 
     @app.get("/_test/boom_csp")
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
     async def _boom() -> None:
         raise RuntimeError("deliberate")
 
@@ -388,6 +390,7 @@ async def test_an_unhandled_exception_carries_the_baseline_headers() -> None:
     app = create_app(allow_no_auth=True)
 
     @app.get("/_test/boom")
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
     async def _boom() -> None:
         raise RuntimeError("deliberate")
 
@@ -405,6 +408,7 @@ async def test_the_500_body_and_status_are_unchanged_by_the_header_addition() ->
     app = create_app(allow_no_auth=True)
 
     @app.get("/_test/boom2")
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
     async def _boom() -> None:
         raise RuntimeError("deliberate")
 
@@ -491,6 +495,7 @@ async def test_an_operator_declared_https_terminator_gets_hsts_on_the_escaped_pa
     app = create_app(allow_no_auth=True, exposure_protected=True)
 
     @app.get("/_test/boom3")
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
     async def _boom() -> None:
         raise RuntimeError("deliberate")
 
