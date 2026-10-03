@@ -678,7 +678,7 @@ def test_a_cleanup_failure_after_a_reload_is_not_a_refusal(
         raise PermissionError(13, "Permission denied", path)
 
     monkeypatch.setattr(shutil, "rmtree", fail)
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.tls_policy"):
         outcome = _reload(pki)
 
     assert outcome is not None and (outcome.reloaded, outcome.refusal) == (1, None)
@@ -1048,23 +1048,47 @@ def test_a_badly_signed_crl_is_reported_over_one_whose_ca_is_not_listed(
 
 
 def _indented(pem: bytes) -> bytes:
-    """``pem`` with its BEGIN line indented one space. OpenSSL skips such a block; it loads the
-    rest of the file (measured, CPython 3.14.6 / OpenSSL 3.5.7)."""
+    """``pem`` with its BEGIN line indented one space; ``pki._crl_blocks`` records what OpenSSL
+    does with that."""
     return b" " + pem
 
 
-def test_openssl_skips_an_indented_crl_block(pki: _Pki, tmp_path: Path) -> None:
-    # The instrument the fix rests on, kept as a test so an OpenSSL that changes its PEM rule
-    # turns this red rather than leaving the parser and OpenSSL to disagree in silence.
-    path = tmp_path / "probe.pem"
-    path.write_bytes(pki.crl.read_bytes() + _indented(_fresher(pki)))
+def _openssl_count(tmp_path: Path, pem: bytes) -> int:
+    path = tmp_path / "count.pem"
+    path.write_bytes(pem)
     scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     scratch.load_verify_locations(cafile=str(path))
-    assert scratch.cert_store_stats()["crl"] == 1
-    path.write_bytes(pki.crl.read_bytes() + _fresher(pki))  # control: unindented, both load
-    scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    scratch.load_verify_locations(cafile=str(path))
-    assert scratch.cert_store_stats()["crl"] == 2
+    return int(scratch.cert_store_stats()["crl"])
+
+
+_BOM = b"\xef\xbb\xbf"
+
+
+@pytest.mark.parametrize(
+    ("shape", "loads"),
+    [
+        (lambda a, b: a + b, 2),
+        (lambda a, b: a + _indented(b), 1),
+        (lambda a, b: a + b"\t" + b, 1),
+        (lambda a, b: _BOM + a + _BOM + b, 2),
+        (lambda a, b: a + _BOM + _BOM + b, 1),
+        (lambda a, b: (a + b).replace(b"\n", b"\r\n"), 2),
+        (lambda a, b: a.replace(b"CRL-----\n", b"CRL-----  \n", 1) + b, 2),
+    ],
+    ids=["plain", "indented", "tab", "bom", "two-boms", "crlf", "trailing-spaces"],
+)
+def test_the_parser_counts_the_crls_openssl_loads(
+    pki: _Pki, tmp_path: Path, shape: object, loads: int
+) -> None:
+    # Against OpenSSL itself, so an OpenSSL that changes its PEM rule turns this red.
+    assert callable(shape)
+    pem = shape(pki.crl.read_bytes(), _fresher(pki))
+    assert _openssl_count(tmp_path, pem) == loads
+    if loads == 2:
+        assert len(judge_every_crl(pem, now=time.time())) == 2  # accepted, both judged
+    else:
+        with pytest.raises(ValueError, match="does not start a line"):
+            judge_every_crl(pem, now=time.time())
 
 
 def test_a_superseding_crl_in_an_indented_block_is_refused_and_the_alert_kept(
@@ -1078,10 +1102,7 @@ def test_a_superseding_crl_in_an_indented_block_is_refused_and_the_alert_kept(
     outcome = _reload(pki)
 
     assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
-    assert (
-        outcome.refusal.remedy == FIX
-        and "does not start at the beginning of a line" in outcome.refusal.reason
-    )
+    assert outcome.refusal.remedy == FIX and "does not start a line" in outcome.refusal.reason
     assert held_crl_copies(pki.crl) == [old]  # not recorded as applied
     assert _alerts(pki) == [5]  # the old copy's alert stays up
     assert _accepts(hop, pki.server())  # and the hop still checks the old CRL
@@ -1094,17 +1115,62 @@ def test_a_superseding_crl_in_an_indented_block_is_refused_and_the_alert_kept(
 
 def test_a_start_refuses_a_crl_in_an_indented_block(pki: _Pki) -> None:
     pki.crl.write_bytes(pki.crl.read_bytes() + _indented(_fresher(pki)))
-    with pytest.raises(ValueError, match="does not start at the beginning of a line"):
+    with pytest.raises(ValueError, match="does not start a line"):
         pki.outbound_hop()
 
 
+@pytest.mark.parametrize(("judged", "loads"), [(2, 1), (1, 2)], ids=["fewer", "more"])
 def test_a_crl_count_openssl_disagrees_with_is_refused_at_start_and_at_reload(
-    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, judged: int, loads: int
 ) -> None:
     # The guard behind the parser, for any shape the two still read differently. Simulated by
-    # having the parser see one block more than OpenSSL loads.
+    # having the parser see one CRL more than OpenSSL loads, or one fewer.
     hop = pki.outbound_hop()
-    pki.crl.write_bytes(_fresher(pki))
+    fresher = _fresher(pki)
+    pki.crl.write_bytes(fresher if loads == 1 else pki.crl.read_bytes() + fresher)
+    real = tls_policy_module.judge_crl_bytes
+
+    def skewed(pem: bytes, **kwargs: object) -> tuple[object, tuple[CrlBlock, ...]]:
+        facts, blocks = real(pem, **kwargs)  # type: ignore[arg-type]
+        return facts, (*blocks, replace(blocks[0], fingerprint=b"never loaded"))[:judged]
+
+    monkeypatch.setattr(tls_policy_module, "judge_crl_bytes", skewed)
+    monkeypatch.setattr(crl_reload, "judge_crl_bytes", skewed)
+
+    outcome = _reload(pki)
+
+    said = f"OpenSSL loads {loads} CRL(s) from this file, but {judged} were checked"
+    assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
+    assert outcome.refusal.remedy == FIX and said in outcome.refusal.reason
+    assert _accepts(hop, pki.server())
+    with pytest.raises(ValueError, match="OpenSSL loads"):
+        pki.outbound_hop()
+
+
+def test_a_file_openssl_cannot_load_is_a_fix_even_when_every_context_needs_a_restart(
+    pki: _Pki,
+) -> None:
+    # Every stale context is refused before the load (here, at the cap), so no context is ready.
+    # OpenSSL's own reading must still run: a start would refuse this file, so "restart" is wrong.
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+    assert (first := _reload(pki, max_reloads=1)) is not None and first.reloaded == 1
+    pki.crl.write_bytes(_fresher(pki).replace(b"-----END X509 CRL", b" -----END X509 CRL"))
+
+    outcome = _reload(pki, max_reloads=1)
+
+    assert outcome is not None and outcome.refusal is not None
+    assert outcome.refusal.remedy == FIX
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_start_on_a_context_that_already_holds_crls_still_counts_them(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Once a context holds the file's CRL, a second load adds none, so its own count proves
+    # nothing; a scratch copy of the judged bytes is counted instead. Simulated disagreement.
+    hop = pki.outbound_hop()
+    harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")  # control: a second load passes
     real = tls_policy_module.judge_crl_bytes
 
     def one_more(pem: bytes, **kwargs: object) -> tuple[object, tuple[CrlBlock, ...]]:
@@ -1112,12 +1178,5 @@ def test_a_crl_count_openssl_disagrees_with_is_refused_at_start_and_at_reload(
         return facts, (*blocks, replace(blocks[0], fingerprint=b"never loaded"))
 
     monkeypatch.setattr(tls_policy_module, "judge_crl_bytes", one_more)
-    monkeypatch.setattr(crl_reload, "judge_crl_bytes", one_more)
-
-    outcome = _reload(pki)
-
-    assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
-    assert outcome.refusal.remedy == FIX and "OpenSSL loads 1 CRL(s)" in outcome.refusal.reason
-    assert _accepts(hop, pki.server())
     with pytest.raises(ValueError, match="OpenSSL loads 1 CRL"):
-        pki.outbound_hop()
+        harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")

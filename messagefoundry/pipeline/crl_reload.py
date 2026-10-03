@@ -91,9 +91,7 @@ import functools
 import gc
 import logging
 import os
-import shutil
 import ssl
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Collection, Sequence
@@ -118,6 +116,7 @@ from messagefoundry.config.tls_policy import (
     crl_not_in_effect,
     crl_scratch_context,
     judge_crl_bytes,
+    staged_crl,
 )
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
 
@@ -462,7 +461,6 @@ def _reload_path(
         # A CRL not in effect yet is judged here, not refused there: a context at the cap, a held
         # CRL nothing supersedes, or a file to fix each outranks a wait, and must be reported.
         facts, blocks = judge_crl_bytes(pem, label=label, now=now, require_in_effect=False)
-        # The cheap rules first: a rollback refuses every context without touching a file.
         verdicts: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         timing: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         ready: list[tuple[ssl.SSLContext, HeldCrl, tuple[str, str] | None]] = []
@@ -487,8 +485,14 @@ def _reload_path(
                 refusals.add(f"{label}: {wait[0]}", wait[1])
                 continue
             ready.append((ctx, held, wait))
-        if ready:
-            reloaded = _load(pem, label, ready, refusals, fingerprint, facts, blocks)
+        with staged_crl(pem) as copy:
+            # OpenSSL's own reading of the file, whether or not any context is ready: a file a start
+            # would refuse is a file to fix, which outranks every verdict above.
+            certificates = _certificates_in(copy, blocks, label=label)
+            if ready:
+                reloaded = _load(
+                    pem, copy, certificates, label, ready, refusals, fingerprint, facts, blocks
+                )
     except _NotProvable as exc:
         refusals.add(str(exc), _NOT_PROVABLE)
     except (ValueError, ssl.SSLError) as exc:
@@ -524,6 +528,8 @@ def _reload_path(
 
 def _load(
     pem: bytes,
+    copy: Path,
+    certificates: set[bytes],
     label: str,
     ready: list[tuple[ssl.SSLContext, HeldCrl, tuple[str, str] | None]],
     refusals: _Refusals,
@@ -531,68 +537,55 @@ def _load(
     facts: CrlFacts,
     blocks: tuple[CrlBlock, ...],
 ) -> int:
-    """Load the judged bytes into each context in ``ready`` that passes the per-context checks.
+    """Load the staged ``copy`` into each context in ``ready`` that passes the per-context checks.
 
     A context paired with a wait gets the checks and then the wait, so a file to fix is reported
     as one even before it takes effect. Returns how many contexts now hold the file. A failure in
     one context is that context's refusal alone, retried next pass: the contexts already loaded
     stay counted, and the rest are still tried."""
     reloaded = 0
-    private = tempfile.mkdtemp(prefix="mefor-crl-")  # mode 0o700: only this account writes it
-    try:
-        # The live load reads this private copy of the judged bytes, never the operator's file a
-        # second time, so a file swapped after the judgement cannot reach a context.
-        copy = Path(private) / "crl.pem"
-        copy.write_bytes(pem)
-        certificates = _certificates_in(copy, blocks, label=label)
-        signatures: dict[frozenset[bytes], tuple[str, bool] | None] = {}
-        for ctx, held, wait in ready:
-            try:
-                anchors = frozenset(ctx.get_ca_certs(binary_form=True))
-                if certificates - anchors:
-                    refusals.add(
-                        f"{label} carries a certificate this hop does not already trust; loading "
-                        "it would make it a trust anchor. Give this setting a bare CRL (BACKLOG "
-                        "#1890)",
-                        FIX,
-                    )
-                    continue
-                if anchors not in signatures:
-                    signatures[anchors] = crl_signature_refusal(pem, anchors)
-                if (unsigned := signatures[anchors]) is not None:
-                    why, found = unsigned
-                    refusals.add(f"{label}: {why}", BAD_SIGNATURE if found else NO_ISSUER)
-                    continue
-                if wait is not None:
-                    refusals.add(f"{label}: {wait[0]}", wait[1])
-                    continue
-                ctx.load_verify_locations(cafile=str(copy))  # cafile= ONLY: cadata= loads no CRL
-            except Exception as exc:
-                # Not a verdict on the file: the scratch context loaded these same bytes. So it
-                # is never sticky, and one context's failure does not stop the others.
-                refusals.add(
-                    f"{label}: the reload failed for a running context ({type(exc).__name__})",
-                    RETRY,
-                )
-                refusals.error = refusals.error or exc
-                continue
-            reloaded += replace_held_copy(
-                ctx,
-                held,
-                replace(
-                    held,
-                    fingerprint=fingerprint,
-                    facts=facts,
-                    blocks=blocks,
-                    reloads=held.reloads + 1,
-                ),
-            )
-    finally:
+    signatures: dict[frozenset[bytes], tuple[str, bool] | None] = {}
+    for ctx, held, wait in ready:
         try:
-            shutil.rmtree(private)
-        except OSError as exc:
-            # The contexts already hold what they loaded, so this is not a refusal.
-            log.warning("crl_reload: could not remove the private CRL copy %s: %s", private, exc)
+            anchors = frozenset(ctx.get_ca_certs(binary_form=True))
+            if certificates - anchors:
+                refusals.add(
+                    f"{label} carries a certificate this hop does not already trust; loading "
+                    "it would make it a trust anchor. Give this setting a bare CRL (BACKLOG "
+                    "#1890)",
+                    FIX,
+                )
+                continue
+            if anchors not in signatures:
+                signatures[anchors] = crl_signature_refusal(pem, anchors)
+            if (unsigned := signatures[anchors]) is not None:
+                why, found = unsigned
+                refusals.add(f"{label}: {why}", BAD_SIGNATURE if found else NO_ISSUER)
+                continue
+            if wait is not None:
+                refusals.add(f"{label}: {wait[0]}", wait[1])
+                continue
+            ctx.load_verify_locations(cafile=str(copy))  # cafile= ONLY: cadata= loads no CRL
+        except Exception as exc:
+            # Not a verdict on the file: the scratch context loaded these same bytes. So it
+            # is never sticky, and one context's failure does not stop the others.
+            refusals.add(
+                f"{label}: the reload failed for a running context ({type(exc).__name__})",
+                RETRY,
+            )
+            refusals.error = refusals.error or exc
+            continue
+        reloaded += replace_held_copy(
+            ctx,
+            held,
+            replace(
+                held,
+                fingerprint=fingerprint,
+                facts=facts,
+                blocks=blocks,
+                reloads=held.reloads + 1,
+            ),
+        )
     return reloaded
 
 

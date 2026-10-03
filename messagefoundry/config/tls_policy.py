@@ -73,6 +73,8 @@ TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 MIRRORED_CONNECTION_SETTING = "connection_name"
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from messagefoundry.pki import CrlBlock, CrlFacts
 
 __all__ = [
@@ -110,6 +112,7 @@ __all__ = [
     "crl_label",
     "crl_not_in_effect",
     "crl_scratch_context",
+    "staged_crl",
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
@@ -328,6 +331,10 @@ def harden_crl_check(
     * A missing file must not degrade to "no revocation checking". A configured control that
       silently does nothing is worse than an absent one.
 
+    A fourth, since BACKLOG #299: OpenSSL must load exactly the CRLs judged
+    (:func:`_refuse_crl_count`), or the hop would be recorded as checking a CRL it never loaded.
+    It runs last, after the #1890 check, so a planted certificate is reported as that.
+
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
     a refreshable CRL drop, and measured on this worktree it enforces revocation identically:
@@ -360,10 +367,9 @@ def harden_crl_check(
 
     pem = path.read_bytes()
     facts, blocks = judge_crl_bytes(pem, label=label, now=time.time())
-    # The guard behind the parser: the CRLs OpenSSL loads from the file must be the ones judged.
-    crl_scratch_context(str(path), blocks, label=label)
 
-    certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
+    before = ctx.cert_store_stats()
+    certs_before = before["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
     stats = ctx.cert_store_stats()
     added = stats["x509"] - certs_before
@@ -396,6 +402,14 @@ def harden_crl_check(
             f"(cert_store_stats crl={loaded}); the check flag would be set with nothing to check "
             "against, which refuses every peer rather than skipping the check"
         )
+    # BACKLOG #299: OpenSSL must have loaded exactly the CRLs judged above. A context that held no
+    # CRL before shows that in its own count, for free. One that did (the same file loaded twice,
+    # or a CA bundle carrying a CRL) cannot, so a scratch context loads the judged bytes instead.
+    if before.get("crl", 0) == 0:
+        _refuse_crl_count(loaded, blocks, label=label)
+    else:
+        with staged_crl(pem) as copy:
+            crl_scratch_context(str(copy), blocks, label=label)
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
@@ -406,23 +420,49 @@ def crl_scratch_context(crl_file: str, blocks: Sequence[CrlBlock], *, label: str
     exactly the CRLs ``blocks`` describes (BACKLOG #299). Raises ``ValueError`` when not.
 
     A context starts with no CRL, and OpenSSL keeps one copy of a CRL it is given twice, so its
-    count must equal the number of distinct CRLs judged. Fewer means OpenSSL skipped a CRL the
-    parser judged: a context would then be recorded as holding a CRL it never checks. Measured on
-    CPython 3.14.6 / OpenSSL 3.5.7 with a BEGIN line indented by one space. The parser now skips
-    that block too (:func:`messagefoundry.pki.judge_every_crl` refuses it), so this is the guard
-    for any other shape the two read differently. More means OpenSSL read a CRL the parser did not.
-    ``cafile=`` only, as :func:`harden_crl_check` says."""
+    count must equal the number of distinct CRLs judged (:func:`_refuse_crl_count`). The parser
+    models which blocks OpenSSL reads (:func:`messagefoundry.pki._crl_blocks`); this counts what
+    OpenSSL actually took. ``cafile=`` only, as :func:`harden_crl_check` says. ``crl_file`` should
+    be a private copy of the judged bytes, so the count is about those bytes."""
     scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots and no CRL
     scratch.load_verify_locations(cafile=crl_file)
-    loaded = scratch.cert_store_stats().get("crl", 0)
+    _refuse_crl_count(scratch.cert_store_stats().get("crl", 0), blocks, label=label)
+    return scratch
+
+
+def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) -> None:
+    """Refuse unless ``loaded``, the CRLs OpenSSL added to a context that held none, is the number of
+    distinct CRLs in ``blocks``. Fewer means OpenSSL skipped a CRL the parser judged, so a context
+    would be recorded as holding a CRL it never checks. More means OpenSSL read one never judged."""
     judged = len({block.fingerprint for block in blocks})
     if loaded != judged:
         raise ValueError(
-            f"{label}: OpenSSL loads {loaded} CRL(s) from this file, but {judged} were checked. "
-            "A context would not hold what the engine judged. Write each CRL as a plain PEM "
-            "block, with its BEGIN and END lines at the start of a line"
+            f"{label}: OpenSSL loads {loaded} CRL(s) from this file, but {judged} were checked, so "
+            "a context would not hold what the engine judged. Write each CRL as a plain PEM block, "
+            "with its BEGIN and END lines each starting a line"
         )
-    return scratch
+
+
+@contextmanager
+def staged_crl(pem: bytes) -> Iterator[Path]:
+    """A private copy of the judged bytes ``pem``, in a directory only this account can write
+    (``mkdtemp`` makes it mode 0o700), removed afterwards (BACKLOG #299). A load that reads this
+    copy, never the operator's file a second time, loads exactly what was judged. A copy that cannot
+    be removed is logged, not raised: what was loaded from it is already loaded."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    private = tempfile.mkdtemp(prefix="mefor-crl-")
+    try:
+        copy = Path(private) / "crl.pem"
+        copy.write_bytes(pem)
+        yield copy
+    finally:
+        try:
+            shutil.rmtree(private)
+        except OSError as exc:
+            logger.warning("could not remove the private CRL copy %s: %s", private, exc)
 
 
 def crl_label(crl_file: str, setting: str | None) -> str:

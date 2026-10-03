@@ -205,8 +205,8 @@ def read_soonest_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     A CRL file may hold one CRL per issuer -- ``[tls].crl_file`` is documented that way -- and
     OpenSSL loads every one of them. So the file fails a handshake as soon as ANY of its CRLs
     lapses, and a freshness check that read only the first block would stay silent while a later
-    issuer's CRL had already expired. This reads every ``X509 CRL`` block and returns the one that
-    expires first.
+    issuer's CRL had already expired. This reads every ``X509 CRL`` block OpenSSL would load
+    (:func:`_crl_blocks`) and returns the one that expires first.
 
     Each block is judged on its own by :func:`read_crl_facts`. A block that cannot be judged (no
     ``nextUpdate``, or unparseable) is skipped, so one such block cannot hide a sibling that is about
@@ -254,7 +254,9 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     block cannot hide a sibling that is about to lapse. A context load must not skip it: OpenSSL
     loads that block too, and a CRL with no ``nextUpdate`` is one OpenSSL treats as never expiring.
     So here any such block raises, naming its position, and a file with no CRL raises as
-    :func:`read_crl_facts` does. So does a CRL that OpenSSL would not load at all (:func:`_crl_blocks`).
+    :func:`read_crl_facts` does. So does a BEGIN marker :func:`_crl_blocks` does not count. That is
+    a model of OpenSSL, not a proof, so a load still counts what OpenSSL took
+    (:func:`messagefoundry.config.tls_policy.crl_scratch_context`).
 
     **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it
     OpenSSL was measured to use a newer delta CRL as if it were complete. Revocations listed only
@@ -263,9 +265,10 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     blocks = list(_crl_blocks(pem))
     if len(blocks) != pem.count(_CRL_BEGIN):
         raise ValueError(
-            "it has an 'X509 CRL' BEGIN line that does not start at the beginning of a line, such "
-            "as an indented one. OpenSSL does not load that CRL, so the file would not hold what it "
-            "appears to. Put every BEGIN line at the start of its line"
+            "it has a '-----BEGIN X509 CRL-----' marker that does not start a line, so OpenSSL "
+            "does not load that CRL. The marker must be the first thing on its line, after a line "
+            "feed: no space, tab or other text before it, and no line that ends in a carriage "
+            "return alone"
         )
     if not blocks:
         raise ValueError(_NO_CRL)
@@ -417,20 +420,31 @@ _CRL_END = b"-----END X509 CRL-----"
 _NO_CRL = "no CRL found in the supplied PEM (expected an 'X509 CRL' block)"
 
 
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
 def _begins_line(pem: bytes, at: int) -> bool:
-    """Whether offset ``at`` of ``pem`` starts a line: the file's start, or just after a LF."""
+    """Whether offset ``at`` of ``pem`` starts a line as OpenSSL reads one: the file's start or just
+    after a LF, with at most one UTF-8 byte order mark before it."""
+    if pem[at - len(_UTF8_BOM) : at] == _UTF8_BOM:
+        at -= len(_UTF8_BOM)
     return at == 0 or pem[at - 1 : at] == b"\n"
 
 
 def _crl_blocks(pem: bytes) -> Iterator[bytes]:
-    """Yield each ``X509 CRL`` PEM block in ``pem`` that OpenSSL would load, in file order.
+    """Yield each ``X509 CRL`` PEM block in ``pem`` whose BEGIN marker starts a line, in file order.
 
-    **OpenSSL loads a block only when its BEGIN line starts a line** (BACKLOG #299). Measured on
-    CPython 3.14.6 / OpenSSL 3.5.7, through ``load_verify_locations(cafile=)``: a BEGIN marker
-    after a space, a tab, other text or a lone CR is skipped, while trailing spaces and CRLF line
-    ends load. A parser that counted a skipped block would judge a CRL the context never holds. So
-    this yields only the blocks OpenSSL reads, and :func:`judge_every_crl` refuses a file that
-    carries any other BEGIN marker, rather than letting the two disagree in silence."""
+    **OpenSSL skips a block whose BEGIN marker does not start a line** (BACKLOG #299). This is the
+    one place that measurement is recorded. On CPython 3.14.6 / OpenSSL 3.5.7, through
+    ``load_verify_locations(cafile=)``, at least these were measured. Skipped: a marker after a
+    space, a tab, other text, a lone CR, or two byte order marks. Loaded: a marker after one UTF-8
+    byte order mark at a line start, trailing spaces on the BEGIN line, and CRLF line ends. A parser
+    that counted a skipped block would judge a CRL the context never holds.
+
+    This models that rule; it is not OpenSSL's reader. OpenSSL splits a line longer than its buffer,
+    so a marker after 254 bytes of text on one line was measured to load. Such a file is refused
+    here, which fails closed. The authority is what OpenSSL loads, which
+    :func:`messagefoundry.config.tls_policy.crl_scratch_context` counts."""
     start = pem.find(_CRL_BEGIN)
     while start >= 0:
         if _begins_line(pem, start):
