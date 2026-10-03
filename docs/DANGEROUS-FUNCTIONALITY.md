@@ -49,7 +49,7 @@ on its own.
 |---|---|---|---|
 | 1 | Executing your Python | Routers and Handlers | In-process, no isolation |
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
-| 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout that is not installed, and each time the tray can build its branded launcher |
+| 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 11 modules | Varies, see below |
 | 5 | Calling native libraries | 19 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
@@ -145,9 +145,9 @@ de-identification leak check only, and is not on the message path.
 `python_child_argv` in `childenv.py` builds a command line that starts a Python child through it.
 At least four kinds of process start this way. Three are the engine's: the sandbox worker, each
 engine shard, and the child that loads the config before any shard starts. The fourth is the tray:
-its first process when autostart starts it from a checkout that is not installed, and its relaunch under its
-branded launcher. An installed tray's login start and a tray started by hand do not use the script;
-see *Autostart starts the tray with the interpreter options; a tray started by hand does not*, at the end of this section. The script does three things:
+its first process when autostart starts it from a checkout, and its relaunch under its branded
+launcher. Two starts do not use the script: an installed tray's login start, and a tray started by
+hand. See *Autostart starts the tray with the interpreter options; a tray started by hand does not*, at the end of this section. The script does three things:
 
 1. It puts the folder above the package on the import path, after the standard library. The folder
    goes ahead of the site-packages folders that follow, which hold installed packages. If the script
@@ -184,20 +184,21 @@ script skips step 1.
 `tray/autostart.py` writes the login command in one of two forms (vault BACKLOG #2822, #2837). Both
 carry `childenv.CHILD_INTERPRETER_FLAGS`, which include `-P` and turn remote debugging off.
 
-- An installed engine gets `-m messagefoundry.tray`. Installed means the package sits in a
-  site-packages folder, or a `.pth` file there names its folder, as an editable install does. On a
-  `-m` start, `-P` keeps the working directory off the import path. Measured 2026-10-02 on Windows,
-  Python 3.14.6, from a folder holding a decoy `messagefoundry` package. With a copy of the package
-  in a venv's site-packages, and again with an editable install, `-P -X disable-remote-debug -m`
+- An installed engine gets `-m messagefoundry.tray`. Installed means the package sits directly in
+  a site-packages folder. On a `-m` start, `-P` keeps the working directory off the import path.
+  Measured 2026-10-02 on Windows, Python 3.14.6, from a folder holding a decoy `messagefoundry`
+  package. With a copy of the package in a venv's site-packages, `-P -X disable-remote-debug -m`
   loaded the installed copy. The same start without `-P` loaded the decoy. This form does not pin
-  the build the way the script does: an absolute `PYTHONPATH` entry in the user's settings is
-  searched ahead of site-packages, and a copy of the package there would answer instead.
-- A checkout that is not installed gets the script by its absolute path. A `-P -m` start there
-  cannot find the package.
+  the build the way the script does. An absolute `PYTHONPATH` entry in the user's settings is
+  searched ahead of site-packages. A copy of the package there would answer instead.
+- A checkout gets the script by its absolute path, editable installs included. The script loads the
+  build by its location. An editable install's `.pth` file can be pointed at another checkout before
+  the next login, so a `-m` start there could load a different build, or none.
 
-Windows documents a Run value as a command line of at most 260 characters, counted in UTF-16 code
-units. The installed form fits a venv folder of up to 188 characters. The script form names the
-checkout folder twice, so it passes 260 once that folder reaches about 74 characters. When the command is
+Microsoft documents a Run value as a command line of at most 260 characters. The code counts UTF-16
+code units, as Windows stores the value. The installed form fits a venv folder of up to 188
+characters. The script form names the checkout folder twice. With the venv inside the checkout, it
+passes 260 once that folder reaches about 74 characters. When the command is
 longer than 260, enabling does not write it. It logs a warning naming the length and the limit to
 `tray.log`, removes any value already there, and leaves Start at Login off. It never falls back to a
 command without the options. What Windows does at login with a longer value was not measured.
@@ -276,11 +277,11 @@ branded relaunch. The module's docstring says what each one gets, and why that i
 boundary by itself. The tray's relaunch also takes its command line from that module, so it
 starts with `-P` like the engine's Python children. Its environment is the user's whole
 environment, less any empty or relative `PYTHONPATH` entry. Autostart starts the first tray
-process with the same interpreter options, under the plain `pythonw.exe` rather than the branded
-launcher, and through the script only from a checkout that is not installed. Windows hands that process the user's
-environment unfiltered. So an empty or relative `PYTHONPATH` entry in the user's own settings would
-put the working directory back on its import path. A tray started by hand gets none of the
-options either. Section 3, under *Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The other
+process with the same interpreter options, under the plain `pythonw.exe`. It goes through the
+script only from a checkout. Windows hands that process the user's environment unfiltered. So an
+empty or relative `PYTHONPATH` entry in the user's own settings would put the working directory back
+on its import path. A tray started by hand gets none of the options either. Section 3, under
+*Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The other
 starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
 that module.

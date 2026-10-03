@@ -140,12 +140,16 @@ class TrayApp:
 
     def _toggle_autostart(self) -> None:
         wanted = not autostart.is_autostart_enabled()
-        if autostart.set_autostart(wanted) != wanted:
+        autostart.set_autostart(wanted)
+        # Read back rather than trust the return: a failed delete is suppressed and reads as off.
+        if autostart.is_autostart_enabled() == wanted:
+            return
+        if wanted:
             # set_autostart logged the length and the limit to tray.log (vault BACKLOG #2837).
-            self._shell.request_notify(
-                "MessageFoundry",
-                "Autostart not turned on: the login command is too long. See tray.log.",
-            )
+            body = "Autostart not turned on: the login command is too long. See tray.log."
+        else:
+            body = "Autostart not turned off: Windows kept the login entry."
+        self._shell.request_notify("MessageFoundry", body)
 
     def _open_repo(self) -> None:
         if self._config.repo_path and self._vscode:

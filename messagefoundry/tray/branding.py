@@ -17,9 +17,9 @@ the venv is active and ``tray`` imports) and its own top-level runtime DLLs — 
 it (``python3XX.dll`` et al., ~7 MB, since a standalone interpreter's runtime is app-local, not in
 System32) — so the process image is ``MessageFoundryTray.exe``. Only its ``RT_VERSION`` resource is
 rewritten (a fresh ``VS_VERSIONINFO`` built here in pure stdlib) so ``FileDescription`` reads
-"MessageFoundry Tray". Autostart still pins the plain ``pythonw``, started through the child bootstrap
-(``tray/autostart.py``), and lets this re-exec apply branding at runtime, so it never depends on the
-derived exe surviving between logins.
+"MessageFoundry Tray". Autostart still pins the plain ``pythonw`` (``tray/autostart.py`` says how
+it starts it) and lets this re-exec apply branding at runtime, so it never depends on the derived
+exe surviving between logins.
 
 Everything is fail-soft: any failure returns ``None``/``False`` and the tray simply runs unbranded
 (listed as "Python"). The builder (:func:`build_version_info`) is pure and unit-tested; the acid

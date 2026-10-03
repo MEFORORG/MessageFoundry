@@ -11,13 +11,12 @@ working directory of a Run-key start (vault BACKLOG #2822).
 So the command carries :data:`~messagefoundry.childenv.CHILD_INTERPRETER_FLAGS`, which include
 ``-P``, and takes one of two forms:
 
-* Where the interpreter can import the package on its own, from a site-packages folder or a
-  ``.pth`` entry in one (an editable install), the short form from
+* Where the package sits directly in a site-packages folder, the short form from
   :func:`~messagefoundry.childenv.python_module_argv`: ``-m messagefoundry.tray``. On a ``-m``
   start, ``-P`` drops the working directory.
-* Anywhere else, the child bootstrap script by its absolute path, from
-  :func:`~messagefoundry.childenv.python_child_argv`. A ``-P -m`` start cannot find a package the
-  interpreter has not been told about; the bootstrap finds it from its own location.
+* Anywhere else, editable installs included, the child bootstrap script by its absolute path, from
+  :func:`~messagefoundry.childenv.python_child_argv`. It loads this build by its location, which a
+  ``-m`` start cannot promise for a checkout.
 
 Windows documents a Run value as a command line of at most :data:`RUN_VALUE_LIMIT` characters
 (vault BACKLOG #2837). Enabling refuses a longer command: it logs a warning, removes any value
@@ -62,29 +61,23 @@ def _norm(path: str | Path) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
-def _pth_paths(site_dir: str) -> set[str]:
-    """The folders the ``.pth`` files in ``site_dir`` add to the path, read the way ``site`` reads
-    them but never executed: comment and ``import`` lines are skipped."""
-    found: set[str] = set()
-    with contextlib.suppress(OSError):
-        for pth in Path(site_dir).glob("*.pth"):
-            with contextlib.suppress(OSError):
-                for line in pth.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-                    entry = line.strip()
-                    if entry and not entry.startswith(("#", "import ", "import\t")):
-                        found.add(_norm(os.path.join(site_dir, entry)))
-    return found
+def _forms(path: str | Path) -> set[str]:
+    """``path`` as written and with links resolved. A symlinked install (``uv`` can link each file
+    into its cache) resolves outside site-packages, so both spellings count."""
+    return {os.path.normcase(os.path.abspath(path)), _norm(path)}
 
 
 def installed_in_site_packages(package_root: Path | None = None) -> bool:
-    """Whether the running interpreter imports the package from its site configuration, with no
-    working directory and no bootstrap: the folder holding it is a site-packages folder, or a
-    ``.pth`` file in one names it. A source checkout run any other way is not."""
-    root = _norm(package_root or Path(__file__).resolve().parents[2])
+    """Whether the package sits directly in one of this interpreter's site-packages folders.
+
+    Only then is the build a ``-P -m`` start imports the one installed beside ``pythonw.exe``. An
+    editable install is a checkout named by a ``.pth`` file, and that file can be pointed at another
+    checkout before the next login; the bootstrap form pins the build by its location instead."""
+    root = _forms(package_root or Path(os.path.abspath(__file__)).parents[2])
     sites = [entry for entry in site.getsitepackages() if entry]
     if site.ENABLE_USER_SITE and site.getusersitepackages():
         sites.append(site.getusersitepackages())
-    return any(root == _norm(entry) or root in _pth_paths(entry) for entry in sites)
+    return any(root & _forms(entry) for entry in sites)
 
 
 def launcher_command(pythonw: str | None = None, *, installed: bool | None = None) -> str:
@@ -114,7 +107,7 @@ def checked_launcher_command() -> str | None:
         # Lower case on purpose: tray.log's redactor reads a run of capitalized words as a name.
         log.warning(
             "autostart not turned on: the login command is %d characters, over the %d that Windows "
-            "documents for a Run value; install the tray in a shorter folder",
+            "documents for a Run value; install the package, or use a shorter folder",
             length,
             RUN_VALUE_LIMIT,
         )

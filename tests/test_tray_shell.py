@@ -119,12 +119,10 @@ def test_installed_means_the_package_sits_in_a_site_packages_folder(
     assert autostart.installed_in_site_packages(site_packages) is True
     checkout = tmp_path / "checkout"
     assert autostart.installed_in_site_packages(checkout) is False
-    # An editable install names the checkout in a .pth file; comment and import lines are skipped.
-    (site_packages / "_editable.pth").write_text(
-        f"# {checkout}\nimport sys\n{checkout}\n", encoding="utf-8"
-    )
-    assert autostart.installed_in_site_packages(checkout) is True
-    assert autostart.installed_in_site_packages(tmp_path / "elsewhere") is False
+    # An editable install names the checkout in a .pth file, which can be re-pointed before the
+    # next login, so it keeps the bootstrap form that pins this build.
+    (site_packages / "_editable.pth").write_text(f"{checkout}\n", encoding="utf-8")
+    assert autostart.installed_in_site_packages(checkout) is False
 
 
 def test_the_length_check_counts_utf16_code_units(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,19 +134,32 @@ def test_the_length_check_counts_utf16_code_units(monkeypatch: pytest.MonkeyPatc
     assert autostart.checked_launcher_command() is None  # 260 characters, 261 units
 
 
-def test_the_menu_says_so_when_autostart_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("before", "after", "note"),
+    [
+        (False, False, "too long"),  # enabling refused
+        (False, True, None),  # enabled
+        (True, True, "not turned off"),  # a delete that failed quietly
+        (True, False, None),  # disabled
+    ],
+)
+def test_the_menu_says_so_when_autostart_does_not_change(
+    monkeypatch: pytest.MonkeyPatch, before: bool, after: bool, note: str | None
+) -> None:
     from messagefoundry.tray.app import TrayApp
 
-    notes: list[tuple[str, str]] = []
+    notes: list[str] = []
+    state = {"on": before}
     app = TrayApp.__new__(TrayApp)
-    app._shell = types.SimpleNamespace(request_notify=lambda t, b: notes.append((t, b)))  # type: ignore[assignment]
-    monkeypatch.setattr(autostart, "is_autostart_enabled", lambda: False)
-    monkeypatch.setattr(autostart, "set_autostart", lambda enabled: False)
+    app._shell = types.SimpleNamespace(request_notify=lambda t, b: notes.append(b))  # type: ignore[assignment]
+    monkeypatch.setattr(autostart, "is_autostart_enabled", lambda: state["on"])
+    monkeypatch.setattr(autostart, "set_autostart", lambda enabled: state.update(on=after))
     app._toggle_autostart()
-    assert len(notes) == 1 and "too long" in notes[0][1]
-    monkeypatch.setattr(autostart, "set_autostart", lambda enabled: enabled)
-    app._toggle_autostart()
-    assert len(notes) == 1
+    if note is None:
+        assert notes == []
+    else:
+        [body] = notes
+        assert note in body
 
 
 @pytest.mark.parametrize(("length", "written"), [(260, True), (261, False)])
