@@ -181,11 +181,10 @@ Each part of that rests on an owner ruling of 2026-10-02, recorded in the vault 
 `docs/security/ASVS-OWNER-RULINGS-2026-10-02-1130.md`:
 
 * **R1** brought the harness in.
-* **R3** answered *"Only operator-run"* for `scripts/`. The option the owner chose put
-  `scripts/service/` and any script the operator docs tell a deployer to run in, and CI,
-  development, ASVS, benchmark, coordination and release tooling out. Outside `scripts/service/`,
-  those are categories of function, not directory names, so a script elsewhere is classified by
-  whether the operator documentation tells a deployer to run it, not by the folder it sits in.
+* **R3** answered *"Only operator-run"* for `scripts/`, choosing the option the scope sentence above
+  states. Outside `scripts/service/`, its excluded kinds are categories of function, not directory
+  names, so a script elsewhere is classified by whether the operator documentation tells a deployer
+  to run it, not by the folder it sits in.
 * **R4** answered *"No"* for `tee/`, the tee relay. It ships in no wheel, and it is outside the
   scope although `docs/TEE-RELAY.md` tells a site to run it.
 
@@ -197,7 +196,10 @@ it.** That reading is recorded in the same vault file, under R3. Both are out:
 * `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate. The engine's
   `messagefoundry/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
   engine code path calls that check. `anon/leak.py` itself, and the hazard of a by-path load, are
-  engine code and stay inside the scope through the engine.
+  engine code and stay inside the scope through the engine. **The reading covers engine call paths
+  only.** The harness's `CaptureSink` takes an optional anonymizer, and its code comment suggests
+  wiring `anonymize_checked` there, which would reach the same load from the harness. The vault file
+  names that wiring as a reason to revisit this reading; until someone does, treat it as open.
 
 **The boundary that phrase implies, stated explicitly because it decides verdicts.** The subject of
 this assessment is those five **software artifacts**. It is not the host, the hypervisor, the CPU, the

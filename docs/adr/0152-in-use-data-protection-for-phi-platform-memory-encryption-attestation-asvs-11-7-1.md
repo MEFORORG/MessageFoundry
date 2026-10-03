@@ -295,10 +295,10 @@ it is strictly weaker than measuring the property.
 > **reports on and gates against** the platform property; it never **provides** it.
 >
 > *Amended 2026-10-03: method section 2 no longer names three artifacts. It now also includes the
-> test harness wheel (owner ruling R1 of 2026-10-02) and the operator-run scripts (R3 of the same
-> date), and excludes `tee/` (R4), all recorded in the vault's
-> `docs/security/ASVS-OWNER-RULINGS-2026-10-02-1130.md`. The argument above does not change: every
-> addition is software, so memory encryption is still a property of none of them.*
+> test harness wheel (owner ruling R1 of 2026-10-02) and the operator-run scripts (R3), and excludes
+> `tee/` (R4); [`ASVS-ASSESSMENT-METHOD.md`](../ASVS-ASSESSMENT-METHOD.md) §2 states the scope and
+> cites the rulings. The argument above does not change: every artifact it now names is software,
+> so memory encryption is still a property of none of them.*
 >
 > **The adversarial review this paragraph demanded has happened.** Two independent multi-agent research
 > runs with 3-vote refutation (25 claims verified, 12 killed in one; 8 confirmed of 25 in the other),

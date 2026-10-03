@@ -203,21 +203,17 @@ re-measurement. See Amendment A.*
 
 - [ ] Whether the wider refusal (no enabled administrator, rather than an empty table) should also
       subsume BACKLOG #1236's recovery affordance, or the two stay separate commands.
-- [ ] Whether `scripts/` is inside this cell's corpus. The method names three artifacts while the
+- [x] Whether `scripts/` is inside this cell's corpus. The method names three artifacts while the
       ASVS verifier scans four roots, and `scripts/dev/sqlserver-docker.ps1` carries a hard-coded
       default `sa` password that is in scope only under the wider reading.
 
 *Amended 2026-09-23: Amendment A carries a recommendation on each item. Neither is ruled, so both
 boxes stay open.*
 
-*Amended 2026-10-03: the second item is answered by owner ruling, and its box stays as written so
-the record of the open question survives. The premise "the method names three artifacts" no longer
-holds. `docs/ASVS-ASSESSMENT-METHOD.md` section 2 now also includes the test harness (owner ruling
-R1 of 2026-10-02) and the operator-run scripts (R3 of 2026-10-02), and excludes `tee/` (R4 of
-2026-10-02), all recorded in the vault's `docs/security/ASVS-OWNER-RULINGS-2026-10-02-1130.md`.
-R3 answers this item partly in: `scripts/service/` and any script the operator docs tell a deployer
-to run are in scope; development tooling such as `scripts/dev/sqlserver-docker.ps1` is out. This
-note says nothing about the first item.*
+*Amended 2026-10-03: the second item is answered by owner ruling R3 of 2026-10-02, so its box is
+ticked. Its premise, that the method names three artifacts, no longer holds: see
+`docs/ASVS-ASSESSMENT-METHOD.md` section 2 for the current scope, and the note under item (b) of
+Amendment A. This note says nothing about the first item.*
 
 ## Amendment A (2026-09-23) — the default account is retired, by owner ruling
 
@@ -586,18 +582,14 @@ in the wheel. So it cannot be "present in the application". Two cautions keep th
 Fix the literal anyway, as hygiene that moves no verdict: require `MEFOR_STORE_PASSWORD`, or generate
 a random password per container.
 
-*Amended 2026-10-03: owner ruling R3 of 2026-10-02 now answers item (b), and it answers the question
-this recommendation argued from a premise that has since changed. Method section 2 no longer names
-three artifacts: it also includes the test harness wheel (R1) and the operator-run scripts (R3), and
-excludes `tee/` (R4). All three are recorded in the vault's
-`docs/security/ASVS-OWNER-RULINGS-2026-10-02-1130.md`. Under R3, only operator-run scripts are in:
-`scripts/service/` and any script the operator docs tell a deployer to run. CI, development, ASVS,
-benchmark, coordination and release tooling are out. So the recommendation holds for its one named
-file, because `scripts/dev/sqlserver-docker.ps1` is development tooling. The first caution above now
-holds in part: the install tooling under `scripts/service/` is in scope, so cell 6.3.2's corpus
-includes it. A Manager's reading recorded under R3, which the owner may overrule, puts
-`scripts/service/measure-store-access.ps1` out as a CI measurement. Re-reading the cell against that
-corpus is record work, and this note grades nothing.*
+*Amended 2026-10-03: owner ruling R3 of 2026-10-02 answers item (b), and it answers it from a
+premise this recommendation did not have. Method section 2 no longer names three artifacts; it now
+includes the test harness wheel (R1) and the operator-run scripts (R3), and excludes `tee/` (R4),
+as `docs/ASVS-ASSESSMENT-METHOD.md` section 2 states and cites. Under that scope the recommendation
+holds for its one named file, `scripts/dev/sqlserver-docker.ps1`, which is development tooling. The
+first caution above now holds for the operator-run install tooling under `scripts/service/`, which
+is inside the assessed scope. What that means for the cell is record work, and this note grades
+nothing.*
 
 ## Amendment B (2026-09-28) -- the first Administrator enrols TOTP, and a repair clears the row first
 
