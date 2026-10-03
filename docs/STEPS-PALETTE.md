@@ -15,7 +15,7 @@ recognizes back as an editable step, so the `.py` file stays the only artifact a
 
 | Item | Generates | What it does |
 |---|---|---|
-| Set Field | `msg.set("<path>", "<value>")` | Set a field to a value |
+| Set Field | `msg.set("<path>", "<value>")`, or `msg.set_data(...)` in the same shape when the value is a template that reads a component or subcomponent and its text holds no delimiter | Set a field to a value; a component read into a template lands as data ([ADR 0206](adr/0206-an-hl7-write-or-re-encode-never-lets-data-become-structure.md)) |
 | Copy Field | `msg.set_data("<dst>", msg.field("<src>") or "")` when `<src>` is a component or subcomponent, else `msg.set(...)` in the same shape | Copy one field into another; a component's value lands as data, never as structure ([ADR 0206](adr/0206-an-hl7-write-or-re-encode-never-lets-data-become-structure.md)) |
 | Trim Field | `trim_field(msg, "<path>")` | Strip surrounding whitespace |
 | Replace | `replace_literal(msg, "<path>", "<old>", "<new>")` | Literal find/replace in a field |
