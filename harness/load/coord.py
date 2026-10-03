@@ -40,6 +40,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from harness.bounded_file import read_capped
+
 #: The two handshake message names (the whole protocol). ``SHARDS_READY`` flows engine→driver,
 #: ``DRIVE_START`` flows driver→engine.
 SHARDS_READY = "SHARDS_READY"
@@ -114,6 +116,12 @@ LADDER_STOP = "LADDER_STOP"
 LADDER_SOAK = "LADDER_SOAK"
 RUNG_ABORTED = "RUNG_ABORTED"
 
+#: The largest coordination message :meth:`FileDropCoord.read` takes (ASVS 5.1.1). The directory is
+#: shared with the OTHER box, a mount or a synced folder, so a message is content another host wrote,
+#: and it is read through the bounded reader rather than whole. Every message is a small JSON object of
+#: counts, ports and timestamps, a few KiB at most, so 1 MiB is far past any legitimate one.
+MAX_COORD_MESSAGE_BYTES = 1 << 20
+
 #: Default coord directory. A Windows path because the rig runs on Windows Server; override with the
 #: ``MEFOR_COORD_DIR`` env var or the ``--coord-dir`` CLI flag for a POSIX box or a shared mount.
 DEFAULT_COORD_DIR = r"C:\mefor_coord"
@@ -167,14 +175,20 @@ class FileDropCoord:
 
     def read(self, name: str) -> dict[str, Any] | None:
         """Return the ``name`` message payload, or ``None`` if it hasn't been posted (or is mid-write /
-        unreadable — the caller just keeps polling)."""
+        unreadable — the caller just keeps polling).
+
+        Raises :class:`CoordMessageRefused` for a message file over :data:`MAX_COORD_MESSAGE_BYTES`,
+        or one that is not a regular file: polling again would read the same refusal forever, and a
+        silent ``None`` would turn it into a timeout that names the wrong cause."""
         path = self._path(name)
         try:
-            raw = path.read_text(encoding="utf-8")
+            data_bytes, refused = read_capped(path, MAX_COORD_MESSAGE_BYTES)
         except OSError:
             return None
+        if refused:
+            raise CoordMessageRefused(f"coord message {name!r} at {path} refused: {refused}")
         try:
-            data = json.loads(raw)
+            data = json.loads(data_bytes.decode("utf-8"))
         except ValueError:
             return None  # a torn read (should not happen with atomic writes) → poll again
         return data if isinstance(data, dict) else None
@@ -210,6 +224,14 @@ class FileDropCoord:
 
 class CoordTimeout(TimeoutError):
     """A handshake message never arrived within its timeout."""
+
+
+class CoordMessageRefused(ValueError):
+    """A handshake message file is over :data:`MAX_COORD_MESSAGE_BYTES` or not a regular file.
+
+    Deliberately NOT a :class:`CoordTimeout`: several callers treat a timeout as "an optional
+    message did not arrive" and carry on, which would turn a refusal into the silent, wrong-cause
+    outcome this exists to prevent. It stops the run with its own reason instead."""
 
 
 def with_missing_ok_unlink(path: Path) -> None:

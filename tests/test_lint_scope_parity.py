@@ -73,10 +73,12 @@ from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
+from tests._precommit_pins import COMMIT, PRECOMMIT, frozen_tag, pins
+
 yaml = pytest.importorskip("yaml")
 
 _ROOT = Path(__file__).resolve().parents[1]
-_PRECOMMIT = _ROOT / ".pre-commit-config.yaml"
+_PRECOMMIT = PRECOMMIT
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _SECURITY = _ROOT / ".github" / "workflows" / "security.yml"
 _CONSTRAINTS = _ROOT / "constraints.lock"
@@ -495,8 +497,11 @@ def _ruff_repo() -> dict[str, Any]:
 
 
 def _ruff_repo_rev() -> str:
-    """The `rev:` pinning the ruff hooks."""
-    return str(_ruff_repo()["rev"])
+    """The tag the ruff hooks' `rev:` commit was pinned from, read from its `# frozen:` comment.
+
+    The `rev:` itself is a commit since vault BACKLOG #2631, so the version lives in the comment.
+    """
+    return frozen_tag(str(_ruff_repo()["repo"]))
 
 
 def _locked_ruff_version() -> str:
@@ -1057,7 +1062,8 @@ def _bandit_repo_rev() -> str:
         f"expected exactly one .pre-commit-config.yaml repo whose URL contains {_BANDIT_REPO!r}; "
         f"found {[r.get('repo') for r in matches]!r}."
     )
-    return str(matches[0]["rev"]).lstrip("v")
+    # The tag beside the pinned commit, as `_ruff_repo_rev` reads ruff's.
+    return frozen_tag(str(matches[0]["repo"])).lstrip("v")
 
 
 def _ci_scanner_pin(package: str) -> str:
@@ -1313,3 +1319,54 @@ def test_semgrep_and_bandit_exclude_the_same_paths() -> None:
         f"{sorted(bandit_paths)}. A path excluded from ONE gate only is scanned by one and not the "
         "other, which is the same class of silent divergence that left scripts/ out of CI bandit."
     )
+
+
+# --- every remote hook repository is pinned by commit (vault BACKLOG #2631, limb 4) ------------------
+
+
+def test_every_remote_hook_repo_is_pinned_by_commit_with_its_tag_beside_it() -> None:
+    """A tag can be moved to other code after review; a commit cannot. So every remote `rev:` is a
+    40-character commit, with the tag it came from as `# frozen: <tag>`.
+
+    Read two ways and held together: the YAML parse gives every repository and its `rev`, and the
+    raw-line reader gives the tag a parse drops. A repository one reader sees and the other does
+    not is a reader fault, and it reds here rather than leaving a repository unchecked.
+
+    Mutation: put any `rev:` back to a tag, or drop its `# frozen:` comment. Red here.
+    """
+    parsed = {
+        str(r["repo"]): str(r.get("rev", ""))
+        for r in _config()["repos"]
+        if str(r.get("repo")) not in ("local", "meta")
+    }
+    assert len(parsed) >= 4, f"expected at least the four remote hook repositories, got {parsed}"
+    raw = pins()
+    assert len(raw) >= 4, f"the raw-line reader found {len(raw)} pinned repositories"
+    assert {url: rev for url, (rev, _tag) in raw.items()} == parsed, (
+        f"the raw-line reader and the YAML parse disagree: {raw} against {parsed}"
+    )
+    offenders = [
+        f"{url}: rev {rev!r}, frozen tag {tag!r}"
+        for url, (rev, tag) in raw.items()
+        if not COMMIT.fullmatch(rev) or not tag
+    ]
+    assert not offenders, (
+        "remote hook repositories not pinned by a commit with its `# frozen: <tag>` (vault BACKLOG "
+        "#2631). Move each with `pre-commit autoupdate --freeze --repo <url>`:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "  - repo: https://example.invalid/x\n    rev: v1.2.3\n",
+        f"  - repo: https://example.invalid/x\n    rev: {'a' * 40}\n",
+        f"  - repo: https://example.invalid/x\n    rev: {'a' * 39}  # frozen: v1.2.3\n",
+    ],
+    ids=["tag-only", "commit-without-tag", "short-commit"],
+)
+def test_the_pin_reader_refuses_what_the_rule_refuses(text: str) -> None:
+    """NEGATIVE CONTROL for the test above: the reader must report a bad pin as bad."""
+    ((rev, tag),) = pins(text).values()
+    assert not (COMMIT.fullmatch(rev) and tag), (rev, tag)

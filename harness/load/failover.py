@@ -266,12 +266,18 @@ class EngineNode:
                 Path(self._log.name).unlink()
 
     def log_tail(self, limit: int = 4000) -> str:
-        """The end of this node's captured stdout/stderr — for diagnosing a failed start in CI."""
+        """The end of this node's captured stdout/stderr — for diagnosing a failed start in CI.
+
+        Reads at most the last ``limit`` bytes (ASVS 5.1.1): the engine under test writes this log,
+        and only its tail is wanted, so the rest is never read into memory."""
         try:
-            data = Path(self._log.name).read_bytes()
+            with open(self._log.name, "rb") as fh:
+                size = fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, size - limit))
+                data = fh.read(limit)
         except OSError:
             return ""
-        return data[-limit:].decode("utf-8", "replace")
+        return data.decode("utf-8", "replace")
 
     # --- API reads (/health needs no session; the rest are read as the rig Administrator) ---
 

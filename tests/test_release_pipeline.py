@@ -57,6 +57,7 @@ from _bash_resolver import bash_candidates, explain_returncode, require_bash
 
 from tests._force_include import hatch_build
 from tests._verify_softeners import verification_softeners
+from tests._workflow_contexts import needs_of
 
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
@@ -270,8 +271,7 @@ def test_each_engine_sbom_is_built_unprivileged_and_handed_to_release(
     assert _despace(str(build.get("if"))) == _despace(str(rel.get("if"))), (
         f"{job_name} and release must share one job guard: {build.get('if')!r} vs {rel.get('if')!r}"
     )
-    needs = rel.get("needs")
-    assert job_name in ([needs] if isinstance(needs, str) else list(needs or [])), needs
+    assert job_name in needs_of(rel), rel.get("needs")
 
     built_here = [
         st for st in build.get("steps") or [] if "cyclonedx_py environment" in _run_shell(st)
@@ -461,8 +461,9 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 # --- (4b) every mutating step tests the EVENT as well as the ref (BACKLOG #1584) ---------------------
 
 #: Steps in release.yml that mutate a public sink BY PUBLISHING A RELEASE ARTIFACT OR ATTESTING ONE --
-#: the four PyPI publishes (the toolkit's since ADR 0201), the three GitHub-release mutations
-#: (BACKLOG #1584) and the SLSA
+#: the four PyPI publishes (the toolkit's since ADR 0201), the four GitHub-release mutations
+#: (BACKLOG #1584; the fourth, which takes the engine's draft release out of draft, since vault
+#: BACKLOG #2631) and the SLSA
 #: build-provenance attestation (BACKLOG #1805). Pinned as a count so a NEW one cannot be added
 #: without either carrying the guard pair or landing here deliberately. An empty scan must never read
 #: as a pass.
@@ -471,7 +472,7 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 #: attestation step. Why `python -m sigstore sign` is NOT is stated in the header's "THE DRY-RUN IS
 #: NOT SILENT" paragraph. Read a green here as "a dispatch neither publishes nor attests a release
 #: artifact", never as "a dispatch writes nothing public".
-_EXPECTED_MUTATING_STEPS = 8
+_EXPECTED_MUTATING_STEPS = 9
 
 #: Actions that publish a release artifact, matched as a `uses:` prefix.
 _PUBLISHING_ACTIONS = (
@@ -855,9 +856,15 @@ def test_the_console_and_engine_tag_namespaces_are_mutually_exclusive() -> None:
 def test_the_console_release_does_not_depend_on_the_engine_release() -> None:
     """``release-harness`` is deliberately lockstep and so carries ``needs: release``. The console is
     deliberately NOT: an engine release must not drag it along, and a console release must not wait on
-    one. A ``needs`` here would silently couple two cadences the design separates."""
-    assert "needs" not in _jobs()["release-webconsole"], (
-        "release-webconsole must not depend on the engine release — the console has its own cadence"
+    one. A ``needs`` on any engine job would silently couple two cadences the design separates.
+
+    It does need ``tag-provenance`` (vault BACKLOG #2631), which belongs to neither cadence: it
+    checks the tagged commit, whichever namespace the tag is in. That is the ONLY job it may need.
+    """
+    needs = needs_of(_jobs()["release-webconsole"])
+    assert needs == ["tag-provenance"], (
+        f"release-webconsole needs {needs}; it must need the provenance gate and nothing else -- "
+        "the console has its own cadence, so it must not depend on the engine release"
     )
 
 
@@ -938,7 +945,7 @@ def test_a_job_without_needs_release_must_create_its_own_github_release() -> Non
         chunk = _executed_shell(body[starts[name] : (starts[nxt] if nxt else len(body))])
         if "gh release upload" not in chunk and "gh release create" not in chunk:
             continue  # attaches nothing to a GitHub release
-        if "release" in (jobs[name].get("needs") or []):
+        if "release" in needs_of(jobs[name]):
             continue  # the engine release ran first and created it
         if "gh release create" not in chunk:
             problems.append(name)
@@ -3353,3 +3360,283 @@ def test_a_shrunk_body_that_fits_says_titles_only_and_one_that_is_cut_says_so() 
     assert "- **T99.**" in fits
     cut = mod.bound(text, url, 1_000)
     assert len(cut) <= 1_000 and cut.endswith(mod.footer(url, cut=True)), cut[-200:]
+
+
+# --- (12) nothing is built from a commit that is not on main (vault BACKLOG #2631, limb 2) -----------
+#
+# scripts/release/tag_provenance.py holds the rule; tests/test_release_tag_provenance.py grades it.
+# These tests hold the WIRING: the gate runs on a tag push, before every job that builds a release
+# artifact, and in a job that holds no write scope.
+
+_PROVENANCE_JOB = "tag-provenance"
+_PROVENANCE_CALL = "python scripts/release/tag_provenance.py"
+
+
+def _upstream(job_key: str) -> set[str]:
+    """Every job ``job_key`` waits on, directly or through another job's ``needs:``."""
+    jobs = _jobs()
+    seen: set[str] = set()
+    todo = needs_of(jobs[job_key])
+    while todo:
+        key = todo.pop()
+        if key not in seen:
+            seen.add(key)
+            todo.extend(needs_of(jobs[key]))
+    return seen
+
+
+def _writes(job: dict) -> list[str]:
+    """The write scopes a job holds. Every job in release.yml names its own; `permissions: {}`
+    at the workflow level means a job naming none holds none."""
+    return sorted(k for k, v in (job.get("permissions") or {}).items() if v == "write")
+
+
+def test_the_provenance_gate_runs_on_a_tag_push_and_holds_no_write_scope() -> None:
+    """The gate's step runs the script on a tag push. Its JOB carries no event guard, because a
+    skipped job skips every job that needs it, which would end the dispatch dry-run. And the job
+    writes nothing: it only reads the server.
+
+    Mutation: guard the job on the event, drop the step's guard, or add a write scope. Red here.
+    """
+    job = _jobs()[_PROVENANCE_JOB]
+    assert _EVENT_GUARD not in str(job.get("if") or ""), (
+        f"{_PROVENANCE_JOB} is guarded on the event at job level, so a dispatch skips it and every "
+        "build job that needs it: the dry-run would build nothing"
+    )
+    steps = [s for s in job.get("steps") or [] if _PROVENANCE_CALL in str(s.get("run") or "")]
+    assert len(steps) == 1, f"expected one step running {_PROVENANCE_CALL}, found {len(steps)}"
+    guard = _despace(str(steps[0].get("if") or ""))
+    assert any(_despace(c) in guard for c in _GUARD_CONJUNCTIONS) and "||" not in guard, (
+        f"the provenance step's guard {steps[0].get('if')!r} is not the event-and-ref pair, so it "
+        "would not run on a tag push, or would run on a dispatch from an unmerged branch"
+    )
+    assert not _writes(job), f"{_PROVENANCE_JOB} holds write scope(s) {_writes(job)}; it only reads"
+
+
+def test_every_job_that_can_publish_waits_on_the_provenance_gate() -> None:
+    """DERIVED, not listed: any job holding a write scope or the OIDC identity can sign or
+    publish, so it must wait on the gate, directly or through another job.
+
+    Liveness: at least the three release jobs must be found, or the derivation matched nothing.
+    Mutation: drop `tag-provenance` from `release`'s or `release-webconsole`'s `needs:`. Red here.
+    """
+    privileged = {
+        key
+        for key, job in _jobs().items()
+        if key != _PROVENANCE_JOB and (_writes(job) or "id-token" in (job.get("permissions") or {}))
+    }
+    assert len(privileged) >= 3, sorted(privileged)
+    assert privileged >= {"release", "release-webconsole", "release-harness"}, sorted(privileged)
+    missing = sorted(key for key in privileged if _PROVENANCE_JOB not in _upstream(key))
+    assert not missing, (
+        f"job(s) {missing} can sign or publish without waiting on {_PROVENANCE_JOB}, so they would "
+        "release a commit that is not on main (vault BACKLOG #2631)"
+    )
+
+
+# --- (13) no asset is added to a published GitHub release (vault BACKLOG #2631, limb 6) --------------
+#
+# An immutable release refuses any asset change once it is published. So the engine's release is a
+# draft until every job that attaches an asset has run, and then one job publishes it. The console's
+# release is created by one call that carries its one asset. A re-run never uploads to a published
+# release. The structural tests hold the shape; the executed tests run each step against a stand-in
+# `gh` that records what it was asked to do.
+
+_PUBLISH_JOB = "publish-github-release"
+
+
+def _gh_release_jobs(verbs: str) -> set[str]:
+    """Jobs whose EXECUTED shell runs `gh release <verb>` for any verb in ``verbs``."""
+    pattern = re.compile(rf"\bgh release (?:{verbs})\b")
+    return {
+        key
+        for key, job in _jobs().items()
+        if any(pattern.search(_executed_shell(str(s.get("run") or ""))) for s in job["steps"])
+    }
+
+
+def test_only_the_publish_job_takes_a_release_out_of_draft_and_it_runs_last() -> None:
+    """The engine release is created as a draft, one job publishes it, and that job waits on
+    every other job that attaches an asset to the engine release.
+
+    Mutation: drop `--draft` from the create, drop `release-harness` from the publish job's
+    `needs:`, or publish from any other job. Red here.
+    """
+    jobs = _jobs()
+    create = _step_script_by_prefix("Create or update the GitHub release", "the engine release")
+    creates = [ln for ln in _executed_shell(create).splitlines() if "gh release create" in ln]
+    assert creates and all("--draft" in ln for ln in creates), (
+        f"the engine release is not created as a draft: {creates}. The harness job attaches after "
+        "it, so a published release would have an asset added after publication"
+    )
+
+    publishers = {
+        key
+        for key, job in jobs.items()
+        if any("--draft=false" in _executed_shell(str(s.get("run") or "")) for s in job["steps"])
+    }
+    # The console job may too: it finishes ITS OWN release when an interrupted create left a draft.
+    assert publishers == {_PUBLISH_JOB, "release-webconsole"}, (
+        f"jobs that take a release out of draft: {sorted(publishers)}; only {_PUBLISH_JOB} (and the "
+        "console job, for its own release) may"
+    )
+    # The console job may publish only because its own `if:` keeps it off engine tags.
+    console_if = _despace(str(jobs["release-webconsole"].get("if") or ""))
+    assert "startsWith(github.ref_name,'webconsole-')" in console_if and "||" not in console_if, (
+        "release-webconsole may take a release out of draft, so it must stay on console tags"
+    )
+    # A status function would run the publish job after a job it needs had FAILED, publishing a
+    # draft with that job's asset missing. The implicit success() is the control.
+    publish_if = str(jobs[_PUBLISH_JOB].get("if") or "")
+    overrides = [
+        f for f in ("always()", "cancelled()", "failure()", "success()") if f in publish_if
+    ]
+    assert not overrides, f"{_PUBLISH_JOB}'s `if:` overrides the needs' success with {overrides}"
+    # Every job that attaches to a release, except the console's, which makes its own in one call.
+    attaching = _gh_release_jobs("create|upload") - {"release-webconsole"}
+    assert attaching >= {"release", "release-harness"}, sorted(attaching)
+    late = sorted(attaching - _upstream(_PUBLISH_JOB))
+    assert not late, (
+        f"job(s) {late} attach to the engine release but {_PUBLISH_JOB} does not wait on them, so "
+        "the release could be published before their asset is on it"
+    )
+    assert not _gh_release_jobs("create|upload") & {_PUBLISH_JOB}, (
+        f"{_PUBLISH_JOB} itself attaches an asset; it must only publish"
+    )
+
+
+#: A stand-in for `gh`. It records each call, answers `release view` from FAKE_RELEASE (absent,
+#: draft or published) and FAKE_ASSETS, and does nothing else.
+_FAKE_GH = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$GH_LOG"
+if [ "$1" = release ] && [ "$2" = view ]; then
+  if [ "$FAKE_RELEASE" = absent ]; then echo "release not found" >&2; exit 1; fi
+  if [ "$FAKE_RELEASE" = broken ]; then echo "HTTP 502: Bad Gateway" >&2; exit 1; fi
+  case "$*" in *isDraft*) if [ "$FAKE_RELEASE" = draft ]; then echo true; else echo false; fi ;; esac
+  case "$*" in *assets*) [ -z "$FAKE_ASSETS" ] || printf '%s\\n' $FAKE_ASSETS ;; esac
+fi
+exit 0
+"""
+
+_TAG = "v0.0.1"
+_HARNESS_WHEEL = "messagefoundry_harness-0.0.1-py3-none-any.whl"
+
+
+def _run_release_step(
+    tmp_path: Path, prefix: str, state: str, assets: str = ""
+) -> tuple[int, str, list[str]]:
+    """Run one release step's ``run:`` block under `bash -e` with the stand-in `gh` first on PATH.
+
+    Returns (exit code, output, the `gh` calls). The work directory holds what each step reads:
+    a CHANGELOG section, the notes script, and one file per asset directory.
+    """
+    work = tmp_path / "work"
+    bin_dir = tmp_path / "bin"
+    for sub in ("scripts/release", "dist", "toolkit-dist", "harness-dist", "webconsole-dist"):
+        (work / sub).mkdir(parents=True, exist_ok=True)
+    bin_dir.mkdir(exist_ok=True)
+    shutil.copyfile(
+        _REPO / "scripts" / "release" / "release_notes.py",
+        work / "scripts" / "release" / "release_notes.py",
+    )
+    (work / "CHANGELOG.md").write_bytes(b"## [0.0.1]\n- **Entry.** Body.\n")
+    for name in (
+        "dist/messagefoundry-0.0.1.tar.gz",
+        f"harness-dist/{_HARNESS_WHEEL}",
+        "webconsole-dist/messagefoundry_webconsole-0.0.1-py3-none-any.whl",
+    ):
+        (work / name).write_bytes(b"fixture\n")
+    (bin_dir / "gh").write_bytes(_FAKE_GH.encode("utf-8"))
+    (bin_dir / "gh").chmod(0o755)
+    script = tmp_path / "step.sh"
+    script.write_bytes(_step_script_by_prefix(prefix, prefix).encode("utf-8"))
+    log = tmp_path / "gh.log"
+    log.write_bytes(b"")
+
+    env = _posix_tool_env()
+    env["PATH"] = os.pathsep.join([str(bin_dir), str(Path(sys.executable).parent), env["PATH"]])
+    env.update(
+        GH_LOG=str(log).replace("\\", "/"),
+        FAKE_RELEASE=state,
+        FAKE_ASSETS=assets,
+        GITHUB_REF_NAME=_TAG,
+        GITHUB_REPOSITORY="example/example",
+    )
+    bash = require_bash(tmp_path, env)
+    rc, out = _run_leak_gate(bash, work, script, env)
+    # A stand-in `gh` that bash cannot find or run would read as the step refusing.
+    assert rc not in (126, 127), explain_returncode(rc, f"the {prefix!r} step") + "\n" + out
+    calls = log.read_bytes().decode("utf-8").splitlines()
+    return rc, out, calls
+
+
+def _uploads(calls: Sequence[str]) -> list[str]:
+    return [c for c in calls if c.startswith(("release upload", "release create"))]
+
+
+@pytest.mark.parametrize(
+    ("prefix", "state", "assets", "ok", "uploads"),
+    [
+        # The engine release: created as a draft, edited while a draft, untouched once published.
+        ("Create or update the GitHub release", "absent", "", True, ["release create"]),
+        ("Create or update the GitHub release", "draft", "", True, ["release upload"]),
+        ("Create or update the GitHub release", "published", "", True, []),
+        # The harness wheel: onto the draft; a published release must already carry it.
+        ("Attach the harness wheel", "draft", "", True, ["release upload"]),
+        ("Attach the harness wheel", "published", _HARNESS_WHEEL, True, []),
+        ("Attach the harness wheel", "published", "something-else.whl", False, []),
+        # The console: one call creates it with its asset; a re-run touches nothing.
+        ("Create or update the console GitHub release", "absent", "", True, ["release create"]),
+        ("Create or update the console GitHub release", "published", "", True, []),
+        # An interrupted create left a draft: attach to it (then publish, graded separately).
+        ("Create or update the console GitHub release", "draft", "", True, ["release upload"]),
+        # A read that fails for any reason but "not found" refuses rather than guessing "absent".
+        ("Create or update the GitHub release", "broken", "", False, []),
+        ("Create or update the console GitHub release", "broken", "", False, []),
+    ],
+    ids=[
+        "engine-new",
+        "engine-draft-rerun",
+        "engine-published-rerun",
+        "harness-draft",
+        "harness-published-has-wheel",
+        "harness-published-missing-wheel",
+        "console-new",
+        "console-rerun",
+        "console-interrupted-draft",
+        "engine-read-error",
+        "console-read-error",
+    ],
+)
+def test_no_release_step_uploads_to_a_published_release(
+    tmp_path: Path, prefix: str, state: str, assets: str, ok: bool, uploads: list[str]
+) -> None:
+    """EXECUTED, so the claim is what each step DOES against each release state.
+
+    The `engine-new` and `harness-draft` cases are the positive controls: they prove the stand-in
+    `gh` is reached and records an upload, so an empty upload list elsewhere means the step chose
+    not to upload. Mutation: drop the published arm of any step. Red here.
+    """
+    rc, out, calls = _run_release_step(tmp_path, prefix, state, assets)
+    assert (rc == 0) is ok, f"exit {rc}:\n{out}\ncalls: {calls}"
+    made = _uploads(calls)
+    assert [c.split(" " + _TAG)[0] for c in made] == uploads, f"gh calls: {calls}\n{out}"
+    if state == "published":
+        assert not made, f"a step uploaded to a published release: {made}"
+    if state == "absent" and "console" not in prefix:
+        assert all("--draft" in c for c in made), f"the engine release was not a draft: {made}"
+    if state == "draft" and "console" in prefix:
+        assert calls[-1] == f"release edit {_TAG} --draft=false", f"draft left unpublished: {calls}"
+    if state == "broken":
+        assert "refusing to guess" in out and "HTTP 502" in out, out
+
+
+@pytest.mark.parametrize(("state", "edits"), [("draft", 1), ("published", 0)])
+def test_the_publish_step_publishes_a_draft_and_leaves_a_published_release_alone(
+    tmp_path: Path, state: str, edits: int
+) -> None:
+    rc, out, calls = _run_release_step(tmp_path, "Publish the draft GitHub release", state)
+    assert rc == 0, out
+    published = [c for c in calls if c == f"release edit {_TAG} --draft=false"]
+    assert len(published) == edits, f"gh calls: {calls}"
+    assert not _uploads(calls), calls
