@@ -65,6 +65,7 @@ class TcpDriver(Driver):
 
     def _send_one(self, payload: bytes) -> Injection:
         try:
+            # Unchecked on purpose, like the MLLP driver: a scenario chooses what reaches the engine.
             framed = self.codec.frame(payload)
             back = send_and_drain(
                 self.host, self.port, framed, self.timeout, DEFAULT_MAX_MESSAGE_BYTES

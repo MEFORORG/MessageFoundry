@@ -18,6 +18,16 @@ generators (`messagefoundry/generators`), and API client (`messagefoundry.apicli
 frames, acknowledges, and reads engine state exactly as the real components do. New message types
 light up automatically as they're added to `messagefoundry/generators/all_types.py`.
 
+It frames by the engine's one-frame rule too (ADR 0205): whether a payload holds a frame byte is
+judged in one place, `FrameCodec.find_frame_byte` in `messagefoundry.framing`. At least the MLLP ACK writers (the Receive tab and the MLLP, load and
+capture sinks) frame with `frame_neutralised`, which turns each frame byte into a space, so the
+engine reads exactly one reply frame even when an echoed MSH-10 held one. The Send tab refuses such
+a payload with `frame_checked` before it opens a connection and shows `not sent:` with the byte and
+its position; the load sender refuses it on its open connection and counts it in `refused_sends`.
+The Compose tab still sends one, on purpose. The modules that frame unchecked are listed, with the
+number of bare uses each makes and why, in `_DELIBERATE` in `tests/test_harness_frame_bytes.py`.
+That test reads imports and attribute uses of `frame`; it does not see a frame assembled by hand.
+
 ## GUI tabs
 
 - **Send** — pick a message type/trigger (or "random across all"), a count, target `host:port`,

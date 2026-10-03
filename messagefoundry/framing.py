@@ -30,6 +30,9 @@ from dataclasses import dataclass
 
 __all__ = [
     "FrameError",
+    "FrameByteFault",
+    "FramePayloadError",
+    "FrameEncodeError",
     "FrameCodec",
     "FrameDecoder",
     "MLLP_CODEC",
@@ -44,6 +47,62 @@ class FrameError(ValueError):
 
     Signals the caller to drop the connection rather than buffer an unbounded frame.
     """
+
+
+@dataclass(frozen=True)
+class FrameByteFault:
+    """Where a payload holds its codec's own ``start`` or ``end`` byte (ADR 0205 rule 1).
+
+    Carries the byte and its position, never the content, so its text is safe to log or show.
+    """
+
+    role: str  # "start" or "end"
+    byte: int
+    position: int
+
+    def describe(self, transport: str) -> str:
+        """The refusal text: one wording for the engine's delivery refusal and the harness's."""
+        return (
+            f"{transport}: payload holds the frame {self.role} byte 0x{self.byte:02X} at byte "
+            f"{self.position}; it would not arrive as one message, so it is not sent"
+        )
+
+
+class FramePayloadError(ValueError):
+    """Raised by :meth:`FrameCodec.frame_checked` for a payload that would not arrive as one frame.
+
+    Not a :class:`FrameError`: that one means a peer's frame went over its cap, and a caller that
+    drops the connection on it must not drop one for a payload this side refused to send.
+    """
+
+    def __init__(self, fault: FrameByteFault, transport: str) -> None:
+        super().__init__(fault.describe(transport))
+        self.fault = fault
+        self.transport = transport
+
+    def __reduce__(self) -> tuple[type[FramePayloadError], tuple[FrameByteFault, str]]:
+        # The constructor takes (fault, transport), not the message, so pickle and copy need this.
+        return (type(self), (self.fault, self.transport))
+
+
+class FrameEncodeError(ValueError):
+    """Raised by :meth:`FrameCodec.frame_checked` and :meth:`FrameCodec.frame_neutralised` for a
+    payload the charset cannot hold. Its text names the position only: a bare
+    :class:`UnicodeEncodeError` quotes the character and carries the whole payload."""
+
+
+def _body(payload: str | bytes, encoding: str) -> bytes:
+    return payload.encode(encoding) if isinstance(payload, str) else bytes(payload)
+
+
+def _encoded(payload: str | bytes, encoding: str, transport: str) -> bytes:
+    try:
+        return _body(payload, encoding)
+    except UnicodeEncodeError as exc:
+        raise FrameEncodeError(
+            f"{transport}: payload cannot be encoded as {encoding} at character {exc.start}; "
+            "it is not sent"
+        ) from None
 
 
 @dataclass(frozen=True)
@@ -71,9 +130,58 @@ class FrameCodec:
 
     def frame(self, payload: str | bytes, encoding: str = "utf-8") -> bytes:
         """Wrap a message: ``start payload end [trailer]``."""
-        body = payload.encode(encoding) if isinstance(payload, str) else bytes(payload)
+        body = _body(payload, encoding)
         tail = [self.end] if self.trailer is None else [self.end, self.trailer]
         return bytes([self.start]) + body + bytes(tail)
+
+    # The ONE definition of "a payload that would break framing" (ADR 0205 rule 1). The engine's
+    # delivery and reply framers (messagefoundry/transports/framing.py) and the test harness's
+    # senders and ACK writers all judge a payload here. A decoder ends a frame at the end byte
+    # alone, whatever follows it, so the end byte is refused on its own and not only as end+trailer;
+    # the trailer is not a frame byte to a decoder (MLLP's is CR, the segment terminator), so it is
+    # not checked. `frame` above stays unchecked, because the fuzzer and the hostile scenarios frame
+    # hostile bytes on purpose.
+
+    def find_frame_byte(self, body: bytes) -> FrameByteFault | None:
+        """The first of this codec's start or end byte in ``body``, or None when it holds neither.
+
+        The start byte is looked for first, then the end byte, each at its first position. The check
+        is on bytes, because a receiver's decoder scans bytes."""
+        for role, byte in (("start", self.start), ("end", self.end)):
+            position = body.find(byte)
+            if position >= 0:
+                return FrameByteFault(role, byte, position)
+        return None
+
+    def neutralise(self, body: bytes) -> bytes:
+        """``body`` with each of this codec's start and end bytes replaced by a space.
+
+        For a REPLY, which must still go as exactly one frame: an acknowledgement echoes header
+        values from the inbound message, and an inbound frame may carry a start byte as data. A
+        space is what the ACK builder already puts in place of an echoed CR or LF. A clean ``body``
+        comes back as is, uncopied; compare with ``!=`` to learn whether anything was replaced."""
+        if self.start not in body and self.end not in body:
+            return body
+        return body.replace(bytes([self.start]), b" ").replace(bytes([self.end]), b" ")
+
+    def frame_checked(
+        self, payload: str | bytes, encoding: str = "utf-8", *, transport: str = "frame"
+    ) -> bytes:
+        """:meth:`frame`, refusing a payload whose encoded bytes hold the start or end byte.
+
+        Raises :class:`FramePayloadError`, whose text names the byte and its position and never the
+        content, or :class:`FrameEncodeError` for a payload the charset cannot hold. Nothing is
+        stripped or escaped: no framing here has an escape mechanism."""
+        body = _encoded(payload, encoding, transport)
+        fault = self.find_frame_byte(body)
+        if fault is not None:
+            raise FramePayloadError(fault, transport)
+        return self.frame(body)
+
+    def frame_neutralised(self, payload: str | bytes, encoding: str = "utf-8") -> bytes:
+        """:meth:`frame` after :meth:`neutralise`: one frame for a reply, for any codec whose start
+        and end bytes are not the space. Raises :class:`FrameEncodeError` as :meth:`frame_checked`."""
+        return self.frame(self.neutralise(_encoded(payload, encoding, "reply")))
 
     def decoder(self, max_frame_bytes: int | None = None) -> FrameDecoder:
         """A fresh stateful reassembler for this scheme."""

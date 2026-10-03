@@ -21,8 +21,9 @@ from harness.load.enginepoll import EnginePoller
 from harness.load.metrics import Counters, Histogram, LatencySummary
 from harness.load.profile import LoadProfile, Phase, Slo
 
-SCHEMA_VERSION = 3  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
-# copies_per_message (the #207 sizing proxy — a COPY COUNT, never a byte figure; ADR 0141)
+SCHEMA_VERSION = 4  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
+# copies_per_message (the #207 sizing proxy — a COPY COUNT, never a byte figure; ADR 0141);
+# 3 to 4: totals.refused_sends (sends the harness refused to frame, ADR 0205 rule 1)
 
 # Exit codes (shared with the CLI).
 EXIT_OK = 0
@@ -841,6 +842,11 @@ def _notes(counters: Counters, poller: EnginePoller) -> list[str]:
             f"{counters.correlation_misses} sink arrivals could not be correlated — raise the "
             "profile's correlator_capacity if the engine backlog exceeded it during a spike"
         )
+    if counters.refused_sends > 0:
+        notes.append(
+            f"{counters.refused_sends} payloads were not sent: each held an MLLP frame byte or could "
+            "not be encoded (a corpus defect, not the engine's); they are not in `sent`"
+        )
     if not poller.samples:
         notes.append("no engine samples collected — engine-side metrics and no-loss are unverified")
     return notes
@@ -853,6 +859,7 @@ def _counters_dict(c: Counters) -> dict[str, int]:
         "nak": c.nak,
         "errors": c.errors,
         "timeouts": c.timeouts,
+        "refused_sends": c.refused_sends,
         "deferred": c.deferred,
         "sink_received": c.sink_received,
         "correlation_misses": c.correlation_misses,
