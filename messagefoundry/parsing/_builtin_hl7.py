@@ -1135,6 +1135,11 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     return "\r".join(lines) + "\r"
 
 
+#: How many distinct escape sequences one :class:`_LeafRewrite` remembers. A real message repeats a
+#: handful; the cap keeps a field of many distinct ones from building a table as large as itself.
+_SEQUENCE_CACHE_MAX = 64
+
+
 class _LeafRewrite:
     """The per-field rewrite :func:`encode_with_separators` uses when a single translate would change
     what a receiver reads: some target delimiter is data under the source set, or a separator escape
@@ -1176,7 +1181,7 @@ class _LeafRewrite:
         self._separators = tuple(structure)
         self._unclosed_head = self._data(self._s_esc)
         # A message repeats few distinct escape sequences (a line break, one separator), so each is
-        # rewritten once per message. Bounded by the message, which this object does not outlive.
+        # rewritten once per message. Capped, so a field of many distinct sequences cannot grow it.
         self._sequences: dict[str, str] = {}
 
     def _holds_code(self, text: str) -> bool:
@@ -1210,7 +1215,9 @@ class _LeafRewrite:
             if cut == len(run) and i < last:
                 rewritten = sequences.get(run)
                 if rewritten is None:
-                    rewritten = sequences[run] = self._sequence(run)
+                    rewritten = self._sequence(run)
+                    if len(sequences) < _SEQUENCE_CACHE_MAX:
+                        sequences[run] = rewritten
                 out.append(rewritten)
                 out.append(pieces[i + 1].translate(table))
                 i += 2

@@ -128,6 +128,15 @@ class X12Message:
         comps[comp - 1] = value
         seg[elem] = self._delims.component.join(comps)
 
+    def set_data(self, path: str, value: str, *, occurrence: int = 1) -> None:
+        """:meth:`set`, under the name the HL7 ``Message`` gives its data write (ADR 0206).
+
+        An X12 write already refuses a delimiter in ``value``, so it never turns data into
+        structure. The Steps view writes ``msg.set_data`` for a value read from a component path,
+        and it cannot tell an X12 handler from an HL7 one, so without this name such a Copy Field or
+        Set Field raised ``AttributeError`` on every X12 message."""
+        self.set(path, value, occurrence=occurrence)
+
     def __setitem__(self, path: str, value: str) -> None:
         self.set(path, value)
 

@@ -1026,6 +1026,10 @@ def split_messages(raw: bytes) -> list[bytes]:
     :func:`dry_run` decodes and parses it whole. That is narrower than the live File source, which
     decodes before splitting — and still strictly better than the UTF-8/``replace`` decode this
     replaced, which turned such a payload into mojibake before anything looked at it.
+
+    A leading UTF-8 byte order mark is read past whatever the connection's charset. The live sources
+    do that only under a UTF-8 charset; under a single-byte one they keep the three bytes and the
+    parser refuses the file, so there the dry run is more lenient than the engine (ADR 0206).
     """
     # A UTF-8 byte order mark reads as three characters in the latin-1 view, so split_batch could
     # not see past it as the live split, which decodes first, does (ADR 0206). Strip it, with the

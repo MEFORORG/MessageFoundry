@@ -134,7 +134,10 @@ open points settled below.
   separator in the text does not keep `msg.set`, because `set` refuses one in a whole field, so it
   can only mean data. At a literal leaf destination the two writes are the same, so `msg.set` is kept
   there. An edit that leaves the line unchanged leaves its write as written. The lens cannot know a
-  message's own separators, so it tests the standard ones. At least four template
+  message's own separators, so it tests the standard ones. Nor can it tell an X12 handler from an
+  HL7 one, and an X12 composite path such as `CLM-05.1` reads as a leaf, so the X12 message gained
+  a `set_data` that is its `set`: an X12 write already refuses a delimiter, so the two cannot differ,
+  and without it such a Copy Field or Set Field raised `AttributeError`. At least four template
   writes into a whole field still take decoded text as structure and are not changed here: the
   wrapper form `set_field(msg, ...)`, and templates into `add_repetition`, `append_to_field` and
   `replace_literal`, each of which writes with `set` or `add_repetition`.
@@ -173,7 +176,8 @@ open points settled below.
   translate it took before. *Changed in the final repair round:* a field holding an escape sequence
   was walked character by character, on the event loop in MLLP `send()`, which a reviewer measured
   at about 20 times the old cost. It is now split on the escape character: each escape sequence is
-  rewritten once per message, and the text between sequences takes the same single translate. On a
+  rewritten once per message, up to 64 distinct ones remembered, and the text between sequences
+  takes the same single translate. On a
   1 MB `OBX-5` under a target subcomponent `#` (best of three, a loaded machine, so read the ranges
   as rough), a report with a line-break escape every 80 characters took 2 to 3 ms before this ADR,
   100 to 180 ms after the walk, and 15 to 16 ms now; a field with a separator escape every 10
@@ -229,7 +233,10 @@ open points settled below.
   lines. What remains is a message when it starts with `MSH`, and is otherwise kept so the parser
   records its `ERROR`. The File source calls `split_batch` too, so it is fixed by the same change.
   The dry-run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8 byte order mark is
-  three characters, so it strips that mark first and splits as the live sources do. *Changed in the
+  three characters, so it strips that mark first and splits as the live sources do under a UTF-8
+  charset. It is not told the connection's charset, so under a single-byte charset, where the live
+  sources keep those three bytes and the parser refuses the file, the dry run still reads past them;
+  that gap stays open. *Changed in the
   final repair round:* a file holding one message led by a UTF-8 byte order mark, or by an
   `FHS`/`BHS` envelope header, used to be handed over whole, and the parser refused it, while each
   message of a two-message file led the same way was recorded. Now `one_message_bytes` in
@@ -239,7 +246,9 @@ open points settled below.
   disposition each member of a batch gets. The mark is read in the decoded text, so under a
   single-byte charset its bytes are three characters, which the batch split keeps too, and a
   `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file whose decoded text starts
-  with `MSH` after whitespace is still handed over as its own bytes.
+  with `MSH` after whitespace is still handed over as its own bytes. The split drops an envelope's
+  header lines but not its `BTS`/`FTS` trailer lines, so the last message of an enveloped file, and
+  now its only message, carries them to the Handler; dropping them is not built here.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.
@@ -318,6 +327,7 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_a_set_field_template_holding_a_field_separator_writes_with_set_data`
   -> `tests/test_data_never_becomes_structure.py::test_a_set_field_path_edit_re_picks_the_write`
   -> `tests/test_data_never_becomes_structure.py::test_an_edit_that_changes_nothing_leaves_a_hand_written_write_alone`
+  -> `tests/test_x12_parsing.py::test_set_data_is_set_on_an_x12_message`
 - **AC-7** -- WHEN the delimiter override rewrites a message, THE SYSTEM SHALL keep every leaf reading
   the same under the target set: a target delimiter inside a leaf is escaped with the target escape
   character, a separator escape is decoded against the source set and re-escaped against the target
@@ -331,6 +341,7 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_an_escaped_and_a_literal_component_stay_distinct_under_the_target`
   -> `tests/test_data_never_becomes_structure.py::test_an_unclosed_escape_holding_a_target_delimiter_is_carried`
   -> `tests/test_data_never_becomes_structure.py::test_the_split_rewrite_matches_the_character_walk`
+  -> `tests/test_data_never_becomes_structure.py::test_a_field_of_many_distinct_escapes_rewrites_past_the_cache_cap`
   -> `tests/test_mllp_encoding_override.py::test_reencode_decodes_separator_escapes_so_they_read_the_same`
 - **AC-8** -- IF the target delimiters cannot carry a value as data, THEN THE SYSTEM SHALL refuse the
   rewrite with content-free text, and the MLLP delivery SHALL fail permanently before any dial.
@@ -376,6 +387,7 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_one_enveloped_message_goes_over_as_the_split_reads_it`
   -> `tests/test_data_never_becomes_structure.py::test_one_enveloped_remote_message_is_recorded`
   -> `tests/test_data_never_becomes_structure.py::test_one_bom_led_message_goes_over_as_the_split_reads_it`
+  -> `tests/test_data_never_becomes_structure.py::test_the_leading_mark_check_reads_the_whitespace_the_sniff_tolerates`
   -> `tests/test_message_split.py`
 
 ## Options considered

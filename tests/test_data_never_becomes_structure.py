@@ -48,6 +48,7 @@ from messagefoundry.lens import (
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing import split as split_mod
 from messagefoundry.parsing.message import Message, reencode_with_separators
+from messagefoundry.parsing.sniff import _LEADING_WS
 from messagefoundry.parsing.split import split_batch, split_batch_bytes
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run, split_messages
@@ -703,6 +704,16 @@ def test_split_batch_bytes_hands_a_single_message_over_without_decoding(
         assert split_batch_bytes(lf, "latin-1") == [lf]
 
 
+def test_the_leading_mark_check_reads_the_whitespace_the_sniff_tolerates() -> None:
+    bom = chr(0xFEFF).encode("utf-8")
+    for byte in range(256):
+        lead = bytes([byte])
+        matched = split_mod._LEADING_BOM.match(lead * 3 + bom) is not None
+        assert matched == (lead in _LEADING_WS), byte
+    assert split_mod._LEADING_BOM.match(bom + b"MSH") is not None
+    assert split_mod._LEADING_BOM.match(b"MSH" + bom) is None
+
+
 def test_split_batch_bytes_still_splits_an_encoding_the_byte_check_cannot_read() -> None:
     raw = "".join(THREE).encode("utf-16")
     assert len(split_batch_bytes(raw, "utf-16")) == 3
@@ -1273,3 +1284,18 @@ def test_the_split_rewrite_matches_the_character_walk(
     fast = _rewrite_all(fields, target)
     monkeypatch.setattr(_builtin_hl7._LeafRewrite, "__call__", _builtin_hl7._LeafRewrite._walk)
     assert fast == _rewrite_all(fields, target)
+
+
+def test_a_field_of_many_distinct_escapes_rewrites_past_the_cache_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # More distinct sequences than the cache keeps, each also repeated, in one field.
+    count = _builtin_hl7._SEQUENCE_CACHE_MAX * 3
+    seqs = [BS + "Z" + format(n, "x") + BS + "#" for n in range(count)]
+    field = "".join(seqs + seqs)
+    target = ("|", "^", "~", "#", BS)
+    fast = _rewrite_all([field], target)
+    # The rewrite ran: each "#" became data under the target set, where it is the subcomponent mark.
+    assert fast[0].count(_esc("T")) == 2 * count
+    monkeypatch.setattr(_builtin_hl7._LeafRewrite, "__call__", _builtin_hl7._LeafRewrite._walk)
+    assert fast == _rewrite_all([field], target)

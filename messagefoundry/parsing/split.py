@@ -26,7 +26,7 @@ import re
 
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import normalize
-from messagefoundry.parsing.sniff import _LEADING_WS, _LEADING_WS_STR
+from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 __all__ = [
     "encode_batch",
@@ -41,6 +41,11 @@ __all__ = [
 # ``MSH^...``) still splits per-message instead of being read as one giant message — after a ``\r`` a
 # segment id is always exactly three chars, so only an ``MSH`` segment starts with the literal "MSH".
 _MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
+
+#: A UTF-8 byte order mark after the leading whitespace the content sniff tolerates. A match, not a
+#: strip, so a file led by whitespace is not copied whole to look at its first bytes. Its class
+#: is the bytes of ``sniff._LEADING_WS``, spelled out for the static ReDoS scan; a test pins the two.
+_LEADING_BOM = re.compile(rb"[ \t\r\n\x0b\x0c]*\xef\xbb\xbf")
 
 #: The batch-envelope header lines a first chunk may open with; neither is a message.
 _ENVELOPE_HEADERS = ("FHS", "BHS")
@@ -97,9 +102,7 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
     message the parser reads as it is. Where a byte scan can tell (:func:`_may_hold_a_later_msh`),
     such a file is returned without a decode or a split, so the common single-message file pays one
     scan."""
-    if not _may_hold_a_later_msh(raw, encoding) and not raw.lstrip(_LEADING_WS).startswith(
-        codecs.BOM_UTF8
-    ):
+    if not _may_hold_a_later_msh(raw, encoding) and not _LEADING_BOM.match(raw):
         return [raw]
     try:
         text = raw.decode(encoding)

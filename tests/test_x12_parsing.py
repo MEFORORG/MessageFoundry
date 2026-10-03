@@ -444,6 +444,25 @@ def test_message_set_rejects_delimiter_injection() -> None:
         msg.set("NM1-03", "BAD~VALUE")  # segment terminator would inject a segment
 
 
+def test_set_data_is_set_on_an_x12_message() -> None:
+    # The Steps view writes msg.set_data for a component read, HL7 or X12 alike (ADR 0206).
+    body = (
+        isa()
+        + "GS*HS*A*B*20240101*1200*1*X*005010X279A1~ST*270*0001~NM1*IL*1*DOE~SE*2*0001~"
+        + "GE*1*1~IEA*1*000000001~"
+    )
+    a, b = X12Message.parse(body), X12Message.parse(body)
+    a.set_data("NM1-03", "SMITH")
+    a.set_data("NM1-04.2", "J")
+    b.set("NM1-03", "SMITH")
+    b.set("NM1-04.2", "J")
+    assert a.encode() == b.encode()
+    with pytest.raises(ValueError, match="delimiter"):
+        a.set_data("NM1-03", "BAD*VALUE")
+    with pytest.raises(KeyError):
+        a.set_data("REF-02", "X")
+
+
 def test_message_refuses_envelope_segment_edits() -> None:
     msg = X12Message.parse(interchange())
     with pytest.raises(ValueError, match="envelope"):
