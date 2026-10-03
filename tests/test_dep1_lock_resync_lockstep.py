@@ -28,10 +28,14 @@ _ROOT = Path(__file__).resolve().parent.parent
 _WORKFLOWS = _ROOT / ".github" / "workflows"
 _GATE = _WORKFLOWS / "security.yml"
 _RESYNC = _WORKFLOWS / "dependabot-lock-resync.yml"
-#: The files the resync derives from the core and sqlserver lock exports, and the command that
-#: derives them (BACKLOG #1812, #1955).
+#: The files the resync derives from the core, sqlserver and harness lock exports, and the command
+#: that derives them (BACKLOG #1812, #1955).
 _CLOSURES = frozenset(
-    {"security/runtime-closure-core.txt", "security/runtime-closure-sqlserver.txt"}
+    {
+        "security/runtime-closure-core.txt",
+        "security/runtime-closure-sqlserver.txt",
+        "security/runtime-closure-harness.txt",
+    }
 )
 _REGENERATOR = "python3 scripts/security/runtime_closure.py"
 
@@ -149,6 +153,7 @@ def test_the_resync_regenerates_the_closure_file() -> None:
     export = max(
         index_of("-o docker/locks/requirements-core.lock"),
         index_of("-o docker/locks/requirements-sqlserver.lock"),
+        index_of("-o security/locks/requirements-harness.lock"),
     )
     regen = index_of(_REGENERATOR)
     commit = index_of("git commit")

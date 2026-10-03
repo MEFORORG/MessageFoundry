@@ -10,9 +10,10 @@ The denominator is ``security/runtime-closure-core.txt``: the core runtime closu
 toolchain. It is a copy of the pin lines in a DEP-1 lock; its own header says which one, and how to
 regenerate it. Tests below hold the copy to that lock in name and version (BACKLOG #1812).
 
-The page also assesses one extra, ``sqlserver``, in its own section (BACKLOG #1955). That section's
-denominator is ``security/runtime-closure-sqlserver.txt``, built and held the same way, and it
-classifies only the names that closure adds to the core one.
+The page also assesses two extras, each in its own section: ``sqlserver`` (BACKLOG #1955) and
+``harness``, which the harness wheel installs and which the ASVS assessment scope took in by owner
+ruling R1 of 2026-10-02. Each section's denominator is its ``security/runtime-closure-<extra>.txt``,
+built and held the same way, and it classifies only the names that closure adds to the core one.
 
 **The property under test is CLOSURE, not correctness of judgement.** Whether ``pyyaml`` belongs in
 tier 1 is an argument for a reviewer. Whether it appears in exactly one of the two tables is a fact,
@@ -56,17 +57,26 @@ _CORE_LOCK = _ROOT / "docker" / "locks" / "requirements-core.lock"
 #: The ``sqlserver`` extra's closure and the lock it copies (BACKLOG #1955).
 _SQLSERVER_CLOSURE = _ROOT / "security" / "runtime-closure-sqlserver.txt"
 _SQLSERVER_LOCK = _ROOT / "docker" / "locks" / "requirements-sqlserver.lock"
+#: The ``harness`` extra's closure and the lock it copies. No image installs that lock.
+_HARNESS_CLOSURE = _ROOT / "security" / "runtime-closure-harness.txt"
+_HARNESS_LOCK = _ROOT / "security" / "locks" / "requirements-harness.lock"
 #: Each closure file and its lock, in the order the regenerator rewrites them.
-_PAIRS = ((_CLOSURE, _CORE_LOCK), (_SQLSERVER_CLOSURE, _SQLSERVER_LOCK))
+_PAIRS = (
+    (_CLOSURE, _CORE_LOCK),
+    (_SQLSERVER_CLOSURE, _SQLSERVER_LOCK),
+    (_HARNESS_CLOSURE, _HARNESS_LOCK),
+)
 #: The dated public-metadata snapshot the ASVS-example section is held to (BACKLOG #1189).
 _READINGS = _ROOT / "security" / "risky-component-readings.json"
 
-#: The headings that bound the page's two classified regions. The core tables run from the tier 1
-#: heading to the sqlserver heading; the sqlserver tables from there to the ASVS reading.
+#: The headings that bound the page's classified regions. The core tables run from the tier 1
+#: heading to the sqlserver heading, the sqlserver tables from there to the harness heading, and
+#: the harness tables from there to the ASVS reading.
 _CORE_START = "## Tier 1 — hostile input"
 _CORE_SPLIT = "## Assessed and NOT designated"
 _SQLSERVER_START = "## The `sqlserver` extra"
-_SQLSERVER_SPLIT = "### Assessed and NOT designated"
+_EXTRA_SPLIT = "### Assessed and NOT designated"
+_HARNESS_START = "## The `harness` extra"
 #: The ASVS-example reading (BACKLOG #1189, ground 2) runs from here to the closing sections.
 _ASVS_START = "## Risky by ASVS's own examples, read from public data"
 _END = "## What this page is not"
@@ -100,9 +110,9 @@ def _closure() -> set[str]:
     return set(_closure_pins())
 
 
-def _sqlserver_additions() -> set[str]:
-    """The names the ``sqlserver`` closure adds to the core one: what its section must classify."""
-    return set(_closure_pins(_SQLSERVER_CLOSURE)) - _closure()
+def _additions(closure: Path) -> set[str]:
+    """The names an extra's closure adds to the core one: what its section must classify."""
+    return set(_closure_pins(closure)) - _closure()
 
 
 def _core_lock_pins() -> dict[str, str]:
@@ -142,18 +152,18 @@ def _table_names(block: str) -> set[str]:
 def _classified(start: str, split: str, end: str) -> tuple[set[str], set[str]]:
     """The names classified between ``start`` and ``end``, split at the ``split`` heading.
 
-    Each heading must be present as a whole line, once, and in that order, or the region is not the
-    one meant. Whole lines, because ``## Assessed and NOT designated`` is a substring of the
-    sqlserver section's ``### Assessed and NOT designated``.
+    ``start`` and ``end`` must each be a whole line once on the page, start first (see ``_region``),
+    and ``split`` a whole line once between them, or the region is not the one meant. Whole lines,
+    because ``## Assessed and NOT designated`` is a substring of each extra's
+    ``### Assessed and NOT designated``. The split is counted within the region only, because every
+    extra's section carries the same one.
     """
-    text = "\n" + _DOC.read_text(encoding="utf-8")
-    lines = [f"\n{h}\n" for h in (start, split, end)]
-    for line in lines:
-        assert text.count(line) == 1, f"{_DOC.name} must carry {line.strip()!r} once"
-    assert text.index(lines[0]) < text.index(lines[1]) < text.index(lines[2]), (
-        f"{_DOC.name} must order {start!r}, {split!r}, {end!r}"
+    region = "\n" + _region(start, end)
+    split_line = f"\n{split}\n"
+    assert region.count(split_line) == 1, (
+        f"{_DOC.name} must carry {split!r} once between {start!r} and {end!r}"
     )
-    head, _, tail = _region(start, end).partition(lines[1])
+    head, _, tail = region.partition(split_line)
     # The not-designated table ends at the next heading of any level, so a later subsection's
     # table is not read as more exclusions.
     return _table_names(head), _table_names(tail.partition("\n#")[0])
@@ -187,7 +197,20 @@ def _designated_and_excluded() -> tuple[set[str], set[str]]:
 
 def _sqlserver_designated_and_excluded() -> tuple[set[str], set[str]]:
     """The names the ``sqlserver`` section classifies, split at its not-designated heading."""
-    return _classified(_SQLSERVER_START, _SQLSERVER_SPLIT, _ASVS_START)
+    return _classified(_SQLSERVER_START, _EXTRA_SPLIT, _HARNESS_START)
+
+
+def _harness_designated_and_excluded() -> tuple[set[str], set[str]]:
+    """The names the ``harness`` section classifies, split at its not-designated heading."""
+    return _classified(_HARNESS_START, _EXTRA_SPLIT, _ASVS_START)
+
+
+#: Each assessed extra: its closure file, its section's start and end headings, and one name the
+#: extra must add, so an empty difference cannot pass the section's tests vacuously.
+_EXTRAS: dict[str, tuple[Path, str, str, str]] = {
+    "sqlserver": (_SQLSERVER_CLOSURE, _SQLSERVER_START, _HARNESS_START, "pyodbc"),
+    "harness": (_HARNESS_CLOSURE, _HARNESS_START, _ASVS_START, "pyside6-essentials"),
+}
 
 
 def test_the_closure_file_parses_and_is_not_empty() -> None:
@@ -282,72 +305,117 @@ def test_the_counts_printed_on_the_page_are_the_real_ones() -> None:
     )
 
 
-def test_the_sqlserver_closure_is_the_core_closure_plus_the_extra() -> None:
-    """RED when: the sqlserver closure stops being a superset of the core one, or adds nothing.
+@pytest.mark.parametrize("extra", sorted(_EXTRAS))
+def test_an_extra_closure_is_the_core_closure_plus_the_extra(extra: str) -> None:
+    """RED when: an extra's closure stops being a superset of the core one, or adds nothing.
 
-    THE POSITIVE CONTROL FOR THE SQLSERVER SECTION (BACKLOG #1955). That section classifies only the
-    names this closure adds, so an empty difference would make every test of it pass vacuously. A
-    core package at a different version here would mean one of the two exports is stale.
+    THE POSITIVE CONTROL FOR EACH EXTRA'S SECTION (BACKLOG #1955 for sqlserver). That section
+    classifies only the names this closure adds, so an empty difference would make every test of it
+    pass vacuously. A core package at a different version here would mean one of the two exports
+    is stale.
     """
+    path, _, _, marker = _EXTRAS[extra]
     core = _closure_pins()
-    sqlserver = _closure_pins(_SQLSERVER_CLOSURE)
-    lost = sorted(core.keys() - sqlserver.keys())
-    assert not lost, f"core packages missing from {_SQLSERVER_CLOSURE.name}: {lost}"
-    moved = sorted(n for n in core if sqlserver[n] != core[n])
-    assert not moved, f"core packages at another version in {_SQLSERVER_CLOSURE.name}: {moved}"
-    assert "pyodbc" in _sqlserver_additions(), (
-        f"{_SQLSERVER_CLOSURE.name} adds no pyodbc to the core closure; the extra's own native "
-        "driver binding is missing, so the file or its parser is wrong"
+    pins = _closure_pins(path)
+    assert len(core) >= 20, f"the core closure parsed to {len(core)} names, too few to be real"
+    lost = sorted(core.keys() - pins.keys())
+    assert not lost, f"core packages missing from {path.name}: {lost}"
+    moved = sorted(n for n in core if pins[n] != core[n])
+    assert not moved, f"core packages at another version in {path.name}: {moved}"
+    assert marker in _additions(path), (
+        f"{path.name} adds no {marker} to the core closure; the extra's own package is missing, "
+        "so the file or its parser is wrong"
     )
 
 
-def test_the_sqlserver_section_classifies_exactly_what_the_extra_adds() -> None:
-    """RED when: the extra gains a package nobody classified, or the section names a stray one.
+@pytest.mark.parametrize("extra", sorted(_EXTRAS))
+def test_an_extra_section_classifies_exactly_what_the_extra_adds(extra: str) -> None:
+    """RED when: an extra gains a package nobody classified, or its section names a stray one.
 
     The core tests above cannot see this: they read only the core closure, and a package the extra
     alone brings is outside it. Names the core tables already classify are not repeated here.
     """
-    additions = _sqlserver_additions()
-    designated, excluded = _sqlserver_designated_and_excluded()
+    path, start, end, _ = _EXTRAS[extra]
+    additions = _additions(path)
+    designated, excluded = _classified(start, _EXTRA_SPLIT, end)
     classified = designated | excluded
     missing = sorted(additions - classified)
     assert not missing, (
-        f"the sqlserver extra adds {missing} and {_DOC.name}'s sqlserver section classifies "
+        f"the {extra} extra adds {missing} and {_DOC.name}'s {extra} section classifies "
         "none of them. Add each to its designated or not-designated table."
     )
     stray = sorted(classified - additions)
     assert not stray, (
-        f"{_DOC.name}'s sqlserver section classifies {stray}, which the extra does not add to "
+        f"{_DOC.name}'s {extra} section classifies {stray}, which the extra does not add to "
         "the core closure. Either they left the extra, or they are core and belong above."
     )
     both = sorted(designated & excluded)
-    assert not both, f"classified twice in the sqlserver section: {both}"
+    assert not both, f"classified twice in the {extra} section: {both}"
 
 
-def test_the_sqlserver_counts_printed_on_the_page_are_the_real_ones() -> None:
-    """RED when: the sqlserver section's arithmetic, or a closure size the page states, drifts.
+@pytest.mark.parametrize("extra", sorted(_EXTRAS))
+def test_an_extra_section_counts_printed_on_the_page_are_the_real_ones(extra: str) -> None:
+    """RED when: an extra section's arithmetic, or a closure size the page states, drifts.
 
-    Each figure is looked for where it belongs: the sum in the sqlserver section, the sizes in the
+    Each figure is looked for where it belongs: the sum in the extra's section, the sizes in the
     scope section above the tiers. So a stray copy elsewhere on the page cannot satisfy it.
     """
-    designated, excluded = _sqlserver_designated_and_excluded()
+    path, start, end, _ = _EXTRAS[extra]
+    designated, excluded = _classified(start, _EXTRA_SPLIT, end)
     added = len(designated) + len(excluded)
-    assert added == len(_sqlserver_additions()), "the sqlserver tables do not sum to the additions"
+    assert added == len(_additions(path)), f"the {extra} tables do not sum to the additions"
     core = len(_closure())
-    total = len(_closure_pins(_SQLSERVER_CLOSURE))
-    section = _region(_SQLSERVER_START, _ASVS_START)
+    total = len(_closure_pins(path))
+    section = _region(start, end)
     sentence = (
         f"{len(designated)} plus {len(excluded)} is {added}, and {core} plus {added} is {total}"
     )
-    assert sentence in section, f"the sqlserver section does not say {sentence!r}"
+    assert sentence in section, f"the {extra} section does not say {sentence!r}"
     scope = _region("## Scope, and the denominator", "## The criterion")
     assert scope, "the scope section's headings moved; this test reads between them"
     for fact in (
-        f"closure is **{total} distributions**",
+        f"The `{extra}` runtime closure is **{total} distributions**",
         f"| **Core runtime closure** | **{core}** |",
-        f"| **`sqlserver` runtime closure** | **{total}** |",
+        f"| **`{extra}` runtime closure** | **{total}** |",
     ):
         assert fact in scope, f"the scope section does not say {fact!r}"
+
+
+def test_the_harness_extra_is_not_listed_as_unassessed() -> None:
+    """RED when: the scope section's list of unassessed extras names ``harness`` again.
+
+    The harness section assesses it, so a list calling it unassessed contradicts the page.
+    """
+    scope = _region("## Scope, and the denominator", "## The criterion")
+    unassessed = scope.partition("An install that enables any other extra")[2].partition("\n\n")[0]
+    assert "`postgres`" in unassessed, "the list of unassessed extras moved; re-read this test"
+    assert "`harness`" not in unassessed, "the scope section still lists `harness` as unassessed"
+
+
+def test_the_harness_reading_gap_is_stated_while_it_is_open() -> None:
+    """RED when: the readings snapshot starts reading the harness additions, or the page stops
+    saying it does not.
+
+    The generated ASVS reading covers the sqlserver closure. The harness section reads its four
+    names on maintenance and support by hand and says the vulnerability-history example was not
+    read. Once a run of the generator reads them, that paragraph is false, and this goes red so it
+    is rewritten in the same change.
+    """
+    additions = _additions(_HARNESS_CLOSURE)
+    assert len(additions) >= 4, f"the harness closure adds only {sorted(additions)}"
+    readings = _readings(_snapshot())
+    assert len(readings) >= 20, f"{_READINGS.name} parsed to {len(readings)} readings"
+    read = sorted(n for n in readings if n in additions)
+    assert not read, (
+        f"{_READINGS.name} now reads {read}; rewrite the harness section's hand reading and its "
+        "statement of what was not read, then drop this test"
+    )
+    section = " ".join(_region(_HARNESS_START, _ASVS_START).split())
+    assert "**The vulnerability-history example was NOT read for them.**" in section
+    hand = _table_names(_region(_HARNESS_START, _ASVS_START).partition("### Read on ASVS")[2])
+    assert hand == additions, (
+        f"the hand reading names {sorted(hand)}, the extra adds {sorted(additions)}"
+    )
 
 
 def test_the_version_comparison_can_fail() -> None:
@@ -404,7 +472,7 @@ def test_the_closure_file_is_its_lock(closure: Path, lock: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("path", [_CLOSURE, _SQLSERVER_CLOSURE], ids=lambda p: p.name)
+@pytest.mark.parametrize("path", [c for c, _ in _PAIRS], ids=lambda p: p.name)
 def test_every_closure_pin_is_the_version_requirements_lock_installs(path: Path) -> None:
     """RED when: requirements.lock installs a different version of a closure package.
 
@@ -432,7 +500,7 @@ def test_every_closure_pin_is_the_version_requirements_lock_installs(path: Path)
     )
 
 
-@pytest.mark.parametrize("path", [_CLOSURE, _SQLSERVER_CLOSURE], ids=lambda p: p.name)
+@pytest.mark.parametrize("path", [c for c, _ in _PAIRS], ids=lambda p: p.name)
 def test_dependabot_does_not_write_the_closure_file(path: Path) -> None:
     """RED when: the uv Dependabot entry stops excluding a closure file.
 
@@ -461,7 +529,7 @@ def test_dependabot_does_not_write_the_closure_file(path: Path) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [_DOC, _CLOSURE, _CORE_LOCK, _SQLSERVER_CLOSURE, _SQLSERVER_LOCK, _READINGS],
+    [_DOC, *(f for pair in _PAIRS for f in pair), _READINGS],
     ids=lambda p: p.name,
 )
 def test_the_tracked_paths_exist(path: Path) -> None:
@@ -577,22 +645,25 @@ def test_the_regenerator_rewrites_a_drifted_closure(tmp_path: Path) -> None:
     assert closure.read_text(encoding="utf-8") == text
 
 
-def test_the_regenerator_rewrites_a_drifted_sqlserver_closure(tmp_path: Path) -> None:
-    """RED when: the regenerator cannot repair the sqlserver pair, or drops a name the extra adds.
+@pytest.mark.parametrize("extra", sorted(_EXTRAS))
+def test_the_regenerator_rewrites_a_drifted_extra_closure(tmp_path: Path, extra: str) -> None:
+    """RED when: the regenerator cannot repair an extra's pair, or drops a name the extra adds.
 
-    The same script-mode run as above, on the second pair. The drift removes ``pyodbc``, the name
-    the core lock does not carry, so a rewrite that read the core lock by mistake would not restore
-    it and this fails.
+    The same script-mode run as above, on each extra's pair. The drift removes the extra's marker
+    package, a name the core lock does not carry, so a rewrite that read the core lock by mistake
+    would not restore it and this fails.
     """
-    text = _SQLSERVER_CLOSURE.read_text(encoding="utf-8")
-    wrong = text.replace("\npyodbc==", "\npyodbc-gone==", 1)
-    assert wrong != text, "the sqlserver closure no longer pins pyodbc; pick another package here"
+    path, _, _, marker = _EXTRAS[extra]
+    lock = dict(_PAIRS)[path]
+    text = path.read_text(encoding="utf-8")
+    wrong = text.replace(f"\n{marker}==", f"\n{marker}-gone==", 1)
+    assert wrong != text, f"{path.name} no longer pins {marker}; pick another package here"
     closure = tmp_path / "closure.txt"
     closure.write_text(wrong, encoding="utf-8")
     script = Path(runtime_closure.__file__)
     run = subprocess.run(
         [sys.executable, "-S", "-E", "-s", str(script), "--closure", str(closure)]
-        + ["--lock", str(_SQLSERVER_LOCK)],
+        + ["--lock", str(lock)],
         capture_output=True,
         text=True,
         check=False,
@@ -638,8 +709,12 @@ def _readings(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _designated() -> set[str]:
-    """Every name the tiers designate: the core tables' and the sqlserver section's."""
-    return _designated_and_excluded()[0] | _sqlserver_designated_and_excluded()[0]
+    """Every name the tiers designate: the core tables' and each extra section's."""
+    return (
+        _designated_and_excluded()[0]
+        | _sqlserver_designated_and_excluded()[0]
+        | _harness_designated_and_excluded()[0]
+    )
 
 
 def _stated_facts_drift(page: str, data: dict[str, Any]) -> list[str]:
@@ -792,6 +867,7 @@ def test_the_generator_reads_the_same_designation_as_this_guard() -> None:
         tier = f"tier {heading.split()[2]}"
         expected |= dict.fromkeys(_table_names(_region(heading, following)), tier)
     expected |= dict.fromkeys(_sqlserver_designated_and_excluded()[0], "the `sqlserver` extra")
+    expected |= dict.fromkeys(_harness_designated_and_excluded()[0], "the `harness` extra")
     assert set(expected) == _designated()
     assert component_readings.designation_labels(page) == expected
 

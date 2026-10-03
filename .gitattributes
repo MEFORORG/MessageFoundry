@@ -10,6 +10,8 @@ docker/locks/*.lock text eol=lf
 constraints.lock text eol=lf
 # The PEP 735 CI-toolchain exports (ADR 0034 §3) — same DEP-1 diff gate, same LF requirement.
 ci/locks/*.lock text eol=lf
+# The harness lock, which security/runtime-closure-harness.txt copies. Same DEP-1 diff gate.
+security/locks/*.lock text eol=lf
 .mefor-hooks/** text eol=lf
 # Shell scripts are executed on the Linux CI runners; force LF so a contributor's
 # core.autocrlf=true can never commit CRLF (which breaks `#!/usr/bin/env bash\r`).
