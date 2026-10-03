@@ -73,12 +73,12 @@ from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
-from tests._precommit_pins import COMMIT, frozen_tag, pins
+from tests._precommit_pins import COMMIT, PRECOMMIT, frozen_tag, pins
 
 yaml = pytest.importorskip("yaml")
 
 _ROOT = Path(__file__).resolve().parents[1]
-_PRECOMMIT = _ROOT / ".pre-commit-config.yaml"
+_PRECOMMIT = PRECOMMIT
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _SECURITY = _ROOT / ".github" / "workflows" / "security.yml"
 _CONSTRAINTS = _ROOT / "constraints.lock"

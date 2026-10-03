@@ -1516,15 +1516,10 @@ jobs:
           # The same 125,000-character ceiling as the engine release step above.
           python scripts/release/release_notes.py notes.md \
             --full-url "https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/packaging/messagefoundry-webconsole/CHANGELOG.md"
-          case "$ver" in
-            *-*) pre_create="--prerelease" ;;
-            *)   pre_create="" ;;
-          esac
-          # ONE CALL CREATES THE RELEASE WITH ITS ONE ASSET, so no asset is ever added after it is
-          # published (vault BACKLOG #2631, limb 6). An immutable release refuses that, and this
-          # job is the only one that touches a console release. So a re-run leaves an existing
-          # release alone: the call that created it attached the wheel, and a re-upload would be
-          # refused and would stop the job before the PyPI publish below.
+          pre_create=""; case "$ver" in *-*) pre_create="--prerelease" ;; esac
+          # ONE CALL CREATES THE RELEASE WITH ITS ONE ASSET (vault BACKLOG #2631, limb 6). So a
+          # re-run leaves an existing release alone: the call that created it attached the wheel,
+          # and a re-upload to a published release would be refused before the PyPI publish below.
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "::notice::Release $tag already exists; its assets are not changed (vault BACKLOG #2631)."
           else
@@ -1857,23 +1852,21 @@ jobs:
           PYVER
           fi
 
-      # Onto the DRAFT the `release` job created (vault BACKLOG #2631, limb 6). The release is
-      # published only by `publish-github-release`, which needs this job, so on a first run it is
-      # always still a draft here. A published one means an earlier run finished; its assets are
-      # then fixed, and this step checks the wheel is among them rather than uploading it.
+      # Onto the DRAFT (vault BACKLOG #2631, limb 6; the header says why). A published release means
+      # an earlier run finished, so this step checks the wheel is on it rather than uploading.
       - name: Attach the harness wheel to the draft GitHub release
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
-          if [ "$is_draft" = "true" ]; then
+          # One read: the first line is isDraft, the rest are the asset names.
+          view=$(gh release view "$tag" --json isDraft,assets --jq '.isDraft, .assets[].name')
+          if [ "${view%%$'\n'*}" = "true" ]; then
             gh release upload "$tag" harness-dist/*.whl --clobber
             exit 0
           fi
-          # Published: every wheel built here must already be an asset of it.
-          attached=$(gh release view "$tag" --json assets --jq '.assets[].name')
+          attached="${view#*$'\n'}"
           for wheel in harness-dist/*.whl; do
             if ! grep -qxF "$(basename "$wheel")" <<<"$attached"; then
               echo "::error::release $tag is published without $(basename "$wheel"), and a published release's assets cannot change (vault BACKLOG #2631)"
@@ -1902,17 +1895,15 @@ jobs:
           skip-existing: true
           attestations: true
 
-  # PUBLISH THE ENGINE'S GITHUB RELEASE LAST, ONCE EVERY ASSET IS ON IT (vault BACKLOG #2631, limb 6).
-  # `release` creates the release as a draft and `release-harness` attaches its wheel to that draft.
-  # An immutable release refuses an asset change once it is published, so publishing must come after
-  # every job that attaches one. That is this job's `needs:`. A job added later that attaches an
-  # asset to the engine release must join that list; tests/test_release_pipeline.py fails until it does.
+  # PUBLISH THE ENGINE'S GITHUB RELEASE LAST, ONCE EVERY ASSET IS ON IT (vault BACKLOG #2631, limb 6;
+  # the header says why). Its `needs:` is every job that attaches an asset to the engine release. A
+  # job added later that attaches one must join it; tests/test_release_pipeline.py fails until it does.
   #
   # If `release-harness` fails, this job is skipped and the release stays a draft. The engine is
   # already on PyPI by then, as it was before this job existed; re-running the failed jobs finishes
   # the release. A draft is never published with an asset missing.
   publish-github-release:
-    # The event-and-ref pair at the job too, so a dispatch never schedules this job at all.
+    # The event-and-ref pair sits on the job, so a dispatch never schedules it at all.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [release, release-harness]
     runs-on: ubuntu-latest
@@ -1923,7 +1914,6 @@ jobs:
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
       - name: Publish the draft GitHub release
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

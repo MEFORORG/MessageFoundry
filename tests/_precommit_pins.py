@@ -11,6 +11,7 @@ compare a hash with a number.
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 
@@ -21,11 +22,16 @@ _REV = re.compile(r"^\s*rev:\s*(\S+)\s*(?:#\s*frozen:\s*(\S+))?\s*$")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
+@functools.cache
+def _config_text() -> str:
+    return PRECOMMIT.read_text(encoding="utf-8")
+
+
 def pins(text: str | None = None) -> dict[str, tuple[str, str | None]]:
     """``{repo url: (rev, frozen tag or None)}`` for every repository that declares a ``rev:``."""
     found: dict[str, tuple[str, str | None]] = {}
     repo: str | None = None
-    for line in (PRECOMMIT.read_text(encoding="utf-8") if text is None else text).splitlines():
+    for line in (_config_text() if text is None else text).splitlines():
         if m := _REPO.match(line):
             repo = m.group(1)
         elif (m := _REV.match(line)) and repo is not None:

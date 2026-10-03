@@ -57,6 +57,7 @@ from _bash_resolver import bash_candidates, explain_returncode, require_bash
 
 from tests._force_include import hatch_build
 from tests._verify_softeners import verification_softeners
+from tests._workflow_contexts import needs_of
 
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
@@ -270,8 +271,7 @@ def test_each_engine_sbom_is_built_unprivileged_and_handed_to_release(
     assert _despace(str(build.get("if"))) == _despace(str(rel.get("if"))), (
         f"{job_name} and release must share one job guard: {build.get('if')!r} vs {rel.get('if')!r}"
     )
-    needs = rel.get("needs")
-    assert job_name in ([needs] if isinstance(needs, str) else list(needs or [])), needs
+    assert job_name in needs_of(rel), rel.get("needs")
 
     built_here = [
         st for st in build.get("steps") or [] if "cyclonedx_py environment" in _run_shell(st)
@@ -861,8 +861,7 @@ def test_the_console_release_does_not_depend_on_the_engine_release() -> None:
     It does need ``tag-provenance`` (vault BACKLOG #2631), which belongs to neither cadence: it
     checks the tagged commit, whichever namespace the tag is in. That is the ONLY job it may need.
     """
-    needs = _jobs()["release-webconsole"].get("needs") or []
-    needs = [needs] if isinstance(needs, str) else list(needs)
+    needs = needs_of(_jobs()["release-webconsole"])
     assert needs == ["tag-provenance"], (
         f"release-webconsole needs {needs}; it must need the provenance gate and nothing else -- "
         "the console has its own cadence, so it must not depend on the engine release"
@@ -946,7 +945,7 @@ def test_a_job_without_needs_release_must_create_its_own_github_release() -> Non
         chunk = _executed_shell(body[starts[name] : (starts[nxt] if nxt else len(body))])
         if "gh release upload" not in chunk and "gh release create" not in chunk:
             continue  # attaches nothing to a GitHub release
-        if "release" in (jobs[name].get("needs") or []):
+        if "release" in needs_of(jobs[name]):
             continue  # the engine release ran first and created it
         if "gh release create" not in chunk:
             problems.append(name)
@@ -3373,21 +3372,16 @@ _PROVENANCE_JOB = "tag-provenance"
 _PROVENANCE_CALL = "python scripts/release/tag_provenance.py"
 
 
-def _needs(job: dict) -> list[str]:
-    needs = job.get("needs") or []
-    return [needs] if isinstance(needs, str) else [str(n) for n in needs]
-
-
 def _upstream(job_key: str) -> set[str]:
     """Every job ``job_key`` waits on, directly or through another job's ``needs:``."""
     jobs = _jobs()
     seen: set[str] = set()
-    todo = list(_needs(jobs[job_key]))
+    todo = needs_of(jobs[job_key])
     while todo:
         key = todo.pop()
         if key not in seen:
             seen.add(key)
-            todo.extend(_needs(jobs[key]))
+            todo.extend(needs_of(jobs[key]))
     return seen
 
 
@@ -3503,10 +3497,8 @@ _FAKE_GH = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_LOG"
 if [ "$1" = release ] && [ "$2" = view ]; then
   if [ "$FAKE_RELEASE" = absent ]; then echo "release not found" >&2; exit 1; fi
-  case "$*" in
-    *isDraft*) if [ "$FAKE_RELEASE" = draft ]; then echo true; else echo false; fi ;;
-    *assets*) printf '%s\\n' $FAKE_ASSETS ;;
-  esac
+  case "$*" in *isDraft*) if [ "$FAKE_RELEASE" = draft ]; then echo true; else echo false; fi ;; esac
+  case "$*" in *assets*) [ -z "$FAKE_ASSETS" ] || printf '%s\\n' $FAKE_ASSETS ;; esac
 fi
 exit 0
 """
@@ -3557,6 +3549,8 @@ def _run_release_step(
     )
     bash = require_bash(tmp_path, env)
     rc, out = _run_leak_gate(bash, work, script, env)
+    # A stand-in `gh` that bash cannot find or run would read as the step refusing.
+    assert rc not in (126, 127), explain_returncode(rc, f"the {prefix!r} step") + "\n" + out
     calls = log.read_bytes().decode("utf-8").splitlines()
     return rc, out, calls
 
