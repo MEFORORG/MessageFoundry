@@ -48,6 +48,8 @@ from messagefoundry.api.auth_routes import _service as _service_guard
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
     before_body_of,
+    mark_route_gate,
+    refuse_undeclared_route,
     require,
     require_phi_read,
     require_service_cert,
@@ -233,13 +235,15 @@ async def test_every_gated_json_route_is_covered_with_no_list_kept_by_hand(engin
 
 def require_unmarked(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """A gate factory in the closure shape ``route_gates.gate_of`` reads, written the way a new
-    ``require_*`` would be if its author forgot the step that answers before the body."""
+    ``require_*`` would be if its author set the gate mark but forgot the step that answers before
+    the body. Without the mark it would be no gate at all, and the engine would refuse its routes
+    outright (vault BACKLOG #2604)."""
 
     async def dependency(request: Request) -> Identity:
         assert permissions
         raise HTTPException(401, "not authenticated")
 
-    return dependency
+    return mark_route_gate(dependency)
 
 
 _SESSION_GATE = require()
@@ -275,7 +279,9 @@ async def test_every_dependency_ahead_of_a_gate_is_accounted_for(engine: Engine)
     it first too, or a caller with no session gets a different answer than the gate's own flow
     gives. Each one is either marked ``answers_before_body`` or is on the short list below of
     dependencies read and found unable to refuse. A new kind fails here until someone reads it."""
-    cannot_refuse = {_no_store_reply}
+    # refuse_undeclared_route runs ahead of every route's own dependencies, but it refuses only a
+    # route with no gate, and every route this loop reads has one (vault BACKLOG #2604).
+    cannot_refuse = {_no_store_reply, refuse_undeclared_route}
     app = create_app(engine, auth=await _service(engine), serve_ui=True, oidc_enabled=True)
     marked: set[object] = set()
     skipped: set[object] = set()

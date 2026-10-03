@@ -209,6 +209,7 @@ from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
     answers_before_body,
     authorize_ws,
+    authorizes_in_body,
     client_ip,
     deadline_utc,
     enforce_phi_read_hop,
@@ -216,6 +217,8 @@ from messagefoundry.api.security import (
     get_auth,
     optional_identity,
     pending_credential_deadline,
+    public_route,
+    refuse_undeclared_route,
     require,
     require_paced,
     require_phi_read,
@@ -1717,13 +1720,16 @@ def create_app(
         redoc_url="/redoc" if expose_docs else None,
         openapi_url="/openapi.json" if expose_docs else None,
         redirect_slashes=False,
+        # Vault BACKLOG #2604: deny by default. Every route registered on this app refuses a request
+        # unless it carries a gate or a public declaration; security.refuse_undeclared_route says
+        # what that covers and what it does not.
+        dependencies=[Depends(refuse_undeclared_route)],
     )
     # Vault BACKLOG #2739: every route registered on this app from here on is built by this class,
     # which refuses a caller with no identity BEFORE FastAPI reads the request body. Set before the
     # first route is added, and on the router because ``FastAPI()`` takes no route class. The class
     # says what it does not cover; a route reached through ``include_router`` is one. The engine
-    # includes no router. The route walk cannot see into one, so
-    # tests/test_preauth_malformed_body.py fails on the first that is added.
+    # includes no router, and tests/test_preauth_malformed_body.py fails on the first that is added.
     app.router.route_class = AuthenticatedBeforeBodyRoute
     if engine is not None:
         app.state.engine = engine
@@ -2046,6 +2052,7 @@ def create_app(
         return await call_next(request)
 
     @app.get("/health", response_model=Health)
+    @public_route("liveness must answer a tokenless probe; the version needs a session")
     async def health(
         request: Request, identity: Identity | None = Depends(optional_identity)
     ) -> Health:
@@ -2065,6 +2072,7 @@ def create_app(
         )
 
     @app.get("/ai/policy", response_model=AiPolicy)
+    @public_route("a tokenless client must be able to read a central off")
     async def ai_policy(
         request: Request, identity: Identity | None = Depends(optional_identity)
     ) -> AiPolicy:
@@ -7040,6 +7048,7 @@ def create_app(
         return IntegrityResult(ok=ok, detail=detail)
 
     @app.websocket("/ws/stats")
+    @authorizes_in_body("the cookie gate, then the header gate, run before the socket is accepted")
     async def ws_stats(websocket: WebSocket) -> None:
         """Push queue-depth stats to the console roughly once a second until it disconnects — the
         live monitor feed. The session is re-validated periodically so a revoked/expired/downgraded

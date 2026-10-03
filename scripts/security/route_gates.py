@@ -15,6 +15,14 @@ result. There is deliberately ONE implementation of the walk (this module), cons
 ``docs/SECURITY.md`` drift guard and the DAST sweep: two copies would be free to disagree, and the
 disagreement would be invisible.
 
+A GATE IS RECOGNISED BY A MARK, NOT A NAME (vault BACKLOG #2604). The qualname is still what a row
+reports, but whether a dependency IS a gate is now the mark its factory sets through
+``messagefoundry.api.security.mark_route_gate``. The engine refuses at request time any route that
+carries neither that mark nor a public declaration, and it reads the same mark, so the walk and the
+refusal cannot disagree about what a gate is. The walk also descends into an included router and into
+a mounted application with routes, and :func:`full_surface_app` builds the app with every
+route-registering flag on.
+
 WEBSOCKET ROUTES ARE READ, NOT ASSUMED (BACKLOG #2057). The HTTP walk reads the dependency closures
 FastAPI attached to a route. ``/ws/stats`` has none: it authorizes inside its own endpoint body, first
 through the web console's cookie hook (``app.state.ui_ws_authorize``, which ``mount_ui`` fills with
@@ -49,12 +57,17 @@ import inspect
 import linecache
 import re
 import types
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from fastapi import FastAPI
+from fastapi import routing as fastapi_routing
 from fastapi.routing import APIRoute, APIWebSocketRoute
+from starlette.routing import BaseRoute, Mount
 
 from messagefoundry.api.app import create_app
+from messagefoundry.api.security import is_route_gate
 from messagefoundry.auth.permissions import Permission
 
 #: Substituted for every ``{path_param}`` when a template must become a concrete request target. It is
@@ -103,15 +116,19 @@ def gate_of(call: object) -> tuple[str, tuple[str, ...], str | None] | None:
     """``(gate name, permission wire strings, action)`` for a route dependency built by one of the
     ``require*()`` factories, by reading the closure cells the factory captured. Recurses through the
     ``base`` cell, because require_paced / require_phi_read / require_step_up* wrap ``require``'s
-    closure. Returns ``None`` for a dependency that is not one of those factories."""
+    closure. Returns ``None`` for a dependency that is not one of those factories.
+
+    A gate is recognised by the mark its factory sets (``mark_route_gate``), never by its name
+    (vault BACKLOG #2604). A dependency merely NAMED ``require_*`` is no gate, and the engine's
+    request-time refusal agrees, because it reads the same mark."""
+    if not is_route_gate(call):
+        return None
     closure = getattr(call, "__closure__", None)
     code = getattr(call, "__code__", None)
     if closure is None or code is None:
         return None
     qualname = getattr(call, "__qualname__", "") or ""
     name = qualname.split(".")[0]
-    if not name.startswith("require"):
-        return None
     cells = dict(zip(code.co_freevars, closure, strict=False))
     perms: tuple[str, ...] = ()
     action: str | None = None
@@ -369,52 +386,99 @@ def websocket_gates(
     return names, permissions
 
 
-def route_rows(app: FastAPI | None = None) -> list[RouteRow]:
-    """Every route operation of ``app`` (a default ``create_app()`` when ``None``).
+def _effective_routes(routes: Sequence[BaseRoute]) -> Iterator[tuple[BaseRoute, Any]]:
+    """``(route, effective)`` for each route, with every ``include_router`` call unpacked.
 
-    ``app`` is optional so a caller that has ALREADY configured a target — the DAST sweep brings up
-    one app instance and probes that exact object — derives its expectation from the same application
-    it is talking to, rather than from a second, differently-configured one.
-    """
-    rows: list[RouteRow] = []
-    target = create_app() if app is None else app
-    for route in target.routes:
+    FastAPI 0.139 and later keep an included router as one opaque object on the app, and serve its
+    routes through an effective context that carries the include's prefix and dependencies.
+    ``effective`` is that context, read through FastAPI's ``iter_route_contexts``, or the route itself
+    where there is no include. The walk takes the PATH and methods from it, and the gate from the
+    route's own dependencies. An older FastAPI copied included routes onto the app, so there the
+    plain list is already complete."""
+    iterate = getattr(fastapi_routing, "iter_route_contexts", None)
+    if iterate is None:  # pragma: no cover - only an older FastAPI than the lock pins
+        for route in routes:
+            yield route, route
+        return
+    for context in iterate(routes):
+        original: BaseRoute = context.original_route
+        if isinstance(original, APIRoute):
+            yield original, context
+        else:
+            # A non-API route reached through an include is served by a rebuilt copy that carries
+            # the include's prefix.
+            yield original, getattr(context, "starlette_route", None) or original
+
+
+def _walk(routes: Sequence[BaseRoute], prefix: str, app: FastAPI) -> Iterator[RouteRow]:
+    for route, effective in _effective_routes(routes):
+        path = prefix + (getattr(effective, "path", None) or "")
         if isinstance(route, APIRoute):
-            methods = sorted(m for m in (route.methods or set()) if m not in _SYNTHETIC_METHODS)
+            methods = sorted(m for m in (effective.methods or set()) if m not in _SYNTHETIC_METHODS)
             gate: tuple[str, tuple[str, ...], str | None] | None = None
+            # The route's OWN dependencies, never the include's: the engine's request-time refusal
+            # reads only those, so a gate an include call adds is refused there and must read as
+            # no gate here too.
             for dep in route.dependant.dependencies:
                 found = gate_of(dep.call)
                 if found is not None:
                     gate = found
                     break
             for method in methods:
-                rows.append(
-                    RouteRow(
-                        method=method,
-                        path=route.path,
-                        permissions=gate[1] if gate else (),
-                        gates=(gate[0],) if gate else (),
-                    )
+                yield RouteRow(
+                    method=method,
+                    path=path,
+                    permissions=gate[1] if gate else (),
+                    gates=(gate[0],) if gate else (),
                 )
         elif isinstance(route, APIWebSocketRoute):
-            names, perms = websocket_gates(route, target)
-            rows.append(RouteRow(method=WS_METHOD, path=route.path, permissions=perms, gates=names))
+            names, perms = websocket_gates(route, app)
+            yield RouteRow(method=WS_METHOD, path=path, permissions=perms, gates=names)
+        elif isinstance(effective, Mount) and effective.routes:
+            # A mounted application with routes of its own. Its routes are walked under the mount's
+            # path, so one the engine's refusal cannot reach still shows up here as ungated.
+            yield from _walk(effective.routes, path, app)
         else:
             # Anything else Starlette mounted: a plain ``Route`` (the OpenAPI/docs endpoints) or a
-            # ``Mount`` (the /ui static tree). It carries no FastAPI dependency closure, so it can only
-            # be reported as UNGATED — which is honest, because that is exactly what it is. Emitting it
-            # here is what stops it falling off the end of the walk and out of the ungated-set
-            # invariant; see the module docstring.
+            # ``Mount`` with no routes (the /ui static tree). It carries no FastAPI dependency
+            # closure, so it can only be reported as UNGATED — which is honest, because that is
+            # exactly what it is. Emitting it here is what stops it falling off the end of the walk
+            # and out of the ungated-set invariant; see the module docstring.
             declared = sorted(
-                m for m in (getattr(route, "methods", None) or set()) if m not in _SYNTHETIC_METHODS
+                m
+                for m in (getattr(effective, "methods", None) or set())
+                if m not in _SYNTHETIC_METHODS
             )
             for method in declared or [MOUNT_METHOD]:
-                rows.append(
-                    RouteRow(
-                        method=method, path=getattr(route, "path", ""), permissions=(), gates=()
-                    )
-                )
-    return rows
+                yield RouteRow(method=method, path=path, permissions=(), gates=())
+
+
+def route_rows(app: FastAPI | None = None) -> list[RouteRow]:
+    """Every route operation of ``app`` (a default ``create_app()`` when ``None``).
+
+    ``app`` is optional so a caller that has ALREADY configured a target — the DAST sweep brings up
+    one app instance and probes that exact object — derives its expectation from the same application
+    it is talking to, rather than from a second, differently-configured one.
+
+    The walk descends into every included router and into every mounted application that has routes
+    of its own (vault BACKLOG #2604). The default app is built with no flag on; use
+    :func:`full_surface_app` for every route the engine can register.
+    """
+    target = create_app() if app is None else app
+    return list(_walk(target.routes, "", target))
+
+
+#: The ``create_app`` flags that register routes. ``oidc_enabled`` registers its routes only beside
+#: ``serve_ui``. A test flips every boolean ``create_app`` takes and checks that none adds a route
+#: :func:`full_surface_app` lacks, so a new flag that registers routes reds a run until it is listed.
+ROUTE_REGISTERING_FLAGS: tuple[str, ...] = ("expose_docs", "serve_ui", "oidc_enabled")
+
+
+def full_surface_app(**kwargs: Any) -> FastAPI:
+    """A ``create_app(**kwargs)`` with every flag in :data:`ROUTE_REGISTERING_FLAGS` on, so a route
+    that only one flag registers is walked too."""
+    flags: dict[str, Any] = dict.fromkeys(ROUTE_REGISTERING_FLAGS, True)
+    return create_app(**flags, **kwargs)
 
 
 def gated_http_rows(app: FastAPI | None = None) -> list[RouteRow]:
