@@ -652,7 +652,7 @@ def test_exchange_code_posts_pkce_and_returns_payload() -> None:
     payload = oidc.exchange_code(
         token_endpoint="https://idp.example/token",
         client_id="mefor-console",
-        client_secret="s3cr3t",
+        client_auth=oidc.ClientSecretPost("s3cr3t"),
         code="the-code",
         redirect_uri="http://localhost:8765/ui/oidc/callback",
         code_verifier="the-verifier",
@@ -670,7 +670,7 @@ def test_exchange_code_without_id_token_raises() -> None:
         oidc.exchange_code(
             token_endpoint="https://idp.example/token",
             client_id="c",
-            client_secret=None,
+            client_auth=None,
             code="x",
             redirect_uri="http://localhost/cb",
             code_verifier="v",
@@ -712,7 +712,7 @@ def test_exchange_code_token_endpoint_errors_leave_no_exception_chain() -> None:
             oidc.exchange_code(
                 token_endpoint="https://idp.example/token",
                 client_id="c",
-                client_secret="SYNTHETIC-SECRET",
+                client_auth=oidc.ClientSecretPost("SYNTHETIC-SECRET"),
                 code="x",
                 redirect_uri="http://localhost/cb",
                 code_verifier="v",
@@ -755,7 +755,7 @@ def test_exchange_code_unparseable_reply_leaves_it_off_the_exception_chain(
         oidc.exchange_code(
             token_endpoint="https://idp.example/token",
             client_id="c",
-            client_secret=None,
+            client_auth=None,
             code="x",
             redirect_uri="http://localhost/cb",
             code_verifier="v",
@@ -784,7 +784,7 @@ def test_exchange_code_too_deep_reply_is_a_flow_error(monkeypatch: pytest.Monkey
         oidc.exchange_code(
             token_endpoint="https://idp.example/token",
             client_id="c",
-            client_secret=None,
+            client_auth=None,
             code="x",
             redirect_uri="http://localhost/cb",
             code_verifier="v",
@@ -797,7 +797,7 @@ def _refusing_exchange(status: int, body: bytes = b'{"error":"invalid_grant"}') 
     oidc.exchange_code(
         token_endpoint="https://idp.example/token",
         client_id="c",
-        client_secret="SYNTHETIC-SECRET",
+        client_auth=oidc.ClientSecretPost("SYNTHETIC-SECRET"),
         code="x",
         redirect_uri="http://localhost/cb",
         code_verifier="v",
@@ -873,7 +873,7 @@ def test_exchange_code_refuses_an_over_length_token_endpoint() -> None:
         oidc.exchange_code(
             token_endpoint="https://idp.example/" + "t" * 9000,
             client_id="c",
-            client_secret=None,
+            client_auth=None,
             code="x",
             redirect_uri="http://localhost/cb",
             code_verifier="v",
@@ -902,7 +902,7 @@ def test_exchange_code_still_posts_an_endpoint_that_fits() -> None:
     payload = oidc.exchange_code(
         token_endpoint="https://idp.example/token",
         client_id="c",
-        client_secret=None,
+        client_auth=None,
         code="x",
         redirect_uri="http://localhost/cb",
         code_verifier="v",

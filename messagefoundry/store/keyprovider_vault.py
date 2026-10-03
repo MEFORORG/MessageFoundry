@@ -286,7 +286,7 @@ class VaultKeyProvider:
         self._settings = settings
 
     def active_key(self) -> str | None:
-        transit_key = os.environ.get(_ENV_TRANSIT_KEY)
+        transit_key = _kek_name()
         wrapped_dek = os.environ.get(_ENV_WRAPPED_DEK)
         if not transit_key or not wrapped_dek:
             # Fail closed: selecting `vault` without the KEK name + wrapped DEK is a misconfiguration, not
@@ -364,3 +364,79 @@ class VaultKeyProvider:
 def build_provider(settings: StoreSettings) -> VaultKeyProvider:
     """The dispatch entrypoint ``keyprovider._load_external_provider`` imports and calls by name."""
     return VaultKeyProvider(settings)
+
+
+# --- what this hop's token must be able to do (BACKLOG #305, ASVS 13.2.2) ---------------------------
+
+#: hvac's default Transit mount. No Transit call in this module or in ``crypto_transit.py`` passes
+#: ``mount_point``, so this is the mount they reach; the path pins in
+#: ``tests/test_vault_ldap_privilege_probes.py`` fail if that stops being true.
+TRANSIT_MOUNT = "transit"
+
+
+def _kek_name() -> str | None:
+    """The KEK's Transit key name. One read for :meth:`VaultKeyProvider.active_key` and for
+    :func:`kek_required_capabilities`, so the probe asks about the key the provider unwraps under."""
+    return os.environ.get(_ENV_TRANSIT_KEY) or None
+
+
+def store_vault_token() -> str:
+    """The store token named in ``MEFOR_STORE_VAULT_TOKEN``, for ``check-privileges``.
+
+    **It refuses when that variable is unset, where the providers do not.** Given no token, hvac
+    reads ``VAULT_TOKEN`` and then ``~/.vault-token``: in an operator's shell that is the operator's
+    own token, and the check would judge it as the engine's. Raises :class:`KeyProviderError`,
+    which the probe reports as not observed."""
+    token = os.environ.get(_ENV_TOKEN)
+    if not token:
+        raise KeyProviderError(
+            f"{_ENV_TOKEN} is not set, so the store token is not known. The check reads only the "
+            f"token named there, never VAULT_TOKEN or ~/.vault-token; run it with the service's "
+            f"environment"
+        )
+    return token
+
+
+def store_vault_address() -> str:
+    """The store Vault named in ``MEFOR_STORE_VAULT_ADDR``, for ``check-privileges``.
+
+    **It refuses when that variable is unset, where the providers do not.** Given no address, hvac
+    reads ``VAULT_ADDR``: in an operator's shell that may be another Vault, which would then receive
+    the engine's token. Raises :class:`KeyProviderError`, which the probe reports as not observed.
+    The providers keep their documented fallback (docs/CONFIGURATION.md)."""
+    addr = os.environ.get(_ENV_ADDR)
+    if not addr:
+        raise KeyProviderError(
+            f"{_ENV_ADDR} is not set, so the store Vault is not known. The check sends the token "
+            f"only to the address named there, never VAULT_ADDR; run it with the service's "
+            f"environment"
+        )
+    return addr
+
+
+def store_vault_client(address: str, token: str) -> Any:
+    """The store hop's Vault client, built by the same :func:`_build_client` the providers use:
+    same TLS narrowing, same anchor, no redirects, and the same cleartext-address refusal (BACKLOG
+    #2317). For ``check-privileges``, which reads the token's own grants through it and changes
+    nothing. Take ``address`` from :func:`store_vault_address` and ``token`` from
+    :func:`store_vault_token`; both refuse an unset variable, and the client uses exactly the
+    values they returned."""
+    return _build_client(address, token)
+
+
+def kek_required_capabilities() -> dict[str, frozenset[str]]:
+    """Every Vault path :meth:`VaultKeyProvider.active_key` calls, with the capability each call needs.
+
+    Kept beside the calls so the two cannot drift: ``read_key`` is a read of ``transit/keys/<KEK>``
+    and ``decrypt_data`` an update of ``transit/decrypt/<KEK>``. Raises :class:`KeyProviderError`
+    when the KEK name is not set, as the provider itself would."""
+    kek = _kek_name()
+    if not kek:
+        raise KeyProviderError(
+            f"[store].key_provider={_EXTRA!r} is selected but {_ENV_TRANSIT_KEY} is not set, so the "
+            f"Transit paths the engine reads are not known."
+        )
+    return {
+        f"{TRANSIT_MOUNT}/keys/{kek}": frozenset({"read"}),
+        f"{TRANSIT_MOUNT}/decrypt/{kek}": frozenset({"update"}),
+    }

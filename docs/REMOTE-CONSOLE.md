@@ -209,7 +209,7 @@ account is not exempt from the engine's second factor
   first, and would have missed exactly that topology on first deployment.) An **undeclared** proxy —
   a set `[security].web_console_public_address` with no `tls_terminated_upstream` — is outside the
   predicate and does **not** refuse: nothing was declared, so exposure would be an inference. It gets
-  its own **warning** instead, naming single-factor admin explicitly, whenever
+  its own **warning** instead, naming single-factor sign-in explicitly, whenever
   `require_mfa` is off. That is a distinct arm — **not** the ADR 0068 §8 undeclared-proxy warning, which
   is about the `/ui` cookie and HSTS and is suppressed by §3's auto-degrade in the same posture. See
   the `allow_single_factor_admin_when_exposed` row in [`CONFIGURATION.md`](CONFIGURATION.md) and

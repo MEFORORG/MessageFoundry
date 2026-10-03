@@ -170,14 +170,41 @@ These are the real disputes. They are here so the next assessor reaches the same
 
 Per ASVS's guidance, stated as what **is** included rather than what is excluded.
 
-**Included:** the MessageFoundry engine, the web console, the IDE extension, and the test harness
-(`harness/`, distributed separately as the harness wheel), assessed as source, at a named commit,
-against **all 345 ASVS 5.0.0 requirements** at **Level 3**. The harness joined the scope by owner
-ruling of 2026-10-02, recorded as R1 of `docs/security/ASVS-OWNER-RULINGS-2026-10-02-1130.md` in the
-vault. `scripts/` was not ruled on and is not added here.
+**Included:** the MessageFoundry engine, the web console, the IDE extension, the test harness
+(`harness/`, distributed separately as the harness wheel), and the operator-run scripts, assessed as
+source, at a named commit, against **all 345 ASVS 5.0.0 requirements** at **Level 3**. The
+operator-run scripts are `scripts/service/`, less the one file named below, and any script the
+operator documentation tells a deployer to run; the rest of `scripts/` (CI, development, ASVS, benchmark, coordination and release
+tooling) is not included, and neither is `tee/`, the tee relay.
+
+Each part of that rests on an owner ruling of 2026-10-02, recorded in the vault as
+`docs/security/ASVS-OWNER-RULINGS-2026-10-02-1130.md`:
+
+* **R1** brought the harness in.
+* **R3** answered *"Only operator-run"* for `scripts/`, choosing the option the scope sentence above
+  states. Outside `scripts/service/`, its excluded kinds are categories of function, not directory
+  names, so a script elsewhere is classified by whether the operator documentation tells a deployer
+  to run it, not by the folder it sits in.
+* **R4** answered *"No"* for `tee/`, the tee relay. It ships in no wheel, and it is outside the
+  scope although `docs/TEE-RELAY.md` tells a site to run it.
+
+**Two files are classified by a Manager's reading, not by the owner, and the owner may overrule
+it.** That reading is recorded in the same vault file, under R3. Both are out:
+
+* `scripts/service/measure-store-access.ps1` sits under `scripts/service/`, but
+  `docs/DANGEROUS-FUNCTIONALITY.md` calls it *"A CI measurement, not a deployment step"*. That
+  document also says how to run it, on a disposable host, which a later reading may weigh
+  differently.
+* `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate. The engine's
+  `messagefoundry/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
+  engine code path calls that check. `anon/leak.py` itself, and the hazard of a by-path load, are
+  engine code and stay inside the scope through the engine. **The reading covers engine call paths
+  only.** The harness's `CaptureSink` takes an optional anonymizer, and its code comment suggests
+  wiring `anonymize_checked` there, which would reach the same load from the harness. The vault file
+  names that wiring as a reason to revisit this reading; until someone does, treat it as open.
 
 **The boundary that phrase implies, stated explicitly because it decides verdicts.** The subject of
-this assessment is those four **software artifacts**. It is not the host, the hypervisor, the CPU, the
+this assessment is those five **software artifacts**. It is not the host, the hypervisor, the CPU, the
 firmware, or the network the operator deploys onto. Where a requirement's **verb** names a property of
 that substrate rather than of the software, the requirement is outside the declared scope and takes
 `na` under rule 1 — with the rationale written, as always.

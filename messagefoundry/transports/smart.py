@@ -38,7 +38,6 @@ import abc
 import http.client
 import math
 import re
-import secrets
 import threading
 import time
 import urllib.error
@@ -81,7 +80,11 @@ from messagefoundry.transports.rest import (
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
 )
-from messagefoundry.transports.signing import CompactJwtSigner
+from messagefoundry.transports.signing import (
+    CLIENT_ASSERTION_TYPE,
+    CompactJwtSigner,
+    client_assertion_claims,
+)
 
 if TYPE_CHECKING:  # only for the with_smart_backend() annotation — avoid importing heavy wiring
     from messagefoundry.config.wiring import ConnectionSpec, FhirLookupSpec
@@ -98,7 +101,6 @@ __all__ = [
 ]
 
 # RFC 7523 / SMART Backend Services constants.
-_CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 # The client_assertion lifetime. SMART caps exp at 5 min after iat; 4 min stays comfortably under the
 # ceiling while tolerating moderate clock skew. The assertion is one-time (consumed at the token POST).
 _CLIENT_ASSERTION_TTL = 240
@@ -534,13 +536,9 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
 
     def _assertion_claims(self) -> dict[str, object]:
         """The five SMART-mandated client_assertion claims (iss=sub=client_id, aud, exp, jti)."""
-        return {
-            "iss": self.client_id,
-            "sub": self.client_id,
-            "aud": self.audience,
-            "exp": int(time.time()) + _CLIENT_ASSERTION_TTL,
-            "jti": secrets.token_urlsafe(32),
-        }
+        return client_assertion_claims(
+            self.client_id, self.audience, ttl_seconds=_CLIENT_ASSERTION_TTL
+        )
 
     def _fetch_token(self) -> tuple[str, float]:
         """Mint a client_assertion, POST it to the token endpoint, and return ``(access_token, ttl)``.
@@ -549,7 +547,7 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         request (the assertion) or the response body (which carries the bearer token)."""
         form = {
             "grant_type": "client_credentials",
-            "client_assertion_type": _CLIENT_ASSERTION_TYPE,
+            "client_assertion_type": CLIENT_ASSERTION_TYPE,
             "client_assertion": self._signer.sign(self._assertion_claims()),
         }
         if self.scope:
