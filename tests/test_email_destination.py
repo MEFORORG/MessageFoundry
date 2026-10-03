@@ -849,6 +849,24 @@ async def test_send_passes_the_checked_sender_as_the_envelope_sender(
     assert smtp.from_addr == "engine@hospital.org"
 
 
+async def test_the_mail_from_line_does_not_follow_the_from_header(
+    wire: _WireCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A plain sender reads the same either way, so change the header after it is built: MAIL FROM
+    # must still be the checked setting, which it is only when passed explicitly.
+    build = EmailDestination._build_message
+
+    def changed_from(self: EmailDestination, payload: str) -> EmailMessage:
+        msg = build(self, payload)
+        msg.replace_header("From", "another@hospital.example")
+        return msg
+
+    monkeypatch.setattr(EmailDestination, "_build_message", changed_from)
+    dest = _wire_dest(wire.port, ["a@hospital.example"])
+    await EmailDestination(dest).send("PID|1|synthetic")
+    assert wire.mail_lines == [b"mail from:<engine@hospital.example>"]
+
+
 def _sender_shapes() -> dict[str, str]:
     """Sender values that are not one plain, checked address. Built from parts, so no literal reads
     as a recipe; the ids are neutral."""
