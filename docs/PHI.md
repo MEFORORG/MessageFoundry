@@ -38,8 +38,13 @@ levels:
   (MLLP-over-TLS, built), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
   not cross the LAN in cleartext — and can't accidentally: the bind-guard **refuses any non-loopback
   *plaintext* API/MLLP bind** (ADR 0002 §0).
-- **Inbound web-service listener** (a partner calling *into* MEFOR) — **not built today**; a distinct
-  surface needing its own auth/TLS when it lands (backlog).
+- **Inbound web-service listener** (a partner calling *into* MEFOR) — **built**, as the inbound
+  [`Http(...)` listener](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023). It is a
+  distinct surface with its own controls: TLS or mTLS, `source_ip_allowlist`, and `intake_auth`, which
+  defaults to `none` and so checks no credential. Off loopback it refuses to start without TLS
+  (the linked section says when a flag can relax that), and, under the default
+  `[security].enforcement = enforce`, without an effective peer control. **CORRECTED 2026-10-03:** this
+  said the listener was not built.
 
 The security controls that only become material off-loopback (MFA, mTLS, certificate revocation,
 off-box logs) are **delegated to the org's environment** (IdP/AD, PKI, SIEM, network controls) and
