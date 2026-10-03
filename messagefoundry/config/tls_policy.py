@@ -54,7 +54,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,11 @@ TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 #: and refusals can name it. Written by the runner for every outbound and lookup, declared or not;
 #: read by ``cleartext_acceptance_from_settings`` and ``revocation_attestation_from_settings``.
 MIRRORED_CONNECTION_SETTING = "connection_name"
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from messagefoundry.pki import CrlBlock, CrlFacts
 
 __all__ = [
     "APPROVED_KEX_GROUPS",
@@ -101,9 +106,17 @@ __all__ = [
     "context_checks_revocation",
     "current_hop_posture",
     "enforce_insecure_hop",
+    "CRL_CLOCK_SKEW_SECONDS",
+    "CrlNotInEffect",
+    "crl_in_effect",
+    "crl_label",
+    "crl_not_in_effect",
+    "crl_scratch_context",
+    "staged_crl",
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
+    "judge_crl_bytes",
     "audit_connection_name",
     "hop_name_prefix",
     "log_attested_crossing",
@@ -318,6 +331,10 @@ def harden_crl_check(
     * A missing file must not degrade to "no revocation checking". A configured control that
       silently does nothing is worse than an absent one.
 
+    A fourth, since BACKLOG #299: OpenSSL must load exactly the CRLs judged
+    (:func:`_refuse_crl_count`), or the hop would be recorded as checking a CRL it never loaded.
+    It runs last, after the #1890 check, so a planted certificate is reported as that.
+
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
     a refreshable CRL drop, and measured on this worktree it enforces revocation identically:
@@ -340,9 +357,7 @@ def harden_crl_check(
 
     from messagefoundry.config.loaded_crls import record_crl_load
 
-    # Name the setting the operator wrote, and no direction: this runs on listeners and on outbound
-    # hops alike (BACKLOG #299). A caller that passes no setting gets the path alone, never a guess.
-    label = f"{setting} ({crl_file!r})" if setting else f"CRL file {crl_file!r}"
+    label = crl_label(crl_file, setting)
     path = Path(crl_file)
     if not path.is_file():
         raise ValueError(
@@ -350,28 +365,11 @@ def harden_crl_check(
             "revocation checking and perform none"
         )
 
-    # Freshness BEFORE loading: an expired CRL refuses every peer, so say so at startup. EVERY block
-    # is judged and the soonest nextUpdate decides, because OpenSSL loads every CRL in the file
-    # (BACKLOG #299). That is the rule the expiry monitor applies (pipeline/cert_expiry.py). Unlike
-    # the monitor, a block that cannot be judged, or a delta CRL, refuses here rather than being
-    # skipped: this is the load, so the block would be trusted.
-    from messagefoundry.pki import read_every_crl_facts, soonest_crl
-
     pem = path.read_bytes()
-    try:
-        every = read_every_crl_facts(pem, now=time.time())
-    except ValueError as exc:
-        raise ValueError(f"{label}: {exc}") from exc
-    facts = soonest_crl(every)
-    if facts.expired:
-        raise ValueError(
-            f"{label} holds a CRL (issuer {facts.issuer!r}) that expired at "
-            f"{facts.next_update_iso} ({-facts.days_remaining} day(s) ago); an expired CRL "
-            "refuses EVERY peer certificate it judges, not only revoked ones. Refresh it, or "
-            "remove it if a newer CRL for that issuer is already in the file"
-        )
+    facts, blocks = judge_crl_bytes(pem, label=label, now=time.time())
 
-    certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
+    before = ctx.cert_store_stats()
+    certs_before = before["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
     stats = ctx.cert_store_stats()
     added = stats["x509"] - certs_before
@@ -404,9 +402,164 @@ def harden_crl_check(
             f"(cert_store_stats crl={loaded}); the check flag would be set with nothing to check "
             "against, which refuses every peer rather than skipping the check"
         )
+    # BACKLOG #299: OpenSSL must have loaded exactly the CRLs judged above. A context that held no
+    # CRL before shows that in its own count, for free. One that did (the same file loaded twice,
+    # or a CA bundle carrying a CRL) cannot, so a scratch context loads the judged bytes instead.
+    if before.get("crl", 0) == 0:
+        _refuse_crl_count(loaded, blocks, label=label)
+    else:
+        with staged_crl(pem) as copy:
+            crl_scratch_context(str(copy), blocks, label=label)
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
-        record_crl_load(ctx, crl_file, pem, facts, setting=setting)
+        record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
+
+
+def crl_scratch_context(crl_file: str, blocks: Sequence[CrlBlock], *, label: str) -> ssl.SSLContext:
+    """A fresh context holding only what OpenSSL loads from ``crl_file``, and proof that it loaded
+    exactly the CRLs ``blocks`` describes (BACKLOG #299). Raises ``ValueError`` when not.
+
+    A context starts with no CRL, and OpenSSL keeps one copy of a CRL it is given twice, so its
+    count must equal the number of distinct CRLs judged (:func:`_refuse_crl_count`). The parser
+    models which blocks OpenSSL reads (:func:`messagefoundry.pki._crl_blocks`); this counts what
+    OpenSSL actually took. ``cafile=`` only, as :func:`harden_crl_check` says. ``crl_file`` should
+    be a private copy of the judged bytes, so the count is about those bytes."""
+    scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots and no CRL
+    scratch.load_verify_locations(cafile=crl_file)
+    _refuse_crl_count(scratch.cert_store_stats().get("crl", 0), blocks, label=label)
+    return scratch
+
+
+def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) -> None:
+    """Refuse unless ``loaded``, the CRLs OpenSSL added to a context that held none, is the number of
+    distinct CRLs in ``blocks``. Fewer means OpenSSL skipped a CRL the parser judged, so a context
+    would be recorded as holding a CRL it never checks. More means OpenSSL read one never judged."""
+    judged = len({block.fingerprint for block in blocks})
+    if loaded != judged:
+        raise ValueError(
+            f"{label}: OpenSSL loads {loaded} CRL(s) from this file, but {judged} were checked, so "
+            "a context would not hold what the engine judged. Write each CRL as a plain PEM block, "
+            "with its BEGIN and END lines each starting a line"
+        )
+
+
+@contextmanager
+def staged_crl(pem: bytes) -> Iterator[Path]:
+    """A private copy of the judged bytes ``pem``, in a directory only this account can write
+    (``mkdtemp`` makes it mode 0o700), removed afterwards (BACKLOG #299). A load that reads this
+    copy, never the operator's file a second time, loads exactly what was judged. A copy that cannot
+    be removed is logged, not raised: what was loaded from it is already loaded."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    private = tempfile.mkdtemp(prefix="mefor-crl-")
+    try:
+        copy = Path(private) / "crl.pem"
+        copy.write_bytes(pem)
+        yield copy
+    finally:
+        try:
+            shutil.rmtree(private)
+        except OSError as exc:
+            logger.warning("could not remove the private CRL copy %s: %s", private, exc)
+
+
+def crl_label(crl_file: str, setting: str | None) -> str:
+    """How a CRL refusal names its file (BACKLOG #299): the setting the operator wrote, and no
+    direction, since one CRL may guard a listener or an outbound hop. Without a setting, the path
+    alone, never a guessed setting name."""
+    return f"{setting} ({crl_file!r})" if setting else f"CRL file {crl_file!r}"
+
+
+def judge_crl_bytes(
+    pem: bytes, *, label: str, now: float, require_in_effect: bool = True
+) -> tuple[CrlFacts, tuple[CrlBlock, ...]]:
+    """Refuse CRL bytes no context may load. Return the facts of the soonest-expiring block, and
+    every block, which a context that records its copy needs (BACKLOG #299).
+
+    The freshness half of :func:`harden_crl_check`, shared with the running-hop reload
+    (:mod:`messagefoundry.pipeline.crl_reload`, BACKLOG #299) so a replacement CRL meets exactly the
+    rules a start does. EVERY block is judged and the soonest ``nextUpdate`` decides, because OpenSSL
+    loads every CRL in the file; that is the expiry monitor's rule too. Unlike the monitor, a block
+    that cannot be judged, or a delta CRL, refuses rather than being skipped, because this decides a
+    load. An expired CRL refuses, because past ``nextUpdate`` it fails every peer, not only revoked
+    ones. So does an issuer whose every CRL takes effect later (:class:`CrlNotInEffect`), unless
+    ``require_in_effect`` is False: the reload asks :func:`crl_not_in_effect` itself, because a file
+    to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``."""
+    from messagefoundry.pki import judge_every_crl, soonest_crl
+
+    try:
+        judged = judge_every_crl(pem, now=now)
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}") from exc
+    facts = soonest_crl([every for every, _ in judged])
+    if facts.expired:
+        raise ValueError(
+            f"{label} holds a CRL (issuer {facts.issuer!r}) that expired at "
+            f"{facts.next_update_iso} ({-facts.days_remaining} day(s) ago); an expired CRL "
+            "refuses EVERY peer certificate it judges, not only revoked ones. Refresh it, or "
+            "remove it if a newer CRL for that issuer is already in the file"
+        )
+    blocks = tuple(block for _, block in judged)
+    if not require_in_effect:
+        return facts, blocks
+    if (first := crl_not_in_effect(blocks, now=now)) is not None:
+        raise CrlNotInEffect(
+            f"{label} holds a CRL (issuer {first.issuer!r}) that does not take effect until "
+            f"{first.this_update.isoformat()}, and no CRL from that issuer that is in effect now. "
+            "Loaded now, it would refuse EVERY peer certificate it judges with 'CRL is not yet "
+            "valid'. Give a CRL that is in effect now, or wait until then"
+        )
+    if (early := crl_not_in_effect(blocks, now=now, skew=0.0)) is not None:
+        # Inside the skew window. OpenSSL allows no skew, so say why peers fail until then.
+        logger.warning(
+            "%s holds a CRL (issuer %r) that takes effect at %s, a little after this host's clock "
+            "reads now. It is accepted as clock skew, but until then every peer that CRL judges "
+            "fails with 'CRL is not yet valid'",
+            label,
+            early.issuer,
+            early.this_update.isoformat(),
+        )
+    return facts, blocks
+
+
+#: How far ahead of this host's clock a CRL's ``thisUpdate`` may sit and still count as in effect,
+#: at a start and at a running-hop reload (BACKLOG #299). A CA whose clock runs a little ahead
+#: issues a CRL that is "not yet valid" here for that long. Refusing it would fail a start, or hold
+#: a reload back, over ordinary clock skew. The cost: OpenSSL itself allows no skew, so a lone CRL
+#: inside this window refuses every peer it judges until its ``thisUpdate`` passes. A reload is
+#: spared that, because the copy it adds to stays in effect and OpenSSL keeps choosing it until then.
+CRL_CLOCK_SKEW_SECONDS = 300.0
+
+
+class CrlNotInEffect(ValueError):
+    """A CRL file whose only CRLs for some issuer take effect later (BACKLOG #299).
+
+    OpenSSL prefers a CRL that is in effect, so a future CRL beside a current one from the same
+    issuer is harmless. Alone, it is the one OpenSSL picks, and it refuses every peer that issuer's
+    CRL judges with ``CRL is not yet valid``. A start refuses it with this error's message."""
+
+
+def crl_in_effect(block: CrlBlock, *, now: float, skew: float = CRL_CLOCK_SKEW_SECONDS) -> bool:
+    """Whether ``block`` is in effect at ``now``, allowing ``skew`` seconds."""
+    return block.this_update.timestamp() <= now + skew
+
+
+def crl_not_in_effect(
+    blocks: Sequence[CrlBlock], *, now: float, skew: float = CRL_CLOCK_SKEW_SECONDS
+) -> CrlBlock | None:
+    """The CRL that decides when every issuer in ``blocks`` has one in effect, or ``None`` when each
+    does at ``now``. For each issuer with none in effect, its earliest CRL counts; of those, the
+    latest decides, since the file is whole only once that one takes effect."""
+    in_effect = {block.issuer for block in blocks if crl_in_effect(block, now=now, skew=skew)}
+    earliest: dict[str, CrlBlock] = {}
+    for block in blocks:
+        if block.issuer in in_effect:
+            continue
+        if block.issuer not in earliest or block.this_update < earliest[block.issuer].this_update:
+            earliest[block.issuer] = block
+    return max(earliest.values(), key=lambda block: block.this_update, default=None)
 
 
 def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:

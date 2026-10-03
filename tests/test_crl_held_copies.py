@@ -135,11 +135,11 @@ def _scan(pki: _Pki) -> tuple[_RecordingSink, list[CertCheck]]:
     return sink, checks
 
 
-_RESTART = "Restart the engine to apply the file"
+_PENDING = "A reload is pending"
 
 
 def _warned(caplog: pytest.LogCaptureFixture) -> bool:
-    return any(_RESTART in r.getMessage() for r in caplog.records)
+    return any(_PENDING in r.getMessage() for r in caplog.records)
 
 
 @pytest.fixture(autouse=True)

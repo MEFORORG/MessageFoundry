@@ -62,6 +62,7 @@ from messagefoundry.pipeline.cluster import (
     demote_stop_budget,
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
+from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
@@ -382,6 +383,7 @@ class Engine:
             else ()
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
+        self._crl_reload_runner: CrlReloadRunner | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
@@ -1351,6 +1353,14 @@ class Engine:
                 watch_unlisted_held_crls=True,
             )
             self._cert_expiry_runner.start()
+        # BACKLOG #299: apply a replaced CRL file to the running hops that hold the old copy. Not
+        # gated on [cert_monitor]: turning the expiry alert off must not also stop a revocation
+        # reaching a running hop. Not leader-gated: each process holds its own TLS contexts. Its cap
+        # is a [cert_monitor] setting all the same, read whatever warn_days is.
+        self._crl_reload_runner = CrlReloadRunner(
+            max_reloads=(self._cert_monitor_settings or CertMonitorSettings()).crl_max_reloads
+        )
+        self._crl_reload_runner.start()
         # ASVS 11.3.4: checkpoint the store cipher's PERSISTED per-key AES-GCM invocation reserve and
         # alarm at 2**31 (half the fail-closed 2**32 birthday ceiling). A no-op when the store carries no
         # bounded cipher (keyless / `vault_transit`). NOT leader-gated and NOT settings-gated: every
@@ -2406,6 +2416,9 @@ class Engine:
             await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
             await self._cert_expiry_runner.stop()
+        if self._crl_reload_runner is not None:
+            await self._crl_reload_runner.stop()
+            self._crl_reload_runner = None
         if self._secret_rotation_runner is not None:
             await self._secret_rotation_runner.stop()
         if self._update_check_runner is not None:

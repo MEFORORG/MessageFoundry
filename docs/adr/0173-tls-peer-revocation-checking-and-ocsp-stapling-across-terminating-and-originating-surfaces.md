@@ -952,3 +952,33 @@ a side effect of reading this ADR.
   call sites in `messagefoundry/`. Whether it could back a Windows-specific path is not evaluated.
 - **A count of "verifying hops".** §1.3's table lists thirteen originating sites and §4.3 explains why
   a fixed count is a liability. Read it as "at least these", per SDS-3.6.
+
+## 10. Amendment 2026-10-02 -- a replaced CRL file reaches a running hop without a restart (BACKLOG #299)
+
+**What changed.** A hop that recorded its CRL load (`harden_crl_check`, `config/loaded_crls.py`) no
+longer needs a restart to see a replaced CRL file. `pipeline/crl_reload.py` checks each held CRL file
+about once a minute, off the event loop. When the file changed, it adds the new CRL to the live
+context. OpenSSL then uses, per issuer, a current CRL with the latest `thisUpdate`. Measured on CPython
+3.14 / OpenSSL 3.5.7 with a real handshake against one context: a clean CRL, then a newer CRL revoking
+the peer, refuses the peer in either load order. Locate it by symbol: `reload_replaced_crls`.
+
+**It fails closed.** A replacement must pass the start rules (`judge_crl_bytes`), carry no certificate
+the hop does not already trust (proved on a scratch context first, because a load cannot be undone),
+have each CRL's signature verify against a CA certificate the hop lists for its issuer (OpenSSL
+checks it only at the handshake, so a badly signed CRL would load and then fail every handshake), and
+supersede every CRL the hop holds. Otherwise the hop keeps its copy, an ERROR names the reason, and
+the expiry monitor keeps judging the held copy. The start rules now also refuse a file whose only CRL
+for some issuer is not in effect yet, at a start and at a reload, because OpenSSL would pick it and
+refuse every peer. Both allow five minutes of clock skew (`CRL_CLOCK_SKEW_SECONDS`). The signature
+check sees only the hop's own trust store, so a CRL issued by an intermediate the peer sends is
+refused, retried every pass, and applied by a restart. A context only gains CRLs, so `[cert_monitor].crl_max_reloads` (default 10,000)
+caps the reloads one context takes for one file; past it, a restart applies the file. Nothing is fetched: this reads the configured file
+only, so §5's out-of-scope fetch bullet and ADR 0078's offline reasoning are untouched.
+
+**What this does to §6 trigger 4.** Its second clause names *"an in-engine CRL refresh that does not
+fetch"*. A reload from the configured file is that, for every hop whose load is recorded. This note
+records the fact and does not re-decide §2. Whether the clause has fired, for the scorecard, is the
+ASVS record's question. **Still needing a restart, at least:** a CRL block inside a CA bundle, which
+nothing records, and a replacement the reload refused. A reload also reaches only the next full handshake: an established connection, or a resumed session, keeps the verdict it was made with. The §5 bullet that an operator who enables
+direction 3 *takes on CRL refresh* still holds: the engine applies a refreshed file, it does not
+obtain one.
