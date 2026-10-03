@@ -327,8 +327,27 @@ def printable(text: str) -> str:
     return "".join(ch for ch in text if not unicodedata.category(ch).startswith("C"))
 
 
+#: Vault's capability words. Any other string a server returns is shown escaped, so a value that
+#: only resembles one (``deny`` plus an invisible character) does not print as that word.
+_VAULT_CAPABILITIES = frozenset(
+    {
+        "create",
+        "read",
+        "update",
+        "patch",
+        "delete",
+        "list",
+        "sudo",
+        "root",
+        "deny",
+        "subscribe",
+        "recover",
+    }
+)
+
+
 def _caps(caps: Iterable[str]) -> str:
-    return ", ".join(sorted(caps)) or "none"
+    return ", ".join(sorted(c if c in _VAULT_CAPABILITIES else repr(c) for c in caps)) or "none"
 
 
 def vault_hop(
@@ -350,8 +369,16 @@ def vault_hop(
     notes: list[str] = []
     # Judged on the printed form too: a name that only LOOKS like root once its invisible
     # characters are dropped would otherwise print as "root" while being judged as something else.
-    if any(p == "root" or printable(p) == "root" for p in reading.policies):
-        over.append("the token carries the root policy")
+    # A name that is not plain printable ASCII (a homoglyph such as a Cyrillic o) cannot be told
+    # apart from root on a terminal at all, so it is reported rather than guessed at.
+    for p in reading.policies:
+        if p == "root" or printable(p) == "root":
+            over.append("the token carries the root policy")
+        elif not (p.isascii() and p.isprintable()):
+            over.append(
+                f"the policy name {p!r} is not plain printable ASCII, so it cannot be told apart "
+                "from root by reading it; read the policy by hand"
+            )
     for path, needed in reading.required.items():
         if path not in reading.capabilities:
             continue  # the probe already reports it as a problem
@@ -525,8 +552,9 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     direct = {g for c in reading.member_of if (g := _ADMIN_GROUP_NAMES.get(c.lower())) in allowed}
     # The primary group is a RID, which no name can fake, so it counts on both paths: a tokenGroups
     # read that somehow lacks the primary group must not turn a Domain Admins primary into clean.
-    if reading.primary_group_rid in _ADMIN_DOMAIN_RIDS:
-        direct.add(_ADMIN_DOMAIN_RIDS[reading.primary_group_rid])
+    primary = (
+        {_ADMIN_DOMAIN_RIDS[r]} if (r := reading.primary_group_rid) in _ADMIN_DOMAIN_RIDS else set()
+    )
     problems = [reading.problem] if reading.problem is not None else []
     if reading.bound and reading.authzid is None:
         problems.append(
@@ -544,6 +572,7 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     # Each group is labelled by the read that found it, so a direct-only find is not read as nested.
     found = [f"{g} (transitive, from tokenGroups)" for g in sorted(by_sid)]
     found += [f"{g} (direct memberOf)" for g in sorted(direct - by_sid)]
+    found += [f"{g} (primary group)" for g in sorted(primary - by_sid - direct)]
     if found:
         state = HopState.OVER_GRANTED
         parts.insert(0, f"over-granted: member of {', '.join(found)}")

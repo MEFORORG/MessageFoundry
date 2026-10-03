@@ -146,7 +146,9 @@ def _least_caps() -> dict[str, list[str]]:
 
 
 def _reading(vault: _FakeVault, token: str = _TOKEN) -> VaultTokenReading:
-    return read_vault_token(lambda: token, lambda t: vault, lambda: dict(_KEK_PATHS))
+    return read_vault_token(
+        lambda: token, lambda: _VAULT_ADDR, lambda a, t: vault, lambda: dict(_KEK_PATHS)
+    )
 
 
 _STORE = VaultConsumer("vault.store", "kek", "store key provider", "read and decrypt the KEK")
@@ -279,10 +281,19 @@ def test_a_policy_that_only_looks_like_root_is_judged_as_root(lookalike: str) ->
     assert "the token carries the root policy" in hop.detail
 
 
-def test_a_capability_with_a_stray_character_is_read_as_the_capability() -> None:
-    caps = {f"transit/keys/{_KEK}": ["read\x00"], f"transit/decrypt/{_KEK}": ["update"]}
+def test_a_capability_that_is_not_exactly_one_is_counted_as_excess() -> None:
+    """Never normalised toward a clean result: "deny" plus an invisible character is not deny."""
+    caps = _least_caps() | {"auth/token/create": ["deny\u200b"]}
     hop = vault_hop(_STORE, _reading(_FakeVault(caps=caps)))
-    assert hop.state is HopState.CLEAN
+    assert hop.state is HopState.OVER_GRANTED
+    assert r"auth/token/create grants 'deny\u200b'; the engine never calls it" in hop.detail
+
+
+def test_a_policy_name_that_is_not_plain_ascii_is_reported() -> None:
+    homoglyph = "r\u043e\u043et"  # Cyrillic o's: prints as root
+    hop = vault_hop(_STORE, _reading(_FakeVault(policies=(homoglyph,), caps=_least_caps())))
+    assert hop.state is HopState.OVER_GRANTED
+    assert "is not plain printable ASCII" in hop.detail
 
 
 def test_an_unset_token_and_address_are_both_named_in_one_run(
@@ -304,7 +315,8 @@ def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> N
     # A batch token: no accessor, and the match still holds, because it is made on the token.
     secrets = read_vault_token(
         lambda: _TOKEN,
-        lambda t: _FakeVault(caps=caps, accessor=""),
+        lambda: _VAULT_ADDR,
+        lambda a, t: _FakeVault(caps=caps, accessor=""),
         lambda: {kv_path: frozenset({"read"})},
     )
     assert store.same_token_as(secrets)
@@ -323,7 +335,8 @@ def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> N
     # The control: two different tokens with the same grants are each judged alone.
     other = read_vault_token(
         lambda: "other-other-other",
-        lambda t: _FakeVault(caps=caps),
+        lambda: _VAULT_ADDR,
+        lambda a, t: _FakeVault(caps=caps),
         lambda: {kv_path: frozenset({"read"})},
     )
     assert [h.state for h in _vault_hops([_STORE, kv], [store, other])] == [
@@ -395,10 +408,13 @@ def test_an_unreachable_vault_is_unobservable_and_names_only_the_type() -> None:
 
 
 def test_a_client_that_cannot_be_built_is_unobservable_with_the_engines_own_text() -> None:
-    def _refuse(token: str) -> Any:
+    def _refuse(address: str, token: str) -> Any:
         raise KeyProviderError("Vault transit key provider: refusing a cleartext address")
 
-    hop = vault_hop(_STORE, read_vault_token(lambda: _TOKEN, _refuse, lambda: dict(_KEK_PATHS)))
+    hop = vault_hop(
+        _STORE,
+        read_vault_token(lambda: _TOKEN, lambda: _VAULT_ADDR, _refuse, lambda: dict(_KEK_PATHS)),
+    )
     assert hop.state is HopState.UNOBSERVABLE
     assert "no Vault client: Vault transit key provider: refusing a cleartext address" in hop.detail
 
@@ -407,11 +423,16 @@ def test_an_unknown_key_name_is_unobservable_but_a_root_token_still_shows() -> N
     def _unknown() -> dict[str, frozenset[str]]:
         raise KeyProviderError("MEFOR_STORE_VAULT_TRANSIT_KEY is not set")
 
-    blind = vault_hop(_STORE, read_vault_token(lambda: _TOKEN, lambda t: _FakeVault(), _unknown))
+    blind = vault_hop(
+        _STORE,
+        read_vault_token(lambda: _TOKEN, lambda: _VAULT_ADDR, lambda a, t: _FakeVault(), _unknown),
+    )
     assert blind.state is HopState.UNOBSERVABLE
     assert "MEFOR_STORE_VAULT_TRANSIT_KEY is not set" in blind.detail
     rooted = _FakeVault(policies=("root",))
-    root = vault_hop(_STORE, read_vault_token(lambda: _TOKEN, lambda t: rooted, _unknown))
+    root = vault_hop(
+        _STORE, read_vault_token(lambda: _TOKEN, lambda: _VAULT_ADDR, lambda a, t: rooted, _unknown)
+    )
     assert root.state is HopState.OVER_GRANTED
 
 
@@ -739,7 +760,7 @@ def test_a_domain_admins_primary_group_counts_even_beside_a_tokengroups_read(
     raw = {"tokenGroups": [_sid(*_DOMAIN, 513)], "primaryGroupID": [b"512"]}
     hop = _judge(_read(monkeypatch, _FakeLdapConn(raw)))
     assert hop.state is HopState.OVER_GRANTED
-    assert "Domain Admins (direct memberOf)" in hop.detail
+    assert "Domain Admins (primary group)" in hop.detail
 
 
 @pytest.mark.parametrize(
@@ -772,10 +793,11 @@ def test_a_who_am_i_that_raises_after_a_good_bind_is_not_a_bind_failure(
     conn.extend = type("E", (), {"standard": type("S", (), {"who_am_i": staticmethod(_raise)})()})()
     reading = _read(monkeypatch, conn)
     assert reading.bound is True and reading.group_sids  # the group read still ran
-    assert reading.whoami_error == "Who am I failed: LDAPExtensionError: unsupported"
+    assert reading.whoami_error == "Who am I failed: LDAPExtensionError"
     hop = _judge(reading)
     assert hop.state is HopState.UNOBSERVABLE
-    assert "Who am I failed: LDAPExtensionError: unsupported" in hop.detail
+    assert "Who am I failed: LDAPExtensionError" in hop.detail
+    assert "unsupported" not in hop.detail  # the directory's own text is not repeated
     assert "bind probe" not in hop.detail
 
 
@@ -983,7 +1005,7 @@ def test_the_store_probe_never_sends_the_token_to_vault_addr(
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
     monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t: pytest.fail(f"built {a}"))
     with pytest.raises(KeyProviderError, match="MEFOR_STORE_VAULT_ADDR is not set"):
-        keyprovider_vault.store_vault_client(_TOKEN)
+        keyprovider_vault.store_vault_address()
     reading = probe_vault(_STORE)
     assert any("MEFOR_STORE_VAULT_ADDR is not set" in p for p in reading.problems)
     assert not reading.looked_up
@@ -1001,7 +1023,7 @@ def test_the_secrets_probe_never_sends_the_token_to_vault_addr(
         secretprovider_vault, "_build_client", lambda a, t: pytest.fail(f"built {a}")
     )
     with pytest.raises(SecretProviderError, match="MEFOR_SECRETS_VAULT_ADDR is not set"):
-        secretprovider_vault.secrets_vault_client(_TOKEN)
+        secretprovider_vault.secrets_vault_address()
     kv = VaultConsumer("vault.secrets", "kv", "kv", "kv", ("mefor/ad",))
     reading = probe_vault(kv)
     assert any("MEFOR_SECRETS_VAULT_ADDR is not set" in p for p in reading.problems)
@@ -1024,6 +1046,34 @@ def test_the_ldap_probe_never_reads_the_bind_password_from_vault_addr(
     reading = read_ldap_bind(settings, None)
     assert reading.bound is False
     assert reading.problem is not None and "MEFOR_SECRETS_VAULT_ADDR is not set" in reading.problem
+
+
+def test_the_ldap_probe_names_both_an_unset_vault_token_and_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MEFOR_SECRETS_VAULT_TOKEN", raising=False)
+    monkeypatch.delenv("MEFOR_SECRETS_VAULT_ADDR", raising=False)
+    monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t: pytest.fail("built"))
+    auth = _ad_settings().model_dump() | {
+        "ad_bind_password": None,
+        "ad_bind_password_secret": "mefor/ad",
+    }
+    settings = ServiceSettings.model_validate({"auth": auth, "secrets": {"provider": "vault"}})
+    reading = read_ldap_bind(settings, None)
+    assert reading.problem is not None
+    assert "MEFOR_SECRETS_VAULT_TOKEN is not set" in reading.problem
+    assert "MEFOR_SECRETS_VAULT_ADDR is not set" in reading.problem
+
+
+def test_a_missing_key_name_is_named_in_the_same_run_as_an_unset_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MEFOR_STORE_VAULT_TOKEN", raising=False)
+    monkeypatch.delenv("MEFOR_STORE_VAULT_ADDR", raising=False)
+    monkeypatch.delenv("MEFOR_STORE_VAULT_TRANSIT_KEY", raising=False)
+    joined = " ".join(probe_vault(_STORE).problems)
+    assert "MEFOR_STORE_VAULT_TOKEN is not set" in joined
+    assert "MEFOR_STORE_VAULT_TRANSIT_KEY is not set" in joined
 
 
 def test_the_secrets_probe_refuses_an_unset_token_too(monkeypatch: pytest.MonkeyPatch) -> None:

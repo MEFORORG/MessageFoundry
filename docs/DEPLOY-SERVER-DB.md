@@ -187,8 +187,8 @@ findings are reported only; they never stop a start.
 **Do not copy the Vault token or the AD bind password into the scheduled task.** That task usually
 lacks them, so in it the Vault and AD hops read as not observed and the command exits 4 even for a
 clean login. Run it with `--json` and read the `store` hop's `state` for this step. Run the full
-check where the service's environment already exists; what the check refuses to fall back to,
-and the AD lockout cost of each run, are in the `SECURITY.md` section linked below. SMTP and the identity provider are
+check where the service's environment already exists. The `SECURITY.md` section linked below
+says which fallbacks the check refuses. It also gives the AD lockout cost of each run. SMTP and the identity provider are
 printed with the identity the engine presents and the least grant each needs, marked **not probed**.
 Confirm those by hand; they never change the exit code. The full per-hop table is in
 [`SECURITY.md`](SECURITY.md) §*Each backend hop's least privilege; the engine probes the store,

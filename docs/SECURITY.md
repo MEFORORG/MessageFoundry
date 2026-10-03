@@ -676,9 +676,11 @@ These are at least:
 A clean LDAP hop means none of these groups, not no powerful group: a group outside the list, such
 as one an Exchange install creates with rights on the domain, is not flagged.
 
-When `tokenGroups` cannot be read, the probe falls back to the direct `memberOf` and
-`primaryGroupID`, which miss a nested group, and reports the hop as not observed unless it finds
-one. A bind that succeeds but whose Who am I names no identity is also not observed, never
+The `primaryGroupID` counts on every read, because a RID cannot be faked by a group name. When
+`tokenGroups` cannot be read, the probe falls back to the direct `memberOf` for every group, which
+misses a nested group, and reports the hop as not observed unless it finds one. A policy name that
+is not plain printable ASCII is reported too, because it cannot be told apart from `root` by
+reading it. A bind that succeeds but whose Who am I names no identity is also not observed, never
 clean. When the base read of `[auth].ad_bind_dn` returns no entry, the hop names the directory's
 result code: `invalidDNSyntax` means the bind identity is a UPN or `DOMAIN\user` rather than a
 distinguished name, and the group read needs a DN.

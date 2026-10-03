@@ -255,13 +255,14 @@ def secrets_vault_address() -> str:
     return addr
 
 
-def secrets_vault_client(token: str) -> Any:
-    """The connector-secret hop's Vault client for ``token``, built by the same :func:`_build_client`
+def secrets_vault_client(address: str, token: str) -> Any:
+    """The connector-secret hop's Vault client, built by the same :func:`_build_client`
     :meth:`VaultSecretProvider.resolve` uses: same TLS narrowing, same anchor, no redirects, and the
     same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
-    own grants through it and changes nothing. Take ``token`` from :func:`secrets_vault_token`; the
-    address comes from :func:`secrets_vault_address`, which refuses an unset one."""
-    return _build_client(secrets_vault_address(), token)
+    own grants through it and changes nothing. Take ``address`` from :func:`secrets_vault_address`
+    and ``token`` from :func:`secrets_vault_token`; both refuse an unset variable, and the client
+    uses exactly the values they returned."""
+    return _build_client(address, token)
 
 
 def kv_required_capabilities(refs: Iterable[str]) -> dict[str, frozenset[str]]:

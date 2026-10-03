@@ -149,8 +149,8 @@ class BindAccountReading:
     ``authzid`` is the RFC 4532 "Who am I?" answer: the identity the directory says the bind
     authenticated as. It proves identity, not rights. ``group_sids`` is the account's own
     ``tokenGroups``, which AD computes over every nested group and the primary group; empty when it
-    could not be read. ``member_of`` (the CN of each direct ``memberOf``) and ``primary_group_rid``
-    are the direct reads, for when it could not. ``problem`` says what could not be read. Nothing
+    could not be read. ``member_of`` (the CN of each direct ``memberOf``) is the direct read for when
+    it could not. ``primary_group_rid`` is read either way: a RID cannot be faked by a group name. ``problem`` says what could not be read. Nothing
     here is a secret: no password is held."""
 
     authzid: str | None
@@ -1002,8 +1002,9 @@ class LdapAuthenticator:
             try:
                 who = _authzid_text(svc.extend.standard.who_am_i())
             except ldap3.core.exceptions.LDAPException as exc:
-                who = None
-                whoami_error = f"Who am I failed: {type(exc).__name__}: {str(exc)[:200]}"
+                # The type name only, as the group read below does: ldap3's text for an
+                # extended-operation error carries the directory's own diagnostic message.
+                who, whoami_error = None, f"Who am I failed: {type(exc).__name__}"
             try:
                 _search(
                     svc,
