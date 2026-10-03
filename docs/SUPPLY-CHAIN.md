@@ -48,6 +48,10 @@ flowchart TB
     SIGN["Sigstore keyless signing<br/>sdist, wheels, both SBOMs, VEX"]:::build
     SLSA["SLSA build provenance attestation"]:::build
     GHREL["Create the GitHub release<br/>artifacts with their Sigstore bundles"]:::build
+  end
+
+  subgraph PUBJOB["release.yml: the publish-pypi job, environment pypi"]
+    CHECK["Fetch the gated files<br/>check each against the release job's digests"]:::build
     PUBTK["Publish the toolkit wheel"]:::build
     PUBENG["Publish the engine sdist and wheel"]:::build
   end
@@ -79,7 +83,8 @@ flowchart TB
   SBOMIN --> SIGN
   SIGN --> SLSA
   SLSA --> GHREL
-  GHREL --> PUBTK
+  GHREL -->|"hand over files and digests"| CHECK
+  CHECK --> PUBTK
   PUBTK --> PUBENG
   GHREL --> GH
   PUBTK --> PYPI
@@ -106,11 +111,13 @@ Four facts the labels leave out:
 - **The merge queue.** `ci.yml` and `security.yml` also trigger on the merge-queue commit. Branch
   protection reads the required checks there. The checked-in list of those checks is
   [`.github/required-contexts.txt`](../.github/required-contexts.txt).
-- **One identity.** In the release job, signing, attestation and publishing all use that job's
-  GitHub OIDC identity. Every PyPI publish in `release.yml` is Trusted Publishing, with no API
-  token.
-- **The order.** A PyPI upload cannot be replaced, so the two publish steps come last in the
-  release job. A blocking step that fails before them stops the job. The SBOM quality score reports
+- **Publishing has its own jobs.** The release job signs and attests with its GitHub OIDC
+  identity. Every PyPI publish runs in a separate job that only publishes, names the `pypi`
+  environment and holds nothing but that identity. It downloads the files the build job gated and
+  checks each one against the digests that job recorded. Every PyPI publish is Trusted Publishing,
+  with no API token.
+- **The order.** A PyPI upload cannot be replaced, so the publish job runs only after the whole
+  release job has passed. A blocking step that fails in the release job stops the publish. The SBOM quality score reports
   and does not block. The toolkit uploads before the engine
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
 
