@@ -154,11 +154,16 @@ def _probe_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
     return probe_dir, _decoy(tmp_path), tmp_path / "report.json"
 
 
-def _assert_started_through_the_bootstrap(report: Path) -> dict[str, Any]:
+def _assert_this_build_with_the_flags(report: Path) -> dict[str, Any]:
     seen: dict[str, Any] = json.loads(report.read_text(encoding="utf-8"))
     assert Path(seen["package"]).resolve() == Path(messagefoundry.__file__).resolve()
     assert seen["safe_path"] is True
     assert seen["remote_debug"] is False
+    return seen
+
+
+def _assert_started_through_the_bootstrap(report: Path) -> dict[str, Any]:
+    seen = _assert_this_build_with_the_flags(report)
     # A `-P -m` start passes the three checks above too, in an installed checkout. The interpreter's
     # own command line says which start it was.
     started = seen["orig_argv"]
@@ -171,25 +176,50 @@ def _assert_started_through_the_bootstrap(report: Path) -> dict[str, Any]:
 _WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="the tray is Windows-only")
 
 
+def _without_flag_stand_ins(probe_dir: Path) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k.upper() not in _FLAG_STAND_INS}
+    env["PYTHONPATH"] = str(probe_dir)
+    return env
+
+
 @_WINDOWS_ONLY
-def test_the_login_command_starts_a_real_first_process_through_the_bootstrap(
-    tmp_path: Path,
+@pytest.mark.parametrize("installed", [False, True], ids=["checkout", "installed"])
+def test_the_login_command_starts_a_real_first_process_with_the_flags(
+    tmp_path: Path, installed: bool
 ) -> None:
-    """The Run-key string itself, parsed by Windows, from a working directory Windows chose. Red
-    before vault BACKLOG #2822: ``-m`` put the working directory first and the decoy answered."""
+    """The Run-key string itself, in each form, parsed by Windows, from a working directory holding
+    a decoy. Red before vault BACKLOG #2822: a plain ``-m`` put the working directory first and the
+    decoy answered."""
     probe_dir, cwd, report = _probe_layout(tmp_path)
-    command = autostart.launcher_command(sys.executable)
+    env = _without_flag_stand_ins(probe_dir)
+    if installed:
+        # The short form needs the package on the interpreter's own path, as an install puts it.
+        control = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
+            [sys.executable, "-P", "-c", "import messagefoundry; print(messagefoundry.__file__)"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=50,
+            check=False,
+        )
+        found = control.stdout.strip()
+        if control.returncode or Path(found).resolve() != Path(messagefoundry.__file__).resolve():
+            pytest.skip("this build is not installed into this interpreter, so -m cannot find it")
+    command = autostart.launcher_command(sys.executable, installed=installed)
     assert command.endswith(" messagefoundry.tray"), command
     command = command.removesuffix("messagefoundry.tray") + subprocess.list2cmdline(
         [_PROBE_MODULE, str(report)]
     )
-    env = {k: v for k, v in os.environ.items() if k.upper() not in _FLAG_STAND_INS}
-    env["PYTHONPATH"] = str(probe_dir)
     done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
         command, cwd=cwd, env=env, capture_output=True, text=True, timeout=50, check=False
     )
     assert done.returncode == 0, done.stderr
-    _assert_started_through_the_bootstrap(report)
+    if installed:
+        seen = _assert_this_build_with_the_flags(report)
+        assert seen["orig_argv"][-3:-2] == ["-m"], seen["orig_argv"]
+    else:
+        _assert_started_through_the_bootstrap(report)
 
 
 @_WINDOWS_ONLY

@@ -8,15 +8,19 @@ logic and prove the Windows modules import + construct their structs cleanly.
 
 from __future__ import annotations
 
+import logging
 import os
+import site
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 from messagefoundry import _child_bootstrap
-from messagefoundry.childenv import python_child_argv
+from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, python_child_argv
+from messagefoundry.tray import autostart
 from messagefoundry.tray.autostart import launcher_command, pythonw_executable
 from messagefoundry.tray.menu import Action, assign_command_ids, build_menu
 from messagefoundry.tray.state import StatusSnapshot, TrayState
@@ -78,14 +82,79 @@ def test_disabled_action_is_not_dispatchable() -> None:
         (r"C:\Program Files\Py\pythonw.exe", r'"C:\Program Files\Py\pythonw.exe"'),
     ],
 )
-def test_launcher_command_starts_the_tray_through_the_bootstrap(pythonw: str, written: str) -> None:
-    """Vault BACKLOG #2822: the login command starts the first tray process like the engine's own
-    Python children, so no working directory leads its import path. The flags are typed out rather
-    than read from childenv, so the test does not check a list against itself."""
+def test_launcher_command_starts_a_checkout_through_the_bootstrap(
+    pythonw: str, written: str
+) -> None:
+    """Vault BACKLOG #2822: for a source checkout the login command starts the first tray process
+    like the engine's own Python children, so no working directory leads its import path. The flags
+    are typed out rather than read from childenv, so the test does not check a list against itself."""
     bootstrap = subprocess.list2cmdline([str(Path(_child_bootstrap.__file__).resolve())])
-    assert launcher_command(pythonw) == (
+    assert launcher_command(pythonw, installed=False) == (
         f"{written} -P -X disable-remote-debug {bootstrap} messagefoundry.tray"
     )
+
+
+@pytest.mark.parametrize(
+    ("pythonw", "written"),
+    [
+        (r"C:\repo\.venv\Scripts\pythonw.exe", r"C:\repo\.venv\Scripts\pythonw.exe"),
+        (r"C:\Program Files\Py\pythonw.exe", r'"C:\Program Files\Py\pythonw.exe"'),
+    ],
+)
+def test_launcher_command_starts_an_installed_tray_by_module(pythonw: str, written: str) -> None:
+    """Vault BACKLOG #2837: an installed package takes the short form. ``-P`` keeps the working
+    directory off a ``-m`` start's import path."""
+    assert launcher_command(pythonw, installed=True) == (
+        f"{written} -P -X disable-remote-debug -m messagefoundry.tray"
+    )
+
+
+def test_installed_means_the_package_sits_in_a_site_packages_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    site_packages = tmp_path / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(site_packages)])
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
+    assert autostart.installed_in_site_packages(site_packages) is True
+    assert autostart.installed_in_site_packages(tmp_path / "checkout") is False
+
+
+@pytest.mark.parametrize(("length", "written"), [(260, True), (261, False)])
+def test_a_login_command_over_the_run_value_limit_is_refused(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, length: int, written: bool
+) -> None:
+    """Vault BACKLOG #2837: Windows documents 260 characters as the longest Run value. A longer
+    command is not written, any value already there is removed, and the menu reads off."""
+    command = "x" * length
+    monkeypatch.setattr(autostart, "launcher_command", lambda *a, **k: command)
+    calls: list[tuple[str, object]] = []
+
+    class _Key:
+        def __enter__(self) -> _Key:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    fake = types.SimpleNamespace(
+        HKEY_CURRENT_USER=object(),
+        REG_SZ=1,
+        CreateKey=lambda *a: _Key(),
+        SetValueEx=lambda key, name, reserved, kind, value: calls.append(("set", value)),
+        DeleteValue=lambda key, name: calls.append(("delete", name)),
+    )
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    monkeypatch.setattr(sys, "platform", "win32")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.tray.autostart"):
+        assert autostart.set_autostart(True) is written
+    if written:
+        assert calls == [("set", command)]
+        assert not caplog.records
+    else:
+        assert calls == [("delete", "MessageFoundryTray")]
+        [record] = caplog.records
+        assert "261 characters" in record.getMessage() and "260" in record.getMessage()
 
 
 def _windows_argv(command_line: str) -> list[str]:
@@ -116,12 +185,18 @@ def _windows_argv(command_line: str) -> list[str]:
     "pythonw",
     [r"C:\Program Files\Python 3.14\pythonw.exe", r"C:\repo\.venv\Scripts\pythonw.exe"],
 )
-def test_windows_reads_the_launcher_command_back_as_the_child_command_line(pythonw: str) -> None:
+@pytest.mark.parametrize("installed", [False, True])
+def test_windows_reads_the_launcher_command_back_as_the_child_command_line(
+    pythonw: str, installed: bool
+) -> None:
     """Windows splits the Run-key string into exactly the argument list a child gets, with a space
-    in a path and without one."""
-    assert _windows_argv(launcher_command(pythonw)) == python_child_argv(
-        "messagefoundry.tray", executable=pythonw
+    in a path and without one, in both forms."""
+    expected = (
+        [pythonw, *CHILD_INTERPRETER_FLAGS, "-m", "messagefoundry.tray"]
+        if installed
+        else python_child_argv("messagefoundry.tray", executable=pythonw)
     )
+    assert _windows_argv(launcher_command(pythonw, installed=installed)) == expected
 
 
 def test_pythonw_executable_falls_back_to_given_path(tmp_path: object) -> None:

@@ -1227,10 +1227,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   own start-up, about 20 ms there, cannot be covered from inside the engine. And a process that
   can write the engine's memory can run code in it by other means, and can remove a hook.
 - **The tray has no hook, so how it started decides whether the interface is on.** No entry
-  reports the tray's process. Two of its starts go through the child bootstrap with
-  `-X disable-remote-debug`, so the interface is off before any tray code runs. One is the branded
-  relaunch, `MessageFoundryTray.exe`. The other is the first process when autostart starts it at
-  login (vault BACKLOG #2822). That holds whether the relaunch then works or the first process
+  reports the tray's process. Two of its starts carry `-X disable-remote-debug`, so the interface
+  is off before any tray code runs. One is the branded relaunch, `MessageFoundryTray.exe`. The other
+  is the first process when autostart starts it at login, in either form
+  `docs/DANGEROUS-FUNCTIONALITY.md` section 3 describes (vault BACKLOG #2822, #2837). That holds whether the relaunch then works or the first process
   runs the tray unbranded. A tray started by hand, as `messagefoundry-tray` or
   `pythonw -m messagefoundry.tray`, has the interface on. That process hands over to the branded
   relaunch. Where branding is unavailable, or the branded child exits at once, it runs the whole

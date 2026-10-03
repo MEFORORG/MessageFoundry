@@ -41,9 +41,12 @@ friendly note and exits.
 
 To **start it automatically at login**, use the tray's **Start at Login** menu item (opt-in, off by
 default). It writes an `HKCU\…\Run` entry pinning the absolute `pythonw.exe` you launched with, so it
-keeps resolving after a reboot. The entry starts the tray through the engine's child bootstrap script,
-with `-P -X disable-remote-debug`, so the folder Windows starts it in is not on its import path. A
-tray you start by hand does not get this; see `docs/DANGEROUS-FUNCTIONALITY.md` section 3.
+keeps resolving after a reboot. The entry starts the tray with the interpreter options the engine's
+own Python children get, so the folder Windows starts it in is not on its import path. Windows
+documents 260 characters as the longest a Run entry may be. If the command would be longer, the tray
+leaves Start at Login off and writes a warning to `tray.log`; install it in a shorter folder.
+`docs/DANGEROUS-FUNCTIONALITY.md` section 3 gives the two forms of the command, and what a tray you
+start by hand lacks.
 
 ## What the icon shows
 
