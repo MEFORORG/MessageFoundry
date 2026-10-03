@@ -404,6 +404,26 @@ def test_a_rig_that_cannot_sign_in_exits_with_its_own_code(
     assert "did not answer" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("session", ["-abc123", "--abc123", "plain-session"])
+def test_run_hands_a_session_that_starts_with_a_dash_to_the_childs_argparse_intact(
+    monkeypatch: pytest.MonkeyPatch, session: str
+) -> None:
+    """A session is ``token_urlsafe``, whose alphabet holds ``-``, so about one in 64 starts with it.
+    Passed as ``--token`` then the value, argparse in the child reads such a value as an option and
+    exits 2 with "expected one argument": the merge-queue flake on engine PR 1981. The child here is a
+    real interpreter whose argparse declares ``--token`` the way ``harness/__main__.py`` does."""
+    monkeypatch.setattr(rigadmin, "_require_sign_in", lambda *_a, **_k: None)
+    monkeypatch.setattr(rigadmin, "sign_in", lambda *_a, **_k: session)
+    child = (
+        "import argparse, sys; p = argparse.ArgumentParser(); p.add_argument('--token'); "
+        f"sys.exit(0 if p.parse_args().token == {session!r} else 7)"
+    )
+    code = rigadmin.main(
+        ["run", "--engine", "https://127.0.0.1:1", "--", sys.executable, "-c", child]
+    )
+    assert code == 0, f"the child's argparse did not receive {session!r} as --token (exit {code})"
+
+
 # --- the workflow legs carry this module's settings ---------------------------
 
 
@@ -541,7 +561,7 @@ async def test_a_rig_node_serves_with_sign_in_on_and_the_rig_reads_it_signed_in(
         child = (
             "import os, sys; "
             f"sys.exit(9 if {rigadmin.ADMIN_PASS_ENV!r} in os.environ else "
-            "0 if sys.argv[-2] == '--token' and len(sys.argv[-1]) > 20 else 7)"
+            "0 if sys.argv[-1].startswith('--token=') and len(sys.argv[-1]) > 28 else 7)"
         )
         code, _ = await asyncio.to_thread(
             _cli, "run", "--engine", url, "--cacert", pin, "--", sys.executable, "-c", child
