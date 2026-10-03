@@ -237,7 +237,12 @@ class PersistentConnection:
             await self._grace_for_acks(rtask, self._stop_grace)
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        # The reader may have FINISHED during the ACK grace after `pending` was taken: cancel() is a
+        # no-op then, and gather would swallow its refusal. Re-raise it so `_run` still records it.
+        for result in results:
+            if isinstance(result, MLLPFrameError):
+                raise result
         for task in done:
             exc = task.exception()
             if exc is not None and not isinstance(exc, asyncio.CancelledError):

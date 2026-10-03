@@ -226,8 +226,12 @@ class CoordTimeout(TimeoutError):
     """A handshake message never arrived within its timeout."""
 
 
-class CoordMessageRefused(ValueError):
-    """A handshake message file is over :data:`MAX_COORD_MESSAGE_BYTES` or not a regular file."""
+class CoordMessageRefused(CoordTimeout):
+    """A handshake message file is over :data:`MAX_COORD_MESSAGE_BYTES` or not a regular file.
+
+    A subclass of :class:`CoordTimeout` on purpose: every caller already treats a timeout as "the
+    rendezvous broke" and runs its abort path (posting ``LADDER_STOP``/``RUNG_ABORTED``, exiting 2),
+    and a refused message is the same broken rendezvous with a truer cause in its text."""
 
 
 def with_missing_ok_unlink(path: Path) -> None:

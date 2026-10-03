@@ -162,6 +162,39 @@ async def test_load_sender_refuses_an_ack_one_byte_over_the_cap(
     assert "over cap" in caplog.text
 
 
+async def test_load_sender_records_a_refusal_that_lands_in_the_stop_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The writer finishes first at a graceful stop; an over-cap ACK arriving in the grace window
+    # must still be recorded, not swallowed with the cancelled reader.
+    monkeypatch.setattr(sender, "DEFAULT_MAX_FRAME_BYTES", _CAP)
+    received = asyncio.Event()
+
+    async def peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read(65536)
+        received.set()
+        await asyncio.sleep(0.2)
+        writer.write(frame(_ack_of(_CAP + 1)))
+        await writer.drain()
+        await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(peer, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    conn = sender.PersistentConnection("127.0.0.1", port, Correlator(10, metrics), metrics)
+    try:
+        conn.start()
+        assert conn.submit_nowait(Outgoing(1, "ADT", "X1", _MSG))
+        await asyncio.wait_for(received.wait(), timeout=5.0)
+        await conn.stop(3.0)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert conn.frame_refusals == 1
+    assert metrics.counters.errors == 1 and metrics.counters.acked == 0
+
+
 # --- the engine node logs -----------------------------------------------------------------------
 
 _PHASE_LINE = "delivery phase timing"
@@ -257,6 +290,8 @@ def test_coord_message_over_the_cap_is_refused_not_polled_forever(
         c.read(coord.SHARDS_READY)
     with pytest.raises(coord.CoordMessageRefused):
         asyncio.run(c.await_message(coord.SHARDS_READY, timeout=5.0, interval=0.01))
+    # Every caller's abort path catches CoordTimeout; a refusal must take that path too.
+    assert issubclass(coord.CoordMessageRefused, coord.CoordTimeout)
 
 
 def test_coord_message_not_posted_still_reads_none(tmp_path: Path) -> None:

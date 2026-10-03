@@ -86,6 +86,9 @@ def test_drop_name_keeps_a_name_exactly_at_the_byte_cap() -> None:
         ".",
         "..",
         "a\x00b.hl7",
+        ".. ",
+        "...",
+        "x.",
     ],
 )
 def test_drop_atomic_refuses_a_name_that_is_not_one_file_name(tmp_path: Path, name: str) -> None:

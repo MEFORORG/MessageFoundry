@@ -65,7 +65,8 @@ def _check_contained(directory: Path, name: str) -> None:
     """Raise :class:`OSError` (``EINVAL``) unless ``name`` is a single file name whose target is a
     direct child of ``directory``. Lexical on purpose: the final component is never followed, and
     :func:`drop_atomic` never writes through an existing name anyway (``os.link`` refuses one).
-    The refusal does not quote ``name``, which came from a message."""
+    A name ending in a dot or a space is refused too: Windows strips those when it opens a name, so
+    ``.. `` would open ``..``. The refusal does not quote ``name``, which came from a message."""
     resolved = Path(os.path.abspath(directory))
     target = Path(os.path.normpath(resolved / name)) if name else resolved
     if (
@@ -74,6 +75,7 @@ def _check_contained(directory: Path, name: str) -> None:
         or "\x00" in name
         or "/" in name
         or "\\" in name
+        or name.endswith((".", " "))
         or target.parent != resolved
         or target.name != name
     ):
