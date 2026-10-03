@@ -2594,10 +2594,7 @@ def _apply_set_params(
         or (action == "set_field" and ("value" in params or "path" in params))
     ):
         before = stmt.value if isinstance(stmt, ast.Expr) else stmt
-        path_only = action == "set_field" and "value" not in params
-        repicked = _repick_write(
-            result, line_start, line_end, _argument_dump(before), path_only=path_only
-        )
+        repicked = _repick_write(result, line_start, line_end, before)
         if repicked != result:
             _refuse_overlong_repick(result, repicked, line_start, line_end)
         result = repicked
@@ -2638,9 +2635,7 @@ def _argument_dump(node: ast.AST) -> str:
             sub.kind = kind
 
 
-def _repick_write(
-    source: str, line_start: int, line_end: int, before: str, *, path_only: bool = False
-) -> str:
+def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) -> str:
     """Re-pick the write of the native Copy Field or Set Field at ``line_start``-``line_end`` of
     ``source``, after an edit of a copy's ``src`` or ``dst`` or of a Set Field's ``path`` or ``value``
     (ADR 0206 rule 1).
@@ -2652,14 +2647,16 @@ def _repick_write(
     so there the method is left as written, and a source that is not a literal keeps its method. A
     Set Field always takes the picked method, so the row keeps reading back as ``set_field``.
     ``source`` is the already-spliced text, so the arguments read here are the ones the edit
-    wrote. ``before`` is the :func:`_argument_dump` of the call before the edit: an edit that
-    changed no argument, such as one that only respelled a string's quotes or dropped a ``u``
+    wrote. ``before`` is the call before the edit, compared by :func:`_argument_dump`: an edit
+    that changed no argument, such as one that only respelled a string's quotes or dropped a ``u``
     prefix, leaves the write as written.
 
-    ``path_only`` says the edit moved a Set Field's path and kept its value. A ``set_data`` such an
-    edit would move into a whole field as ``set`` is refused: ``set_data`` wrote that value as
-    data, and ``set`` would turn its separators into structure. Keeping ``set_data`` there instead
-    would leave a line the recognizer reads as code, so the edit is refused rather than guessed."""
+    A Set Field edit that moves its path off a literal leaf into a whole field and keeps its value
+    is refused when the picked write is ``set`` and the value is not plain text. At the leaf either
+    write escaped the value, so it was data, and ``set`` into a whole field would turn its
+    separators into structure. Keeping ``set_data`` instead would leave a line the recognizer reads
+    as code, so the edit is refused rather than guessed. Whether the value was kept is read from
+    the arguments, not from which parameters the edit named."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -2683,7 +2680,7 @@ def _repick_write(
     if len(found) != 1:
         return source
     call = found[0]
-    if _argument_dump(call) == before:
+    if _argument_dump(call) == _argument_dump(before):
         return source
     func = call.func
     assert isinstance(func, ast.Attribute)
@@ -2691,16 +2688,11 @@ def _repick_write(
     field_call = _msg_field_source(value)
     if field_call is None:
         want = _template_write_method(value, dst)
-        if (
-            path_only
-            and func.attr == "set_data"
-            and want == "set"
-            and not _is_leaf_literal(getattr(dst, "value", None))
-        ):
+        if want == "set" and _moves_data_off_a_leaf(before, dst, value):
             raise LensRewriteError(
-                "this path edit would move a value written with msg.set_data into a whole field, "
-                "where the Steps view writes msg.set and the value's separators would become "
-                "structure: a value written as data stays data - edit it as text"
+                "this path edit would move a value written as data at a component or "
+                "subcomponent into a whole field, where msg.set would make its separators "
+                "structure - edit it as text"
             )
     else:
         src = getattr(field_call.args[0], "value", None)
@@ -2712,6 +2704,28 @@ def _repick_write(
     data = source.encode("utf-8")
     end = _line_byte_starts(data)[(func.end_lineno or func.lineno) - 1] + func.end_col_offset
     return (data[: end - len(func.attr)] + want.encode("ascii") + data[end:]).decode("utf-8")
+
+
+def _moves_data_off_a_leaf(before: ast.AST, dst: ast.expr, value: ast.expr) -> bool:
+    """Whether an edit of a write ``before`` moved its destination off a literal leaf into a whole
+    field, to ``dst``, and kept a ``value`` that is not plain text.
+
+    Plain text is a string literal holding no separator the lens tests for, nor ``|``; ``set``
+    writes it the same at a leaf and in a whole field, so moving it changes nothing."""
+    if not isinstance(before, ast.Call) or len(before.args) != 2:
+        return False
+    old_dst, old_value = before.args
+    if not _is_leaf_literal(getattr(old_dst, "value", None)):
+        return False
+    if _is_leaf_literal(getattr(dst, "value", None)):
+        return False
+    if _argument_dump(old_value) != _argument_dump(value):
+        return False
+    text = getattr(value, "value", None) if isinstance(value, ast.Constant) else None
+    plain = isinstance(text, str) and not any(
+        char in _AUTHORED_STRUCTURE or char == "|" for char in text
+    )
+    return not plain
 
 
 def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line_end: int) -> None:

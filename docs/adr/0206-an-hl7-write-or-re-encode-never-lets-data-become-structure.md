@@ -131,12 +131,15 @@ open points settled below.
   (component) and `*` (element). Its destination is not a literal leaf. The pick runs on insert
   and on an edit of the value or the path. The recognizer reads such a `msg.set_data` back as
   `set_field`. At a literal leaf destination it reads any `msg.set_data` that is not a copy back
-  as `set_field`, whatever the value, because there the two writes are the same. A path edit that
-  would move such a line into a whole field, where the lens would write `msg.set`, is refused:
-  `msg.set_data` wrote that value as data, and `msg.set` would make its separators structure. A
-  `msg.set_data` into a whole field whose template text holds one of those separators, such as
-  `MRN: `, reads as a `code` row, because the lens never writes that line. A whole-field read is
-  raw text with its structure, so it keeps `msg.set`. Text holding one of those separators is structure the
+  as `set_field`, whatever the value, because there the two writes are the same. An edit that
+  moves a Set Field's path off a literal leaf into a whole field and keeps its value is refused
+  when the lens would write `msg.set` there and the value is not plain text, whichever write the
+  line was spelled with. At the leaf either write escaped the value, so it was data, and
+  `msg.set` would make its separators structure. Whether the value was kept is read from the
+  arguments, so naming it unchanged in the same edit is refused too. A `msg.set_data` into a whole
+  field whose template text holds one of those separators, such as `MRN: `, reads as a `code`
+  row, because the lens never writes that line. A whole-field read is raw text with its
+  structure, so it keeps `msg.set`. Text holding one of those separators is structure the
   author wrote, so it keeps `msg.set` too, and the lint still flags a leaf it copies. A field
   separator in the text does not keep `msg.set`. `set` refuses one in a whole field, so it can only
   mean data. At a literal leaf destination the lens writes `msg.set`. An edit that changes no
@@ -332,10 +335,11 @@ than one `MSH` is left to its own item.
   `^ ~ & \ : > *`, THE SYSTEM SHALL write it with `set_data` on insert and on an edit of its value
   or path, and read it back as `set_field`; WHEN its text holds one, THE SYSTEM SHALL keep `set`.
   WHEN a `set_data` call that is not a copy writes a literal leaf, THE SYSTEM SHALL read it back as
-  `set_field`, whatever its value; and WHEN a path edit would move it into a whole field as `set`,
-  THE SYSTEM SHALL refuse the edit. WHEN an edit changes no argument, including one that only respells quotes or
-  drops a `u` prefix, THE SYSTEM SHALL leave its write alone. WHEN such a `set_data` line runs on an
-  X12 message, THE SYSTEM SHALL write the value as `set` writes it, and SHALL raise `ValueError`
+  `set_field`, whatever its value. WHEN an edit moves a Set Field's path off a literal leaf into a
+  whole field, keeps a value that is not plain text, and would write it with `set`, THE SYSTEM
+  SHALL refuse the edit, whichever write the line was spelled with. WHEN an edit changes no
+  argument, including one that only respells quotes or drops a `u` prefix, THE SYSTEM SHALL leave
+  its write alone. WHEN such a `set_data` line runs on an X12 message, THE SYSTEM SHALL write the value as `set` writes it, and SHALL raise `ValueError`
   rather than write the component separator into a whole element.
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_inserts_a_copy_from_a_leaf_with_set_data_and_reads_it_back`
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_keeps_set_for_a_whole_field_or_an_expression_source`
@@ -356,6 +360,7 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_a_set_data_template_into_a_leaf_still_reads_back_as_set_field`
   -> `tests/test_data_never_becomes_structure.py::test_any_set_data_value_into_a_leaf_reads_back_as_set_field`
   -> `tests/test_data_never_becomes_structure.py::test_a_path_edit_never_moves_a_leafs_data_write_into_a_whole_field_as_set`
+  -> `tests/test_data_never_becomes_structure.py::test_a_path_edit_that_keeps_the_meaning_is_not_refused`
   -> `tests/test_data_never_becomes_structure.py::test_a_set_data_template_holding_a_colon_is_a_code_row`
   -> `tests/test_data_never_becomes_structure.py::test_the_no_change_test_leaves_the_tree_it_reads_as_it_was`
   -> `tests/test_x12_parsing.py::test_set_data_is_set_on_an_x12_message_and_keeps_one_component`

@@ -1152,20 +1152,40 @@ def test_any_set_data_value_into_a_leaf_reads_back_as_set_field(value: str) -> N
     assert row["action"] == "set_field"
 
 
+@pytest.mark.parametrize("method", ["set", "set_data"])
 @pytest.mark.parametrize(
     "value",
     [
-        pytest.param('"A^B"', id="plain-literal"),
+        pytest.param('"A^B"', id="literal-with-a-separator"),
+        pytest.param('"A:B"', id="literal-with-an-x12-separator"),
         pytest.param("family", id="expression"),
         pytest.param("f\"A^{msg['PID-3.1'] or ''}\"", id="authored-structure"),
     ],
 )
-def test_a_path_edit_never_moves_a_leafs_data_write_into_a_whole_field_as_set(value: str) -> None:
-    # set_data wrote the value as data at the leaf; set into a whole field would make its
-    # separators structure, and set_data there would not read back as a step. So it is refused.
-    source = LENS_SOURCE + f'    msg.set_data("PV1-19.1", {value})\n'
+def test_a_path_edit_never_moves_a_leafs_data_write_into_a_whole_field_as_set(
+    method: str, value: str
+) -> None:
+    # At a leaf either write escaped the value, so it was data; set into a whole field would make
+    # its separators structure, and set_data there would not read back as a step. So it is refused.
+    source = LENS_SOURCE + f'    msg.{method}("PV1-19.1", {value})\n'
     with pytest.raises(LensRewriteError, match="as data"):
         _set_path(source, "PV1-19")
+    # Naming the value too, unchanged, is the same edit.
+    row = _native_rows(source)[-1]
+    if value != "family":
+        parts = row.get("param_parts", {}).get("value")
+        resent = {"parts": parts} if parts is not None else ast.literal_eval(value)
+        with pytest.raises(LensRewriteError, match="as data"):
+            rewrite_source(
+                source,
+                {
+                    "op": "set_params",
+                    "line_start": row["line_start"],
+                    "line_end": row["line_end"],
+                    "params": {"path": "PV1-19", "value": resent},
+                },
+                contract=CONTRACT_V2,
+            )
     # Another leaf is fine: there the two writes are the same.
     assert _native_rows(_set_path(source, "PV1-20.1"))[-1]["action"] == "set_field"
     # A value edit is the author writing anew, so the pick runs as it does on insert.
@@ -1173,10 +1193,36 @@ def test_a_path_edit_never_moves_a_leafs_data_write_into_a_whole_field_as_set(va
         assert _set_value(source, "C^D").endswith('    msg.set("PV1-19.1", "C^D")\n')
 
 
+@pytest.mark.parametrize(
+    ("line", "path", "want"),
+    [
+        pytest.param('msg.set("PV1-19.1", "AB")', "PV1-19", 'msg.set("PV1-19", "AB")', id="plain"),
+        pytest.param(
+            "msg.set_data(\"PV1-19\", f\"{msg['PID-3.1'] or ''}\")",
+            "PV1-20",
+            "msg.set_data(\"PV1-20\", f\"{msg['PID-3.1'] or ''}\")",
+            id="whole-to-whole-data-template",
+        ),
+        pytest.param(
+            "msg.set_data(\"PV1-19.1\", f\"{msg['PID-3.1'] or ''}\")",
+            "PV1-19",
+            "msg.set_data(\"PV1-19\", f\"{msg['PID-3.1'] or ''}\")",
+            id="leaf-to-whole-data-template",
+        ),
+        pytest.param(
+            'msg.set("PV1-19", family)', "PV1-19.1", 'msg.set("PV1-19.1", family)', id="to-leaf"
+        ),
+    ],
+)
+def test_a_path_edit_that_keeps_the_meaning_is_not_refused(line: str, path: str, want: str) -> None:
+    out = _set_path(LENS_SOURCE + f"    {line}\n", path)
+    assert out.splitlines()[-1] == f"    {want}"
+
+
 def test_a_set_data_template_holding_a_colon_is_a_code_row() -> None:
     # The X12 separators keep set, so the lens never writes this line, and it reads as code.
     source = LENS_SOURCE + "    msg.set_data(\"PV1-19\", f\"MRN: {msg['PID-3.1'] or ''}\")\n"
-    assert _native_rows(source)[-1].get("action") != "set_field"
+    assert _native_rows(source)[-1]["kind"] == "code"
 
 
 def test_the_no_change_test_leaves_the_tree_it_reads_as_it_was() -> None:
