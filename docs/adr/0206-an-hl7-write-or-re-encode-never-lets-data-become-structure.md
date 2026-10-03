@@ -126,20 +126,28 @@ open points settled below.
   the record of that decision; `docs/STEPS-PALETTE.md` shows the new one. *Added in the final repair
   round:* a native Set Field whose value is a template is picked the same way. The write is
   `msg.set_data` when three things hold. Every read in the template is a literal component or
-  subcomponent path. Its own text holds no component, repetition, subcomponent or escape
-  character. Its destination is not a literal leaf. The pick runs on insert and on an edit of the
-  value or the path. The recognizer reads such a `msg.set_data` back as `set_field`, at a leaf
-  destination too, where the two writes are the same. A whole-field read is raw text with its
-  structure, so it keeps `msg.set`. Text holding one of those delimiters is structure the author
-  wrote, so it keeps `msg.set` too, and the lint still flags a leaf it copies. A field separator in
-  the text does not keep `msg.set`. `set` refuses one in a whole field, so it can only mean data. At
-  a literal leaf destination the lens writes `msg.set`. An edit that changes no argument leaves the
-  write as written, even when it respells a string's quotes. The lens cannot know a message's own
-  separators, so it tests the standard ones. It cannot tell an X12 handler from an HL7 one either.
-  An X12 composite path such as `CLM-05.1` reads as a leaf, so a Set Field template over one is
-  written `msg.set_data`. The X12 message gained a `set_data` for that line, which raised
-  `AttributeError` before. It is the X12 `set`, except that a whole element also refuses the
-  component separator. X12 has no escape, so refusing is how the value stays data. A Copy Field on
+  subcomponent path. Its own text holds no separator in common use in either format: the HL7
+  component, repetition, subcomponent and escape characters `^ ~ & \`, and the X12 `:` and `>`
+  (component) and `*` (element). Its destination is not a literal leaf. The pick runs on insert
+  and on an edit of the value or the path. The recognizer reads such a `msg.set_data` back as
+  `set_field`. At a literal leaf destination it reads any `msg.set_data` back as `set_field`,
+  whatever the value, because there the two writes are the same. A whole-field read is raw text
+  with its structure, so it keeps `msg.set`. Text holding one of those separators is structure the
+  author wrote, so it keeps `msg.set` too, and the lint still flags a leaf it copies. A field
+  separator in the text does not keep `msg.set`. `set` refuses one in a whole field, so it can only
+  mean data. At a literal leaf destination the lens writes `msg.set`. An edit that changes no
+  argument leaves the write as written, even when it respells a string's quotes or drops a `u`
+  prefix. The lens cannot know a message's own separators, and it cannot tell an X12 handler from
+  an HL7 one, so it tests the separators in common use in both. An X12 composite path such as
+  `CLM-05.1` reads as a leaf, so a Set Field template over one is written `msg.set_data`. The X12
+  message gained a `set_data` for that line, which raised `AttributeError` before. It is the X12
+  `set`, except that a whole element also refuses the component separator. X12 has no escape, so
+  refusing is how the value stays data. `set_data` receives the value already built, so it cannot
+  tell a separator the author typed from one a read returned. That is why the lens keeps `set` for
+  a template whose text holds `:` or `>`: the author typed it as structure, and `set_data` would
+  refuse it on every X12 message. A component separator outside that set is the miss, and it fails
+  loud: X12 `set_data` raises rather than write it. Each separator added costs the other way, since
+  an HL7 template that keeps `set` lets a decoded leaf's separators become structure. A Copy Field on
   X12 still fails, because `X12Message` has no `field` method. That was true before this ADR, and
   it is not changed here. At least four template
   writes into a whole field still take decoded text as structure and are not changed here: the
@@ -314,10 +322,14 @@ than one `MSH` is left to its own item.
 - **AC-6** -- WHEN the Steps view inserts a Copy Field from a literal leaf, THE SYSTEM SHALL emit
   `set_data` and read the line back as the same `copy_field` row; and WHEN an edit moves a copy's
   source or destination across that line, THE SYSTEM SHALL re-pick `set` or `set_data`. WHEN a Set
-  Field template reads only literal leaves into a whole field, and its text holds no component,
-  repetition, subcomponent or escape character, THE SYSTEM SHALL write it with `set_data` and read
-  it back as `set_field`. WHEN an edit changes no argument, THE SYSTEM SHALL leave its write alone.
-  WHEN such a template is written to an X12 message, THE SYSTEM SHALL keep the value one component.
+  Field template reads only literal leaves into a whole field, and its text holds none of
+  `^ ~ & \ : > *`, THE SYSTEM SHALL write it with `set_data` on insert and on an edit of its value
+  or path, and read it back as `set_field`; WHEN its text holds one, THE SYSTEM SHALL keep `set`.
+  WHEN a `set_data` call writes a literal leaf, THE SYSTEM SHALL read it back as `set_field`,
+  whatever its value. WHEN an edit changes no argument, including one that only respells quotes or
+  drops a `u` prefix, THE SYSTEM SHALL leave its write alone. WHEN such a `set_data` line runs on an
+  X12 message, THE SYSTEM SHALL write the value as `set` writes it, and SHALL raise `ValueError`
+  rather than write the component separator into a whole element.
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_inserts_a_copy_from_a_leaf_with_set_data_and_reads_it_back`
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_keeps_set_for_a_whole_field_or_an_expression_source`
   -> `tests/test_data_never_becomes_structure.py::test_a_copy_edited_from_a_leaf_to_a_whole_field_source_writes_with_set`
@@ -332,9 +344,14 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_a_set_field_path_edit_re_picks_the_write`
   -> `tests/test_data_never_becomes_structure.py::test_an_edit_that_changes_nothing_leaves_a_hand_written_write_alone`
   -> `tests/test_data_never_becomes_structure.py::test_an_edit_that_only_respells_a_quote_leaves_the_write_alone`
+  -> `tests/test_data_never_becomes_structure.py::test_an_edit_that_only_drops_a_u_prefix_leaves_the_write_alone`
+  -> `tests/test_data_never_becomes_structure.py::test_a_set_field_template_holding_an_x12_separator_keeps_set`
   -> `tests/test_data_never_becomes_structure.py::test_a_set_data_template_into_a_leaf_still_reads_back_as_set_field`
+  -> `tests/test_data_never_becomes_structure.py::test_any_set_data_value_into_a_leaf_reads_back_as_set_field`
   -> `tests/test_x12_parsing.py::test_set_data_is_set_on_an_x12_message_and_keeps_one_component`
   -> `tests/test_x12_parsing.py::test_the_lens_set_field_template_line_runs_on_an_x12_message`
+  -> `tests/test_x12_parsing.py::test_a_lens_template_whose_text_holds_the_component_separator_runs_on_x12`
+  -> `tests/test_x12_parsing.py::test_a_path_edit_keeps_set_for_a_template_holding_the_component_separator`
 - **AC-7** -- WHEN the delimiter override rewrites a message, THE SYSTEM SHALL keep every leaf reading
   the same under the target set: a target delimiter inside a leaf is escaped with the target escape
   character, a separator escape is decoded against the source set and re-escaped against the target
