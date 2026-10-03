@@ -187,8 +187,6 @@ _RETRIED = frozenset({WAIT, LAPSES_FIRST, RETRY, NO_ISSUER})
 #: :data:`LAPSES_FIRST` is a fix too, and the most urgent one: every peer is refused, restart or not.
 _PRECEDENCE = (FIX, BAD_SIGNATURE, _NOT_PROVABLE, LAPSES_FIRST, RESTART, NO_ISSUER, RETRY, WAIT)
 _RANK = {remedy: rank for rank, remedy in enumerate(_PRECEDENCE)}
-#: The remedies that say only time is missing.
-_TIME_ONLY = frozenset({WAIT, LAPSES_FIRST})
 #: The remedies that send the operator to a restart, which fails while the file is not in effect.
 _SAYS_RESTART = frozenset({RESTART, NO_ISSUER, RETRY, _NOT_PROVABLE})
 
@@ -463,6 +461,9 @@ def _reload_path(
         facts, blocks = judge_crl_bytes(pem, label=label, now=now, require_in_effect=False)
         verdicts: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         timing: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
+        # Every stale context, with the verdict that holds it back, if any. Each still gets the
+        # per-context file checks below, since a file a start would refuse, or would load and then
+        # fail every handshake on, outranks a restart or a wait.
         ready: list[tuple[ssl.SSLContext, HeldCrl, tuple[str, str] | None]] = []
         for ctx, held in stale:
             # First, for every context: does some CRL it holds lapse before the file can apply?
@@ -472,27 +473,22 @@ def _reload_path(
             if (late := timing[held.blocks]) is not None and late[1] == LAPSES_FIRST:
                 refusals.add(f"{label}: {late[0]}", LAPSES_FIRST)
             if held.reloads >= max_reloads:
-                refusals.add(
-                    f"{label}: this hop has taken {held.reloads} CRL reloads, and each one stays in "
-                    "its trust store ([cert_monitor].crl_max_reloads)",
-                    RESTART,
+                capped = (
+                    f"this hop has taken {held.reloads} CRL reloads, and each one stays in its "
+                    "trust store ([cert_monitor].crl_max_reloads)"
                 )
+                ready.append((ctx, held, (capped, RESTART)))
                 continue
             if held.blocks not in verdicts:
                 verdicts[held.blocks] = supersede_refusal(held.blocks, blocks, now=now)
-            wait = verdicts[held.blocks]
-            if wait is not None and wait[1] not in _TIME_ONLY:
-                refusals.add(f"{label}: {wait[0]}", wait[1])
-                continue
-            ready.append((ctx, held, wait))
+            ready.append((ctx, held, verdicts[held.blocks]))
         with staged_crl(pem) as copy:
-            # OpenSSL's own reading of the file, whether or not any context is ready: a file a start
-            # would refuse is a file to fix, which outranks every verdict above.
+            # OpenSSL's own reading of the file first: a file a start would refuse is a file to
+            # fix, which outranks every verdict above.
             certificates = _certificates_in(copy, blocks, label=label)
-            if ready:
-                reloaded = _load(
-                    pem, copy, certificates, label, ready, refusals, fingerprint, facts, blocks
-                )
+            reloaded = _load(
+                pem, copy, certificates, label, ready, refusals, fingerprint, facts, blocks
+            )
     except _NotProvable as exc:
         refusals.add(str(exc), _NOT_PROVABLE)
     except (ValueError, ssl.SSLError) as exc:
@@ -539,13 +535,16 @@ def _load(
 ) -> int:
     """Load the staged ``copy`` into each context in ``ready`` that passes the per-context checks.
 
-    A context paired with a wait gets the checks and then the wait, so a file to fix is reported
-    as one even before it takes effect. Returns how many contexts now hold the file. A failure in
+    A context paired with a verdict (a wait, a restart) gets the checks and then that verdict, so a
+    file to fix is reported as one whatever else holds the context back. Returns how many contexts now hold the file. A failure in
     one context is that context's refusal alone, retried next pass: the contexts already loaded
     stay counted, and the rest are still tried."""
     reloaded = 0
     signatures: dict[frozenset[bytes], tuple[str, bool] | None] = {}
-    for ctx, held, wait in ready:
+    for ctx, held, held_back in ready:
+        if held_back is not None:
+            # Recorded first, so a file check below that ranks lower cannot hide it.
+            refusals.add(f"{label}: {held_back[0]}", held_back[1])
         try:
             anchors = frozenset(ctx.get_ca_certs(binary_form=True))
             if certificates - anchors:
@@ -562,8 +561,7 @@ def _load(
                 why, found = unsigned
                 refusals.add(f"{label}: {why}", BAD_SIGNATURE if found else NO_ISSUER)
                 continue
-            if wait is not None:
-                refusals.add(f"{label}: {wait[0]}", wait[1])
+            if held_back is not None:
                 continue
             ctx.load_verify_locations(cafile=str(copy))  # cafile= ONLY: cadata= loads no CRL
         except Exception as exc:

@@ -1180,3 +1180,27 @@ def test_a_start_on_a_context_that_already_holds_crls_still_counts_them(
     monkeypatch.setattr(tls_policy_module, "judge_crl_bytes", one_more)
     with pytest.raises(ValueError, match="OpenSSL loads 1 CRL"):
         harden_crl_check(hop, str(pki.crl), setting="[tls].crl_file")
+
+
+@pytest.mark.parametrize("bad", ["planted-ca", "forged"])
+def test_a_file_to_fix_is_reported_for_a_context_at_the_cap(
+    pki: _Pki, tmp_path: Path, bad: str
+) -> None:
+    # A context the cap holds back still gets the file checks: a restart would refuse a planted
+    # CA, and would load a forged CRL that then fails every handshake it judges.
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+    assert (first := _reload(pki, max_reloads=1)) is not None and first.reloaded == 1
+    if bad == "planted-ca":
+        replacement, remedy = _planted_bundle(pki, tmp_path), FIX
+    else:
+        signer = ec.generate_private_key(ec.SECP256R1())
+        replacement = pki.crl_pem(issued=0.5 * _DAY, lasts=90 * _DAY, signer=signer)
+        remedy = BAD_SIGNATURE
+    pki.crl.write_bytes(replacement)
+
+    outcome = _reload(pki, max_reloads=1)
+
+    assert outcome is not None and outcome.refusal is not None
+    assert outcome.refusal.remedy == remedy
+    assert _accepts(hop, pki.server())
