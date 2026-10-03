@@ -168,8 +168,8 @@ def test_serve_still_refuses_with_no_destination_list(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"]) == 2
     err = capsys.readouterr().err
-    assert "outbound egress is UNRESTRICTED on a production PHI instance" in err
-    assert "Set [security].block_unlisted_outbound=true" in err
+    assert "no outbound destination is declared on a production PHI instance" in err
+    assert "every outbound would be refused" in err
 
 
 def test_serve_passes_the_egress_gate_when_the_switch_is_written_true(
@@ -185,4 +185,8 @@ def test_serve_passes_the_egress_gate_when_the_switch_is_written_true(
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"])
-    assert "egress is UNRESTRICTED" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "no outbound destination is declared" not in err
+    # Positive evidence that control got PAST the egress gate: the off-box log gate, which `_serve`
+    # runs after it, is what speaks. A refusal at an earlier gate would not print this.
+    assert "must forward its logs off-box" in err

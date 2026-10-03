@@ -833,7 +833,9 @@ def test_serve_refuses_open_egress_in_prod(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"]) == 2
     err = capsys.readouterr().err
-    assert "egress is UNRESTRICTED on a production" in err
+    # Nothing declared and the switch unset: every outbound would be refused under the deny
+    # default (vault BACKLOG #2605), and the refusal says so rather than "unrestricted".
+    assert "no outbound destination is declared on a production" in err
 
 
 def test_serve_warns_open_egress_in_staging(
@@ -850,7 +852,7 @@ def test_serve_warns_open_egress_in_staging(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 0
     err = capsys.readouterr().err
-    assert "egress is UNRESTRICTED in a PHI-carrying environment" in err and "staging" in err
+    assert "no outbound destination is declared on a PHI instance" in err and "staging" in err
 
 
 # --- C3: required active environment + custom-name posture (ADR 0017) --------

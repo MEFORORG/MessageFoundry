@@ -953,8 +953,8 @@ async def test_reference_runner_follower_converges_without_materializing(tmp_pat
         store,  # type: ignore[arg-type]
         lambda: [_file_spec(tmp_path)],
         ReferenceSettings(),
-        coordinator=_NotLeaderCoordinator(),
-        egress=EgressSettings(deny_by_default=False),  # is_leader False
+        coordinator=_NotLeaderCoordinator(),  # is_leader False
+        egress=EgressSettings(deny_by_default=False),
     )
     result = await runner.run_once(force=True)
     assert store.writes == 0  # follower never re-reads the source
@@ -970,8 +970,8 @@ async def test_reference_runner_leader_materializes_and_converges(tmp_path: Path
         store,  # type: ignore[arg-type]
         lambda: [_file_spec(tmp_path)],
         ReferenceSettings(),
-        coordinator=_LeaderCoordinator(),
-        egress=EgressSettings(deny_by_default=False),  # is_leader True, is_clustered True
+        coordinator=_LeaderCoordinator(),  # is_leader True, is_clustered True
+        egress=EgressSettings(deny_by_default=False),
     )
     result = await runner.run_once(force=True)
     assert store.writes == 1  # leader re-reads the source and writes the shared snapshot

@@ -532,10 +532,8 @@ async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
         claim_mode="pooled",
         alert_sink=sink,
         infra_fault_stop_after=1,  # the first zero-progress infra fault STOPs the lane
-        infra_fault_backoff_cap=0.05,
-        egress=EgressSettings(
-            deny_by_default=False
-        ),  # so a re-armed lane re-claims the re-pended head at once
+        infra_fault_backoff_cap=0.05,  # so a re-armed lane re-claims the re-pended head at once
+        egress=EgressSettings(deny_by_default=False),
     )
     attempts = 0
 
@@ -597,10 +595,8 @@ async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_windo
         claim_mode="pooled",
         alert_sink=_LogPageSink(),
         infra_fault_stop_after=1,  # the first zero-progress infra fault STOPs the lane
-        infra_fault_backoff_cap=0.05,
-        egress=EgressSettings(
-            deny_by_default=False
-        ),  # so a re-armed lane re-claims the re-pended head at once
+        infra_fault_backoff_cap=0.05,  # so a re-armed lane re-claims the re-pended head at once
+        egress=EgressSettings(deny_by_default=False),
     )
     attempts = 0
 

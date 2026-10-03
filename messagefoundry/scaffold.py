@@ -112,7 +112,7 @@ port = 8765
 # production_instance = true          # production tier? (drives the prod-DEBUG refusal + the AI data-scope ceiling)
 # EVERY instance carries patient data (ADR 0186) - there is no data-class switch to set here, and the
 # retired one is REFUSED at load. To relax a specific PHI gate, name that gate's own switch.
-# block_unlisted_outbound = true      # lock outbound destinations down (recommended for Test/Prod)
+# block_unlisted_outbound = false     # the audited opt-out: an empty [egress] list allows any destination
 
 [ai]
 # The active-environment NAME — REQUIRED (also passable as `serve --env <name>`). Free-form: name

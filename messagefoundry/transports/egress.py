@@ -70,7 +70,8 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
     (today: the DATABASE source, which polls a SQL host). Reuses ``[egress].allowed_db``: although the
     DB source pulls data *in* rather than exfiltrating it, it still opens an outbound connection to an
     operator-named host, so the same allowlist guards against pointing the engine at an arbitrary
-    server. Opt-in (an empty list = unrestricted), matching destinations; checked at load/reload/start.
+    server. Matches destinations: an empty list refuses under the default ``deny_by_default`` and is
+    unrestricted only under the audited opt-out; checked at load/reload/start.
 
     A TCP/MLLP/File *source* is a local **listener** (it binds ``[inbound].bind_host`` and waits for
     peers, never dialing out), so there is nothing to connect-gate here — ``[egress].allowed_tcp``
@@ -125,7 +126,7 @@ def check_lookup_allowed(
     label: str = "DatabaseLookup",
 ) -> None:
     """Fail-closed connect-allowlist for a ``DatabaseLookup`` (it dials out to a SQL host for a live,
-    read-only ``db_lookup``). Reuses ``[egress].allowed_db`` (opt-in; an empty list = unrestricted), like
+    read-only ``db_lookup``). Reuses ``[egress].allowed_db`` (an empty list refuses unless opted out), like
     the DATABASE source — checked at load/reload/start so the engine is never pointed at a non-allowlisted
     server. ``settings`` are the already-``env()``-resolved connection settings. Under
     ``[egress].deny_by_default`` an empty ``allowed_db`` refuses the lookup outright. ``label`` names
@@ -248,7 +249,7 @@ def _check_forward_proxy_egress(
         raise WiringError(
             f"{label}: a forward proxy is configured but [egress].allowed_proxy is empty — list the "
             "proxy host to permit it (the proxy receives a Proxy-Authorization credential, so this "
-            "list is deny-by-default, unlike the [egress].allowed_* destination lists)"
+            "list is deny-by-default even under [security].block_unlisted_outbound = false)"
         )
     if not _http_egress_allowed(proxy_url, allowed_proxy):
         host = _egress_host_label(proxy_url)
@@ -626,11 +627,4 @@ def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
         port = parts.port
     except ValueError:
         return False
-    host = (parts.hostname or "").lower()
-    for entry in allowed:
-        allow_host, _, allow_port = entry.partition(":")
-        if allow_host.strip().lower() == host and (
-            not allow_port or str(port) == allow_port.strip()
-        ):
-            return True
-    return False
+    return host_port_allowed(parts.hostname or "", port, allowed)
