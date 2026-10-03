@@ -22,7 +22,7 @@ is pure and tested; the ``winreg`` read and write is Windows-only and guarded.
 from __future__ import annotations
 
 import contextlib
-import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,10 +32,6 @@ _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _VALUE_NAME = "MessageFoundryTray"
 _MODULE = "messagefoundry.tray"
 
-#: An argument made only of these characters goes into the command unquoted: a flag, an option
-#: value, a module name. Anything else, a path above all, is quoted.
-_BARE_ARGUMENT = re.compile(r"[\w.-]+")
-
 
 def pythonw_executable(executable: str | None = None) -> str:
     """The console-less interpreter to launch with: the ``pythonw.exe`` beside ``sys.executable``."""
@@ -44,26 +40,14 @@ def pythonw_executable(executable: str | None = None) -> str:
     return str(candidate if candidate.exists() else exe)
 
 
-def _run_key_argument(argument: str) -> str:
-    """One argument, written so the Windows command-line parser reads it back unchanged.
-
-    Inside quotes a run of backslashes is literal unless a quote follows it, so a run at the end is
-    doubled. A Windows path cannot hold a quote, so one here is refused rather than escaped.
-    """
-    if _BARE_ARGUMENT.fullmatch(argument):
-        return argument
-    if '"' in argument:
-        raise ValueError(f"a Run-key argument cannot carry a quote: {argument!r}")
-    trailing = len(argument) - len(argument.rstrip("\\"))
-    return f'"{argument}{"\\" * trailing}"'
-
-
 def launcher_command(pythonw: str | None = None) -> str:
-    """The HKCU Run command string, built from :func:`~messagefoundry.childenv.python_child_argv`:
-    ``"<abs pythonw.exe>" -P -X disable-remote-debug "<abs _child_bootstrap.py>" messagefoundry.tray``.
+    """The HKCU Run command string: :func:`~messagefoundry.childenv.python_child_argv` joined by
+    ``subprocess.list2cmdline``, which quotes the way the Windows command-line parser reads back.
+    ``<abs pythonw.exe> -P -X disable-remote-debug <abs _child_bootstrap.py> messagefoundry.tray``.
     """
-    argv = python_child_argv(_MODULE, executable=pythonw or pythonw_executable())
-    return " ".join(_run_key_argument(argument) for argument in argv)
+    return subprocess.list2cmdline(
+        python_child_argv(_MODULE, executable=pythonw or pythonw_executable())
+    )
 
 
 def is_autostart_enabled() -> bool:

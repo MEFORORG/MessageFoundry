@@ -407,7 +407,12 @@ on its import path. When branding is unavailable, that first process runs the wh
 `childenv.python_child_argv` too: the absolute `pythonw.exe`, `-P -X disable-remote-debug`, then the
 bootstrap script by its absolute path. A script start never searches the working directory, so the
 login start no longer depends on the folder Windows starts it in. The limit above now holds only for
-a tray started by hand, as `messagefoundry-tray` or `pythonw -m messagefoundry.tray`. Windows still
+a tray started by hand, as `messagefoundry-tray` or `pythonw -m messagefoundry.tray`. **That limit
+stays, by decision: #2822 does not route a hand start through the bootstrap.** A hand start keeps
+remote debugging on. `pythonw -m` also puts the working directory first. The `messagefoundry-tray`
+launcher was not run to measure this, since it starts a real tray; its console twin
+`messagefoundry.exe`, the same form of launcher, did not search the working directory (measured
+2026-10-02, `docs/DANGEROUS-FUNCTIONALITY.md` section 3). Windows still
 hands the login start the user's environment unfiltered, so an empty or relative `PYTHONPATH` entry
 of the user's own would put the working directory back. `tests/test_tray_shell.py` pins the command
 and reads it back through Windows' own parser. `tests/test_tray_branding.py` starts a real process

@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from functools import cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -975,6 +975,24 @@ class _TrayProbe(NamedTuple):
     loaded: frozenset[str]
 
 
+def _run_marked_probe(code: str, *, path_head: Path | None = None) -> Any:
+    """Run `code` in a fresh interpreter and return the JSON it printed after `_PROBE_MARK`.
+
+    `path_head` is prepended to `PYTHONPATH` so a control can supply a name this environment may not
+    have installed."""
+    env = dict(os.environ)
+    if path_head is not None:
+        inherited = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{path_head}{os.pathsep}{inherited}" if inherited else str(path_head)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    marked = [ln for ln in result.stdout.splitlines() if ln.startswith(_PROBE_MARK)]
+    assert len(marked) == 1, f"the probe printed {len(marked)} marked lines: {result.stdout!r}"
+    return json.loads(marked[0].removeprefix(_PROBE_MARK))
+
+
 def _tray_import_probe(plant: str = "", *, path_head: Path | None = None) -> _TrayProbe:
     """Import the tray shell in a fresh interpreter and report what landed in `sys.modules`.
 
@@ -998,17 +1016,7 @@ def _tray_import_probe(plant: str = "", *, path_head: Path | None = None) -> _Tr
         f"print({_PROBE_MARK!r} + json.dumps("
         "{'found': sorted(found), 'loaded': sorted(loaded)}))\n"
     )
-    env = dict(os.environ)
-    if path_head is not None:
-        inherited = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = f"{path_head}{os.pathsep}{inherited}" if inherited else str(path_head)
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=300
-    )
-    assert result.returncode == 0, result.stderr
-    marked = [ln for ln in result.stdout.splitlines() if ln.startswith(_PROBE_MARK)]
-    assert len(marked) == 1, f"the probe printed {len(marked)} marked lines: {result.stdout!r}"
-    payload = json.loads(marked[0].removeprefix(_PROBE_MARK))
+    payload = _run_marked_probe(code, path_head=path_head)
     loaded = frozenset(payload["loaded"])
     # The tray import is the whole subject, and a plant runs BEFORE it, so without this line deleting
     # `import messagefoundry.tray.app` would leave every positive control below passing on the plant
@@ -1141,7 +1149,6 @@ _TRAY_START_LEAVES = (
     "messagefoundry.tray.branding",
 )
 _TRAY_START_LOADS = frozenset({"messagefoundry", "messagefoundry.childenv", "messagefoundry.tray"})
-_LEAF_MARK = "MEFOR-TRAY-LEAVES:"
 
 
 def _tray_leaf_probe(
@@ -1159,18 +1166,9 @@ def _tray_leaf_probe(
         "ours = sorted(m for m in new if m.partition('.')[0] == 'messagefoundry')\n"
         "other = sorted({m.partition('.')[0] for m in new} - set(sys.stdlib_module_names)\n"
         "               - {'messagefoundry'})\n"
-        f"print({_LEAF_MARK!r} + json.dumps([ours, other]))\n"
+        f"print({_PROBE_MARK!r} + json.dumps([ours, other]))\n"
     )
-    env = dict(os.environ)
-    if path_head is not None:
-        inherited = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = f"{path_head}{os.pathsep}{inherited}" if inherited else str(path_head)
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=300
-    )
-    assert result.returncode == 0, result.stderr
-    [line] = [ln for ln in result.stdout.splitlines() if ln.startswith(_LEAF_MARK)]
-    ours, other = json.loads(line.removeprefix(_LEAF_MARK))
+    ours, other = _run_marked_probe(code, path_head=path_head)
     return set(ours), set(other)
 
 

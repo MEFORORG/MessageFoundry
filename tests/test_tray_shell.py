@@ -9,6 +9,7 @@ logic and prove the Windows modules import + construct their structs cleanly.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import pytest
 
 from messagefoundry import _child_bootstrap
 from messagefoundry.childenv import python_child_argv
-from messagefoundry.tray.autostart import _run_key_argument, launcher_command, pythonw_executable
+from messagefoundry.tray.autostart import launcher_command, pythonw_executable
 from messagefoundry.tray.menu import Action, assign_command_ids, build_menu
 from messagefoundry.tray.state import StatusSnapshot, TrayState
 
@@ -70,20 +71,27 @@ def test_disabled_action_is_not_dispatchable() -> None:
     assert Action.EXIT in mapping.values()  # always available
 
 
-def test_launcher_command_starts_the_tray_through_the_bootstrap() -> None:
+@pytest.mark.parametrize(
+    ("pythonw", "written"),
+    [
+        (r"C:\repo\.venv\Scripts\pythonw.exe", r"C:\repo\.venv\Scripts\pythonw.exe"),
+        (r"C:\Program Files\Py\pythonw.exe", r'"C:\Program Files\Py\pythonw.exe"'),
+    ],
+)
+def test_launcher_command_starts_the_tray_through_the_bootstrap(pythonw: str, written: str) -> None:
     """Vault BACKLOG #2822: the login command starts the first tray process like the engine's own
-    Python children, so no working directory leads its import path. Typed out rather than read from
-    childenv, so the test does not check a list against itself."""
-    cmd = launcher_command(r"C:\repo\.venv\Scripts\pythonw.exe")
-    bootstrap = Path(_child_bootstrap.__file__).resolve()
-    assert cmd == (
-        rf'"C:\repo\.venv\Scripts\pythonw.exe" -P -X disable-remote-debug "{bootstrap}" '
-        "messagefoundry.tray"
+    Python children, so no working directory leads its import path. The flags are typed out rather
+    than read from childenv, so the test does not check a list against itself."""
+    bootstrap = subprocess.list2cmdline([str(Path(_child_bootstrap.__file__).resolve())])
+    assert launcher_command(pythonw) == (
+        f"{written} -P -X disable-remote-debug {bootstrap} messagefoundry.tray"
     )
 
 
 def _windows_argv(command_line: str) -> list[str]:
-    """``command_line`` split by Windows' own parser, ``CommandLineToArgvW``."""
+    """``command_line`` split by Windows' own parser, ``CommandLineToArgvW``. A local copy: the one
+    in ``tests/test_provision_first_administrator.py`` sits in a module that imports the CLI, the
+    store and auth, which a tray test has no reason to load."""
     if sys.platform != "win32":  # the skipif already guarantees it; this narrows mypy's linux pass
         pytest.skip("Win32 only")
     import ctypes
@@ -103,12 +111,7 @@ def _windows_argv(command_line: str) -> list[str]:
         kernel32.LocalFree(ctypes.cast(parsed, wintypes.HLOCAL))
 
 
-_WINDOWS_ONLY = pytest.mark.skipif(
-    sys.platform != "win32", reason="the Run key and its parser are Windows-only"
-)
-
-
-@_WINDOWS_ONLY
+@pytest.mark.skipif(sys.platform != "win32", reason="the Run key and its parser are Windows-only")
 @pytest.mark.parametrize(
     "pythonw",
     [r"C:\Program Files\Python 3.14\pythonw.exe", r"C:\repo\.venv\Scripts\pythonw.exe"],
@@ -119,18 +122,6 @@ def test_windows_reads_the_launcher_command_back_as_the_child_command_line(pytho
     assert _windows_argv(launcher_command(pythonw)) == python_child_argv(
         "messagefoundry.tray", executable=pythonw
     )
-
-
-@_WINDOWS_ONLY
-@pytest.mark.parametrize("argument", ["C:\\a b\\", "C:\\a\\\\", "C:\\a b", "-P", "x.y"])
-def test_windows_reads_each_quoted_argument_back_unchanged(argument: str) -> None:
-    # A backslash run before a closing quote is the case the quoting has to double.
-    assert _windows_argv(f'"C:\\x.exe" {_run_key_argument(argument)}') == ["C:\\x.exe", argument]
-
-
-def test_a_quote_in_a_run_key_argument_is_refused() -> None:
-    with pytest.raises(ValueError, match="quote"):
-        _run_key_argument('C:\\a"b')
 
 
 def test_pythonw_executable_falls_back_to_given_path(tmp_path: object) -> None:

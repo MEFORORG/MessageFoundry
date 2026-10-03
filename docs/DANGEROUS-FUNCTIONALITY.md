@@ -191,8 +191,14 @@ So a file or folder planted in its working directory, named like any module it i
 in its place. That holds whether or not the relaunch then works. The process also carries on as the
 tray itself in at least three cases. Branding is unavailable, the relaunch cannot start, or the
 branded child exits within a short grace window. `_CHILD_STARTUP_GRACE_S` in `tray/branding.py`
-sets that window. The `messagefoundry-tray` command is a launcher that the installer writes, and
-what it puts on the import path was not measured here.
+sets that window. **A tray started by hand is not routed through the script, by decision, and that
+limit is open.** The `messagefoundry-tray` command is a launcher the installer writes. It was not
+run to measure this, because it starts a real tray. Its console twin from the same install,
+`messagefoundry.exe`, has the same form: a small program with the entry-point script archived
+inside it. Run from a working directory holding a decoy `messagefoundry` package,
+`messagefoundry.exe --version` loaded the real package, while `python -m messagefoundry --version`
+loaded the decoy. Measured 2026-10-02 on Windows, Python 3.14.6. Either way that start keeps remote
+debugging on, because a launcher passes no interpreter option.
 
 ---
 

@@ -17,6 +17,7 @@ import pytest
 import messagefoundry
 from messagefoundry import _child_bootstrap
 from messagefoundry.tray import autostart, branding
+from tests.test_isolated_launch import _decoy
 
 
 def test_build_version_info_is_self_consistent() -> None:
@@ -146,11 +147,7 @@ def _probe_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
     probe_dir = tmp_path / "probe"
     probe_dir.mkdir()
     (probe_dir / f"{_PROBE_MODULE}.py").write_text(_PROBE_SOURCE, encoding="utf-8")
-    cwd = tmp_path / "cwd"
-    decoy = cwd / "messagefoundry"
-    decoy.mkdir(parents=True)
-    (decoy / "__init__.py").write_text("raise SystemExit('the decoy answered')\n", encoding="utf-8")
-    return probe_dir, cwd, tmp_path / "report.json"
+    return probe_dir, _decoy(tmp_path), tmp_path / "report.json"
 
 
 def _assert_started_through_the_bootstrap(report: Path) -> dict[str, Any]:
@@ -173,8 +170,9 @@ def test_the_login_command_starts_a_real_first_process_through_the_bootstrap(
     probe_dir, cwd, report = _probe_layout(tmp_path)
     command = autostart.launcher_command(sys.executable)
     assert command.endswith(" messagefoundry.tray"), command
-    # A temporary path holds no quote, and does not end in a backslash.
-    command = command.removesuffix("messagefoundry.tray") + f'{_PROBE_MODULE} "{report}"'
+    command = command.removesuffix("messagefoundry.tray") + subprocess.list2cmdline(
+        [_PROBE_MODULE, str(report)]
+    )
     env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONSAFEPATH"}
     env["PYTHONPATH"] = str(probe_dir)
     done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
