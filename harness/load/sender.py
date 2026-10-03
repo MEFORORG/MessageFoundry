@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import random
 import time
 from collections import deque
@@ -28,7 +29,9 @@ from harness.load.correlator import Correlator
 from harness.load.failover_track import FailoverTracker
 from harness.load.metrics import LiveMetrics
 from harness.load.profile import Target
-from messagefoundry.mllpcodec import MLLPDecoder, frame
+from messagefoundry.mllpcodec import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder, MLLPFrameError, frame
+
+log = logging.getLogger(__name__)
 
 OnDone = Callable[[], None]
 _Job = tuple[Outgoing, OnDone | None]
@@ -102,6 +105,9 @@ class PersistentConnection:
         # The connscale reload probe reads it after every connection is back, so a second close
         # that took the replies can be told from an engine that never answered (BACKLOG #1292).
         self._drops = 0
+        # How many sockets this side closed because the engine sent a reply frame over the MLLP cap
+        # (ASVS 5.1.1). Not a drop: the engine did not close anything, this side refused the frame.
+        self._frame_refusals = 0
         # Called on every reply (ACK or NAK) while set, and None otherwise. The connscale reload probe
         # sets it only while it waits for the first reply after the reload, and clears it on that
         # reply, so the steady-state read path pays one None check (BACKLOG #1292).
@@ -129,6 +135,11 @@ class PersistentConnection:
     def drops(self) -> int:
         """How many sockets ended without this side stopping them: the peer closed or reset each."""
         return self._drops
+
+    @property
+    def frame_refusals(self) -> int:
+        """How many sockets ended because a reply frame was over ``DEFAULT_MAX_FRAME_BYTES``."""
+        return self._frame_refusals
 
     def set_on_reply(self, callback: Callable[[], None] | None) -> None:
         """Call ``callback`` on every reply from now on, or stop calling anything with None."""
@@ -189,6 +200,13 @@ class PersistentConnection:
                 dropped = not self._stop.is_set()
             except (OSError, ConnectionError):
                 dropped = not self._stop.is_set()
+            except MLLPFrameError as exc:
+                # A reply frame over the cap: refused, counted as a transport error, and the socket
+                # closed rather than the frame buffered whole. Its in-flight sends are released as
+                # timeouts below, like any other close, and the connection reopens after the backoff.
+                self._frame_refusals += 1
+                self._m.counters.errors += 1
+                log.warning("MLLP reply frame over cap; closing connection: %s", exc)
             finally:
                 self._up = False
                 if dropped:
@@ -257,7 +275,10 @@ class PersistentConnection:
             await writer.drain()
 
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:
-        decoder = MLLPDecoder()
+        # The engine's replies are another party's content, so they are bounded like the engine's
+        # own MLLP intake (ASVS 5.1.1). An over-cap frame raises MLLPFrameError out of the feed, and
+        # `_run` refuses it; ACKs earlier in the same read were already handled (the feed is lazy).
+        decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
         while True:
             chunk = await reader.read(_READ_BYTES)
             if not chunk:
