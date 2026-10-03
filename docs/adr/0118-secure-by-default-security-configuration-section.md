@@ -131,6 +131,12 @@ production_instance          = true          # was [ai].production
 | `audit_all_authorization_decisions` | `[diagnostics].audit_all_authz` | grant-audit scope |
 | `handles_real_patient_data` / `production_instance` | `[ai].data_class` / `[ai].production` | the posture triple every gate + the AI-policy clamp reads |
 
+> **Note, 2026-10-02 (vault BACKLOG #2719).** `require_sign_in` is removed, not relocated. `serve`
+> always requires sign-in and refuses to start without it, on every bind, so `[security].require_sign_in`
+> and `[auth].enabled` are both refused at load as removed keys. The template above and this row are
+> kept as this decision wrote them. `handles_real_patient_data` was retired the same way earlier
+> (BACKLOG #1279).
+
 `environment` selection (which `environments/<env>.toml` loads) is **not** a security posture switch and
 stays where it is; `handles_real_patient_data` / `production_instance` keep deriving from the environment
 name exactly as `[ai]` does today, so a stock dev/staging/prod instance needs no explicit value.

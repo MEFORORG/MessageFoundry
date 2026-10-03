@@ -104,10 +104,9 @@ async def test_posture_reports_security_and_has_no_write_route(engine: Engine) -
     # AC-5: the effective [security] switch values are reported (read-only, booleans/ints only).
     sec = body["security"]
     assert sec["require_mfa"] is False and sec["block_unlisted_outbound"] is False
-    assert (
-        sec["require_sign_in"] is True and sec["local_access_only"] is True
-    )  # secure defaults kept
+    assert sec["local_access_only"] is True  # secure default kept
     assert "handles_real_patient_data" not in sec  # retired (BACKLOG #1279)
+    assert "require_sign_in" not in sec  # retired: `serve` always requires sign-in (vault #2719)
 
     # ...the active loosenings each name the risk (AC-4/AC-5)...
     loosen = {row["switch"]: row["risk"] for row in body["loosenings"]}
