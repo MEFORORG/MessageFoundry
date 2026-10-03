@@ -74,6 +74,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._precommit_pins import frozen_tag
+
 yaml = pytest.importorskip("yaml")
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -468,7 +470,8 @@ def test_the_hook_rev_matches_the_version_ci_installs(hook_id: str) -> None:
     repo = _repo_of(hook_id)
     url = str(repo["repo"]).rstrip("/")
     slug = "/".join(url.removesuffix(".git").split("/")[-2:])
-    hook_rev = str(repo["rev"]).lstrip("v")
+    # The tag beside the pinned commit: the `rev:` is a commit since vault BACKLOG #2631.
+    hook_rev = frozen_tag(str(repo["repo"])).lstrip("v")
     ci_version, block = _installed_version(hook_id, slug)
 
     print(
