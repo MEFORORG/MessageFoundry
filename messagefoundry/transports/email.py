@@ -28,7 +28,8 @@ escape) — the same ``refuse_cleartext_credentials`` posture the REST destinati
 transport consumes (refuse enforcing-production-PHI off-loopback, warn non-enforcing PHI, allow
 loopback / synthetic / attested), rather than the bare warning it used to get. The
 ``[egress].allowed_smtp`` allowlist is the authoritative fail-closed host gate (enforced by the runner
-at load/reload/start).
+at load/reload/start), and the deny-by-default ``[egress].allowed_recipient_domains`` list bounds the
+``recipients`` (vault BACKLOG #2616).
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** the email; a mailbox has no
 idempotency key, so a rare duplicate is possible after a transient failure between server-accept and
@@ -42,11 +43,15 @@ There is **no email source yet** — an inbound IMAP/POP read + M365/Google XOAU
 from __future__ import annotations
 
 import asyncio
+import email.policy
 import logging
 import smtplib
 import ssl
+import string
 from collections.abc import Mapping
+from email.headerregistry import Address
 from email.message import EmailMessage
+from email.utils import getaddresses, parseaddr
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -61,6 +66,7 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.controlchars import has_control_char
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -69,7 +75,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
 
-__all__ = ["EmailDestination"]
+__all__ = ["EmailDestination", "envelope_address_problem", "envelope_recipients"]
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +92,64 @@ def _as_recipients(value: Any) -> list[str]:
     if not recipients:
         raise ValueError("Email destination requires a non-empty 'recipients' setting")
     return recipients
+
+
+def envelope_recipients(value: Any) -> list[str]:
+    """Every envelope address an Email destination with this ``recipients`` setting would send to.
+
+    One entry can hold several addresses, so this splits the entries joined with ``", "`` rather
+    than reading one address per entry. It uses :func:`email.utils.getaddresses`, which does NOT
+    decode RFC 2047 encoded words, so the text checked is the text sent. The destination passes
+    this list to ``send_message`` as ``to_addrs`` and builds ``To:`` from it, and the ``[egress]``
+    recipient-domain check (vault BACKLOG #2616) checks the same list. An address the parser cannot
+    read comes back as ``""``, which :func:`envelope_address_problem` refuses. Raises
+    :class:`ValueError` for an empty setting, as construction does."""
+    return [addr for _, addr in getaddresses([", ".join(_as_recipients(value))])]
+
+
+#: What a recipient's local part may hold, between dots: RFC 5322 ``atext`` without ``%`` and ``!``,
+#: which some relays read as a further routing hop, without ``|`` and ``/``, which some mail servers
+#: read as pipe or file delivery during alias expansion, and without ``=`` and ``?``, so no part of
+#: an address can form an RFC 2047 encoded word that a later parse would decode. An allowlist, not
+#: a denylist, so a character nobody thought of is refused rather than passed (vault BACKLOG #2616).
+_LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-^_`{}~")
+#: The line breaks ``str.splitlines()`` honours beyond C0 and DEL (NEL, LINE SEPARATOR, PARAGRAPH
+#: SEPARATOR). ``policy.default`` refuses a header value holding one, so a subject or sender with
+#: one would fail every send. The shared ``controlchars`` alphabet is deliberately blind to them.
+_UNICODE_LINE_BREAKS = frozenset("\u0085\u2028\u2029")
+#: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address.
+_MAX_LOCAL = 64
+_MAX_ADDRESS = 254
+#: What a recipient's domain may hold: a hostname. Matching an allowlist entry also needs this.
+_DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
+
+
+def envelope_address_problem(address: str) -> str | None:
+    """Why one :func:`envelope_recipients` address cannot be sent to as written, or ``None``.
+
+    The address must be a plain ``local@domain`` that reads back unchanged, within the RFC 5321
+    size limits: a dot-separated local part of :data:`_LOCAL_ATEXT` that does not start with ``-``,
+    and a hostname-shaped domain. ``smtplib`` writes an address it cannot re-read onto the
+    ``RCPT TO`` line raw, so anything looser could put a mailbox there that is not the one checked.
+    Both the ``[egress]`` recipient-domain check and construction call this. The text names no part
+    of the address."""
+    if parseaddr(address)[1] != address:
+        return "does not read back as the same address"
+    local, at, domain = address.rpartition("@")
+    if not (at and local and domain):
+        return "is not a readable address"
+    if len(local) > _MAX_LOCAL or len(address) > _MAX_ADDRESS:
+        return "is longer than SMTP allows"
+    if any(not part or set(part) - _LOCAL_ATEXT for part in local.split(".")):
+        return "has a local part outside plain mailbox characters"
+    if local.startswith("-"):
+        # A leading hyphen reads as an option to some local delivery programs.
+        return "has a local part that starts with a hyphen"
+    if not domain.isascii():
+        return "has a non-ASCII domain; write it in its ASCII xn-- form"
+    if set(domain) - _DOMAIN_TEXT:
+        return "has a domain that is not a host name"
+    return None
 
 
 class EmailDestination(DestinationConnector):
@@ -109,7 +173,23 @@ class EmailDestination(DestinationConnector):
         self.port = int(s.get("port", 587))
         self.sender = sender
         self.recipients = _as_recipients(s.get("recipients"))
+        self._envelope = envelope_recipients(self.recipients)
+        for address in self._envelope:
+            # The same rule the [egress] check applies, held here too so no build path that skips
+            # that check can put an unchecked mailbox on the RCPT line.
+            problem = envelope_address_problem(address)
+            if problem is not None:
+                raise ValueError(f"Email destination: a recipient {problem}")
         self.subject = str(s.get("subject", ""))
+        for name, value in (("subject", self.subject), ("sender", self.sender)):
+            # A control character in a header value would raise inside _build_message at every
+            # send, where it dead-letters as an internal error. Refuse it here, at load.
+            # policy.default refuses every str.splitlines() separator: the C0 controls the shared
+            # alphabet covers, plus three outside it, named in _UNICODE_LINE_BREAKS.
+            if has_control_char(value) or any(ch in _UNICODE_LINE_BREAKS for ch in value):
+                raise ValueError(f"Email destination '{name}' holds a control character")
+        # Build the To: addresses once, refusing a mismatch here rather than at send time.
+        self._to_addresses = self._to_header()
         username = s.get("username")
         password = s.get("password")
         self.username: str | None = str(username) if username else None
@@ -284,11 +364,40 @@ class EmailDestination(DestinationConnector):
         await asyncio.to_thread(self._send, payload)
         return None
 
+    def _to_header(self) -> list[Address]:
+        """The ``To:`` addresses, built from the checked envelope list rather than the raw setting.
+
+        ``policy.default`` still parses whatever a header is given, Address objects included, and
+        that parser decodes RFC 2047 encoded words. Two things keep it from naming an unchecked
+        address. :data:`_LOCAL_ATEXT` admits no ``=`` or ``?``, so no encoded word can form. And this
+        method sets the header on a scratch message and folds it under both policies the send can
+        use (``SMTP`` and ``SMTPUTF8``), which is the text the generator writes. It refuses any
+        result that is not exactly the checked list, so a later widening of that allowlist fails
+        closed at construction instead of reaching the wire."""
+        addresses = [
+            Address(username=local, domain=domain)
+            for local, _, domain in (address.rpartition("@") for address in self._envelope)
+        ]
+        probe = EmailMessage()
+        probe["To"] = addresses
+        header = probe["To"]
+        expected = ", ".join(self._envelope)
+        # Folding breaks the line only after a comma, so dropping each CRLF leaves the joined text.
+        written = [
+            header.fold(policy=pol).partition(":")[2].replace("\r\n", "").strip()
+            for pol in (email.policy.SMTP, email.policy.SMTPUTF8)
+        ]
+        if str(header) != expected or any(text != expected for text in written):
+            raise ValueError(
+                "Email destination: the To header does not match the checked recipients"
+            )
+        return addresses
+
     def _build_message(self, payload: str) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = self.subject
         msg["From"] = self.sender
-        msg["To"] = ", ".join(self.recipients)
+        msg["To"] = self._to_addresses
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
         msg.set_content(payload, charset=self.encoding)
@@ -337,7 +446,7 @@ class EmailDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="EMAIL outbound",
                     )
-                smtp.send_message(msg)
+                smtp.send_message(msg, to_addrs=self._envelope)
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --

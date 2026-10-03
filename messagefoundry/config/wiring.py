@@ -2871,7 +2871,8 @@ def Email(
     authentication. Point ``tls_ca_file`` at your relay's CA PEM for a private-CA server;
     ``tls_verify=False`` is a trusted-network dev/test escape, refused on an enforcing production-PHI
     instance even with ``MEFOR_ALLOW_INSECURE_TLS``, and it also refuses SMTP ``AUTH``.
-    The egress host is gated by ``[egress].allowed_smtp``. Put
+    The egress host is gated by ``[egress].allowed_smtp``, and every recipient's domain by the
+    deny-by-default ``[egress].allowed_recipient_domains`` (an empty list refuses the destination). Put
     secrets in ``env()`` (``username``/``password``), never inline. Delivery is at-least-once, so a retry
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""

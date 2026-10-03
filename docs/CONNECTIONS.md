@@ -1970,13 +1970,19 @@ instance can declare its way out of the flip any more ([ADR 0186](adr/0186-retir
 `[security].block_unlisted_outbound`; `[egress].deny_by_default` moved there under ADR 0118 and is
 **rejected at config load**.)
 
-**CAUTION: `allowed_smtp` is one of the two lists that does *not* count as "egress is restricted".** The
+**CAUTION: `allowed_smtp` is one of the lists that does *not* count as "egress is restricted".** The
 open-egress startup gate reads only `allowed_mllp`/`allowed_tcp`/`allowed_http`/`allowed_db`/
 `allowed_remote`/`allowed_file_dirs`, so a PHI instance whose **only** declared egress is this `Email()`
 relay populates `allowed_smtp`, declares its one destination — and still **exits 2** with *"outbound
 egress is UNRESTRICTED … refusing to start"*. A mail-only deployment must set
 **`[security].block_unlisted_outbound = true`**; that is the arm of the gate it can actually satisfy.
 The same is true of `allowed_direct` for a Direct-only instance.
+
+**The recipients are gated too, and that gate is deny-by-default.** `allowed_smtp` gates only the
+relay hop, so every address in `recipients` must also sit in a domain listed in
+`[egress].allowed_recipient_domains`. An empty list refuses every `Email()` destination. The
+matching rules are in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress).
+
 Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox has no idempotency key a rare
 duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does
 connect/EHLO/NOOP only (reachability — it never sends `MAIL FROM`/`DATA`).
@@ -2001,6 +2007,7 @@ outbound(
 # in the --config dir is never read):
 #   [egress]
 #   allowed_smtp = ["smtp.example.org"]
+#   allowed_recipient_domains = ["example.org"]   # deny-by-default: required for any Email()
 # ...and note allowed_smtp alone does NOT satisfy the open-egress startup gate on a PHI instance —
 # see CONFIGURATION.md §[egress].
 ```
