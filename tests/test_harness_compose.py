@@ -130,3 +130,41 @@ def test_no_ack_expectation_flags_an_unexpected_reply(qapp: Any) -> None:
 
     assert results and results[0].ack_code == "AA" and not results[0].ok
     assert "unexpected" in results[0].error
+
+
+@pytest.mark.parametrize(("over", "ok"), [(0, True), (1, False)])
+def test_send_worker_bounds_the_ack_at_the_frame_cap(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch, over: int, ok: bool
+) -> None:
+    """The ACK is the engine's content (ASVS 5.1.1): at the cap it is read whole, one byte over it is
+    refused and recorded, never buffered whole or cut short."""
+    import harness.mllp as harness_mllp
+
+    cap = 256
+    monkeypatch.setattr(harness_mllp, "DEFAULT_MAX_FRAME_BYTES", cap)
+    head = b"MSH|^~\\&|B|A|D|C|20260101||ACK|X1|P|2.5.1\rMSA|AA|X1|"
+    reply = head + b"x" * (cap + over - len(head))
+    server = socket.create_server(("127.0.0.1", 0))
+    port = server.getsockname()[1]
+
+    def serve() -> None:
+        conn, _ = server.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(frame(reply))
+            conn.recv(1)  # hold open until the worker closes
+
+    threading.Thread(target=serve, daemon=True).start()
+    results: list[SendResult] = []
+    worker = SendWorker(
+        "127.0.0.1", port, [SendItem(1, "ADT", "A01", "X1", _MSG)], timeout=3.0, rate=0.0
+    )
+    worker.result.connect(results.append)
+    worker.run()
+    server.close()
+
+    assert len(results) == 1
+    if ok:
+        assert results[0].ok and results[0].ack_code == "AA"
+    else:
+        assert not results[0].ok and results[0].error.startswith("reply refused:")

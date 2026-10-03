@@ -102,7 +102,7 @@ from typing import Any
 import pytest
 
 from tests._workflow_contexts import WORKFLOWS as WORKFLOW_DIR
-from tests._workflow_contexts import jobs_of, required_contexts, resolve
+from tests._workflow_contexts import jobs_of, needs_of, required_contexts, resolve
 
 yaml = pytest.importorskip("yaml")
 
@@ -652,15 +652,6 @@ def scan(paths: Sequence[Path] | None = None) -> Scan:
     )
 
 
-def _needs_of(job: Any) -> list[str]:
-    needs = job.get("needs")
-    if needs is None:
-        return []
-    if isinstance(needs, str):
-        return [needs]
-    return [str(n) for n in needs]
-
-
 def gating_jobs_without_needs_walk() -> set[tuple[str, str]]:
     """Every required context resolved to its own job, and no further.
 
@@ -689,7 +680,7 @@ def gating_jobs() -> set[tuple[str, str]]:
         job = jobs.get(job_key)
         if job is None:
             continue
-        for need in _needs_of(job):
+        for need in needs_of(job):
             nxt = (workflow, need)
             if need in jobs and nxt not in seen:
                 seen.add(nxt)

@@ -32,6 +32,7 @@ flowchart TB
 
   MAIN[("main branch")]:::store
   TAG(["Version tag vX.Y.Z pushed"]):::ext
+  PROV["tag-provenance job<br/>the tagged commit is on main and passed its required checks"]:::build
 
   subgraph SBOMS["release.yml: two SBOM jobs, each with a read-only token"]
     SBL["sbom-linux<br/>CycloneDX SBOM from the hash-locked core runtime"]:::build
@@ -47,12 +48,13 @@ flowchart TB
     SBOMIN["Fetch both SBOMs, stage the OpenVEX file<br/>install sbomqs by pinned digest, report each SBOM's quality score"]:::build
     SIGN["Sigstore keyless signing<br/>sdist, wheels, both SBOMs, VEX"]:::build
     SLSA["SLSA build provenance attestation"]:::build
-    GHREL["Create the GitHub release<br/>artifacts with their Sigstore bundles"]:::build
+    GHREL["Create the GitHub release as a draft<br/>artifacts with their Sigstore bundles"]:::build
     PUBTK["Publish the toolkit wheel"]:::build
     PUBENG["Publish the engine sdist and wheel"]:::build
   end
 
   HARN["release-harness job<br/>build wheel, member gate, smoke test"]:::build
+  GHPUB["publish-github-release job<br/>publish the draft once every asset is on it"]:::build
   TAGW(["Console tag webconsole-vX.Y.Z pushed"]):::ext
   WEB["release-webconsole job<br/>build wheel, member gate, smoke test, engine floor gate"]:::build
 
@@ -67,8 +69,10 @@ flowchart TB
   AUDIT --> MAIN
   SAST --> MAIN
   MAIN -->|"a maintainer tags the release commit"| TAG
+  TAG --> PROV
   TAG --> SBL
   TAG --> SBW
+  PROV --> PRE
   SBL -->|"SBOM file"| PRE
   SBW -->|"SBOM file"| PRE
   PRE --> BUILD
@@ -81,20 +85,23 @@ flowchart TB
   SLSA --> GHREL
   GHREL --> PUBTK
   PUBTK --> PUBENG
-  GHREL --> GH
+  GHREL -->|"draft"| GH
   PUBTK --> PYPI
   PUBENG --> PYPI
   PUBENG -->|"then"| HARN
-  HARN -->|"attach wheel"| GH
+  HARN -->|"attach wheel to the draft"| GH
   HARN -.->|"publish"| PYPI
+  HARN --> GHPUB
+  GHPUB -->|"publish the release"| GH
   MAIN -->|"a maintainer tags a console release"| TAGW
-  TAGW --> WEB
+  TAGW --> PROV
+  PROV --> WEB
   WEB -->|"create release"| GH
   WEB -.->|"publish"| PYPI
 ```
 
 **Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
-group's title names the workflow its boxes belong to. The two job boxes outside a group are in
+group's title names the workflow its boxes belong to. The job boxes outside a group are in
 `release.yml` too. The merge checks group shows at least the checks that bear on the package. A
 dotted arrow is a publish step that runs when its repository variable is set.
 
@@ -113,6 +120,13 @@ Four facts the labels leave out:
   release job. A blocking step that fails before them stops the job. The SBOM quality score reports
   and does not block. The toolkit uploads before the engine
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
+- **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
+  too. A separate job publishes it last, so no job adds an asset to a published release.
+- **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
+  run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
+  passed. To clear it, re-run the failed job on that commit, then re-run the release. A check
+  still running is waited for. A check the server requires that never ran on the commit also
+  blocks it; tag a newer commit that ran it.
 
 ## What we publish, per release
 
