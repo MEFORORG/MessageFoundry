@@ -551,30 +551,22 @@ async def test_an_alphanumeric_field_separator_gets_a_readable_reply() -> None:
 _TRICKLE = Case("trickle", "tcp", b"\x02", stall=True, trickle=b"ISA*00*" * 40)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ENGINE GAP: the raw-TCP listener has no frame deadline (max_frame_seconds is MLLP-only), "
-        "so a peer trickling one byte inside receive_timeout holds its slot indefinitely."
-    ),
-)
+# ADR 0155 defect 3, fixed by vault BACKLOG #2606: both listeners now carry `max_frame_seconds`.
+# These were strict xfails. They run under the same stall bound as the MLLP slowloris case, and the
+# scanned posture's frame deadline is now applied to all three planes. The 1.0s bound the xfails
+# used equalled that deadline, so it could not pass even with the deadline working.
+
+
 @_LIVE
 async def test_the_raw_tcp_listener_closes_a_trickling_peer() -> None:
-    result = await _run_alone(_TRICKLE, _budget(stall_close_seconds=1.0))
+    result = await _run_alone(_TRICKLE, _budget())
     assert not result.findings, result.findings
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ENGINE GAP: the X12 listener has no frame deadline (max_frame_seconds is MLLP-only), so a "
-        "peer trickling an interchange inside receive_timeout holds its slot indefinitely."
-    ),
-)
 @_LIVE
 async def test_the_x12_listener_closes_a_trickling_peer() -> None:
     trickle = replace(_TRICKLE, plane="x12", payload=b"ISA")
-    result = await _run_alone(trickle, _budget(stall_close_seconds=1.0))
+    result = await _run_alone(trickle, _budget())
     assert not result.findings, result.findings
 
 

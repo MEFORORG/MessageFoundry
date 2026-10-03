@@ -45,7 +45,7 @@ from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.security import get_auth
+from messagefoundry.api.security import get_auth, public_route
 from messagefoundry.auth.oidc import FlowCacheFullError, FlowError
 from messagefoundry.auth.service import AuthService, OidcStepUp
 
@@ -200,6 +200,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return is_external(url, deps.organization_domains)
 
     @app.get("/ui/oidc/start")
+    @public_route("the federated sign-in start; a session does not exist yet")
     async def ui_oidc_interstitial(request: Request) -> Response:
         """ASVS 3.7.3: interpose "you are leaving this site", with a cancel, before the IdP hop.
 
@@ -232,6 +233,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
 
     @app.post("/ui/oidc/start")
+    @public_route("the federated sign-in start; a session does not exist yet")
     async def ui_oidc_start(request: Request) -> Response:
         """Confirmed: mint the flow and hand the browser to the IdP.
 
@@ -302,6 +304,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return resp
 
     @app.post("/ui/reauth/oidc")
+    @public_route("the federated re-authentication a step-up gate sends the browser to")
     async def ui_reauth_oidc(request: Request) -> Response:
         """The federated step-up leg's START (BACKLOG #296, ADR 0142 Amendment B).
 
@@ -370,6 +373,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return resp
 
     @app.get("/ui/oidc/callback")
+    @public_route("the federated sign-in return; a session does not exist yet")
     async def ui_oidc_callback(
         request: Request,
         code: str | None = Query(None, max_length=4096),

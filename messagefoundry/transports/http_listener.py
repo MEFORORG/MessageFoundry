@@ -49,12 +49,12 @@ from typing import Any, ClassVar
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import client_cert_principal, constant_time_match_any
 from messagefoundry.redaction import safe_exc
+from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.base import (
     InboundHandler,
     InboundReply,
     ReplyOutcome,
     SourceConnector,
-    peer_ip_allowed,
     positive_cap,
     register_source,
     wait_for_intake,
@@ -724,7 +724,22 @@ class HttpSource(SourceConnector):
         self.reply_write_timeout: float = float(s.get("reply_write_timeout") or 30.0)
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
-        self._active = 0
+        # vault BACKLOG #2606: the per-host cap SHIPS OFF here, unlike on the MLLP, raw-TCP and X12
+        # listeners. This connector answers one request per connection, so behind a reverse proxy
+        # every partner arrives from one address and a per-host cap would be the listener's whole
+        # capacity. An operator who sees real client addresses can set one.
+        self.max_connections_per_host: int | None = positive_cap(
+            s.get("max_connections_per_host"),
+            int,
+            knob="max_connections_per_host",
+            transport="HTTP source",
+        )
+        self._admission = ListenerAdmission(
+            transport="HTTP",
+            max_connections=self.max_connections,
+            max_connections_per_host=self.max_connections_per_host,
+            source_ip_allowlist=self.source_ip_allowlist,
+        )
         # Live client writers + handler tasks so stop()/reload can actively close established
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
@@ -736,6 +751,7 @@ class HttpSource(SourceConnector):
         # leader_gate is ignored: a listen source runs on every node (each binds its own endpoint), so
         # there is no shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
+        self._admission.stopping = False  # a restart of this same instance serves again
         self._server = await asyncio.start_server(
             self._on_client, self.host, self.port, ssl=self._ssl
         )
@@ -748,7 +764,9 @@ class HttpSource(SourceConnector):
         return port
 
     async def stop(self) -> None:
-        # Stop accepting NEW connections (this alone does not close established ones).
+        # Stop accepting NEW connections (this alone does not close established ones). A connection
+        # reaching _on_client from here is refused unread.
+        self._admission.stopping = True
         if self._server is not None:
             self._server.close()
         # ADR 0154 D5 — the PRE-CLOSE drain phase, and its position is the whole point (AC-10).
@@ -769,17 +787,21 @@ class HttpSource(SourceConnector):
         # waiting for in-flight handlers of a peer holding its connection open). A request mid-handler
         # still finishes its commit (the body is durably stored before the 202, so at-least-once holds).
         # Then await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
-        for writer in list(self._clients):
-            writer.close()
-        pending = [task for task in self._client_tasks if not task.done()]
-        if pending:
-            _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
-            for task in still_running:
-                task.cancel()
-            if still_running:
-                await asyncio.gather(*still_running, return_exceptions=True)
-        self._clients.clear()
-        self._client_tasks.clear()
+        try:
+            for writer in list(self._clients):
+                writer.close()
+            pending = [task for task in self._client_tasks if not task.done()]
+            if pending:
+                _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
+                for task in still_running:
+                    task.cancel()
+                if still_running:
+                    await asyncio.gather(*still_running, return_exceptions=True)
+            self._clients.clear()
+            self._client_tasks.clear()
+        finally:
+            # Even when this stop() is cancelled: a task cancelled past its grace never released.
+            self._admission.reset()
         # Bound wait_closed() so a Windows ProactorEventLoop overlapped-op wedge can't hang teardown on
         # the suite's shared session loop (#55, mirrors MLLPSource.stop()). The listener is closed and
         # every client task is resolved, so a wait_closed() past the grace is an OS wedge — abandoning it
@@ -996,19 +1018,18 @@ class HttpSource(SourceConnector):
         established = False
         failed = False
         try:
-            if self.source_ip_allowlist is not None:
-                peer = writer.get_extra_info("peername")
-                if not peer_ip_allowed(peer, self.source_ip_allowlist):
-                    logger.warning(
-                        "HTTP connection from %s refused: not in source_ip_allowlist", peer
-                    )
-                    await self._emit_event("peer_not_allowlisted", peer_host=peer_host)
+            # vault BACKLOG #2606: stop, allowlist, global cap and per-host cap, decided in one place
+            # for every socket listener (transports/admission.py). Refused before a request byte.
+            refusal = self._admission.check(writer, peer_host)
+            if refusal is not None:
+                if refusal.kind is None:
+                    return  # the listener is stopping: close unread, with no answer
+                await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
+                if refusal.kind == "peer_not_allowlisted":
                     await self._write_safely(writer, build_response(403, '{"error":"forbidden"}'))
-                    return  # not allowlisted — refuse (closed in the outer finally; _active untouched)
-            if self.max_connections is not None and self._active >= self.max_connections:
-                await self._emit_event("at_capacity", peer_host=peer_host)
-                await self._write_safely(writer, build_response(503, '{"error":"at capacity"}'))
-                return  # at capacity — refuse the new client
+                else:
+                    await self._write_safely(writer, build_response(503, '{"error":"at capacity"}'))
+                return  # refused (closed in the outer finally); no slot was taken
             # mTLS intake auth needs no request bytes at all, so it refuses here, alongside the
             # allowlist and capacity guards, without consuming a connection slot.
             cert_refusal = self._authorize_peer_cert(writer, peer_host)
@@ -1026,8 +1047,8 @@ class HttpSource(SourceConnector):
                     ),
                 )
                 return  # pre-ingress refusal — nothing accepted, so nothing to count
-            self._active += 1
-            established = True
+            self._admission.admit(peer_host)
+            established = True  # set with the admit, so the finally below always releases it
             await self._emit_event("established", peer_host=peer_host)
             failed = await self._serve_one(reader, writer, peer_host=peer_host)
         except OSError as exc:
@@ -1042,7 +1063,7 @@ class HttpSource(SourceConnector):
             await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
         finally:
             if established:
-                self._active -= 1
+                self._admission.release(peer_host)
             self._clients.discard(writer)
             if task is not None:
                 self._client_tasks.discard(task)
@@ -1253,7 +1274,7 @@ class HttpSource(SourceConnector):
         mode, such as the fixed ``422`` on a refused body.
 
         The drain was unbounded: a peer that stops reading held the connection — and its
-        ``max_connections`` slot, since ``_active`` spans all of ``_serve_one`` — for as long as it
+        ``max_connections`` slot, since the admitted slot spans all of ``_serve_one`` — for as long as it
         liked, with no clock on it (``receive_timeout`` bounds the *read*, not the write). The refuse
         path already bounds its drain the same way in ``_write_safely``; only the success path did not.
 

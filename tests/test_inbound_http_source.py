@@ -1345,7 +1345,7 @@ async def test_max_connections_flood_refused_and_event(store: MessageStore) -> N
         for _ in range(2):
             _reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
             holders.append(writer)
-        assert await _wait_for(lambda: src._active == 2)  # both established (at the cap)
+        assert await _wait_for(lambda: src._admission.active == 2)  # both established (at the cap)
 
         # The 3rd client is over the cap: refused at accept, before any request is read.
         resp = await _http(src.sockport, body=JSON_BODY.encode("utf-8"))
