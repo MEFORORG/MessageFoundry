@@ -173,8 +173,8 @@ Per ASVS's guidance, stated as what **is** included rather than what is excluded
 **Included:** the MessageFoundry engine, the web console, the IDE extension, the test harness
 (`harness/`, distributed separately as the harness wheel), and the operator-run scripts, assessed as
 source, at a named commit, against **all 345 ASVS 5.0.0 requirements** at **Level 3**. The
-operator-run scripts are `scripts/service/` and any script the operator documentation tells a
-deployer to run; the rest of `scripts/` (CI, development, ASVS, benchmark, coordination and release
+operator-run scripts are `scripts/service/`, less the one file named below, and any script the
+operator documentation tells a deployer to run; the rest of `scripts/` (CI, development, ASVS, benchmark, coordination and release
 tooling) is not included, and neither is `tee/`, the tee relay.
 
 Each part of that rests on an owner ruling of 2026-10-02, recorded in the vault as
@@ -191,8 +191,10 @@ Each part of that rests on an owner ruling of 2026-10-02, recorded in the vault 
 **Two files are classified by a Manager's reading, not by the owner, and the owner may overrule
 it.** That reading is recorded in the same vault file, under R3. Both are out:
 
-* `scripts/service/measure-store-access.ps1` sits under `scripts/service/` but is a CI measurement,
-  not a deployment step, and no operator guide tells a deployer to run it.
+* `scripts/service/measure-store-access.ps1` sits under `scripts/service/`, but
+  `docs/DANGEROUS-FUNCTIONALITY.md` calls it *"A CI measurement, not a deployment step"*. That
+  document also says how to run it, on a disposable host, which a later reading may weigh
+  differently.
 * `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate. The engine's
   `messagefoundry/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
   engine code path calls that check. `anon/leak.py` itself, and the hazard of a by-path load, are
