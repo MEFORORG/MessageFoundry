@@ -382,3 +382,29 @@ would log its request URLs, at WARNING. `tests/test_tray_logscrub.py` pins the c
 checks in a fresh interpreter that the tray entrypoint loads neither `logging_setup` nor `config`.
 
 The **Must never import** list is unchanged.
+
+## Amendment (2026-10-02) -- one more stdlib-only module: `messagefoundry.childenv`, for the branded relaunch (vault BACKLOG #2801)
+
+`tray/branding.py` started the branded launcher as `MessageFoundryTray.exe -m messagefoundry.tray`, with no
+`-P`. So the child's import path began with the working directory, and a file planted there could stand in
+for a module the tray imports. Every Python child the engine starts already has `-P` through
+`messagefoundry.childenv` (vault BACKLOG #2587). A bare `-P -m` is not enough here: from a checkout that is
+not installed, the child cannot find `messagefoundry` at all. Measured: with an interpreter that does not
+have the package installed, `-P -X disable-remote-debug -m messagefoundry.childenv` fails with
+`ModuleNotFoundError` even from the checkout root. The same flags through `childenv`'s bootstrap script
+start it from a foreign working directory.
+
+So the relaunch now builds its command line with `childenv.python_child_argv`, and its environment with
+`childenv.engine_environment`. That is the user's whole environment, as the tray needs, less any empty
+or relative `PYTHONPATH` entry. Measured: an inherited `PYTHONPATH=.` puts the working
+directory back under `-P`.
+
+This covers the relaunched child only. The first tray process starts however its launcher started it,
+and autostart writes `pythonw -m messagefoundry.tray`, so that process still has the working directory
+on its import path. When branding is unavailable, that first process runs the whole tray.
+
+This adds `messagefoundry.childenv` to the tray-importable list, on the same terms as the modules above. It
+is accepted because `childenv` imports only the standard library, so it brings none of the packages the
+tray must never import. `tests/test_tray_branding.py` pins the command line and the environment.
+
+The **Must never import** list is unchanged.

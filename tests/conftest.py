@@ -447,19 +447,28 @@ def _quiesce_background_loggers_at_teardown(
 
 @pytest.fixture
 def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the PROCESS reading ``GET /security/posture`` takes to the hardened launch (vault
-    BACKLOG #2700).
+    """Pin the PROCESS readings ``GET /security/posture`` takes to the hardened launch (vault
+    BACKLOG #2700, #2701).
 
-    The route reports whether the interpreter it runs in accepts an injected script, and under
-    pytest that follows how pytest was started. OPT-IN, for a test whose subject is the SETTINGS
-    posture and which asserts the exact list. ``tests/test_remote_debug_guard.py`` covers the
+    The route reports whether the interpreter it runs in accepts an injected script, whether it
+    was started in isolated mode, and what start-up code and writable site directories it has.
+    Under pytest all of that follows how pytest was started and where it is installed. OPT-IN, for
+    a test whose subject is the SETTINGS posture and which asserts the exact list.
+    ``tests/test_remote_debug_guard.py`` and ``tests/test_startup_code_inventory.py`` cover the
     other readings."""
     from messagefoundry.remotedebug import RemoteDebugPosture
+    from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
 
     monkeypatch.setattr(
         "messagefoundry.api.app.remote_debug_posture",
         lambda: RemoteDebugPosture(interpreter_enabled=False, guard_installed=False),
     )
+    hardened = StartupPosture(
+        launch=InterpreterLaunch(
+            isolated=True, safe_path=True, ignore_environment=True, no_user_site=True
+        )
+    )
+    monkeypatch.setattr("messagefoundry.api.app.startup_posture", lambda: hardened)
 
 
 @pytest.fixture

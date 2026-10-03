@@ -105,7 +105,8 @@ the overwhelming majority of statements fail to classify.
 
 **`<Block>` is a comment / section label, not an action.** It is preserved as a comment in the
 generated module and its body is emitted at the *same* indentation. Emitting it as a step would invent
-an action the export never had.
+an action the export never had. *Amended 2026-10-02 (§2(b.4)):* a label that is itself a statement
+also gets a counted TODO marker.
 
 **Statement grammar.** After stripping: `Verb operand …`, where an operand is `$variable`,
 `%tree/path` (a message-tree path whose leaf carries the HL7 coordinates), `"string literal"`,
@@ -347,7 +348,9 @@ that is no `<Package>`. An unread package attribute. A list tag in another case 
 A call named, or a `<Call>` tag, outside every list. Each renders exactly as step 1. The walker
 matches each
 statement against one whole-string template per verb rather than walking tokens as the importer
-does, so the two read the specification by different methods.
+does, so the two read the specification by different methods. *Amended 2026-10-02 (§2(b.4)):* the
+guard now runs that vendored file plus one amendment made as it loads. The file itself is unchanged
+and still pinned.
 
 **A call the attribute does not spell** has its own tests in the same file. They write one character
 of the verb as a character reference or behind a tag. They do so at every position, in ten ways, six
@@ -416,6 +419,296 @@ same as `set_field(msg, ...)`. The row carries no field naming the message it wr
 lists only its outbound. The `.copy()` and `Message.parse(...)` lines are plain `code` rows. The
 module still round-trips with no whole-file refusal, which AC-4 requires. Showing the receiver is a
 follow-up for ADR 0076/0089.
+
+**(b.4) AMENDMENT 2026-10-02 — a statement anywhere but on a `<Line>` is marked, never emitted, and
+its list holds no handle (BACKLOG #2632).** A `<Block>`, `<Call>`, `<Case>`, `<Foreach>`, `<If>`,
+`<Loop>` or `<Try>` can carry a statement in `@Data`, such as
+`<Block Data="MsgTreeCopy %ADT/ to %OUT/">`. The render kept it only as label text, or as the text
+of a dead condition, and counted nothing for it. The handle scan read its `MsgTreeCopy` as a clone
+that was made. So a later send of `%OUT` rendered as a send of `msg`, with no marker anywhere. The
+same held for an element whose tag the importer does not model, and for a `<List>` or `<Actions>`
+wrapper, whose own `@Data` the render never read at all. A `MsgSend` in a Block's or a Call's
+`@Data` rendered as a live send.
+
+One function, `_label_statement`, now decides it for the render and the scan alike, for every
+element that is not a `<Line>`. The `@Data` is a statement when the element does not render its verb
+itself, and either:
+
+- the verb, in any case, is one the importer reads on a `<Line>`: `ItemCopy`, `ItemClear`,
+  `ItemAppend`, `MsgTreeCopy`, `MsgCreate`, `MsgLog` or `MsgSend`; or
+- the element is a `<Block>` or a list wrapper and its `@Data` leads with a verb the exporter styled
+  as a `keyword`. Neither has a verb of its own. A construct or a `<Call>` leads with its own
+  keyword, which no table lists in full, and an unmodelled element may.
+
+A container renders a control verb itself: its own construct, a call, an exit, a `LoopExit`. A
+`MsgSend` is the exception, because it would deliver a message. So in a Block's or a Call's `@Data`
+it is a statement too. It stays a send, and it is always refused: the handler raises where the
+send stands, as it does for a send of a handle that is not `msg` (§2(b″)). Its body stays at the
+element's own level, where a send's body always went. A `<Call>` carrying any other statement
+renders as a plain label: it names no list, so it is not counted as a call. That label remembers
+the kind it had, for the one test that reads it (below). *Corrected 2026-10-02 (the Lander's first
+hold on PR 1938):* at first only a `MsgSend` made a Call a label, and a `<Call Data="MsgLog …">`
+still counted as a mapped call. *Corrected again 2026-10-02 (the Lander's second hold):* a
+`MsgSend` there was itself rendered as a plain label with a marker, which is quieter than main.
+"Never quieter than main", below, has the rule. A `LoopExit` there still renders its `break`,
+which only ever sits in a loop that is itself a dead placeholder.
+
+Whether Corepoint runs such a statement is not known. So:
+
+- The render emits a counted TODO for it, naming the statement, ahead of the element's body: after
+  a Block's or a Call's label comment, before a construct's placeholder, and before a list wrapper's
+  flattened statements. An unmodelled element is one counted marker already, so the statement is
+  named in that marker and not counted twice.
+- A marker never changes the shape of the tree. Which construct holds which branch, which
+  branch marker opens a branch, and which element is a branch-group are all decided as they are
+  with every marker taken out. An orphaned branch renders its body live, so this is what keeps a
+  marker from turning dead code into live code. The marker is its own step type, `LabelMarker`,
+  which stands for no statement position of the export. At least three places decide shape, and
+  each leaves it out:
+  - `_parse_list` holds a marker back from its list until a statement position follows it. So
+    the one rule that adopts a sibling branch, `_adopt_branch`, never finds a marker as the step
+    before a branch, and the marker follows the whole chain. That holds at any depth of wrapper,
+    and wherever a flattened body leaves a marker last: a wrapper nested in another, a
+    branch-group `<If>`, a `<Line>` carrying a list.
+  - `_split_branches` opens a branch at a branch marker that holds no statement of its own. A
+    label marker is none, so `<Line Data="Catch"><List Data="MsgLog …"/></Line>` still opens its
+    branch, and the label marker leads it.
+  - The branch-group test reads the kind a label had before it was demoted from a call
+    (`Control.demoted_from`). So a demoted label makes no group appear and none go. A send in
+    a Block's or a Call's `@Data` is a send still, so it needs no such memory.
+
+  Among the steps that are not adopted, every marker stays where its element sat, in source
+  order. *Corrected 2026-10-02, three times.* The first cut let the sibling adoption see the
+  marker as a step, and an `Else` after such a wrapper ran for every message (code review, round
+  2). The second moved a wrapper's marker ahead of the step before it, by looking one step back
+  in one call. A wrapper nested in another starts a new call, so its marker orphaned the branch
+  again (the Lander's hold on PR 1938). The third repaired the sibling adoption alone. Code
+  review of it found the other two places above, each with a branch main keeps dead that
+  rendered live. Moving one marker, and then guarding one test, were both too narrow. The rule
+  is now stated for the whole tree, and a test compares that tree with main's.
+- A send in a Block's or a Call's `@Data` is no marker. It is a refused send, in the tree where
+  main's send is. So
+  it selects the handler's `sends` list exactly where main's send does. That matters: a handler
+  with no send the render reaches ends on a `return Send(...)` for every destination in its tree,
+  rendered or not. *Corrected 2026-10-02 (code review of the repair, round 2):* an earlier cut
+  took the send out of the tree, and a send the render never reaches was then delivered for every
+  message. The last limit below says where such a send comes from.
+- Nothing is mapped for it, and it is never emitted as a write or a delivery.
+- The scan holds no handle for the whole list. Every role-parsed send the render reaches raises,
+  and no role-parsed field write maps onto `msg`. So a clone or a send counts only on a `<Line>`.
+
+That fails toward the visible side: a clone such a statement names is never treated as made, and an
+overwrite it names is never ignored. The scan is never more permissive than it was.
+
+**Never quieter than main.** This is the rule for the whole amendment. It is written out because
+each round of review on PR 1938 found one more list on which the branch did worse than main: a
+branch main keeps dead rendered live, and then a refusal became a silent filter. For every list,
+against main's step 1 tree:
+
+- **(a)** The head adds no live send, inline or in a closing `return`, and no vocabulary call.
+- **(b)** Where main sends or refuses, the head sends or refuses. No `raise NotImplementedError`
+  goes, at any depth, and no send becomes a comment. A handler ends on the closing `return` main
+  gives it. So one that main ends on the `return None` that says no destination was named never
+  ends on a bare `return sends`.
+- **(c)** What main counted unmapped is still counted. What main marked `# TODO` is still marked.
+
+Louder is allowed, and it is all this amendment does: a delivery becomes a refusal, and a mapped
+step becomes a counted TODO. Quieter is the defect. A refusal sends the message to ERROR, where an
+operator sees it. A handler that returns nothing sends it to FILTERED, and nobody is told.
+
+*Corrected 2026-10-02 (the Lander's second hold on PR 1938).* A `MsgSend` in a Block's or a Call's
+`@Data` was rendered as a label and a comment. main refuses that send when its handle is not
+`msg`, so main's handler raises. The branch returned an empty list in its place. The same cut gave
+a send that names no destination a `sends` list, so its handler ended on `return sends` where main
+ends on the marked `return None`. One rule repairs both: such a send is the send main made of it,
+and it is refused. Its destination stays declared for the hand-finish. The handler ends as main
+ends it. A `try` around it re-raises ahead of every Catch. It counts unmapped once. Where main
+delivered that send, the head now raises. That is louder, and on purpose: the statement may never
+have run, so it is no delivery, and it is no silent filter either.
+
+The whole-list gate is unchanged and stays closed for such a list. It admits a `<Block>` only with
+no label, a `<List>` only with no attribute, and no construct or other tag at all. Prose stays a
+label: `<Block Data="Patient identity">` renders as before.
+
+At least these limits remain:
+
+- The verb is read as a `<Line>`'s is: the first `keyword` span, or with none, the first word. So a
+  table verb after other unstyled words, such as `Step 1: MsgTreeCopy ...`, still reads as a
+  label. So does a verb outside the table with no leading `keyword` span, and one in a
+  construct's, a Call's or an unmodelled element's `@Data`, styled or not. No word list tells
+  prose from every verb.
+- The rule is blunt on purpose. Any table verb off a `<Line>`, a `MsgLog` included, leaves the
+  whole list holding no handle, so its role-parsed sends raise until someone finishes them.
+- A `<Block>` label that merely leads with a word the exporter styled as a `keyword` is read as a
+  statement. So is the `@Data` of a list wrapper that leads with one. How often a real label does
+  that was not measured: the validated export is not in this repository.
+- The marker and the statement share one 200-character comment, so a statement longer than about
+  90 characters is cut. Under a `@Disabled` ancestor the preview shows only the verb.
+- A statement with no role markup names no handle the scan can read. So a markup-free write still
+  maps onto `msg` and a markup-free send still sends it, in such a list as in any other (§2(b″)).
+  The same holds for a markup-free `MsgTreeCopy` on a `<Line>`.
+- The refusal at a send on a `<Line>`, and the reason on a declined write, still name the two
+  older causes: no single input handle, or an overwritten input. The marker carries the true one.
+  A send in a Block's or a Call's `@Data` names its own cause in its refusal.
+- A construct carrying a statement counts twice: once as the construct, as before, and once
+  unmapped for the statement. A `<Call>` carrying one counts once, for the statement. A send in
+  a Block's or a Call's `@Data` counts once, as the refusal it is.
+- A wrapper that holds a statement of its own, between a construct and its sibling branch, orphans
+  that branch. main does the same whatever the wrapper's `@Data`, and this amendment leaves it as
+  it found it. `test_a_wrappers_marker_changes_nothing_where_main_already_orphans` pins that.
+- Where main never renders an element, this amendment does not either. main keeps a branch held
+  by another branch in the tree, and neither renders it nor counts it. A statement off a `<Line>`
+  in there gets no marker and no count, as nothing in there gets one. A send in there is still
+  collected as a destination. A handler with no send the render reaches then delivers to it in
+  its closing `return`, role-marked or not. That is main's defect and it is not repaired here.
+  It is where "every role-parsed send in the list raises" does not hold. One list that shows it:
+  a `<Loop Data="Catch">` holding a `<Call Data="ElseIf (y)">`, which holds `<Line Data="Else"/>`
+  and a `MsgSend`. main and the head both end that handler on `return Send(...)` and count one
+  step.
+
+The differential guard compares a gate-declined list with step 1. That step 1 path now carries this
+rule. So the guard runs the vendored step 1 file with one amendment made as it loads. The file
+itself stays as vendored and pinned. The amendment is listed in the guard's `_STEP1_AMENDMENTS`, with
+the rule copied as text, so a later change to the head's rule turns the guard red until the copy is
+amended on purpose. Two more tests run the battery against the file exactly as vendored. They check
+that the amendment changes only lists that may carry a statement off a `<Line>`, by a wider reading
+written apart from the rule. Where it changes a list it must only narrow: no new live send, no new
+vocabulary call, and one more unmapped step, or else only comment lines and refusals change,
+with the guard a refusal brings to a `try` and the `pass` it takes from an empty body. A
+live send is read inline and in the handler's closing `return`. *Corrected 2026-10-02 (code review
+of the repair, round 2):* the bound read the inline form alone, so it could not see a closing
+`return Send(...)` that the amendment added.
+
+The bound now also checks clauses (b) and (c) of "Never quieter than main". It reads every send
+and every refusal of the handler, by depth and by destination. A refusal of a send stands for
+that send. None may go. A `try` that holds a refusal must open on the guard that re-raises it,
+or the Catch would swallow it. The closing `return` must be main's line. Every name main counted
+unmapped must still be counted. Every `# TODO` main writes must still be written, at its depth
+and naming the same word. Depth stands in for "runs": a line one level in sits under a dead
+placeholder, or in a `try`. The shape test is what keeps a line from moving between those two.
+*Corrected 2026-10-02 (code review of this repair):* the first cut counted lines by depth
+alone, so a send that went could hide behind a refusal gained elsewhere at the same depth.
+At least two limits remain. Every refusal that names no destination shares one key at its
+depth, so one of those can still hide behind another. And the unmapped names are compared as
+counts by name, so a name main counted can go unseen where the amendment adds a marker of the
+same name.
+
+It holds the head to the same bound, against the same vendored file, wherever the
+gate is closed. And `test_no_raw_list_is_quieter_than_main` runs it over the 4,000 lists drawn
+with no grammar, which the next paragraphs describe. *Corrected 2026-10-02 (the Lander's second
+hold):* the bound checked none of that and read the battery alone. Every seed put a send main
+DELIVERS where a label belongs, so no shape it read held a refusal that could go.
+`test_the_bound_sees_a_refusal_turned_into_a_quiet_filter` is the control: it renders a send off
+a `<Line>` as a comment once more, and the bound must then be red.
+`test_the_bound_sees_each_mutant_of_the_ending_and_the_guard` breaks the closing `return` and
+the guard in turn, and the bound must be red on the seed written for each.
+
+That bound is what catches a rule that is wrong in the head and in its copy alike, where the
+head-equals-baseline check is blind. It missed the wrapper defect twice, each time for want of a
+seed. At first no seed put a wrapper between a construct and a sibling branch. Eight seeds then
+did, each with one wrapper, and the bound stayed green on a wrapper nested in another. The seeds
+now also nest the wrapper to a depth of two and three, with the statement on the inner wrapper,
+the outer, or each, with and without a statement inside, for each of the four branch kinds. They
+end a branch-group, a `<Line>`'s list and a wrapper around the construct with such a wrapper, and
+they put a send label over a construct. After code review of the repair they also put a marked
+wrapper inside a bare branch marker, and a demoted label inside a bare `<Call>` and a bare
+`<Block>`.
+
+Seeds cover only the routes someone thought of, and three reviews in a row found one nobody had.
+So a second test states the rule for the whole tree and draws shapes of its own.
+`test_no_branch_main_adopts_is_orphaned` parses a list with the vendored file as it is, with the
+amended baseline and with the head. It compares the shape of the three trees: every construct
+with its body and its branches, label markers left out, a demoted label read as the kind it had.
+The shapes must be equal. The head is held to that wherever the gate is closed. The test runs
+over the battery, and over 4,000 lists drawn with no grammar: any tag, any `@Data` from a pool of
+statements, conditions and branch verbs, nested four deep. Three of the statements carry role
+markup, one element in ten is `@Disabled`, and one in ten has a `@Comment`. The bound sees an
+orphan only through a live send or a vocabulary call in its body. This test needs neither. It is
+still a sample, with one casing per tag and a small pool. It shows no difference on the lists it
+draws, not that none exists.
+
+Measured 2026-10-02 at the repaired head. The battery holds 8,083 shapes, 627 of them fixed seeds,
+and the amendment changes 761. The repair added 115 seeds. Each row puts part of the repair back
+and counts the lists that fail. "Head alone" changes the head only, which the
+head-equals-baseline check sees. "Both" changes the head and the baseline copy alike, which that
+check cannot see. The shape test is counted on the battery and on its 4,000 raw lists.
+
+| What is put back | Head alone | Both: the bound | Both: shape, battery | Both: shape, raw |
+|---|---|---|---|---|
+| the whole repair, so the rule at `880f431d94` | 121 | 52 | 53 | 178 |
+| a sibling adoption sees a marker as a step | 70 | 70 | 70 | 5 |
+| the same, and a wrapper moves its marker one step back (round 2) | 86 | 43 | 43 | 0 |
+| a branch marker holding a label marker opens no branch | 4 | 1 | 4 | 7 |
+| the branch-group test reads the rendered kind | 12 | 12 | 12 | 13 |
+| a send label nests its body | 2 | 2 | 2 | 169 |
+| a demoted send label no longer selects the `sends` list | 2 | 2 | 0 | 0 |
+| a `<Call>` carrying a statement stays a call | 23 | 0 | 0 | 0 |
+
+With the repair in place every count is zero. Two rows show what each check cannot see. A send
+label that drops the `sends` list changes no shape, so the shape test cannot see it. The bound
+sees it, on the two seeds written for it, and so does the unit test
+`test_demoting_a_handlers_only_visible_send_adds_no_trailing_send`. *Corrected 2026-10-02 (the
+Lander's second hold):* this said only the bound saw it. A Call that stays a call changes no
+shape and adds no live code on these lists: with the kind remembered, it only counts a label as
+a mapped call, so only the head-equals-baseline check and a unit test see it. Both are readings
+of this battery, not proofs about the change.
+
+The two rows about a send label were measured before the second repair, when a send off a
+`<Line>` was a label. It is a refused send now, so neither mutation exists as written.
+
+Measured 2026-10-02 at the second repair. The battery holds 8,099 shapes. Sixteen are new seeds,
+on a `<Block>` and on a `<Call>`: a send off a `<Line>` that main refuses, alone, beside another
+send and in a `Try` with a Catch; a send naming no destination, with role markup and without,
+and inside an `If` and a `Try`; and a send main delivers, in a `Try` with a Catch. The amendment
+changes 777 battery shapes and 2,929 of the 4,000 raw lists. "Put back" restores the
+earlier rule, a send off a `<Line>` rendered as a label and a marker, in the head and in the
+baseline copy alike.
+
+| | Battery, of 8,099 | Raw lists, of 4,000 |
+|---|---|---|
+| The bound is red, with the earlier rule put back | 26 | 429 |
+| The same, counting refusals alone and not sends | 8 | 128 |
+| The bound is red, with the repair in place | 0 | 0 |
+
+The second row is the first cut of this check, which counted only the refusals, over the ten
+seeds it then had. All 8 of its battery shapes are new seeds. So a lost refusal could not show on
+the 8,083 older shapes by any check, and it showed on the raw lists once the bound read them.
+Counting sends too adds ten older seeds, where main delivers the send and the earlier rule left
+a comment. Of the 26, sixteen are new seeds and ten are older. This is still a sample. It shows
+no quieter list among those it draws, not that none exists.
+
+The measurement below is older. It was taken the same day at `880f431d94`, before the repair, and
+was not run again. The battery then held 7,968 shapes, 512 of them fixed seeds. The 181 seeds new
+at that head put a statement on each of the seven container tags, an unmodelled tag and a list
+wrapper: a clone, a write, a send, a styled verb outside the table, and each of the seven verbs
+with no markup in two casings. The amendment changed 646 shapes, marked a live statement in 623
+and dropped a live send in 513. The head equalled the amended baseline on every shape. Each
+mutation arm of the head failed the guard, counted in shapes. The row "a wrapper's marker sits
+where the wrapper sat" was the first cut put back, where the adoption saw the marker. The marker
+does sit there now, and the adoption never sees it.
+
+| Mutation of the head | Shapes failing |
+|---|---|
+| no rule at all | 646 |
+| the scan ignores the rule, so the render marks only | 557 |
+| the render ignores the rule, so the scan holds nothing and nothing is marked | 646 |
+| a construct drops its marker | 90 |
+| a `<Block>` or a `<Call>` drops its marker | 511 |
+| a list wrapper drops its marker | 27 |
+| a wrapper's marker sits where the wrapper sat | 8 |
+| an unmodelled tag does not name the statement | 18 |
+| the rule reaches the seven container tags only | 45 |
+| a send in a `<Block>` or a `<Call>` stays a live send | 6 |
+| a `<Call>` carrying a send still renders as a call | 3 |
+| the table loses `msgtreecopy` | 230 |
+| the table loses `msgcreate` | 18 |
+| the verb is matched in its usual case only | 91 |
+| the keyword reading is dropped | 2 |
+| the keyword reading is a `<Block>`'s alone | 1 |
+| the keyword reading reaches every element | 7 |
+| the keyword need not lead the `@Data` | 1 |
+| the marker leaves the statement out | 623 |
+| the gate admits a `<Block>` with a label | 248 |
 
 ### (c) Unmapped actions are never silently dropped (count-and-log)
 
@@ -503,6 +796,24 @@ omitting it would claim it vanished.
 - **AC-6f (hardened XML)** — a DTD/entity payload and malformed XML SHALL raise
   `CorepointImportError`; a hostile `@Data` SHALL NOT inject code.
   → `::test_malformed_or_hostile_xml_raises_cleanly`, `::test_hostile_xml_values_cannot_inject_code`
+- **AC-6g (a statement off a `<Line>`, amendment 2026-10-02)** — an element other than a `<Line>`
+  whose `@Data` is a statement (§2(b.4)) SHALL emit a counted TODO naming it, SHALL emit no
+  write and no delivery for it, and its list SHALL hold no handle as `msg`; a prose label SHALL
+  stay a comment. A `MsgSend` in a Block's or a Call's `@Data` SHALL be a refused send, which
+  raises, wherever main renders that send (the last limit of §2(b.4) says where it does not).
+  The marker SHALL NOT
+  change the shape of the tree: which construct holds which branch. The head SHALL be no quieter
+  than main on any list: no refusal, marked ending, unmapped count or TODO main has SHALL go.
+  → `::test_a_clone_where_a_label_belongs_is_marked_and_its_send_is_judged_on_the_marker`,
+  `::test_a_send_in_a_block_label_is_never_a_delivery`,
+  `::test_a_send_off_a_line_is_refused_aloud_and_never_filters_in_silence`,
+  `::test_a_send_off_a_line_naming_no_destination_keeps_mains_loud_ending`,
+  `::test_a_catch_never_swallows_the_refusal_of_a_send_off_a_line`,
+  `::test_a_prose_block_label_stays_a_label`, `::test_the_scan_and_the_render_ask_one_rule`,
+  `::test_a_wrappers_marker_never_orphans_a_sibling_branch`,
+  `::test_a_marker_at_the_end_of_any_flattened_body_never_orphans_a_branch`,
+  `::test_a_branch_marker_holding_only_a_marked_wrapper_still_opens_its_branch`,
+  `::test_a_demoted_label_changes_no_shape_around_it`
 
 ## 4. Consequences
 

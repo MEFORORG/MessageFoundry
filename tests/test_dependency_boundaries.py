@@ -848,8 +848,13 @@ def test_the_engine_homes_still_export_the_moved_names() -> None:
     for name in ("SB", "EB", "CR", "DEFAULT_MAX_FRAME_BYTES", "frame", "MLLPDecoder", "build_ack"):
         assert getattr(tmllp, name) is getattr(codec, name), name
     assert tmllp.MLLPFrameError is codec.MLLPFrameError
-    for name in tframing.__all__:
+    # Every name the leaf exports, not every name the engine home exports: the engine home also
+    # defines its own delivery and reply framers (ADR 0205), which the leaf must not carry.
+    for name in framing.__all__:
         assert getattr(tframing, name) is getattr(framing, name), name
+    for name in ("frame_for_delivery", "frame_reply", "check_frame_bytes"):
+        assert name in tframing.__all__, name
+        assert not hasattr(framing, name), name
 
 
 def test_importing_api_does_not_eagerly_pull_fastapi() -> None:
@@ -1079,9 +1084,10 @@ def test_the_tray_probe_passes_the_import_adr_0113_permits() -> None:
     """The negative control: the ADR-PERMITTED import must trip nothing else (BACKLOG #1716).
 
     ADR 0113 §1 allows the tray `messagefoundry.apiclient`, and the tray does not take that import
-    today -- its non-tray engine imports are the stdlib-only `messagefoundry.service_status`,
+    today -- its non-tray engine imports include the stdlib-only `messagefoundry.service_status`,
     `messagefoundry.service`, `messagefoundry.api_tls_source` and `messagefoundry.log_backoff`
-    (measured 2026-09-26, BACKLOG #1844). So nothing else in this file would notice if the
+    (measured 2026-09-26, BACKLOG #1844), and `messagefoundry.childenv` (vault BACKLOG #2801).
+    So nothing else in this file would notice if the
     forbidden set were drawn to red on a legal import, and the guard would fail the first compliant
     change instead of the first violation.
 
