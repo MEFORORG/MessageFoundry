@@ -4158,10 +4158,10 @@ class EgressSettings(_Section):
 #: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
 #:
 #: BOTH ARMS ARE REACHABLE, AND SAYING ONLY "is set" ASSERTS SOMETHING FALSE ON THE COMMON PATH. The
-#: operator can write ``[security].block_unlisted_outbound`` -- but ``__main__`` also FLIPS the field on
-#: for any PHI instance that left it unset, announcing that as "defaulted ON". An instance that
-#: configured nothing is the usual way this refusal fires, so a message reading "is set" tells that
-#: operator they set something they did not.
+#: operator can write ``[security].block_unlisted_outbound`` -- but the field is also ON by default
+#: (vault BACKLOG #2605; every instance is a PHI instance). An instance that configured nothing is
+#: the usual way this refusal fires, so a message reading "is set" tells that operator they set
+#: something they did not.
 #:
 #: Defined once, beside the field, because the six refusal sites live in two other modules
 #: (``pipeline/reference_sync.py``, ``pipeline/wiring_runner.py``) and a second copy of this sentence

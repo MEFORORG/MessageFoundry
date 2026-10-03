@@ -2069,9 +2069,10 @@ def _serve(args: argparse.Namespace) -> int:
     # re-assertion here would be unreachable dead code. No instance is exempt: the gate reads no
     # synthetic or dev condition, so a dev or loopback start is held to the same rule.
     #
-    # Open-egress posture (Q5b): on a PHI-carrying instance, outbound egress that is fully
-    # unrestricted — no [egress] allowlist AND deny_by_default off — lets a transform send PHI to any
-    # destination. The refuse/warn split is [security].enforcement, NOT the deployment tier: the branch
+    # Open-egress posture (Q5b): the gate catches two states with no [egress] allowlist declared.
+    # With [security].block_unlisted_outbound written false, egress is fully unrestricted and a
+    # transform could send PHI to any destination. With it left unset, the deny default (vault
+    # BACKLOG #2605) would refuse every outbound, and the gate says so. The refuse/warn split is [security].enforcement, NOT the deployment tier: the branch
     # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
     # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
     # enforcement = warn. No instance is exempt and none stays quiet: a dev or loopback instance is
@@ -2109,7 +2110,8 @@ def _serve(args: argparse.Namespace) -> int:
     # outbound as a degraded lane, rather than refusing here with one clear message. The two states
     # the gate catches differ, and each message says which: written false is allow-any egress, and
     # left unset with nothing declared is every outbound refused.
-    if not (deny_written and eg.deny_by_default) and not listed:
+    egress_open = not (deny_written and eg.deny_by_default) and not listed
+    if egress_open:
         tier = f"{'production ' if production else ''}PHI instance ({env_name!r})"
         if deny_written:
             # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when the
@@ -2135,8 +2137,9 @@ def _serve(args: argparse.Namespace) -> int:
                 return 2
             print(
                 "warning: outbound egress is UNRESTRICTED in a PHI-carrying environment "
-                f"({env_name!r}) — a transform may send to any destination. Set [security].block_unlisted_outbound or per-transport "
-                "[egress].allowed_* allowlists to fail closed.",
+                f"({env_name!r}) — a transform may send to any destination. Set "
+                "[security].block_unlisted_outbound=true, or declare per-transport "
+                f"[egress].allowed_* allowlists, to fail closed.{mail_only_note}",
                 file=sys.stderr,
             )
         else:
@@ -2145,8 +2148,7 @@ def _serve(args: argparse.Namespace) -> int:
                     f"error: no outbound destination is declared on a {tier}; refusing to start — "
                     "[security].block_unlisted_outbound is on by default, so every outbound would "
                     "be refused. Declare the permitted destinations with per-transport "
-                    "[egress].allowed_* allowlists, or set [security].block_unlisted_outbound=true "
-                    "to start with every outbound refused.",
+                    "[egress].allowed_* allowlists.",
                     file=sys.stderr,
                 )
                 return 2
@@ -2160,9 +2162,8 @@ def _serve(args: argparse.Namespace) -> int:
 
     # Egress deny-by-default (#186c, ASVS 13.2.4/13.2.5): EVERY instance runs FAIL-CLOSED egress unless
     # the operator wrote [security].block_unlisted_outbound=false, so a transport whose per-type
-    # [egress].allowed_* list is EMPTY refuses every destination of that type. That closes the gap the
-    # all-or-nothing open-egress gate above leaves (a partially-configured instance would otherwise
-    # allow-any the transports it did not list). This used to be an in-place flip of a false model
+    # [egress].allowed_* list is EMPTY refuses every destination of that type, including on a
+    # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
     # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
     # and this block only announces the posture, or audits the explicit opt-out. No instance is
     # exempt: a dev, loopback or staging instance is held to it exactly as a production one is.

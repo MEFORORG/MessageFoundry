@@ -227,11 +227,10 @@ def _check_forward_proxy_egress(
     folding it in would force the proxy to be co-listed with every host. A dedicated list answers the
     objection instead of evading it, and leaves the ADR's scope sentence literally true.
 
-    **Deny-by-default**, following ``[ai].allowed_endpoints`` (ADR 0135) rather than the permissive-
-    when-empty destination lists: a configured proxy with an EMPTY ``allowed_proxy`` is refused. The
-    asymmetry is deliberate — an empty list refuses nothing until a proxy is actually configured, and
-    permissive-when-empty would leave this credential-bearing host ungated on the default posture,
-    which is the hole the key exists to close.
+    **Deny-by-default on its own terms**, following ``[ai].allowed_endpoints`` (ADR 0135): a configured
+    proxy with an EMPTY ``allowed_proxy`` is refused even under the
+    ``[security].block_unlisted_outbound = false`` opt-out that makes the destination lists
+    permissive when empty. An empty list refuses nothing until a proxy is actually configured.
 
     The ``"default"`` sentinel is exempt: it names no address at config time (urllib resolves the OS
     proxy at request time), and ``proxy_config_from_settings`` refuses to combine it with proxy

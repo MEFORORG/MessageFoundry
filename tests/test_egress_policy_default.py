@@ -8,7 +8,7 @@ means unrestricted. ``serve`` flipped the field in place, so any other entry poi
 egress: an embedder that omitted the policy, the ``check`` command, and the ``connection`` CLI.
 These tests pin three things. The model default denies. Every seam that builds a connector, or
 the runner that owns one, names its policy with no default. And ``serve`` still refuses to start
-with no destination list set, with the same message as before.
+with no destination list set, with a message that says every outbound would be refused.
 """
 
 from __future__ import annotations
@@ -187,6 +187,7 @@ def test_serve_passes_the_egress_gate_when_the_switch_is_written_true(
     main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"])
     err = capsys.readouterr().err
     assert "no outbound destination is declared" not in err
+    assert "egress is UNRESTRICTED" not in err
     # Positive evidence that control got PAST the egress gate: the off-box log gate, which `_serve`
     # runs after it, is what speaks. A refusal at an earlier gate would not print this.
     assert "must forward its logs off-box" in err

@@ -158,6 +158,7 @@ def probe(rate: float, duration_s: float = 1.5, pool_size: int = 4) -> int:
         MEFOR_LOAD_OTHER_PORT=str(oth_s.getsockname()[1]),
         MEFOR_LOAD_SINK_PORT=str(sink_port),
     )
+    from harness.config.load._shape import load_shape
     from messagefoundry.api import create_managed_app
     from messagefoundry.config.settings import EgressSettings
 
@@ -168,10 +169,8 @@ def probe(rate: float, duration_s: float = 1.5, pool_size: int = 4) -> int:
         # The load runner reads /stats with no bearer token, on a loopback socket and a temp store.
         allow_no_auth=True,
         # An explicit policy, which create_managed_app requires (vault BACKLOG #2605): the load graph
-        # delivers only to its MLLP sinks, on the host harness/config/load/_shape.py reads.
-        egress_settings=EgressSettings(
-            allowed_mllp=[os.environ.get("MEFOR_LOAD_SINK_HOST", "127.0.0.1") or "127.0.0.1"]
-        ),
+        # delivers only to its MLLP sinks, on the host the graph's own shape reads.
+        egress_settings=EgressSettings(allowed_mllp=[load_shape().sink_host]),
     )
     uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="error"))
     # Release the MLLP ports at the last moment; hand the still-bound API socket to uvicorn.

@@ -823,8 +823,8 @@ def test_serve_keyless_poc_phi_env_refuses_when_production_true(
 def test_serve_refuses_open_egress_in_prod(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # With a key configured (so the keyless gate passes), a production PHI instance whose outbound
-    # egress is fully unrestricted (no [egress].deny_by_default, no allowlists) fails closed.
+    # With a key configured (so the keyless gate passes), a production PHI instance that declares
+    # no outbound destination and leaves [security].block_unlisted_outbound unset fails closed.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv(
         "MEFOR_STORE_ENCRYPTION_KEY", "x" * 44
@@ -841,7 +841,7 @@ def test_serve_refuses_open_egress_in_prod(
 def test_serve_warns_open_egress_in_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # enforcement=warn reproduces the historical non-production dial: unrestricted egress only WARNS and
+    # enforcement=warn reproduces the historical non-production dial: nothing declared only WARNS and
     # still starts (under default enforce it refuses — the dial is decoupled from the production tier).
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # silence the keyless warning
