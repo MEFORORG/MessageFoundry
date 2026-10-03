@@ -40,7 +40,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 from messagefoundry.childenv import engine_environment, python_child_argv
-from messagefoundry.tray import __version__
+from messagefoundry.tray import ENTRY_MODULE, __version__
 
 log = logging.getLogger("messagefoundry.tray.branding")
 
@@ -347,7 +347,7 @@ def relaunch_branded() -> bool:
         # Started like the engine's Python children (vault BACKLOG #2801); childenv says what the
         # command line and the environment do. The tray keeps the user's whole environment.
         child = subprocess.Popen(  # nosec B603 - fixed argv (our own branded launcher, the child interpreter flags, our own bootstrap script, a module name), shell=False
-            python_child_argv("messagefoundry.tray", executable=str(branded)),
+            python_child_argv(ENTRY_MODULE, executable=str(branded)),
             env=engine_environment(),
             close_fds=True,
         )

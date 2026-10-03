@@ -255,7 +255,8 @@ branded relaunch. The module's docstring says what each one gets, and why that i
 boundary by itself. The tray's relaunch also takes its command line from that module, so it
 starts with `-P` like the engine's Python children. Its environment is the user's whole
 environment, less any empty or relative `PYTHONPATH` entry. Autostart starts the first tray
-process with the same command line, but Windows hands it the user's environment unfiltered. So an
+process with the same interpreter options and bootstrap, under the plain `pythonw.exe` rather than
+the branded launcher. Windows hands that process the user's environment unfiltered. So an
 empty or relative `PYTHONPATH` entry in the user's own settings would put the working directory back
 on its import path. A tray started by hand gets neither. Section 3, under *A tray started by hand
 skips the script*, says what that means for its import path. The other

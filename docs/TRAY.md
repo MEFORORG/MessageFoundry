@@ -41,7 +41,9 @@ friendly note and exits.
 
 To **start it automatically at login**, use the tray's **Start at Login** menu item (opt-in, off by
 default). It writes an `HKCU\…\Run` entry pinning the absolute `pythonw.exe` you launched with, so it
-keeps resolving after a reboot.
+keeps resolving after a reboot. The entry starts the tray through the engine's child bootstrap script,
+with `-P -X disable-remote-debug`, so the folder Windows starts it in is not on its import path. A
+tray you start by hand does not get this; see `docs/DANGEROUS-FUNCTIONALITY.md` section 3.
 
 ## What the icon shows
 

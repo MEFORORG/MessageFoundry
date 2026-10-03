@@ -141,7 +141,9 @@ this originally read "remote/https", see the amendment below*. Multi-shard /
 `supervise` is **unsupported-and-detected**. Open Console = `os.startfile(url + "/ui")`, gated by the /ui probe;
 Open Repo = the resolved `code` CLI on `repo_path`; both disable cleanly when unavailable. Launch / autostart pin
 the **absolute repo-venv `pythonw.exe`** (the real risk is the *wrong interpreter*, not cwd — the editable
-install exposes the repo root on `sys.path`), self-healing a stale Run-key value; autostart is **opt-in**. Single
+install exposes the repo root on `sys.path` -- *superseded for autostart by the 2026-10-02 amendment's
+vault BACKLOG #2822 note: the working directory is a risk too, and the login start now goes through the
+child bootstrap*), self-healing a stale Run-key value; autostart is **opt-in**. Single
 instance via a `Local\` mutex; `NIM_DELETE` in `finally` and on `WM_ENDSESSION`; a top-level crash handler that
 logs, removes the icon, and exits nonzero; `TaskbarCreated` re-add.
 
@@ -403,26 +405,24 @@ This covers the relaunched child only. The first tray process starts however its
 and autostart writes `pythonw -m messagefoundry.tray`, so that process still has the working directory
 on its import path. When branding is unavailable, that first process runs the whole tray.
 
-**Narrowed the same day by vault BACKLOG #2822.** Autostart now writes the command line from
-`childenv.python_child_argv` too: the absolute `pythonw.exe`, `-P -X disable-remote-debug`, then the
-bootstrap script by its absolute path. A script start never searches the working directory, so the
-login start no longer depends on the folder Windows starts it in. The limit above now holds only for
-a tray started by hand, as `messagefoundry-tray` or `pythonw -m messagefoundry.tray`. **That limit
-stays, by decision: #2822 does not route a hand start through the bootstrap.** A hand start keeps
-remote debugging on. `pythonw -m` also puts the working directory first. The `messagefoundry-tray`
-launcher was not run to measure this, since it starts a real tray; its console twin
-`messagefoundry.exe`, the same form of launcher, did not search the working directory (measured
-2026-10-02, `docs/DANGEROUS-FUNCTIONALITY.md` section 3). Windows still
-hands the login start the user's environment unfiltered, so an empty or relative `PYTHONPATH` entry
-of the user's own would put the working directory back. `tests/test_tray_shell.py` pins the command
-and reads it back through Windows' own parser. `tests/test_tray_branding.py` starts a real process
-from that command, and a real branded child through `relaunch_branded`, each from a working
-directory holding a decoy package. `tests/test_dependency_boundaries.py` checks on every
-interpreter, the 3.14 floor included, that `tray.branding`, `tray.autostart` and the bootstrap load
-no engine module beyond `childenv` and nothing outside the standard library.
-
 This adds `messagefoundry.childenv` to the tray-importable list, on the same terms as the modules above. It
 is accepted because `childenv` imports only the standard library, so it brings none of the packages the
 tray must never import. `tests/test_tray_branding.py` pins the command line and the environment.
 
 The **Must never import** list is unchanged.
+
+**Narrowed the same day by vault BACKLOG #2822.** Autostart now builds its login command with
+`childenv.python_child_argv` as well. That is the absolute `pythonw.exe`, `-P -X disable-remote-debug`,
+then the bootstrap script by its absolute path. A script start never searches the working directory.
+So the login start no longer depends on the folder Windows starts it in.
+
+The limit above now holds only for a tray started by hand, as `messagefoundry-tray` or
+`pythonw -m messagefoundry.tray`. **That limit stays, by decision: this item does not route a hand
+start through the bootstrap.** `docs/DANGEROUS-FUNCTIONALITY.md` section 3 says what a hand start
+keeps, with the measurement. Its section 4 says what the login start still inherits from the user's
+environment.
+
+`tests/test_tray_shell.py` pins the login command and reads it back through Windows' own parser.
+`tests/test_tray_branding.py` starts a real process from that command, and a real branded child
+through `relaunch_branded`. `tests/test_dependency_boundaries.py` pins what `tray.branding`,
+`tray.autostart` and the bootstrap import, on every interpreter, the 3.14 floor included.

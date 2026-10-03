@@ -31,6 +31,10 @@ lives in the sibling ``winshell``/``winsvc``/``poller``/``elevate`` modules.
 
 from __future__ import annotations
 
-__all__ = ["__version__"]
+__all__ = ["ENTRY_MODULE", "__version__"]
 
 __version__ = "0.1.0"
+
+#: The module that runs the tray. The login command (``autostart``) and the branded relaunch
+#: (``branding``) both start it, so they name it from here.
+ENTRY_MODULE = "messagefoundry.tray"

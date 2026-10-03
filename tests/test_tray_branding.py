@@ -137,9 +137,13 @@ import json, sys
 import messagefoundry
 with open(sys.argv[1], "w", encoding="utf-8") as out:
     json.dump({"executable": sys.executable, "safe_path": sys.flags.safe_path,
-               "remote_debug": sys.is_remote_debug_enabled(), "package": messagefoundry.__file__},
-              out)
+               "remote_debug": sys.is_remote_debug_enabled(), "package": messagefoundry.__file__,
+               "orig_argv": sys.orig_argv}, out)
 """
+
+#: Each would make the child report a flag on without the command line setting it, so neither may
+#: reach the child (the same list as ``_run`` in ``tests/test_isolated_launch.py``).
+_FLAG_STAND_INS = ("PYTHONSAFEPATH", "PYTHON_DISABLE_REMOTE_DEBUG")
 
 
 def _probe_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -155,6 +159,12 @@ def _assert_started_through_the_bootstrap(report: Path) -> dict[str, Any]:
     assert Path(seen["package"]).resolve() == Path(messagefoundry.__file__).resolve()
     assert seen["safe_path"] is True
     assert seen["remote_debug"] is False
+    # A `-P -m` start passes the three checks above too, in an installed checkout. The interpreter's
+    # own command line says which start it was.
+    started = seen["orig_argv"]
+    assert "-m" not in started, started
+    bootstrap = Path(_child_bootstrap.__file__).resolve()
+    assert any(Path(arg).resolve() == bootstrap for arg in started[1:]), started
     return seen
 
 
@@ -173,7 +183,7 @@ def test_the_login_command_starts_a_real_first_process_through_the_bootstrap(
     command = command.removesuffix("messagefoundry.tray") + subprocess.list2cmdline(
         [_PROBE_MODULE, str(report)]
     )
-    env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONSAFEPATH"}
+    env = {k: v for k, v in os.environ.items() if k.upper() not in _FLAG_STAND_INS}
     env["PYTHONPATH"] = str(probe_dir)
     done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
         command, cwd=cwd, env=env, capture_output=True, text=True, timeout=120, check=False
@@ -201,6 +211,8 @@ def test_the_relaunch_starts_a_real_branded_child_through_the_bootstrap(
     probe_dir, cwd, report = _probe_layout(tmp_path)
     monkeypatch.chdir(cwd)
     monkeypatch.setenv("PYTHONPATH", str(probe_dir))
+    for name in _FLAG_STAND_INS:
+        monkeypatch.delenv(name, raising=False)
     real_popen = subprocess.Popen
     children: list[subprocess.Popen[bytes]] = []
 
@@ -212,9 +224,15 @@ def test_the_relaunch_starts_a_real_branded_child_through_the_bootstrap(
 
     monkeypatch.setattr(subprocess, "Popen", _popen)
     monkeypatch.setattr(branding, "ensure_branded_launcher", lambda *a, **k: branded)
-    branding.relaunch_branded()  # the probe may outlive the grace window or not; either is fine
-    [child] = children
-    assert child.wait(timeout=120) == 0
+    try:
+        branding.relaunch_branded()  # the probe may outlive the grace window or not; either is fine
+        [child] = children
+        assert child.wait(timeout=120) == 0
+    finally:
+        for started in children:  # an orphan would hold the copied runtime in tmp_path open
+            if started.poll() is None:
+                started.kill()
+                started.wait(timeout=30)
     seen = _assert_started_through_the_bootstrap(report)
     assert Path(seen["executable"]).name == branding.BRANDED_EXE_NAME
 

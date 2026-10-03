@@ -5,11 +5,11 @@
 Autostart is **off by default** and toggled from the menu. The launch command pins the **absolute**
 ``pythonw.exe`` of the running interpreter, so a Start-at-Login entry runs the interpreter the tray
 was installed into. The working directory is a risk as well, not only the interpreter. A ``-m``
-start puts the working directory first on the import path, and Windows, not this code, picks the
+start puts the working directory first on the import path. Windows, not this code, picks the
 working directory of a Run-key start. So the command starts the tray the way the engine starts its
-Python children, through :func:`messagefoundry.childenv.python_child_argv` (vault BACKLOG #2822):
+Python children (vault BACKLOG #2822). It comes from :func:`messagefoundry.childenv.python_child_argv`:
 ``-P`` and ``-X disable-remote-debug``, then the child bootstrap script by its absolute path. A
-script start never searches the working directory, and ``-P`` drops the script's own folder, so a
+script start never searches the working directory, and ``-P`` drops the script's own folder. So a
 file planted in either cannot stand in for a module the first tray process imports. ``-P`` on a
 ``-m`` start is not enough: from a checkout that is not installed, the interpreter then cannot find
 the package. The bootstrap finds it from its own location.
@@ -27,10 +27,10 @@ import sys
 from pathlib import Path
 
 from messagefoundry.childenv import python_child_argv
+from messagefoundry.tray import ENTRY_MODULE
 
 _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _VALUE_NAME = "MessageFoundryTray"
-_MODULE = "messagefoundry.tray"
 
 
 def pythonw_executable(executable: str | None = None) -> str:
@@ -46,7 +46,7 @@ def launcher_command(pythonw: str | None = None) -> str:
     ``<abs pythonw.exe> -P -X disable-remote-debug <abs _child_bootstrap.py> messagefoundry.tray``.
     """
     return subprocess.list2cmdline(
-        python_child_argv(_MODULE, executable=pythonw or pythonw_executable())
+        python_child_argv(ENTRY_MODULE, executable=pythonw or pythonw_executable())
     )
 
 
