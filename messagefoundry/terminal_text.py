@@ -10,7 +10,8 @@ console cannot encode stops the print. :func:`escape_for_terminal` is the rule a
 ``samples/send_mllp.py``, ``harness/load/rigadmin.py`` ``get``, the harness ``--scenario`` and
 ``--load`` lines, the ``shardcert`` two-box engine-error lines, the ``--fuzz`` setup and failure
 lines, the reconcile text report and the ``messagefoundry verify`` console summary print by, so a
-later hardening applies to all of them at once. It is not every such tool. At least three keep a different rule or none:
+later hardening applies to all of them at once. It is not every such tool. At least three keep a
+different rule or none:
 ``check-privileges`` (``privilege_check.printable``) and the ``messagefoundry-toolkit`` command
 (BACKLOG #2516) each keep a category-based rule, and ``tee`` imports nothing from this package by
 design.
@@ -36,10 +37,14 @@ glyph -- an accented letter, an em dash, a CJK name -- and still escapes every o
 format controls such as U+200E/F, U+202A-202E and U+2066-2069 (``Cf``), the line and paragraph
 separators (``Zl``, ``Zp``), a lone surrogate (``Cs``), and the private-use and unassigned code
 points (``Co``, ``Cn``), which this interpreter's Unicode tables cannot vouch for and a newer
-terminal may treat as a control. It is for a sink whose own text is not ASCII, where the strict
-rule would turn the tool's own em dash into ``\\u2014``. Its output is not pure ASCII, so it is for a
-stream already hardened against an unencodable character (``messagefoundry.console_streams``
-does that for the engine's command line).
+terminal may treat as a control. Because a character it keeps can look like an ASCII one, it
+also escapes a kept character that stands directly before text reading as an escape body, and
+doubles a backslash before more text than the strict rule does; :data:`_ESCAPE_BODY_KEEP` says how
+far that goes. It is
+for a sink whose own text is not ASCII, where the strict rule would turn the tool's own em dash
+into ``\\u2014``. Its output is not pure ASCII, so it is for a stream already hardened against an
+unencodable character (``messagefoundry.console_streams`` does that for the engine's command
+line).
 
 WHY THIS IS NOT IN :mod:`messagefoundry.controlchars`. That module states ONE alphabet, C0 plus
 DEL, and builds every screen and neutraliser from it; its docstring calls widening that alphabet a
@@ -64,7 +69,10 @@ __all__ = ["CONTROL_CATEGORIES", "escape_for_terminal", "escape_json_for_termina
 
 #: THE STRICT ALPHABET: every character that is not printable ASCII, newline or tab. The JSON path
 #: uses it as is; the text path decides per character in :func:`_is_escaped`, which spells the same
-#: set and widens or narrows it by the options. A change to one is a change to both.
+#: set and widens or narrows it by the options. Every pattern here stays a literal so the ReDoS
+#: scan in ``tests/test_security_static.py`` can read it, so
+#: ``tests/test_terminal_text_console_sinks.py`` holds the spellings to each other over every code
+#: point instead.
 _NOT_SHOWN = r"[^\t\n -~]"
 
 #: The Unicode general categories ``keep_printable_unicode`` still escapes; see the module
@@ -75,8 +83,32 @@ CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
 #: A whole run of backslashes, or any character that is not printable ASCII. Matching the run
 #: whole keeps one pass linear however many backslashes a peer sends.
 _CANDIDATE = re.compile(r"\\+|[^ -~]")
-#: Text that reads as one of this module's escapes when a backslash stands before it.
+#: Text that reads as one of this module's escapes when a backslash stands before it. The strict
+#: rule's output is pure ASCII, so only an ASCII hex digit can read as one there.
 _ESCAPE_LOOKALIKE = re.compile(r"x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}")
+#: ``keep_printable_unicode`` prints non-ASCII characters as themselves, and many render nearly as
+#: an ASCII twin: a fullwidth digit (U+FF10 to U+FF19), ``u`` (U+FF55) or backslash (U+FF3C), a
+#: Cyrillic small e or ha, a reverse solidus operator (U+29F5), or a combining overlay. A list of
+#: look-alikes would miss one, so in that mode the rule keys on position instead. An escape BODY is
+#: ``x``, ``u`` or ``U`` followed by the escape's width of characters that are each an ASCII hex
+#: digit or non-ASCII. A kept character directly before a body is escaped, so nothing that merely
+#: looks like a backslash can start one; and a backslash run is doubled before a body or before ANY
+#: non-ASCII character, so a look-alike escape letter after a real backslash cannot either.
+#: Over-matching only escapes a character or doubles a backslash that did not strictly need it,
+#: which still decodes correctly; the cost is that a path component starting with a non-ASCII
+#: letter shows its backslash doubled in this mode.
+_ESCAPE_BODY_KEEP = re.compile(
+    r"x(?:[0-9A-Fa-f]|[^\x00-\x7f]){2}"
+    r"|u(?:[0-9A-Fa-f]|[^\x00-\x7f]){4}"
+    r"|U(?:[0-9A-Fa-f]|[^\x00-\x7f]){8}"
+)
+#: What a backslash run is doubled before in keep mode; see :data:`_ESCAPE_BODY_KEEP`.
+_ESCAPE_LOOKALIKE_KEEP = re.compile(
+    r"[^\x00-\x7f]"
+    r"|x(?:[0-9A-Fa-f]|[^\x00-\x7f]){2}"
+    r"|u(?:[0-9A-Fa-f]|[^\x00-\x7f]){4}"
+    r"|U(?:[0-9A-Fa-f]|[^\x00-\x7f]){8}"
+)
 _NOT_SHOWN_RE = re.compile(_NOT_SHOWN)
 
 
@@ -105,11 +137,13 @@ def escape_for_terminal(
 
     By default the result is pure ASCII, so any console codec encodes it. ``single_line`` also
     escapes newline and tab; ``keep_printable_unicode`` lets a printable non-ASCII character
-    through and escapes only :data:`CONTROL_CATEGORIES` past ASCII.
+    through and escapes, past ASCII, :data:`CONTROL_CATEGORIES` and a kept character standing
+    directly before an escape body (:data:`_ESCAPE_BODY_KEEP`).
 
     A run of backslashes is doubled, all of it, only where it stands before text that reads as an
     escape or before a character about to be escaped. So an odd run before an escape marks a real
-    one and an even run marks text, while an ordinary Windows or UNC path prints as typed. A
+    one and an even run marks text, while an ordinary Windows or UNC path prints as typed (with
+    ``keep_printable_unicode``, an ASCII one: see :data:`_ESCAPE_LOOKALIKE_KEEP`). A
     component that itself reads as an escape, such as ``\\x64``, is still doubled.
 
     Computed per call with no cache, so a peer sending many distinct code points cannot grow this
@@ -120,12 +154,19 @@ def escape_for_terminal(
             char, single_line=single_line, keep_printable_unicode=keep_printable_unicode
         )
 
+    lookalike = _ESCAPE_LOOKALIKE_KEEP if keep_printable_unicode else _ESCAPE_LOOKALIKE
+
     def replace(match: re.Match[str]) -> str:
         found = match.group()
         if found[0] != "\\":
-            return _visible(found) if escaped(found) else found
+            if escaped(found):
+                return _visible(found)
+            # Only a kept non-ASCII character reaches here unescaped: see _ESCAPE_BODY_KEEP.
+            if keep_printable_unicode and _ESCAPE_BODY_KEEP.match(text, match.end()):
+                return _visible(found)
+            return found
         end = match.end()
-        if _ESCAPE_LOOKALIKE.match(text, end) or (end < len(text) and escaped(text[end])):
+        if lookalike.match(text, end) or (end < len(text) and escaped(text[end])):
             return found * 2
         return found
 

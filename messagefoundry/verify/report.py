@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Render verify results — console summary, Markdown, JSON. Dependency-free (stdlib only)."""
+"""Render verify results — console summary, Markdown, JSON. Standard library plus
+:mod:`messagefoundry.terminal_text`, itself standard-library only, for the peer-text escape."""
 
 from __future__ import annotations
 
@@ -71,7 +72,10 @@ _MD_CELL = {
     "`": "&#96;",
     "$": "&#36;",
 }
-_MD_CELL_RE = re.compile("|".join(re.escape(k) for k in _MD_CELL))
+#: Spelled as a literal, not joined from the keys, so the ReDoS scan in
+#: ``tests/test_security_static.py`` can read it; ``tests/test_terminal_text_console_sinks.py``
+#: holds it to the keys above.
+_MD_CELL_RE = re.compile(r"[&<>|`$]|\]\(")
 #: A backslash run Markdown would eat: two or more (each pair reads as one), or one before ASCII
 #: punctuation, the references above included. Doubled, it renders as written, so the terminal
 #: rule's odd/even backslash convention and a UNC path survive the renderer.

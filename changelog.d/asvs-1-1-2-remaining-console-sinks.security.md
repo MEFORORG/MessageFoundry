@@ -18,3 +18,15 @@
   hides its target; what it still leaves, at least a bare URL's autolink, is listed in
   `messagefoundry/verify/report.py`. At least the load report's engine `/status` strings and `tee
   naks` still carry a peer's text as it came.
+  The `shardcert` shard-start errors now escape the engine log tail they quote, the
+  `ingress_probe` setup-failure line escapes it to one line (it is printed beside the `RESULT`
+  line its workflow reads), and the `connscale` reload probe's warning escapes the engine reply to
+  one line. A `--fuzz` failure line escapes a quoted identifier once rather than twice, so a real
+  ESC prints as `\x1b` and text spelling it prints doubled. With `keep_printable_unicode`, a
+  backslash is now also doubled before any non-ASCII character and before `x`, `u` or `U` followed
+  by non-ASCII look-alike hex digits, and a kept character standing directly before such an escape
+  body is escaped, so at least fullwidth, Cyrillic, combining-mark and look-alike-backslash
+  spellings of an escape no longer pass for an escaped bidirectional override. An ASCII letter
+  that resembles a hex digit, such as `l` for `1`, is still not treated as one, in either mode.
+  At least the `connscale` pooled-arm miss notes and the batch-box cell notes, and a `shardcert`
+  provisioning failure's traceback, still print engine output as it came.

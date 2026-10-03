@@ -103,8 +103,9 @@ def test_keeping_unicode_disambiguates_a_backslash_as_the_strict_rule_does() -> 
     assert _keep("\\\u202e") == "\\\\\\u202e"  # a backslash before an escaped character
     assert _keep("\\\\x1b") == "\\\\\\\\x1b"  # a run before a lookalike is doubled whole
     assert _keep("\\\\") == "\\\\"
-    # A backslash before a character that prints as itself stays single, as before plain text.
-    assert _keep("C:\\caf\u00e9\\\u00e9") == "C:\\caf\u00e9\\\u00e9"
+    # A backslash before ASCII that prints as itself stays single, as before plain text. Before a
+    # non-ASCII character it is doubled, because a kept character can pass for an escape letter.
+    assert _keep("C:\\caf\u00e9\\\u00e9") == "C:\\caf\u00e9\\\\\u00e9"
     assert _keep("MSH|^~\\&|") == "MSH|^~\\&|"
 
 
@@ -177,12 +178,12 @@ def test_verify_console_escapes_a_hostile_jwks_kid_and_keeps_the_em_dash() -> No
 
 def test_verify_console_leaves_every_engine_detail_without_peer_text_alone() -> None:
     rows = [
-        CheckResult("host.python", "Python 3.14+", Status.PASS, "3.14.0 \u2014 ok"),
+        CheckResult("host.python", "Python", Status.PASS, "interpreter ok \u2014 fine"),
         CheckResult("a", "title with \u00e9", Status.MANUAL, "C:\\Program Files\\app"),
         CheckResult("host.writable", "w", Status.FAIL, "C:\\Users\\svc not writable"),
     ]
     console = render_console(rows)
-    assert "3.14.0 \u2014 ok" in console
+    assert "interpreter ok \u2014 fine" in console
     assert "title with \u00e9" in console
     assert "C:\\Program Files\\app" in console
     assert "C:\\Users\\svc not writable" in console
@@ -231,13 +232,13 @@ def test_verify_markdown_neutralises_a_hostile_jwks_kid_in_one_row() -> None:
 
 def test_verify_markdown_leaves_ordinary_engine_text_readable() -> None:
     rows = [
-        CheckResult("host.python", "Python 3.14+", Status.PASS, "3.14.0 \u2014 ok"),
+        CheckResult("host.python", "Python", Status.PASS, "interpreter ok \u2014 fine"),
         CheckResult("host.writable", "w", Status.FAIL, "C:\\Users\\svc not writable"),
         CheckResult("store.path", "t", Status.FAIL, "check [store].path; RECEIVED->ROUTED"),
         CheckResult("store.connect", "t", Status.FAIL, "run `messagefoundry serve` once"),
     ]
     md = render_markdown(rows)
-    assert "| host.python | Python 3.14+ | PASS | 3.14.0 \u2014 ok |" in md
+    assert "| host.python | Python | PASS | interpreter ok \u2014 fine |" in md
     assert "| C:\\Users\\svc not writable |" in md
     assert "check [store].path; RECEIVED-&gt;ROUTED" in md
     # The engine's own code span renders as plain backticks: a code span would stop the references
@@ -469,3 +470,216 @@ def test_a_rig_setup_error_keeps_its_log_tail_lines_and_escapes_the_rest() -> No
     assert _exc_text(exc) == (
         f"engine exited during startup:\\x0aline one {_HOSTILE_SHOWN}\\x0d\\x0aline two"
     )
+
+
+# --- review round: the remaining sinks and the alphabet ----------------------------------------
+
+
+def test_the_strict_alphabet_and_the_per_character_rule_agree_over_every_code_point() -> None:
+    # The alphabet is spelled three times: _NOT_SHOWN (the JSON path), _CANDIDATE (what the text
+    # path looks at) and _is_escaped (what it decides). Each pattern stays a literal so the ReDoS
+    # scan in test_security_static.py can read it, so this holds the three to each other instead.
+    from messagefoundry.terminal_text import _CANDIDATE, _NOT_SHOWN_RE, _is_escaped
+
+    for code in range(0x110000):
+        char = chr(code)
+        by_pattern = _NOT_SHOWN_RE.fullmatch(char) is not None
+        assert by_pattern is _is_escaped(char, single_line=False, keep_printable_unicode=False), (
+            f"U+{code:04X}"
+        )
+        looked_at = _CANDIDATE.fullmatch(char) is not None
+        escapable = _is_escaped(char, single_line=True, keep_printable_unicode=False)
+        assert looked_at is (char == "\\" or escapable), f"U+{code:04X}"
+
+
+def test_the_markdown_cell_pattern_matches_exactly_its_replacement_keys() -> None:
+    from messagefoundry.verify import report
+
+    assert len(report._MD_CELL) >= 7
+    for key in report._MD_CELL:
+        assert report._MD_CELL_RE.fullmatch(key), key
+    # Every match must be a key, or _md_cell raises KeyError: walk every single code point and
+    # every ASCII pair, which covers each key's length.
+    assert max(len(key) for key in report._MD_CELL) == 2
+    for code in range(0x110000):
+        char = chr(code)
+        assert (report._MD_CELL_RE.fullmatch(char) is not None) is (char in report._MD_CELL), code
+    for first in range(0x80):
+        for second in range(0x80):
+            pair = chr(first) + chr(second)
+            matched = report._MD_CELL_RE.fullmatch(pair) is not None
+            assert matched is (pair in report._MD_CELL), pair
+
+
+@pytest.mark.parametrize(
+    "lookalike",
+    [
+        "u\uff12\uff10\uff12\uff25",  # fullwidth 202E
+        "u20\uff12e",  # one fullwidth digit among ASCII ones
+        "x\uff11\uff42",  # fullwidth 1b
+        "u\u0662\u0660\u0662e",  # Arabic-Indic digits (Nd)
+        "u202\u0435",  # a Cyrillic e
+        "U0001\uff26\uff16\uff10\uff10",  # fullwidth F600 in the eight-digit form
+        "\u034fu202E",  # an invisible combining grapheme joiner before the letter
+        "\u0445\u0031b",  # a Cyrillic small ha for the x
+        "\uff55202E",  # a fullwidth u
+    ],
+)
+def test_keeping_unicode_doubles_a_backslash_before_a_non_ascii_hex_lookalike(
+    lookalike: str,
+) -> None:
+    # Printable non-ASCII prints as itself in this mode, so a fullwidth or Cyrillic digit after
+    # a backslash and u would read as a real escape of a bidirectional override.
+    text = "\\" + lookalike
+    shown = _keep(text)
+    # The backslash is doubled, so it reads as text. A kept character in the window may itself be
+    # escaped too (the combining joiner is: it stands before an escape body), which a doubled
+    # backslash before a real escape spells unambiguously.
+    assert shown.startswith("\\\\")
+    assert shown in ("\\" + text, "\\\\\\u034fu202E")
+
+
+def test_keeping_unicode_leaves_a_backslash_before_a_short_or_ascii_tail_single() -> None:
+    # Not every backslash before a u: only one followed by enough hex-looking characters.
+    assert _keep("C:\\users\\caf\u00e9") == "C:\\users\\caf\u00e9"
+    assert _keep("\\u\u00e9") == "\\u\u00e9"  # one character is not an escape's width
+    # The strict rule's output is pure ASCII, so its lookalike stays ASCII hex only.
+    assert escape_for_terminal("\\u\uff12\uff10\uff12\uff25") == ("\\u\\uff12\\uff10\\uff12\\uff25")
+
+
+@pytest.mark.parametrize(
+    "slash",
+    [
+        "\ufe68",  # small reverse solidus
+        "\uff3c",  # fullwidth reverse solidus
+        "\u29f5",  # reverse solidus operator
+        "\u2216",  # set minus
+        "\u20e5",  # combining reverse solidus overlay
+    ],
+)
+@pytest.mark.parametrize("body", ["u202E", "x1b", "U0001F600", "u\uff12\uff10\uff12\uff25"])
+def test_keeping_unicode_escapes_a_kept_character_before_an_escape_body(
+    slash: str, body: str
+) -> None:
+    # Anything that looks like a backslash would start a forged escape the doubling never sees,
+    # since the doubling only looks at a real backslash; so the character before a body is escaped.
+    assert _keep(f"kid {slash}{body}") == f"kid \\u{ord(slash):04x}{body}"
+
+
+def test_keeping_unicode_keeps_a_character_not_before_an_escape_body() -> None:
+    assert _keep("\uff3c path \u29f5 u20 caf\u00e9u") == "\uff3c path \u29f5 u20 caf\u00e9u"
+
+
+def test_a_connscale_reload_probe_logs_an_engine_reply_escaped_to_one_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from harness.load.connscale import probe
+
+    class _Client:
+        def reload_config(self, config_dir: str | None) -> object:
+            raise ApiError(f"500: {_HOSTILE}{_FORGE}", status=500)
+
+    with caplog.at_level("WARNING", logger=probe.__name__):
+        reading, refused = probe.time_reload_outcome(_Client(), None)  # type: ignore[arg-type]
+    assert (reading, refused) == (None, False)
+    [record] = [r for r in caplog.records if r.name == probe.__name__]
+    assert record.getMessage() == (
+        f"reload probe: the reload request failed (HTTP 500): 500: {_HOSTILE_SHOWN}{_FORGE_SHOWN}"
+    )
+
+
+class _TailNode:
+    def __init__(self, tail: str) -> None:
+        self._tail = tail
+
+    def log_tail(self) -> str:
+        return self._tail
+
+
+def test_a_shardcert_log_tail_is_escaped_and_keeps_its_lines() -> None:
+    from harness.load import shardcert
+
+    node = _TailNode(f"line one {_HOSTILE}\r\nline two\n")
+    assert shardcert._shown_tail(node) == f"line one {_HOSTILE_SHOWN}\nline two\n"  # type: ignore[arg-type]
+
+
+def test_no_shardcert_message_embeds_a_raw_log_tail() -> None:
+    # Every RuntimeError a shard's start raises reaches the terminal as an uncaught traceback, so a
+    # log tail in one must go through _shown_tail. A raw call in an f-string is the regression.
+    import ast
+
+    import harness.load.shardcert as shardcert
+
+    tree = ast.parse(Path(shardcert.__file__).read_text(encoding="utf-8"))
+    # Any read of a log tail, however it is then formatted, outside the one helper that escapes it.
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_shown_tail"
+    )
+    inside = {id(node) for node in ast.walk(helper)}
+    reads = [
+        (node.lineno, id(node) in inside)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "log_tail"
+    ]
+    escaped = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_shown_tail"
+    ]
+    # The positive controls: the helper's own read is found, and so are the raise sites using it.
+    assert len(reads) >= 1
+    assert any(in_helper for _, in_helper in reads)
+    assert len(escaped) >= 4
+    raw = [line for line, in_helper in reads if not in_helper]
+    assert raw == []
+
+
+def test_an_ingress_probe_setup_failure_prints_its_log_tail_escaped_to_one_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from harness.load import ingress_probe
+    from harness.load.failover import FailoverError
+
+    exc = FailoverError(f"node a exited during startup:\nRESULT rate=60 ok=True {_HOSTILE}\r\n")
+    assert ingress_probe._setup_failed(10.0, "engine_did_not_start", exc) == 2
+    # One line: the workflow reads every stdout or stderr line starting RESULT, so a tail line of
+    # its own could forge a verdict.
+    assert capsys.readouterr().err == (
+        "ingress probe: engine_did_not_start: node a exited during startup:\\x0a"
+        f"RESULT rate=60 ok=True {_HOSTILE_SHOWN}\\x0d\\x0a\n"
+    )
+
+
+def test_a_fuzz_failure_line_escapes_a_shown_identifier_once() -> None:
+    # invariants.shown() keeps the value raw, so the printed line escapes it exactly once: a real
+    # ESC prints as \x1b, and text spelling \x1b prints doubled, as everywhere else.
+    from harness.fuzz import campaign
+    from harness.fuzz.invariants import shown
+    from harness.fuzz.mutate import Case
+
+    lines: list[str] = []
+    session = campaign._Session.__new__(campaign._Session)
+    session.emit = lines.append
+    session.keep_replays = False
+    session.config = campaign.FuzzConfig(seed=7, iterations=1, seconds=None, batch=1, out_dir=None)
+    session.result = campaign.CampaignResult(seed=7)
+    case = Case(7, 1, "ADT^A01", "field", "m", b"", "c\x1bid\\x1b")
+    reason = f"reply is not an ACK (MSH-9.1 {shown('A\x1b[2J\\x1b')})"
+    session._fail(reason, case, [case])
+    assert len(lines) == 1
+    assert "control_id='c\\x1bid\\\\x1b' " in lines[0]
+    assert "reason=reply is not an ACK (MSH-9.1 'A\\x1b[2J\\\\x1b') " in lines[0]
+    # The record keeps the value raw; only the printed line is escaped.
+    assert session.result.failures[0].reason == "reply is not an ACK (MSH-9.1 'A\x1b[2J\\x1b')"
+
+
+def test_a_shown_identifier_stays_inside_its_quotes() -> None:
+    from harness.fuzz.invariants import shown
+
+    assert shown("a' reason=ok") == '"a\' reason=ok"'
+    assert shown('a" b') == "'a\" b'"
+    assert shown(None) == "None"

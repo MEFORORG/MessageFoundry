@@ -287,15 +287,16 @@ class _Session:
             where = (
                 f"iteration={case.iteration} message={case.message} layer={case.layer} "
                 f"mutation={case.mutation} sent_bytes={len(case.data)} "
-                f"control_id={shown(case.control_id)}"
+                f"control_id={escape_for_terminal(shown(case.control_id), single_line=True)}"
             )
         elif sent:
             where = f"iterations={sent[0].iteration}-{sent[-1].iteration} (batch-level)"
         else:
             where = "before any case of the batch was sent (batch-level)"
         replay_note = " ".join(str(p) for p in paths) or "(none written)"
-        # The reason can quote a peer: an API reply body, a transport's error text. It stays as it
-        # was in the Failure above and is escaped only on this one line (ASVS 1.1.2).
+        # The reason can quote a peer: an API reply body, a transport's error text, a control id
+        # through invariants.shown(), which keeps it raw. It stays as it was in the Failure above
+        # and is escaped once, only on this one line, as the control id is (ASVS 1.1.2).
         shown_reason = escape_for_terminal(reason, single_line=True)
         self.emit(
             f"FAIL seed={self.config.seed} {where} reason={shown_reason} replay={replay_note}"
