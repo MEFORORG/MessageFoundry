@@ -96,13 +96,18 @@ def _body(payload: str | bytes, encoding: str) -> bytes:
 
 
 def _encoded(payload: str | bytes, encoding: str, transport: str) -> bytes:
+    # The raise sits OUTSIDE the except on purpose, as in transports.base.encode_wire_body: a
+    # UnicodeEncodeError carries the whole payload as ``.object``, and ``raise ... from None`` still
+    # leaves it reachable through ``__context__``. Only the offset leaves the handler.
+    position: int
     try:
         return _body(payload, encoding)
     except UnicodeEncodeError as exc:
-        raise FrameEncodeError(
-            f"{transport}: payload cannot be encoded as {encoding} at character {exc.start}; "
-            "it is not sent"
-        ) from None
+        position = exc.start
+    raise FrameEncodeError(
+        f"{transport}: payload cannot be encoded as {encoding} at character {position}; "
+        "it is not sent"
+    )
 
 
 @dataclass(frozen=True)

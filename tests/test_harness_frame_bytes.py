@@ -282,10 +282,16 @@ def test_compose_framer_still_sends_a_hostile_payload(listener: socket.socket) -
 
 
 def test_an_unencodable_payload_is_refused_without_its_content() -> None:
+    payload = "PID|||||M\u00fcller"
     with pytest.raises(FrameEncodeError) as caught:
-        frame_checked("PID|||||M\u00fcller", "ascii")
-    assert "ller" not in str(caught.value) and "\\xfc" not in str(caught.value)
-    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+        frame_checked(payload, "ascii")
+    err = caught.value
+    # Neither link of the chain may hold the UnicodeEncodeError, whose .object is the whole payload.
+    assert err.__cause__ is None and err.__context__ is None
+    for text in (str(err), repr(err), *map(str, err.args)):
+        assert "ller" not in text and "PID" not in text and "\u00fc" not in text
+        assert "\\xfc" not in text
+    assert "at character 9" in str(err)  # positive control: the content-free fact is there
     with pytest.raises(FrameEncodeError):
         frame_neutralised("M\u00fcller", "ascii")
 
