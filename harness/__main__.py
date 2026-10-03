@@ -412,6 +412,7 @@ def _run_scenario(
     from harness.endpoints import Endpoints
     from harness.scenarios import SCENARIOS, run_scenario
     from messagefoundry.apiclient import ApiError, EngineClient
+    from messagefoundry.terminal_text import escape_for_terminal
 
     scenario = SCENARIOS.get(name)
     if scenario is None:
@@ -432,7 +433,7 @@ def _run_scenario(
                 client.set_token(token)
             result = run_scenario(scenario, client, timeout=timeout, endpoints=endpoints)
     except ApiError as exc:
-        print(f"FAIL  {name}: {exc}", file=sys.stderr)
+        print(f"FAIL  {name}: {escape_for_terminal(str(exc))}", file=sys.stderr)
         return 1
     except OSError as exc:
         # Setup, not a verdict on the engine: a sink could not bind (the GUI Receive tab already
@@ -441,9 +442,9 @@ def _run_scenario(
         return 2
     if result.skipped:
         # Not a pass: the scenario's precondition (an external server, an extra) is missing here.
-        print(f"SKIP  {name}: {result.detail}")
+        print(f"SKIP  {name}: {escape_for_terminal(result.detail)}")
         return 2
-    print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {result.detail}")
+    print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {escape_for_terminal(result.detail)}")
     return 0 if result.ok else 1
 
 
@@ -499,6 +500,7 @@ def _run_load(args: argparse.Namespace) -> int:
     from harness.load.report import compare_to_baseline
     from harness.load.runner import PreflightError, run_load
     from messagefoundry.apiclient import ApiError
+    from messagefoundry.terminal_text import escape_for_terminal
 
     try:
         profile = get_profile(args.load)
@@ -531,7 +533,7 @@ def _run_load(args: argparse.Namespace) -> int:
     except ApiError as exc:
         # A bad/expired --token or an engine that's down surfaces here (the client validates the token
         # via /auth/me before preflight). That's a setup failure, not an SLO violation → exit 2.
-        print(f"engine setup failed: {exc}", file=sys.stderr)
+        print(f"engine setup failed: {escape_for_terminal(str(exc))}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
