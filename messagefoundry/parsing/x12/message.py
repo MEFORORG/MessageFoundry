@@ -136,7 +136,11 @@ class X12Message:
         so the value stays one component. X12 has no escape, so refusing is the only way to keep
         it data. The Steps view writes a Set Field template that reads a component path as
         ``msg.set_data``, and it cannot tell an X12 handler from an HL7 one. Without this name
-        that line raised ``AttributeError`` on every X12 message."""
+        that line raised ``AttributeError`` on every X12 message. The value reaches this method
+        already built, so it cannot tell a separator the author typed from one a read returned;
+        the Steps view keeps ``set`` for a template whose own text holds one. A bad path fails
+        first, as it does under :meth:`set`."""
+        _parse_path(path)
         self._reject_delimiters(value, whole_element=False)
         self.set(path, value, occurrence=occurrence)
 

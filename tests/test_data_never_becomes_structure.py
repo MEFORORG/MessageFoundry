@@ -710,7 +710,7 @@ def test_split_batch_bytes_hands_a_single_message_over_without_decoding(
 
 def test_the_msh_opening_check_is_the_parsers_strip() -> None:
     # One check serves the parser and the one-message hand-off; it must read what a strip reads.
-    for code in [*range(0x3100), 0xFEFF, 0x202F, 0x205F]:
+    for code in [*range(0x3100), 0xFEFF]:
         text = chr(code) * 2 + "MSH|"
         assert starts_with_msh(text) == text.lstrip().startswith("MSH"), code
     assert not starts_with_msh("PID|MSH")
@@ -1118,6 +1118,36 @@ def test_an_edit_that_only_respells_a_quote_leaves_the_write_alone() -> None:
     source = LENS_SOURCE + "    msg.set('PV1-19', f\"{msg['PID-3.1'] or ''}\")\n"
     out = _set_path(source, "PV1-19")
     assert "msg.set(" in out and "set_data" not in out
+
+
+def test_an_edit_that_only_drops_a_u_prefix_leaves_the_write_alone() -> None:
+    source = LENS_SOURCE + "    msg.set(u\"PV1-19\", f\"{msg['PID-3.1'] or ''}\")\n"
+    out = _set_path(source, "PV1-19")
+    assert "msg.set(" in out and "set_data" not in out
+
+
+@pytest.mark.parametrize("sep", [":", ">", "*"])
+def test_a_set_field_template_holding_an_x12_separator_keeps_set(sep: str) -> None:
+    # The lens cannot know whether the handler runs on X12, where these are structure the author
+    # typed, and X12 set_data refuses its component separator in a whole element.
+    parts = [{"path": "PID-3.1"}, {"text": f"{sep}B"}]
+    out = _set_value(LENS_SOURCE + '    msg.set("PV1-19", "X")\n', {"parts": parts})
+    assert "set_data" not in out
+    assert _native_rows(out)[-1]["param_parts"]["value"] == parts
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param('"X"', id="plain-literal"),
+        pytest.param("f\"A^{msg['PID-3.1'] or ''}\"", id="authored-structure"),
+        pytest.param("f\"{msg['PID-3'] or ''}\"", id="whole-field-read"),
+    ],
+)
+def test_any_set_data_value_into_a_leaf_reads_back_as_set_field(value: str) -> None:
+    # At a leaf destination set_data and set write the same thing, so the value does not matter.
+    row = _native_rows(LENS_SOURCE + f'    msg.set_data("PV1-19.1", {value})\n')[-1]
+    assert row["action"] == "set_field"
 
 
 def test_a_set_data_template_into_a_leaf_still_reads_back_as_set_field() -> None:

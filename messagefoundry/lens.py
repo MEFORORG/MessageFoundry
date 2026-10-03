@@ -300,9 +300,10 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
     != 1), a non-``msg`` receiver, or any other method makes it unrecognized (→ a read-only ``code`` row):
     when unsure the lens degrades rather than risk a corrupting edit. ``occurrence=``/other keyword args
     are preserved as read-only ``display`` fields (never dropped, never editable in Phase A). A
-    ``msg.set_data`` call is a ``set_field`` only when its value is a template the lens itself would
-    write with ``set_data`` (:func:`_template_is_data`); any other one that is not a copy is a
-    ``code`` row, because ``set_field`` otherwise means :meth:`Message.set`."""
+    ``msg.set_data`` call that is not a copy is a ``set_field`` when its destination is a literal
+    component or subcomponent path, where it writes what ``msg.set`` writes, or when its value is a
+    template the lens itself would write with ``set_data`` (:func:`_template_is_data`). Any other
+    one is a ``code`` row, because ``set_field`` otherwise means :meth:`Message.set`."""
     func = call.func
     if not isinstance(func, ast.Attribute) or not _is_msg_method(func, func.attr):
         return None
@@ -320,9 +321,13 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
             return _NativeAction(
                 "copy_field", [("src", field_call.args[0]), ("dst", dst_or_path)], display
             )
-        # At a literal leaf the lens writes set, but set_data writes the same thing there, so a
-        # set_data line it would write anywhere else still reads back as the Set Field it is.
-        if func.attr == "set_data" and not _template_is_data(value):
+        # At a literal leaf set_data writes what set writes, so any value there reads back as the
+        # Set Field it is; elsewhere only a template the lens itself writes with set_data does.
+        if (
+            func.attr == "set_data"
+            and not _is_leaf_literal(getattr(dst_or_path, "value", None))
+            and not _template_is_data(value)
+        ):
             return None
         return _NativeAction("set_field", [("path", dst_or_path), ("value", value)], display)
     if func.attr in ("delete_segments", "delete_segment"):
@@ -2589,7 +2594,7 @@ def _apply_set_params(
         or (action == "set_field" and ("value" in params or "path" in params))
     ):
         before = stmt.value if isinstance(stmt, ast.Expr) else stmt
-        repicked = _repick_write(result, line_start, line_end, ast.dump(before))
+        repicked = _repick_write(result, line_start, line_end, _argument_dump(before))
         if repicked != result:
             _refuse_overlong_repick(result, repicked, line_start, line_end)
         result = repicked
@@ -2615,6 +2620,21 @@ def _refuse_overlong_repick(result: str, repicked: str, line_start: int, line_en
             )
 
 
+def _argument_dump(node: ast.AST) -> str:
+    """``ast.dump`` of ``node`` with every constant's ``kind`` left out.
+
+    ``kind`` records a ``u`` prefix, which is spelling and not a value. So an edit that only drops
+    one compares equal, as an edit that only respells a string's quotes already does."""
+    kinds = [(sub, sub.kind) for sub in ast.walk(node) if isinstance(sub, ast.Constant)]
+    try:
+        for sub, _ in kinds:
+            sub.kind = None
+        return ast.dump(node)
+    finally:
+        for sub, kind in kinds:
+            sub.kind = kind
+
+
 def _repick_write(source: str, line_start: int, line_end: int, before: str) -> str:
     """Re-pick the write of the native Copy Field or Set Field at ``line_start``-``line_end`` of
     ``source``, after an edit of a copy's ``src`` or ``dst`` or of a Set Field's ``path`` or ``value``
@@ -2627,8 +2647,9 @@ def _repick_write(source: str, line_start: int, line_end: int, before: str) -> s
     so there the method is left as written, and a source that is not a literal keeps its method. A
     Set Field always takes the picked method, so the row keeps reading back as ``set_field``.
     ``source`` is the already-spliced text, so the arguments read here are the ones the edit
-    wrote. ``before`` is the ``ast.dump`` of the call before the edit: an edit that changed no
-    argument, such as one that only respelled a string's quotes, leaves the write as written."""
+    wrote. ``before`` is the :func:`_argument_dump` of the call before the edit: an edit that
+    changed no argument, such as one that only respelled a string's quotes or dropped a ``u``
+    prefix, leaves the write as written."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -2652,7 +2673,7 @@ def _repick_write(source: str, line_start: int, line_end: int, before: str) -> s
     if len(found) != 1:
         return source
     call = found[0]
-    if ast.dump(call) == before:
+    if _argument_dump(call) == before:
         return source
     func = call.func
     assert isinstance(func, ast.Attribute)
@@ -4622,23 +4643,36 @@ def _copy_write_method(src: Any) -> str:
     return "set_data" if _is_leaf_literal(src) else "set"
 
 
-#: The delimiters that template text carries as structure the author meant: component,
-#: repetition, subcomponent and escape. A field separator is not among them, because a whole-field
-#: ``set`` refuses one anyway, so text holding it can only mean data.
-_AUTHORED_STRUCTURE = frozenset("^~&" + chr(92))
+#: The characters that template text carries as structure the author meant, in either format the
+#: lens writes for. The lens is static: it cannot tell an HL7 handler from an X12 one, and it cannot
+#: read a message's own separators. So the rule is one an author can predict: text holding a
+#: separator in common use in either format keeps ``set``.
+#:
+#: * HL7 component, repetition, subcomponent and escape: ``^ ~ & \``.
+#: * X12 separators in common use: ``:`` and ``>`` for a component, ``*`` for an element, ``^`` for
+#:   a repetition and ``~`` to end a segment. The component separator is the one that matters. An
+#:   X12 ``set_data`` refuses it in a whole element, because the value reaches it already built and
+#:   could hold one read from data, so a template whose text holds one would raise on every X12
+#:   message. The other X12 separators are refused by both writes.
+#:
+#: The HL7 field separator is not among them: a whole-field ``set`` refuses one anyway, so text
+#: holding it can only mean data. A separator outside this set is the miss, and it fails loud: X12
+#: ``set_data`` raises rather than write it. Each character added costs the other way, because an
+#: HL7 template that keeps ``set`` lets a decoded leaf's separators become structure, which the
+#: handler-security lint flags.
+_AUTHORED_STRUCTURE = frozenset("^~&" + chr(92) + ":>*")
 
 
 def _template_write_method(value: ast.expr, dst: ast.expr) -> str:
     """The ``Message`` write a native Set Field writing ``value`` to ``dst`` uses (ADR 0206 rule 1).
 
     ``set_data`` for a template whose every read is a literal component or subcomponent path, whose
-    read is decoded, and whose own text holds no component, repetition, subcomponent or escape
-    character; ``set`` for anything else. A whole-field read is raw text with its structure, which
-    ``set_data`` would escape into one component, and text holding one of those delimiters is
-    structure the author wrote, so either keeps ``set``, and the handler-security lint still flags
-    a leaf such a template copies. At a literal leaf destination the two writes are the same, so
-    ``set`` is kept there too. The lens is static and cannot know a message's own separators, so
-    the test uses the standard ones."""
+    read is decoded, and whose own text holds no character in :data:`_AUTHORED_STRUCTURE`; ``set``
+    for anything else. A whole-field read is raw text with its structure, which ``set_data`` would
+    escape into one component, and text holding one of those characters is structure the author
+    wrote, so either keeps ``set``, and the handler-security lint still flags a leaf such a template
+    copies. At a literal leaf destination the two writes are the same, so ``set`` is kept there
+    too."""
     if _is_leaf_literal(getattr(dst, "value", None)) or not _template_is_data(value):
         return "set"
     return "set_data"
@@ -4646,9 +4680,9 @@ def _template_write_method(value: ast.expr, dst: ast.expr) -> str:
 
 def _template_is_data(value: ast.expr) -> bool:
     """Whether ``value`` is a template whose every read is a literal component or subcomponent path
-    and whose own text holds no component, repetition, subcomponent or escape character: the
-    template :func:`_template_write_method` writes with ``set_data`` at a whole-field destination.
-    A hand-written f-string may have no read at all, which is not one."""
+    and whose own text holds no character in :data:`_AUTHORED_STRUCTURE`: the template
+    :func:`_template_write_method` writes with ``set_data`` at a whole-field destination. A
+    hand-written f-string may have no read at all, which is not one."""
     parts = _template_parts(value)
     if parts is None:
         return False
