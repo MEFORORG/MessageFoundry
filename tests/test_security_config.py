@@ -491,9 +491,8 @@ def test_no_logged_settings_text_is_named_like_a_password() -> None:
     ``mfa`` as a separate word in its name, as ``OIDC_MFA_CLAIM_EXCEPTION`` did on PR 1959.
 
     CodeQL is not a required check, so before this test the rule lived only in a comment. Scoped to
-    module-level names, which the engine chooses. A config field such as ``require_mfa`` is a class
-    attribute an operator writes, so it cannot be renamed; a text about one carries a literal
-    instead of its value. ADR 0034's 2026-10-03 amendment holds the class."""
+    this module's own names, and ``__all__`` is a subset of them. ADR 0034's 2026-10-03 amendment
+    holds the rule and says why the scope stops here."""
     # Positive control: the two names PR 1959 renamed away from, and the names it chose instead.
     assert _named_like_a_password_and_logged("OIDC_MFA_CLAIM_EXCEPTION", "a fixed sentence")
     assert _named_like_a_password_and_logged(
@@ -502,11 +501,10 @@ def test_no_logged_settings_text_is_named_like_a_password() -> None:
     assert not _named_like_a_password_and_logged(
         "OIDC_SECOND_FACTOR_CLAIM_EXCEPTION", "a fixed sentence"
     )
-    module = vars(settings_module)
     offenders = sorted(
         name
-        for name in set(module) | set(settings_module.__all__)
-        if name in module and _named_like_a_password_and_logged(name, module[name])
+        for name, value in vars(settings_module).items()
+        if _named_like_a_password_and_logged(name, value)
     )
     assert offenders == []
 

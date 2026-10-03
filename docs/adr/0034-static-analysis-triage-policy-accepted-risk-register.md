@@ -882,6 +882,11 @@ reading is attributed to that pull request and was not re-measured here.
 for the module-level names in `config.settings`, because CodeQL is not a required check. It reaches
 no other module and no config field. Rule 2 has no guard but a reader.
 
+The guard stops at one module on purpose. Measured 2026-10-03, the same scan over every module in
+the `messagefoundry` package flags 17 names in `auth/`, `api/` and `pipeline/`: audit-event and
+step-up action constants such as `MFA_ENABLED` and `STEP_UP_ACTION_MFA_ENROLL`. Renaming those is a
+separate decision, not a wording fix, so a package-wide guard would start red.
+
 ### The discriminator
 
 A name match is the false case only while the logged value carries no secret: a fixed sentence, a
