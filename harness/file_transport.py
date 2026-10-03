@@ -16,13 +16,13 @@ only live arrivals).
 from __future__ import annotations
 
 import logging
-import stat
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
 
+from harness.bounded_file import read_capped
 from harness.drivers.file import drop_atomic
 from harness.mllp import Received, SendItem
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
@@ -141,26 +141,13 @@ class FolderWatcher(QObject):
         for path in sorted(self._dir.glob("*.hl7")):
             if path.name in self._seen:
                 continue
-            cap = self.max_file_bytes
-            data = b""
-            reason = ""
             try:
-                # Size first, so an over-cap file is never opened. Only a regular file: a FIFO named
-                # *.hl7 reports size 0 and would block this (GUI) thread on open.
-                st = path.stat()
-                if not stat.S_ISREG(st.st_mode):
-                    reason = "not a regular file; not read"
-                elif st.st_size > cap:
-                    reason = f"{st.st_size} bytes, over the {cap}-byte cap; not read"
-                else:
-                    # Read one byte past the size it reported, then top up to one past the cap
-                    # only if it grew, so a small file costs a small read and a grown one is caught.
-                    with path.open("rb") as fh:
-                        data = fh.read(st.st_size + 1)
-                        if len(data) > st.st_size:
-                            data += fh.read(cap + 1 - len(data))
-                    if len(data) > cap:
-                        reason = f"grew past the {cap}-byte cap while read; not kept"
+                # A size and type check before the open, so an over-cap file is never opened, and
+                # again on the open handle, so a file swapped or grown in between is judged by what
+                # is read. Only a regular file: a FIFO named *.hl7 would block this (GUI) thread.
+                # A symlink is not followed, so a writer to this directory cannot point the pane at
+                # a file of the operator's elsewhere.
+                data, reason = read_capped(path, self.max_file_bytes, follow_symlinks=False)
             except OSError:
                 continue  # transient lock/vanish — leave out of _seen so the next rescan retries
             # Only after a successful read or a refusal, so a failed read is retried. A refused file

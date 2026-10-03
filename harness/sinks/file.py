@@ -8,15 +8,18 @@ records each file's path relative to it (``meta["relpath"]``) and whether its re
 symlinks followed, stays inside it (``meta["inside"]``). A file written OUTSIDE the directory is by
 construction not seen here; a scenario that tests for an escape must look where it would land.
 
-Reading is bounded the way the GUI's folder watcher is: regular files only, each capped at the
-engine's per-message cap, and an over-cap file recorded as refused rather than read.
+Reading is bounded the way the GUI's folder watcher is, through the same reader
+(:func:`harness.bounded_file.read_capped`): regular files only, symlinks not followed, each capped
+at the engine's per-message cap, checked again on the open handle, and an over-cap file (or one that
+grows past the cap while read) recorded with an empty payload and a ``refused`` reason rather than
+read.
 """
 
 from __future__ import annotations
 
-import stat
 from pathlib import Path
 
+from harness.bounded_file import NOT_REGULAR, read_capped
 from harness.endpoints import Endpoints
 from harness.sinks import Record, Sink
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -36,6 +39,8 @@ class FileSink(Sink):
         self.directory = Path(directory)
         self.pattern = pattern
         self._seen: set[Path] = set()
+        #: The most one file may hold and still be read: the engine's per-message cap.
+        self.max_file_bytes = DEFAULT_MAX_MESSAGE_BYTES
 
     def start(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -54,15 +59,12 @@ class FileSink(Sink):
             if path in self._seen:
                 continue
             try:
-                st = path.lstat()
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                if st.st_size > DEFAULT_MAX_MESSAGE_BYTES:
-                    data, refused = b"", "over the per-message cap; not read"
-                else:
-                    data, refused = path.read_bytes(), ""
+                # Symlinks are not followed: lstat first, O_NOFOLLOW on the open where the OS has it.
+                data, refused = read_capped(path, self.max_file_bytes, follow_symlinks=False)
             except OSError:
                 continue  # vanished or locked mid-write: the next scan retries it
+            if refused == NOT_REGULAR:
+                continue
             self._seen.add(path)
             resolved = path.resolve()
             meta = {

@@ -264,7 +264,7 @@ from messagefoundry.config.ai_policy import (
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import config_fingerprint_detail, fingerprint_matches
+from messagefoundry.config.fingerprint import fingerprint_matches
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -367,9 +367,9 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
-from messagefoundry.remotedebug import remote_debug_posture
+from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_posture
 from messagefoundry.service_status import query_service_state
-from messagefoundry.startupcode import startup_posture
+from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
 from messagefoundry.store.content_search import (
@@ -873,7 +873,7 @@ def _build_approval_gate(
         registry = outcome.registry
         # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
         failures = await _record_reload_audit(
-            engine, actor=actor, dir_arg=config_dir, failed_steps=[f.step for f in outcome.failures]
+            engine, actor=actor, failed_steps=[f.step for f in outcome.failures]
         )
         return {
             "inbound": len(registry.inbound),
@@ -909,6 +909,110 @@ def _build_approval_gate(
     return gate
 
 
+def _posture_security(state: Any) -> SecuritySettings:
+    """The ``[security]`` a posture reading judges. BACKLOG #1989: when serve stashed its resolved
+    settings, ``[security]`` is read from THAT object, the one the static-credential hops come from, so
+    every part of a reading uses one ``[security]``. On the serve path the two stashes are the same
+    object; off it they can differ."""
+    cred_settings = getattr(state, "static_credential_settings", None)
+    if cred_settings is not None:
+        security: SecuritySettings = cred_settings.security
+        return security
+    return getattr(state, "security", None) or SecuritySettings()
+
+
+def _posture_loosenings(
+    state: Any,
+    engine: Engine,
+    runner: RegistryRunner | None,
+    *,
+    remote_debug: RemoteDebugPosture,
+    startup: StartupPosture,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """The active ``security_loosenings()`` entries and the scope note, read off ``state``.
+
+    ``GET /security/posture`` and the start's ``config_loaded`` audit row (vault BACKLOG #2597) both
+    call this, so the row records the list the route would report. ``runner`` and the two process
+    readings (vault BACKLOG #2700 / #2701) are passed in rather than read here, so a caller that
+    also reports them elsewhere reads each once."""
+    store = getattr(state, "store_settings", None) or StoreSettings()
+    cred_settings = getattr(state, "static_credential_settings", None)
+    security = _posture_security(state)
+    # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed, or None when no
+    # preflight ran in this process; the registry then reports nothing for it.
+    store_privilege = getattr(state, "store_privilege", None)
+    # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
+    # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
+    auth_settings = getattr(state, "auth_settings", None) or AuthSettings()
+    # #323 layer 3: [alerts] carries the SMTP-hop deviation (cleartext / verification off). Same
+    # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
+    # graph loaded, unlike the connection-scoped cleartext_accepted set below.
+    alerts_settings = getattr(state, "alerts_settings", None) or AlertsSettings()
+    # BACKLOG #1004: [secret_rotation] carries the store DEK's calendar-expiry opt-out. Same
+    # stash-or-default pattern — settings-scoped, so this route reports it completely with no graph.
+    secret_rotation_settings = (
+        getattr(state, "secret_rotation_settings", None) or SecretRotationSettings()
+    )
+    # BACKLOG #1179: [api] carries the plaintext upstream-hop acknowledgement. Read off the
+    # resolved settings serve stashed, the #1989 object; an app built without them (the
+    # embedding/test path) reports the shipped [api] defaults, which acknowledge nothing.
+    api_settings = cred_settings.api if cred_settings is not None else ApiSettings()
+    # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
+    # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
+    # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
+    # being honoured, a generic DB hop has no verifying TLS keyword, a hop is attested secure, or a
+    # revocation refusal is attested away, and a stale or absent list would understate the
+    # posture. An engine with no
+    # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
+    # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
+    # the whole posture — the same discipline `messagefoundry security show` follows.
+    if runner is not None:
+        cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
+        expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
+        hostname_hops = [name for name, _ in hostname_unchecked_hops(runner.registry)]
+        query_hops = [name for name, _ in query_credential_hops(runner.registry)]
+        db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
+        attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
+        revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
+    else:
+        cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
+        query_hops = []
+        attested_hops, revocation_hops = [], []
+    loosenings_scope = (
+        None
+        if runner is not None
+        else (
+            "settings only — no connection graph is loaded on this engine, so the per-connection "
+            "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
+            "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
+            "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
+        )
+    )
+    pairs = list(
+        security_loosenings(
+            security,
+            store,
+            auth_settings,
+            alerts_settings,
+            secret_rotation_settings,
+            cleartext_hops=cleartext_hops,
+            expiry_relaxed_hops=expired_hops,
+            hostname_unchecked_hops=hostname_hops,
+            query_credential_hops=query_hops,
+            unverified_db_hops=db_hops,
+            attested_hops=attested_hops,
+            revocation_attested_hops=revocation_hops,
+            api=api_settings,
+            store_privilege=store_privilege,
+            # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
+            audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
+            remote_debug=remote_debug,
+            startup=startup,
+        )
+    )
+    return pairs, loosenings_scope
+
+
 # The degraded-step label _record_reload_audit adds when the graph swapped and its config_reload
 # audit row failed (BACKLOG #1940). It sits beside the engine's own labels in ReloadResult.failures.
 _RELOAD_AUDIT_STEP = "audit"
@@ -918,16 +1022,22 @@ async def _record_reload_audit(
     engine: Engine,
     *,
     actor: str,
-    dir_arg: object,
+    action: Literal["config_reload", "config_loaded"] = "config_reload",
     client: str | None = None,
     failed_steps: Sequence[str] = (),
+    extra: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
+    The start writes its ``config_loaded`` row through here too (vault BACKLOG #2597), passing the
+    action and its ``loosenings`` in ``extra``. Every row names the running directory, its engine
+    shard and cluster node, since each engine-shard process loads the graph.
+
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
-    records the same fingerprint-bearing row as an ungated one. The fingerprint is computed off the
-    event loop and is best-effort — a fingerprint failure must never block the audit of a successful
-    reload. ``dir_arg`` is the requested config_dir (advisory; the row keys on engine.last_reload_dir).
+    records the same fingerprint-bearing row as an ungated one. The fingerprint is the engine's
+    :attr:`~Engine.loaded_config_fingerprint`, the digest it took of the bytes it loaded, so the row
+    and ``GET /config/provenance`` always name one digest. When the engine could not take one, the row
+    is written without it.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -939,54 +1049,78 @@ async def _record_reload_audit(
     to one caller once and the audit is what a later reader has: a reload whose reference sets never
     re-armed must be findable after the fact, not only by whoever happened to read the 200.
 
-    **It returns the steps the caller reports, and lets no fault escape (BACKLOG #1940).** Both
-    callers run it after the graph has swapped. A raise would tell the caller that a reload which ran
+    **It returns the steps the caller reports, and lets no fault escape (BACKLOG #1940).** Every
+    caller runs it after the graph is live. A raise would tell the caller that a reload which ran
     had failed: the executor's would be compensated into ``failed`` and the inline route's would be a
-    500, and a retry would run the reload again. So every step here catches ``Exception``:
-
-    * A fingerprint that cannot be computed is logged at ERROR, and the row is written without it.
-    * A row that cannot be built or written is logged at ERROR with whatever detail was built. The
-      detail holds counts, step names and the fingerprint, never message content.
-      :data:`_RELOAD_AUDIT_STEP` is then added to the returned steps, so the answer says the new
-      graph is live and its row is missing. A released reload carries that into ``approval.approved``.
+    500, and a retry would run the reload again. So a row that cannot be built or written is logged
+    at ERROR with whatever detail was built. The detail holds counts, step names, switch names and
+    the fingerprint, never message content. :data:`_RELOAD_AUDIT_STEP` is then added to the returned
+    steps, so the answer says the new graph is live and its row is missing. A released reload
+    carries that into ``approval.approved``.
 
     A cancellation still propagates: it is not a failure of this helper."""
-    fingerprint: dict[str, object] = {}
-    if engine.last_reload_dir is not None:
-        try:
-            fingerprint = await asyncio.to_thread(config_fingerprint_detail, engine.last_reload_dir)
-        except Exception:  # noqa: BLE001 - after the swap nothing may escape (BACKLOG #1940)
-            # An unreadable dir mid-reload, a git ref that is not UTF-8, an executor refusing work
-            # at shutdown: the row is still written, without the fingerprint.
-            _log.exception(
-                "config fingerprint failed for %s (step config_fingerprint); the config_reload row"
-                " is written without it",
-                engine.last_reload_dir,
-            )
     detail: str | None = None
     try:
         rr = engine.registry_runner
+        directory = engine.running_config_dir
         detail = json.dumps(
             {
-                "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
+                "dir": str(directory) if directory else None,
+                "shard": rr.registry.shard_id if rr else None,
+                "node": engine.coordinator.node_id,
                 "inbound": len(rr.registry.inbound) if rr else 0,
                 "outbound": len(rr.registry.outbound) if rr else 0,
                 "dry_run": False,
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
-                **fingerprint,
+                **(extra or {}),
+                **(engine.loaded_config_fingerprint or {}),
             }
         )
-        await engine.store.record_audit("config_reload", actor=actor, detail=detail, client=client)
+        await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
     except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
         _log.exception(
-            "config reload swapped the graph, but its config_reload audit row failed (step %s)."
-            " Lost row: actor=%s detail=%s",
+            "config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
+            "loaded at start" if action == "config_loaded" else "reload swapped the graph",
+            action,
             _RELOAD_AUDIT_STEP,
             actor,
             detail,
         )
         return [*failed_steps, _RELOAD_AUDIT_STEP]
     return list(failed_steps)
+
+
+async def _record_start_audit(
+    app: FastAPI, engine: Engine, *, fingerprint_failed: bool = False
+) -> None:
+    """Write the start's ``config_loaded`` row through :func:`_record_reload_audit` (vault BACKLOG
+    #2597), so a restart records which code and which posture the engine started with.
+
+    Called once per process, after every settings stash the loosenings reader needs. It never
+    raises: the engine is already taking traffic, and a lost row is logged at ERROR rather than
+    refusing a start. A loosenings list that cannot be read is recorded as ``None``, which says
+    unknown, never as an empty list, which would say none are active. A start whose fingerprint
+    could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is."""
+    switches: list[str] | None
+    try:
+        pairs, _scope = _posture_loosenings(
+            app.state,
+            engine,
+            engine.registry_runner,
+            remote_debug=remote_debug_posture(),
+            startup=await asyncio.to_thread(startup_posture),
+        )
+        switches = [name for name, _risk in pairs]
+    except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
+        _log.exception("the start's loosenings list could not be read; config_loaded records None")
+        switches = None
+    await _record_reload_audit(
+        engine,
+        actor="system",
+        action="config_loaded",
+        failed_steps=["config_fingerprint"] if fingerprint_failed else [],
+        extra={"loosenings": switches},
+    )
 
 
 def _summary(row: Row) -> MessageSummary:
@@ -2217,59 +2351,8 @@ def create_app(
         # the one the static-credential hops below come from, so every part of this response reads one
         # [security]. On the serve path the two stashes are the same object; off it they can differ.
         cred_settings = getattr(request.app.state, "static_credential_settings", None)
-        security = (
-            cred_settings.security
-            if cred_settings is not None
-            else getattr(request.app.state, "security", None) or SecuritySettings()
-        )
-        # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
-        # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
-        auth_settings = getattr(request.app.state, "auth_settings", None) or AuthSettings()
-        # #323 layer 3: [alerts] carries the SMTP-hop deviation (cleartext / verification off). Same
-        # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
-        # graph loaded, unlike the connection-scoped cleartext_accepted set below.
-        alerts_settings = getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
-        # BACKLOG #1004: [secret_rotation] carries the store DEK's calendar-expiry opt-out. Same
-        # stash-or-default pattern — settings-scoped, so this route reports it completely with no graph.
-        secret_rotation_settings = (
-            getattr(request.app.state, "secret_rotation_settings", None) or SecretRotationSettings()
-        )
-        # BACKLOG #1179: [api] carries the plaintext upstream-hop acknowledgement. Read off the
-        # resolved settings serve stashed, the #1989 object; an app built without them (the
-        # embedding/test path) reports the shipped [api] defaults, which acknowledge nothing.
-        api_settings = cred_settings.api if cred_settings is not None else ApiSettings()
-        # ADR 0153 + #333 + the 2026-09-24 hop attestation + ADR 0173: the connection-scoped
-        # deviations. Read LIVE off the running graph (so a reload is reflected) — this route is where
-        # an operator learns a cleartext hop is being crossed by declaration, an expired certificate is
-        # being honoured, a generic DB hop has no verifying TLS keyword, a hop is attested secure, or a
-        # revocation refusal is attested away, and a stale or absent list would understate the
-        # posture. An engine with no
-        # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
-        # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
-        # the whole posture — the same discipline `messagefoundry security show` follows.
+        security = _posture_security(request.app.state)
         runner = engine.registry_runner
-        if runner is not None:
-            cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
-            expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
-            hostname_hops = [name for name, _ in hostname_unchecked_hops(runner.registry)]
-            query_hops = [name for name, _ in query_credential_hops(runner.registry)]
-            db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
-            attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
-            revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
-        else:
-            cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
-            query_hops = []
-            attested_hops, revocation_hops = [], []
-        loosenings_scope = (
-            None
-            if runner is not None
-            else (
-                "settings only — no connection graph is loaded on this engine, so the per-connection "
-                "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
-                "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-                "tls_revocation_attested declarations are NOT included (see `messagefoundry check`)"
-            )
-        )
         # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed. `None` means no
         # preflight ran in this process (an embedding, or an app built without the managed lifespan) —
         # the registry then reports nothing for it and `store_privilege` below renders the explicit
@@ -2283,29 +2366,10 @@ def create_app(
         # reading reads files, so the call is kept off the event loop.
         remote_debug = remote_debug_posture()
         startup = await asyncio.to_thread(startup_posture)
-        loosenings = [
-            SecurityLoosening(switch=name, risk=risk)
-            for name, risk in security_loosenings(
-                security,
-                store,
-                auth_settings,
-                alerts_settings,
-                secret_rotation_settings,
-                cleartext_hops=cleartext_hops,
-                expiry_relaxed_hops=expired_hops,
-                hostname_unchecked_hops=hostname_hops,
-                query_credential_hops=query_hops,
-                unverified_db_hops=db_hops,
-                attested_hops=attested_hops,
-                revocation_attested_hops=revocation_hops,
-                api=api_settings,
-                store_privilege=store_privilege,
-                # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
-                audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
-                remote_debug=remote_debug,
-                startup=startup,
-            )
-        ]
+        pairs, loosenings_scope = _posture_loosenings(
+            request.app.state, engine, runner, remote_debug=remote_debug, startup=startup
+        )
+        loosenings = [SecurityLoosening(switch=name, risk=risk) for name, risk in pairs]
         interpreter_view = InterpreterView.from_readings(startup, remote_debug)
         # BACKLOG #1182: the static-credential inventory, through its single reader. The graph half is
         # read live off the running graph, like the loosenings above; the settings half from the resolved
@@ -4095,26 +4159,20 @@ def create_app(
         # records the identical fingerprint-bearing row, and reports a failed row the same way (#1940).
         failures = [f.step for f in outcome.failures]
         if req.dry_run:
-            fingerprint: dict[str, object] = {}
-            if engine.last_reload_dir is not None:
-                try:
-                    fingerprint = await asyncio.to_thread(
-                        config_fingerprint_detail, engine.last_reload_dir
-                    )
-                except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
-                    _log.warning(
-                        "config fingerprint failed for %s: %s", engine.last_reload_dir, exc
-                    )
+            # The directory this dry run checked comes from the outcome, never from
+            # engine.last_reload_dir: a dry run does not move that field (vault BACKLOG #2598).
+            # The same best-effort rule as the start and an applied reload: degrade, never fail.
+            fingerprint, _reason = await engine.fingerprint_bundle(outcome.directory)
             await engine.store.record_audit(
                 "config_reload_check",
                 actor=user.username,
                 detail=json.dumps(
                     {
-                        "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
+                        "dir": str(outcome.directory),
                         "inbound": len(registry.inbound),
                         "outbound": len(registry.outbound),
                         "dry_run": True,
-                        **fingerprint,
+                        **(fingerprint or {}),
                     }
                 ),
                 client=client_ip(request),
@@ -4123,7 +4181,6 @@ def create_app(
             failures = await _record_reload_audit(
                 engine,
                 actor=user.username,
-                dir_arg=req.config_dir,
                 client=client_ip(request),
                 failed_steps=failures,
             )
@@ -6247,14 +6304,14 @@ def create_app(
         if not isinstance(fp, str) or not fp:
             return ConfigProvenance(loaded=False)  # no graph loaded yet, or fingerprint unavailable
         drift = False
-        target = engine.last_reload_dir or engine.config_dir
+        target = engine.running_config_dir
         if target is not None:
-            try:
-                current = await asyncio.to_thread(config_fingerprint_detail, target)
+            # The one best-effort rule every load uses (vault BACKLOG #2597). An unreadable bundle
+            # reports clean rather than a false DRIFT alarm.
+            current, _reason = await engine.fingerprint_bundle(target)
+            if current is not None:
                 # Constant-time (ASVS 11.2.4, BACKLOG #1167); a missing fingerprint reads as drift.
                 drift = not fingerprint_matches(current.get("fingerprint"), fp)
-            except OSError:  # dir unreadable now — report clean rather than a false DRIFT alarm
-                drift = False
         git_head = loaded.get("git_head") if loaded else None
         files = loaded.get("files") if loaded else None
         return ConfigProvenance(
@@ -8108,6 +8165,10 @@ def create_managed_app(
                 # Inside the span too (BACKLOG #1989): a raise from add_registry is past every check
                 # above and before the teardown span below, so nothing else would close the store.
                 engine.add_registry(loaded)
+                # Right after the load, so the digest covers the bytes it read, and the provenance
+                # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
+                # unreadable bundle: it leaves the baseline empty and the start goes on.
+                start_fingerprint_failure = await engine.capture_start_provenance()
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
@@ -8264,6 +8325,13 @@ def create_managed_app(
             # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
+            # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
+            # last stash the loosenings reader needs is the one above, and the graph is already
+            # serving, so a later startup step that aborts must not leave the start unrecorded.
+            if config_dir is not None:
+                await _record_start_audit(
+                    app, engine, fingerprint_failed=start_fingerprint_failure is not None
+                )
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
                 await auth.initialize()
