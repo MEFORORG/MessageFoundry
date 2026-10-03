@@ -3786,6 +3786,10 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     )
 
 
+#: The characters a ``[egress].allowed_recipient_domains`` entry may hold, after lowercasing.
+_DOMAIN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-.")
+
+
 class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
@@ -3910,11 +3914,14 @@ class EgressSettings(_Section):
             item = raw.strip().lower().rstrip(".")
             if not item:
                 continue
-            if any(ch in item for ch in "@/:* "):
+            # Letters, digits, hyphens and dots, with no empty label: a hostname-shaped domain. This
+            # refuses an address, URL, port, wildcard, leading-dot suffix, address literal and a
+            # comma-joined pair, none of which the exact match below could ever hit.
+            if set(item) - _DOMAIN_CHARS or "" in item.split("."):
                 raise ValueError(
                     f"[egress].allowed_recipient_domains: {item!r} must be a bare domain such as "
-                    "'hospital.example', not an address, URL, port or wildcard; list each subdomain "
-                    "as its own entry"
+                    "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
+                    "subdomain as its own entry"
                 )
             cleaned.append(item)
         return cleaned

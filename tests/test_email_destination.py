@@ -470,7 +470,7 @@ def _email_dest(
     )
 
 
-def test_allowed_smtp_empty_is_unrestricted() -> None:
+def test_allowed_smtp_empty_leaves_the_relay_host_unrestricted() -> None:
     e = EgressSettings(allowed_recipient_domains=_RCPT_DOMAINS)
     check_egress_allowed(_email_dest("any.smtp.example"), e)  # no raise
 
@@ -538,10 +538,9 @@ def test_listed_recipient_domain_passes(recipients: list[str]) -> None:
         "a@hospital.example, b@partner.example",
         ["a@mail.hospital.example"],  # a subdomain is a different domain
         ["a@nothospital.example"],  # a listed domain as a suffix does not match
-        ["no-at-sign"],  # no readable domain
+        ["no-at-sign"],  # not a readable address
         ["a@"],
-        [""],
-        [],
+        ['""@hospital.example'],  # listed domain, empty local part
     ],
 )
 def test_unlisted_or_unreadable_recipient_is_refused(recipients: list[str] | str) -> None:
@@ -582,8 +581,28 @@ def test_recipient_domains_load_from_the_environment(tmp_path: Path) -> None:
     assert loaded.allowed_recipient_domains == ["hospital.example", "lab.example"]
 
 
+@pytest.mark.parametrize("recipients", [[""], []])
+def test_empty_recipients_are_refused_with_the_construction_message(
+    recipients: list[str],
+) -> None:
+    # The operator is told to fix the connection, not the allowlist.
+    e = _relay_listed(["hospital.example"])
+    with pytest.raises(WiringError, match="non-empty 'recipients'"):
+        check_egress_allowed(_email_dest("smtp.hospital.example", recipients=recipients), e)
+
+
 @pytest.mark.parametrize(
-    "entry", ["a@hospital.example", "https://hospital.example", "hospital.example:25", "*.example"]
+    "entry",
+    [
+        "a@hospital.example",
+        "https://hospital.example",
+        "hospital.example:25",
+        "*.example",
+        ".hospital.example",
+        "[10.0.0.1]",
+        "a.example,b.example",
+        "hospital..example",
+    ],
 )
 def test_a_recipient_domain_that_can_never_match_is_refused_at_load(entry: str) -> None:
     with pytest.raises(ValidationError, match="bare domain"):

@@ -40,8 +40,8 @@ send the Handler's body outside the organisation through a permitted relay.
 
 - **`[egress].allowed_recipient_domains: list[str] = []`** in `EgressSettings`, wired into `_split_list`
   (`MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS=a.example,b.example`). Each entry is a bare domain. A
-  validator lowercases each entry at load and refuses one that could never match: an address, a URL,
-  a port or a wildcard.
+  validator lowercases each entry at load and refuses one that could never match, such as an address,
+  a URL, a port, a wildcard or a leading-dot suffix.
 - **`check_egress_allowed` runs it for every EMAIL destination**, after the host arm. It reads the
   addresses through the transport's own `envelope_recipients`: the entries are joined into one `To:`
   header and parsed with the stdlib address parser, so an entry holding two addresses yields two. Every address must have a domain

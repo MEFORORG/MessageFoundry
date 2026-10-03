@@ -9883,8 +9883,9 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     """Fail-closed: refuse (raise :class:`WiringError`) an outbound destination not on the ``[egress]``
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
-    exfiltrate PHI. Opt-in per transport (an empty list = unrestricted), except two lists that are
-    deny-by-default on their own terms: ``allowed_proxy`` and ``allowed_recipient_domains``. Checked against the resolved
+    exfiltrate PHI. Opt-in per transport (an empty list = unrestricted), except for lists that
+    are deny-by-default on their own terms, such as ``allowed_proxy`` and
+    ``allowed_recipient_domains``. Checked against the resolved
     (``env()``-substituted) destination at config load/reload/start. Webhook/SMTP alert sinks carry no
     PHI bodies and keep their own ``[alerts]`` host allowlists.
 
@@ -10081,27 +10082,38 @@ def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> Non
     domain after the last ``@``; a subdomain needs its own entry. The log line and the error name
     the destination and the domain, never the full address. ``EgressSettings`` has already
     normalised the entries."""
-    permitted = set(allowed)
     try:
         addresses = envelope_recipients(dest.settings.get("recipients"))
-    except ValueError:
-        addresses = [""]  # nothing readable to check is a refusal, never a pass
+    except ValueError as exc:
+        # The transport's own construction message, so the operator fixes the connection rather
+        # than the allowlist.
+        raise WiringError(f"outbound {dest.name!r}: {exc}") from exc
+    if not addresses:
+        # Fail closed without leaning on the parser: a gate that checked nothing has not passed.
+        raise WiringError(f"outbound {dest.name!r}: EMAIL destination names no recipient address")
+    permitted = set(allowed)
     for address in addresses:
         local, at, domain = address.rpartition("@")
-        domain = domain.strip().lower().rstrip(".")
-        if at and local and domain and domain in permitted:
-            continue
-        shown = domain if at and domain else "(no readable domain)"
-        log.warning(
-            "egress denied: outbound %r EMAIL recipient domain %r not in "
-            "[egress].allowed_recipient_domains",
-            dest.name,
-            shown,
-        )
-        raise WiringError(
-            f"outbound {dest.name!r}: EMAIL recipient domain {shown!r} is not in the "
-            "[egress].allowed_recipient_domains allowlist (an empty list permits no recipient)"
-        )
+        domain = domain.lower()
+        if not (at and local and domain):
+            log.warning(
+                "egress denied: outbound %r EMAIL recipient is not a readable address", dest.name
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: an EMAIL recipient is not a readable address, so the "
+                "[egress].allowed_recipient_domains check cannot pass it"
+            )
+        if domain not in permitted:
+            log.warning(
+                "egress denied: outbound %r EMAIL recipient domain %r not in "
+                "[egress].allowed_recipient_domains",
+                dest.name,
+                domain,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: EMAIL recipient domain {domain!r} is not in the "
+                "[egress].allowed_recipient_domains allowlist (an empty list permits no recipient)"
+            )
 
 
 def _mllp_egress_allowed(host: str, port: object, allowed: list[str]) -> bool:
