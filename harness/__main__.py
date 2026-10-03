@@ -129,6 +129,22 @@ _INSECURE_HINT = (
     "carries no credential.)"
 )
 
+
+def _exc_text(exc: BaseException, *, single_line: bool = True) -> str:
+    """An exception's text for stderr, escaped (ASVS 1.1.2).
+
+    An ``ApiError`` can carry the engine's own reply body (``apiclient`` ``_error_detail``), and a
+    rig setup error can carry an engine log tail, so a peer's control sequence must not reach the
+    operator's terminal raw. ``single_line`` (the default) also escapes the newline, so the text
+    cannot start a line of its own; a setup error whose text is a multi-line log tail passes
+    ``False``; a Windows log tail's CRLF then reads as one newline rather than a visible CR on every
+    line. The import is lazy: nothing from ``messagefoundry`` at module scope (see above)."""
+    from messagefoundry.terminal_text import escape_for_terminal
+
+    text = str(exc) if single_line else str(exc).replace("\r\n", "\n")
+    return escape_for_terminal(text, single_line=single_line)
+
+
 #: The engine API a bare `--scenario` / `--load` talks to. https because the engine always serves TLS
 #: (ADR 0172); the monitor tab's default is the same URL.
 _DEFAULT_ENGINE = "https://127.0.0.1:8765"
@@ -433,7 +449,7 @@ def _run_scenario(
                 client.set_token(token)
             result = run_scenario(scenario, client, timeout=timeout, endpoints=endpoints)
     except ApiError as exc:
-        print(f"FAIL  {name}: {escape_for_terminal(str(exc))}", file=sys.stderr)
+        print(f"FAIL  {name}: {_exc_text(exc)}", file=sys.stderr)
         return 1
     except OSError as exc:
         # Setup, not a verdict on the engine: a sink could not bind (the GUI Receive tab already
@@ -442,9 +458,11 @@ def _run_scenario(
         return 2
     if result.skipped:
         # Not a pass: the scenario's precondition (an external server, an extra) is missing here.
-        print(f"SKIP  {name}: {escape_for_terminal(result.detail)}")
+        print(f"SKIP  {name}: {escape_for_terminal(result.detail, single_line=True)}")
         return 2
-    print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {escape_for_terminal(result.detail)}")
+    # One line per verdict: single_line, or a newline in the detail starts a forged PASS line.
+    detail = escape_for_terminal(result.detail, single_line=True)
+    print(f"{'PASS' if result.ok else 'FAIL'}  {name}: {detail}")
     return 0 if result.ok else 1
 
 
@@ -500,7 +518,6 @@ def _run_load(args: argparse.Namespace) -> int:
     from harness.load.report import compare_to_baseline
     from harness.load.runner import PreflightError, run_load
     from messagefoundry.apiclient import ApiError
-    from messagefoundry.terminal_text import escape_for_terminal
 
     try:
         profile = get_profile(args.load)
@@ -533,7 +550,7 @@ def _run_load(args: argparse.Namespace) -> int:
     except ApiError as exc:
         # A bad/expired --token or an engine that's down surfaces here (the client validates the token
         # via /auth/me before preflight). That's a setup failure, not an SLO violation → exit 2.
-        print(f"engine setup failed: {escape_for_terminal(str(exc))}", file=sys.stderr)
+        print(f"engine setup failed: {_exc_text(exc)}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -622,7 +639,7 @@ def _run_failover(args: argparse.Namespace) -> int:
             run_failover_load(profile, ports=ports, db_backend=args.db_backend or backend)
         )
     except FailoverError as exc:
-        print(f"failover setup failed: {exc}", file=sys.stderr)
+        print(f"failover setup failed: {_exc_text(exc, single_line=False)}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -668,7 +685,7 @@ def _run_connscale(args: argparse.Namespace) -> int:
             )
         )
     except ConnScaleError as exc:
-        print(f"connscale setup failed: {exc}", file=sys.stderr)
+        print(f"connscale setup failed: {_exc_text(exc, single_line=False)}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -732,7 +749,7 @@ def _run_estate(args: argparse.Namespace) -> int:
             )
         )
     except EstateError as exc:
-        print(f"estate setup failed: {exc}", file=sys.stderr)
+        print(f"estate setup failed: {_exc_text(exc, single_line=False)}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -857,7 +874,7 @@ def _run_multishard(argv: list[str]) -> int:
             )
         )
     except ConnScaleError as exc:
-        print(f"multishard setup failed: {exc}", file=sys.stderr)
+        print(f"multishard setup failed: {_exc_text(exc, single_line=False)}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -1468,7 +1485,7 @@ def _run_shardcert_driver(argv: list[str]) -> int:
         ApiError
     ) as exc:  # plaintext http to a remote engine without --insecure — actionable, not a crash
         print(
-            f"shardcert-driver: {exc}\n{_INSECURE_HINT}",
+            f"shardcert-driver: {_exc_text(exc)}\n{_INSECURE_HINT}",
             file=sys.stderr,
         )
         return 2
@@ -1748,7 +1765,7 @@ def _run_shardcert_drive(argv: list[str]) -> int:
         ApiError
     ) as exc:  # plaintext http to a remote engine without --insecure — actionable, not a crash
         print(
-            f"shardcert-drive: {exc}\n{_INSECURE_HINT}",
+            f"shardcert-drive: {_exc_text(exc)}\n{_INSECURE_HINT}",
             file=sys.stderr,
         )
         return 2
@@ -2111,7 +2128,7 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         return 2
     except ApiError as exc:  # plaintext http to a remote engine without --insecure
         print(
-            f"shardcert-drive-ladder: {exc}\n{_INSECURE_HINT}",
+            f"shardcert-drive-ladder: {_exc_text(exc)}\n{_INSECURE_HINT}",
             file=sys.stderr,
         )
         return 2
@@ -2241,7 +2258,9 @@ def _run_connscale_remote(argv: list[str]) -> int:
             )
         )
     except ConnScaleError as exc:
-        print(f"connscale-remote setup failed: {exc}", file=sys.stderr)
+        print(
+            f"connscale-remote setup failed: {_exc_text(exc, single_line=False)}", file=sys.stderr
+        )
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)

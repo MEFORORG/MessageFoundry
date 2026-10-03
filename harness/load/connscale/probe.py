@@ -49,6 +49,7 @@ from pathlib import Path
 
 from messagefoundry.api.models import PendingApprovalResponse
 from messagefoundry.apiclient import ApiError, EngineClient
+from messagefoundry.terminal_text import escape_for_terminal
 
 _log = logging.getLogger(__name__)
 
@@ -741,11 +742,13 @@ def time_reload_outcome(client: EngineClient, config_dir: str | None) -> tuple[f
         result = client.reload_config(config_dir)
     except ApiError as exc:
         refused = exc.status in RELOAD_REFUSED_STATUSES
+        # An ApiError carries the engine's own reply body, and the harness configures no logging,
+        # so this record reaches stderr as written: escaped to one line (ASVS 1.1.2).
         _log.warning(
             "reload probe: %s (HTTP %s): %s",
             "the engine refused the reload" if refused else "the reload request failed",
             exc.status,
-            exc,
+            escape_for_terminal(str(exc), single_line=True),
         )
         return None, refused
     if isinstance(result, PendingApprovalResponse):

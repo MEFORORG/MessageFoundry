@@ -68,7 +68,10 @@ def test_a_backslash_is_doubled_only_where_it_would_read_as_an_escape() -> None:
     assert escape_for_terminal("\\u202e") == "\\\\u202e"
     assert escape_for_terminal("\\U0001f600") == "\\\\U0001f600"
     assert escape_for_terminal("\\\x1b") == "\\\\\\x1b"  # a backslash before an escaped byte
-    assert escape_for_terminal("\\\\") == "\\\\\\"  # each backslash before a backslash
+    # A run is doubled whole before an escape-lookalike, and left alone elsewhere, so the parity
+    # of the run before an escape tells a real one (odd) from text (even).
+    assert escape_for_terminal("\\\\x1b") == "\\\\\\\\x1b"
+    assert escape_for_terminal("\\\\") == "\\\\"
 
 
 def test_the_output_is_ascii_so_any_console_codec_encodes_it() -> None:

@@ -72,6 +72,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_all_healthy
 from harness.load.profile import load_profile_text
 from harness.load.runner import run_load
 from harness.load.tlsmat import harness_ssl_context
+from messagefoundry.terminal_text import escape_for_terminal
 
 _CONFIG_DIR = Path("harness/config/load")
 #: How long the engine has to answer ``/health`` once ``serve`` is spawned. The account step runs
@@ -161,8 +162,15 @@ def _node_env(store: Path, *, adt: int, results: int, other: int, sink: int) -> 
 
 
 def _setup_failed(rate: float, reason: str, exc: BaseException) -> int:
-    """Report a repeat whose engine never got as far as the measurement, and end the run."""
-    print(f"ingress probe: {reason}: {exc}", file=sys.stderr, flush=True)
+    """Report a repeat whose engine never got as far as the measurement, and end the run.
+
+    ``exc`` can carry an engine log tail (``failover._await_all_healthy``), so it is escaped, and
+    to ONE line, newlines included (ASVS 1.1.2). Unlike the other rig setup errors, which keep a
+    tail's lines, this line is printed beside the ``RESULT`` verdict, and the ingress-rate-probe
+    workflow merges stderr into stdout and reads every line starting ``RESULT``: a tail line of its
+    own could forge one."""
+    shown = escape_for_terminal(str(exc), single_line=True)
+    print(f"ingress probe: {reason}: {shown}", file=sys.stderr, flush=True)
     print(f"RESULT rate={rate:g} ERROR={reason}", flush=True)
     return 2
 
