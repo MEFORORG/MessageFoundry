@@ -554,6 +554,9 @@ def test_listed_recipient_domain_passes(recipients: list[str]) -> None:
         ['"a@partner.example"@hospital.example'],
         ["a@höspital.example"],  # non-ASCII domain: only the ASCII xn-- form can be listed
         ["a@Kospital.example"],  # a Unicode case fold must not reach an ASCII entry
+        ["a|b@hospital.example"],  # a delivery-pipe character
+        ["a/b@hospital.example"],  # a delivery-file character
+        ["x" * 65 + "@hospital.example"],  # longer than SMTP allows for a local part
     ],
 )
 def test_unlisted_or_unreadable_recipient_is_refused(recipients: list[str] | str) -> None:
@@ -584,6 +587,7 @@ class _WireCapture:
         self._sock = socket.create_server(("127.0.0.1", 0))
         self.port: int = self._sock.getsockname()[1]
         self.rcpt_lines: list[bytes] = []
+        self.data: list[bytes] = []
         self.connections = 0
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
@@ -607,6 +611,7 @@ class _WireCapture:
                         for body in reader:
                             if body.rstrip(b"\r\n") == b".":
                                 break
+                            self.data.append(body)
                     elif verb == b"QUIT":
                         conn.sendall(b"221 bye\r\n")
                         break
@@ -658,6 +663,9 @@ async def test_the_rcpt_line_on_the_wire_names_exactly_the_checked_address(
         b"RCPT TO:<A@HOSPITAL.EXAMPLE>",
         b"RCPT TO:<B.C+D@HOSPITAL.EXAMPLE>",
     ]
+    # The To: header is built from the same checked list, so the display name does not reach it.
+    [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
+    assert to_line.rstrip(b"\r\n") == b"To: a@hospital.example, b.c+d@HOSPITAL.example"
 
 
 def _quote() -> str:

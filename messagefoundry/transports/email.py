@@ -116,9 +116,13 @@ def envelope_recipients(value: Any) -> list[str]:
 
 
 #: What a recipient's local part may hold, between dots: RFC 5322 ``atext`` without ``%`` and ``!``,
-#: which some relays read as a further routing hop. An allowlist, not a denylist, so a character
-#: nobody thought of is refused rather than passed (vault BACKLOG #2616).
-_LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-/=?^_`{|}~")
+#: which some relays read as a further routing hop, and without ``|`` and ``/``, which some mail
+#: servers read as pipe or file delivery during alias expansion. An allowlist, not a denylist, so a
+#: character nobody thought of is refused rather than passed (vault BACKLOG #2616).
+_LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-=?^_`{}~")
+#: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address.
+_MAX_LOCAL = 64
+_MAX_ADDRESS = 254
 #: What a recipient's domain may hold: a hostname. Matching an allowlist entry also needs this.
 _DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
 
@@ -136,6 +140,8 @@ def envelope_address_problem(address: str) -> str | None:
     local, at, domain = address.rpartition("@")
     if not (at and local and domain):
         return "is not a readable address"
+    if len(local) > _MAX_LOCAL or len(address) > _MAX_ADDRESS:
+        return "is longer than SMTP allows"
     if any(not part or set(part) - _LOCAL_ATEXT for part in local.split(".")):
         return "has a local part outside plain mailbox characters"
     if not domain.isascii():
@@ -352,7 +358,9 @@ class EmailDestination(DestinationConnector):
         msg = EmailMessage()
         msg["Subject"] = self.subject
         msg["From"] = self.sender
-        msg["To"] = _to_header(self.recipients)
+        # The checked envelope list, not the raw setting: display names, comments and routes in
+        # the setting never reach the header, so every address a reader sees was checked.
+        msg["To"] = _to_header(self._envelope)
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
         msg.set_content(payload, charset=self.encoding)
