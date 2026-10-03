@@ -8019,7 +8019,11 @@ def _connection(args: argparse.Namespace) -> int:
         load_environment_values,
         resolve_values_base_dir,
     )
-    from messagefoundry.config.settings import hop_posture_from_ai, load_settings
+    from messagefoundry.config.settings import (
+        BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
+        hop_posture_from_ai,
+        load_settings,
+    )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
@@ -8096,7 +8100,26 @@ def _connection(args: argparse.Namespace) -> int:
             result = connections_edit.remove_connection(args.config, args.name, validate=validate)
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
-    except (WiringError, OSError) as exc:
+    except WiringError as exc:
+        message = str(exc)
+        # The deny default (vault BACKLOG #2605) refuses an unlisted outbound. With no
+        # --service-config, the IDE's usual call, the edit was checked against whatever settings
+        # load_settings found, so say where the list belongs rather than leave the analyst guessing.
+        if args.service_config is None and BLOCK_UNLISTED_OUTBOUND_IN_FORCE in message:
+            # load_settings falls back to ./messagefoundry.toml, so say which case this was.
+            local = Path("messagefoundry.toml")
+            read = (
+                f"against {local.resolve()}, the settings file in the working directory"
+                if local.is_file()
+                else "with no instance settings file, since none was found"
+            )
+            message += (
+                f". No --service-config was given, so this edit was checked {read}. Pass "
+                "--service-config <path to the instance's messagefoundry.toml>, and list the "
+                "connection's host in that file's [egress] allowed_* list for its transport"
+            )
+        return _emit_error(message, as_json=args.json)
+    except OSError as exc:
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
     return 0

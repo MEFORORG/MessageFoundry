@@ -1117,7 +1117,7 @@ def enforce_signature_header_limits(signer: object | None, *, connector: str) ->
 # byte-identical.
 
 #: Sentinel ``proxy_url`` value meaning "Use the OS/environment default web proxy" (getproxies()), #112.
-#: PUBLIC because the ``[egress].allowed_proxy`` gate in ``pipeline/wiring_runner.py`` has to exempt it
+#: PUBLIC because the ``[egress].allowed_proxy`` gate in ``transports/egress.py`` has to exempt it
 #: (it names no address at config time), and a second copy of the literal would be free to drift.
 PROXY_DEFAULT = "default"
 

@@ -4163,9 +4163,9 @@ class EgressSettings(_Section):
 #: the usual way this refusal fires, so a message reading "is set" tells that operator they set
 #: something they did not.
 #:
-#: Defined once, beside the field, because the six refusal sites live in two other modules
-#: (``pipeline/reference_sync.py``, ``pipeline/wiring_runner.py``) and a second copy of this sentence
-#: is how five of them stay right while the sixth goes stale.
+#: Defined once, beside the field, because the refusal sites live in another module
+#: (``transports/egress.py``, and ``__main__`` matches on it) and a second copy of this sentence
+#: is how most of them stay right while one goes stale.
 #:
 #: Names the ``[security]`` spelling, not ``[egress].deny_by_default``: ADR 0118 relocated the key and
 #: the loader REFUSES the old one as file or env input, so naming it hands out a remediation that dies
