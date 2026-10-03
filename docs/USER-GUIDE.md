@@ -248,6 +248,8 @@ The file it sends, [samples/messages/adt_a01.hl7](../samples/messages/adt_a01.hl
 
 `send_mllp.py` sends the whole file as one frame, and an MLLP listener takes one message per frame. A file holding several messages, such as [samples/messages/adt_batch.hl7](../samples/messages/adt_batch.hl7), gets an `MSA|AR` with `more than one MSH in body` and is recorded `ERROR` ([ADR 0206](adr/0206-an-hl7-write-or-re-encode-never-lets-data-become-structure.md) rule 5). Drop a batch file in a `File(...)` inbox instead, which splits it into one message each.
 
+`send_mllp.py` itself refuses, before it connects, a file the engine's own MLLP delivery would refuse to send ([ADR 0205](adr/0205-an-outbound-frame-holds-exactly-one-message.md) rule 1): one holding an MLLP frame byte, which would not arrive as one message. That includes a file saved with its own MLLP framing around it, so strip that first. It prints the reason to stderr and exits 3.
+
 ### 3. What to expect
 
 `send_mllp.py` reuses the engine's MLLP framing, waits for the framed ACK, and prints it:
