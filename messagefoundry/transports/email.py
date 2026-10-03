@@ -46,10 +46,11 @@ import asyncio
 import logging
 import smtplib
 import ssl
+import string
 from collections.abc import Mapping
 from email.errors import MessageError
 from email.message import EmailMessage
-from email.utils import getaddresses
+from email.utils import getaddresses, parseaddr
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -72,7 +73,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
 
-__all__ = ["EmailDestination", "envelope_recipients"]
+__all__ = ["EmailDestination", "envelope_address_problem", "envelope_recipients"]
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,36 @@ def envelope_recipients(value: Any) -> list[str]:
     return [addr for _, addr in getaddresses([str(h) for h in msg.get_all("To", [])])]
 
 
+#: What a recipient's local part may hold, between dots: RFC 5322 ``atext`` without ``%`` and ``!``,
+#: which some relays read as a further routing hop. An allowlist, not a denylist, so a character
+#: nobody thought of is refused rather than passed (vault BACKLOG #2616).
+_LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-/=?^_`{|}~")
+#: What a recipient's domain may hold: a hostname. Matching an allowlist entry also needs this.
+_DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
+
+
+def envelope_address_problem(address: str) -> str | None:
+    """Why one :func:`envelope_recipients` address cannot be sent to as written, or ``None``.
+
+    The address must be a plain ``local@domain`` that reads back unchanged: a dot-separated local
+    part of :data:`_LOCAL_ATEXT` and a hostname-shaped domain. ``smtplib`` writes an address it
+    cannot re-read onto the ``RCPT TO`` line raw, so anything looser could put a mailbox there that
+    is not the one checked. Both the ``[egress]`` recipient-domain check and construction call this.
+    The text names no part of the address."""
+    if parseaddr(address)[1] != address:
+        return "does not read back as the same address"
+    local, at, domain = address.rpartition("@")
+    if not (at and local and domain):
+        return "is not a readable address"
+    if any(not part or set(part) - _LOCAL_ATEXT for part in local.split(".")):
+        return "has a local part outside plain mailbox characters"
+    if not domain.isascii():
+        return "has a non-ASCII domain; write it in its ASCII xn-- form"
+    if set(domain) - _DOMAIN_TEXT:
+        return "has a domain that is not a host name"
+    return None
+
+
 class EmailDestination(DestinationConnector):
     """Deliver each transformed payload as a plain-text SMTP email (outbound only — ADR 0029 Phase 1).
 
@@ -136,6 +167,12 @@ class EmailDestination(DestinationConnector):
         self.sender = sender
         self.recipients = _as_recipients(s.get("recipients"))
         self._envelope = envelope_recipients(self.recipients)
+        for address in self._envelope:
+            # The same rule the [egress] check applies, held here too so no build path that skips
+            # that check can put an unchecked mailbox on the RCPT line.
+            problem = envelope_address_problem(address)
+            if problem is not None:
+                raise ValueError(f"Email destination: a recipient {problem}")
         self.subject = str(s.get("subject", ""))
         username = s.get("username")
         password = s.get("password")

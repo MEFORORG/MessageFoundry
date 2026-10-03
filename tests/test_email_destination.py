@@ -7,7 +7,10 @@ in-process fake SMTP (no real server is ever contacted)."""
 from __future__ import annotations
 
 import smtplib
+import socket
 import ssl
+import threading
+from collections.abc import Iterator
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -571,6 +574,116 @@ def test_recipient_domains_empty_refuses_every_email_destination(egress: EgressS
         check_egress_allowed(
             _email_dest("smtp.hospital.example", recipients=["a@hospital.example"]), egress
         )
+
+
+class _WireCapture:
+    """A loopback SMTP listener that records each ``RCPT`` command line exactly as it arrives, so a
+    test reads the recipient the relay would act on rather than a list handed to a fake client."""
+
+    def __init__(self) -> None:
+        self._sock = socket.create_server(("127.0.0.1", 0))
+        self.port: int = self._sock.getsockname()[1]
+        self.rcpt_lines: list[bytes] = []
+        self.connections = 0
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            self.connections += 1
+            with conn, conn.makefile("rb") as reader:
+                conn.sendall(b"220 capture\r\n")
+                for raw in reader:
+                    line = raw.rstrip(b"\r\n")
+                    verb = line[:4].upper()
+                    if verb == b"RCPT":
+                        self.rcpt_lines.append(line)
+                    if verb == b"DATA":
+                        conn.sendall(b"354 go\r\n")
+                        for body in reader:
+                            if body.rstrip(b"\r\n") == b".":
+                                break
+                    elif verb == b"QUIT":
+                        conn.sendall(b"221 bye\r\n")
+                        break
+                    conn.sendall(b"250 ok\r\n")
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+@pytest.fixture
+def wire() -> Iterator[_WireCapture]:
+    capture = _WireCapture()
+    try:
+        yield capture
+    finally:
+        capture.close()
+
+
+def _wire_dest(port: int, recipients: list[str]) -> Destination:
+    return Destination(
+        name="OB_EMAIL",
+        type=ConnectorType.EMAIL,
+        settings={
+            "host": "127.0.0.1",
+            "port": port,
+            "sender": "engine@hospital.example",
+            "recipients": recipients,
+            "use_tls": False,
+            "timeout_seconds": 5.0,
+        },
+        cleartext_accepted=True,
+        cleartext_reason="loopback capture listener in a unit test",
+    )
+
+
+def _wire_egress(port: int) -> EgressSettings:
+    return EgressSettings(
+        allowed_smtp=[f"127.0.0.1:{port}"], allowed_recipient_domains=["hospital.example"]
+    )
+
+
+async def test_the_rcpt_line_on_the_wire_names_exactly_the_checked_address(
+    wire: _WireCapture,
+) -> None:
+    dest = _wire_dest(wire.port, ["Ops <a@hospital.example>", "b.c+d@HOSPITAL.example"])
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    await EmailDestination(dest).send("PID|1|synthetic")
+    assert [line.upper() for line in wire.rcpt_lines] == [
+        b"RCPT TO:<A@HOSPITAL.EXAMPLE>",
+        b"RCPT TO:<B.C+D@HOSPITAL.EXAMPLE>",
+    ]
+
+
+def _quote() -> str:
+    return chr(34)
+
+
+#: Recipient values whose parse does not read back as the plain address it seems to name. Built from
+#: parts so no single literal reads as a recipe.
+_NON_ROUND_TRIP = [
+    _quote() + "<" + "relaylocal" + ">" + " " + "ORCPT" + "=" + "rfc822;x" + "@hospital.example",
+    _quote() + "relaylocal" + ">" + "@hospital.example",
+]
+
+
+@pytest.mark.parametrize("value", _NON_ROUND_TRIP, ids=["parameter-after-mailbox", "stray-angle"])
+async def test_a_value_that_does_not_read_back_is_refused_before_any_rcpt(
+    wire: _WireCapture, value: str
+) -> None:
+    dest = _wire_dest(wire.port, [value])
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(dest, _wire_egress(wire.port))
+    # Construction holds the same rule, so a build path that skipped the check sends nothing either.
+    with pytest.raises(ValueError, match="recipient"):
+        EmailDestination(dest)
+    assert wire.connections == 0
+    assert wire.rcpt_lines == []
 
 
 def test_recipient_domains_do_not_gate_direct() -> None:

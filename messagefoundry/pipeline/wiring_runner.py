@@ -206,7 +206,7 @@ from messagefoundry.transports.base import (
     SyncReplyResolver,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
-from messagefoundry.transports.email import envelope_recipients
+from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials
@@ -10184,18 +10184,10 @@ def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> Non
         raise WiringError(f"outbound {dest.name!r}: EMAIL destination names no recipient address")
     permitted = set(allowed)
     for address in addresses:
-        local, at, domain = address.rpartition("@")
-        if not (at and local and domain):
-            _refuse_email_recipient(dest.name, "is not a readable address")
-        if any(ch in local for ch in _LOCAL_PART_ROUTING_CHARS):
-            # A relay may treat these as a further hop, so the domain after the last "@" would not
-            # be where the mail ends up. Plain mailboxes never need them.
-            _refuse_email_recipient(dest.name, "has a local part with a routing character")
-        if not domain.isascii():
-            _refuse_email_recipient(
-                dest.name, "has a non-ASCII domain; write it in its ASCII xn-- form"
-            )
-        domain = domain.lower()
+        problem = envelope_address_problem(address)
+        if problem is not None:
+            _refuse_email_recipient(dest.name, problem)
+        domain = address.rpartition("@")[2].lower()
         if domain not in permitted:
             log.warning(
                 "egress denied: outbound %r EMAIL recipient domain %r not in "
@@ -10207,10 +10199,6 @@ def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> Non
                 f"outbound {dest.name!r}: EMAIL recipient domain {domain!r} is not in the "
                 "[egress].allowed_recipient_domains allowlist (an empty list permits no recipient)"
             )
-
-
-#: Characters an EMAIL recipient's local part may not carry: each can name a further routing hop.
-_LOCAL_PART_ROUTING_CHARS = frozenset('%!@"')
 
 
 def _refuse_email_recipient(name: str, why: str) -> NoReturn:

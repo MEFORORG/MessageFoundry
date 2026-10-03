@@ -46,9 +46,12 @@ send the Handler's body outside the organisation through a permitted relay.
   addresses through the transport's own `envelope_recipients`: the entries are joined into one `To:`
   header and parsed with the stdlib address parser, so an entry holding two addresses yields two. Every address must have a domain
   that matches a listed entry exactly, without regard to ASCII case. A subdomain needs its own entry.
-  An address with no readable domain is refused, and so is one whose local part carries a
-  mail-routing character, because a relay may forward on it past the listed domain. A non-ASCII
-  domain is refused; its `xn--` form can be listed.
+  Each address must be a plain `local@domain` that the stdlib parser reads back unchanged.
+  The local part is allowlisted, not denylisted: RFC 5322 `atext` and dots, without `%` and `!`,
+  which some relays route on. `smtplib` writes an address it cannot re-read onto the `RCPT TO`
+  line raw, so a looser rule could put a mailbox there other than the one checked. The domain must
+  be an ASCII host name; an internationalized domain is listed in its `xn--` form. Construction
+  applies the same rule, so a build path that skipped the check still sends nothing.
 - **The transport sends to the checked list.** `EmailDestination` passes the same
   `envelope_recipients` list to `send_message` as `to_addrs`, so a header added later cannot
   widen the RCPT set past what the gate saw.
