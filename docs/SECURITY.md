@@ -2097,8 +2097,11 @@ under both (`AuthService._unverified_session_owes_factor`). Setting `[security].
 frees any account that has not enrolled a factor, whatever its role, at the cost of the exposure
 gate named earlier in this paragraph: on an exposed instance `serve` refuses to start under
 `enforce` unless `allow_single_factor_admin_when_exposed` is set. An account that has enrolled a
-factor still owes it under either setting; an OIDC sign-in meets it while
-`[auth].oidc_require_mfa_claim` is on, the default. Making the account an AD principal is **no
+factor owes it while it keeps one, under either setting, and an OIDC sign-in meets it while
+`[auth].oidc_require_mfa_claim` is on, the default. With `require_mfa` off, or for an account
+`require_mfa_scope` leaves out (under `administrators`, any account without the Administrator role,
+directory ones included), the holder may remove its last factor. Under `administrators` with
+`require_mfa` on, a directory account that does so is still not single-factor: its next Kerberos session stays MFA-pending until it enrols again. Making the account an AD principal is **no
 longer** an escape. Nor is the mTLS service-identity plane: a certificate identity is admitted on one route only,
 `GET /service/identity`, so it cannot carry a working service account (the mTLS row of the pathway
 table below). An operator who opts out at exposure re-enables `[security].require_mfa = true`, or

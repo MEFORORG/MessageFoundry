@@ -10,7 +10,9 @@ AC-5 (the read-only posture view) is in ``tests/test_api_security_posture.py``.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     keyless_opt_out_refusal,
     load_settings,
+    oidc_second_factor_claim_exception,
     security_loosenings,
 )
 
@@ -411,26 +414,56 @@ def test_require_mfa_scope_advisory_names_only_the_accounts_it_frees() -> None:
     loos = dict(_loosenings(SecuritySettings(require_mfa_scope="administrators")))
     assert loos["require_mfa_scope"] == (
         "a local account without the Administrator role is single-factor until it enrolls a "
-        "second factor. Administrators and directory accounts still owe one; an OIDC sign-in "
-        "meets it with an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
+        "second factor. Administrators and directory accounts still owe one, unless an OIDC "
+        "sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
     )
 
 
 def test_require_mfa_advisory_keeps_an_enrolled_factor_and_the_oidc_claim() -> None:
     """Vault BACKLOG #2798. RED when the ``require_mfa = false`` advisory again says EVERY account is
-    single-factor.
+    single-factor, or again says an enrolled account must ALWAYS satisfy its factor.
 
     With the requirement off, ``AuthService._mfa_required_for`` still holds an ENROLLED account to its
-    factor, and the OIDC claim gate (``auth/oidc/claims.py:_check_mfa_gate``) reads only
-    ``[auth].oidc_require_mfa_claim``. What the switch frees is an account with no factor enrolled,
-    which is where a Kerberos ticket that asserts no strength gets in on its own."""
+    factor, but only while it keeps one: the last-factor removal guards ask the same helper with
+    ``second_factor_enrolled=False``, which answers False here, so the holder may remove the last. The
+    OIDC claim gate (``auth/oidc/claims.py:_check_mfa_gate``) reads only
+    ``[auth].oidc_require_mfa_claim``, and the OIDC mint stamps the session verified on that setting,
+    so the claim stands in for an enrolled factor. What the switch frees is an account with no factor
+    enrolled, which is where a Kerberos ticket that asserts no strength gets in on its own."""
     loos = dict(_loosenings(SecuritySettings(require_mfa=False)))
     assert loos["require_mfa"] == (
         "an account with no second factor enrolled is single-factor, so a Kerberos session enters "
-        "on a ticket that asserts no strength. An enrolled account must still satisfy its factor, "
-        "and an OIDC sign-in still needs a checked amr/acr claim while "
-        "[auth].oidc_require_mfa_claim is on"
+        "on a ticket that asserts no strength. An enrolled account owes its factor only while it "
+        "keeps one, and its holder may remove the last. Where an OIDC sign-in carries an amr/acr "
+        "claim checked while [auth].oidc_require_mfa_claim is on, that claim stands in for the "
+        "enrolled factor"
     )
+
+
+@pytest.mark.parametrize(
+    ("oidc_enabled", "claim_gate", "expected"),
+    [
+        (
+            True,
+            True,
+            ", unless an OIDC sign-in carries an amr/acr claim checked while "
+            "[auth].oidc_require_mfa_claim is on",
+        ),
+        (True, False, ""),
+        (False, True, ""),
+    ],
+)
+def test_startup_texts_name_the_oidc_exception_only_where_it_exists(
+    oidc_enabled: bool, claim_gate: bool, expected: str
+) -> None:
+    """Vault BACKLOG #1133. The exposed-without-MFA refusal, warnings and AUDIT line describe ONE
+    running config. With OIDC off, or its claim gate off, every OIDC session mints unverified, so the
+    record must not name an exception this instance does not have. ``model_construct`` skips the
+    OIDC-enabled validators (issuer, client secret, endpoints), which are not what is on trial."""
+    auth = AuthSettings.model_construct(
+        oidc_enabled=oidc_enabled, oidc_require_mfa_claim=claim_gate
+    )
+    assert oidc_second_factor_claim_exception(auth) == expected
 
 
 def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
@@ -444,9 +477,40 @@ def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
     assert loos["allow_single_factor_admin_when_exposed"] == (
         "an EXPOSED instance under enforcement = enforce may start with [security].require_mfa "
         "off, on an audited warning instead of the refusal. Every account with no second factor "
-        "enrolled is then single-factor over the network, unless an OIDC sign-in carries a "
-        "checked amr/acr claim"
+        "enrolled is then single-factor over the network, unless an OIDC sign-in carries an "
+        "amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
     )
+
+
+@pytest.mark.parametrize(
+    ("switch", "sec"),
+    [
+        ("require_mfa", SecuritySettings(require_mfa=False)),
+        (
+            "allow_single_factor_admin_when_exposed",
+            SecuritySettings(allow_single_factor_admin_when_exposed=True),
+        ),
+    ],
+)
+def test_ide_security_editor_risk_mirrors_the_mfa_advisories(
+    switch: str, sec: SecuritySettings
+) -> None:
+    """Vault BACKLOG #1133. RED when the IDE Security Settings page drifts from the engine's text.
+
+    ``ide/src/securityEditorWebview.ts`` says its ``risk`` strings are kept in step with
+    ``security_loosenings()``, and nothing checked it: the page still said "the Administrator role is
+    single-factor" after the engine text was corrected. TypeScript cannot import the Python, so this
+    reads the source. Scoped to the two MFA switches; other risks there are shorter on purpose."""
+    source = (
+        Path(__file__).resolve().parent.parent / "ide" / "src" / "securityEditorWebview.ts"
+    ).read_text(encoding="utf-8")
+    # One FIELDS entry is one `{ ... }` with no nested braces, so `[^{}]` keeps the match inside it,
+    # and the captured literal is decoded as JSON so a backslash-u escape compares as its character.
+    entry = re.search(rf'\{{ key: "{re.escape(switch)}",[^{{}}]*\}}', source)
+    assert entry is not None, f"no FIELDS entry for {switch} in securityEditorWebview.ts"
+    risk = re.search(r'risk: ("(?:[^"\\]|\\.)*")', entry.group(0))
+    assert risk is not None, f"the {switch} entry has no risk string"
+    assert json.loads(risk.group(1)) == dict(_loosenings(sec))[switch]
 
 
 def test_loosening_warns_and_prod_phi_refuses(
