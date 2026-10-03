@@ -48,6 +48,7 @@ from messagefoundry.lens import (
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing import split as split_mod
 from messagefoundry.parsing.message import Message, reencode_with_separators
+from messagefoundry.parsing.peek import starts_with_msh
 from messagefoundry.parsing.sniff import _LEADING_WS
 from messagefoundry.parsing.split import split_batch, split_batch_bytes
 from messagefoundry.pipeline import ingress_guards, wiring_runner
@@ -702,6 +703,14 @@ def test_split_batch_bytes_hands_a_single_message_over_without_decoding(
         assert split_batch_bytes(raw, "utf-8") == [raw]
         lf = raw.replace(CR.encode(), chr(10).encode())
         assert split_batch_bytes(lf, "latin-1") == [lf]
+
+
+def test_the_msh_opening_check_is_the_parsers_strip() -> None:
+    # One check serves the parser and the one-message hand-off; it must read what a strip reads.
+    for code in [*range(0x3100), 0xFEFF, 0x202F, 0x205F]:
+        text = chr(code) * 2 + "MSH|"
+        assert starts_with_msh(text) == text.lstrip().startswith("MSH"), code
+    assert not starts_with_msh("PID|MSH")
 
 
 def test_the_leading_mark_check_reads_the_whitespace_the_sniff_tolerates() -> None:

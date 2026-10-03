@@ -4640,9 +4640,13 @@ def _template_write_method(value: ast.expr, dst: ast.expr) -> str:
         return "set"
     paths = [part[PART_PATH] for part in parts if PART_PATH in part]
     text = "".join(part.get(PART_TEXT, "") for part in parts)
-    if not paths or any(char in _AUTHORED_STRUCTURE for char in text):
+    if (
+        not paths
+        or any(char in _AUTHORED_STRUCTURE for char in text)
+        or not all(_is_leaf_literal(path) for path in paths)
+    ):
         return "set"
-    return "set_data" if all(_is_leaf_literal(path) for path in paths) else "set"
+    return "set_data"
 
 
 def _native_write_method(value: ast.expr, dst: ast.expr) -> str:

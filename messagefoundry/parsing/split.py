@@ -25,7 +25,7 @@ import codecs
 import re
 
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import normalize
+from messagefoundry.parsing.peek import normalize, starts_with_msh
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 __all__ = [
@@ -43,9 +43,9 @@ __all__ = [
 _MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
 
 #: A UTF-8 byte order mark after the leading whitespace the content sniff tolerates. A match, not a
-#: strip, so a file led by whitespace is not copied whole to look at its first bytes. Its class
-#: is the bytes of ``sniff._LEADING_WS``, spelled out for the static ReDoS scan; a test pins the two.
-_LEADING_BOM = re.compile(rb"[ \t\r\n\x0b\x0c]*\xef\xbb\xbf")
+#: strip, so a file led by whitespace is not copied whole to look at its first bytes. In a bytes
+#: pattern ``\s`` is exactly the bytes of ``sniff._LEADING_WS``; a test pins the two.
+_LEADING_BOM = re.compile(rb"\s*\xef\xbb\xbf")
 
 #: The batch-envelope header lines a first chunk may open with; neither is a message.
 _ENVELOPE_HEADERS = ("FHS", "BHS")
@@ -124,7 +124,7 @@ def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> byt
     ``FHS``/``BHS`` envelope header, so ``message`` is handed over re-encoded, as each member of a
     batch is. Without this, one such message was an ``ERROR`` where the same message in a batch of
     two was recorded."""
-    if text.lstrip().startswith("MSH") or not message.startswith("MSH"):
+    if starts_with_msh(text) or not message.startswith("MSH"):
         return raw
     return message.encode(encoding)
 

@@ -247,6 +247,16 @@ def normalize(raw: str | bytes, *, encoding: str = "utf-8", errors: str = "repla
     return raw.replace("\r\n", "\r").replace("\n", "\r")
 
 
+#: ``MSH`` after whitespace, the opening the parser requires. In a ``str`` pattern ``\s`` is the
+#: whitespace ``str.lstrip()`` removes, and a match copies nothing, where a strip copies the body.
+_LEADS_WITH_MSH = re.compile(r"\s*MSH")
+
+
+def starts_with_msh(text: str) -> bool:
+    """Whether :meth:`Peek.parse` reads ``text`` as opening with an ``MSH`` segment."""
+    return _LEADS_WITH_MSH.match(text) is not None
+
+
 @dataclass(frozen=True)
 class Peek:
     """A parsed view over an inbound message exposing routing fields + path access.
@@ -272,7 +282,7 @@ class Peek:
         if not norm.strip():
             raise HL7PeekError("empty message")
         enforce_size_limits(norm, max_bytes=max_bytes, max_segments=max_segments)
-        if not norm.lstrip().startswith("MSH"):
+        if not starts_with_msh(norm):
             raise HL7PeekError("message does not start with an MSH segment")
         enforce_expansion_budget(norm)
         return cls(message=parse_or_refuse(drop_blank_segments(norm)), raw=norm)
