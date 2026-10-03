@@ -78,7 +78,8 @@ path to a `.toml`. To run as an account you already hold, skip `rigadmin` and pa
 
 ### Rigs sign in
 
-Every rig that starts `messagefoundry serve` signs in to it. A rig is a CI leg or a harness runner
+Every rig that starts `messagefoundry serve` signs in to it, because `serve` always requires sign-in:
+it refuses to start without it, and no setting turns it off (vault BACKLOG #2719). A rig is a CI leg or a harness runner
 (`--failover`, `--connscale`, `--estate`, `multishard`, `shardcert`). The helper is
 [`harness/load/rigadmin.py`](../harness/load/rigadmin.py). It is test tooling, and it adds no
 password input to any shipped command.
@@ -97,7 +98,7 @@ its nodes, and then signs in. You pass nothing.
 store commits for each signed-in request: it stamps the session's last use, and it audits the
 authorization grant. A poller sample is three requests, so six commits and three audit rows.
 Measured 2026-10-02 on an idle engine on SQLite, 20 samples moved `committed_txns` by 120; with
-sign-in off the same 20 moved it by 0. So `committed_txns`, `txn/msg (measured)` and DB growth carry
+sign-in off, before `serve` lost that mode, the same 20 moved it by 0. So `committed_txns`, `txn/msg (measured)` and DB growth carry
 that much per sample. A figure banked before rigs signed in is not comparable with one taken after
 until `6 x samples` is taken off the commit count. At a low message rate the share is not small.
 

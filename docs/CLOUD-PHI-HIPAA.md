@@ -131,7 +131,8 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 
 ## 6. Identity, access, audit
 
-- **Authentication required + MFA.** `MEFOR_SECURITY_REQUIRE_SIGN_IN=true`; `MEFOR_SECURITY_REQUIRE_MFA=true`, the default.
+- **Authentication required + MFA.** Sign-in is always on, and `serve` refuses to start without it
+  (vault BACKLOG #2719). `MEFOR_SECURITY_REQUIRE_MFA=true`, the default.
   It covers directory accounts too; [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14)
   states which accounts owe a factor. An instance is exposed when it has an off-loopback bind or a
   declared TLS-terminating proxy. An exposed instance with `require_mfa=false` **refuses** to start

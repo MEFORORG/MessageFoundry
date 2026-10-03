@@ -24,7 +24,11 @@ discharged by the 2026-07-24 amendment). A real Corepoint export is **XML, not J
   the single biggest schema surprise: without the strip, the overwhelming majority of statements fail
   to classify because the leading token is markup, not a verb.
 * **``<Block>`` is a comment / section label, not an action** — it is preserved as a comment in the
-  generated module and never emitted as a step.
+  generated module and never emitted as a step. A statement written in the ``@Data`` of any
+  element but a ``<Line>`` is marked as a counted TODO and never emitted as a write or a
+  delivery; a ``MsgSend`` in a Block's or a Call's ``@Data`` is a refused send, which
+  raises (BACKLOG #2632; see
+  :func:`_label_statement`).
 * Operands are ``$variable``, ``%tree/path`` (a message-tree path), ``"string literal"``,
   ``[bracketed option]`` and ``(parenthesised condition)``; the verb vocabulary is **42 verbs**, of
   which 30 cover 99.4% of statements.
@@ -108,6 +112,7 @@ __all__ = [
     "CorepointImportError",
     "Action",
     "UnmappedAction",
+    "LabelMarker",
     "Control",
     "Handler",
     "Destination",
@@ -174,6 +179,19 @@ class UnmappedAction:
 
 
 @dataclass(frozen=True)
+class LabelMarker(UnmappedAction):
+    """The counted TODO for a statement written in the ``@Data`` of an element that is not a
+    ``<Line>`` (:func:`_label_marker`, BACKLOG #2632).
+
+    It renders and counts as any :class:`UnmappedAction`. It is its own type because it is no
+    statement position of the export: every test that decides the SHAPE of the tree leaves it
+    out, so the tree is the one the same export gives with no marker in it. At least these three
+    decide shape: :func:`_parse_list` (which construct a sibling branch continues),
+    :func:`_split_branches` (which marker opens a branch) and the branch-group test in
+    :func:`_parse_statement`."""
+
+
+@dataclass(frozen=True)
 class Control:
     """A non-leaf element of the ``<Package>`` control-flow tree — a construct with a nested body.
 
@@ -219,6 +237,10 @@ class Control:
     refusal: str = ""
     # The local a live ``"send"`` delivers: a name this module generated, never export text.
     message: str = "msg"
+    # ``"call"`` on a ``"block"`` that would have been one, had its ``@Data`` not been a statement
+    # off a ``<Line>`` (BACKLOG #2632). It renders and counts as the label it is. Only the test
+    # that decides the shape of the tree reads it (:func:`_structural_kind`).
+    demoted_from: str = ""
 
 
 # One node of a handler body: a mapped vocabulary call, an unmapped TODO, or a control construct.
@@ -822,18 +844,26 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     The scan skips ``@Disabled`` statements exactly where :func:`_parse_statement` does, and reads each
     verb and kind through the same helpers. It is **flow-insensitive**: it does not see statement order
     or whether a copy sits in a branch, so a send that runs before its clone is made, or a clone made
-    only on one branch, still counts as held. Modelling that is #313 step 2."""
+    only on one branch, still counts as held. Modelling that is #313 step 2.
+
+    A list holding a live element, other than a ``<Line>``, whose ``@Data`` is a statement
+    (:func:`_label_statement`) holds nothing at all, whatever that statement is: the render only
+    marks it, so the scan must not count a clone the render never made, nor miss an overwrite
+    Corepoint may have run (BACKLOG #2632). So a clone or a send counts only on a ``<Line>``,
+    the one place the render emits a statement."""
     inputs: set[str] = set()
     delivered: set[str] = set()
     root_copies: list[tuple[str, str]] = []  # (source handle, destination handle)
     for elem in _live_elements(action_list):
         data = _attr(elem, "Data")
         tokens = parse_roles(data) if data else ()
+        if _label_statement(elem):
+            return frozenset(), frozenset()  # see the docstring: nothing is held
         if not tokens:
             continue  # markup-free: no handle roles to learn from
         inputs.update(t.text for t in tokens if t.source_class == "input-handle")
-        # Every live element counts, an unmodelled tag included: it ran in Corepoint even though the
-        # render only marks it, and counting it can only narrow what is held.
+        # Every live element's handles count, an unmodelled tag included. Past the rule above, a
+        # root copy or a send can only sit on a ``<Line>``.
         verb = _statement_verb(tokens, _split_verb(strip_markup(data))[0])
         operands = _operands_from_roles(tokens)
         if _statement_kind(_local(elem.tag), verb) == "send":
@@ -953,6 +983,32 @@ _KIND_BY_VERB = {
     "actionlistexit": "exit",
     "actionliststop": "exit",
 }
+
+# Verbs this importer reads as a STATEMENT on a ``<Line>``, lower-cased: the writes it maps or
+# binds, the clone the handle scan counts, a log and a send. :func:`_label_statement` reads the
+# ``@Data`` of every other element against it, because no word list tells prose from every verb.
+# Kept by hand and apart from the gate's allow-list, on purpose: taking a verb OFF that list
+# narrows the gate, and must not turn the verb back into a label here. A test holds it a superset.
+_STATEMENT_VERBS = frozenset(
+    {"itemappend", "itemclear", "itemcopy", "msgcreate", "msglog", "msgsend", "msgtreecopy"}
+)
+# What the marker says for such a statement (:func:`_label_marker`), ahead of the statement itself.
+# Kept short: the two share one 200-character comment. It says "role-marked" because the scan
+# reads handles from role markup alone: a markup-free write or send on a ``<Line>`` of such a list
+# names no handle the scan can read, and still renders as it does in any other list.
+_LABEL_STATEMENT_WHY = (
+    "not on a Line, so it may never have run; nothing is mapped and no role-marked handle here "
+    "is taken to be msg"
+)
+# Why a ``MsgSend`` in a Block's or a Call's ``@Data`` is refused, whatever it names. It is the
+# one statement off a ``<Line>`` that is not marked with a comment alone. main renders it where it
+# sits: as a delivery, as a refusal that raises, or as a bare TODO when it names no destination and
+# is not refused. A comment in place of the refusal would leave a handler that returns nothing, so
+# the message would be FILTERED where main sent it to ERROR. The head must never be quieter than
+# main (ADR 0086 §2(b.4)), so it raises here wherever main renders the send at all.
+_LABEL_SEND_REFUSAL = (
+    f"MsgSend is {_LABEL_STATEMENT_WHY}; the import refuses to send msg in its place"
+)
 
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
 _BRANCH_PARENT = {"elif": "if", "else": "if", "except": "try", "match": "case"}
@@ -1384,17 +1440,32 @@ def _split_branches(steps: list[Step]) -> tuple[tuple[Step, ...], tuple[Control,
     marker: Control | None = None
     start = 0
     for i, step in enumerate(steps):
-        if isinstance(step, Control) and step.kind in _BRANCH_PARENT and not step.body:
+        # A marker opens a branch when it holds no statement of its own. A label marker is none:
+        # a ``<List Data="MsgLog …"/>`` inside a ``Catch`` line leaves it a branch marker, and
+        # the label marker leads the branch.
+        if (
+            isinstance(step, Control)
+            and step.kind in _BRANCH_PARENT
+            and all(isinstance(inner, LabelMarker) for inner in step.body)
+        ):
             if marker is None:
                 body = tuple(steps[:i])
             else:
-                branches.append(replace(marker, body=tuple(steps[start:i])))
+                branches.append(replace(marker, body=(*marker.body, *steps[start:i])))
             marker = step
             start = i + 1
     if marker is None:
         return tuple(steps), ()
-    branches.append(replace(marker, body=tuple(steps[start:])))
+    branches.append(replace(marker, body=(*marker.body, *steps[start:])))
     return body, tuple(branches)
+
+
+def _structural_kind(step: Step) -> str:
+    """The kind the branch-group test reads for ``step``, or ``""`` for a leaf.
+
+    A label demoted from a call answers with the kind it had, so demoting it changes the shape
+    of nothing around it (BACKLOG #2632)."""
+    return (step.demoted_from or step.kind) if isinstance(step, Control) else ""
 
 
 # How deep the ``<List>`` tree may nest. The walk is mutually recursive (list → statement → list), so
@@ -1441,39 +1512,72 @@ def _parse_list(
 ) -> list[Step]:
     """Parse the statement children of a ``<List>``/``<Actions>`` into ordered steps.
 
-    A branch marker that follows a compatible construct as a *sibling* is adopted by it; the more
-    common in-body form is handled by :func:`_split_branches` when the construct is built."""
+    A branch marker that follows a compatible construct as a *sibling* is adopted by it
+    (:func:`_adopt_branch`); the more common in-body form is handled by :func:`_split_branches`
+    when the construct is built."""
     if depth > _MAX_NESTING:
         raise CorepointImportError(
             f"export nests statements more than {_MAX_NESTING} levels deep — refusing to parse"
         )
     steps: list[Step] = []
+    # Label markers written after the last statement position. They wait here, outside ``steps``,
+    # until the next one arrives. So ``steps[-1]`` is always a statement position, and a marker
+    # never comes between a construct and a branch written after it: not from a wrapper beside
+    # the construct, not from one nested in another, not at the end of a body flattened to this
+    # level. Seen as a step, a marker would orphan the branch, and an orphan's body renders live
+    # (BACKLOG #2632). It keeps its place in source order among the steps that are not adopted.
+    waiting: list[Step] = []
     for child in container:
         tag = _local(child.tag).lower()
+        produced: list[Step]
         if tag in _LIST_TAGS:
-            # A doubly-wrapped list: flatten rather than lose the statements.
-            steps.extend(_parse_list(child, subject, held, in_control, depth + 1))
-            continue
-        # EVERY other child is a statement position and goes through _parse_statement — including a tag
-        # this layer does not model, which comes back as an "unknown" marker plus its parsed subtree.
-        # Skipping unmodelled tags here (as an earlier cut did, citing the <Connection>/<Codeset>/
-        # <DataPoint> package subtrees) dropped whole subtrees silently: those subtrees are children of
-        # <Package>, NEVER of a <List>, so the tolerance was applied exactly where statements live and a
-        # <Switch> — or a <Lines> typo — vanished with its body. Untrusted input is still never a crash.
-        produced = _parse_statement(child, subject, held, in_control, depth + 1)
-        if (
-            len(produced) == 1
-            and isinstance(produced[0], Control)
-            and produced[0].kind in _BRANCH_PARENT
-            and steps
-            and isinstance(steps[-1], Control)
-            and steps[-1].kind == _BRANCH_PARENT[produced[0].kind]
-        ):
-            previous = steps[-1]
-            steps[-1] = replace(previous, branches=(*previous.branches, produced[0]))
-            continue
-        steps.extend(produced)
-    return steps
+            # A doubly-wrapped list: flatten rather than lose the statements. A statement the rule
+            # finds in the wrapper's own ``@Data`` is marked where the wrapper sits, ahead of the
+            # statements it holds (:func:`_label_marker`).
+            produced = [
+                *_label_marker(child),
+                *_parse_list(child, subject, held, in_control, depth + 1),
+            ]
+        else:
+            # EVERY other child is a statement position and goes through _parse_statement — including
+            # a tag this layer does not model, which comes back as an "unknown" marker plus its parsed
+            # subtree. Skipping unmodelled tags here (as an earlier cut did, citing the <Connection>/
+            # <Codeset>/<DataPoint> package subtrees) dropped whole subtrees silently: those subtrees
+            # are children of <Package>, NEVER of a <List>, so the tolerance was applied exactly where
+            # statements live and a <Switch> — or a <Lines> typo — vanished with its body. Untrusted
+            # input is still never a crash.
+            produced = _parse_statement(child, subject, held, in_control, depth + 1)
+            if _adopt_branch(steps, produced):
+                continue
+        for step in produced:
+            if isinstance(step, LabelMarker):
+                waiting.append(step)
+            else:
+                steps.extend(waiting)
+                waiting.clear()
+                steps.append(step)
+    return [*steps, *waiting]
+
+
+def _adopt_branch(steps: list[Step], produced: list[Step]) -> bool:
+    """Attach ``produced`` to the construct written before it, when ``produced`` is one branch
+    marker that construct continues. Says whether it did. THE one adoption rule.
+
+    It reads ``steps[-1]`` alone. :func:`_parse_list` keeps every :class:`LabelMarker` out of
+    that position, so a marker never changes which branch is adopted: the answer is the one this
+    list gives with every marker taken out of it."""
+    if len(produced) != 1 or not steps:
+        return False
+    branch, previous = produced[0], steps[-1]
+    if not (
+        isinstance(branch, Control)
+        and branch.kind in _BRANCH_PARENT
+        and isinstance(previous, Control)
+        and previous.kind == _BRANCH_PARENT[branch.kind]
+    ):
+        return False
+    steps[-1] = replace(previous, branches=(*previous.branches, branch))
+    return True
 
 
 def _container_steps(
@@ -1531,14 +1635,29 @@ def _parse_statement(
         label = statement or note or tag
         return [Control("disabled", source, label, body=tuple(body))]
 
+    # A statement written anywhere but on a ``<Line>`` is marked and counted, and never emitted as
+    # a write or a delivery: whether Corepoint runs it there is not known. A send in a Block's
+    # or a Call's ``@Data`` is refused.
+    marker = _label_marker(elem)
+
     if tag.lower() not in _STATEMENT_TAGS:
         # An element in a statement position whose tag this layer does not model. Reported and counted,
         # with its parsed subtree inlined beneath the marker — never dropped (count-and-log). The marker
         # says the element's SCOPE was lost, because an unmodelled construct may well have been
         # conditional: inlining its body is the honest, visible degradation, guessing the scope is not.
-        return [Control("unknown", tag, statement or note, body=tuple(body))]
+        # It is one counted marker already, so a statement it carries is named in that marker rather
+        # than counted a second time beside it.
+        detail = marker[0].detail if marker else statement or note
+        return [Control("unknown", tag, detail, body=tuple(body))]
 
-    if not data and any(isinstance(s, Control) and s.kind == kind for s in body):
+    if marker and kind == "call":
+        # A statement in a Call's ``@Data``. The Call names no list to inline, so it is no call
+        # and does not count as mapped: the marker stands for the statement, under a plain label.
+        # The label keeps the SHAPE the element had, and remembers its kind for the branch-group
+        # test. (A send off a ``<Line>`` is not demoted. It is refused, in the send arm below.)
+        return [Control("block", tag, statement, body=(*marker, *body), demoted_from="call")]
+
+    if not data and any(_structural_kind(s) == kind for s in body):
         # A **branch-group wrapper**: the validated export writes ``<If>``/``<Try>`` with no ``@Data``
         # at all, holding one child per branch (``<Line Data="If (…)">``, ``<Line Data="Else">``,
         # ``<Line Data="Catch">``) that each carry their OWN condition and their OWN body. Emitting a
@@ -1581,18 +1700,30 @@ def _parse_statement(
         # ``*body`` matters: a ``MsgSend`` element that carries a nested list would otherwise lose it
         # (the break/exit path below always kept its body — this one silently did not).
         args = _role_send_args(role_operands) if roles else _send_args(operands)
-        refusal = _send_refusal(role_operands, held) if roles else ""
+        if tag.lower() != "line":
+            # A ``MsgSend`` in a Block's or a Call's ``@Data``. It may never have run, so it is
+            # never a delivery. It is no comment either: it is a send, refused, in the form main
+            # gives a refused send and at the same place, with its body after it. So its
+            # destination stays declared, it selects the handler's closing ``return`` as main's
+            # send does, a ``try`` around it re-raises, and it counts unmapped once. The refusal
+            # stands in for the marker, so the statement is not counted a second time beside it.
+            # The test is the element, not the marker: this send must be refused even if a
+            # later verb table left :func:`_label_statement` not naming it. That protects the
+            # send alone. The scan asks that rule, so the list's handles still depend on it.
+            refusal = _LABEL_SEND_REFUSAL
+        else:
+            refusal = _send_refusal(role_operands, held) if roles else ""
         return [Control("send", source, statement, args=args, refusal=refusal), *body]
     if kind in ("break", "exit"):
         return [Control(kind, source, statement), *body]
     if kind in ("block", "call"):
         # A ``<Block>`` is a section LABEL, not an action, and a ``<Call>``'s target list is inlined:
         # both emit a comment plus their body at the SAME indentation — never a step of their own.
-        return [Control(kind, source, statement or note or tag, body=tuple(body))]
+        return [Control(kind, source, statement or note or tag, body=(*marker, *body))]
 
     inner, branches = _split_branches(body)
     detail = _strip_leading_verb(statement, verb)
-    return [Control(kind, source, detail, body=inner, branches=branches)]
+    return [*marker, Control(kind, source, detail, body=inner, branches=branches)]
 
 
 def _statement_verb(roles: tuple[RoleToken, ...], flat_verb: str) -> str:
@@ -1615,6 +1746,61 @@ def _statement_kind(tag: str, verb: str) -> str | None:
         # ``<Call Data="ActionListCall …">`` — the verb is the more specific truth.
         return _KIND_BY_VERB[verb.lower()]
     return kind
+
+
+def _label_statement(elem: Element) -> str:
+    """The verb of a statement ``elem`` carries in ``@Data`` though it is not a ``<Line>``, or ``""``
+    (BACKLOG #2632).
+
+    THE one rule, asked by the render (:func:`_label_marker`) and by :func:`_message_handles` alike,
+    so the two cannot disagree on it (ADR 0086 has the history). The ``@Data`` of a container is its
+    label or its condition, an unmodelled element's is unknown, and a ``<List>`` wrapper's is never
+    rendered at all. It is a statement there when the element does not render the verb itself, and:
+
+    * the verb is in :data:`_STATEMENT_VERBS`, in any case, with or without markup; or
+    * the element is a ``<Block>`` or a list wrapper and its ``@Data`` LEADS with a verb the
+      exporter styled as a ``keyword``. Neither has a verb of its own, so a leading keyword is
+      evidence. A construct or a ``<Call>`` leads with its own keyword, and an unmodelled element
+      may, so only the table counts for those.
+
+    A container renders a control verb itself: its own construct, a call, an exit, a ``LoopExit``.
+    A ``MsgSend`` is the exception. It would deliver a message, so in a Block's or a Call's
+    ``@Data`` it is a statement too. (A ``LoopExit`` there still renders its ``break``, which
+    only ever sits in a loop that is itself a dead placeholder.)
+
+    The verb is read as a ``<Line>``'s is: the first ``keyword`` span, or with none, the first
+    word. So a listed verb after other unstyled words still reads as a label, and so does an
+    unlisted verb with no leading ``keyword`` span."""
+    tag = _local(elem.tag).lower()
+    if tag == "line":
+        return ""
+    data = _attr(elem, "Data")
+    roles = parse_roles(data)
+    verb = _statement_verb(roles, _split_verb(strip_markup(data))[0])
+    lowered = verb.lower()
+    kind = _CONTAINER_KIND_BY_TAG.get(tag)
+    if kind is not None:
+        rendered = _statement_kind(tag, verb)
+        if rendered != "send" and rendered == _KIND_BY_VERB.get(lowered):
+            return ""  # the container renders this verb itself, and never as a delivery
+    leads = next((token for token in roles if token.role not in _PROSE_ROLES), None)
+    bare = kind == "block" or tag in _LIST_TAGS  # an element with no verb of its own
+    styled = bare and leads is not None and leads.role == "keyword" and _role_verb(roles)
+    return verb if lowered in _STATEMENT_VERBS or styled else ""
+
+
+def _label_marker(elem: Element) -> list[LabelMarker]:
+    """The counted TODO for a statement :func:`_label_statement` finds on ``elem``, or ``[]``.
+
+    The statement rides in the marker, after the reason, because a ``<Try>`` and a ``<List>`` wrapper
+    print their ``@Data`` nowhere else. It reaches the module only through :func:`_comment_text`,
+    which cuts the two at 200 characters together. Under a ``@Disabled`` ancestor the preview shows
+    only the verb, as it does for any unmapped step."""
+    carried = _label_statement(elem)
+    if not carried:
+        return []
+    statement = strip_markup(_attr(elem, "Data"))
+    return [LabelMarker(carried, f"{_LABEL_STATEMENT_WHY}: {statement}")]
 
 
 def _source_label(tag: str, verb: str) -> str:
@@ -2629,7 +2815,11 @@ def _vocabulary_used(steps: tuple[Step, ...]) -> set[str]:
 
 
 def _has_inline_send(steps: tuple[Step, ...]) -> bool:
-    """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list."""
+    """Whether the tree carries a ``MsgSend`` that must accumulate into a ``sends`` list.
+
+    A send in a Block's or a Call's ``@Data`` is refused and still a send
+    (:data:`_LABEL_SEND_REFUSAL`), so this
+    reads the tree as main does, and a handler ends on the ``return`` main gives it."""
     return _any_live_control(steps, lambda ctrl: ctrl.kind == "send" and bool(ctrl.args))
 
 
@@ -2800,6 +2990,13 @@ def _count_steps(steps: tuple[Step, ...], *, in_loop: bool) -> tuple[int, list[s
     ``MsgSend`` that is refused or names no destination (*unmapped*), or preserved as
     commented-out pseudo-source under a ``@Disabled`` element or action-list (*disabled*). Nothing is
     ever silently dropped.
+
+    One element counts twice, on purpose: a construct whose ``@Data`` is a statement
+    (:func:`_label_marker`). The construct is counted as it always was, and the statement it carried
+    is counted unmapped beside it, because the two are rendered apart. A ``<Call>`` carrying one
+    is a plain label and is not counted as a call, so only its statement counts. A ``MsgSend``
+    in a Block's or a Call's ``@Data`` counts once too: it is a refused send, which is
+    unmapped as any refusal is.
 
     The names go through :func:`_comment_text` because the CLI prints them: the import summary is the
     count-and-log record a migrator trusts, and a JSON export naming a class

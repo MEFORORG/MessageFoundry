@@ -83,7 +83,8 @@ def test_ac3_contradiction_is_rejected_and_rolled_back(
 def test_set_rejects_a_file_that_still_has_a_relocated_legacy_key(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A file still carrying a moved key ([auth].enabled) fails validation on write → rolled back.
+    # A file still carrying a refused key ([auth].enabled, removed by vault BACKLOG #2719) fails
+    # validation on write → rolled back.
     toml = tmp_path / "mf.toml"
     toml.write_text("[auth]\nenabled = false\n", encoding="utf-8")
     rc, res = _set(toml, {"require_mfa": False}, capsys)

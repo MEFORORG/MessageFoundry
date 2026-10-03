@@ -1826,30 +1826,25 @@ def _serve(args: argparse.Namespace) -> int:
         settings.store.path = str(effective_root / settings.store.path)
 
     # THE SINGLE DEFINITION of "this instance is exposed" (BACKLOG #326): an off-loopback bind OR a
-    # declared upstream TLS terminator. Hoisted here so its earliest consumer — the auth-off arm just
-    # below (BACKLOG #1013) — can read it; the full rationale (why not `serve_ui`, why deliberately
-    # narrow) sits at the MFA-at-exposure gate that was its original first consumer. Defined ONCE: a
-    # second copy is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
+    # declared upstream TLS terminator. The full rationale (why not `serve_ui`, why deliberately
+    # narrow) sits at the MFA-at-exposure gate that is its first consumer. Defined ONCE: a second copy
+    # is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
     instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
 
-    # Fail closed: with auth disabled the API would answer as a full-privilege system identity, so any
-    # exposed instance would publish admin access to the network with no authentication at all. Exposure
-    # is EITHER a non-loopback bind OR a declared upstream TLS terminator on a loopback bind — the same
-    # `instance_exposed` the MFA-at-exposure gate consults (BACKLOG #1013: this arm previously keyed on
-    # the bind alone, so an auth-off PHI instance behind a declared terminator would have started
-    # silently on first deployment). A true loopback posture with no declared terminator is the only
-    # place no-auth may run.
-    if not settings.auth.enabled and instance_exposed:
-        exposure_desc = (
-            f"non-loopback host {settings.api.host!r}"
-            if not settings.api.is_loopback
-            else "loopback host behind a declared TLS-terminating reverse proxy "
-            "([api].tls_terminated_upstream)"
-        )
+    # Fail closed: `serve` always requires sign-in, on every bind (vault BACKLOG #2719). With auth
+    # disabled the API would answer every request as a full-privilege system identity. This arm used
+    # to refuse only an EXPOSED instance (BACKLOG #1013) and let a bare loopback bind run with no
+    # sign-in. That loopback mode was removed: it named no person in the audit trail, and it could not
+    # repair an account either, since with no auth service the account and audit routes answer 503.
+    # No config key turns sign-in off any more ([security].require_sign_in and [auth].enabled are
+    # both refused at load), so this arm is the backstop for a caller that builds Settings in code.
+    # The app factory's allow_no_auth=True stays for embedders and tests; `serve` never passes it.
+    if not settings.auth.enabled:
         print(
-            f"error: refusing to serve with [auth] enabled=false on {exposure_desc}; the API would "
-            "answer as a full-privilege system identity with no authentication. Enable auth or bind a "
-            "loopback host with no declared terminator.",
+            "error: refusing to serve with authentication disabled; the API would answer every "
+            "request as a full-privilege system identity with no sign-in. `serve` always requires "
+            "sign-in, on every bind (vault BACKLOG #2719): build the settings with "
+            "[auth].enabled on.",
             file=sys.stderr,
         )
         return 2
@@ -3026,7 +3021,7 @@ def _serve(args: argparse.Namespace) -> int:
             "reverse-proxy-mTLS guidance in docs/security/OFF-LOOPBACK-DEPLOYMENT.md (ASVS 8.4.2).",
             file=sys.stderr,
         )
-        if settings.auth.enabled and not settings.auth.admin_new_ip_step_up:
+        if not settings.auth.admin_new_ip_step_up:
             # Fires only when an operator has turned the signal OFF: it defaults on since BACKLOG
             # #288 (owner ruling 2026-09-26), and off is also a named loosening in
             # security_loosenings(). This line stays because it is the exposure-specific reminder.
@@ -3091,8 +3086,9 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-    # THE SINGLE DEFINITION OF "this instance is exposed" (BACKLOG #326) is derived above, before the
-    # auth-off arm (BACKLOG #1013) that also consumes it, from two fields no earlier arm reassigns —
+    # THE SINGLE DEFINITION OF "this instance is exposed" (BACKLOG #326) is derived above, beside the
+    # auth-off arm (which since vault BACKLOG #2719 refuses on every bind), from two fields no earlier
+    # arm reassigns —
     # `is_loopback` and `tls_terminated_upstream` are read straight off the loaded config and are never
     # mutated in place, unlike `serve_ui`.
     #
@@ -3143,7 +3139,7 @@ def _serve(args: argparse.Namespace) -> int:
     # identically (extend-never-weaken). It reads `instance_exposed`, NOT the mutated console flag: the
     # single-factor admin surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
     admin_exposed = instance_exposed
-    if admin_exposed and settings.auth.enabled and not settings.auth.require_mfa:
+    if admin_exposed and not settings.auth.require_mfa:
         exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
             if not settings.api.is_loopback
@@ -3198,12 +3194,7 @@ def _serve(args: argparse.Namespace) -> int:
     # above was about a DECLARED proxy, and promoting an inference to a refusal is a different decision.
     # Scoped as tightly as the refusal is: only where require_mfa was EXPLICITLY opted out. It reads
     # no PHI or data-class condition, because every instance is a PHI instance.
-    if (
-        not instance_exposed
-        and settings.api.public_origin
-        and settings.auth.enabled
-        and not settings.auth.require_mfa
-    ):
+    if not instance_exposed and settings.api.public_origin and not settings.auth.require_mfa:
         print(
             "warning: [security].web_console_public_address is set with no declared TLS terminator "
             "on a PHI instance "
@@ -3602,8 +3593,8 @@ def _serve(args: argparse.Namespace) -> int:
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
     # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py
     # builds the notifier only when BOTH are on, so with either off it is silently absent (which the
-    # defaults and the off-loopback runbook never set). Under enforce, an instance with sign-in on
-    # and no effective channel REFUSES to start, unless
+    # defaults and the off-loopback runbook never set). Under enforce, an instance with no effective
+    # channel REFUSES to start (sign-in is always on, vault BACKLOG #2719), unless
     # [alerts].security_notifications_required=false.
     # No instance is exempt as synthetic or dev. The refuse/warn split is [security].enforcement,
     # NOT the deployment tier — the branch below reads `enforcing`, and `enforce` is the shipped
@@ -3613,111 +3604,109 @@ def _serve(args: argparse.Namespace) -> int:
     # [alerts] is not optional on a stock instance. The explicit, audited opt-out is
     # [alerts].security_notifications_required=false (accept the pull-only /me/security-events feed in
     # writing). "Effective channel" == notify_security_events on + SMTP host + sender (parity with the
-    # app.py notifier wiring). Skipped when auth is disabled (no accounts to notify — a non-loopback
-    # no-auth serve is already refused elsewhere).
-    if settings.auth.enabled:
-        security_channel_ready = bool(
-            settings.auth.notify_security_events
-            and settings.alerts.email_smtp_host
-            and settings.alerts.email_from
-        )
-        if not security_channel_ready:
-            if settings.alerts.security_notifications_required:
-                if enforcing:
-                    print(
-                        "error: no out-of-band security-notification channel is configured on a "
-                        f"{'production ' if production else ''}PHI instance ({env_name!r}); refusing to "
-                        "start — account-security events (lockout, password/roles change, new-IP admin "
-                        "action) would have no push channel. The pull-only /me/security-events feed "
-                        "carries the user's own events but not an administrator's change to their "
-                        "account (ASVS 6.3.5/6.3.7). Configure the [alerts] SMTP transport (email_smtp_host + "
-                        "email_from; add email_to as well — the credential reminders and the alert "
-                        "email transport need a recipient) and keep "
-                        "[auth].notify_security_events on; or, to rely on the "
-                        "pull-only feed, set [alerts].security_notifications_required=false (audited).",
-                        file=sys.stderr,
-                    )
-                    return 2
+    # app.py notifier wiring). Not scoped to sign-in: `serve` always requires it (vault BACKLOG #2719),
+    # so there are always accounts to notify.
+    security_channel_ready = bool(
+        settings.auth.notify_security_events
+        and settings.alerts.email_smtp_host
+        and settings.alerts.email_from
+    )
+    if not security_channel_ready:
+        if settings.alerts.security_notifications_required:
+            if enforcing:
                 print(
-                    "warning: no out-of-band security-notification channel is configured in a "
-                    f"PHI-carrying environment ({env_name!r}) — account-security events have no push "
-                    "channel; the pull-only /me/security-events feed carries the user's own events but "
-                    "not an administrator's change to their account. Configure the [alerts] SMTP "
-                    "transport (email_smtp_host + email_from) with [auth].notify_security_events on "
-                    "(ASVS 6.3.5/6.3.7).",
+                    "error: no out-of-band security-notification channel is configured on a "
+                    f"{'production ' if production else ''}PHI instance ({env_name!r}); refusing to "
+                    "start — account-security events (lockout, password/roles change, new-IP admin "
+                    "action) would have no push channel. The pull-only /me/security-events feed "
+                    "carries the user's own events but not an administrator's change to their "
+                    "account (ASVS 6.3.5/6.3.7). Configure the [alerts] SMTP transport (email_smtp_host + "
+                    "email_from; add email_to as well — the credential reminders and the alert "
+                    "email transport need a recipient) and keep "
+                    "[auth].notify_security_events on; or, to rely on the "
+                    "pull-only feed, set [alerts].security_notifications_required=false (audited).",
                     file=sys.stderr,
                 )
-            elif enforcing:
-                logging.getLogger(__name__).warning(
-                    "AUDIT: starting a %sPHI instance (environment %r) with no security-"
-                    "notification channel ([alerts].security_notifications_required=false) — "
-                    "a user sees their own account-security events only in the pull-only "
-                    "/me/security-events feed, and an administrator's change to their account not at "
-                    "all (out-of-band-notification opt-out override).",
-                    "production " if production else "",
-                    env_name,
-                )
-                print(
-                    f"warning: [alerts].security_notifications_required=false — a "
-                    f"{'production ' if production else ''}PHI "
-                    f"instance ({env_name!r}) has no out-of-band security-event push (only the "
-                    "pull-only /me/security-events feed). Configure [alerts] SMTP + "
-                    "[auth].notify_security_events to enable it.",
-                    file=sys.stderr,
-                )
+                return 2
+            print(
+                "warning: no out-of-band security-notification channel is configured in a "
+                f"PHI-carrying environment ({env_name!r}) — account-security events have no push "
+                "channel; the pull-only /me/security-events feed carries the user's own events but "
+                "not an administrator's change to their account. Configure the [alerts] SMTP "
+                "transport (email_smtp_host + email_from) with [auth].notify_security_events on "
+                "(ASVS 6.3.5/6.3.7).",
+                file=sys.stderr,
+            )
+        elif enforcing:
+            logging.getLogger(__name__).warning(
+                "AUDIT: starting a %sPHI instance (environment %r) with no security-"
+                "notification channel ([alerts].security_notifications_required=false) — "
+                "a user sees their own account-security events only in the pull-only "
+                "/me/security-events feed, and an administrator's change to their account not at "
+                "all (out-of-band-notification opt-out override).",
+                "production " if production else "",
+                env_name,
+            )
+            print(
+                f"warning: [alerts].security_notifications_required=false — a "
+                f"{'production ' if production else ''}PHI "
+                f"instance ({env_name!r}) has no out-of-band security-event push (only the "
+                "pull-only /me/security-events feed). Configure [alerts] SMTP + "
+                "[auth].notify_security_events to enable it.",
+                file=sys.stderr,
+            )
 
-        # --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need a RECIPIENT, not just a relay ---
-        # The unclaimed-temporary-password reminder and the cert-expiry reminder go to the [alerts]
-        # notifier, and notifier_from_settings builds one only from a webhook_url, or from SMTP host +
-        # sender + at least one email_to. The per-user channel above needs no email_to (each notice is
-        # addressed to its account), so a config that passes it can still send every reminder to the log
-        # alone. Same refuse/warn split and the same audited waiver as the channel gate, so an instance
-        # that waived out-of-band notices in writing is not refused twice. The recipient test IS
-        # configured_alert_transport_names, the no-build mirror of notifier_from_settings, so the two
-        # cannot drift. Scoped to sign-in on, like the channel gate: the cert monitor also runs with
-        # sign-in off, and that loopback-only case is not gated here.
-        from messagefoundry.pipeline.alert_sinks import configured_alert_transport_names
+    # --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need a RECIPIENT, not just a relay ---
+    # The unclaimed-temporary-password reminder and the cert-expiry reminder go to the [alerts]
+    # notifier, and notifier_from_settings builds one only from a webhook_url, or from SMTP host +
+    # sender + at least one email_to. The per-user channel above needs no email_to (each notice is
+    # addressed to its account), so a config that passes it can still send every reminder to the log
+    # alone. Same refuse/warn split and the same audited waiver as the channel gate, so an instance
+    # that waived out-of-band notices in writing is not refused twice. The recipient test IS
+    # configured_alert_transport_names, the no-build mirror of notifier_from_settings, so the two
+    # cannot drift.
+    from messagefoundry.pipeline.alert_sinks import configured_alert_transport_names
 
-        reminder_can_fire = (
-            settings.auth.initial_password_expiry_hours > 0 or settings.cert_monitor.warn_days > 0
-        )
-        if reminder_can_fire and not configured_alert_transport_names(settings.alerts):
-            if settings.alerts.security_notifications_required:
-                if enforcing:
-                    print(
-                        "error: no [alerts] recipient is configured on a "
-                        f"{'production ' if production else ''}PHI instance ({env_name!r}); "
-                        "refusing to start — the credential reminders (an unclaimed temporary "
-                        "password nearing its deadline, a certificate nearing expiry) would reach "
-                        "only the log (ASVS 6.4.5). Set [alerts].webhook_url, or email_to alongside "
-                        "email_smtp_host + email_from; or, to accept reminders in the log only, set "
-                        "[alerts].security_notifications_required=false (audited).",
-                        file=sys.stderr,
-                    )
-                    return 2
+    reminder_can_fire = (
+        settings.auth.initial_password_expiry_hours > 0 or settings.cert_monitor.warn_days > 0
+    )
+    if reminder_can_fire and not configured_alert_transport_names(settings.alerts):
+        if settings.alerts.security_notifications_required:
+            if enforcing:
                 print(
-                    "warning: no [alerts] recipient is configured in a PHI-carrying environment "
-                    f"({env_name!r}) — the credential reminders (an unclaimed temporary password, an "
-                    "expiring certificate) reach only the log. Set [alerts].webhook_url, or email_to "
-                    "alongside email_smtp_host + email_from (ASVS 6.4.5).",
+                    "error: no [alerts] recipient is configured on a "
+                    f"{'production ' if production else ''}PHI instance ({env_name!r}); "
+                    "refusing to start — the credential reminders (an unclaimed temporary "
+                    "password nearing its deadline, a certificate nearing expiry) would reach "
+                    "only the log (ASVS 6.4.5). Set [alerts].webhook_url, or email_to alongside "
+                    "email_smtp_host + email_from; or, to accept reminders in the log only, set "
+                    "[alerts].security_notifications_required=false (audited).",
                     file=sys.stderr,
                 )
-            elif enforcing and security_channel_ready:
-                # With no channel either, the waiver's AUDIT line above already fired; one per waiver.
-                logging.getLogger(__name__).warning(
-                    "AUDIT: starting a %sPHI instance (environment %r) with no [alerts] recipient "
-                    "([alerts].security_notifications_required=false) — the credential reminders "
-                    "reach only the log (ASVS 6.4.5 waiver).",
-                    "production " if production else "",
-                    env_name,
-                )
-                print(
-                    "warning: [alerts].security_notifications_required=false — no [alerts] "
-                    f"recipient on a {'production ' if production else ''}PHI instance "
-                    f"({env_name!r}); the credential reminders reach only the log. Set "
-                    "[alerts].webhook_url, or email_to alongside email_smtp_host + email_from.",
-                    file=sys.stderr,
-                )
+                return 2
+            print(
+                "warning: no [alerts] recipient is configured in a PHI-carrying environment "
+                f"({env_name!r}) — the credential reminders (an unclaimed temporary password, an "
+                "expiring certificate) reach only the log. Set [alerts].webhook_url, or email_to "
+                "alongside email_smtp_host + email_from (ASVS 6.4.5).",
+                file=sys.stderr,
+            )
+        elif enforcing and security_channel_ready:
+            # With no channel either, the waiver's AUDIT line above already fired; one per waiver.
+            logging.getLogger(__name__).warning(
+                "AUDIT: starting a %sPHI instance (environment %r) with no [alerts] recipient "
+                "([alerts].security_notifications_required=false) — the credential reminders "
+                "reach only the log (ASVS 6.4.5 waiver).",
+                "production " if production else "",
+                env_name,
+            )
+            print(
+                "warning: [alerts].security_notifications_required=false — no [alerts] "
+                f"recipient on a {'production ' if production else ''}PHI instance "
+                f"({env_name!r}); the credential reminders reach only the log. Set "
+                "[alerts].webhook_url, or email_to alongside email_smtp_host + email_from.",
+                file=sys.stderr,
+            )
 
     # --- #323 layer 3: the alerts / security-event SMTP hop must AUTHENTICATE the relay -------------
     # The [alerts] SMTP transport carries operator alert bodies and every per-user security-event email
@@ -4197,8 +4186,6 @@ def _serve(args: argparse.Namespace) -> int:
         audit_all_authz=settings.diagnostics.audit_all_authz,
         env_values_provider=env_values,
         auth_settings=settings.auth,
-        # The factory denies unless told (vault BACKLOG #2611), so sign-in off is said here.
-        allow_no_auth=not settings.auth.enabled,
         ai_settings=settings.ai,
         alerts_settings=settings.alerts,
         secrets_settings=settings.secrets,
