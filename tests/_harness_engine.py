@@ -121,7 +121,11 @@ def _environment(values: Mapping[str, str]) -> Iterator[None]:
 #: The ``[egress]`` section the served graphs run under. ``allowed_http`` names the loopback host, so
 #: the HTTP-family outbounds of ``harness/config/http.py`` pass the REAL ``[egress].allowed_http``
 #: gate rather than an unset one (an unset list is permissive). No other family's outbound reads it.
-HARNESS_EGRESS_TOML = '[egress]\nallowed_http = ["127.0.0.1"]\n'
+#: ``allowed_recipient_domains`` names the harness mail domain: that list is deny-by-default, so the
+#: Email outbounds of ``harness/config/email.py`` would not load without it (vault BACKLOG #2616).
+HARNESS_EGRESS_TOML = (
+    '[egress]\nallowed_http = ["127.0.0.1"]\nallowed_recipient_domains = ["harness.invalid"]\n'
+)
 
 
 def harness_egress(

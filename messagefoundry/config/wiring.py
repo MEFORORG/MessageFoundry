@@ -1856,6 +1856,9 @@ def Tcp(
     max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    max_connections_per_host: int
+    | None = 32,  # inbound: cap concurrent clients from ONE peer address
+    max_frame_seconds: float | None = 60.0,  # inbound: cap one frame's life, start byte to end byte
     # INBOUND message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Unlike the caps above
     # these default to OFF, and that is ruled rather than accidental: a rate on a clinical interface
     # is only safe at a number taken from a real feed profile. Over budget the listener PAUSES
@@ -1891,6 +1894,12 @@ def Tcp(
     framed reply and treats receiving it as confirmation (the reply is **not** parsed — X12 997/TA1
     acks are a deferred follow-up). Delivery is at-least-once → the receiver **must be idempotent**.
 
+    **Inbound connection bounds (vault BACKLOG #2606)** are MLLP's, at MLLP's defaults:
+    ``max_connections_per_host`` (32) caps concurrent sockets from ONE peer address, so set it to
+    ``None``/``0`` behind a source-NAT proxy where every partner shares one address; and
+    ``max_frame_seconds`` (60 s) bounds one frame from its start byte to its end byte, which is what
+    reaches a peer that trickles bytes and so is never idle. Raise it with ``max_frame_bytes``.
+
     **Inbound message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast one
     accepted connection may feed messages in; ``message_burst`` is how large a burst passes before the
     sustained rate applies (default: one second's worth). Over budget the listener **pauses reading**
@@ -1916,6 +1925,8 @@ def Tcp(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_frame_bytes": max_frame_bytes,
+            "max_connections_per_host": max_connections_per_host,
+            "max_frame_seconds": max_frame_seconds,
             "max_messages_per_second": max_messages_per_second,
             "message_burst": message_burst,
             "connect_timeout": connect_timeout,
@@ -1942,6 +1953,9 @@ def X12(
     max_interchange_bytes: int | None = 16
     * 1024
     * 1024,  # cap one interchange's bytes (OOM); both dirs
+    max_connections_per_host: int
+    | None = 32,  # inbound: cap concurrent clients from ONE peer address
+    max_frame_seconds: float | None = 60.0,  # inbound: cap one interchange's life, ISA to IEA
     # INBOUND interchange-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported; one token per ISA/IEA
     # interchange, which is this connector's frame. Defaults to OFF for the ruled reason in MLLP().
     max_messages_per_second: float | None = None,  # None/0 = no rate bound (the shipped default)
@@ -1980,6 +1994,11 @@ def X12(
     allowlist). Delivery is at-least-once → the receiver **must be idempotent** (a crash-re-send of a
     non-idempotent 270 yields a fresh 271 captured at the next ``response_seq``).
 
+    **Inbound connection bounds (vault BACKLOG #2606)** are MLLP's, at MLLP's defaults:
+    ``max_connections_per_host`` (32) caps concurrent sockets from ONE peer address (``None``/``0``
+    behind a source-NAT proxy), and ``max_frame_seconds`` (60 s) bounds one interchange from its
+    ``ISA`` to its ``IEA``. Raise it with ``max_interchange_bytes``.
+
     **Inbound interchange-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast
     one accepted connection may feed **interchanges** in (one token per ``ISA…IEA``);
     ``message_burst`` is how large a burst passes before the sustained rate applies (default: one
@@ -2001,6 +2020,8 @@ def X12(
             "max_connections": max_connections,
             "receive_timeout": receive_timeout,
             "max_interchange_bytes": max_interchange_bytes,
+            "max_connections_per_host": max_connections_per_host,
+            "max_frame_seconds": max_frame_seconds,
             "max_messages_per_second": max_messages_per_second,
             "message_burst": message_burst,
             "connect_timeout": connect_timeout,
@@ -2028,6 +2049,8 @@ def Http(
     | None = 60.0,  # bound the whole-request read (slow-loris guard), seconds
     max_body_bytes: int | None = 16 * 1024 * 1024,  # cap one request body's bytes (OOM guard)
     max_header_bytes: int | None = 64 * 1024,  # cap the request line + headers (header-flood guard)
+    max_connections_per_host: int
+    | None = None,  # cap clients from ONE peer address; OFF by default
     # Message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Defaults to OFF for the ruled
     # reason in MLLP(). Scoped to the LISTENER, not the connection: this connector answers one
     # request per connection, so a per-connection bucket would pace nothing at all.
@@ -2096,6 +2119,10 @@ def Http(
     **DoS guards** are HTTP twins of MLLP's: ``max_connections`` (flood), ``receive_timeout`` (slow-loris
     — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
     ``Content-Length`` before a byte is buffered), and ``max_header_bytes`` (header flood).
+    ``max_connections_per_host`` caps concurrent sockets from one peer address and **ships off** here
+    (vault BACKLOG #2606): behind a reverse proxy every partner arrives from one address, so a cap
+    would become the listener's whole capacity. Set one only where the listener sees real client
+    addresses.
 
     **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener
     takes messages in; ``message_burst`` is how large a burst passes before the sustained rate applies
@@ -2166,6 +2193,7 @@ def Http(
         "receive_timeout": receive_timeout,
         "max_body_bytes": max_body_bytes,
         "max_header_bytes": max_header_bytes,
+        "max_connections_per_host": max_connections_per_host,
         "max_messages_per_second": max_messages_per_second,
         "message_burst": message_burst,
         "tls": tls,
@@ -2843,7 +2871,8 @@ def Email(
     authentication. Point ``tls_ca_file`` at your relay's CA PEM for a private-CA server;
     ``tls_verify=False`` is a trusted-network dev/test escape, refused on an enforcing production-PHI
     instance even with ``MEFOR_ALLOW_INSECURE_TLS``, and it also refuses SMTP ``AUTH``.
-    The egress host is gated by ``[egress].allowed_smtp``. Put
+    The egress host is gated by ``[egress].allowed_smtp``, and every recipient's domain by the
+    deny-by-default ``[egress].allowed_recipient_domains`` (an empty list refuses the destination). Put
     secrets in ``env()`` (``username``/``password``), never inline. Delivery is at-least-once, so a retry
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""

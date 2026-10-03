@@ -268,6 +268,8 @@ These outbounds sit behind `[egress].allowed_http`. `serve` turns
 so allow loopback first: `[egress] allowed_http = ["127.0.0.1"]`, or
 `MEFOR_EGRESS_ALLOWED_HTTP=127.0.0.1`. The same rule applies to every other transport the directory
 serves; the coverage graph's MLLP and File outbounds need `allowed_mllp` and `allowed_file_dirs`.
+The Email outbounds also need `allowed_recipient_domains = ["harness.invalid"]`. That list is
+deny-by-default whatever `block_unlisted_outbound` says, so leaving it empty refuses both.
 The tests serve the graph with `allowed_http` set, and check that an empty or wrong list makes the
 delivery scenarios fail.
 

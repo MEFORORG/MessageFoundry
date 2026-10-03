@@ -811,7 +811,12 @@ each release and on any trigger below. Those are maintainer-internal documents;
   PHI-critical posture/mandate → the pluggable KeyProvider seam (KMS/Vault/HSM envelope decryption,
   BEYOND WP-BL3-04).
 - **16.4.3 — off-box log / audit shipping.** Off-loopback-conditional. *Compensating controls:* the local
-  `audit_log` is append-only, SHA-256 hash-chained, and read-gated; restricted host. *Build trigger:*
+  `audit_log` is append-only, hash-chained, and read-gated; restricted host. On a store with a
+  key each link is an HMAC-SHA-256 under an audit key derived from the store key, or held
+  in Transit under `vault_transit`, so someone who can write the table
+  but holds no key cannot edit, reorder or remove a row from the middle unseen. Rows removed from the
+  end show only against an anchor held outside the database. On a keyless store the chain is plain
+  SHA-256 and shows corruption only. *Build trigger:*
   off-loopback exposure → structured JSON logging + syslog/SIEM forwarding (BEYOND WP-BL3-20).
 
 ### A.7 Spec-driven development — existing stack and recommendations

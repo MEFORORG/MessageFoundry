@@ -1021,7 +1021,7 @@ async def test_an_unhandshaken_socket_spends_a_connection_slot(
         try:
             # Before the fix a socket that sent no ClientHello was outside the count entirely.
             await _until(
-                lambda: source._active == 1,
+                lambda: source._admission.active == 1,
                 "a socket still in its TLS handshake was not counted against the caps",
             )
             r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
@@ -1034,8 +1034,8 @@ async def test_an_unhandshaken_socket_spends_a_connection_slot(
                 await _close_raw(w2)
         # The slot comes back when the unhandshaken socket goes, and no `established` or `closed`
         # was emitted for it: it never became a session.
-        await _until(lambda: source._active == 0, "the slot was not released")
-        assert source._per_host == {}
+        await _until(lambda: source._admission.active == 0, "the slot was not released")
+        assert source._admission.per_host == {}
         assert events.kinds() == ["at_capacity"]
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
@@ -1061,7 +1061,7 @@ async def test_a_peer_outside_the_allowlist_is_refused_before_its_handshake(
             lambda: "peer_not_allowlisted" in events.kinds(), "no peer_not_allowlisted event"
         )
         assert events.kinds() == ["peer_not_allowlisted"]
-        assert source._active == 0
+        assert source._admission.active == 0
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
@@ -1083,8 +1083,8 @@ async def test_a_failed_handshake_gives_its_slot_back_and_emits_nothing(
             await _closed_by_listener(reader, within=5.0)
         finally:
             await _close_raw(writer)
-        await _until(lambda: source._active == 0, "the slot was not released")
-        assert source._per_host == {}
+        await _until(lambda: source._admission.active == 0, "the slot was not released")
+        assert source._admission.per_host == {}
         assert events.kinds() == []
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
@@ -1118,11 +1118,11 @@ async def test_a_peer_dropping_as_its_handshake_completes_is_closed_quietly(
                 await _closed_by_listener(reader, within=5.0)
             finally:
                 await _close_raw(writer)
-            await _until(lambda: source._active == 0, "the slot was not released")
+            await _until(lambda: source._admission.active == 0, "the slot was not released")
             await _until(lambda: not source._client_tasks, "the client task did not finish")
         assert "task failed" not in caplog.text
         assert events.kinds() == []
-        assert source._per_host == {}
+        assert source._admission.per_host == {}
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
