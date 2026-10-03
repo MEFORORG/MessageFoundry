@@ -592,14 +592,28 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
   enforce it at the reverse proxy (mTLS client certificates) plus MDM in front of an off-loopback `/ui`,
   not inside the engine — the engine has no device-attestation channel and does not attempt one.
 
-### Each backend hop's least privilege; the engine probes only the store
+### Each backend hop's least privilege; the engine probes the store, Vault and LDAP
 
-The engine checks one hop's grant itself: the store principal. It reads that principal's roles and
-permissions at every start, and `messagefoundry check-privileges` runs the same read on demand
-(BACKLOG #305, ASVS 13.2.2). The probe looks for grants beyond the documented set. It does not
-confirm the documented grants are present, and nothing in the engine does. Every other hop
-below is the operator's to attest. The command prints the Vault, LDAP, SMTP and IdP hops with the
-identity the engine presents and the grant it needs, marked **not probed**.
+`messagefoundry check-privileges` probes three hops and prints two (BACKLOG #305, ASVS 13.2.2). Each
+probe looks for grants beyond the documented set. None confirms the documented grants are present,
+except that a Vault token missing a capability the engine calls is noted.
+
+- **The store principal.** The engine reads its roles and permissions at every start, and the
+  command runs the same read on demand.
+- **Each Vault token.** The command reads the token's own policies, TTL and renewability
+  (`auth/token/lookup-self`), then its capabilities (`sys/capabilities-self`) on each path the engine
+  calls and on administrative paths it never calls. The token, its id and its accessor are
+  never printed. It reads only the token in `MEFOR_STORE_VAULT_TOKEN` or `MEFOR_SECRETS_VAULT_TOKEN`,
+  and sends it only to the Vault in `MEFOR_STORE_VAULT_ADDR` or `MEFOR_SECRETS_VAULT_ADDR`.
+- **The AD bind account.** The command binds as the service account and asks the directory who it
+  is (the RFC 4532 "Who am I?" operation). It then reads that account's own `tokenGroups`, which AD
+  computes over every nested and primary group, and flags an administrative group. Who am I proves
+  identity, not rights: delegated directory ACLs are not read, so the hop always says **rights not
+  read**.
+
+SMTP and the IdP stay **not probed**: an SMTP relay reports nothing about an account's rights, and
+the engine has no read of the client registration at the IdP. They print the identity the engine
+presents and the grant it needs.
 
 The table names at least these hops. The engine dials others it does not list here, such as the AI
 broker, the syslog forwarder and the alert webhook; `messagefoundry check` names at least the
@@ -610,29 +624,89 @@ backend hops that present a static credential or none (the *Delegated identity* 
 | Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
-| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>` | No: printed, not probed |
-| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key | No: printed, not probed |
-| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else | No: printed, not probed |
-| LDAP (AD) | `[auth].ad_bind_dn` | read and search on the user and group search bases; no write and no administrative group | No: printed, not probed |
+| Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>`; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
+| Vault, Transit cipher | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on the data and audit keys under `transit/keys/`; `update` on `transit/encrypt/` and `transit/decrypt/` for the data key and `transit/hmac/` for the audit key; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.store`); reported only, never gates a start |
+| Vault, connector secrets | the token in `MEFOR_SECRETS_VAULT_TOKEN` | `read` on the KV v2 data path of each `*_secret` reference, and nothing else; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for `check-privileges` | **Yes**, by `check-privileges` (hop `vault.secrets`); reported only, never gates a start |
+| LDAP (AD) | `[auth].ad_bind_dn` | read and search on the user and group search bases; no write and no administrative group | **Partly**, by `check-privileges`: identity and administrative groups; delegated ACLs not read; never gates a start |
 | SMTP (alerts) | `[alerts].email_username`, or no AUTH account | send as `[alerts].email_from` only | No: printed, not probed |
 | IdP (OIDC) | `[auth].oidc_client_id` at `[auth].oidc_issuer` | a confidential client allowed the configured `oidc_scopes` only; no directory or admin API permission | No: printed, not probed |
 | Outbound connections | each connection's own credential (`Database`, `Rest`, `FHIR`, `Ftp`, `Email` and the rest) | what that feed's partner grants for that feed alone | No: `check-privileges` does not read the connection graph; `messagefoundry check` lists their static credentials |
 
 The Vault rows name at least the calls the code makes today. A policy that grants them and nothing
 more is the least grant for that consumer. The Transit cipher skips the separate audit-key read when
-one key does both jobs.
+one key does both jobs. The two `check-privileges` paths are in Vault's `default` policy. A token
+made with `-no-default-policy` needs them granted, or its hop reads as not observed. Neither path
+lets a token change anything.
 
-The store row is the only one with a probe because the engine has a read-only primitive for it and
-none for the rest. There is no Vault token self-lookup in the engine, no LDAP effective-rights read,
-and nothing an SMTP relay or an IdP reports about its own grants. `check-privileges` makes no network
-call the engine does not already make, so it does not add one to fill the gap.
+A Vault token is **over-granted** when any of these holds:
 
-`check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when the store
-probe could not read the principal, and 1 when the settings do not load. Clean means no grant beyond
-the documented set. A hop marked not probed
-never changes the exit code. Its last line, `serve:`, says what `serve` would do with the same
-observation. The runbook step that runs it for the gMSA is
-[`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
+- it carries the `root` policy;
+- a path the engine calls grants more than that call needs;
+- an administrative path it is asked about grants anything but `deny`;
+- the store and the connector-secret hops hold the same token. Then each hop is judged against the
+  union of both grants, so each holds the other's paths beyond its own least grant.
+
+The administrative paths it is asked about are at least these:
+
+- two policy writes under a placeholder name, `sys/policies/acl/` and the older `sys/policy/`;
+- the same two writes for each policy the token carries, which catches a policy that may rewrite
+  itself;
+- two identity-group paths that can attach a policy, `identity/group` and `identity/group/name/`;
+- a secrets mount (`sys/mounts/`), an auth method (`sys/auth/`) and `auth/token/create`;
+- for each Transit key the engine uses, its `config` (which can make the key exportable), `rotate`,
+  `export` and `backup` paths.
+
+Grants on other paths the engine does not call are not read, so a clean token still needs its policy
+read by hand.
+
+The AD bind account is **over-granted** when it is in an administrative group the check knows.
+These are at least:
+
+- **By fixed SID**, read from `tokenGroups`: Domain Admins, Domain Controllers, Read-only Domain
+  Controllers, Cloneable Domain Controllers, Schema Admins, Enterprise Admins, Enterprise Read-only
+  Domain Controllers, Group Policy Creator Owners, Key Admins and Enterprise Key Admins in its
+  domain; Administrators, Account Operators, Server Operators, Print Operators and Backup Operators
+  in BUILTIN; and Enterprise Domain Controllers. A SID does not change with the language, so a
+  localised group name does not hide one.
+- **By name only**: DnsAdmins. It has no fixed SID; the DNS role gives it an ordinary one when it is
+  installed. So it is found only in the direct `memberOf`, and a nested DnsAdmins membership is not
+  seen. When `tokenGroups` was read, a direct `memberOf` name counts only for DnsAdmins: an
+  ordinary group that is merely named Administrators is not the BUILTIN one.
+
+A clean LDAP hop means none of these groups, not no powerful group: a group outside the list, such
+as one an Exchange install creates with rights on the domain, is not flagged.
+
+The `primaryGroupID` counts on every read, because a RID cannot be faked by a group name. When
+`tokenGroups` cannot be read, the probe falls back to the direct `memberOf` for every group, which
+misses a nested group, and reports the hop as not observed unless it finds one. A policy name that
+is not plain printable ASCII is reported too, because it cannot be told apart from `root` by
+reading it. A bind that succeeds but whose Who am I names no identity is also not observed, never
+clean. When the base read of `[auth].ad_bind_dn` returns no entry, the hop names the directory's
+result code: `invalidDNSyntax` means the bind identity is a UPN or `DOMAIN\user` rather than a
+distinguished name, and the group read needs a DN.
+
+These probes add read-only calls the engine does not otherwise make: the token self-lookup, the
+capabilities read, Who am I and one read of the bind account's own entry. Each goes through the
+client the engine builds for that hop, with its TLS, trust anchor and cleartext refusal. Run the
+command with the service's environment, so the Vault tokens and the AD bind password are the
+engine's own:
+
+- **A Vault hop whose `MEFOR_*_VAULT_TOKEN` or `MEFOR_*_VAULT_ADDR` is unset is not observed.**
+  The engine itself would fall back to `VAULT_TOKEN`, `~/.vault-token` or `VAULT_ADDR` there. The
+  check does not. In an operator's shell those values are the operator's own. Judging that token
+  as the engine's would report on the wrong token. Sending the engine's token to that address
+  would hand it to a different Vault. A Vault-held AD bind password is read under the same rule.
+- **Each run binds to AD as the service account.** A wrong or stale bind password is a failed bind,
+  and each one counts toward the domain's account lockout threshold. Repeated runs with the wrong
+  password can lock the account the running engine uses. Check the password before you run the
+  command again.
+
+`check-privileges` exits 0 when every probe that ran was clean, 3 on an over-grant, 4 when a probe
+could not read its principal, and 1 when the settings do not load. Clean means no grant beyond the
+documented set. A hop marked not probed never changes the exit code. Its last line, `serve:`, says
+what `serve` would do with the store observation. **Only the store finding gates a start**; a Vault
+or LDAP over-grant is reported, and the `serve:` line says it does not gate a start. The runbook step
+that runs it for the gMSA is [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 step 6.
 
 **What `serve` does with the store finding ([ADR 0199](adr/0199-an-over-granted-store-login-refuses-start-under-enforce-with-an-audited-opt-out.md), owner ruling 2026-09-27).** Under
 the shipped `[security].enforcement = enforce`, an over-granted store login **refuses to start**. The
@@ -2097,8 +2171,11 @@ under both (`AuthService._unverified_session_owes_factor`). Setting `[security].
 frees any account that has not enrolled a factor, whatever its role, at the cost of the exposure
 gate named earlier in this paragraph: on an exposed instance `serve` refuses to start under
 `enforce` unless `allow_single_factor_admin_when_exposed` is set. An account that has enrolled a
-factor still owes it under either setting; an OIDC sign-in meets it while
-`[auth].oidc_require_mfa_claim` is on, the default. Making the account an AD principal is **no
+factor owes it while it keeps one, under either setting, and an OIDC sign-in meets it while
+`[auth].oidc_require_mfa_claim` is on, the default. With `require_mfa` off, or for an account
+`require_mfa_scope` leaves out (under `administrators`, any account without the Administrator role,
+directory ones included), the holder may remove its last factor. Under `administrators` with
+`require_mfa` on, a directory account that does so is still not single-factor: its next Kerberos session stays MFA-pending until it enrols again. Making the account an AD principal is **no
 longer** an escape. Nor is the mTLS service-identity plane: a certificate identity is admitted on one route only,
 `GET /service/identity`, so it cannot carry a working service account (the mTLS row of the pathway
 table below). An operator who opts out at exposure re-enables `[security].require_mfa = true`, or
@@ -2840,6 +2917,25 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   URL exists and a token's `kid` can never steer *where* the engine fetches from (no SSRF). It can
   still cause a refetch *of the pinned JWKS URI* — an unknown `kid` triggers at most one fetch per
   `[auth].oidc_jwks_min_refetch_seconds` (default 300s), globally, which is the amplification bound.
+- **The engine authenticates to the token endpoint with its secret by default, or with a signed
+  assertion** (BACKLOG #296). `[auth].oidc_token_endpoint_auth_method` defaults to
+  `client_secret_post`, which sends the client secret in the token request body. That secret is
+  reusable: nothing in it names the endpoint or bounds its lifetime. `private_key_jwt` (OIDC Core
+  section 9, RFC 7523) sends a JWT signed with `[auth].oidc_client_private_key` instead, and no
+  secret. The assertion is addressed to a pinned, allow-listed URL, is short-lived and is fresh for
+  every request; [CONFIGURATION.md](CONFIGURATION.md) lists its claims and the key rules. It is
+  built and signed by the same code as the SMART client's assertion, so the algorithm set (no
+  `none`, no HMAC) and the key-strength floor are that signer's. The key never leaves the engine and
+  is never logged; a bad key, or a `oidc_client_certificate` that does not hold its public half,
+  refuses startup. A secret configured beside the key is refused, and so is any assertion setting
+  configured beside the secret.
+  **Limits.** The engine reads no discovery document, so it cannot check that the IdP lists
+  `private_key_jwt` in `token_endpoint_auth_methods_supported`; register the client for that
+  method at the IdP. No live IdP has been tried: Entra ID's certificate path (an `x5t#S256`
+  thumbprint from `oidc_client_certificate`) is built from its documentation, not a tenant. Whether the IdP *also* still accepts the secret for this client is the IdP's
+  setting, not the engine's, so remove the secret there once the key works. Default stays
+  `client_secret_post`; refusing the secret method outright is an owner decision that has not
+  been made.
 - **Degradation is isolated, for an account with no binding.** An unreachable IdP does not
   affect local sign-in, or Kerberos sign-in by an account with no federated binding, and
   federation recovers without an engine restart. A bound account has no other sign-in during
@@ -3282,7 +3378,7 @@ Comparative properties on the dimensions the table's four columns cannot carry:
 | **Local** | passkeys only (WebAuthn origin-bound, `attestation=none`, `user_verification=preferred`); password/TOTP are phishable | TOTP is single-use per 30 s step (`totp_skew_steps` default `0`); recovery codes single-use; passkey challenges are 64-byte CSPRNG, single-use, 120 s TTL, with a strict sign-counter compare-and-set | argon2id password hash (t=3, m=64 MiB, p=4); TOTP secret **cipher-encrypted**; recovery codes argon2id-hashed; COSE public keys **plaintext by design** | built (TOTP + passkeys) | disable the account or revoke sessions; reaches the next HTTP request, with [exceptions](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832) |
 | **AD** | none | none beyond TLS | **none** — only the service-account bind password (by policy from env or a `[secrets]` reference; a value in the config file is still accepted, with a WARNING at load; with no bind password from any source, `ad_enabled` refuses the load) | **not asserted here** — the bind re-proves an existing session and grants nothing; the delegated, engine-unreadable MFA grant that used to belong to the Kerberos row is retired (BACKLOG #1144) | disabling in AD does **not** end a live session on its own; `[auth].ad_session_recheck_seconds` (default **300 s**) closes it, bounded by the interval times the strikes, with [exceptions](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832) |
 | **Kerberos** | the ticket: none (single-leg, no channel binding). The engine second factor the session must then meet, while `[security].require_mfa` is on (the default) or once the account has enrolled one: a passkey is phishing-resistant (origin-bound); a TOTP or recovery code is not | ticket lifetime is the domain's | **none** — the acceptor keytab/SPN is OS-owned | an **engine** factor (TOTP or passkey), enrolled and satisfied at the engine — the ticket asserts nothing the engine can read, so nothing is delegated (BACKLOG #1144) | as AD |
-| **OIDC** | the federated leg: the IdP's, not the engine's. At sign-in the engine asks for its own factor, where a passkey is phishing-resistant, only when the session is minted MFA-pending, which happens with `oidc_require_mfa_claim` off, and then only while `[security].require_mfa` is on or the account has enrolled one | strongest of the four interactive and directory pathways: server-side PKCE verifier + `state` (constant-time compare) + `nonce`, single-use flow, a `__Host-`-prefixed browser-binding cookie the callback requires, and a `typ`/kid/alg/signature/`events`/`iss`/`aud`/`exp`/`iat`/`nbf`/`auth_time`/`nonce`/`sub` ladder under a bounded clock skew — `typ` and `events` assert the token **class** (an access token or a logout token carries the same issuer and key), and `sub`/`iat`/`auth_time` are required rather than optional. The IdP step-up leg runs the same flow and ladder, then refuses a token whose `auth_time` predates the staged flow by more than `oidc_clock_skew_seconds`. **Residual:** an IdP that ignores `max_age=0` still passes when its last sign-in for the user falls inside that skew | **none** — only the confidential-client secret (by policy from env or a `[secrets]` reference, resolved eagerly at startup; a value in the config file is still accepted, with a WARNING at load) | asserted via `amr`/`acr` **and enforced** — with `[auth].oidc_require_mfa_claim` on (default) a token carrying no configured `amr`/`acr` is refused at claims validation, and only then is the session minted MFA-verified; switch it off and the federated session is minted **un**verified, which `mfa_satisfied` refuses while `[security].require_mfa` is on or once the account has enrolled a factor. This is the one directory leg whose directory-side factor claim the engine checks, by verifying the signed `amr`/`acr`; that is still an assertion, not a proof. A Kerberos session's factor is the engine's own, which the engine verifies directly | as AD, plus the `id_token.exp` and `auth_time + max_age` caps; no refresh tokens and no RP-initiated logout |
+| **OIDC** | the federated leg: the IdP's, not the engine's. At sign-in the engine asks for its own factor, where a passkey is phishing-resistant, only when the session is minted MFA-pending, which happens with `oidc_require_mfa_claim` off, and then only while `[security].require_mfa` is on or the account has enrolled one | strongest of the four interactive and directory pathways: server-side PKCE verifier + `state` (constant-time compare) + `nonce`, single-use flow, a `__Host-`-prefixed browser-binding cookie the callback requires, and a `typ`/kid/alg/signature/`events`/`iss`/`aud`/`exp`/`iat`/`nbf`/`auth_time`/`nonce`/`sub` ladder under a bounded clock skew — `typ` and `events` assert the token **class** (an access token or a logout token carries the same issuer and key), and `sub`/`iat`/`auth_time` are required rather than optional. The IdP step-up leg runs the same flow and ladder, then refuses a token whose `auth_time` predates the staged flow by more than `oidc_clock_skew_seconds`. **Residual:** an IdP that ignores `max_age=0` still passes when its last sign-in for the user falls inside that skew | **none** — only the confidential-client credential: the client secret (by policy from env or a `[secrets]` reference, resolved eagerly at startup; a value in the config file is still accepted, with a WARNING at load), or under `private_key_jwt` a signing key loaded the same way (BACKLOG #296) | asserted via `amr`/`acr` **and enforced** — with `[auth].oidc_require_mfa_claim` on (default) a token carrying no configured `amr`/`acr` is refused at claims validation, and only then is the session minted MFA-verified; switch it off and the federated session is minted **un**verified, which `mfa_satisfied` refuses while `[security].require_mfa` is on or once the account has enrolled a factor. This is the one directory leg whose directory-side factor claim the engine checks, by verifying the signed `amr`/`acr`; that is still an assertion, not a proof. A Kerberos session's factor is the engine's own, which the engine verifies directly | as AD, plus the `id_token.exp` and `auth_time + max_age` caps; no refresh tokens and no RP-initiated logout |
 | **mTLS** | n/a (no interactive ceremony) | n/a | **none** — the engine holds only the client CA, the name map and, if set, the CRL file | none, structurally | **opt-in CRL checking, off by default** — `VERIFY_X509_STRICT` is strict path validation and checks no revocation, so with `[api].tls_client_crl_file` unset a revoked but chain-valid client certificate is accepted. Set it and a revoked client certificate fails the handshake (BACKLOG #1005; the [CONFIGURATION.md `[api]` row](CONFIGURATION.md#api) is the source of record). No OCSP. Engine-side: remove the allow-list entry (config change → restart) or disable the mapped account |
 | **HTTP intake** | `api_key` / `bearer`: none, the shared secret is phishable like any password; `mtls_subject`: the client certificate's | `api_key` / `bearer`: none beyond TLS, and a listener without `tls` sends the secret in cleartext; `mtls_subject`: the TLS handshake | `api_key` / `bearer`: **the raw shared secret**, held in process memory and compared as-is, not hashed like a Local password. `intake_api_key` / `intake_api_key_next` must be `env()` references, never inline, and nothing writes them to the store. `mtls_subject`: only `tls_ca_file` and the subject list | none, structurally | change the `env()` secret (the `intake_api_key_next` slot avoids an outage) or drop the subject from `intake_client_subjects`; either takes effect only once the connection is rebuilt, which a restart does, because the listener reads both at construction. Under `[security].enforcement = enforce` an `mtls_subject` listener, like any intake listener with `tls` and `tls_ca_file`, is refused at start unless it also sets `tls_crl_file` or declares `tls_revocation_attested = true` with a `tls_revocation_attested_reason` (an `inbound()` keyword or a top-level `connections.toml` key, not under `[settings]`). The attestation checks no revocation in the engine: the listener starts, and each start logs a WARNING that reads `on operator attestation` and carries the reason ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)). Prefer `tls_crl_file` |
 

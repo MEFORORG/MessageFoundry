@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from harness.reconcile.compare import (
     DEFAULT_KEY,
+    LoadError,
     MessagePair,
     ReconcileResult,
     field_value,
@@ -44,6 +45,7 @@ __all__ = [
     "MessagePair",
     "ReconcileResult",
     "field_value",
+    "LoadError",
     "load_messages",
     "reconcile",
 ]

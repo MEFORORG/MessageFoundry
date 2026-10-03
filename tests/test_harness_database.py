@@ -40,6 +40,7 @@ from messagefoundry.apiclient import EngineClient
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import DatabasePoll, EnvRef, env, load_config
 from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from tests._harness_engine import HARNESS_CONFIG, ephemeral_overrides, serve_harness_config
 
 DB_CONFIG = HARNESS_CONFIG / "database"
@@ -321,15 +322,55 @@ def test_the_sink_reads_only_rows_written_after_it_started(
     _fake_pyodbc(monkeypatch)
     monkeypatch.setattr(_database, "connect", lambda eps: conn)
     with DatabaseSink(Endpoints(environ={})) as sink:
-        conn.rows = [(42, "C42", "ADT^A05", "MSH|a"), (43, "C43", "ADT^A05", "MSH|b")]
+        conn.rows = [(42, "C42", "ADT^A05", "MSH|a", 5), (43, "C43", "ADT^A05", "MSH|b", 5)]
         first = sink.records()
-        conn.rows = [(44, "C44", "ADT^A05", "MSH|c")]
+        conn.rows = [(44, "C44", "ADT^A05", "MSH|c", 5)]
         second = sink.records()
     assert [r.meta["control_id"] for r in first] == ["C42", "C43"]
     assert [r.meta["id"] for r in second] == ["42", "43", "44"]
     queried = [params for sql, params in conn.executed if sql == _database.SELECT_OUTBOX_AFTER]
     assert queried == [(41,), (43,)]  # the high-water mark moves; old rows are never re-read
     assert conn.closed
+
+
+def test_the_sink_reads_no_payload_over_the_cap_and_records_the_refusal(
+    monkeypatch: pytest.MonkeyPatch, credentials: None
+) -> None:
+    """ASVS 5.1.1: the read withholds an over-cap payload server-side, and the sink records the row
+    as refused, never as a delivery and never silently dropped. The fetched-side check bites too."""
+    sql = _database.SELECT_OUTBOX_AFTER
+    cap = _database.MAX_OUTBOX_PAYLOAD_CHARS
+    assert cap == DEFAULT_MAX_MESSAGE_BYTES
+    assert f"CASE WHEN DATALENGTH(payload) <= {2 * cap} THEN payload END" in sql
+    assert "DATALENGTH(payload) / 2" in sql
+    conn = _FakeConn()
+    _fake_pyodbc(monkeypatch)
+    monkeypatch.setattr(_database, "connect", lambda eps: conn)
+    with DatabaseSink(Endpoints(environ={})) as sink:
+        sink.max_payload_chars = 5
+        conn.rows = [
+            (1, "C1", "ADT^A05", None, cap + 1),  # withheld by the server
+            (2, "C2", "ADT^A05", "MSH|ab", 6),  # fetched, but over the sink's own cap
+            (3, "C3", "ADT^A05", "MSH|a", 5),  # at the cap: kept
+            (
+                4,
+                "C4",
+                "ADT^A05",
+                "\U0001f600" * 3,
+                6,
+            ),  # 3 characters, 6 code units, as the server counts
+        ]
+        records = sink.records()
+    assert [r.meta["control_id"] for r in records] == ["C1", "C2", "C3", "C4"]
+    assert [r.payload for r in records] == [b"", b"", b"MSH|a", b""]
+    assert records[3].meta["refused"].startswith("6 UTF-16 code units, over the 5-unit cap")
+    # A withheld payload names the server-side cap, which the attribute cannot raise or hide.
+    assert (
+        records[0].meta["refused"].startswith(f"{cap + 1} UTF-16 code units, over the {cap}-unit")
+    )
+    assert records[1].meta["refused"].startswith("6 UTF-16 code units, over the 5-unit cap")
+    assert "refused" not in records[2].meta
+    assert "MSH" not in records[1].meta["refused"]  # the refusal never quotes the payload
 
 
 def test_the_sink_survives_a_dropped_session_and_closes_on_a_failed_start(
@@ -348,7 +389,7 @@ def test_the_sink_survives_a_dropped_session_and_closes_on_a_failed_start(
         assert sink.records() == []
         assert sink.last_error == "_FakeError"
         assert dropping.closed  # the dead session is dropped, not reused
-        dropping.rows = [(1, "C1", "ADT^A05", "MSH|a")]
+        dropping.rows = [(1, "C1", "ADT^A05", "MSH|a", 5)]
         assert [r.meta["control_id"] for r in sink.records()] == ["C1"]  # the next poll redials
     assert len(dials) == 2
     refusing = _FakeConn(refuse_at=1)  # the high-water read itself is refused
