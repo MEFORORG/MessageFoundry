@@ -88,7 +88,9 @@ def load_messages(
     Each file is capped at ``max_file_bytes`` (default :data:`DEFAULT_MAX_LOAD_FILE_BYTES`) and refused
     with :class:`LoadError` over it, before it is read whole; so is a named path that is not a regular
     file. In a directory the cap is a TOTAL across its files, since every message is held at once;
-    only regular files are read, and anything else in it is skipped."""
+    only regular files are read, a symlink is not followed, as in the File tab's watch pane, and
+    anything else in it is skipped. A JSONL line that is not an object with a string ``raw`` raises
+    ``ValueError`` naming the line number, never its content."""
     if max_file_bytes <= 0:
         raise ValueError(f"max_file_bytes must be a positive byte count, got {max_file_bytes}")
     p = Path(path)
@@ -96,18 +98,37 @@ def load_messages(
         out: list[str] = []
         left = max_file_bytes
         for child in sorted(p.iterdir()):
-            if child.is_file():
-                data = _read(child, left)
-                left -= len(data)
-                out.extend(_split_batch(data.decode("latin-1")))
+            # The directory's entries are another system's output, not paths the operator named, so a
+            # symlink among them is not followed: it could point anywhere the operator can read.
+            if not child.is_file(follow_symlinks=False):
+                continue
+            data, reason = read_capped(child, left, follow_symlinks=False)
+            if reason == NOT_REGULAR:
+                continue  # swapped for a non-file since the listing: skipped, like any other
+            if reason:
+                # ``left`` is what remains of the directory's total, not a per-file cap, so name both.
+                raise LoadError(
+                    f"{child}: over the {left} bytes left of the {max_file_bytes}-byte total cap "
+                    "for this directory; not read",
+                    over_cap=True,
+                )
+            left -= len(data)
+            out.extend(_split_batch(data.decode("latin-1")))
         return out
     # Decode straight away, so the bytes are not held beside the text while it is split.
     if p.suffix == ".jsonl":
         msgs: list[str] = []
-        for line in _read(p, max_file_bytes).decode("utf-8").splitlines():
+        for number, line in enumerate(_read(p, max_file_bytes).decode("utf-8").splitlines(), 1):
             line = line.strip()
-            if line:
-                msgs.append(json.loads(line)["raw"])
+            if not line:
+                continue
+            record = json.loads(line)
+            raw = record.get("raw") if isinstance(record, dict) else None
+            if not isinstance(raw, str):
+                # Without this, a list or a number on a line raised TypeError, which the CLI did not
+                # catch, so it exited 1, the code for "the outputs differ".
+                raise ValueError(f"{p}: line {number} is not an object with a string 'raw'")
+            msgs.append(raw)
         return msgs
     return _split_batch(_read(p, max_file_bytes).decode("latin-1"))
 

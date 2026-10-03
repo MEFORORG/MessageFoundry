@@ -20,7 +20,10 @@ raw received Data Set is charged against ``max_object_bytes`` (default the engin
 which also clamps the engine's SCP), and a Deflated Explicit VR LE object is inflated in bounded
 memory, discarding the output, against the lesser of that and the codec's inflate ceiling. An object
 over either is answered :data:`CANNOT_UNDERSTAND`, never decoded, and still recorded, with an empty
-payload and a ``refused`` reason.
+payload and a ``refused`` reason. One charge comes after decode: the re-encoded Part-10 object, which
+adds the preamble and file meta the raw count leaves out, is charged against ``max_object_bytes``
+again, as the engine's SCP charges it. An object refused there has been decoded and re-encoded, and
+is answered and recorded the same way.
 """
 
 from __future__ import annotations
@@ -124,8 +127,9 @@ class DimseSink(Sink):
         # re-encode -- otherwise pynetdicom would answer its own 0xC211 and a retry scenario would
         # blame the engine for the sink's fault. Such a record has an empty payload, so a scenario
         # that counts the UID inside each delivered object still misses it. The one exception is an
-        # object over the cap: it is refused before decode and answered CANNOT_UNDERSTAND, which no
-        # configured status may override, so a sink can never be told to accept what it did not read.
+        # object over a cap: it is answered CANNOT_UNDERSTAND, which no configured status may override,
+        # so a sink can never be told to accept what it did not read. The raw and inflate charges
+        # refuse before decode; the re-encoded charge below can only refuse after it.
         meta = {
             "sop_instance_uid": str(getattr(event.request, "AffectedSOPInstanceUID", "") or ""),
             "calling_ae": str(getattr(event.assoc.requestor, "ae_title", "") or "").strip(),

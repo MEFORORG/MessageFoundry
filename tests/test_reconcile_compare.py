@@ -126,6 +126,70 @@ def test_compare_cli_reports_an_over_cap_input_and_exits_two(
     assert "could not be read (FileNotFoundError)" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "line",
+    ["[1, 2]", "5", '"MSH|^~\\\\&|"', "null", '{"raw": 5}', '{"control_id": "A"}', "[" * 100_000],
+    ids=["list", "number", "string", "null", "raw-not-text", "no-raw", "nested-too-deep"],
+)
+def test_compare_cli_exits_two_on_a_jsonl_line_that_is_not_a_capture_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], line: str
+) -> None:
+    """A JSONL line that is not an object with a string ``raw`` is malformed input, exit 2, never 1
+    ("the outputs differ"). A list or a number used to raise an uncaught TypeError, so the process
+    exited 1; a line nested too deep raised RecursionError the same way."""
+    jsonl = tmp_path / "cap.jsonl"
+    jsonl.write_text(json.dumps({"raw": _msg("A")}) + "\n" + line + "\n", encoding="utf-8")
+    batch = tmp_path / "export.hl7"
+    batch.write_text(_msg("A"), encoding="latin-1")
+    assert reconcile_main(["compare", "--mefor", str(jsonl), "--corepoint", str(batch)]) == 2
+    err = capsys.readouterr().err
+    assert "could not be read" in err and "MSH" not in err  # by class only, never the content
+
+
+def test_load_messages_names_the_jsonl_line_and_not_its_content(tmp_path: Path) -> None:
+    jsonl = tmp_path / "cap.jsonl"
+    jsonl.write_text(json.dumps({"raw": _msg("A")}) + "\n" + '["PID|SECRET"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="line 2 is not an object") as bad:
+        load_messages(jsonl)
+    assert "SECRET" not in str(bad.value) and not isinstance(bad.value, LoadError)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="no symlinks on this platform")
+def test_load_messages_directory_mode_does_not_follow_a_symlink(tmp_path: Path) -> None:
+    """In a directory, a symlink is skipped, not followed, as the File tab's watch pane skips one:
+    the entries are another system's output, and a link could point at any file the operator can
+    read. A symlinked DIRECTORY the operator names is still read; only entries inside it are judged."""
+    outside = tmp_path / "outside.hl7"
+    outside.write_text(_msg("OUTSIDE"), encoding="latin-1")
+    d = tmp_path / "exp"
+    d.mkdir()
+    (d / "1.hl7").write_text(_msg("A"), encoding="latin-1")
+    try:
+        (d / "2.hl7").symlink_to(outside)
+    except OSError:  # Windows without the symlink privilege
+        pytest.skip("cannot create a symlink here")
+    assert [field_value(m, ("MSH", 10)) for m in load_messages(d)] == ["A"]
+    linked = tmp_path / "linked"
+    linked.symlink_to(d, target_is_directory=True)
+    assert [field_value(m, ("MSH", 10)) for m in load_messages(linked)] == ["A"]
+
+
+def test_load_messages_directory_refusal_names_the_total_not_a_file_cap(tmp_path: Path) -> None:
+    """The directory budget is a total, so a refusal names what was left of it and the total, not
+    "the N-byte cap" as though N were a per-file cap the operator had set."""
+    one = _msg("A").encode("latin-1")
+    d = tmp_path / "exp"
+    d.mkdir()
+    (d / "1.hl7").write_bytes(one)
+    (d / "2.hl7").write_bytes(one)
+    total = len(one) * 2 - 1
+    with pytest.raises(LoadError) as over:
+        load_messages(d, max_file_bytes=total)
+    text = str(over.value)
+    assert "2.hl7" in text and over.value.over_cap
+    assert f"over the {len(one) - 1} bytes left of the {total}-byte total cap" in text
+
+
 def test_reconcile_identical_is_clean() -> None:
     # Same content, only the engine-non-deterministic MSH-7 stamp + MSH-10 differ → blanked → clean.
     mefor = [_msg("MEF1", stamp="20260101111111")]
