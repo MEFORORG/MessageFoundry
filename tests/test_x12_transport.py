@@ -29,15 +29,12 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.parsing.message import RawMessage
 from messagefoundry.parsing.x12 import X12Peek
-from messagefoundry.pipeline.wiring_runner import (
-    RegistryRunner,
-    _source_config,
-    check_egress_allowed,
-)
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _source_config
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import x12 as x12_mod
 from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.x12 import X12Destination, X12Source
 
 
@@ -366,10 +363,14 @@ async def test_reply_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_build_source_and_destination_via_registry() -> None:
-    src = build_source(Source(type=ConnectorType.X12, settings={"host": "127.0.0.1", "port": 0}))
+    src = build_source(
+        Source(type=ConnectorType.X12, settings={"host": "127.0.0.1", "port": 0}),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(src, X12Source)
     dest = build_destination(
-        Destination(name="o", type=ConnectorType.X12, settings={"host": "127.0.0.1", "port": 9})
+        Destination(name="o", type=ConnectorType.X12, settings={"host": "127.0.0.1", "port": 9}),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, X12Destination)
 
@@ -422,7 +423,9 @@ def test_x12_egress_shares_allowed_tcp_allowlist() -> None:
 
 
 def test_x12_egress_empty_allowlist_is_unrestricted() -> None:
-    check_egress_allowed(_x12_dest("anywhere.example", 1234), EgressSettings())  # no raise
+    check_egress_allowed(
+        _x12_dest("anywhere.example", 1234), EgressSettings(deny_by_default=False)
+    )  # no raise
 
 
 def test_x12_source_config_injects_bind_host() -> None:

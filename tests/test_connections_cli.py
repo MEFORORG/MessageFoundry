@@ -35,6 +35,11 @@ def cfg(tmp_path: Path) -> Path:
     return tmp_path
 
 
+#: The edit's build check runs under the settings model's deny default (vault BACKLOG #2605), so
+#: a test whose outbound dials the partner host lists it.
+_EPIC_EGRESS = '[egress]\nallowed_mllp = ["epic.example"]\n'
+
+
 def _svc(cfg: Path, body: str = "") -> Path:
     path = cfg / "svc.toml"
     path.write_text(body, encoding="utf-8")
@@ -204,7 +209,7 @@ def test_hand_comment_survives_gui_upsert(cfg: Path, capsys: pytest.CaptureFixtu
         "cleartext_accepted": True,
         "cleartext_reason": "legacy partner has no MLLP-over-TLS listener",
     }
-    assert _upsert(cfg, obj, capsys, svc=_svc(cfg))[0] == 0
+    assert _upsert(cfg, obj, capsys, svc=_svc(cfg, _EPIC_EGRESS))[0] == 0
     text = (cfg / "connections.toml").read_text(encoding="utf-8")
     assert "# hand-written — keep this header comment" in text  # untouched table's comments survive
     assert "# important inline note" in text
@@ -338,7 +343,7 @@ def test_cli_end_to_end_maximal_with_commented_sibling(
         ),
         encoding="utf-8",
     )
-    svc = _svc(cfg)
+    svc = _svc(cfg, _EPIC_EGRESS)
     before_reg = load_config(cfg)
     rc = main(["connection", "list", "--config", str(cfg), "--json"])
     entries = json.loads(capsys.readouterr().out)

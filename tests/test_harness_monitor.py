@@ -22,6 +22,8 @@ from typing import Any
 import pytest
 import uvicorn
 
+from messagefoundry.config.settings import EgressSettings
+
 pytest.importorskip("PySide6")
 
 from harness import monitor  # noqa: E402
@@ -98,7 +100,10 @@ def _serve(
         db_path=tmp_path / "console.db",
         config_dir=tmp_path / "config",
         poll_interval=0.05,
-        allow_no_auth=True,  # the monitor reads the API with no session
+        allow_no_auth=True,
+        egress_settings=EgressSettings(
+            deny_by_default=False
+        ),  # the monitor reads the API with no session
     )
     port = _free_port()
     uv = uvicorn.Server(

@@ -41,13 +41,13 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.keywrap import KeyWrapRefused
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
 from messagefoundry.transports import build_destination, build_source, remotefile
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationStartupError,
     NegativeAckError,
 )
+from messagefoundry.transports.egress import check_egress_allowed, check_source_allowed
 from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES
 from messagefoundry.transports.remotefile import (
     _APPROVED_SFTP_CIPHERS,
@@ -184,7 +184,10 @@ def _dest(
     base: dict[str, Any] = dict(host="sftp.example.com", remote_dir="/in")  # noqa: C408
     base.update(over)
     d = build_destination(
-        Destination(name="OB_REMOTE", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings)
+        Destination(
+            name="OB_REMOTE", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, RemoteFileDestination)
     return d
@@ -194,7 +197,10 @@ def _src(monkeypatch: pytest.MonkeyPatch, client: _FakeClient, **over: Any) -> R
     _install_client(monkeypatch, client)
     base: dict[str, Any] = dict(host="sftp.example.com", remote_dir="/in")  # noqa: C408
     base.update(over)
-    s = build_source(Source(type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings))
+    s = build_source(
+        Source(type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(s, RemoteFileSource)
     return s
 
@@ -981,7 +987,9 @@ def test_plain_ftp_with_credentials_refused_without_escape(
 ) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with pytest.raises(ValueError, match="CLEARTEXT"):
-        build_destination(_ftp_dest(username="u", password="p"))
+        build_destination(
+            _ftp_dest(username="u", password="p"), egress=EgressSettings(deny_by_default=False)
+        )
 
 
 def test_plain_ftp_with_credentials_allowed_with_escape(
@@ -989,19 +997,26 @@ def test_plain_ftp_with_credentials_allowed_with_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    dest = build_destination(_ftp_dest(username="u", password="p"))
+    dest = build_destination(
+        _ftp_dest(username="u", password="p"), egress=EgressSettings(deny_by_default=False)
+    )
     assert isinstance(dest, RemoteFileDestination)  # builds (warns), not refused
 
 
 def test_plain_ftp_without_credentials_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    dest = build_destination(_ftp_dest())  # anonymous — nothing to leak
+    dest = build_destination(
+        _ftp_dest(), egress=EgressSettings(deny_by_default=False)
+    )  # anonymous — nothing to leak
     assert isinstance(dest, RemoteFileDestination)
 
 
 def test_ftps_with_credentials_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    dest = build_destination(_ftp_dest(tls=True, username="u", password="p"))  # TLS → fine
+    dest = build_destination(
+        _ftp_dest(tls=True, username="u", password="p"),
+        egress=EgressSettings(deny_by_default=False),
+    )  # TLS → fine
     assert isinstance(dest, RemoteFileDestination)
 
 
@@ -1091,7 +1106,8 @@ def test_sftp_with_credentials_is_allowed(monkeypatch: pytest.MonkeyPatch) -> No
             name="OB",
             type=ConnectorType.REMOTEFILE,
             settings=Sftp(host="h", remote_dir="/in", username="u", password="p").settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, RemoteFileDestination)  # SSH → credentials fine
 
@@ -1626,7 +1642,7 @@ def test_egress_host_port_match() -> None:
 
 
 def test_egress_unrestricted_when_empty() -> None:
-    check_egress_allowed(_remote_dest("anywhere.example"), EgressSettings())
+    check_egress_allowed(_remote_dest("anywhere.example"), EgressSettings(deny_by_default=False))
 
 
 def _remote_src_cfg(host: str, port: int = 22) -> Source:
@@ -1654,7 +1670,9 @@ def test_source_connect_permits_listed_host() -> None:
 
 
 def test_source_connect_unrestricted_when_empty() -> None:
-    check_source_allowed(_remote_src_cfg("anywhere.example"), "IB_REMOTE", EgressSettings())
+    check_source_allowed(
+        _remote_src_cfg("anywhere.example"), "IB_REMOTE", EgressSettings(deny_by_default=False)
+    )
 
 
 # === factory smoke ===========================================================
@@ -1680,7 +1698,8 @@ def test_requires_core_settings(missing: str) -> None:
     base[missing] = ""
     with pytest.raises(ValueError):
         build_destination(
-            Destination(name="OB", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings)
+            Destination(name="OB", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -2530,7 +2549,8 @@ def _config_fault_dest(
     posture = HopPosture(enforcing=False) if kind == "plain" else None
     with active_hop_posture(posture):
         return build_destination(
-            _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over)
+            _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -2582,7 +2602,13 @@ async def _e2e_runner(
                 )
             )
         sink = _Sink()
-        runner = RegistryRunner(Registry(), store, poll_interval=0.02, alert_sink=sink)
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            poll_interval=0.02,
+            alert_sink=sink,
+            egress=EgressSettings(deny_by_default=False),
+        )
     except BaseException:
         await store.close()  # the callers' finally closes it only once this returns
         raise
@@ -2721,7 +2747,8 @@ async def test_validate_directory_stops_the_lane_only_on_a_refused_credential(
     the real ``_FtpClient`` so the classification under test is the shipped one."""
     _scripted_ftps(monkeypatch, refuse_at="login", reply=reply)
     dest = build_destination(
-        _ftp_dest(tls=True, username="u", password="p", validate_directory=True, filename="m.hl7")
+        _ftp_dest(tls=True, username="u", password="p", validate_directory=True, filename="m.hl7"),
+        egress=EgressSettings(deny_by_default=False),
     )
     with pytest.raises(DeliveryError) as caught:
         await dest.send(_UPLOAD_BODY)
@@ -2933,7 +2960,8 @@ async def test_a_same_named_entry_that_is_not_a_file_is_a_collision(
     Driven through the shipped ``_FtpClient``, so the MLSD parsing under test is the real one."""
     box = _drop_box(monkeypatch, [*_MLSD_DOTS, ("msg.hl7", {"type": entry_type})])
     dest = build_destination(
-        _ftp_dest(tls=True, username="u", password="p", filename="msg.hl7", overwrite=False)
+        _ftp_dest(tls=True, username="u", password="p", filename="msg.hl7", overwrite=False),
+        egress=EgressSettings(deny_by_default=False),
     )
     await dest.send(_UPLOAD_BODY)
     (rename,) = [r for c in box.connections for r in c.renamed]
@@ -2974,7 +3002,10 @@ async def test_the_overwrite_off_probe_uses_one_connection(monkeypatch: pytest.M
     """The probe ensures the directory and lists it. On two connections, two connect bounds in a
     row can outlast the API's cap on the probe; on one, they cannot."""
     box = _drop_box(monkeypatch, list(_MLSD_DOTS))
-    dest = build_destination(_ftp_dest(tls=True, username="u", password="p", overwrite=False))
+    dest = build_destination(
+        _ftp_dest(tls=True, username="u", password="p", overwrite=False),
+        egress=EgressSettings(deny_by_default=False),
+    )
     await dest.test_connection()
     (conn,) = box.connections
     assert conn.made == ["/in"] and conn.listed == 1, "the probe must still ensure AND list"

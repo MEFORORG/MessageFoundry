@@ -41,6 +41,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -230,7 +231,11 @@ async def _engine_run(
     run: _Run | None = None
     try:
         runner = RegistryRunner(
-            _registry(outdir), store, poll_interval=0.02, intake_gate=IntakeGate()
+            _registry(outdir),
+            store,
+            poll_interval=0.02,
+            intake_gate=IntakeGate(),
+            egress=EgressSettings(deny_by_default=False),
         )
         await runner.start()
         if stall is not None:

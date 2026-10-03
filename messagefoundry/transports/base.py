@@ -31,6 +31,7 @@ from enum import Enum
 from typing import Any, ClassVar, Protocol
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 
 # Re-exported, not defined here: the matcher moved to the neutral, stdlib-only
 # ``messagefoundry.netaddr`` so the operator-surface allow-list
@@ -940,21 +941,33 @@ ECH_UNSUPPORTED_SOURCE_MSG = (
 )
 
 
-def build_source(config: Source) -> SourceConnector:
+# The egress policy is a REQUIRED argument of both builders, and each builder runs the check itself
+# (vault BACKLOG #2605). A caller that wants a connector must say which policy it runs under, so no
+# build path can construct one unchecked. The import is lazy because `transports.egress` imports
+# connector modules that import this one.
+
+
+def build_source(config: Source, *, egress: EgressSettings) -> SourceConnector:
+    from messagefoundry.transports.egress import check_source_allowed
+
     try:
         builder = _SOURCES[config.type]
     except KeyError:
         raise ValueError(f"no source connector registered for {config.type.value!r}") from None
+    check_source_allowed(config, config.name or config.type.value, egress)
     if config.settings.get("ech_egress"):
         raise ValueError(ECH_UNSUPPORTED_SOURCE_MSG)
     return builder(config)
 
 
-def build_destination(config: Destination) -> DestinationConnector:
+def build_destination(config: Destination, *, egress: EgressSettings) -> DestinationConnector:
+    from messagefoundry.transports.egress import check_egress_allowed
+
     try:
         builder = _DESTINATIONS[config.type]
     except KeyError:
         raise ValueError(f"no destination connector registered for {config.type.value!r}") from None
+    check_egress_allowed(config, egress)
     if config.settings.get("ech_egress") and config.type not in _ECH_ROUTING_DESTINATIONS:
         raise ValueError(ECH_UNSUPPORTED_DESTINATION_MSG)
     return builder(config)

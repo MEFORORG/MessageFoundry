@@ -28,11 +28,12 @@ from messagefoundry.config.wiring import (
     inbound,
     outbound,
 )
-from messagefoundry.pipeline.wiring_runner import RegistryRunner, check_egress_allowed
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import tcp as tcp_mod
 from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.framing import (
     MLLP_CODEC,
     STX_ETX_CODEC,
@@ -455,7 +456,8 @@ def test_build_source_and_destination_via_registry() -> None:
     src = build_source(
         Source(
             type=ConnectorType.TCP, settings={"host": "127.0.0.1", "port": 0, "framing": "vt_fs"}
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(src, TcpSource) and src.codec is MLLP_CODEC
     dest = build_destination(
@@ -463,7 +465,8 @@ def test_build_source_and_destination_via_registry() -> None:
             name="o",
             type=ConnectorType.TCP,
             settings={"host": "127.0.0.1", "port": 9, "start": 0x02, "end": 0x03},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, TcpDestination)
     assert (dest.codec.start, dest.codec.end, dest.codec.trailer) == (0x02, 0x03, None)
@@ -471,7 +474,10 @@ def test_build_source_and_destination_via_registry() -> None:
 
 def test_build_source_rejects_bad_framing() -> None:
     with pytest.raises(ValueError, match="framing"):
-        build_source(Source(type=ConnectorType.TCP, settings={"port": 0, "framing": "bogus"}))
+        build_source(
+            Source(type=ConnectorType.TCP, settings={"port": 0, "framing": "bogus"}),
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 # --- factory + wiring guards -------------------------------------------------
@@ -516,7 +522,9 @@ def _tcp_dest(host: str, port: int) -> Destination:
 
 
 def test_tcp_egress_empty_allowlist_is_unrestricted() -> None:
-    check_egress_allowed(_tcp_dest("anywhere.example", 1234), EgressSettings())  # no raise
+    check_egress_allowed(
+        _tcp_dest("anywhere.example", 1234), EgressSettings(deny_by_default=False)
+    )  # no raise
 
 
 def test_tcp_egress_allowlist_enforced() -> None:

@@ -52,7 +52,7 @@ from messagefoundry.cli_common import _load_operator_json, _OperatorJsonError
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.models import ContentType
-from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.settings import EgressSettings, StoreSettings
 from messagefoundry.config.wiring import InboundConnection, Registry, WiringError
 from messagefoundry.corepoint_import import (
     CorepointImportError,
@@ -701,7 +701,9 @@ async def test_the_mllp_ar_ack_and_reason_carry_no_body(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "engine.db")
     try:
         reg = _hl7_registry()
-        ack = await RegistryRunner(reg, store)._handle_inbound(reg.inbound["IB_HL7"], _ADT.encode())
+        ack = await RegistryRunner(
+            reg, store, egress=EgressSettings(deny_by_default=False)
+        )._handle_inbound(reg.inbound["IB_HL7"], _ADT.encode())
         cur = await store._db.execute("SELECT status, error FROM messages")
         rows = [dict(r) for r in await cur.fetchall()]
     finally:

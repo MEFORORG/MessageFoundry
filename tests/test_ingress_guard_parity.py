@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, Validation
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -325,7 +326,10 @@ async def _live_rows(
 ) -> list[dict[str, Any]]:
     """Hand ``body`` to one live listener and return every ``messages`` row (a fresh store per test)."""
     reg = _registry(ic)
-    handler = getattr(wiring_runner.RegistryRunner(reg, store), listener)
+    handler = getattr(
+        wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)),
+        listener,
+    )
     await handler(reg.inbound[ic.name], body)
     cur = await store._db.execute("SELECT status, error FROM messages")
     return [dict(r) for r in await cur.fetchall()]

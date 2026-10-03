@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.settings import BackupSettings, DrSettings, StoreSettings
+from messagefoundry.config.settings import BackupSettings, DrSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError, load_config
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.dr import DrCoordinator
@@ -117,7 +117,9 @@ class _ResetSpy:
 
 
 async def test_owned_lanes_none_without_registry(tmp_path: Path) -> None:
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         assert eng._owned_lanes() is None  # no wired graph at all -> global recovery
     finally:
@@ -129,7 +131,9 @@ async def test_owned_lanes_none_for_unsharded_registry(tmp_path: Path) -> None:
     # so the recovery scope stays None (global) even when the filter is applied.
     cfg = _write_cfg(tmp_path / "cfg", tmp_path, [None])
     reg = load_config(cfg)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         eng.add_registry(reg)
         assert reg.shard_id is None and reg.all_shard_ids is None
@@ -142,7 +146,12 @@ async def test_owned_lanes_for_shard_of_two_shard_config(tmp_path: Path) -> None
     cfg = _write_cfg(tmp_path / "cfg", tmp_path, ["a", "b"])
     full = load_config(cfg)
     reg_a = filter_registry_for_shard(full, "a")
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_filter=_only("a"))
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_filter=_only("a"),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         eng.add_registry(reg_a)
         owned = eng._owned_lanes()
@@ -168,7 +177,12 @@ async def test_start_passes_owned_lanes_to_reset_when_sharded(
 ) -> None:
     cfg = _write_cfg(tmp_path / "cfg", tmp_path, ["a", "b"])
     full = load_config(cfg)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_filter=_only("a"))
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_filter=_only("a"),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(filter_registry_for_shard(full, "a"))
     spy = _ResetSpy(eng.store)
     monkeypatch.setattr(eng.store, "reset_stale_inflight", spy)
@@ -189,7 +203,9 @@ async def test_start_passes_owned_none_when_unsharded(
     # coordinator reclaims in-flight rows — is covered by the existing cluster/leader-tasks tests;
     # not duplicated here.)
     cfg = _write_cfg(tmp_path / "cfg", tmp_path, [None])
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(cfg))
     spy = _ResetSpy(eng.store)
     monkeypatch.setattr(eng.store, "reset_stale_inflight", spy)
@@ -218,7 +234,9 @@ async def test_start_dead_letters_ingress_rows_of_a_removed_inbound(tmp_path: Pa
     buildup and stall alerts, which only ask ``pending_depth`` about registry lanes.
     """
     cfg = _write_cfg(tmp_path / "cfg", tmp_path, [None])
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     # Residue from a config in which IB_GONE existed; the graph being started no longer names it.
     gone = await eng.store.enqueue_ingress(channel_id="IB_GONE", raw=_RAW)
     live = await eng.store.enqueue_ingress(channel_id="IB_PLAIN", raw=_RAW)
@@ -243,7 +261,12 @@ async def test_start_never_dead_letters_a_sibling_shards_lane(tmp_path: Path) ->
     """
     cfg = _write_cfg(tmp_path / "cfg", tmp_path, ["a", "b"])
     full = load_config(cfg)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_filter=_only("a"))
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_filter=_only("a"),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     sibling = await eng.store.enqueue_ingress(channel_id="IB_B", raw=_RAW)
     gone = await eng.store.enqueue_ingress(channel_id="IB_GONE", raw=_RAW)
     eng.add_registry(filter_registry_for_shard(full, "a"))
@@ -269,7 +292,12 @@ async def test_reload_refuses_shard_universe_change_and_accepts_same_set(tmp_pat
     keeps ownership/filtering intact."""
     two = _write_cfg(tmp_path / "cfg_two", tmp_path, ["a", "b"])
     three = _write_cfg(tmp_path / "cfg_three", tmp_path, ["a", "b", "c"])
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_filter=_only("a"))
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_filter=_only("a"),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(_only("a")(load_config(two)))
     await eng.start()
     try:

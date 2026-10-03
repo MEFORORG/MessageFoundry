@@ -27,6 +27,7 @@ from messagefoundry.config.models import (
     OutboundSigning,
     SignatureAlgorithm,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import OutboundConnection, Rest, Soap, env
 from messagefoundry.pipeline.wiring_runner import _dest_config
 from messagefoundry.transports import build_destination
@@ -105,7 +106,8 @@ def _header(req: urllib.request.Request, name: str) -> str | None:
 def _rest(signing: OutboundSigning | None = None, **over: object) -> RestDestination:
     settings = Rest(url=REST_URL, **over).settings
     dest = build_destination(
-        Destination(name="OB_REST", type=ConnectorType.REST, settings=settings, sign=signing)
+        Destination(name="OB_REST", type=ConnectorType.REST, settings=settings, sign=signing),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, RestDestination)
     return dest
@@ -114,7 +116,8 @@ def _rest(signing: OutboundSigning | None = None, **over: object) -> RestDestina
 def _soap(signing: OutboundSigning | None = None, **over: object) -> SoapDestination:
     settings = Soap(url=SOAP_URL, **over).settings
     dest = build_destination(
-        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=settings, sign=signing)
+        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=settings, sign=signing),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, SoapDestination)
     return dest
@@ -422,7 +425,7 @@ def test_dest_config_assembles_sign_with_env_resolution(ec_pem: str) -> None:
     assert dest_cfg.sign.algorithm is SignatureAlgorithm.ES256
     assert dest_cfg.sign.key_id == "acme-2026"
     # the env() ref was materialized into a usable key (the connector builds + signs)
-    built = build_destination(dest_cfg)
+    built = build_destination(dest_cfg, egress=EgressSettings(deny_by_default=False))
     assert isinstance(built, RestDestination)
     assert built._signer is not None
 
@@ -430,7 +433,9 @@ def test_dest_config_assembles_sign_with_env_resolution(ec_pem: str) -> None:
 async def test_with_signing_end_to_end_through_the_connector(ec_pem: str) -> None:
     spec = with_signing(Rest(url=env("u")), private_key=env("k"), algorithm="ES256")
     oc = OutboundConnection(name="OB", spec=spec)
-    dest = build_destination(_dest_config(oc, {"u": REST_URL, "k": ec_pem}))
+    dest = build_destination(
+        _dest_config(oc, {"u": REST_URL, "k": ec_pem}), egress=EgressSettings(deny_by_default=False)
+    )
     assert isinstance(dest, RestDestination)
     opener = _FakeOpener()
     dest._opener = opener

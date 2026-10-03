@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -169,7 +170,9 @@ def _registry() -> Registry:
 
 
 async def _start(store: MessageStore) -> tuple[RegistryRunner, _Recorder]:
-    runner = RegistryRunner(_registry(), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _registry(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     recorder = _Recorder()
     runner._destinations["OB_X12"] = recorder  # swap in before any inbound traffic

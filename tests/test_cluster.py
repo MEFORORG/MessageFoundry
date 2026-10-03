@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from messagefoundry.config.settings import ClusterSettings, ReferenceSettings
+from messagefoundry.config.settings import ClusterSettings, EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec, Registry, load_config
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.cluster import (
@@ -422,7 +422,11 @@ def test_null_coordinator_owns_no_lease_row() -> None:
 async def test_engine_create_defaults_to_null_coordinator(tmp_path: Path) -> None:
     """A SQLite-backed Engine (the convenience path) ends up with a NullCoordinator, documenting the
     byte-identical single-node default."""
-    eng = await Engine.create(tmp_path / "cluster.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "cluster.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         assert isinstance(eng._coordinator, NullCoordinator)
         assert eng._coordinator.is_leader() is True
@@ -432,7 +436,12 @@ async def test_engine_create_defaults_to_null_coordinator(tmp_path: Path) -> Non
 
 async def test_engine_holds_passed_coordinator(tmp_path: Path) -> None:
     fake = _NotLeaderCoordinator()
-    eng = await Engine.create(tmp_path / "cluster2.db", poll_interval=0.02, coordinator=fake)
+    eng = await Engine.create(
+        tmp_path / "cluster2.db",
+        poll_interval=0.02,
+        coordinator=fake,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         # The engine holds exactly the object passed (it does not wrap or replace it), and a False
         # gate is accepted without error — no gate call site exists in the engine logic yet.
@@ -443,19 +452,33 @@ async def test_engine_holds_passed_coordinator(tmp_path: Path) -> None:
 
 def test_runner_holds_passed_coordinator() -> None:
     fake = _NotLeaderCoordinator()
-    runner = RegistryRunner(Registry(), store=_NullStore(), coordinator=fake)  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        Registry(),
+        store=_NullStore(),  # type: ignore[arg-type]
+        coordinator=fake,
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert runner._coordinator is fake
     assert runner.coordinator is fake  # exposed for Steps 4/5
 
 
 def test_runner_defaults_to_null_coordinator() -> None:
-    runner = RegistryRunner(Registry(), store=_NullStore())  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        Registry(),
+        store=_NullStore(),  # type: ignore[arg-type]
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(runner.coordinator, NullCoordinator)
 
 
 async def test_engine_add_registry_threads_coordinator_into_runner(tmp_path: Path) -> None:
     fake = _NotLeaderCoordinator()
-    eng = await Engine.create(tmp_path / "cluster3.db", poll_interval=0.02, coordinator=fake)
+    eng = await Engine.create(
+        tmp_path / "cluster3.db",
+        poll_interval=0.02,
+        coordinator=fake,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         runner = eng.add_registry(Registry())
         assert runner.coordinator is fake  # the engine threads its coordinator into the runner
@@ -581,7 +604,7 @@ async def test_runner_threads_coordinator_is_leader_into_source(
     # drive a clustered LEADER coordinator: the engine brings the graph up and the runner threads the
     # predicate, which on the leader reports True.
     fake = _LeaderCoordinator()
-    monkeypatch.setattr(wiring_runner, "build_source", lambda cfg: _SpySource())
+    monkeypatch.setattr(wiring_runner, "build_source", lambda cfg, *, egress: _SpySource())
 
     cfgdir = tmp_path / "cfg"
     cfgdir.mkdir()
@@ -606,7 +629,12 @@ async def test_runner_threads_coordinator_is_leader_into_source(
         ),
         encoding="utf-8",
     )
-    eng = await Engine.create(tmp_path / "thread.db", poll_interval=0.05, coordinator=fake)
+    eng = await Engine.create(
+        tmp_path / "thread.db",
+        poll_interval=0.05,
+        coordinator=fake,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
@@ -630,7 +658,7 @@ async def test_runner_logs_leader_gated_only_for_poll_sources(
     import logging
 
     def _build(source_cls: type[_SpySource]) -> str:
-        monkeypatch.setattr(wiring_runner, "build_source", lambda cfg: source_cls())
+        monkeypatch.setattr(wiring_runner, "build_source", lambda cfg, *, egress: source_cls())
         cfgdir = tmp_path / source_cls.__name__
         cfgdir.mkdir()
         inbox = tmp_path / f"in-{source_cls.__name__}"
@@ -659,7 +687,10 @@ async def test_runner_logs_leader_gated_only_for_poll_sources(
     async def _run(source_cls: type[_SpySource]) -> list[str]:
         cfgdir = _build(source_cls)
         eng = await Engine.create(
-            tmp_path / f"{source_cls.__name__}.db", poll_interval=0.05, coordinator=fake
+            tmp_path / f"{source_cls.__name__}.db",
+            poll_interval=0.05,
+            coordinator=fake,
+            egress_settings=EgressSettings(deny_by_default=False),
         )
         eng.add_registry(load_config(Path(cfgdir)))
         caplog.clear()
@@ -708,7 +739,12 @@ async def test_follower_file_source_does_not_ingest(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (inbox / "a.hl7").write_bytes(b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\r")
-    eng = await Engine.create(tmp_path / "follower.db", poll_interval=0.02, coordinator=fake)
+    eng = await Engine.create(
+        tmp_path / "follower.db",
+        poll_interval=0.02,
+        coordinator=fake,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
@@ -757,6 +793,7 @@ async def _run_one_claim(coordinator: ClusterCoordinator, worker: str) -> list[t
         store=_NullStore(),  # type: ignore[arg-type]  # the runner only holds the reference here
         coordinator=coordinator,
         poll_interval=0.0,
+        egress=EgressSettings(deny_by_default=False),
     )
     spy = _FifoClaimSpyStore(runner._stop)
     runner.store = spy  # type: ignore[assignment]
@@ -916,7 +953,8 @@ async def test_reference_runner_follower_converges_without_materializing(tmp_pat
         store,  # type: ignore[arg-type]
         lambda: [_file_spec(tmp_path)],
         ReferenceSettings(),
-        coordinator=_NotLeaderCoordinator(),  # is_leader False
+        coordinator=_NotLeaderCoordinator(),
+        egress=EgressSettings(deny_by_default=False),  # is_leader False
     )
     result = await runner.run_once(force=True)
     assert store.writes == 0  # follower never re-reads the source
@@ -932,7 +970,8 @@ async def test_reference_runner_leader_materializes_and_converges(tmp_path: Path
         store,  # type: ignore[arg-type]
         lambda: [_file_spec(tmp_path)],
         ReferenceSettings(),
-        coordinator=_LeaderCoordinator(),  # is_leader True, is_clustered True
+        coordinator=_LeaderCoordinator(),
+        egress=EgressSettings(deny_by_default=False),  # is_leader True, is_clustered True
     )
     result = await runner.run_once(force=True)
     assert store.writes == 1  # leader re-reads the source and writes the shared snapshot
@@ -945,7 +984,12 @@ async def test_reference_runner_default_coordinator_materializes_as_today(tmp_pa
     # materialize from source every pass, converge a no-op.
     store = await MessageStore.open(tmp_path / "ref.db")
     try:
-        runner = ReferenceSyncRunner(store, lambda: [_file_spec(tmp_path)], ReferenceSettings())
+        runner = ReferenceSyncRunner(
+            store,
+            lambda: [_file_spec(tmp_path)],
+            ReferenceSettings(),
+            egress=EgressSettings(deny_by_default=False),
+        )
         result = await runner.run_once(force=True)
         assert result.synced == 1
         assert store.reference_view()["codes"] == {"A": "1"}  # materialized exactly as before
@@ -1044,7 +1088,11 @@ async def test_config_convergence_bad_reload_does_not_advance_or_kill_loop() -> 
 async def test_engine_single_node_spawns_no_convergence_loop(tmp_path: Path) -> None:
     # Single-node (NullCoordinator, is_clustered False): the engine must NOT spawn the config-
     # convergence loop, so behaviour is byte-identical.
-    eng = await Engine.create(tmp_path / "single.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "single.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         await eng.start()
         assert eng._config_convergence is None  # never spawned single-node
@@ -1061,7 +1109,10 @@ async def test_engine_clustered_spawns_convergence_and_seeds_applied(tmp_path: P
             return 4  # the cluster is already at version 4 when this node joins
 
     eng = await Engine.create(
-        tmp_path / "clustered.db", poll_interval=0.02, coordinator=_SeededCoordinator()
+        tmp_path / "clustered.db",
+        poll_interval=0.02,
+        coordinator=_SeededCoordinator(),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         await eng.start()
@@ -1129,7 +1180,11 @@ async def test_engine_operator_reload_propagate_bumps_and_advances_applied(tmp_p
     cfgdir = tmp_path / "cfg"
     _minimal_config(cfgdir, tmp_path)
     eng = await Engine.create(
-        tmp_path / "propagate.db", poll_interval=0.05, config_dir=cfgdir, coordinator=coord
+        tmp_path / "propagate.db",
+        poll_interval=0.05,
+        config_dir=cfgdir,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     eng.add_registry(load_config(cfgdir))
     await eng.start()
@@ -1149,7 +1204,11 @@ async def test_engine_convergence_reload_does_not_propagate(tmp_path: Path) -> N
     cfgdir = tmp_path / "cfg"
     _minimal_config(cfgdir, tmp_path)
     eng = await Engine.create(
-        tmp_path / "noprop.db", poll_interval=0.05, config_dir=cfgdir, coordinator=coord
+        tmp_path / "noprop.db",
+        poll_interval=0.05,
+        config_dir=cfgdir,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     eng.add_registry(load_config(cfgdir))
     await eng.start()

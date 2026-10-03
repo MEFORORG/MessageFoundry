@@ -27,7 +27,7 @@ from messagefoundry.auth.permissions import (
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import Priority
-from messagefoundry.config.settings import AuthSettings, DrSettings, StoreSettings
+from messagefoundry.config.settings import AuthSettings, DrSettings, EgressSettings, StoreSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
@@ -65,6 +65,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         config_dir=None,
         store_settings=StoreSettings(path=str(tmp_path / "rbac.db")),
         dr_settings=DrSettings(enabled=True, activate=False, priority_threshold=Priority.CRITICAL),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     await eng.start()
     yield eng

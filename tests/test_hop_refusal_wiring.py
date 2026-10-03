@@ -211,7 +211,7 @@ def test_build_check_registry_stamps_posture(monkeypatch: pytest.MonkeyPatch) ->
 
     seen: list[HopPosture | None] = []
 
-    def fake_build_destination(dest: Destination) -> object:
+    def fake_build_destination(dest: Destination, *, egress: EgressSettings) -> object:
         # A cell built inside build_check_registry sees the stamped posture here (this is exactly
         # what a real connector's __init__ will read to key its posture-keyed refusal).
         seen.append(current_hop_posture())
@@ -227,7 +227,7 @@ def test_build_check_registry_stamps_posture(monkeypatch: pytest.MonkeyPatch) ->
         reg,
         inbound_bind_host="127.0.0.1",
         env_values={},
-        egress=EgressSettings(),
+        egress=EgressSettings(deny_by_default=False),
         posture=posture,
     )
     assert seen == [posture]
@@ -241,12 +241,18 @@ def test_build_check_registry_none_posture_leaves_unstamped(
     from messagefoundry.pipeline import wiring_runner as wr
 
     seen: list[HopPosture | None] = []
-    monkeypatch.setattr(wr, "build_destination", lambda dest: seen.append(current_hop_posture()))
+    monkeypatch.setattr(
+        wr, "build_destination", lambda dest, *, egress: seen.append(current_hop_posture())
+    )
 
     reg = Registry()
     reg.add_outbound(build_outbound_connection("OB", File(directory=".")))
     wr.build_check_registry(
-        reg, inbound_bind_host="127.0.0.1", env_values={}, egress=EgressSettings(), posture=None
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+        posture=None,
     )
     # Unstamped -> None; the cell fail-closes on its own (treats the hop as prod-PHI).
     assert seen == [None]

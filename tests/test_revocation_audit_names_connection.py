@@ -99,13 +99,15 @@ def test_two_outbounds_to_one_host_the_audit_line_names_the_attested_one(
     url = f"https://{_HOST}/ingest"
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         build_destination(
-            _dest("OB_LAB_A", ConnectorType.REST, Rest(url=url).settings, attested=True)
+            _dest("OB_LAB_A", ConnectorType.REST, Rest(url=url).settings, attested=True),
+            egress=EgressSettings(deny_by_default=False),
         )
         # CONTROL: the unattested sibling to the SAME host is refused, so it cannot be the
         # connection the audit line names, and the line above is the attestation firing.
         with pytest.raises(InsecureHopRefused, match="revocation"):
             build_destination(
-                _dest("OB_LAB_B", ConnectorType.REST, Rest(url=url).settings, attested=False)
+                _dest("OB_LAB_B", ConnectorType.REST, Rest(url=url).settings, attested=False),
+                egress=EgressSettings(deny_by_default=False),
             )
     audit = _audit(caplog)
     assert "connection 'OB_LAB_A';" in audit
@@ -122,7 +124,8 @@ def test_two_attested_outbounds_to_one_host_each_line_names_its_own(
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         for name in ("OB_LAB_A", "OB_LAB_B"):
             build_destination(
-                _dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True)
+                _dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True),
+                egress=EgressSettings(deny_by_default=False),
             )
     lines = [r.getMessage() for r in caplog.records if "operator attestation" in r.getMessage()]
     assert len(lines) == 2
@@ -148,7 +151,10 @@ def test_the_http_family_audit_line_names_the_connection(
 ) -> None:
     ctype, factory, url = _HTTP[cell]
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
-        build_destination(_dest(f"OB_{cell}", ctype, factory(url=url).settings, attested=True))
+        build_destination(
+            _dest(f"OB_{cell}", ctype, factory(url=url).settings, attested=True),
+            egress=EgressSettings(deny_by_default=False),
+        )
     assert f"connection 'OB_{cell}';" in _audit(caplog)
 
 
@@ -269,7 +275,10 @@ def test_the_name_and_cell_survive_the_log_filters(
     # can end in one, so the record must survive both or it is not findable.
     url = f"https://{_HOST}/ingest"
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
-        build_destination(_dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True))
+        build_destination(
+            _dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True),
+            egress=EgressSettings(deny_by_default=False),
+        )
     shipped = _shipped(_audit(caplog))
     assert f"connection '{name}';" in shipped
     assert "REST destination (verified TLS" in shipped
@@ -370,7 +379,7 @@ def _build_check(reg: Registry) -> None:
         reg,
         inbound_bind_host="127.0.0.1",
         env_values={},
-        egress=EgressSettings(),
+        egress=EgressSettings(deny_by_default=False),
         posture=_ENFORCING,
     )
 
@@ -381,7 +390,7 @@ def _build_live(reg: Registry) -> None:
     runner = SimpleNamespace(
         registry=reg,
         _env_values={},
-        _egress=EgressSettings(),
+        _egress=EgressSettings(deny_by_default=False),
         _hop_posture=_ENFORCING,
         _trust_anchor_policy=None,
     )

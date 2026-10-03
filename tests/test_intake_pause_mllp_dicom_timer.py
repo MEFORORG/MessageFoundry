@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline.intake_bound import DEPTH_REASON, DISK_REASON
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -203,7 +204,9 @@ async def test_mllp_messages_sent_during_a_pause_are_all_persisted_and_acked(
     store = await MessageStore.open(tmp_path / "mllp-pause.db")
     gate = _held()
     try:
-        runner = RegistryRunner(_mllp_registry(), store, intake_gate=gate)
+        runner = RegistryRunner(
+            _mllp_registry(), store, intake_gate=gate, egress=EgressSettings(deny_by_default=False)
+        )
         await runner.start()
         try:
             source = runner._sources["IB_M_ADT"]

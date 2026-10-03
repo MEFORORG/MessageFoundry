@@ -16,12 +16,9 @@ from messagefoundry import DICOM, DICOMweb
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, build_inbound_connection
-from messagefoundry.pipeline.wiring_runner import (
-    _allowlist_for,
-    check_dimse_tls_exposure,
-    check_egress_allowed,
-)
+from messagefoundry.pipeline.wiring_runner import check_dimse_tls_exposure
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.egress import _allowlist_for, check_egress_allowed
 
 
 def _dimse_source(host: str, *, tls: bool = False) -> Source:
@@ -154,7 +151,8 @@ def test_outbound_dimse_scu_builds() -> None:
             settings=DICOM(
                 ae_title="MEFOR", host="192.0.2.20", port=11112, called_ae_title="PACS"
             ).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, DicomScuDestination)
 
@@ -165,7 +163,8 @@ def test_outbound_dimse_scu_requires_host() -> None:
         build_destination(
             Destination(
                 name="OB_SCU", type=ConnectorType.DIMSE, settings=DICOM(ae_title="MEFOR").settings
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 

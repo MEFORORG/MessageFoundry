@@ -40,6 +40,7 @@ from messagefoundry.auth.notifications import (
 )
 from messagefoundry.auth.service import FEDERATED_SIGN_IN_REQUIRED, AuthService
 from messagefoundry.auth.tokens import hash_token
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine, security_notify
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
@@ -235,7 +236,11 @@ async def test_the_refusal_reaches_a_renamed_bound_row_before_anything_is_writte
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "bound_pathway.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "bound_pathway.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Fail-closed outbound/egress allowlist (WP-11c, ASVS 13.2.4/13.2.5/14.2.3): a destination not on the
-[egress] allowlist is refused at config build_check; an empty list = unrestricted."""
+[egress] allowlist is refused at config build_check. An empty list refuses too, unless the audited
+opt-out is written (vault BACKLOG #2605)."""
 
 from __future__ import annotations
 
@@ -18,13 +19,13 @@ from messagefoundry.config.wiring import (
     Registry,
     WiringError,
 )
-from messagefoundry.pipeline.wiring_runner import (
-    RegistryRunner,
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.store.store import MessageStore
+from messagefoundry.transports.egress import (
     check_egress_allowed,
     check_lookup_allowed,
     check_source_allowed,
 )
-from messagefoundry.store.store import MessageStore
 
 
 def _mllp(host: str, port: int) -> Destination:
@@ -36,7 +37,7 @@ def _file(directory: str) -> Destination:
 
 
 def test_empty_allowlist_is_unrestricted() -> None:
-    e = EgressSettings()  # nothing configured → today's behavior (any destination)
+    e = EgressSettings(deny_by_default=False)  # the audited opt-out: an empty list allows any
     check_egress_allowed(_mllp("anywhere.example", 1234), e)
     check_egress_allowed(_file("/tmp/whatever"), e)
 
@@ -119,7 +120,7 @@ def test_deny_by_default_honours_a_set_allowlist() -> None:
 
 
 def test_deny_by_default_off_is_unrestricted() -> None:
-    e = EgressSettings()  # default false + empty lists → today's behavior (any destination)
+    e = EgressSettings(deny_by_default=False)  # the opt-out with empty lists: any destination
     check_egress_allowed(_mllp("anywhere.example", 1234), e)
     check_egress_allowed(_db_dest("any.sql"), e)
 
@@ -196,7 +197,7 @@ def test_every_credential_token_url_key_is_gated_on_the_outbound_arm() -> None:
     when it points off-allowlist. This is what stops the next credential-bearing endpoint setting
     from shipping ungated the way `oauth2_token_url` did — add a key to the table and this test
     fails until the gate actually covers it."""
-    from messagefoundry.pipeline.wiring_runner import _CREDENTIAL_EGRESS_URL_KEYS
+    from messagefoundry.transports.egress import _CREDENTIAL_EGRESS_URL_KEYS
 
     assert _CREDENTIAL_EGRESS_URL_KEYS, "the credential-URL table must not be empty"
     egress = EgressSettings(allowed_http=["api.partner.org"])
@@ -209,7 +210,7 @@ def test_every_credential_token_url_key_is_gated_on_the_outbound_arm() -> None:
 def test_every_credential_token_url_key_is_gated_on_the_lookup_arm() -> None:
     """The read arm must stay in lockstep with the outbound arm — DELTA-04 was exactly that drift
     (the read arm gated only `url`). Same table, both arms, asserted together."""
-    from messagefoundry.pipeline.wiring_runner import (
+    from messagefoundry.transports.egress import (
         _CREDENTIAL_EGRESS_URL_KEYS,
         check_fhir_lookup_allowed,
     )
@@ -242,7 +243,7 @@ def test_proxy_url_is_not_in_the_credential_token_url_table() -> None:
     gate was built and passes after. It is a regression pin against a FUTURE edit, and it earns its
     place only because that edit is what the ledger row asks for in writing.
     """
-    from messagefoundry.pipeline.wiring_runner import _CREDENTIAL_EGRESS_URL_KEYS
+    from messagefoundry.transports.egress import _CREDENTIAL_EGRESS_URL_KEYS
 
     assert "proxy_url" not in {key for key, _what in _CREDENTIAL_EGRESS_URL_KEYS}
 
@@ -281,7 +282,9 @@ def test_proxy_gate_is_deny_by_default_with_an_empty_list() -> None:
     proxy is set — and permissive-when-empty would leave this credential-bearing host ungated on the
     default posture, which is the hole the key exists to close.
     """
-    wide_open = EgressSettings()  # no allowed_http, no allowed_proxy, no deny_by_default
+    wide_open = EgressSettings(
+        deny_by_default=False
+    )  # no allowed_http, no allowed_proxy, no deny_by_default
     with pytest.raises(WiringError, match="allowed_proxy is empty"):
         check_egress_allowed(
             _rest("https://api.partner.org/v1", proxy_url="http://p.example"), wide_open
@@ -300,7 +303,9 @@ def test_proxy_gate_skips_the_default_sentinel() -> None:
     The deny-by-default arm it must not trip IS red-first — see the test above."""
     from messagefoundry.transports.rest import PROXY_DEFAULT
 
-    egress = EgressSettings()  # empty allowed_proxy — the deny-by-default arm must NOT fire
+    egress = EgressSettings(
+        deny_by_default=False
+    )  # empty allowed_proxy — the deny-by-default arm must NOT fire
     check_egress_allowed(_rest("https://api.partner.org/v1", proxy_url=PROXY_DEFAULT), egress)
     check_egress_allowed(_rest("https://api.partner.org/v1", proxy_url="DEFAULT"), egress)
 
@@ -309,7 +314,7 @@ def test_proxy_gate_covers_the_fhir_lookup_read_arm() -> None:
     """The read arm dials through the same proxy as the outbound, so it must stay in lockstep —
     DELTA-04 was exactly that drift. Gated OUTSIDE the `allowed_http` guard: that list being empty
     says nothing about whether the proxy is permitted."""
-    from messagefoundry.pipeline.wiring_runner import check_fhir_lookup_allowed
+    from messagefoundry.transports.egress import check_fhir_lookup_allowed
 
     egress = EgressSettings(allowed_http=["fhir.example.org"], allowed_proxy=["proxy.corp.example"])
     settings = {"url": "https://fhir.example.org/fhir", "proxy_url": "http://evil.example:3128"}
@@ -319,7 +324,7 @@ def test_proxy_gate_covers_the_fhir_lookup_read_arm() -> None:
     check_fhir_lookup_allowed("epic", ok, egress)  # no raise
     # The deny-by-default arm reaches the read arm too, and fires with allowed_http empty.
     with pytest.raises(WiringError, match="allowed_proxy is empty"):
-        check_fhir_lookup_allowed("epic", settings, EgressSettings())
+        check_fhir_lookup_allowed("epic", settings, EgressSettings(deny_by_default=False))
 
 
 def test_a_listed_proxy_does_not_satisfy_the_destination_gate() -> None:

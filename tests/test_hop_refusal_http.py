@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
@@ -100,7 +101,8 @@ def _build(
             tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
             if revocation_attested
             else None,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
 
 
@@ -293,20 +295,29 @@ def test_soap_ws_username_cleartext_attested_allowed_on_prod(
 def test_fhir_lookup_cleartext_read_refused_on_prod(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD), pytest.raises(InsecureHopRefused):
-        FhirLookupExecutor({"L": {"url": "http://fhir.example.org/fhir"}})
+        FhirLookupExecutor(
+            {"L": {"url": "http://fhir.example.org/fhir"}},
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 def test_fhir_lookup_cleartext_read_refused_staging(monkeypatch: pytest.MonkeyPatch) -> None:
     # decision 5: a cleartext lookup that refused today stays refused in staging (no loosen).
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_STAGING), pytest.raises(InsecureHopRefused):
-        FhirLookupExecutor({"L": {"url": "http://fhir.example.org/fhir"}})
+        FhirLookupExecutor(
+            {"L": {"url": "http://fhir.example.org/fhir"}},
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 def test_fhir_lookup_loopback_read_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_PROD):
-        ex = FhirLookupExecutor({"L": {"url": "http://127.0.0.1:8080/fhir"}})
+        ex = FhirLookupExecutor(
+            {"L": {"url": "http://127.0.0.1:8080/fhir"}},
+            egress=EgressSettings(deny_by_default=False),
+        )
     assert ex.connections == frozenset({"L"})
 
 
@@ -341,7 +352,10 @@ def test_fhir_lookup_declared_read_allowed_on_prod(
     FhirLookup("L", url="http://fhir.example.org/fhir", **declaration)
     with active_hop_posture(_PROD):
         # The settings the runner hands the executor: the spec's typed declarations, mirrored.
-        ex = FhirLookupExecutor({"L": _fhir_lookup_settings(reg.fhir_lookups["L"], {}, None)})
+        ex = FhirLookupExecutor(
+            {"L": _fhir_lookup_settings(reg.fhir_lookups["L"], {}, None)},
+            egress=EgressSettings(deny_by_default=False),
+        )
     assert ex.connections == frozenset({"L"})
 
 

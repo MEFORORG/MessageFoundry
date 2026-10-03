@@ -56,7 +56,7 @@ from messagefoundry.auth.audit_visibility import (
 )
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.base import Store
@@ -325,7 +325,9 @@ class _World:
 async def _open_world(tmp: Path, monkeypatch: pytest.MonkeyPatch) -> _World:
     tmp.mkdir(parents=True, exist_ok=True)
     db = tmp / "oracle.db"
-    engine = await Engine.create(db, poll_interval=0.02)
+    engine = await Engine.create(
+        db, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     service = AuthService(engine.store, _route_settings(), security_notifier=_FakeNotifier())
     identity, password, steps = await _totp_admin(service, monkeypatch)
     await engine.store.set_user_notify_email(identity.user_id, email="owner@example.test")
@@ -417,7 +419,9 @@ async def _admin_unlock(world: _World, monkeypatch: pytest.MonkeyPatch) -> _Worl
     setenv_at_rest_opt_out(monkeypatch)
     argv = ["admin-unlock", "--username", ADMIN_USERNAME, "--db", str(world.db)]
     assert await asyncio.to_thread(cli_main, argv) == 0
-    engine = await Engine.create(world.db, poll_interval=0.02)
+    engine = await Engine.create(
+        world.db, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     service = AuthService(engine.store, _route_settings(), security_notifier=_FakeNotifier())
     await service.initialize()
     return _World(

@@ -19,6 +19,7 @@ import pytest
 
 from messagefoundry.config.impact import plan_rename
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     HopPosture,
@@ -108,7 +109,10 @@ def test_an_attested_cleartext_rest_hop_names_its_connection(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
-        build_destination(_rest("OB_REST_A", f"http://{_HOST}/x", hop_attested=True))
+        build_destination(
+            _rest("OB_REST_A", f"http://{_HOST}/x", hop_attested=True),
+            egress=EgressSettings(deny_by_default=False),
+        )
     assert "connection 'OB_REST_A';" in _shipped(_lines(caplog, "ATTESTED secure"))
 
 
@@ -117,7 +121,9 @@ def test_an_attested_cleartext_rest_hop_names_its_connection(
 
 def test_a_revocation_refusal_names_the_refused_connection() -> None:
     with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused) as exc:
-        build_destination(_rest("OB_LAB_B", f"https://{_HOST}/x"))
+        build_destination(
+            _rest("OB_LAB_B", f"https://{_HOST}/x"), egress=EgressSettings(deny_by_default=False)
+        )
     assert "connection 'OB_LAB_B';" in str(exc.value)
 
 
@@ -428,7 +434,7 @@ def test_a_weakened_sql_server_refusal_names_its_connection() -> None:
     settings["trust_server_certificate"] = True
     cfg = Destination(name="OB_SS", type=ConnectorType.DATABASE, settings=settings)
     with active_hop_posture(_ENFORCING), pytest.raises(ValueError, match="TLS is weakened") as exc:
-        build_destination(cfg)
+        build_destination(cfg, egress=EgressSettings(deny_by_default=False))
     assert "connection 'OB_SS';" in str(exc.value)
 
 

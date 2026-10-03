@@ -24,7 +24,12 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.config.settings import InboundSettings, RetentionSettings, StoreBackend
+from messagefoundry.config.settings import (
+    EgressSettings,
+    InboundSettings,
+    RetentionSettings,
+    StoreBackend,
+)
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline import intake_bound
 from messagefoundry.pipeline.engine import Engine
@@ -91,7 +96,9 @@ async def test_the_runner_injects_no_gate_unless_given_one(tmp_path: Path) -> No
     assert SourceConnector.intake_gate is None
     store = await MessageStore.open(tmp_path / "nogate.db")
     try:
-        runner = RegistryRunner(_tcp_registry(), store)
+        runner = RegistryRunner(
+            _tcp_registry(), store, egress=EgressSettings(deny_by_default=False)
+        )
         await runner.start()
         try:
             assert runner._sources["IB_T_ADT"].intake_gate is None
@@ -610,7 +617,11 @@ async def test_the_engine_pauses_intake_on_low_disk_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(shutil, "disk_usage", _Disk(free_mib=10))
-    engine = await Engine.create(tmp_path / "engine.db", retention_settings=RetentionSettings())
+    engine = await Engine.create(
+        tmp_path / "engine.db",
+        retention_settings=RetentionSettings(),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     await engine.start()
     try:
         monitor = engine._intake_monitor
@@ -631,7 +642,9 @@ async def test_an_engine_without_retention_settings_never_pauses(
 ) -> None:
     disk = _Disk(free_mib=10)
     monkeypatch.setattr(shutil, "disk_usage", disk)
-    engine = await Engine.create(tmp_path / "engine2.db")
+    engine = await Engine.create(
+        tmp_path / "engine2.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
     await engine.start()
     try:
         monitor = engine._intake_monitor
@@ -650,7 +663,9 @@ async def test_messages_sent_during_a_pause_are_all_persisted_after_resume(tmp_p
     gate = IntakeGate()
     gate.hold(DEPTH_REASON)
     try:
-        runner = RegistryRunner(_tcp_registry(), store, intake_gate=gate)
+        runner = RegistryRunner(
+            _tcp_registry(), store, intake_gate=gate, egress=EgressSettings(deny_by_default=False)
+        )
         await runner.start()
         try:
             source = runner._sources["IB_T_ADT"]

@@ -161,7 +161,12 @@ def test_build_check_registry_allows_pt_inbound() -> None:
     reg = Registry()
     reg.add_inbound(build_inbound_connection("PT_X", PassThrough(), router="r"))
     # A PT inbound builds its inert source and passes the egress allowlist (no dial-out) — no error.
-    build_check_registry(reg, inbound_bind_host="127.0.0.1", env_values={}, egress=EgressSettings())
+    build_check_registry(
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 # --------------------------------------------------------------------------- inert source
@@ -644,7 +649,7 @@ async def _engine_on_backend(
     s = await MessageStore.open(tmp_path / "pt_backend.db")
     s.backend = backend  # fake the reported backend for the guard
     s.supports_pt_reingress = supports_pt
-    engine = Engine(s)
+    engine = Engine(s, egress_settings=EgressSettings(deny_by_default=False))
     engine.add_registry(registry)
     return engine, s
 
@@ -684,7 +689,7 @@ async def test_engine_rejects_pt_on_unknown_future_backend(tmp_path: Any) -> Non
     # guard falls back to naming the store class) — yet PT is still rejected (allow-list, not block-list).
     s.supports_pt_reingress = False
     s.backend = None  # type: ignore[assignment]  # not a StoreBackend → class-name fallback
-    engine = Engine(s)
+    engine = Engine(s, egress_settings=EgressSettings(deny_by_default=False))
     engine.add_registry(_pt_graph())
     try:
         with pytest.raises(WiringError) as exc:
@@ -701,7 +706,7 @@ async def test_guard_accepts_pt_on_sqlite_backend(tmp_path: Any) -> None:
     # only drives the decision, not the full socket bring-up.)
     s = await MessageStore.open(tmp_path / "pt_sqlite.db")
     assert s.supports_pt_reingress is True and s.backend is StoreBackend.SQLITE
-    engine = Engine(s)
+    engine = Engine(s, egress_settings=EgressSettings(deny_by_default=False))
     engine.add_registry(_pt_graph())
     try:
         engine._check_pt_backend_supported()  # no raise — PT permitted on SQLite
@@ -782,7 +787,7 @@ async def test_reload_live_rejects_introduced_pt_inbound(
     s = await MessageStore.open(tmp_path / "reload_pt.db")
     s.backend = backend
     s.supports_pt_reingress = False
-    engine = Engine(s)
+    engine = Engine(s, egress_settings=EgressSettings(deny_by_default=False))
     engine.add_registry(_file_graph(inbox, outdir, with_pt=False))
     try:
         await engine.start()  # non-PT graph on a non-SQLite backend → starts clean
@@ -815,7 +820,9 @@ async def test_reload_bringup_rejects_pt_graph_when_started_graphless(
     s = await MessageStore.open(tmp_path / "bringup_pt.db")
     s.backend = backend
     s.supports_pt_reingress = False
-    engine = Engine(s)  # no add_registry → runner is None
+    engine = Engine(
+        s, egress_settings=EgressSettings(deny_by_default=False)
+    )  # no add_registry → runner is None
     try:
         await engine.start()  # graphless start
         assert engine.registry_runner is None
@@ -843,7 +850,9 @@ async def test_reload_dry_run_rejects_pt_graph(
     s = await MessageStore.open(tmp_path / "dryrun_pt.db")
     s.backend = backend
     s.supports_pt_reingress = False
-    engine = Engine(s)  # runner is None → dry_run builds a throwaway checker carrying this store
+    engine = Engine(
+        s, egress_settings=EgressSettings(deny_by_default=False)
+    )  # runner is None → dry_run builds a throwaway checker carrying this store
     try:
         _patch_load_config(monkeypatch, _file_graph(inbox, outdir, with_pt=True))
         with pytest.raises(WiringError) as exc:
@@ -864,7 +873,7 @@ async def test_reload_paths_succeed_on_sqlite_backend(tmp_path: Any, monkeypatch
     # (a) live-runner swap: start a non-PT graph, reload-in a PT inbound → it goes live.
     s = await MessageStore.open(tmp_path / "sqlite_live.db")
     assert s.supports_pt_reingress is True and s.backend is StoreBackend.SQLITE
-    engine = Engine(s)
+    engine = Engine(s, egress_settings=EgressSettings(deny_by_default=False))
     engine.add_registry(_file_graph(inbox, outdir, with_pt=False))
     try:
         await engine.start()
@@ -878,7 +887,7 @@ async def test_reload_paths_succeed_on_sqlite_backend(tmp_path: Any, monkeypatch
 
     # (b) dry_run on SQLite + PT graph: returns the registry, no raise.
     s2 = await MessageStore.open(tmp_path / "sqlite_dry.db")
-    engine2 = Engine(s2)
+    engine2 = Engine(s2, egress_settings=EgressSettings(deny_by_default=False))
     try:
         _patch_load_config(monkeypatch, _file_graph(inbox, outdir, with_pt=True))
         reg = await engine2.reload(tmp_path, dry_run=True)
@@ -898,7 +907,7 @@ async def test_reload_non_pt_graph_unaffected_on_non_sqlite(
     s = await MessageStore.open(tmp_path / "nonpt_reload.db")
     s.backend = backend
     s.supports_pt_reingress = False
-    engine = Engine(s)
+    engine = Engine(s, egress_settings=EgressSettings(deny_by_default=False))
     engine.add_registry(_file_graph(inbox, outdir, with_pt=False))
     try:
         await engine.start()

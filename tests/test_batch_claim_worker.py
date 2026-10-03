@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -64,7 +65,9 @@ async def test_t5_n1_uses_single_claim_never_batch(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reg = _registry(tmp_path)
-    runner = RegistryRunner(reg, store, fifo_claim_batch=1)  # default OFF
+    runner = RegistryRunner(
+        reg, store, fifo_claim_batch=1, egress=EgressSettings(deny_by_default=False)
+    )  # default OFF
 
     single_calls = {"n": 0}
     batch_calls = {"n": 0}
@@ -97,7 +100,9 @@ async def test_t7_batch_mode_routes_backlog_in_order(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reg = _registry(tmp_path)
-    runner = RegistryRunner(reg, store, fifo_claim_batch=8)
+    runner = RegistryRunner(
+        reg, store, fifo_claim_batch=8, egress=EgressSettings(deny_by_default=False)
+    )
 
     batch_calls = {"n": 0}
     real_batch = store.claim_next_fifo_batch

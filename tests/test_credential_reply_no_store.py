@@ -39,7 +39,7 @@ from fastapi.routing import APIRoute
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests.test_api_auth import PW, _add, _auth, _client, _login, _reauth, _service
 from tests.test_no_store_phi_coverage import _response_models
@@ -90,7 +90,11 @@ def _credential_routes(routes: tuple[Any, ...] | list[Any]) -> set[tuple[str, st
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "credential_no_store.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "credential_no_store.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

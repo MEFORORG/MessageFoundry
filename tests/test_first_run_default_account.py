@@ -28,7 +28,7 @@ from messagefoundry.api import create_managed_app
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import provision_totp
@@ -91,6 +91,7 @@ async def test_a_fresh_store_gets_no_account(tmp_path: Path) -> None:
         db_path=db,
         poll_interval=0.05,
         auth_settings=AuthSettings(enabled=True, notify_security_events=False),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     async with app.router.lifespan_context(app):
         pass

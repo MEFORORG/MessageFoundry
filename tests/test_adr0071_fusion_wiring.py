@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.settings import EgressSettings, StoreSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -136,7 +136,12 @@ class _FakeSyncPool:
 async def test_flag_off_builds_no_fusion(store: MessageStore, tmp_path: Path) -> None:
     inbox = tmp_path / "in"
     inbox.mkdir()
-    runner = RegistryRunner(_reg(inbox, tmp_path / "out"), store, pooled_sweep_interval=0.05)
+    runner = RegistryRunner(
+        _reg(inbox, tmp_path / "out"),
+        store,
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert runner._fuse_thread_hops is False
     assert runner.fusion_active is False
     await runner.start()
@@ -164,6 +169,7 @@ async def test_flag_on_non_ss_ignored_and_flows(store: MessageStore, tmp_path: P
         fuse_thread_hops=True,
         claim_mode="pooled",
         pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     collector = _Collector()
@@ -196,6 +202,7 @@ async def test_command_timeout_zero_fails_closed(store: MessageStore, tmp_path: 
         _bare_ss(command_timeout=0),
         fuse_thread_hops=True,
         claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
     )
     active = await runner._activate_fusion()
     assert active is False
@@ -218,7 +225,11 @@ async def test_pool_open_failure_fails_closed(store: MessageStore, tmp_path: Pat
     ss.open_sync_handoff_pool = _raise_open  # type: ignore[method-assign]
     ss.close_sync_handoff_pool = lambda: closed.__setitem__("n", closed["n"] + 1)  # type: ignore[method-assign]
     runner = RegistryRunner(
-        _reg(inbox, tmp_path / "out"), ss, fuse_thread_hops=True, claim_mode="pooled"
+        _reg(inbox, tmp_path / "out"),
+        ss,
+        fuse_thread_hops=True,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
     )
     active = await runner._activate_fusion()
     assert active is False
@@ -239,6 +250,7 @@ async def test_slot_clamp_fused_stages_only(store: MessageStore, tmp_path: Path)
         claim_mode="pooled",
         pooled_fusing_workers=8,
         pooled_max_processing_lanes=256,
+        egress=EgressSettings(deny_by_default=False),
     )
     # Simulate the decision _start_pooled_dispatchers makes on live SS.
     runner._fusion_active = True
@@ -267,7 +279,12 @@ async def test_fused_route_raising_router_sets_route_exc(
     def _boom(m: Any) -> list[str]:
         raise ValueError("router boom")
 
-    runner = RegistryRunner(_reg(inbox, tmp_path / "out", router=_boom), store, claim_mode="pooled")
+    runner = RegistryRunner(
+        _reg(inbox, tmp_path / "out", router=_boom),
+        store,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
+    )
     fake_pool = _FakeSyncPool()
     store.sync_handoff_pool = lambda stage: fake_pool  # type: ignore[attr-defined]
     runner._fuse_route_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="t-fuse")
@@ -300,7 +317,12 @@ async def test_fused_route_handoff_fault_sets_handoff_exc(
     # pool WAS acquired (the CPU stage completed) before the handoff faulted.
     inbox = tmp_path / "in"
     inbox.mkdir()
-    runner = RegistryRunner(_reg(inbox, tmp_path / "out"), store, claim_mode="pooled")
+    runner = RegistryRunner(
+        _reg(inbox, tmp_path / "out"),
+        store,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
+    )
     fake_pool = _FakeSyncPool()
     store.sync_handoff_pool = lambda stage: fake_pool  # type: ignore[attr-defined]
 
@@ -342,7 +364,10 @@ async def test_fused_transform_raising_handler_sets_xform_exc(
         raise ValueError("handler boom")
 
     runner = RegistryRunner(
-        _reg(inbox, tmp_path / "out", handler=_boom_handler), store, claim_mode="pooled"
+        _reg(inbox, tmp_path / "out", handler=_boom_handler),
+        store,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
     )
     fake_pool = _FakeSyncPool()
     store.sync_handoff_pool = lambda stage: fake_pool  # type: ignore[attr-defined]
@@ -375,7 +400,12 @@ async def test_fused_transform_handoff_fault_sets_handoff_exc(
     # A transform-handoff raise (transform_one succeeded) is INFRA ⇒ handoff_exc set, xform_exc None.
     inbox = tmp_path / "in"
     inbox.mkdir()
-    runner = RegistryRunner(_reg(inbox, tmp_path / "out"), store, claim_mode="pooled")
+    runner = RegistryRunner(
+        _reg(inbox, tmp_path / "out"),
+        store,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
+    )
     fake_pool = _FakeSyncPool()
     store.sync_handoff_pool = lambda stage: fake_pool  # type: ignore[attr-defined]
 

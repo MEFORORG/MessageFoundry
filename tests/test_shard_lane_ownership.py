@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import BuildupThreshold, ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -217,7 +218,9 @@ async def _until(pred, *, timeout: float = 5.0) -> None:
 async def test_unsharded_runner_owns_everything(store: MessageStore, tmp_path: Path) -> None:
     # Unsharded (shard_id None): owner is None and the predicate is True for EVERY name — the
     # single-process engine is byte-identical to pre-ADR-0073 (no gate anywhere).
-    runner = RegistryRunner(_unsharded_registry(tmp_path), store)
+    runner = RegistryRunner(
+        _unsharded_registry(tmp_path), store, egress=EgressSettings(deny_by_default=False)
+    )
     assert runner.registry.shard_id is None
     for name in ("file_out", "never_declared_anywhere"):
         assert runner.destination_owner(name) is None
@@ -241,7 +244,7 @@ async def test_sharded_predicate_matches_rendezvous_owner(
     # the predicate is TOTAL — a name no registry ever declared still resolves one owner.
     owned, foreign = _pick_dest("a"), _pick_dest("b")
     reg = _sharded_registry(tmp_path, [owned, foreign], send_to=owned)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     for dest in (owned, foreign):
         expect = owner_shard_of_destination(dest, UNIVERSE)
         assert runner.destination_owner(dest) == expect
@@ -260,7 +263,13 @@ async def test_per_lane_spawns_delivery_workers_only_for_owned_lanes(
 ) -> None:
     owned, foreign = _pick_dest("a"), _pick_dest("b")
     reg = _sharded_registry(tmp_path, [owned, foreign], send_to=owned)
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode="per_lane")
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         # Single consumer per lane: THIS shard runs a delivery worker only for the lane it owns.
@@ -283,7 +292,9 @@ async def test_pooled_outbound_lane_provider_filters_to_owned(
 ) -> None:
     owned, foreign = _pick_dest("a"), _pick_dest("b")
     reg = _sharded_registry(tmp_path, [owned, foreign], send_to=owned)
-    runner = RegistryRunner(reg, store, claim_mode="pooled")
+    runner = RegistryRunner(
+        reg, store, claim_mode="pooled", egress=EgressSettings(deny_by_default=False)
+    )
     provider = runner._pooled_lane_provider(Stage.OUTBOUND)
     assert provider() == {owned}
     # A reload-dropped-but-still-built lane (in _destinations, NOT in registry.outbound) appears
@@ -303,7 +314,9 @@ async def test_wake_lane_drops_non_owned_outbound_and_foreign_response(
 ) -> None:
     owned, foreign = _pick_dest("a"), _pick_dest("b")
     reg = _sharded_registry(tmp_path, [owned, foreign], send_to=owned)
-    runner = RegistryRunner(reg, store, claim_mode="pooled")
+    runner = RegistryRunner(
+        reg, store, claim_mode="pooled", egress=EgressSettings(deny_by_default=False)
+    )
     out_stub, resp_stub = _StubDispatcher(), _StubDispatcher()
     runner._dispatchers[Stage.OUTBOUND] = out_stub  # type: ignore[assignment]
     runner._dispatchers[Stage.RESPONSE] = resp_stub  # type: ignore[assignment]
@@ -323,7 +336,12 @@ async def test_wake_lane_drops_non_owned_outbound_and_foreign_response(
 
 async def test_wake_lane_ungated_when_unsharded(store: MessageStore, tmp_path: Path) -> None:
     # Unsharded: no gate — every OUTBOUND wake reaches the dispatcher (byte-identical semantics).
-    runner = RegistryRunner(_unsharded_registry(tmp_path), store, claim_mode="pooled")
+    runner = RegistryRunner(
+        _unsharded_registry(tmp_path),
+        store,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
+    )
     stub = _StubDispatcher()
     runner._dispatchers[Stage.OUTBOUND] = stub  # type: ignore[assignment]
     runner._wake_lane(Stage.OUTBOUND, "file_out")
@@ -337,7 +355,13 @@ async def test_wake_lane_ungated_when_unsharded(store: MessageStore, tmp_path: P
 async def test_outbound_controls_refuse_non_owned_lane(store: MessageStore, tmp_path: Path) -> None:
     owned, foreign = _pick_dest("a"), _pick_dest("b")
     reg = _sharded_registry(tmp_path, [owned, foreign], send_to=owned)
-    runner = RegistryRunner(reg, store, claim_mode="pooled", pooled_sweep_interval=0.05)
+    runner = RegistryRunner(
+        reg,
+        store,
+        claim_mode="pooled",
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         # A non-owning shard's pause would report quiesced instantly (no local worker/lane) and
@@ -390,6 +414,7 @@ async def test_watchdog_pages_buildup_on_non_owned_lane(
         claim_mode="pooled",
         pooled_sweep_interval=0.05,
         alert_sink=sink,  # type: ignore[arg-type]
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     foreign_collector = _Collector()
@@ -412,7 +437,12 @@ async def test_watchdog_pages_buildup_on_non_owned_lane(
 
 
 async def test_unsharded_runner_spawns_no_watchdog(store: MessageStore, tmp_path: Path) -> None:
-    runner = RegistryRunner(_unsharded_registry(tmp_path), store, claim_mode="pooled")
+    runner = RegistryRunner(
+        _unsharded_registry(tmp_path),
+        store,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert runner._shard_watchdog is None
     await runner.start()
     try:

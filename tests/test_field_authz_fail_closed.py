@@ -35,6 +35,7 @@ from messagefoundry.api.models import MessageDetail, MessageSummary
 from messagefoundry.api.phi_gate import GATEABLE_PROPERTIES, PhiGatedModel
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 #: Invented MRN/name, never real PHI.
@@ -130,7 +131,11 @@ def test_redaction_releases_only_what_the_caller_holds() -> None:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "phi_gate.db", poll_interval=0.05)
+    eng = await Engine.create(
+        tmp_path / "phi_gate.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         yield eng
     finally:

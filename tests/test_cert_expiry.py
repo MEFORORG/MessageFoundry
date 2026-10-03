@@ -23,6 +23,7 @@ from messagefoundry.config.settings import (
     ApiSettings,
     AuthSettings,
     CertMonitorSettings,
+    EgressSettings,
     LoggingSettings,
     ServiceSettings,
     StoreBackend,
@@ -700,7 +701,11 @@ def test_the_engine_hands_the_settings_crls_to_its_expiry_monitor(tmp_path: Path
     watched = crls_from_settings(ServiceSettings(tls=TlsSettings(crl_file=str(crl))))
 
     async def _go() -> list[MonitoredCert]:
-        eng = await Engine.create(tmp_path / "crl.db", settings_crls=watched)
+        eng = await Engine.create(
+            tmp_path / "crl.db",
+            settings_crls=watched,
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
         try:
             return eng._monitored_certs()
         finally:

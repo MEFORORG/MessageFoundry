@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import RetentionSettings
+from messagefoundry.config.settings import EgressSettings, RetentionSettings
 from messagefoundry.pipeline import retention as retention_mod
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.cluster import NullCoordinator
@@ -1565,7 +1565,9 @@ def test_settings_validation() -> None:
 
 async def test_engine_starts_and_stops_retention_runner(tmp_path) -> None:
     engine = await Engine.create(
-        tmp_path / "engine.db", retention_settings=RetentionSettings(messages_days=1)
+        tmp_path / "engine.db",
+        retention_settings=RetentionSettings(messages_days=1),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     await engine.start()
     try:
@@ -1576,7 +1578,9 @@ async def test_engine_starts_and_stops_retention_runner(tmp_path) -> None:
 
 
 async def test_engine_without_retention_settings_has_no_runner(tmp_path) -> None:
-    engine = await Engine.create(tmp_path / "engine2.db")
+    engine = await Engine.create(
+        tmp_path / "engine2.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
     await engine.start()
     try:
         assert engine._retention_runner is None

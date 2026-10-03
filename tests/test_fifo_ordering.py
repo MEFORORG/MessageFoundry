@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import OrderingMode, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
@@ -110,7 +111,11 @@ async def test_runner_resolves_ordering_override_over_default(tmp_path: Path) ->
             """
         )
     )
-    engine = await Engine.create(tmp_path / "mf.db", ordering_default=OrderingMode.FIFO)
+    engine = await Engine.create(
+        tmp_path / "mf.db",
+        ordering_default=OrderingMode.FIFO,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(load_config(cfgdir))
     await engine.start()
     try:

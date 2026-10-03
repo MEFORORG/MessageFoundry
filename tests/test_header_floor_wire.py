@@ -58,6 +58,7 @@ from messagefoundry.api.protocol_headers import (
     floored_ws_protocol_class,
 )
 from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 #: The uvicorn this suite was measured against. See the module docstring before moving it.
@@ -78,7 +79,11 @@ _HANDSHAKE = (
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "wire.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "wire.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Soap, WiringError, build_outbound_connection
 from messagefoundry.transports import build_destination
 from messagefoundry.transports import soap as soap_mod
@@ -37,7 +38,10 @@ URL = "https://api.example.com/svc"
 
 def _dest(**over: object) -> SoapDestination:
     settings = Soap(url=URL, **over).settings  # type: ignore[arg-type]
-    d = build_destination(Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=settings))
+    d = build_destination(
+        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(d, SoapDestination)
     return d
 
@@ -149,7 +153,8 @@ def test_client_cert_requires_https() -> None:
                     client_cert_file="c.pem",
                     client_key_file="k.pem",
                 ).settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 

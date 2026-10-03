@@ -530,6 +530,11 @@ _CLIENT_ALLOWED: Mapping[str, _Allowance] = MappingProxyType(
             "reads the live connector registries, read-only, through the public registered_kinds "
             "accessor, to report which connector kinds the scenarios cover (vault BACKLOG #2672)",
         ),
+        "harness/load/ingress_probe.py": _Allowance(
+            frozenset({"messagefoundry.config"}),
+            "builds the explicit [egress] policy its in-process engine needs, since "
+            "create_managed_app takes no default (vault BACKLOG #2605)",
+        ),
         "harness/load/shardcert.py": _Allowance(
             frozenset({"messagefoundry.config", "messagefoundry.pipeline", "messagefoundry.store"}),
             "certifies an engine-shard plan by running the loader and the sharding planner itself",

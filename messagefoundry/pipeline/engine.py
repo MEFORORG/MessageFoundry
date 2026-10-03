@@ -235,7 +235,7 @@ class Engine:
         settings_crls: Sequence[MonitoredCert] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
-        egress_settings: EgressSettings | None = None,
+        egress_settings: EgressSettings,
         hop_posture: HopPosture | None = None,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
         shadow_settings: ShadowSettings | None = None,
@@ -602,7 +602,7 @@ class Engine:
         settings_crls: Sequence[MonitoredCert] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
-        egress_settings: EgressSettings | None = None,
+        egress_settings: EgressSettings,
         hop_posture: HopPosture | None = None,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
         shadow_settings: ShadowSettings | None = None,
@@ -1796,7 +1796,7 @@ class Engine:
                 "no config directory is configured — a connection flag cannot be persisted"
             )
         cfg_dir: Path = config_dir
-        egress = self._egress_settings or EgressSettings()
+        egress = self._egress_settings
 
         def _write() -> None:
             entries = connections_edit.list_connections(cfg_dir)

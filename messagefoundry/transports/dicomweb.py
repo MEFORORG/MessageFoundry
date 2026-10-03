@@ -9,7 +9,7 @@ a DICOMweb service via STOW-RS.
 ``RestDestination``: the no-redirect, http(s)-only, TLS-verifying opener (a 3xx can't divert a
 PHI-bearing POST to an unintended host; ASVS 15.3.2), the cleartext-credential refusal, and the outbound
 length limits. The fail-closed ``[egress].allowed_http`` host gate is enforced by the runner (it folds
-DICOMWEB into the REST/SOAP/FHIR arm — see wiring_runner ``_allowlist_for`` / ``check_egress_allowed``).
+DICOMWEB into the REST/SOAP/FHIR arm — see transports.egress ``_allowlist_for`` / ``check_egress_allowed``).
 It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works without the DIMSE stack.
 
 **STOW-RS layer (on top of REST):**

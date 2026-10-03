@@ -32,6 +32,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     DICOM,
     FHIR,
@@ -58,6 +59,7 @@ from messagefoundry.transports.rest import (
     ech_sidecar_url_from_settings,
     egress_route_from_settings,
 )
+from tests._egress_policy import permitting
 
 
 @pytest.fixture(scope="module")
@@ -77,7 +79,10 @@ def rsa_pem() -> str:
 def _rest(url: str = "https://partner.example/ingest", **extra: object) -> RestDestination:
     settings = Rest(url=url).settings
     settings.update(extra)
-    d = build_destination(Destination(name="OB_REST", type=ConnectorType.REST, settings=settings))
+    d = build_destination(
+        Destination(name="OB_REST", type=ConnectorType.REST, settings=settings),
+        egress=permitting(settings),
+    )
     assert isinstance(d, RestDestination)
     return d
 
@@ -270,7 +275,8 @@ def _dest(spec: ConnectionSpec, label: str, **extra: object) -> DestinationConne
     settings = dict(spec.settings)
     settings.update(extra)
     return build_destination(
-        Destination(name=f"OB_{label.upper()}", type=spec.type, settings=settings)
+        Destination(name=f"OB_{label.upper()}", type=spec.type, settings=settings),
+        egress=permitting(settings),
     )
 
 
@@ -380,7 +386,10 @@ def test_the_spy_reaches_the_builder_without_the_ech_key(
 def test_inbound_builds_without_any_ech_key() -> None:
     """Negative control for the inbound refusal below."""
     spec = MLLP(port=2575)
-    src = build_source(Source(name="IB_MLLP", type=spec.type, settings=dict(spec.settings)))
+    src = build_source(
+        Source(name="IB_MLLP", type=spec.type, settings=dict(spec.settings)),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert src is not None
 
 
@@ -389,7 +398,10 @@ def test_inbound_refuses_ech_egress() -> None:
     settings = dict(spec.settings)
     settings.update(ech_egress=True, ech_sidecar=_SIDECAR)
     with pytest.raises(ValueError) as exc:
-        build_source(Source(name="IB_MLLP", type=spec.type, settings=settings))
+        build_source(
+            Source(name="IB_MLLP", type=spec.type, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
     assert str(exc.value) == ECH_UNSUPPORTED_SOURCE_MSG
 
 

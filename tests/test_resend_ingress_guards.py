@@ -29,7 +29,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, ContentType, Validation
-from messagefoundry.config.settings import AuthSettings, StoreSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -100,7 +100,11 @@ def _registry(tmp_path: Path, ic: InboundConnection) -> Registry:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    e = await Engine.create(tmp_path / "guards.db", poll_interval=0.02)
+    e = await Engine.create(
+        tmp_path / "guards.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         yield e
     finally:

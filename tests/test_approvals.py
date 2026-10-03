@@ -29,7 +29,7 @@ from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, RetryPolicy
-from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
+from messagefoundry.config.settings import ApprovalsSettings, AuthSettings, EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -54,7 +54,11 @@ OFF = ApprovalsSettings(enabled=False)
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "approvals.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "approvals.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
@@ -1707,7 +1711,7 @@ async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: boo
     """Start a slow shielded write inside the managed lifespan, cancel its caller, then shut down."""
     from messagefoundry.api import create_managed_app
 
-    app = create_managed_app(db_path=db_path)
+    app = create_managed_app(db_path=db_path, egress_settings=EgressSettings(deny_by_default=False))
     finished = asyncio.Event()
     # Undrained, the write is held until the lifespan has exited, so the control cannot pass by a
     # slow teardown. Drained, it sleeps briefly, and the drain has to wait for it.
@@ -1762,7 +1766,9 @@ async def test_a_drain_failure_does_not_skip_engine_stop(tmp_path: Path) -> None
     store's non-daemon worker keeps the process alive."""
     from messagefoundry.api import create_managed_app
 
-    app = create_managed_app(db_path=tmp_path / "boom.db")
+    app = create_managed_app(
+        db_path=tmp_path / "boom.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
     calls: list[str] = []
     real_stop: list[Any] = []
     try:

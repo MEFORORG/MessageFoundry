@@ -49,6 +49,7 @@ from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
 from messagefoundry.store.base import DEFAULT_STORE_ACQUIRE_TIMEOUT, acquire_pooled
+from messagefoundry.transports.egress import host_port_allowed
 
 __all__ = ["ReferenceSyncRunner", "ReferenceSyncError"]
 
@@ -57,21 +58,6 @@ log = logging.getLogger(__name__)
 
 class ReferenceSyncError(RuntimeError):
     """A reference set's source could not be materialized (bad source kind, missing file, parse error)."""
-
-
-def _egress_allows(host: str, port: object, allowed: list[str]) -> bool:
-    """host[:port] membership in an ``[egress]`` allowlist entry (``"host"`` = any port, or ``"host:port"``).
-
-    Same matching as the connector egress gate; reimplemented here (a few lines) to avoid importing a
-    private symbol from the runner."""
-    host = host.lower()
-    for entry in allowed:
-        allow_host, _, allow_port = entry.partition(":")
-        if allow_host.strip().lower() == host and (
-            not allow_port or str(port) == allow_port.strip()
-        ):
-            return True
-    return False
 
 
 @dataclass(frozen=True)
@@ -135,7 +121,7 @@ def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None =
 
 async def _load_database_source(
     settings: Mapping[str, Any],
-    egress: EgressSettings | None,
+    egress: EgressSettings,
     *,
     posture: HopPosture | None = None,
     name: str | None = None,
@@ -156,21 +142,20 @@ async def _load_database_source(
     from messagefoundry.transports.database import _login_timeout, _make_pool
 
     server = str(settings.get("server", ""))
-    if egress is not None:
-        # Under deny-by-default an empty allowed_db refuses the dial-out outright (parity with the
-        # DATABASE source / db_lookup gates in wiring_runner.py — this is the one dial-out path that
-        # otherwise ignored the flag).
-        if egress.deny_by_default and not egress.allowed_db:
-            raise ReferenceSyncError(
-                f"DATABASE reference source: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
-                "[egress].allowed_db is empty — list the reference server to permit it"
-            )
-        if egress.allowed_db and not _egress_allows(
-            server, settings.get("port", 1433), egress.allowed_db
-        ):
-            raise ReferenceSyncError(
-                f"DATABASE reference server {server!r} is not in the [egress].allowed_db allowlist"
-            )
+    # `egress` is required (vault BACKLOG #2605): a caller that passed none used to skip this check.
+    # Under deny-by-default an empty allowed_db refuses the dial-out outright, in parity with the
+    # DATABASE source and db_lookup gates in transports/egress.py.
+    if egress.deny_by_default and not egress.allowed_db:
+        raise ReferenceSyncError(
+            f"DATABASE reference source: {BLOCK_UNLISTED_OUTBOUND_IN_FORCE} and "
+            "[egress].allowed_db is empty — list the reference server to permit it"
+        )
+    if egress.allowed_db and not host_port_allowed(
+        server, settings.get("port", 1433), egress.allowed_db
+    ):
+        raise ReferenceSyncError(
+            f"DATABASE reference server {server!r} is not in the [egress].allowed_db allowlist"
+        )
     key_col = settings.get("key_column")
     value_col = settings.get("value_column")
     statement = str(settings.get("statement", ""))
@@ -234,7 +219,7 @@ class ReferenceSyncRunner:
         settings: ReferenceSettings,
         *,
         env_values: Mapping[str, Any] | None = None,
-        egress: EgressSettings | None = None,
+        egress: EgressSettings,
         alert_sink: AlertSink | None = None,
         coordinator: ClusterCoordinator | None = None,
         clock: Callable[[], float] = time.time,

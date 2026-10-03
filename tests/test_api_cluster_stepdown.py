@@ -36,7 +36,7 @@ from messagefoundry.auth.permissions import (
 )
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.cluster import (
     ClusterCoordinator,
@@ -153,7 +153,12 @@ async def _engine(tmp_path: Path, coordinator: ClusterCoordinator | None = None)
     """A started SQLite engine holding ``coordinator``. ``Engine.create`` is the documented
     tests/embedding path and forwards ``coordinator`` straight through, so nothing here re-implements
     the constructor's keyword list."""
-    eng = await Engine.create(tmp_path / "stepdown.db", poll_interval=0.02, coordinator=coordinator)
+    eng = await Engine.create(
+        tmp_path / "stepdown.db",
+        poll_interval=0.02,
+        coordinator=coordinator,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     await eng.start()
     return eng
 

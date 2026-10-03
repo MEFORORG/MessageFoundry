@@ -36,7 +36,7 @@ from messagefoundry.auth.service import (
     DirectoryObjectIdMissing,
 )
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 from tests.test_api_auth import (
@@ -65,7 +65,11 @@ ACTION = "admin_federated_identity"
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     """Local rather than imported: a fixture resolves by name in the module that requests it."""
-    eng = await Engine.create(tmp_path / "federated_identity.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "federated_identity.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

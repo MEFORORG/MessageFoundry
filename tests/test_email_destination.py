@@ -26,10 +26,11 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
 )
 from messagefoundry.config.wiring import WiringError
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.mllp import InsecureHopGuard
+from tests._egress_policy import permitting
 
 
 class _FakeSMTP:
@@ -478,7 +479,8 @@ def _email_dest(
 
 
 def test_allowed_smtp_empty_leaves_the_relay_host_unrestricted() -> None:
-    e = EgressSettings(allowed_recipient_domains=_RCPT_DOMAINS)
+    # Under the audited opt-out only: the model default denies an empty list (vault BACKLOG #2605).
+    e = EgressSettings(deny_by_default=False, allowed_recipient_domains=_RCPT_DOMAINS)
     check_egress_allowed(_email_dest("any.smtp.example"), e)  # no raise
 
 
@@ -571,7 +573,7 @@ def test_unlisted_or_unreadable_recipient_is_refused(recipients: list[str] | str
 
 @pytest.mark.parametrize(
     "egress",
-    [EgressSettings(), EgressSettings(allowed_smtp=["smtp.hospital.example"])],
+    [EgressSettings(deny_by_default=False), EgressSettings(allowed_smtp=["smtp.hospital.example"])],
     ids=["nothing-listed", "relay-listed"],
 )
 def test_recipient_domains_empty_refuses_every_email_destination(egress: EgressSettings) -> None:
@@ -818,7 +820,7 @@ def test_recipient_domains_do_not_gate_direct() -> None:
         type=ConnectorType.DIRECT,
         settings={"host": "hisp.example", "recipients": ["a@partner.example"], "port": 587},
     )
-    check_egress_allowed(d, EgressSettings())  # no raise
+    check_egress_allowed(d, EgressSettings(deny_by_default=False))  # no raise
 
 
 def test_recipient_domains_load_from_the_environment(tmp_path: Path) -> None:
@@ -831,9 +833,9 @@ def test_recipient_domains_load_from_the_environment(tmp_path: Path) -> None:
 
 def test_a_gate_that_read_no_address_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
     # The stdlib parser never yields an empty list today; the gate must not depend on that.
-    import messagefoundry.pipeline.wiring_runner as wr
+    import messagefoundry.transports.egress as egress_mod
 
-    monkeypatch.setattr(wr, "envelope_recipients", lambda _value: [])
+    monkeypatch.setattr(egress_mod, "envelope_recipients", lambda _value: [])
     e = _relay_listed(["hospital.example"])
     with pytest.raises(WiringError, match="no recipient address"):
         check_egress_allowed(_email_dest("smtp.hospital.example"), e)
@@ -880,7 +882,7 @@ def test_a_recipient_domain_that_can_never_match_is_refused_at_load(entry: str) 
 def test_registered_in_destination_registry() -> None:
     from messagefoundry.transports.base import build_destination
 
-    conn = build_destination(_dest())
+    conn = build_destination(_dest(), egress=permitting(_dest().settings))
     assert isinstance(conn, EmailDestination)
 
 

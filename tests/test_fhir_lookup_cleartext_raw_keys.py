@@ -76,7 +76,7 @@ def _build_check(reg: Registry) -> None:
         reg,
         inbound_bind_host="127.0.0.1",
         env_values={},
-        egress=EgressSettings(),
+        egress=EgressSettings(deny_by_default=False),
         posture=_ENFORCING,
     )
 
@@ -87,7 +87,7 @@ def _build_live(reg: Registry) -> None:
     runner = SimpleNamespace(
         registry=reg,
         _env_values={},
-        _egress=EgressSettings(),
+        _egress=EgressSettings(deny_by_default=False),
         _hop_posture=_ENFORCING,
         _trust_anchor_policy=None,
     )

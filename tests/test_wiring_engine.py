@@ -21,9 +21,11 @@ from messagefoundry.config.models import (
     InternalErrorPolicy,
     RetryPolicy,
     SaturationThreshold,
+    Source,
     StallThreshold,
     Validation,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -102,7 +104,7 @@ async def test_inbound_decodes_with_connection_encoding(store: MessageStore) -> 
     # Staged pipeline: the listener decodes + persists to the ingress stage (status RECEIVED) and
     # ACKs; routing happens later in the ingress worker (not started here).
     reg = _inbound_registry("latin-1")
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     raw = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100||Müller^X\r".encode("latin-1")
     await runner._handle_inbound(reg.inbound["mllp_in"], raw)
     cur = await store._db.execute("SELECT status, raw FROM messages")
@@ -126,7 +128,7 @@ async def test_non_hl7_inbound_commits_raw_without_parsing(store: MessageStore) 
         )
     )
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     body = b'{"mrn": "100", "note": "not HL7 at all"}'
     ack = await runner._handle_inbound(reg.inbound["json_in"], body)
     assert ack is None  # the non-HL7 source owns its own receive-time response; no HL7 ACK here
@@ -148,7 +150,7 @@ async def test_inbound_decode_error_records_error_and_naks(store: MessageStore) 
     from messagefoundry.parsing.peek import Peek
 
     reg = _inbound_registry("utf-8")
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     raw = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100||bad \xff\xfe utf8\r"
     ack = await runner._handle_inbound(reg.inbound["mllp_in"], raw)
     cur = await store._db.execute("SELECT status, raw, error FROM messages")
@@ -270,8 +272,8 @@ async def test_start_inbound_does_not_register_on_bind_failure(
     from messagefoundry.pipeline import wiring_runner as wr
 
     reg = _inbound_registry("utf-8")
-    runner = RegistryRunner(reg, store)
-    monkeypatch.setattr(wr, "build_source", lambda cfg: _BoomSource())
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
+    monkeypatch.setattr(wr, "build_source", lambda cfg, *, egress: _BoomSource())
     with pytest.raises(OSError):
         await runner.start_inbound("mllp_in")
     assert not runner.inbound_running("mllp_in")
@@ -291,13 +293,15 @@ async def test_start_isolates_inbound_bind_failure_and_recovers(
         OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path)}))
     )
     sink = _RecordingAlertSink()
-    runner = RegistryRunner(reg, store, alert_sink=sink)
+    runner = RegistryRunner(
+        reg, store, alert_sink=sink, egress=EgressSettings(deny_by_default=False)
+    )
     real_build_source = wr.build_source
     calls = {"n": 0}
 
-    def flaky(cfg: object):
+    def flaky(cfg: Source, *, egress: EgressSettings) -> object:
         calls["n"] += 1
-        return _BoomSource() if calls["n"] == 1 else real_build_source(cfg)
+        return _BoomSource() if calls["n"] == 1 else real_build_source(cfg, egress=egress)
 
     monkeypatch.setattr(wr, "build_source", flaky)
     try:
@@ -329,7 +333,7 @@ async def test_fatal_startup_error_still_unwinds_and_raises(
     reg.add_outbound(
         OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path)}))
     )
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     def boom():
         raise RuntimeError("lookup executor build failed")
@@ -344,7 +348,7 @@ async def test_fatal_startup_error_still_unwinds_and_raises(
 async def test_per_connection_ops_take_reload_lock(store: MessageStore) -> None:
     # M-10: public per-connection ops serialize against reload()/stop() via _reload_lock.
     reg = _inbound_registry("utf-8")
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     await runner._reload_lock.acquire()
     task = asyncio.ensure_future(runner.start_inbound("mllp_in"))
     await asyncio.sleep(0.05)
@@ -380,7 +384,9 @@ async def _until_message(
 
 
 async def _run(reg: Registry, store: MessageStore) -> RegistryRunner:
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     return runner
 
@@ -459,7 +465,13 @@ async def test_runner_refuses_non_loopback_plaintext_mllp(store: MessageStore) -
         InboundConnection("mllp_in", ConnectionSpec(ConnectorType.MLLP, {"port": 0}), router="r")
     )
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, inbound_bind_host="0.0.0.0", poll_interval=0.02)
+    runner = RegistryRunner(
+        reg,
+        store,
+        inbound_bind_host="0.0.0.0",
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(WiringError, match="without TLS"):
         await runner._start_inbound_unsafe("mllp_in")
 
@@ -514,7 +526,9 @@ async def test_pipeline_delivery_failure_logs_no_phi(store: MessageStore, tmp_pa
     root.addHandler(handler)
     prior = root.level
     root.setLevel(logging.DEBUG)
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     runner._destinations["file_out"] = _RejectsWithPayload()  # swap in before any traffic
     (inbox / "a.hl7").write_bytes(PHI_ADT.encode("utf-8"))
@@ -743,7 +757,9 @@ async def test_failed_delivery_retries_then_succeeds(store: MessageStore, tmp_pa
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     reg = _retry_registry(inbox, outdir, RetryPolicy(max_attempts=3, backoff_seconds=0.03))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     flaky = _FlakyDestination(fail_times=2)
     runner._destinations["file_out"] = flaky  # swap in before any traffic
@@ -759,7 +775,9 @@ async def test_exhausted_retries_dead_letter(store: MessageStore, tmp_path: Path
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     reg = _retry_registry(inbox, outdir, RetryPolicy(max_attempts=2, backoff_seconds=0.02))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     runner._destinations["file_out"] = _FlakyDestination(fail_times=99)  # always fails
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -814,7 +832,13 @@ async def test_delivery_requeues_when_leadership_lost_before_send(
         inbox, outdir, RetryPolicy(backoff_seconds=30.0)
     )  # long backoff: 1 attempt
     coord = _FlipCoordinator(leader=True)
-    runner = RegistryRunner(reg, store, poll_interval=0.02, coordinator=coord)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        coordinator=coord,
+        egress=EgressSettings(deny_by_default=False),
+    )
     dest = _NeverSends()
     runner._destinations["file_out"] = dest
     # Seed one outbound row directly (a row the would-be leader routed), then drop leadership BEFORE
@@ -879,7 +903,13 @@ async def test_leadership_lost_before_send_does_not_dead_letter_under_a_finite_r
     inbox.mkdir()
     reg = _retry_registry(inbox, outdir, RetryPolicy(backoff_seconds=30.0, max_attempts=1))
     coord = _FlipCoordinator(leader=True)
-    runner = RegistryRunner(reg, store, poll_interval=0.02, coordinator=coord)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        coordinator=coord,
+        egress=EgressSettings(deny_by_default=False),
+    )
     dest = _NeverSends()
     runner._destinations["file_out"] = dest
     mid = await store.enqueue_message(
@@ -933,7 +963,13 @@ async def test_delivery_proceeds_while_leader(store: MessageStore, tmp_path: Pat
     inbox.mkdir()
     reg = _retry_registry(inbox, outdir, RetryPolicy())
     coord = _FlipCoordinator(leader=True)
-    runner = RegistryRunner(reg, store, poll_interval=0.02, coordinator=coord)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        coordinator=coord,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     flaky = _FlakyDestination(fail_times=0)  # succeeds immediately
     runner._destinations["file_out"] = flaky
@@ -968,7 +1004,9 @@ async def test_permanent_reject_fails_fast_without_retrying(
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     reg = _retry_registry(inbox, outdir, RetryPolicy())  # default: retry forever
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     dest = _AlwaysRaises(NegativeAckError("negative ACK (MSA-1=AR)", code="AR", permanent=True))
     runner._destinations["file_out"] = dest
@@ -991,7 +1029,9 @@ async def test_internal_error_dead_letters_and_continues(
     reg = _retry_registry(
         inbox, outdir, RetryPolicy()
     )  # default: retry forever (would loop if hit)
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     dest = _AlwaysRaises(ValueError("boom in connector"))
     runner._destinations["file_out"] = dest
@@ -1080,7 +1120,14 @@ async def test_stop_policy_halts_connection_and_alerts(store: MessageStore, tmp_
     reg = _stop_registry(inbox, outdir, InternalErrorPolicy.STOP)
     sink = _RecordingAlertSink()
     # per_lane: asserts the per-outbound delivery worker halts (pooled handles STOP via the dispatcher).
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink, claim_mode="per_lane")
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     dest = _AlwaysRaises(ValueError("boom in connector"))
     runner._destinations["file_out"] = dest
@@ -1127,7 +1174,13 @@ async def test_queue_buildup_alert_on_blocked_lane(store: MessageStore, tmp_path
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("file_out", m))
     sink = _RecordingAlertSink()
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     runner._destinations["file_out"] = _AlwaysRaises(DeliveryError("downstream down"))
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -1153,6 +1206,7 @@ async def test_stop_policy_via_global_default(store: MessageStore, tmp_path: Pat
         poll_interval=0.02,
         internal_error_default=InternalErrorPolicy.STOP,
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     runner._destinations["file_out"] = _AlwaysRaises(ValueError("boom"))
@@ -1192,6 +1246,7 @@ async def test_ingress_stop_policy_halts_and_alerts(store: MessageStore, tmp_pat
         internal_error_default=InternalErrorPolicy.STOP,
         alert_sink=sink,
         claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -1228,6 +1283,7 @@ async def test_ingress_stop_then_restart_rearms_worker(store: MessageStore, tmp_
         alert_sink=_RecordingAlertSink(),
         delivery_defaults=RetryPolicy(backoff_seconds=0.01, backoff_multiplier=1.0),
         claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -1254,6 +1310,7 @@ async def test_ingress_buildup_alert_is_stage_aware(store: MessageStore, tmp_pat
         poll_interval=0.02,
         buildup_default=BuildupThreshold(max_depth=2),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     await store.enqueue_ingress(channel_id="IB", raw=ADT)
     await store.enqueue_ingress(channel_id="IB", raw=ADT)
@@ -1271,7 +1328,11 @@ async def test_ingress_inbound_not_in_registry_reschedules_not_dead_letters(
     # reload to restore the inbound. The worker then exits (returns) rather than spinning.
     reg = Registry()  # "GONE" is not in the registry
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, delivery_defaults=RetryPolicy(max_attempts=1)
+        reg,
+        store,
+        poll_interval=0.02,
+        delivery_defaults=RetryPolicy(max_attempts=1),
+        egress=EgressSettings(deny_by_default=False),
     )
     mid = await store.enqueue_ingress(channel_id="GONE", raw=ADT)
     await runner._router_worker("GONE")  # returns after rescheduling the one residual row
@@ -1295,7 +1356,9 @@ async def test_transient_nak_retries_under_finite_cap(store: MessageStore, tmp_p
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     reg = _retry_registry(inbox, outdir, RetryPolicy(max_attempts=3, backoff_seconds=0.02))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     dest = _AlwaysRaises(NegativeAckError("negative ACK (MSA-1=AE)", code="AE", permanent=False))
     runner._destinations["file_out"] = dest
@@ -1362,6 +1425,7 @@ async def test_transform_buildup_alert_is_stage_aware(store: MessageStore, tmp_p
         poll_interval=0.02,
         buildup_default=BuildupThreshold(max_depth=2),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     for _ in range(2):  # two routed rows for inbound "IB"
         mid = await store.enqueue_ingress(channel_id="IB", raw=ADT)
@@ -1396,6 +1460,7 @@ async def test_message_stall_alert_fires_over_threshold(
         poll_interval=0.02,
         stall_default=StallThreshold(max_oldest_seconds=60.0),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     old = _time.time() - 120.0  # oldest pending row created 120s ago → over the 60s threshold
 
@@ -1422,6 +1487,7 @@ async def test_message_stall_alert_silent_under_threshold(
         poll_interval=0.02,
         stall_default=StallThreshold(max_oldest_seconds=60.0),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     young = _time.time() - 5.0  # 5s old → well under the 60s threshold
 
@@ -1442,7 +1508,13 @@ async def test_message_stall_alert_off_by_default(
 
     reg = Registry()
     sink = _RecordingAlertSink()
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)  # no stall_default
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )  # no stall_default
     old = _time.time() - 9999.0
 
     async def _stub(name: str, *, stage: str):
@@ -1462,7 +1534,13 @@ async def test_message_stall_per_connection_override(
 
     reg = Registry()
     sink = _RecordingAlertSink()
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)  # global stall OFF
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )  # global stall OFF
     runner._stall["OB_TIGHT"] = StallThreshold(max_oldest_seconds=10.0)  # per-connection override
     old = _time.time() - 30.0
 
@@ -1493,6 +1571,7 @@ async def test_saturation_alert_fires_on_rising_backlog(
         poll_interval=0.02,
         saturation_default=SaturationThreshold(sustain_samples=3),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     depths = iter([0, 5, 10, 15])
 
@@ -1524,6 +1603,7 @@ async def test_saturation_alert_silent_on_bursty_but_draining_lane(
         poll_interval=0.02,
         saturation_default=SaturationThreshold(sustain_samples=3),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     depths = iter([0, 50, 40, 20, 10])  # a burst the worker is clearing (a decrease appears)
 
@@ -1545,7 +1625,11 @@ async def test_saturation_alert_off_by_default(
     reg = Registry()
     sink = _RecordingAlertSink()
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, alert_sink=sink
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )  # no saturation_default
     read = False
 
@@ -1573,6 +1657,7 @@ async def test_saturation_alert_not_paged_for_paused_outbound(
         poll_interval=0.02,
         saturation_default=SaturationThreshold(sustain_samples=3),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     runner._outbound_paused.add("OB_PAUSED")
     depths = iter([0, 5, 10, 15, 20])
@@ -1603,6 +1688,7 @@ async def test_buildup_realert_throttle_fires_suppresses_then_refires(
         poll_interval=0.02,
         buildup_default=BuildupThreshold(max_depth=1),  # 1 waiting is already over threshold
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
 
     async def _stub(name: str, *, stage: str):
@@ -1640,6 +1726,7 @@ async def test_stall_realert_throttle_fires_suppresses_then_refires(
         poll_interval=0.02,
         stall_default=StallThreshold(max_oldest_seconds=60.0),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     clock = [1000.0]
     monkeypatch.setattr(_wr.time, "time", lambda: clock[0])
@@ -1679,6 +1766,7 @@ async def test_saturation_realert_throttle_fires_suppresses_then_refires(
         poll_interval=0.02,
         saturation_default=SaturationThreshold(sustain_samples=3),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     depths = iter([0, 10, 20, 30, 40, 50])  # strictly rising → signals once primed (4th sample)
 
@@ -1712,7 +1800,9 @@ async def test_transform_worker_dead_letters_missing_handler(
     inbox = tmp_path / "in"
     inbox.mkdir()
     reg = _registry(inbox, tmp_path / "out", lambda m: [], {})  # inbound present; no handlers
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     # Pre-seed a routed row naming a handler that isn't registered (route_handoff bypasses route_only's
     # existence check, simulating a handler removed after the routed row was produced).
     mid = await store.enqueue_ingress(channel_id="file_in", raw=ADT)
@@ -1792,7 +1882,11 @@ async def test_outbound_stop_retains_rows_then_resume_drains_fifo(
     reports the tri-state status running->stopped; ZERO INFLIGHT once 'stopped'; a nudge/reload does NOT
     resume a paused outbound; start_outbound then drains everything in FIFO order across the pause."""
     runner = RegistryRunner(
-        _outbound_only_registry(tmp_path), store, poll_interval=0.02, claim_mode=claim_mode
+        _outbound_only_registry(tmp_path),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     rec = _Recorder()
@@ -1853,7 +1947,14 @@ async def test_per_lane_stop_outbound_quiesces_after_content_stop_exited_worker(
     inbox.mkdir()
     reg = _stop_registry(inbox, outdir, InternalErrorPolicy.STOP)
     sink = _RecordingAlertSink()
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink, claim_mode="per_lane")
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     runner._destinations["file_out"] = _AlwaysRaises(ValueError("boom in connector"))
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -1884,7 +1985,13 @@ async def test_pooled_stop_outbound_quiesces_after_content_stop(
     inbox.mkdir()
     reg = _stop_registry(inbox, outdir, InternalErrorPolicy.STOP)
     sink = _RecordingAlertSink()
-    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)  # pooled (default)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )  # pooled (default)
     await runner.start()
     runner._destinations["file_out"] = _AlwaysRaises(ValueError("boom in connector"))
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
@@ -1906,7 +2013,11 @@ async def test_outbound_stop_zero_inflight_with_hung_destination(
     blocked; once the head resolves the lane is 'stopped' with ZERO INFLIGHT. Cooperative — never
     cancelled."""
     runner = RegistryRunner(
-        _outbound_only_registry(tmp_path), store, poll_interval=0.02, claim_mode=claim_mode
+        _outbound_only_registry(tmp_path),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
 
@@ -1975,7 +2086,13 @@ async def test_outbound_resume_drains_backed_off_head(
             ),  # short backoff so the head is due again quickly
         )
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode=claim_mode)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     flaky = _FlakyDestination(
         fail_times=1
@@ -2010,7 +2127,11 @@ async def test_restart_outbound_keeps_connector_warm(
     never torn down — a restart deliberately keeps MLLP sockets / DB pools / SMART tokens warm) and
     ending 'running'; delivery still works afterward."""
     runner = RegistryRunner(
-        _outbound_only_registry(tmp_path), store, poll_interval=0.02, claim_mode=claim_mode
+        _outbound_only_registry(tmp_path),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     rec = _Recorder()
@@ -2046,6 +2167,7 @@ async def test_paused_outbound_suppresses_buildup_and_stall_then_lifts(
         buildup_default=BuildupThreshold(max_depth=1),
         stall_default=StallThreshold(max_oldest_seconds=60.0),
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     old = _time.time() - 120.0  # deep + aged -> crosses BOTH thresholds
 
@@ -2073,7 +2195,12 @@ async def test_paused_outbound_suppresses_buildup_and_stall_then_lifts(
 async def test_outbound_control_unknown_name_raises_and_reload_lock(store: MessageStore) -> None:
     """outbound_running / the control primitives raise KeyError for a name that is neither a declared nor
     a draining outbound (so the API 404s), and stop_outbound serializes against a held reload lock."""
-    runner = RegistryRunner(_inbound_registry("utf-8"), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _inbound_registry("utf-8"),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     # An inbound-only graph: 'out' is not an outbound.
     with pytest.raises(KeyError):
         runner.outbound_running("out")
@@ -2081,7 +2208,9 @@ async def test_outbound_control_unknown_name_raises_and_reload_lock(store: Messa
     reg.add_outbound(
         OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": "."}))
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         with pytest.raises(KeyError):

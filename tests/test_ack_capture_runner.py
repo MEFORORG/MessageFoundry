@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -44,7 +45,7 @@ async def _ack_rows(store: MessageStore):
 async def test_aa_captured_body_null_on_unencrypted_store(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "aa.db")
     try:
-        runner = RegistryRunner(_registry(), store)
+        runner = RegistryRunner(_registry(), store, egress=EgressSettings(deny_by_default=False))
         ack = await runner._handle_inbound(runner.registry.inbound["IB_X"], ADT.encode())
         assert ack is not None  # AA returned to the sender
         rows = await _ack_rows(store)
@@ -59,7 +60,7 @@ async def test_aa_captured_body_null_on_unencrypted_store(tmp_path: Path) -> Non
 async def test_aa_body_stored_when_encrypted(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "aa_enc.db", cipher=make_cipher(generate_key()))
     try:
-        runner = RegistryRunner(_registry(), store)
+        runner = RegistryRunner(_registry(), store, egress=EgressSettings(deny_by_default=False))
         await runner._handle_inbound(runner.registry.inbound["IB_X"], ADT.encode())
         rows = await _ack_rows(store)
         assert rows[0].ack_code == "AA"
@@ -71,7 +72,7 @@ async def test_aa_body_stored_when_encrypted(tmp_path: Path) -> None:
 async def test_parse_nak_captured_without_body(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "nak.db")
     try:
-        runner = RegistryRunner(_registry(), store)
+        runner = RegistryRunner(_registry(), store, egress=EgressSettings(deny_by_default=False))
         ack = await runner._handle_inbound(runner.registry.inbound["IB_X"], b"not an hl7 message")
         assert ack is not None  # AR NAK returned
         rows = await _ack_rows(store)
@@ -85,7 +86,9 @@ async def test_parse_nak_captured_without_body(tmp_path: Path) -> None:
 async def test_capture_off_per_connection(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "off_conn.db")
     try:
-        runner = RegistryRunner(_registry(capture_ack=False), store)
+        runner = RegistryRunner(
+            _registry(capture_ack=False), store, egress=EgressSettings(deny_by_default=False)
+        )
         await runner._handle_inbound(runner.registry.inbound["IB_X"], ADT.encode())
         assert await _ack_rows(store) == []
     finally:
@@ -95,7 +98,12 @@ async def test_capture_off_per_connection(tmp_path: Path) -> None:
 async def test_capture_off_via_master_switch(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "off_master.db")
     try:
-        runner = RegistryRunner(_registry(), store, response_sent_default=False)
+        runner = RegistryRunner(
+            _registry(),
+            store,
+            response_sent_default=False,
+            egress=EgressSettings(deny_by_default=False),
+        )
         await runner._handle_inbound(runner.registry.inbound["IB_X"], ADT.encode())
         assert await _ack_rows(store) == []
     finally:

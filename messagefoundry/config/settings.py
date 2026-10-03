@@ -4014,15 +4014,14 @@ class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
     Bounds where the engine may **send** PHI, so a fat-fingered or hostile outbound destination can't
-    exfiltrate it. With ``deny_by_default`` off, each destination list is **opt-in**: empty =
-    unrestricted; once a transport's list is set, a destination of that transport not on it is
-    **refused at config load/reload** (fail-closed), checked against the resolved
-    (``env()``-substituted) destination. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
+    exfiltrate it. ``deny_by_default`` is ON unless an operator turns it off, so a transport whose list
+    is empty refuses every destination of that type; once a transport's list is set, a destination of
+    that transport not on it is **refused at config load/reload** (fail-closed), checked against the
+    resolved (``env()``-substituted) destination. With ``deny_by_default`` off, each list is opt-in and
+    an empty one is unrestricted. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
     their own ``[alerts]`` host allowlists.
 
-    ``deny_by_default`` flips the destination lists fail-closed, so an empty one refuses everything.
-    The comment on the field says what else it covers, how operators set it, and when ``serve`` turns
-    it on.
+    The comment on ``deny_by_default`` says what else it covers and how operators set it.
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" (any port) or "host:port".
@@ -4092,12 +4091,13 @@ class EgressSettings(_Section):
     # db_lookup/fhir_lookup reads that dial through the same lists. Operators set it as
     # [security].block_unlisted_outbound (ADR 0118), which reaches this field only when written.
     #
-    # This field's model default is false (the per-list opt-in above), and a caller that loads settings
-    # without `serve` sees false. `serve` sets it True whenever it is left unset, with no further
-    # condition in the code: since BACKLOG #1279 every instance counts as a PHI instance, so this is
-    # any PHI instance. On stock defaults the open-egress gate just before the flip refuses to start
-    # first. The code at the flip, in `_serve` in messagefoundry/__main__.py, is the authority.
-    deny_by_default: bool = False
+    # The MODEL default is true (vault BACKLOG #2605). It used to be false, with `serve` flipping it on
+    # in place, so every other entry point -- an embedder, `check`, the `connection` CLI -- ran with
+    # allow-all egress. Now every caller that builds settings gets deny unless the operator writes the
+    # audited opt-out `block_unlisted_outbound = false`. `serve` still refuses to start when no
+    # destination list is set and the switch was not written true; that gate tests the explicit
+    # value itself, in `_serve` in messagefoundry/__main__.py, because this default alone would satisfy it.
+    deny_by_default: bool = True
 
     @field_validator(
         "allowed_mllp",

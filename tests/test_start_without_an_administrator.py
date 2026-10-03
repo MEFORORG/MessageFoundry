@@ -36,6 +36,7 @@ from messagefoundry.api import create_managed_app
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    EgressSettings,
     SecurityEnforcement,
     SecuritySettings,
     StoreSettings,
@@ -76,6 +77,7 @@ def _app(
             email_from="alerts@example.invalid",
         ),
         security_settings=SecuritySettings(enforcement=enforcement),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
 
 

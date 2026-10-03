@@ -30,6 +30,7 @@ from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
     AuthSettings,
+    EgressSettings,
     SecurityEnforcement,
     SecuritySettings,
 )
@@ -238,7 +239,11 @@ def test_ai_broker_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "ai_wiring.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "ai_wiring.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

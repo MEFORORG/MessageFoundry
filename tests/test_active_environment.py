@@ -13,6 +13,7 @@ from messagefoundry.config.active_environment import (
     set_active,
 )
 from messagefoundry.config.models import ConnectorType, Validation
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -96,7 +97,9 @@ async def test_engine_threads_active_environment_to_runner(tmp_path: Path) -> No
 
     store = await MessageStore.open(tmp_path / "e.db")
     try:
-        eng = Engine(store, active_environment="prod")
+        eng = Engine(
+            store, active_environment="prod", egress_settings=EgressSettings(deny_by_default=False)
+        )
         runner = eng.add_registry(_registry_with_face_handler())
         assert runner._active_environment == "prod"
     finally:

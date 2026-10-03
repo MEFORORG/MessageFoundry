@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.settings import StoreBackend
+from messagefoundry.config.settings import EgressSettings, StoreBackend
 from messagefoundry.config.wiring import (
     MLLP,
     FhirLookupSpec,
@@ -246,7 +246,12 @@ async def test_engine_reload_reapplies_shard_filter(tmp_path: Path) -> None:
     def only_a(reg: Registry) -> Registry:
         return filter_registry_for_shard(reg, "a")
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_filter=only_a)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_filter=only_a,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         eng.add_registry(only_a(load_config(cfg)))
         await eng.start()
@@ -295,7 +300,12 @@ async def test_engine_reload_accepts_reingress_to_a_foreign_shards_loopback(tmp_
     def only_b(reg: Registry) -> Registry:
         return filter_registry_for_shard(reg, "b")
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_filter=only_b)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_filter=only_b,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         eng.add_registry(only_b(load_config(cfg)))
         await eng.start()

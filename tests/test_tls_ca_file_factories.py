@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config import wiring
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 from messagefoundry.config.wiring import (
     FHIR,
@@ -83,7 +84,9 @@ def _destination_opener(
 ) -> urllib.request.OpenerDirector:
     """Build ``spec`` the way the runner does -- ``_dest_config`` then the connector registry."""
     config = _dest_config(build_outbound_connection("OB", spec), {}, trust_anchor_policy=policy)
-    opener: urllib.request.OpenerDirector = build_destination(config)._opener  # type: ignore[attr-defined]
+    opener: urllib.request.OpenerDirector = build_destination(
+        config, egress=EgressSettings(deny_by_default=False)
+    )._opener  # type: ignore[attr-defined]
     return opener
 
 
@@ -193,7 +196,9 @@ def test_a_named_ca_is_the_lookup_hops_only_anchor(tmp_path: Path) -> None:
     ca = _ca_pem(tmp_path, "mefor-lookup-ca")
     spec = FhirLookup("L", url="https://fhir.internal.example.org/fhir", tls_ca_file=ca)
     ex = FhirLookupExecutor(
-        {"L": _fhir_lookup_settings(spec, {}, None)}, trust_anchor_policy=_pinned(tmp_path)
+        {"L": _fhir_lookup_settings(spec, {}, None)},
+        trust_anchor_policy=_pinned(tmp_path),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert ex._opener["L"] is not rest._NO_REDIRECT_OPENER
     assert _opener_subjects(ex._opener["L"]) == {"mefor-lookup-ca"}
@@ -272,7 +277,9 @@ def test_without_a_ca_the_destination_keeps_the_shared_opener(factory: str) -> N
 def test_without_a_ca_the_lookup_keeps_the_shared_opener() -> None:
     spec = FhirLookup("L", url="https://fhir.internal.example.org/fhir")
     ex = FhirLookupExecutor(
-        {"L": _fhir_lookup_settings(spec, {}, None)}, trust_anchor_policy=TrustAnchorPolicy()
+        {"L": _fhir_lookup_settings(spec, {}, None)},
+        trust_anchor_policy=TrustAnchorPolicy(),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert ex._opener["L"] is rest._NO_REDIRECT_OPENER
 

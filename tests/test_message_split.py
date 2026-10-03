@@ -19,6 +19,7 @@ import pytest
 
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.parsing import Message, split_batch, split_by_obr
 from messagefoundry.transports import build_source
 
@@ -244,7 +245,8 @@ def _source(inbox: Path, **extra: object) -> object:
                 "poll_seconds": 0.01,
                 **extra,
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
 
 

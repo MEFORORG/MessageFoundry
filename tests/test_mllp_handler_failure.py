@@ -26,6 +26,7 @@ from typing import Any, NoReturn
 import pytest
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing.peek import Peek
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -326,7 +327,7 @@ async def test_end_to_end_an_ingress_commit_failure_reaches_the_sender_as_ae(
             )
         )
         reg.add_router("r", lambda m: [])
-        runner = RegistryRunner(reg, store)
+        runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
         await runner.start()
         try:
             monkeypatch.setattr(store, "enqueue_ingress", _raise_locked)

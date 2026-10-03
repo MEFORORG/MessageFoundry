@@ -25,6 +25,7 @@ from messagefoundry.config.models import (
     Priority,
     Schedule,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -161,7 +162,9 @@ async def test_no_schedule_is_always_on(store: MessageStore) -> None:
     reg = Registry()
     reg.add_inbound(build_inbound_connection("in_plain", MLLP(port=_free_port()), router="r"))
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.inbound_running("in_plain")
@@ -179,7 +182,13 @@ async def test_reconcile_starts_in_window_and_parks_out(store: MessageStore) -> 
         build_inbound_connection("in_sched", MLLP(port=_free_port()), router="r", schedule=schedule)
     )
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02, schedule_clock=clock.now)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert runner.inbound_running("in_sched")  # auto_start + inside window → up
@@ -206,7 +215,12 @@ async def test_scheduler_task_autonomously_parks_out_of_window(store: MessageSto
     )
     reg.add_router("r", lambda m: [])
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, schedule_clock=clock.now, schedule_tick=0.02
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -239,7 +253,12 @@ async def test_outbound_schedule_pauses_and_resumes_delivery(
         )
     )
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, schedule_clock=clock.now, schedule_tick=0.02
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -278,7 +297,12 @@ async def test_dual_role_name_gets_one_scheduler_per_direction(
         )
     )
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, schedule_clock=clock.now, schedule_tick=0.02
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        schedule_tick=0.02,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -384,6 +408,7 @@ async def _start_credential_fault_rig(
         schedule_clock=clock.now,
         claim_mode=claim_mode,
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -507,7 +532,10 @@ async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
         claim_mode="pooled",
         alert_sink=sink,
         infra_fault_stop_after=1,  # the first zero-progress infra fault STOPs the lane
-        infra_fault_backoff_cap=0.05,  # so a re-armed lane re-claims the re-pended head at once
+        infra_fault_backoff_cap=0.05,
+        egress=EgressSettings(
+            deny_by_default=False
+        ),  # so a re-armed lane re-claims the re-pended head at once
     )
     attempts = 0
 
@@ -569,7 +597,10 @@ async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_windo
         claim_mode="pooled",
         alert_sink=_LogPageSink(),
         infra_fault_stop_after=1,  # the first zero-progress infra fault STOPs the lane
-        infra_fault_backoff_cap=0.05,  # so a re-armed lane re-claims the re-pended head at once
+        infra_fault_backoff_cap=0.05,
+        egress=EgressSettings(
+            deny_by_default=False
+        ),  # so a re-armed lane re-claims the re-pended head at once
     )
     attempts = 0
 
@@ -632,7 +663,12 @@ async def test_a_dr_filtered_inbound_is_not_started_by_its_window(store: Message
     )
     reg.add_router("r", lambda m: [])
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, schedule_clock=clock.now, dr_threshold=Priority.CRITICAL
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        dr_threshold=Priority.CRITICAL,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -722,7 +758,12 @@ async def test_a_log_halt_is_not_restarted_or_re_paged_by_every_window_tick(
     guard = _DeadLogGuard()
     sink = _LogPageSink()
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, schedule_clock=clock.now, alert_sink=sink
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=clock.now,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -807,6 +848,7 @@ async def test_a_reload_that_adds_a_schedule_starts_its_calendar(store: MessageS
         poll_interval=0.02,
         schedule_clock=clock.now,
         schedule_tick=0.02,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -832,6 +874,7 @@ async def test_a_reload_that_edits_a_schedule_replaces_its_calendar(store: Messa
         poll_interval=0.02,
         schedule_clock=clock.now,
         schedule_tick=0.02,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -866,6 +909,7 @@ async def test_a_reload_that_removes_a_scheduled_connection_cancels_its_calendar
         poll_interval=0.02,
         schedule_clock=clock.now,
         schedule_tick=0.02,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -907,6 +951,7 @@ async def test_a_reload_that_drops_a_schedule_resumes_the_lane_its_calendar_park
         store,
         poll_interval=0.02,
         schedule_clock=clock.now,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -939,6 +984,7 @@ async def test_a_reload_does_not_re_bind_a_schedule_parked_inbound(store: Messag
         store,
         poll_interval=0.02,
         schedule_clock=clock.now,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -987,6 +1033,7 @@ async def test_a_window_open_that_cannot_bind_is_recorded_and_alerted_once(
         schedule_clock=clock.now,
         schedule_tick=0.02,
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     holder: socket.socket | None = None
@@ -1063,6 +1110,7 @@ async def test_content_stop_is_not_resumed_by_the_next_window(
         claim_mode=claim_mode,
         internal_error_default=InternalErrorPolicy.STOP,
         alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:

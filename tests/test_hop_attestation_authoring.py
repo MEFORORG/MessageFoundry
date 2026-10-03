@@ -19,6 +19,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
     StoreSettings,
@@ -267,7 +268,10 @@ def test_a_fhir_lookup_flag_written_without_its_reason_is_refused_by_the_executo
     from messagefoundry.transports.fhir import FhirLookupExecutor
 
     with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
-        FhirLookupExecutor({"fl": {"url": "https://fhir.example/fhir", "tls_hop_attested": True}})
+        FhirLookupExecutor(
+            {"fl": {"url": "https://fhir.example/fhir", "tls_hop_attested": True}},
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 def test_the_check_line_lists_every_attested_hop(tmp_path: Path) -> None:

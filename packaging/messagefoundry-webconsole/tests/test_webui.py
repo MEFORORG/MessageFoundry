@@ -28,7 +28,7 @@ from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
+from messagefoundry.config.settings import ApprovalsSettings, AuthSettings, EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -2242,7 +2242,11 @@ def test_ws_stats_payload_is_enriched(tmp_path: Path) -> None:
     from messagefoundry.api import create_managed_app
 
     app = create_managed_app(
-        db_path=tmp_path / "wsx.db", poll_interval=0.05, serve_ui=True, allow_no_auth=True
+        db_path=tmp_path / "wsx.db",
+        poll_interval=0.05,
+        serve_ui=True,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with TestClient(app) as tc, tc.websocket_connect("/ws/stats") as ws:
         data = ws.receive_json()
@@ -2260,7 +2264,12 @@ def test_ws_stats_payload_is_counts_only_without_serve_ui(tmp_path: Path) -> Non
 
     from messagefoundry.api import create_managed_app
 
-    app = create_managed_app(db_path=tmp_path / "wsx.db", poll_interval=0.05, allow_no_auth=True)
+    app = create_managed_app(
+        db_path=tmp_path / "wsx.db",
+        poll_interval=0.05,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     with TestClient(app) as tc, tc.websocket_connect("/ws/stats") as ws:
         data = ws.receive_json()
         assert "outbox_by_status" in data and isinstance(data["outbox_by_status"], dict)
@@ -7842,6 +7851,7 @@ def _managed_oidc_app(tmp_path: object, *, oidc_enabled: bool) -> object:
         auth_settings=settings,
         serve_ui=True,
         public_origin="https://ops.example",
+        egress_settings=EgressSettings(deny_by_default=False),
     )
 
 

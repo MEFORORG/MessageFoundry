@@ -15,7 +15,7 @@ import pytest
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from tests._admin_account import create_local_user_chosen
@@ -26,7 +26,9 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN999^^^H^MR||
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    e = await Engine.create(tmp_path / "p.db", poll_interval=0.02)
+    e = await Engine.create(
+        tmp_path / "p.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         yield e
     finally:

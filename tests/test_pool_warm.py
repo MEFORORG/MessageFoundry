@@ -21,6 +21,7 @@ import pytest
 
 from messagefoundry.config.settings import (
     ClusterSettings,
+    EgressSettings,
     ServiceSettings,
     StoreBackend,
     StoreSettings,
@@ -345,7 +346,7 @@ class _WarmSpyStore:
 
 async def test_engine_fire_pool_warm_creates_one_named_task() -> None:
     store = _WarmSpyStore()
-    engine = Engine(store)  # type: ignore[arg-type]  # spy store; coordinator defaults to NullCoordinator
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]  # spy store; coordinator defaults to NullCoordinator
     await engine._fire_pool_warm()
     task = engine._warm_pool_task
     assert task is not None and not task.done()
@@ -361,7 +362,7 @@ async def test_engine_refire_cancels_prior_warm_instead_of_orphaning_it() -> Non
     # The MUST-FIX: _start_graph re-runs on every leadership acquire, so a promote->demote->re-promote
     # flap must cancel the prior term's warm (never orphan it from stop()) and keep at most one alive.
     store = _WarmSpyStore()
-    engine = Engine(store)  # type: ignore[arg-type]
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]
     await engine._fire_pool_warm()
     first = engine._warm_pool_task
     assert first is not None
@@ -384,7 +385,7 @@ async def test_engine_fire_pool_warm_is_clean_on_sqlite(tmp_path: Path) -> None:
     # End-to-end with a real SQLite store: warm_pool returns immediately, so the task completes without
     # error and stop() gathers the already-done task cleanly.
     store = await MessageStore.open(tmp_path / "warm.db")
-    engine = Engine(store)
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
     try:
         await engine._fire_pool_warm()
         task = engine._warm_pool_task

@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -300,7 +301,7 @@ async def test_runner_writes_connection_events_to_store(tmp_path: Path) -> None:
             )
         )
         reg.add_router("r", lambda m: [])
-        runner = RegistryRunner(reg, store)
+        runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
         await runner.start()
         try:
             port = runner._sources["IB_T_ADT"].sockport  # type: ignore[attr-defined]

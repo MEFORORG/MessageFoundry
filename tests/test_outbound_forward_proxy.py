@@ -35,12 +35,9 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, OutboundConnection, Rest, Soap, WiringError
-from messagefoundry.pipeline.wiring_runner import (
-    _apply_egress_proxy_default,
-    _dest_config,
-    check_egress_allowed,
-)
+from messagefoundry.pipeline.wiring_runner import _apply_egress_proxy_default, _dest_config
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCredentialsProvider
 from messagefoundry.transports.rest import (
@@ -51,6 +48,7 @@ from messagefoundry.transports.rest import (
     proxy_config_from_settings,
 )
 from messagefoundry.transports.smart import SmartBackendTokenProvider
+from tests._egress_policy import permitting
 
 
 def _rsa_pem() -> str:
@@ -113,7 +111,8 @@ def _build(
                 cleartext_reason="on-prem proxy listener has no TLS" if accepted else None,
                 tls_revocation_attested=True,  # isolate the proxy behaviour from the #201 revocation gate
                 tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
-            )
+            ),
+            egress=permitting(settings),
         )
 
 
@@ -724,7 +723,8 @@ def test_fhir_lookup_executor_proxied() -> None:
                     "url": "https://fhir.example.org/fhir",
                     "proxy_url": PROXY,
                 }
-            }
+            },
+            egress=permitting({"proxy_url": PROXY}),
         )
     opener = ex._opener["epic"]
     assert opener is not _NO_REDIRECT_OPENER

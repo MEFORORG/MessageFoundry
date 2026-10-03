@@ -2079,7 +2079,7 @@ def _serve(args: argparse.Namespace) -> int:
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
-    # _allowlist_for (pipeline/wiring_runner.py). ([egress].allowed_proxy is a ninth allowed_* key and
+    # _allowlist_for (transports/egress.py). ([egress].allowed_proxy is a ninth allowed_* key and
     # is deliberately NOT one of them: it gates a transport INTERMEDIARY rather than a destination, is
     # not in _allowlist_for, and is deny-by-default on its own terms — BACKLOG #1659 — so listing a
     # proxy says nothing about where PHI may be sent and must not satisfy this gate.)
@@ -2100,9 +2100,14 @@ def _serve(args: argparse.Namespace) -> int:
         or eg.allowed_remote
         or eg.allowed_file_dirs
     )
-    if "deny_by_default" not in eg.model_fields_set:
+    deny_written = "deny_by_default" in eg.model_fields_set
+    if not deny_written:
         listed = listed or eg.allowed_smtp or eg.allowed_direct
-    egress_open = not eg.deny_by_default and not listed
+    # The gate reads whether the operator WROTE the switch true, not the field's value. The model
+    # default has been deny since vault BACKLOG #2605, so the value alone is true on a stock instance
+    # and this refusal would never fire. Without it a stock instance would start and fail every
+    # outbound as a degraded lane, rather than refusing here with one clear message.
+    egress_open = not (deny_written and eg.deny_by_default) and not listed
     if egress_open:
         # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when
         # [security].block_unlisted_outbound was set explicitly (otherwise those two count above), so
@@ -2134,23 +2139,15 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): EVERY instance defaults to
-    # FAIL-CLOSED egress whenever the field is unset, in every environment, production or not.
-    # Unless the operator explicitly set [security].block_unlisted_outbound, turn
-    # it ON here so a transport whose per-type [egress].allowed_* list is EMPTY refuses every
-    # destination of that type — closing the gap the all-or-nothing open-egress gate above leaves (a
-    # partially-configured instance would otherwise allow-any the transports it did not list). The
-    # opt-out is EXPLICIT + audited: writing [security].block_unlisted_outbound=false restores the per-list opt-in
-    # (empty = allow-any) posture. Gated on ANY PHI instance (WP243/#243, ASVS 13.2.4/13.2.5 — broadened
-    # from production-only), and every instance is a PHI instance: the flip reads no synthetic or
-    # dev condition, so no instance is exempt. A dev, loopback or staging instance flips exactly as
-    # a production one does. Placed AFTER the open-egress gate. Under enforce, a fully-open instance
-    # hits that gate's refusal first. Under warn, it gets that gate's warning and then this flip
-    # closes egress. settings.egress is the same object later passed to
-    # create_managed_app, so the in-place flip threads through to the wiring_runner egress enforcement
-    # (no forbidden-file edit).
-    if "deny_by_default" not in settings.egress.model_fields_set:
-        settings.egress.deny_by_default = True
+    # Egress deny-by-default (#186c, ASVS 13.2.4/13.2.5): EVERY instance runs FAIL-CLOSED egress unless
+    # the operator wrote [security].block_unlisted_outbound=false, so a transport whose per-type
+    # [egress].allowed_* list is EMPTY refuses every destination of that type. That closes the gap the
+    # all-or-nothing open-egress gate above leaves (a partially-configured instance would otherwise
+    # allow-any the transports it did not list). This used to be an in-place flip of a false model
+    # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
+    # and this block only announces the posture, or audits the explicit opt-out. No instance is
+    # exempt: a dev, loopback or staging instance is held to it exactly as a production one is.
+    if not deny_written:
         # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
         # like the sibling posture gates rather than logging.info.
         print(

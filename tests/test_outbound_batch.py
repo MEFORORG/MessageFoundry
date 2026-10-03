@@ -22,6 +22,7 @@ import pytest
 from _pace_probe import install_pace_probe
 
 from messagefoundry.config.models import BatchConfig, ConnectorType, Destination, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
@@ -120,7 +121,13 @@ class _Recorder:
 
 
 def _runner(store: Any, *, claim_mode: str = "per_lane") -> RegistryRunner:
-    return RegistryRunner(Registry(), store, poll_interval=0.02, claim_mode=claim_mode)
+    return RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 def _wire_batch(
@@ -331,7 +338,13 @@ async def test_a_credential_fault_on_a_batch_stops_the_lane_and_keeps_every_row(
     # the whole batch: a bad password emptied the lane's queue into the DLQ.
     mids = await _enqueue(store, 3)
     sink = _StopRecorder()
-    runner = RegistryRunner(Registry(), store, poll_interval=0.02, alert_sink=sink)
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
     _wire_batch(
         runner, _Recorder(fail=_credential_fault()), BatchConfig(max_count=5, max_wait_ms=1)
     )
@@ -356,7 +369,11 @@ async def test_the_dead_letter_policy_still_dead_letters_a_credential_faulted_ba
     # batch path that never dead-letters anything.
     mids = await _enqueue(store, 3)
     runner = RegistryRunner(
-        Registry(), store, poll_interval=0.02, credential_fault_policy="dead_letter"
+        Registry(),
+        store,
+        poll_interval=0.02,
+        credential_fault_policy="dead_letter",
+        egress=EgressSettings(deny_by_default=False),
     )
     _wire_batch(
         runner, _Recorder(fail=_credential_fault()), BatchConfig(max_count=5, max_wait_ms=1)

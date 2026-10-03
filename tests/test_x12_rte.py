@@ -19,6 +19,7 @@ import pytest
 
 import messagefoundry.parsing.x12.message as x12_message_mod
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     X12,
     Loopback,
@@ -452,7 +453,9 @@ async def _drain_reingress(
 
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         # A WALL-CLOCK deadline, not a fixed iteration count: a server backend pays network
@@ -566,7 +569,8 @@ async def test_x12_over_rest_bare_body_reingresses_and_routes(store: MessageStor
             name="OB_REST_RTE",
             type=ConnectorType.REST,
             settings=Rest(url="http://127.0.0.1:9/eligibility", capture_response=True).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     rest._opener = _Opener(_Resp(200, _271()))  # type: ignore[attr-defined]
     resp = await rest.send(EDI)
@@ -605,7 +609,8 @@ async def test_x12_over_soap_envelope_into_x12_loopback_errors_not_dropped(
             name="OB_SOAP_RTE",
             type=ConnectorType.SOAP,
             settings=Soap(url="http://127.0.0.1:9/CORE", capture_response=True).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     soap._opener = _Opener(_Resp(200, envelope.encode()))  # type: ignore[attr-defined]
     resp = await soap.send("<env/>")

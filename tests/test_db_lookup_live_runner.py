@@ -29,6 +29,7 @@ import pytest
 from messagefoundry import db_lookup
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     DatabaseLookupSpec,
@@ -181,7 +182,9 @@ def _registry(
 
 
 async def _run(reg: Registry, store: MessageStore) -> RegistryRunner:
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     return runner
 

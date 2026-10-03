@@ -33,6 +33,7 @@ from messagefoundry.config.models import (
     Destination,
     Source,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import DatabaseRef, WiringError, env
 from messagefoundry.transports.database import (
     DatabaseDestination,
@@ -131,7 +132,9 @@ async def test_poll_source_pool_passes_the_login_timeout(
 async def test_db_lookup_pool_passes_the_login_timeout(
     pool_calls: list[dict[str, Any]],
 ) -> None:
-    executor = DatabaseLookupExecutor({"clarity": dict(_SQLSERVER)})
+    executor = DatabaseLookupExecutor(
+        {"clarity": dict(_SQLSERVER)}, egress=EgressSettings(deny_by_default=False)
+    )
     with pytest.raises(_StopPool):
         await executor._get_pool("clarity")
     assert len(pool_calls) == 1
@@ -145,7 +148,7 @@ async def test_reference_sync_pool_passes_the_login_timeout(
 
     settings = {**_SQLSERVER, "statement": "SELECT code FROM t", "key_column": "code"}
     with pytest.raises(_StopPool):
-        await _load_database_source(settings, None)
+        await _load_database_source(settings, EgressSettings(deny_by_default=False))
     assert len(pool_calls) == 1
     assert pool_calls[0].get("timeout") == _LOGIN_TIMEOUT
 
@@ -210,7 +213,10 @@ def test_a_bad_connect_timeout_is_refused_on_the_generic_dialect_too() -> None:
 
 def test_a_bad_connect_timeout_is_refused_by_the_lookup_executor() -> None:
     with pytest.raises(ValueError, match="DatabaseLookup 'clarity' connect_timeout"):
-        DatabaseLookupExecutor({"clarity": {**_SQLSERVER, "connect_timeout": 0}})
+        DatabaseLookupExecutor(
+            {"clarity": {**_SQLSERVER, "connect_timeout": 0}},
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 def test_a_bad_connect_timeout_is_refused_when_a_database_ref_is_declared() -> None:
@@ -241,7 +247,10 @@ async def test_lookup_pool_keeps_its_login_timeout_whatever_the_mapping_dialect(
     pool_calls: list[dict[str, Any]],
 ) -> None:
     """The lookup always builds the SQL Server DSN, so a stray `dialect` key must not drop the bound."""
-    executor = DatabaseLookupExecutor({"clarity": {**_SQLSERVER, "dialect": "generic"}})
+    executor = DatabaseLookupExecutor(
+        {"clarity": {**_SQLSERVER, "dialect": "generic"}},
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(_StopPool):
         await executor._get_pool("clarity")
     assert pool_calls[0].get("timeout") == _LOGIN_TIMEOUT
@@ -271,5 +280,5 @@ async def test_reference_sync_refuses_a_bad_resolved_connect_timeout(
         "connect_timeout": "0",
     }
     with pytest.raises(ValueError, match="reference source connect_timeout"):
-        await _load_database_source(settings, None)
+        await _load_database_source(settings, EgressSettings(deny_by_default=False))
     assert pool_calls == []

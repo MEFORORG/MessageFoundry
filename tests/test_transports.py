@@ -26,6 +26,7 @@ from _phi_log_capture import (
 )
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import MLLP, File
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.compression import gzip_compress, gzip_decompress
@@ -221,7 +222,8 @@ async def test_file_destination_writes_named_file(tmp_path: Path) -> None:
             name="archive",
             type=ConnectorType.FILE,
             settings={"directory": str(tmp_path), "filename": "{MSH-10}.hl7"},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     await dest.send(ADT)
     out = tmp_path / "MSG00001.hl7"
@@ -235,7 +237,8 @@ async def test_file_destination_does_not_clobber(tmp_path: Path) -> None:
             name="archive",
             type=ConnectorType.FILE,
             settings={"directory": str(tmp_path), "filename": "fixed.hl7"},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     await dest.send(ADT)
     await dest.send(ADT)
@@ -304,7 +307,8 @@ async def test_file_source_reads_and_archives(tmp_path: Path) -> None:
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -334,7 +338,8 @@ async def test_file_source_keeps_persistently_failing_file_for_retry(tmp_path: P
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -370,7 +375,8 @@ async def test_file_source_quarantines_content_rejected_by_scan_hook(tmp_path: P
             Source(
                 type=ConnectorType.FILE,
                 settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
         task = asyncio.create_task(src.start(handler))
         try:
@@ -412,7 +418,8 @@ async def test_file_source_scan_hook_malfunction_fails_closed(tmp_path: Path) ->
             Source(
                 type=ConnectorType.FILE,
                 settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
         task = asyncio.create_task(src.start(handler))
         try:
@@ -545,7 +552,8 @@ async def test_file_destination_honors_encoding(tmp_path: Path) -> None:
             name="archive",
             type=ConnectorType.FILE,
             settings={"directory": str(tmp_path), "filename": "out.txt", "encoding": "latin-1"},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     payload = "PID|1||X||café\r"
     await dest.send(payload)
@@ -570,7 +578,8 @@ async def test_file_source_min_age_skips_recent_files(tmp_path: Path) -> None:
                 "poll_seconds": 0.01,
                 "min_age_seconds": 3600,  # far in the future → the fresh file is "too new"
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -600,7 +609,8 @@ async def test_file_source_after_read_delete(tmp_path: Path) -> None:
                 "poll_seconds": 0.01,
                 "after_read": "delete",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -744,7 +754,8 @@ def _file_dest(directory: Path, **over: object) -> FileDestination:
     settings: dict[str, object] = {"directory": str(directory), "filename": "msg.hl7"}
     settings.update(over)
     dest = build_destination(
-        Destination(name="OB_FILE", type=ConnectorType.FILE, settings=settings)
+        Destination(name="OB_FILE", type=ConnectorType.FILE, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, FileDestination)
     return dest
@@ -1192,7 +1203,8 @@ async def test_file_source_recursive_descends_subdirs(tmp_path: Path) -> None:
                 "poll_seconds": 0.01,
                 "recursive": True,
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -1250,7 +1262,8 @@ async def test_file_source_skips_symlink_escaping_watch_root(tmp_path: Path) -> 
                 "poll_seconds": 0.01,
                 "recursive": True,
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -1268,7 +1281,8 @@ async def test_file_destination_refuses_path_escape(
     # the destination refuses to write outside its configured directory.
     out = tmp_path / "out"
     dest = build_destination(
-        Destination(name="OB", type=ConnectorType.FILE, settings={"directory": str(out)})
+        Destination(name="OB", type=ConnectorType.FILE, settings={"directory": str(out)}),
+        egress=EgressSettings(deny_by_default=False),
     )
     monkeypatch.setattr(
         "messagefoundry.transports.file.render_filename", lambda *a, **k: "../escape.hl7"
@@ -1302,7 +1316,8 @@ async def test_file_source_sort_mtime_orders_by_time(tmp_path: Path) -> None:
                 "poll_seconds": 0.01,
                 "sort": "mtime",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -1493,7 +1508,8 @@ async def test_file_source_routes_oversized_to_error(tmp_path: Path) -> None:
                 "poll_seconds": 0.01,
                 "max_file_bytes": 100,
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -1522,7 +1538,8 @@ async def test_file_source_leaves_file_in_place_on_handler_failure(tmp_path: Pat
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -1545,7 +1562,8 @@ async def test_file_destination_gzip_compress(tmp_path: Path) -> None:
             name="archive",
             type=ConnectorType.FILE,
             settings={"directory": str(tmp_path), "filename": "out.hl7", "compress": "gzip"},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     await dest.send(ADT)
     written = tmp_path / "out.hl7.gz"
@@ -1574,7 +1592,8 @@ async def test_file_source_gunzips_before_sniff(tmp_path: Path) -> None:
                 "poll_seconds": 0.01,
                 "decompress": "gzip",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -1611,7 +1630,8 @@ async def test_file_source_quarantines_decompression_bomb(tmp_path: Path) -> Non
                 "decompress": "gzip",
                 "max_decompressed_bytes": 1024,
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -1642,7 +1662,8 @@ async def test_file_source_quarantines_corrupt_archive(tmp_path: Path) -> None:
                 "poll_seconds": 0.01,
                 "decompress": "gzip",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler))
     try:
@@ -1674,7 +1695,8 @@ async def test_file_source_gunzips_non_hl7_content_type(tmp_path: Path) -> None:
                 "poll_seconds": 0.01,
                 "decompress": "gzip",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     src.content_type = ContentType.X12  # runner injects this; set it directly
     task = asyncio.create_task(src.start(handler))
@@ -1695,7 +1717,8 @@ def test_file_connector_rejects_unsupported_compression() -> None:
                 name="ob",
                 type=ConnectorType.FILE,
                 settings={"directory": "x", "compress": "zip"},
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     with pytest.raises(ValueError, match="decompress"):
         FileSource(
@@ -1731,7 +1754,8 @@ async def test_file_source_ingests_binary_file_when_content_type_binary(tmp_path
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.pdf", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     src.content_type = ContentType.BINARY  # runner injects this; set it directly here
     task = asyncio.create_task(src.start(handler))
@@ -1770,7 +1794,8 @@ async def test_file_source_sniffs_x12_and_quarantines_non_isa(tmp_path: Path) ->
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     src.content_type = ContentType.X12  # x12 inbound → ISA sniff stays ON
     task = asyncio.create_task(src.start(handler))
@@ -1802,7 +1827,8 @@ async def test_file_source_quarantines_non_fhir_when_content_type_fhir(tmp_path:
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.fhir", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     src.content_type = ContentType.FHIR  # fhir inbound → JSON {/[ sniff ON
     task = asyncio.create_task(src.start(handler))
@@ -1832,7 +1858,8 @@ async def test_file_source_quarantines_non_hl7_when_content_type_hl7v2(tmp_path:
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     src.content_type = ContentType.HL7V2  # hl7v2 inbound → sniff stays ON
     task = asyncio.create_task(src.start(handler))
@@ -1870,7 +1897,8 @@ async def test_file_source_skips_scan_when_gate_false(tmp_path: Path) -> None:
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler, leader_gate=lambda: False))
     try:
@@ -1898,7 +1926,8 @@ async def test_file_source_processes_when_gate_true(tmp_path: Path) -> None:
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler, leader_gate=lambda: True))
     try:
@@ -1926,7 +1955,8 @@ async def test_file_source_resumes_when_gate_flips_to_true(tmp_path: Path) -> No
         Source(
             type=ConnectorType.FILE,
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     task = asyncio.create_task(src.start(handler, leader_gate=lambda: leader["on"]))
     try:

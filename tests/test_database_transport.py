@@ -23,7 +23,6 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import (
@@ -41,6 +40,7 @@ from messagefoundry.transports.database import (
     generic_odbc_no_tls_params,
     generic_odbc_tls_unenforced,
 )
+from messagefoundry.transports.egress import check_egress_allowed, check_source_allowed
 
 INSERT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
 
@@ -49,7 +49,8 @@ def _dest(**over: Any) -> DatabaseDestination:
     base: dict[str, Any] = dict(server="sql.example.com", database="MFDB", statement=INSERT)  # noqa: C408
     base.update(over)
     d = build_destination(
-        Destination(name="OB_DB", type=ConnectorType.DATABASE, settings=Database(**base).settings)
+        Destination(name="OB_DB", type=ConnectorType.DATABASE, settings=Database(**base).settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, DatabaseDestination)
     return d
@@ -393,7 +394,8 @@ def test_generic_destination_builds_without_database() -> None:
                 statement=INSERT,
                 odbc_params={"PORT": "5432"},
             ).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, DatabaseDestination)
     assert d._dialect == "generic"
@@ -416,7 +418,8 @@ def test_generic_destination_warning_names_the_connection(
                     statement=INSERT,
                     odbc_params={"SSLmode": "disable"},
                 ).settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("'OB_DB_GEN'" in m and "SSLmode=disable" in m for m in warned), warned
@@ -519,7 +522,8 @@ def test_generic_source_warning_names_the_connection(caplog: pytest.LogCaptureFi
                     odbc_driver="PostgreSQL Unicode",
                     poll_statement="SELECT 1",
                 ).settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     # `inbound:` prefixed, as every inbound record and the loosening reports spell it.
@@ -533,7 +537,8 @@ def test_sqlserver_destination_still_requires_database() -> None:
                 name="OB_DB_SS",
                 type=ConnectorType.DATABASE,
                 settings=Database(server="db.example", statement=INSERT).settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -561,7 +566,8 @@ def test_requires_core_settings(missing: str) -> None:
     base[missing] = ""
     with pytest.raises(ValueError):
         build_destination(
-            Destination(name="OB", type=ConnectorType.DATABASE, settings=Database(**base).settings)
+            Destination(name="OB", type=ConnectorType.DATABASE, settings=Database(**base).settings),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -690,7 +696,8 @@ async def test_lookup_pool_acquire_timeout_is_db_lookup_error() -> None:
     from messagefoundry.transports.database import DatabaseLookupExecutor
 
     ex = DatabaseLookupExecutor(
-        {"clarity": {"server": "s", "database": "d", "acquire_timeout": 0.05}}
+        {"clarity": {"server": "s", "database": "d", "acquire_timeout": 0.05}},
+        egress=EgressSettings(deny_by_default=False),
     )
     ex._pools["clarity"] = _HangingPool()
     with pytest.raises(DbLookupError, match="pool acquire timed out"):
@@ -764,7 +771,9 @@ def test_egress_host_port_match() -> None:
 
 
 def test_egress_unrestricted_when_empty() -> None:
-    check_egress_allowed(_db_dest("anywhere.example"), EgressSettings())  # empty = unrestricted
+    check_egress_allowed(
+        _db_dest("anywhere.example"), EgressSettings(deny_by_default=False)
+    )  # empty = unrestricted
 
 
 # === DATABASE source (poll) ==================================================
@@ -780,7 +789,10 @@ def _src(**over: Any) -> DatabaseSource:
         server="sql.example.com", database="MFDB", poll_statement=POLL, mark_statement=MARK
     )
     base.update(over)
-    s = build_source(Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings))
+    s = build_source(
+        Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(s, DatabaseSource)
     return s
 
@@ -1126,7 +1138,10 @@ def test_source_requires_core_settings(missing: str) -> None:
     base: dict[str, Any] = dict(server="s", database="d", poll_statement=POLL)  # noqa: C408
     base[missing] = ""
     with pytest.raises(ValueError):
-        build_source(Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings))
+        build_source(
+            Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 # --- source connect-allowlist ([egress].allowed_db) --------------------------
@@ -1153,7 +1168,9 @@ def test_source_connect_permits_listed_server() -> None:
 
 
 def test_source_connect_unrestricted_when_empty() -> None:
-    check_source_allowed(_src_cfg("anywhere.example"), "IB_DB", EgressSettings())
+    check_source_allowed(
+        _src_cfg("anywhere.example"), "IB_DB", EgressSettings(deny_by_default=False)
+    )
 
 
 def test_source_connect_ignores_non_database_source() -> None:

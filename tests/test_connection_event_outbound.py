@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import AlertRule
+from messagefoundry.config.settings import AlertRule, EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection, Registry
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -45,7 +45,13 @@ def _runner_with_outbound(
             ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 1}),
         )
     )
-    return RegistryRunner(reg, store, alert_sink=sink, **kw)  # type: ignore[arg-type]
+    return RegistryRunner(
+        reg,
+        store,
+        alert_sink=sink,  # type: ignore[arg-type]
+        egress=EgressSettings(deny_by_default=False),
+        **kw,  # type: ignore[arg-type]
+    )
 
 
 def _drain(runner: RegistryRunner) -> list[dict]:

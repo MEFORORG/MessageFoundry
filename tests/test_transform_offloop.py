@@ -22,6 +22,7 @@ import pytest
 
 from messagefoundry.config.active_environment import current_environment
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -101,7 +102,9 @@ async def test_transform_runs_off_main_thread(store: MessageStore, tmp_path: Pat
         return Send("file_out", str(m))
 
     reg = _registry(inbox, outdir, lambda m: ["h"], {"h": handle})
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         await _until_stat(store, OutboxStatus.DONE.value, 1)
@@ -120,7 +123,9 @@ async def test_router_runs_off_main_thread(store: MessageStore, tmp_path: Path) 
         return ["h"]
 
     reg = _registry(inbox, outdir, route, {"h": lambda m: Send("file_out", str(m))})
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         await _until_stat(store, OutboxStatus.DONE.value, 1)
@@ -156,7 +161,9 @@ async def test_slow_handler_does_not_stall_the_loop(store: MessageStore, tmp_pat
             ticks += 1
 
     reg = _registry(inbox, outdir, lambda m: ["h"], {"h": slow})
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     tick_task = asyncio.ensure_future(ticker())
     await runner.start()
     try:
@@ -187,7 +194,13 @@ async def test_provider_resolves_off_loop(store: MessageStore, tmp_path: Path) -
         return Send("file_out", f"env={env}")
 
     reg = _registry(inbox, outdir, lambda m: ["h"], {"h": handle})
-    runner = RegistryRunner(reg, store, poll_interval=0.02, active_environment="staging")
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        active_environment="staging",
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         await _until_stat(store, OutboxStatus.DONE.value, 1)

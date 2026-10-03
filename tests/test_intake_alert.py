@@ -20,7 +20,12 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AlertRule, StoreBackend
+from messagefoundry.config.settings import (
+    _ALERT_EVENT_TYPES,
+    AlertRule,
+    EgressSettings,
+    StoreBackend,
+)
 from messagefoundry.pipeline import intake_bound
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, intake_pause_detail
@@ -383,6 +388,7 @@ async def test_the_engine_hands_its_sink_to_the_monitor_and_clears_off_bounds(
         tmp_path / "engine.db",
         retention_settings=RetentionSettings(),
         alert_sink=cast(AlertSink, sink),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     await engine.start()
     try:
@@ -399,7 +405,11 @@ async def test_an_engine_with_both_bounds_off_still_clears_both(tmp_path: Path) 
     from messagefoundry.pipeline.engine import Engine
 
     sink = _RecordingSink()
-    engine = await Engine.create(tmp_path / "engine2.db", alert_sink=cast(AlertSink, sink))
+    engine = await Engine.create(
+        tmp_path / "engine2.db",
+        alert_sink=cast(AlertSink, sink),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     await engine.start()
     try:
         assert sink.kinds(DEPTH) == ["resumed"] and sink.kinds(DISK) == ["resumed"]

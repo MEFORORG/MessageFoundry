@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
@@ -95,7 +96,12 @@ async def _row_state(store: MessageStore, mid: str) -> tuple[str, int, str | Non
 def _runner(store: MessageStore, sink: _RecordingSink, *, policy: str = "stop") -> RegistryRunner:
     reg = Registry()
     return RegistryRunner(
-        reg, store, poll_interval=0.02, alert_sink=sink, credential_fault_policy=policy
+        reg,
+        store,
+        poll_interval=0.02,
+        alert_sink=sink,
+        credential_fault_policy=policy,
+        egress=EgressSettings(deny_by_default=False),
     )
 
 
@@ -235,4 +241,9 @@ async def test_dead_letter_policy_dead_letters_the_configuration_fault(store: Me
 
 def test_credential_fault_policy_validated_at_construction(store: MessageStore) -> None:
     with pytest.raises(AssertionError):
-        RegistryRunner(Registry(), store, credential_fault_policy="bogus")
+        RegistryRunner(
+            Registry(),
+            store,
+            credential_fault_policy="bogus",
+            egress=EgressSettings(deny_by_default=False),
+        )

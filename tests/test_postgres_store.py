@@ -28,6 +28,7 @@ from uuid import uuid4
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, RetryPolicy, Validation
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing.binary import chunk_b64, is_doc_ref, parse_doc_ref
 from messagefoundry.parsing.message import Message
@@ -231,7 +232,9 @@ async def test_ingest4_nul_ingress_persists_error_row(store) -> None:
 
     from messagefoundry.parsing import RawMessage
 
-    runner = RegistryRunner(_ingest4_registry(), store)
+    runner = RegistryRunner(
+        _ingest4_registry(), store, egress=EgressSettings(deny_by_default=False)
+    )
     ic = runner.registry.inbound["IB_HL7"]
 
     # Non-vacuity: on an UNENCRYPTED store (the default; mfenc base64 would otherwise be NUL-free) an
@@ -3619,7 +3622,7 @@ async def test_mllp_inbound_commits_ingress_before_aa(store) -> None:
     # raw to the ingress stage. Assert the AA reply AND that the committed ingress row is visible +
     # claimable — the AA was not returned ahead of a durable commit (count-and-log intact).
     reg = _mllp_inbound_registry("IB_MLLP", lambda m: [])
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     ack = await runner._handle_inbound(reg.inbound["IB_MLLP"], RAW.encode("utf-8"))
     assert ack is not None and Peek.parse(ack).field("MSA-1") == "AA"  # positive ACK to the sender
     ing = await store.claim_next_fifo("IB_MLLP", stage=Stage.INGRESS.value)
@@ -3635,7 +3638,7 @@ async def test_mllp_post_ingress_failure_errors_without_nak(store) -> None:
     # second reply/NAK: _handle_inbound wrote the one AA; _process_ingress_item holds no sender socket
     # and returns a control-flow outcome, never an ACK string.
     reg = _mllp_inbound_registry("IB_MLLP", lambda m: ["ghost"])  # names an unregistered handler
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     ack = await runner._handle_inbound(reg.inbound["IB_MLLP"], RAW.encode("utf-8"))
     assert (
         ack is not None and Peek.parse(ack).field("MSA-1") == "AA"
@@ -4594,7 +4597,9 @@ async def test_over_threshold_detaches_verbatim_pg(store) -> None:
     b64 = _big_b64(2000)  # ~2668 base64 chars, well over the 500-byte message threshold
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
-    runner = RegistryRunner(_streaming_registry(ic), store)
+    runner = RegistryRunner(
+        _streaming_registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -4623,7 +4628,9 @@ async def test_below_threshold_byte_identical_pg(store) -> None:
     raw = _hl7_with_doc(b64)
     assert len(raw) < 5000
     ic = _streaming_ic(threshold=5000)
-    runner = RegistryRunner(_streaming_registry(ic), store)
+    runner = RegistryRunner(
+        _streaming_registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -4641,7 +4648,9 @@ async def test_over_max_message_bytes_naks_ar_pg(store) -> None:
     # total cap (Peek.parse) → NAK AR + ERROR, before any detach.
     ic = _streaming_ic(threshold=500, max_message_bytes=1000)
     assert len(raw) > 1000
-    runner = RegistryRunner(_streaming_registry(ic), store)
+    runner = RegistryRunner(
+        _streaming_registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -4656,7 +4665,12 @@ async def test_stream_inflight_budget_naks_ae_pg(store) -> None:
     b64 = _big_b64(2000)
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
-    runner = RegistryRunner(_streaming_registry(ic), store, stream_inflight_budget_bytes=10)
+    runner = RegistryRunner(
+        _streaming_registry(ic),
+        store,
+        stream_inflight_budget_bytes=10,
+        egress=EgressSettings(deny_by_default=False),
+    )
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -4675,7 +4689,9 @@ async def test_ack_fires_after_skeleton_and_incref_commit_pg(store) -> None:
     # durable (the two-object commit) — count-and-log holds on the server store.
     b64 = _big_b64(1500)
     ic = _streaming_ic(threshold=500)
-    runner = RegistryRunner(_streaming_registry(ic), store)
+    runner = RegistryRunner(
+        _streaming_registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
 
     ack = await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
     assert _stream_ack_code(ack) == "AA"
@@ -4694,7 +4710,9 @@ async def test_crash_orphan_sweep_and_rerun_dedups_pg(store) -> None:
     b64 = _big_b64(1500)
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
-    runner = RegistryRunner(_streaming_registry(ic), store)
+    runner = RegistryRunner(
+        _streaming_registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
 
     skeleton, refs = await runner._detach_documents(ic, raw)
     assert len(refs) == 1
@@ -4722,7 +4740,9 @@ async def test_strict_downgraded_to_header_only_over_threshold_pg(store, monkeyp
     monkeypatch.setattr(wiring_runner, "validate", _boom)
     b64 = _big_b64(2000)
     ic = _streaming_ic(threshold=500, strict=True)
-    runner = RegistryRunner(_streaming_registry(ic), store)
+    runner = RegistryRunner(
+        _streaming_registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
 
     ack = await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
     assert _stream_ack_code(ack) == "AA"  # RECEIVED, not blocked by (skipped) strict validation
