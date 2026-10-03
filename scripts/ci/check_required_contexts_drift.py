@@ -71,7 +71,11 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT))
-from tests._workflow_contexts import required_contexts  # noqa: E402
+from scripts.ci.required_contexts import (  # noqa: E402
+    branch_protection_contexts,
+    file_contexts,
+    gh_api,
+)
 
 _CANONICAL = ".github/required-contexts.txt"
 
@@ -82,7 +86,8 @@ def _server_contexts(repo: str | None, branch: str, branch_json: Path | None) ->
     Deliberately NOT ``.../protection``: that endpoint carries ``strict`` but needs admin scope and
     401s without it. This one exposes ``protection.required_status_checks.contexts`` to an anonymous
     reader, so the check runs under the workflow's existing read-only token -- and would still run on a
-    fork PR, where no elevated token exists.
+    fork PR, where no elevated token exists. The reader is shared with the release's provenance gate
+    (scripts/ci/required_contexts.py).
     """
     if branch_json is not None:
         payload = json.loads(branch_json.read_text(encoding="utf-8"))
@@ -92,25 +97,8 @@ def _server_contexts(repo: str | None, branch: str, branch_json: Path | None) ->
             if repo
             else f"repos/{{owner}}/{{repo}}/branches/{branch}"
         )
-        # B603 asks whether untrusted input reaches a subprocess. It cannot here: argv is a fixed
-        # literal list, there is no shell, and the only variable elements are `--repo`/`--branch`,
-        # operator-typed CLI arguments on a CI runner -- not message, config, or network data.
-        out = subprocess.run(  # noqa: S603  # nosec B603 B607 - fixed argv, no shell, operator repo
-            ["gh", "api", endpoint], capture_output=True, text=True, timeout=120
-        )
-        if out.returncode != 0:
-            raise RuntimeError(f"gh api failed ({out.returncode}): {out.stderr.strip()[:400]}")
-        payload = json.loads(out.stdout)
-
-    protection = payload.get("protection") or {}
-    checks = protection.get("required_status_checks") or {}
-    contexts = checks.get("contexts")
-    if contexts is None:
-        raise RuntimeError(
-            "the branch payload carried no required_status_checks.contexts -- the API shape changed, "
-            "or this branch is unprotected. Either way it is not an empty required set."
-        )
-    return [str(c) for c in contexts]
+        payload = gh_api([endpoint])
+    return branch_protection_contexts(payload)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -124,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    declared = required_contexts()
+    declared = file_contexts()
     if not declared:
         print(
             f"::error::{_CANONICAL} parsed to ZERO contexts -- the format changed under the parser. "
