@@ -110,12 +110,10 @@ _POSTGRES = {"backend": "postgres", "server": "db.example", "database": "mf", "u
 
 
 def _service(auth: dict[str, Any], **sections: dict[str, Any]) -> dict[str, Any]:
+    """A fresh ``ServiceSettings`` input; every section mapping also carries the sentinels."""
     data: dict[str, Any] = {"auth": auth, "api": {"public_origin": "https://ops.example"}}
     data.update(sections)
-    for value in data.values():
-        if isinstance(value, dict):
-            value.update(_CARRIER)
-    return data
+    return {k: {**v, **_CARRIER} if isinstance(v, dict) else v for k, v in data.items()}
 
 
 #: ``case id -> (the [auth] mapping, the other sections, a fragment of the refusal it must hit)``.
@@ -269,9 +267,7 @@ def _assert_clean(exc: ValidationError, case: str) -> None:
 
 def _validate_service(case: str) -> ValidationError:
     auth, sections, fragment = _AUTH_CASES[case]
-    data = _service(
-        dict(auth), **{k: v if not isinstance(v, dict) else dict(v) for k, v in sections.items()}
-    )
+    data = _service(auth, **sections)
     with pytest.raises(ValidationError) as caught:
         ServiceSettings.model_validate(data)
     assert fragment in str(caught.value), (case, str(caught.value))
@@ -295,7 +291,7 @@ _DIRECT_CASES = sorted(
 def test_a_refusal_from_auth_settings_directly_echoes_no_secret(case: str) -> None:
     auth, _, fragment = _AUTH_CASES[case]
     with pytest.raises(ValidationError, match=fragment.replace("[", r"\[")) as caught:
-        AuthSettings.model_validate(dict(auth))
+        AuthSettings.model_validate(auth)
     _assert_clean(caught.value, case)
     with pytest.raises(ValidationError) as constructed:
         AuthSettings(**auth)

@@ -343,7 +343,13 @@ class _InputHidingModel(BaseModel):
     def __get_pydantic_core_schema__(
         cls, source: type[BaseModel], handler: GetCoreSchemaHandler
     ) -> core_schema.CoreSchema:
-        return core_schema.no_info_wrap_validator_function(_refuse_without_input, handler(source))
+        schema = handler(source)
+        # A section nested in ServiceSettings hands back its own stored schema, already wrapped.
+        if schema["type"] == "function-wrap" and schema["function"]["function"] is (
+            _refuse_without_input
+        ):
+            return schema
+        return core_schema.no_info_wrap_validator_function(_refuse_without_input, schema)
 
 
 class _Section(_InputHidingModel):
@@ -3574,13 +3580,16 @@ class AuthSettings(_Section):
         # The signing key's two rules above, for the secret. The resolver reads a whitespace-only
         # reference as set, and the reference wins silently over the literal.
         secret_ref = self.oidc_client_secret_ref
-        if not self.oidc_private_key_jwt and secret_ref is not None and not given(secret_ref):
-            raise ValueError("oidc_client_secret_ref is set but blank; remove it or give a value")
-        if not self.oidc_private_key_jwt and given(self.oidc_client_secret) and given(secret_ref):
-            raise ValueError(
-                "set oidc_client_secret or oidc_client_secret_ref, not both: the reference would "
-                "be used and the other ignored"
-            )
+        if not self.oidc_private_key_jwt:
+            if secret_ref is not None and not given(secret_ref):
+                raise ValueError(
+                    "oidc_client_secret_ref is set but blank; remove it or give a value"
+                )
+            if given(self.oidc_client_secret) and given(secret_ref):
+                raise ValueError(
+                    "set oidc_client_secret or oidc_client_secret_ref, not both: the reference "
+                    "would be used and the other ignored"
+                )
         stray = [
             name
             for name in (
