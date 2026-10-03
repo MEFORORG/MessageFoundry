@@ -173,7 +173,9 @@ async def test_load_sender_records_a_refusal_that_lands_in_the_stop_grace(
     async def peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         await reader.read(65536)
         received.set()
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(
+            1.0
+        )  # well past the writer's 0.1 s stop poll, so this lands in the grace
         writer.write(frame(_ack_of(_CAP + 1)))
         await writer.drain()
         await reader.read()
@@ -290,8 +292,8 @@ def test_coord_message_over_the_cap_is_refused_not_polled_forever(
         c.read(coord.SHARDS_READY)
     with pytest.raises(coord.CoordMessageRefused):
         asyncio.run(c.await_message(coord.SHARDS_READY, timeout=5.0, interval=0.01))
-    # Every caller's abort path catches CoordTimeout; a refusal must take that path too.
-    assert issubclass(coord.CoordMessageRefused, coord.CoordTimeout)
+    # Not a timeout: callers that treat a timeout as "optional message absent" must not swallow it.
+    assert not issubclass(coord.CoordMessageRefused, coord.CoordTimeout)
 
 
 def test_coord_message_not_posted_still_reads_none(tmp_path: Path) -> None:

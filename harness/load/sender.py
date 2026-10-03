@@ -235,18 +235,22 @@ class PersistentConnection:
         # grace (set by stop()) before cancelling the reader.
         if wtask in done and rtask is not None and not rtask.done():
             await self._grace_for_acks(rtask, self._stop_grace)
-        for task in pending:
+        # Re-split AFTER the grace: a reader that finished inside it is done now, and cancelling it
+        # is a no-op whose exception (an over-cap ACK refused, say) the gather below would swallow.
+        done = {t for t in tasks if t.done()}
+        for task in tasks - done:
             task.cancel()
-        results = await asyncio.gather(*pending, return_exceptions=True)
-        # The reader may have FINISHED during the ACK grace after `pending` was taken: cancel() is a
-        # no-op then, and gather would swallow its refusal. Re-raise it so `_run` still records it.
-        for result in results:
-            if isinstance(result, MLLPFrameError):
-                raise result
-        for task in done:
-            exc = task.exception()
-            if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                raise exc
+        await asyncio.gather(*(tasks - done), return_exceptions=True)
+        # Retrieve every finished task's exception, writer first, so a peer reset the writer saw is
+        # what `_run` records (a drop) and no exception is left unretrieved.
+        errors = [
+            exc
+            for task in (wtask, rtask)
+            if task is not None and task in done and not task.cancelled()
+            if (exc := task.exception()) is not None
+        ]
+        if errors:
+            raise errors[0]
 
     async def _grace_for_acks(self, rtask: asyncio.Task[None], grace: float = 2.0) -> None:
         loop = asyncio.get_running_loop()

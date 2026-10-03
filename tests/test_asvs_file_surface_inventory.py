@@ -812,6 +812,16 @@ def test_every_harness_client_is_named_in_the_client_row_and_capped() -> None:
     for rel in {k.split("::")[0] for k in clients} | set(HARNESS_HAND_KEPT_CLIENTS):
         assert f"`{rel}`" in first_cell, f"{rel} is not named in the harness client row"
     assert "`messagefoundry/apiclient/client.py`" in first_cell
+    for rel, const in HARNESS_HAND_KEPT_CLIENTS.items():
+        tree = ast.parse((_ROOT / rel).read_text(encoding="utf-8"))
+        capped = [
+            c
+            for c in ast.walk(tree)
+            if isinstance(c, ast.Call)
+            and _call_name(c) == "read"
+            and any(isinstance(a, ast.Name) and a.id == const for a in c.args)
+        ]
+        assert capped, f"{rel} no longer reads through {const}"
     assert http_driver.MAX_REPLY_BYTES == 64 * 1024
     for needle in (
         f"DEFAULT_MAX_FRAME_BYTES` = {_size(DEFAULT_MAX_FRAME_BYTES)}",
