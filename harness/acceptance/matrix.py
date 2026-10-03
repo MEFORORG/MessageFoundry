@@ -378,7 +378,7 @@ MATRIX: tuple[MatrixRow, ...] = (
     ),
     _row(
         "F2",
-        "Native TOTP MFA for local accounts (WP-14)",
+        "Native TOTP MFA for local and directory accounts (WP-14)",
         ONCE,
         Coverage.PYTEST,
         ("tests/test_step_up.py", "tests/test_mfa.py"),

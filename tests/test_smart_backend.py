@@ -33,13 +33,13 @@ from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.fhir import FhirDestination
 from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.signing import (
+    CLIENT_ASSERTION_TYPE,
     CompactJwtSigner,
     SigningError,
     _b64u_decode,
     _verify,
 )
 from messagefoundry.transports.smart import (
-    _CLIENT_ASSERTION_TYPE,
     SmartAuthError,
     SmartBackendTokenProvider,
     token_provider_from_destination,
@@ -372,7 +372,7 @@ def test_asvs_191_smart_oauth_controls_exercised(rsa_pem: str) -> None:
     # 10.4.10 — the confidential client authenticates the token backchannel with private_key_jwt and
     # carries NO shared secret in any form.
     assert form["grant_type"] == ["client_credentials"]
-    assert form["client_assertion_type"] == [_CLIENT_ASSERTION_TYPE]
+    assert form["client_assertion_type"] == [CLIENT_ASSERTION_TYPE]
     assert len(form["client_assertion"][0].split(".")) == 3  # a compact JWS (header.claims.sig)
     assert not ({"client_secret", "client_secret_post", "client_secret_basic"} & form.keys())
 
@@ -659,7 +659,7 @@ def test_audit_token_post_never_asserts_a_token_value(rsa_pem: str) -> None:
     token = provider.access_token()
     form = urllib.parse.parse_qs(opener.requests[0].data.decode())  # type: ignore[union-attr]
     # The assertion is PRESENT and compact (three dot-separated segments) — shape only, not its bytes.
-    assert form["client_assertion_type"] == [_CLIENT_ASSERTION_TYPE]
+    assert form["client_assertion_type"] == [CLIENT_ASSERTION_TYPE]
     assert len(form["client_assertion"][0].split(".")) == 3
     # The bearer round-trips opaquely; we never pin its value beyond "non-empty str" (no value coupling).
     assert isinstance(token, str) and token

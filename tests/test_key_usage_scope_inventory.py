@@ -60,6 +60,8 @@ _KEY_MATERIAL = frozenset(
         "Inbound XML-DSig verification",
         "SFTP transport",
         "SMART Backend Services client assertion",
+        # BACKLOG #296: the OIDC relying party's private_key_jwt key, the same shape as SMART's.
+        "OIDC private_key_jwt client assertion",
         # BACKLOG #1163: surfaces the 2026-08-20 research found with no row of their own.
         "DR backup archive",
         "TOTP shared secret",

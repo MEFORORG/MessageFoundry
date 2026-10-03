@@ -74,6 +74,8 @@ CRITICAL_SECRETS: dict[str, str] = {
     "MEFOR_STORE_PASSWORD": "SQL/Postgres store password",
     "MEFOR_AUTH_AD_BIND_PASSWORD": "Active Directory bind password",
     "MEFOR_AUTH_OIDC_CLIENT_SECRET": "Federated OIDC confidential-client secret (ADR 0142)",
+    "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY": "Federated OIDC private_key_jwt signing key (BACKLOG #296)",
+    "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD": "its passphrase (BACKLOG #296)",
     "MEFOR_ALERTS_EMAIL_PASSWORD": "SMTP alert password",
     "MEFOR_AI_API_KEY": "AI engine-broker LLM credential (ADR 0135)",
     "MEFOR_API_TLS_KEY_PASSWORD": "off-loopback TLS private-key passphrase",
