@@ -147,10 +147,14 @@ class ReloadOutcome:
       engine that does not exist, and reporting plain success would hide a step an operator has to
       go finish by hand -- so the partial outcome is its own answer (ASVS 2.3.3, BACKLOG #1111).
 
-    A dry run applies nothing, so it reports ``applied`` False with no failures."""
+    A dry run applies nothing, so it reports ``applied`` False with no failures.
+
+    ``directory`` is the resolved directory this call loaded, applied or not. A dry run's audit row
+    reads it here, because :attr:`Engine.last_reload_dir` moves only on an applied reload."""
 
     registry: Registry
     applied: bool
+    directory: Path
     failures: tuple[ReloadStepFailure, ...] = ()
 
     @property
@@ -539,11 +543,14 @@ class Engine:
         # and so the engine's own reloads, which pass the resolved startup dir, always pass.
         configured = [*config_reload_roots, *([config_dir] if config_dir else [])]
         self._reload_roots_lexical = lexical_roots([*configured, *self._reload_roots])
-        # The directory the most recent reload loaded from (resolved) — for audit by the API.
+        # The directory the most recent APPLIED reload loaded from (resolved). The provenance drift
+        # check and set_connection_flag both trust it to name where the running graph came from, so
+        # a dry run or a failed reload never moves it (vault BACKLOG #2598).
         self.last_reload_dir: Path | None = None
         # ADR 0041 D1 (config provenance, item C): the content fingerprint + best-effort git commit of
-        # the graph currently loaded, captured at each successful non-dry-run load. None until the first
-        # load or when fingerprinting failed. Read by GET /config/provenance to report the running commit
+        # the graph currently loaded, captured at the start's first load (capture_start_provenance,
+        # vault BACKLOG #2597) and at each successful non-dry-run reload. None before either, or when
+        # fingerprinting failed. Read by GET /config/provenance to report the running commit
         # and detect on-disk DRIFT. Holds only a one-way hash + a commit sha — never resolved env values.
         self.loaded_config_fingerprint: dict[str, object] | None = None
 
@@ -1793,7 +1800,7 @@ class Engine:
 
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
-        config_dir = self.last_reload_dir or self.config_dir
+        config_dir = self.running_config_dir
         if config_dir is None:
             raise WiringError(
                 "no config directory is configured — a connection flag cannot be persisted"
@@ -1853,6 +1860,43 @@ class Engine:
                         rr.registry.outbound[name], flagged=flagged
                     )
 
+    @property
+    def running_config_dir(self) -> Path | None:
+        """The directory the running graph came from: the last applied reload's, else the startup
+        ``--config`` dir. The provenance drift check and :meth:`set_connection_flag` read it."""
+        return self.last_reload_dir or self.config_dir
+
+    async def fingerprint_bundle(self, path: Path) -> tuple[dict[str, object] | None, str | None]:
+        """The ADR 0041 D1 content fingerprint of ``path``, or ``(None, reason)`` when it cannot be read.
+
+        The one best-effort rule for every load: the start, an applied reload and a dry run all call
+        it, so a bundle one of them tolerates cannot make another refuse (vault BACKLOG #2597).
+        OSError is an unreadable file; ValueError is a VCS head that is not UTF-8
+        (UnicodeDecodeError). Anything else, such as an ImportError of the fingerprint module, still
+        raises. The reason is a :func:`safe_exc` rendering, logged here at WARNING."""
+        from messagefoundry.config.fingerprint import config_fingerprint_detail
+
+        try:
+            return await asyncio.to_thread(config_fingerprint_detail, path), None
+        except (OSError, ValueError) as exc:
+            reason = safe_exc(exc)
+            log.warning("config fingerprint failed for %s: %s", path, reason)
+            return None, reason
+
+    async def capture_start_provenance(self) -> str | None:
+        """Take the provenance baseline for the graph a start loaded from :attr:`config_dir`.
+
+        The start's first load is the lifespan's, not :meth:`reload_detail`, so without this call
+        :attr:`loaded_config_fingerprint` stayed ``None`` until the first reload and ``GET
+        /config/provenance`` could not see drift after a plain start (vault BACKLOG #2597). The
+        caller runs it right after the first load, so the digest covers the bytes that load read.
+        An unreadable bundle leaves the baseline ``None`` and the start goes on. Returns the
+        failure reason, or ``None`` when the digest was taken or there is no config dir."""
+        if self.config_dir is None:
+            return None
+        self.loaded_config_fingerprint, reason = await self.fingerprint_bundle(self.config_dir)
+        return reason
+
     def guard_registry(self, registry: Registry) -> None:
         """Run the engine's registry guard over ``registry``; raises ``WiringError`` to refuse it.
 
@@ -1910,7 +1954,8 @@ class Engine:
         resolve **within** an allowed reload root (the startup dir + ``config_reload_roots``);
         otherwise :class:`ConfigReloadDenied` is raised — the loader executes Python, so an
         arbitrary client path must never be honoured. The resolved directory is recorded on
-        :attr:`last_reload_dir` for auditing.
+        :attr:`last_reload_dir` only once a non-dry-run reload has swapped the graph; every outcome
+        also carries it as :attr:`ReloadOutcome.directory`.
 
         Validates first (a bad config raises before anything is swapped, so the running graph is
         left untouched), then atomically swaps via the runner's quiesce-and-swap reload. If the
@@ -1950,7 +1995,6 @@ class Engine:
         # Off the event loop: the resolve opens the target and each parent, and a slow volume would
         # otherwise stall every listener for as long as that takes (vault BACKLOG #2581).
         path = await asyncio.to_thread(self._resolve_reload_target, config_dir)
-        self.last_reload_dir = path
         if not await asyncio.to_thread(path.is_dir):
             raise FileNotFoundError(f"config directory not found: {config_dir}")
         # Re-gather this environment's values so a reload/promote picks up edited environments/<env>.toml
@@ -2069,7 +2113,7 @@ class Engine:
                 coordinator=self._coordinator,
             )
             checker.build_check(registry)
-            return ReloadOutcome(registry=registry, applied=False)
+            return ReloadOutcome(registry=registry, applied=False, directory=path)
         # ADR 0041 D1 (config provenance, item C): fingerprint the bundle BEFORE the swap. The digest
         # is a pure, offline fold over the directory's file BYTES (config/fingerprint.py). It never
         # reads the live graph, so computing it here is meaning-preserving, and it narrows the window
@@ -2077,18 +2121,12 @@ class Engine:
         # here also means a failure the OSError guard never covered (an ImportError on the local
         # import, say) aborts the reload while the OLD graph is still live, instead of surfacing as a
         # failed reload with the NEW graph already serving. The value is ASSIGNED only after the swap.
-        fingerprint: dict[str, object] | None
-        try:
-            from messagefoundry.config.fingerprint import config_fingerprint_detail
-
-            fingerprint = await asyncio.to_thread(config_fingerprint_detail, path)
-        except OSError as exc:
-            # Still best-effort: an unreadable bundle leaves provenance unknown rather than refusing
-            # an otherwise-applicable config. Recorded as a step failure so the caller is not told the
-            # reload was clean when GET /config/provenance will report nothing.
-            log.warning("config fingerprint before reload failed for %s: %s", path, exc)
-            fingerprint = None
-            failures.append(ReloadStepFailure("config_fingerprint", safe_exc(exc)))
+        # Still best-effort: an unreadable bundle leaves provenance unknown rather than refusing an
+        # otherwise-applicable config. Recorded as a step failure so the caller is not told the
+        # reload was clean when GET /config/provenance will report nothing.
+        fingerprint, fingerprint_failure = await self.fingerprint_bundle(path)
+        if fingerprint_failure is not None:
+            failures.append(ReloadStepFailure("config_fingerprint", fingerprint_failure))
         if runner is None:
             runner = self.add_registry(registry)
             try:
@@ -2107,8 +2145,10 @@ class Engine:
         # reported as a PARTIAL outcome, never as a failed reload. Telling the caller the reload
         # failed while the new graph serves traffic would be a false report, and reporting plain
         # success would hide a step an operator still has to finish by hand.
-        # Provenance is now the NEW bundle's (the digest was taken above, before the swap).
+        # Provenance is now the NEW bundle's (the digest was taken above, before the swap), and so is
+        # the directory it came from. Set together and only here (vault BACKLOG #2598).
         self.loaded_config_fingerprint = fingerprint
+        self.last_reload_dir = path
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
@@ -2147,7 +2187,9 @@ class Engine:
                 len(failures),
                 ", ".join(f.step for f in failures),
             )
-        return ReloadOutcome(registry=registry, applied=True, failures=tuple(failures))
+        return ReloadOutcome(
+            registry=registry, applied=True, directory=path, failures=tuple(failures)
+        )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
         """Resolve the reload target and enforce the allow-list (see :class:`ConfigReloadDenied`).

@@ -98,7 +98,11 @@ from messagefoundry.auth.policy import (
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
-from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
+from messagefoundry.config.secretprovider import (
+    SecretProvider,
+    SecretProviderError,
+    resolve_connector_secret,
+)
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
 from messagefoundry.controlchars import scrub_log_argument
@@ -1774,6 +1778,87 @@ def _refuse_idp_revocation(
         guard.enforce_construction()
 
 
+def _resolve_oidc_credential(
+    provider: SecretProvider | None, *, ref: str | None, literal: str | None, setting: str
+) -> str:
+    """Resolve one ``[auth]`` OIDC client credential, naming the setting the operator wrote.
+
+    ``resolve_connector_secret`` names a reference ``<label>_secret``, which is the AD and SMTP
+    spelling. These references are ``<setting>_ref``, so its no-provider refusal is worded here
+    instead. A credential that resolves empty is refused too, since it would send no credential.
+    """
+    if ref and provider is None:
+        raise SecretProviderError(
+            f"[auth].{setting}_ref is set but [secrets].provider is unset ('none'). Set "
+            "[secrets].provider (e.g. 'vault'), or remove the reference to use the "
+            "environment-sourced value."
+        )
+    value = resolve_connector_secret(provider, ref=ref, literal=literal, label=f"[auth].{setting}")
+    if not value:
+        named = f"{setting}_ref" if ref else setting
+        raise SecretProviderError(f"[auth].{named} resolved to an empty value")
+    return value
+
+
+def oidc_client_auth_from_settings(
+    settings: AuthSettings, secret_provider: SecretProvider | None
+) -> oidc.ClientAuthentication:
+    """The configured OIDC client credential, resolved and checked (BACKLOG #296).
+
+    The ONE construction, shared by :class:`AuthService` and ``messagefoundry verify --section
+    federation``, so the check resolves exactly what the engine sends. Only the configured method's
+    credential is resolved, which may call the ``[secrets]`` provider.
+
+    Raises :class:`SecretProviderError` for a reference that does not resolve, a credential that
+    resolves empty, or a key reference that resolves to anything but a PEM key, and :class:`~messagefoundry.transports.signing.SigningError` for a key or
+    certificate that cannot be read, parsed or used with the configured algorithm. None of these
+    messages carries a credential.
+    """
+    if not settings.oidc_private_key_jwt:
+        secret = _resolve_oidc_credential(
+            secret_provider,
+            ref=settings.oidc_client_secret_ref,
+            literal=settings.oidc_client_secret,
+            setting="oidc_client_secret",
+        )
+        return oidc.ClientSecretPost(secret)
+    key = _resolve_oidc_credential(
+        secret_provider,
+        ref=settings.oidc_client_private_key_ref,
+        literal=settings.oidc_client_private_key,
+        setting="oidc_client_private_key",
+    )
+    # The signer reads a value with no PEM header as a file path. A secret-store value must be the
+    # key itself, never a path the store chooses, so a reference that resolves to anything else is
+    # refused here, naming the reference rather than a file.
+    if settings.oidc_client_private_key_ref and "-----BEGIN" not in key:
+        raise SecretProviderError(
+            "[auth].oidc_client_private_key_ref did not resolve to a PEM key; the referenced "
+            "secret must hold the key itself"
+        )
+    audience = (
+        settings.oidc_issuer
+        if settings.oidc_client_assertion_audience == "issuer"
+        else settings.oidc_token_endpoint
+    )
+    # Unreachable while the settings validator holds, since both callers run only with oidc_enabled
+    # set. Kept so a future caller's gap fails here, by name, not in the signer as an empty string.
+    if not settings.oidc_client_id or not audience:
+        raise ValueError(
+            "private_key_jwt needs oidc_client_id and the assertion audience "
+            f"(oidc_{settings.oidc_client_assertion_audience})"
+        )
+    return oidc.PrivateKeyJwtClientAuth(
+        client_id=settings.oidc_client_id,
+        audience=audience,
+        private_key=key,
+        algorithm=settings.oidc_client_assertion_algorithm,
+        private_key_password=settings.oidc_client_private_key_password,
+        key_id=settings.oidc_client_assertion_key_id,
+        certificate=settings.oidc_client_certificate,
+    )
+
+
 class AuthService:
     """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory."""
 
@@ -1940,19 +2025,17 @@ class AuthService:
         self._reconcile_unkeyed_reported: set[str] = set()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
-        self._oidc_client_secret: str | None = None
+        self._oidc_client_auth: oidc.ClientAuthentication | None = None
         self._oidc_jwks: oidc.JwksCache | None = None
         self._oidc_flows: oidc.FlowCache | None = None
         if settings.oidc_enabled:
             # A SEPARATE branch from the ldap one above: secret_provider is otherwise consumed only
             # inside `elif settings.ad_enabled`, so every test that injects ldap= would skip secret
             # resolution entirely and the reference would be dead in tests but live in production.
-            self._oidc_client_secret = resolve_connector_secret(
-                secret_provider,
-                ref=settings.oidc_client_secret_ref,
-                literal=settings.oidc_client_secret,
-                label="[auth].oidc_client_secret",
-            )
+            # BACKLOG #296: exactly one client credential is resolved, the one the configured method
+            # sends. Under private_key_jwt the key is read and checked here, so a missing,
+            # unreadable, weak or wrong-curve key refuses startup like an unresolvable secret.
+            self._oidc_client_auth = oidc_client_auth_from_settings(settings, secret_provider)
             # Eager: a bad CA path or an unresolvable secret must refuse startup, exactly as the AD
             # bind password does. NO network I/O happens here — JwksCache opens no socket until its
             # first get_key — so an UNREACHABLE IdP still constructs cleanly (AC-8).
@@ -3196,7 +3279,7 @@ class AuthService:
         payload = oidc.exchange_code(
             token_endpoint=self._settings.oidc_token_endpoint or "",
             client_id=self._settings.oidc_client_id or "",
-            client_secret=self._oidc_client_secret,
+            client_auth=self._oidc_client_auth,
             code=code,
             redirect_uri=redirect_uri,
             code_verifier=flow.code_verifier,

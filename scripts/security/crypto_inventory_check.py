@@ -320,6 +320,9 @@ INVENTORY: dict[str, frozenset[str]] = {
         {"cryptography", "hmac", "messagefoundry.transports.signing"}
     ),
     "messagefoundry/auth/oidc/flow.py": frozenset({"hashlib", "hmac", "secrets"}),
+    # BACKLOG #296: the private_key_jwt client assertion. Its claims, its jti and its signature are
+    # all the shared signing module's (transports/signing.py).
+    "messagefoundry/auth/oidc/client_auth.py": frozenset({"messagefoundry.transports.signing"}),
     "messagefoundry/auth/oidc/jwks.py": frozenset(
         {"cryptography", "messagefoundry.transports.signing"}
     ),
@@ -587,11 +590,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/rest.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "ssl"}
     ),
-    "messagefoundry/transports/signing.py": frozenset({"cryptography"}),
-    # ADR 0024: a random `jti` for the SMART Backend Services client_assertion JWT (the JWT signing
-    # itself reuses signing.py's `cryptography`).
+    # BACKLOG #296: `secrets` draws the random `jti` in client_assertion_claims, the one RFC 7523
+    # claim builder the SMART client and the OIDC private_key_jwt client share.
+    "messagefoundry/transports/signing.py": frozenset({"cryptography", "hmac", "secrets"}),
+    # ADR 0024: the SMART Backend Services client_assertion JWT. Its claims (and their random `jti`)
+    # and its signature both come from signing.py since BACKLOG #296.
     "messagefoundry/transports/smart.py": frozenset(
-        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing", "secrets"}
+        {"messagefoundry.config.tls_policy", "messagefoundry.transports.signing"}
     ),
     # BACKLOG #1171 retired ws_password_type='digest', which was this file's only hashlib use (the
     # WS-Security PasswordDigest SHA-1 construction). The row is bidirectional, so the token had to go
@@ -637,11 +642,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # when it CHANGED, and compares it to the stored fingerprint through
     # pipeline.secret_rotation.fingerprints_equal: constant-time over bytes, the same compare the
     # rotation watcher uses (ASVS 11.2.4, BACKLOG #1167), never a bare `!=`.
+    # BACKLOG #296: provision-admin also imports SigningError, to give a refused OIDC
+    # private_key_jwt key a fixed text; it signs nothing.
     "messagefoundry/__main__.py": frozenset(
         {
             "messagefoundry.config.tls_policy",
             "messagefoundry.store.crypto",
             "messagefoundry.store.keyprovider",
+            "messagefoundry.transports.signing",
         }
     ),
     # ADR 0019 §5: the `vault` connector-secret provider does a Vault KV v2 read of a connector
@@ -693,6 +701,22 @@ INVENTORY: dict[str, frozenset[str]] = {
             "hvac",
             "messagefoundry.config.tls_policy",
             "messagefoundry.store.keyprovider",
+        }
+    ),
+    # BACKLOG #305 (ASVS 13.2.2): check-privileges reads each Vault token's own policies and
+    # capabilities through the providers' own client builders (store_vault_client, the Transit
+    # cipher's and the KEK's required-path helpers), so it carries their TLS narrowing, anchor and
+    # cleartext refusal and builds no client of its own. tls_policy and keyprovider are imported only
+    # to recognise the engine's fixed-text refusals (InsecureHopRefused, KeyProviderError). hashlib:
+    # a SHA-256 digest of each Vault token, held in memory only to tell whether two hops hold the
+    # same token, and never printed. No encrypt, decrypt, MAC or key load.
+    "messagefoundry/privilege_probes.py": frozenset(
+        {
+            "hashlib",
+            "messagefoundry.config.tls_policy",
+            "messagefoundry.store.crypto_transit",
+            "messagefoundry.store.keyprovider",
+            "messagefoundry.store.keyprovider_vault",
         }
     ),
     # --- non-messagefoundry roots (#283's _CRYPTO_SITES_OUTSIDE_THE_PACKAGE, now walked by this gate) ---
@@ -978,6 +1002,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/oidc/flow.py": frozenset(
         {"compare:hmac.compare_digest", "csprng:secrets.token_bytes", "hash:hashlib.sha256"}
     ),
+    "messagefoundry/auth/oidc/client_auth.py": frozenset(
+        {"csprng:via messagefoundry.transports.signing", "sign_verify:.sign()"}
+    ),
     "messagefoundry/auth/oidc/jwks.py": frozenset(
         {
             "key_cert:.public_key()",
@@ -1251,6 +1278,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
         }
     ),
+    # BACKLOG #305: check-privileges digests each Vault token with SHA-256 to tell whether two hops
+    # hold the same token. An identity comparison held in memory, never printed or stored.
+    "messagefoundry/privilege_probes.py": frozenset({"hash:hashlib.sha256"}),
     # BACKLOG #300: `_build_client` takes the Vault hop's narrowed context from
     # tls_policy.assert_hvac_tls_suites and mounts it, so a TLS context is built here now.
     "messagefoundry/store/keyprovider_vault.py": frozenset(
@@ -1417,8 +1447,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
+    # BACKLOG #296: certificate_thumbprint loads the OIDC client certificate, compares its public key
+    # to the signing key's by SubjectPublicKeyInfo bytes, and sends only its SHA-256 thumbprint.
     "messagefoundry/transports/signing.py": frozenset(
         {
+            "compare:hmac.compare_digest",
+            "csprng:secrets.token_urlsafe",
+            "key_cert:.public_bytes()",
+            "key_cert:cryptography.x509.load_pem_x509_certificate",
             "key_cert:.public_key()",
             "key_cert:cryptography.hazmat.primitives.serialization.load_pem_private_key",
             "key_cert:messagefoundry.keywrap.key_wrap_refusal",
@@ -1429,7 +1465,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/transports/smart.py": frozenset(
         {
-            "csprng:secrets.token_urlsafe",
+            "csprng:via messagefoundry.transports.signing",
             "key_cert:via messagefoundry.transports.rest",
             "sign_verify:.sign()",
             "tls_context:via messagefoundry.transports.rest",

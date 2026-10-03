@@ -360,7 +360,9 @@ const home: Receiver = {
 // --- Security Settings ---------------------------------------------------------------------------
 
 /** Recorded 2026-09-29 from `messagefoundry security show --json` over a settings file with one
- *  loosened switch (require_mfa = false), which is what securityEditor.ts refresh() posts. */
+ *  loosened switch (require_mfa = false), which is what securityEditor.ts refresh() posts. The
+ *  require_mfa risk string was edited by hand on 2026-10-02 to the engine's corrected text (vault
+ *  BACKLOG 1133); the rest is as recorded. */
 const SECURITY_SHOW: Payload = {
   "values": {
     "local_access_only": true,
@@ -438,7 +440,7 @@ const SECURITY_SHOW: Payload = {
   "loosenings": [
     {
       "switch": "require_mfa",
-      "risk": "every account is single-factor \u2014 no engine second factor is required, and a directory session is admitted on a ticket that asserts no strength"
+      "risk": "an account with no second factor enrolled is single-factor, so a Kerberos session enters on a ticket that asserts no strength. An enrolled account owes its factor only while it keeps one, and its holder may remove the last. Where an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on, that claim stands in for the enrolled factor"
     }
   ],
   "loosenings_partial": false,

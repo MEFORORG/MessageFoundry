@@ -45,17 +45,21 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    GetCoreSchemaHandler,
+    ValidationError,
     ValidationInfo,
+    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
+from pydantic_core import ErrorDetails, InitErrorDetails, PydanticCustomError, core_schema
 
 from messagefoundry.api_tls_source import api_tls_source
 from messagefoundry.childenv import outside_engine_namespace
@@ -139,6 +143,8 @@ __all__ = [
     "KEYLESS_REFUSED_BY_NO_OPT_OUT",
     "KEYLESS_REFUSED_BY_NO_STRICT_ACK",
     "KEYLESS_REFUSED_BY_UNREAD_KEY",
+    "OIDC_SECOND_FACTOR_CLAIM_EXCEPTION",
+    "oidc_second_factor_claim_exception",
 ]
 
 #: Known config sections (used to parse ``MEFOR_<SECTION>_<KEY>`` env vars).
@@ -188,10 +194,17 @@ _FILE_SECRET_KEYS = (
     ("store", "encryption_keys_retired"),
     ("auth", "ad_bind_password"),
     ("auth", "oidc_client_secret"),  # ADR 0142: env only (MEFOR_AUTH_OIDC_CLIENT_SECRET)
+    ("auth", "oidc_client_private_key_password"),  # BACKLOG #296: env only
     ("alerts", "email_password"),
     ("api", "tls_key_password"),
     ("ai", "api_key"),  # ADR 0135: engine-broker LLM credential — env only (MEFOR_AI_API_KEY)
 )
+
+#: (section, key) fields that take inline PEM or a path to a PEM file. Only inline PEM in the config
+#: file warns; a path there is the [api].tls_key_file pattern (see _warn_file_secrets). "Inline" is
+#: the signer's own test, a "-----BEGIN" header (transports/signing.py `_read_key_material`); config
+#: cannot import transports, so the test is restated there and here.
+_FILE_INLINE_PEM_KEYS = (("auth", "oidc_client_private_key"),)  # BACKLOG #296
 
 
 class StoreBackend(str, Enum):  # noqa: UP042
@@ -289,7 +302,88 @@ def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
     return value
 
 
-class _Section(BaseModel):
+#: What a settings validation error shows in place of the value it refused (BACKLOG #296).
+HIDDEN_INPUT = "[not shown]"
+
+
+#: Every error type pydantic-core knows. One of these is rebuilt from its own template and ``ctx``,
+#: so the rendered message is never fed back in as a template, where a ``{error}`` the operator
+#: wrote would be substituted again at each level.
+_KNOWN_ERROR_TYPES = frozenset(get_args(core_schema.ErrorType))
+
+
+def _without_input(err: ErrorDetails) -> InitErrorDetails:
+    """One error, rebuilt with :data:`HIDDEN_INPUT` in place of its input."""
+    if err["type"] in _KNOWN_ERROR_TYPES:
+        detail = InitErrorDetails(type=err["type"], loc=err["loc"], input=HIDDEN_INPUT)
+        if "ctx" in err:
+            detail["ctx"] = err["ctx"]
+        # A PydanticCustomError may reuse a known type name with another ctx (pydantic's own
+        # EmailStr raises 'value_error' with a 'reason'), which the known template refuses.
+        try:
+            ValidationError.from_exception_data("probe", [detail])
+        except (TypeError, ValueError, KeyError):
+            pass
+        else:
+            return detail
+    # A validator's own PydanticCustomError: keep its type and rendered message, with no context,
+    # so the message is not formatted a second time.
+    return InitErrorDetails(
+        type=PydanticCustomError(err["type"], err["msg"]), loc=err["loc"], input=HIDDEN_INPUT
+    )
+
+
+def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
+    """Validate ``value``; on a refusal, re-raise every error with its input replaced.
+
+    A refusal from an ``after``-mode model validator carries the whole section's input mapping as
+    its ``input``, and ``str(exc)``, ``repr(exc)``, ``exc.errors()`` and ``exc.json()`` all render
+    it. That mapping holds whatever secrets the section reads from the environment, so any caller
+    that prints or logs the error would disclose them. ``hide_input_in_errors`` is not enough: it
+    hides the input from ``str`` and ``repr`` only, and only on the outermost model.
+
+    Each error keeps its location, type and message, and a known type keeps its ``ctx`` (a
+    validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT ONLY. The message
+    and ``ctx`` are written by the validator, and a validator that quotes the value it refused
+    still shows it there: at least the ``[backup]`` and ``[dr]`` cloud-URL refusals and the
+    ``[api].trusted_proxies`` entry refusals do. None of those is meant to hold a secret, but a URL
+    can carry one, so a validator message must name the setting, never quote a secret value.
+    """
+    try:
+        return handler(value)
+    except ValidationError as exc:
+        title, errors = exc.title, exc.errors(include_url=False)
+    # Rebuilt OUTSIDE the handler: anything raised while rebuilding would otherwise carry the
+    # original, input-bearing error on its __context__.
+    raise ValidationError.from_exception_data(title, [_without_input(err) for err in errors])
+
+
+class _InputHidingModel(BaseModel):
+    """A settings model whose validation errors never carry the value they refused (BACKLOG #296).
+
+    The wrap sits OUTSIDE the whole model schema, its own validators included, so it holds for
+    direct construction and for the model nested in another one. A per-raise helper cannot, since
+    the next plain ``ValueError`` added to a validator would bring the echo back.
+    """
+
+    # Keeps the placeholder, and its misleading input_type of str, out of str(exc); errors() and
+    # json() still carry the placeholder. Inherited and merged into each subclass's own config.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: type[BaseModel], handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        schema = handler(source)
+        # A section nested in ServiceSettings hands back its own stored schema, already wrapped.
+        if schema["type"] == "function-wrap" and schema["function"]["function"] is (
+            _refuse_without_input
+        ):
+            return schema
+        return core_schema.no_info_wrap_validator_function(_refuse_without_input, schema)
+
+
+class _Section(_InputHidingModel):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
     # (_reject_unknown_file_keys). A model-level extra="forbid" would refuse the engine's OWN writes:
     # _env_overrides scrapes every MEFOR_<section>_<key> into its section dict, and a dozen documented
@@ -2897,6 +2991,31 @@ class AuthSettings(_Section):
     # `_ref` suffix (not the house `_secret`) avoids the absurd `oidc_client_secret_secret`; ADR 0142.
     oidc_client_secret: str | None = None
     oidc_client_secret_ref: str | None = None
+    # BACKLOG #296: how the engine authenticates to the token endpoint. `client_secret_post` (the
+    # default, byte-identical to before) sends the secret above. `private_key_jwt` (OIDC Core section
+    # 9, RFC 7523) sends a short-lived JWT signed with the private key below instead, and no secret;
+    # the two are exclusive, so a configured credential is always the one that is sent.
+    oidc_token_endpoint_auth_method: Literal["client_secret_post", "private_key_jwt"] = (
+        "client_secret_post"
+    )
+    # The signing key: inline PEM (ENV: MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY; inline PEM in the config
+    # file warns) or a path to a PEM file, or a [secrets].provider reference in the `_ref` field. Read
+    # eagerly at startup, so a missing, unreadable, weak or wrong-curve key refuses to start.
+    oidc_client_private_key: str | None = None
+    oidc_client_private_key_ref: str | None = None
+    oidc_client_private_key_password: str | None = None  # env only (_FILE_SECRET_KEYS warns)
+    # Asymmetric only: the enum holds no `none` and no HMAC algorithm, so neither can be configured.
+    oidc_client_assertion_algorithm: SignatureAlgorithm = SignatureAlgorithm.RS256
+    oidc_client_assertion_key_id: str | None = None  # JWS `kid`, for an IdP holding several keys
+    # The X.509 certificate holding the key's public half (inline PEM or a path; public, not secret).
+    # When set, every assertion carries its `x5t#S256` thumbprint, which is how an IdP that registers
+    # a certificate (Entra ID) finds the key. Refused at startup unless it holds the signing key's
+    # public half.
+    oidc_client_certificate: str | None = None
+    # The assertion `aud`: the pinned token endpoint (OIDC Core section 9; Entra ID and Okta require
+    # it), or the pinned issuer for an IdP that asks for its issuer identifier. A closed choice, so
+    # the assertion is only ever addressed to a URL already pinned and allow-listed here.
+    oidc_client_assertion_audience: Literal["token_endpoint", "issuer"] = "token_endpoint"
     oidc_authorization_endpoint: str | None = None  # https, pinned
     oidc_token_endpoint: str | None = None  # https, pinned
     oidc_jwks_uri: str | None = None  # https, pinned
@@ -3097,8 +3216,8 @@ class AuthSettings(_Section):
             if text.startswith("["):
                 # The helper returns rather than raises, so this refusal has no decode error on its
                 # chain (BACKLOG #2085). It also turns json's RecursionError on a deeply nested value
-                # into a refusal. It hides nothing else: pydantic's error still quotes the raw value
-                # as input_value.
+                # into a refusal. The raw value stays out of the error's input too, as for every
+                # settings model (_InputHidingModel, BACKLOG #296).
                 parsed, refusal = json_loads_or_refusal(text)
                 if refusal is not None:
                     raise ValueError(
@@ -3373,6 +3492,14 @@ class AuthSettings(_Section):
             )
         return self
 
+    @property
+    def oidc_private_key_jwt(self) -> bool:
+        """Whether the OIDC client authenticates with a signed assertion, not a secret (BACKLOG #296).
+
+        The one comparison every reader shares, so no two of them can spell the method differently.
+        """
+        return self.oidc_token_endpoint_auth_method == "private_key_jwt"  # nosec B105 -- a method name, not a credential
+
     @model_validator(mode="after")
     def _require_oidc_fields(self) -> AuthSettings:
         """Federated OIDC needs its pinned endpoints + a fail-closed posture when enabled (ADR 0142).
@@ -3421,14 +3548,101 @@ class AuthSettings(_Section):
         # understand. `if not value` is already the emptiness test used by the `missing` list ten lines
         # above; this line was the only one in the validator that disagreed. Whitespace is stripped for the
         # test only — the value itself is never rewritten.
+        def given(*values: str | None) -> bool:
+            return any((v or "").strip() for v in values)
+
+        has_secret = given(self.oidc_client_secret, self.oidc_client_secret_ref)
+        # BACKLOG #296. The same blank-is-missing rule for the signing key.
+        has_key = given(self.oidc_client_private_key, self.oidc_client_private_key_ref)
+        if self.oidc_private_key_jwt and not has_key:
+            raise ValueError(
+                "oidc_token_endpoint_auth_method='private_key_jwt' requires a NON-EMPTY signing "
+                "key: set oidc_client_private_key (inline PEM via "
+                "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY, or a path to a PEM file) or "
+                "oidc_client_private_key_ref (a [secrets].provider reference)",
+            )
+        # The signer sends any non-empty `kid` verbatim, so a blank or space-padded one would reach
+        # the IdP as a key id that matches nothing. Refused rather than trimmed. A blank certificate
+        # or passphrase is refused for the same reason: either would be used as given.
+        kid = self.oidc_client_assertion_key_id
         if (
-            not (self.oidc_client_secret or "").strip()
-            and not (self.oidc_client_secret_ref or "").strip()
+            self.oidc_private_key_jwt
+            and kid is not None
+            and (not kid.strip() or kid != kid.strip())
         ):
+            raise ValueError(
+                "oidc_client_assertion_key_id is blank or has leading or trailing whitespace",
+            )
+        # The key reference too: the resolver treats a whitespace-only reference as set, and an
+        # empty one as unset, so only the whitespace-only one is refused.
+        blank = [
+            name
+            for name in ("oidc_client_certificate", "oidc_client_private_key_password")
+            if getattr(self, name) is not None and not given(getattr(self, name))
+        ]
+        key_ref = self.oidc_client_private_key_ref
+        if key_ref and not given(key_ref):
+            blank.append("oidc_client_private_key_ref")
+        if self.oidc_private_key_jwt and blank:
+            raise ValueError(f"{', '.join(blank)} is set but blank; remove it or give a value")
+        # The provider reference would win silently over the literal, so both is refused.
+        if (
+            self.oidc_private_key_jwt
+            and given(self.oidc_client_private_key)
+            and given(self.oidc_client_private_key_ref)
+        ):
+            raise ValueError(
+                "set oidc_client_private_key or oidc_client_private_key_ref, not both: the "
+                "reference would be used and the other ignored",
+            )
+        # A credential the configured method never sends is a live credential nobody uses. Refused
+        # rather than ignored, so the configuration says exactly what goes on the wire.
+        if self.oidc_private_key_jwt and has_secret:
+            raise ValueError(
+                "oidc_token_endpoint_auth_method='private_key_jwt' never sends the client "
+                "secret: remove oidc_client_secret / oidc_client_secret_ref",
+            )
+        if not self.oidc_private_key_jwt and not has_secret:
             raise ValueError(
                 "oidc_enabled requires a NON-EMPTY client secret: set oidc_client_secret (via "
                 "MEFOR_AUTH_OIDC_CLIENT_SECRET) or oidc_client_secret_ref (a [secrets].provider "
-                "reference). An env var exported with no value counts as missing."
+                "reference). An env var exported with no value counts as missing.",
+            )
+        # The signing key's two rules above, for the secret. The resolver reads a whitespace-only
+        # reference as set, and the reference wins silently over the literal. An EMPTY reference
+        # reads as unset everywhere (an env var exported with no value), so only whitespace refuses.
+        secret_ref = self.oidc_client_secret_ref
+        if not self.oidc_private_key_jwt:
+            if secret_ref and not given(secret_ref):
+                raise ValueError(
+                    "oidc_client_secret_ref is set but blank; remove it or give a value"
+                )
+            if given(self.oidc_client_secret) and given(secret_ref):
+                raise ValueError(
+                    "set oidc_client_secret or oidc_client_secret_ref, not both: the reference "
+                    "would be used and the other ignored"
+                )
+        stray = [
+            name
+            for name in (
+                "oidc_client_private_key",
+                "oidc_client_private_key_ref",
+                "oidc_client_private_key_password",
+                "oidc_client_assertion_key_id",
+                "oidc_client_certificate",
+            )
+            if given(getattr(self, name))
+        ]
+        # A non-default assertion shape set beside the secret method is dead config too.
+        if self.oidc_client_assertion_algorithm is not SignatureAlgorithm.RS256:
+            stray.append("oidc_client_assertion_algorithm")
+        if self.oidc_client_assertion_audience != "token_endpoint":
+            stray.append("oidc_client_assertion_audience")
+        if not self.oidc_private_key_jwt and stray:
+            raise ValueError(
+                f"{', '.join(stray)} apply only with "
+                "oidc_token_endpoint_auth_method='private_key_jwt'; the configured method is "
+                "'client_secret_post', which sends the client secret and no assertion",
             )
 
         # Every pinned URL must be https (no dev escape — this is an off-box trust boundary) and its
@@ -3443,8 +3657,14 @@ class AuthSettings(_Section):
             ("oidc_jwks_uri", self.oidc_jwks_uri),
         ):
             parts = urlsplit(url or "")
+            # Neither refusal quotes the URL: it can carry credentials in its userinfo, and with
+            # no "https://" urlsplit reads the text before the first ':' as the scheme.
             if parts.scheme != "https":
-                raise ValueError(f"[auth].{name} must be an https URL (got {url!r})")
+                raise ValueError(f"[auth].{name} must be an https URL")
+            # A user name or password in a pinned URL would be printed by verify and, for the
+            # token endpoint, sent as the assertion's aud. Refused rather than stripped.
+            if parts.username is not None or parts.password is not None:
+                raise ValueError(f"[auth].{name} must not carry a user name or password")
             if parts.hostname not in allowed:
                 raise ValueError(
                     f"[auth].{name} host {parts.hostname!r} is not in oidc_allowed_endpoints "
@@ -4900,6 +5120,8 @@ ENFORCEABLE_SECRET_EXPIRY_CLASSES: frozenset[str] = frozenset(
         "MEFOR_AUTH_AD_BIND_PASSWORD",
         "MEFOR_ALERTS_EMAIL_PASSWORD",
         "MEFOR_AUTH_OIDC_CLIENT_SECRET",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD",
         "MEFOR_API_TLS_KEY_PASSWORD",
         "MEFOR_STORE_VAULT_TOKEN",
         "MEFOR_SECRETS_VAULT_TOKEN",
@@ -5834,7 +6056,7 @@ class SecuritySettings(_Section):
         return "serve_web_console" in self.model_fields_set
 
 
-class ServiceSettings(BaseModel):
+class ServiceSettings(_InputHidingModel):
     model_config = ConfigDict(extra="ignore")  # tolerate forward-looking/unknown sections
 
     security: SecuritySettings = Field(default_factory=SecuritySettings)
@@ -6038,15 +6260,26 @@ def _warn_file_secrets(file_data: Mapping[str, Any], path: Path) -> None:
     for section, key in _FILE_SECRET_KEYS:
         sect = file_data.get(section)
         if isinstance(sect, dict) and sect.get(key) is not None:
-            _log.warning(
-                "secret [%s].%s is set in %s; move it to env (MEFOR_%s_%s) — the config file is "
-                "not a safe place for secrets",
-                section,
-                key,
-                path,
-                section.upper(),
-                key.upper(),
-            )
+            _warn_file_secret(section, key, path)
+    # A key-or-path field is a secret only when it holds the key itself. A path in the file is the
+    # TLS-key pattern and fine; inline PEM is not (BACKLOG #296).
+    for section, key in _FILE_INLINE_PEM_KEYS:
+        sect = file_data.get(section)
+        value = sect.get(key) if isinstance(sect, dict) else None
+        if isinstance(value, str) and "-----BEGIN" in value:
+            _warn_file_secret(section, key, path)
+
+
+def _warn_file_secret(section: str, key: str, path: Path) -> None:
+    _log.warning(
+        "secret [%s].%s is set in %s; move it to env (MEFOR_%s_%s) — the config file is "
+        "not a safe place for secrets",
+        section,
+        key,
+        path,
+        section.upper(),
+        key.upper(),
+    )
 
 
 def _section_models() -> dict[str, type[BaseModel]]:
@@ -6815,6 +7048,29 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     return out
 
 
+#: The one sign-in that proves a second factor without an enrolled one, worded once for the MFA
+#: advisories here and the exposure texts in ``__main__._serve``. ``_check_mfa_gate`` checks the
+#: amr/acr claim, and the OIDC mint stamps the session verified, only while this setting is on.
+#: Neither this name nor the helper's below may hold ``mfa`` as a separate word. CodeQL reads such a
+#: name as a password source (the ``mfa_verify_min_elapsed_seconds`` note above, same cause), so
+#: every log line carrying this fixed sentence would raise ``py/clear-text-logging-sensitive-data``.
+OIDC_SECOND_FACTOR_CLAIM_EXCEPTION = (
+    "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
+)
+
+
+def oidc_second_factor_claim_exception(auth: AuthSettings) -> str:
+    """``", unless <OIDC_SECOND_FACTOR_CLAIM_EXCEPTION>"`` when THIS instance has that exception,
+    else ``""``.
+
+    For the startup texts, which describe one running config rather than a switch. With OIDC off, or
+    with the claim gate off, every OIDC session mints unverified, so naming the exception there would
+    tell an auditor reading the AUDIT line that OIDC users are covered when none are."""
+    if auth.oidc_enabled and auth.oidc_require_mfa_claim:
+        return f", unless {OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}"
+    return ""
+
+
 def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
@@ -7047,9 +7303,9 @@ def security_loosenings(
             (
                 "require_mfa",
                 "an account with no second factor enrolled is single-factor, so a Kerberos session "
-                "enters on a ticket that asserts no strength. An enrolled account must still "
-                "satisfy its factor, and an OIDC sign-in still needs a checked amr/acr claim while "
-                "[auth].oidc_require_mfa_claim is on",
+                "enters on a ticket that asserts no strength. An enrolled account owes its factor "
+                "only while it keeps one, and its holder may remove the last. Where "
+                f"{OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}, that claim stands in for the enrolled factor",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7059,9 +7315,8 @@ def security_loosenings(
             (
                 "require_mfa_scope",
                 "a local account without the Administrator role is single-factor until it enrolls "
-                "a second factor. Administrators and directory accounts still owe one; an OIDC "
-                "sign-in meets it with an amr/acr claim checked while "
-                "[auth].oidc_require_mfa_claim is on",
+                "a second factor. Administrators and directory accounts still owe one, unless "
+                f"{OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:
@@ -7071,7 +7326,7 @@ def security_loosenings(
                 "an EXPOSED instance under enforcement = enforce may start with "
                 "[security].require_mfa off, on an audited warning instead of the refusal. Every "
                 "account with no second factor enrolled is then single-factor over the network, "
-                "unless an OIDC sign-in carries a checked amr/acr claim",
+                f"unless {OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}",
             )
         )
     if not sec.encrypt_stored_data:
@@ -7485,62 +7740,30 @@ def security_loosenings(
 def settings_error_detail(exc: Exception) -> str:
     """Render a :func:`load_settings` failure WITHOUT echoing any configured value.
 
-    WHY ``str(exc)`` IS NOT SAFE HERE. ``str(ValidationError)`` carries ``input_value=`` for every
-    failing field, and for an ``after``-mode model validator that value is the whole section's input
-    mapping. The secrets in ``_FILE_SECRET_KEYS`` come from the environment
-    (``MEFOR_STORE_PASSWORD`` and siblings) and are in that mapping, so one missing ``[store].server``
-    renders the store password into whatever the caller does with the string -- stdout, a pasted
-    ticket, a PowerShell ``throw`` in a transcript. Field path plus message, never ``input`` and never
-    ``ctx``, is enough for an operator to find the key and carries no configured value at all.
+    WHY ``str(exc)`` WAS NOT SAFE. Pydantic gives every error an ``input``, and for an ``after``-mode
+    model validator that is the whole section's input mapping. The secrets in ``_FILE_SECRET_KEYS``
+    come from the environment (``MEFOR_STORE_PASSWORD`` and siblings) and are in that mapping, so one
+    missing ``[store].server`` rendered the store password into whatever the caller did with the
+    string. A long value is not safer: pydantic abbreviates a long ``input_value`` repr from the
+    middle, so a 32-character password loses its head and discloses its tail.
 
-    A LONG VALUE IS NOT SAFER: pydantic abbreviates a long ``input_value`` repr from the middle, so a
-    32-character password loses its head and discloses its tail.
+    SINCE BACKLOG #296 THE SETTINGS MODELS STRIP THE INPUT THEMSELVES. Every ``_Section`` and
+    :class:`ServiceSettings` re-raises each error with its input replaced by :data:`HIDDEN_INPUT`
+    (``_InputHidingModel``), so ``str(exc)``, ``exc.errors()`` and ``exc.json()`` carry the
+    placeholder, never the refused mapping. That covers
+    the ``__main__.py`` arms that still print ``str(exc)`` (at least ``audit-verify``,
+    ``rotate-key`` and the store commands behind ``_host_gated_store_settings``). ``serve`` and
+    ``supervise`` already rendered through this function, by way of ``_load_service_settings``.
 
-    THIS IS THE RENDERER TO REACH FOR, AND AT LEAST FIFTEEN CALLERS STILL DO NOT REACH FOR IT.
-    "At least", and never an enumeration, for two reasons this paragraph has already been wrong about
-    once each.
+    THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
+    refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``
+    cloud-URL refusals and the ``[api].trusted_proxies`` entry refusals do. None of them is meant to
+    hold a secret, but a URL can carry one, so a validator message must name the setting and never
+    quote a secret value. The OIDC URL refusals quote no part of the URL for that reason.
 
-    FIRST, THE NUMBER IS A MEASUREMENT AND NOT AN INVARIANT. Nothing gates a new ``except`` arm, so
-    the next one lands without touching this paragraph; PR 1141 was open with one in it while this
-    was being written. Re-measure before you quote it.
-
-    SECOND, AND THIS IS THE ONE THAT BIT: THE INSTRUMENT DECIDES THE ANSWER, so read what it asked.
-    This paragraph used to say SEVEN arms, then SIX, then FIVE, each from an AST walk for a literal
-    ``str(<bound>)`` in the handler. That walk is BLIND TO AN F-STRING, and most of these sites use
-    one. Re-run over ``messagefoundry/__main__.py`` at ``19c98e023`` asking instead whether the bound
-    exception reaches ANY string rendering -- ``str()``, an f-string, ``%`` or ``.format`` -- of the
-    20 ``except`` arms naming ``ValidationError``, **16** render it, not five. The narrow instrument
-    was not measuring a smaller problem; it was measuring a smaller part of the same one. The earlier
-    counts are kept above as what they were: readings, from a tool that answered an adjacent question.
-
-    SO NO LIST HERE IS THE POPULATION. #1523 fixed ``_cluster_vip``; this change fixed ``_ai_policy``
-    (and this paragraph said those five were what remained, under the narrow walk, until the broad
-    one was run). ``ai-policy`` is also the only one RUN and confirmed to disclose a planted
-    ``MEFOR_STORE_PASSWORD``, first here and now pinned by ``tests/test_cli_ai_policy.py``; every
-    other site was read, not run, so what follows counts ARMS, not confirmed disclosures.
-
-    WHERE TO START, IF YOU ARE THE ONE DOING THE SWEEP, because the arms are not equally bad and a
-    count flattens them. ``_serve`` (``__main__.py`` around line 1495) and ``_supervise`` are the
-    two that matter most: both render a boot-time ``load_settings`` failure with
-    ``print(f"error: {exc}", file=sys.stderr)``, and the engine runs as a Windows service under NSSM,
-    which captures that stream to a file (docs/SERVICE.md). On first deployment a ``[store]`` that
-    fails validation would therefore write ``MEFOR_STORE_PASSWORD`` into a persisted service log, on
-    every start attempt, with no operator present to see it -- and support-bundle assembly collects
-    logs. ``ai-policy`` reached one IDE bridge read; that one reaches a file that keeps it. A third
-    group -- ``_security`` and ``_alert`` -- validates JSON the operator just typed at a named path,
-    where echoing the input back is arguably the point; do not sweep those without deciding that
-    question separately.
-
-    ``_emit_error`` IS NOT THE CHOKEPOINT, and the shape of the sweep depends on knowing that. It
-    takes an already-rendered ``str``, not an exception, so it cannot call this function without a
-    signature change; many of its 56 call sites pass hand-authored or deliberately value-carrying
-    text that must NOT be re-rendered (the JSON-echo group above is the clearest kind); and half the
-    arms above never touch it, printing straight to stderr through their own emitter. The shape that
-    DOES work is already written, in ``messagefoundry/verify/runner.py``'s ``_load_settings``: a
-    wrapper returning ``(settings, detail)`` so each caller keeps its own emitter, stream and exit
-    code. That one renders safely and is still missing ``OSError``, so it is a third site holding
-    half the fix. The sweep is NOT part of #1523 or of this change, and is stated rather than done,
-    so nobody reads this docstring as covering it.
+    THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
+    is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is
+    not a settings model, such as an ``[[alerts.rules]]`` rule.
     """
     from pydantic import ValidationError
 
