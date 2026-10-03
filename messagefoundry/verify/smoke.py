@@ -32,6 +32,7 @@ from messagefoundry.config.tls_policy import (
     harden_verify_flags,
     narrow_to_approved_suites,
 )
+from messagefoundry.mllpcodec import FrameEncodeError, FramePayloadError, frame_checked
 from messagefoundry.verify.model import CheckResult, Status
 
 if TYPE_CHECKING:
@@ -300,7 +301,13 @@ def smoke_live(
     The switch is the caller's to make and is never inferred: probing in the clear and retrying over
     TLS (or the reverse) is exactly the protocol fall-back 12.3.1 forbids, so a mismatch fails and
     says so instead."""
-    frame = b"\x0b" + message.encode("utf-8") + b"\x1c\x0d"
+    # Through the engine's one-frame rule (ADR 0205 rule 1), as the harness and send_mllp do, before
+    # dialling, so a refused message never opens a connection. The message is the verifier's own
+    # synthetic one, so this is consistency rather than a live gap.
+    try:
+        frame = frame_checked(message)
+    except (FramePayloadError, FrameEncodeError) as exc:
+        return CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.FAIL, f"not sent: {exc}")
     try:
         with socket.create_connection((host, port), timeout=timeout) as raw:
             # Handshake FIRST when TLS is asked for, so no application byte can precede it.

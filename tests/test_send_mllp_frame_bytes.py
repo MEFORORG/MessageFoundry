@@ -12,6 +12,11 @@ route is seen; the clean case is the instrument's positive control, the same lis
 one connection and exactly one frame. Each hostile case also shows that the bare ``frame`` of the
 same payload is not one frame whose body is free of frame bytes, which is all the guard claims: the
 input is the shape the rule refuses, not a clean message refused by mistake. Synthetic data only.
+
+The ACK the script prints is the peer's text, so the last tests show it printed as printable ASCII:
+a control character, ESC among them, and every non-ASCII code point as a visible escape rather than
+passed to the terminal, an ordinary ACK unchanged, and the reply read under the frame cap and one
+overall deadline.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import ast
 import importlib.util
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -179,3 +185,127 @@ def test_the_check_runs_on_the_message_as_sent_after_crlf_is_collapsed(
 
     assert status == 3
     assert "0x1C at byte 3;" in capsys.readouterr().err
+
+
+def test_the_printed_ack_shows_control_characters_as_escapes(
+    listener: socket.socket, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A peer's ACK holding ESC sequences (a cursor move, a window retitle), DEL and a C1 CSI: each
+    # is printed as a visible escape, while CR still becomes a newline and tab stays a tab.
+    path = tmp_path / "clean.hl7"
+    path.write_bytes(_CLEAN.encode("utf-8"))
+    ack = (
+        "MSH|^~\\&|RECV|FAC|SEND|FAC|1||ACK|1|P|2.5.1\r"
+        "MSA|AA|CTRL1|\x1b[2J\x1b]0;owned\x07\x7f\u009b1m\tend\r"
+    )
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(5)
+            received = b""
+            while not received.endswith(bytes([EB, CR])):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                received += chunk
+            conn.sendall(frame(ack))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    status = _load().main([str(path), "--port", _port(listener), "--timeout", "5"])
+    thread.join(5)
+
+    assert status == 0
+    out = capsys.readouterr().out
+    assert out.startswith("--- ACK ---\nMSH|")
+    assert "MSA|AA|CTRL1|\\x1b[2J\\x1b]0;owned\\x07\\x7f\\u009b1m\tend\n" in out
+    assert not any(ch < " " and ch not in "\n\t" or "\x7f" <= ch < "\xa0" for ch in out)
+
+
+def test_printable_output_is_ascii_and_cannot_be_forged() -> None:
+    printable = _load()._printable
+    # Control: an ordinary ACK prints unchanged, MSH-2's backslash and an HL7 escape included.
+    assert printable(b"MSH|^~\\&|A\rMSA|AA|X\\F\\Y\tZ\r") == "MSH|^~\\&|A\nMSA|AA|X\\F\\Y\tZ\n"
+    # A backslash that would start an escape is doubled, so text spelling one cannot pass for an
+    # escaped control byte, and a backslash before an escaped byte stays distinguishable too.
+    assert printable(b"\x1b" + b"\\x1b") == "\\x1b\\\\x1b"
+    assert printable(b"\\\x1b") == "\\\\\\x1b"
+    assert printable(b"\\\\") == "\\\\\\"  # each backslash before a backslash is doubled
+    # A bidirectional override, a non-ASCII letter and a byte that is not UTF-8 are escaped too,
+    # so what the operator reads is in byte order and a cp1252 console can always encode it.
+    shown = printable("A\u202eB\u00e9".encode() + b"\xff" + "\U0001f600".encode())
+    assert shown == "A\\u202eB\\u00e9\\ufffd\\U0001f600"
+    assert shown.encode("ascii").decode("cp1252") == shown
+
+
+def test_an_ack_over_the_frame_cap_is_refused_not_buffered(
+    listener: socket.socket,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A peer that never ends its frame is cut off at the cap, as the harness Send tab does.
+    path = tmp_path / "clean.hl7"
+    path.write_bytes(_CLEAN.encode("utf-8"))
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(5)
+            received = b""
+            while not received.endswith(bytes([EB, CR])):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                received += chunk
+            conn.sendall(bytes([SB]) + b"MSH|" + b"x" * 200)  # never sends the end byte
+            conn.recv(1)  # hold the connection open until the script closes it
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    module = _load()
+    monkeypatch.setattr(module, "DEFAULT_MAX_FRAME_BYTES", 64)
+    status = module.main([str(path), "--port", _port(listener), "--timeout", "5"])
+    thread.join(5)
+
+    assert status == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("send_mllp: reply refused: frame exceeded 64 bytes")
+    assert "MSH" not in captured.err
+
+
+def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_path: Path) -> None:
+    # Each byte arrives inside --timeout, so only a deadline for the whole reply ends the wait.
+    path = tmp_path / "clean.hl7"
+    path.write_bytes(_CLEAN.encode("utf-8"))
+    done = threading.Event()
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(5)
+            received = b""
+            while not received.endswith(bytes([EB, CR])):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                received += chunk
+            try:
+                conn.sendall(bytes([SB]))
+                while not done.wait(0.2):
+                    conn.sendall(b"x")
+            except OSError:
+                return
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            _load().main([str(path), "--port", _port(listener), "--timeout", "1"])
+    finally:
+        done.set()
+    assert time.monotonic() - started < 4
+    thread.join(5)

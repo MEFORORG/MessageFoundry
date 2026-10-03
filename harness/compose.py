@@ -9,15 +9,26 @@ expectation** — Accept (AA/CA), Reject (AE/AR), or No ACK (verified with a sho
 an unexpected reply is flagged rather than ignored) — or drop it as a file. Pair it with the Monitor tab
 to confirm the resulting disposition (e.g. a no-MSH message → ERROR + AR NAK; a wrong-version
 message into the strict inbound → ERROR + AE).
+
+MLLP sends frame through ``frame_checked`` by default, as the Send tab does: a message holding an
+MLLP start or end byte would not arrive as one message, so it is refused before any connection and
+the result reads ``not sent:`` with the byte and its position, never the content. An operator can
+paste a real message here, so the default must not split one. Sending such bytes is still one of
+the malformations this tab exists for (ADR 0205 rule 4 refuses them at ingress), so the clearly
+labelled opt-in checkbox switches to the bare framer for one send: it clears itself whenever a send
+starts, on either transport, so a message pasted afterwards is checked again unless the operator
+ticks it again.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 
 from PySide6.QtCore import QThread
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QHBoxLayout,
@@ -39,7 +50,7 @@ from messagefoundry.generators import (
     _core,
     all_types,  # noqa: F401  (registers the built-in message types)
 )
-from messagefoundry.mllpcodec import frame
+from messagefoundry.mllpcodec import frame, frame_checked
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 
 _COLUMNS = ["Time", "Transport", "Result", "Expected", "OK", "Error"]
@@ -88,11 +99,18 @@ class ComposePanel(QWidget):
         self._port.setValue(2575)
         self._expect = QComboBox()
         self._expect.addItems([_ACCEPT, _REJECT, _NONE])
+        # Off by default: the checked framer refuses a frame byte rather than split the message.
+        self._raw_frame = QCheckBox("Send MLLP frame bytes unchecked (deliberately malformed)")
+        self._raw_frame.setToolTip(
+            "Off: a message holding 0x0B or 0x1C is refused before connecting, as the Send tab "
+            "does. On: it is framed as-is, to test the engine's ingress refusal (ADR 0205 rule 4)."
+        )
         mllp_page = QWidget()
         mllp_form = QFormLayout(mllp_page)
         mllp_form.addRow("Host:", self._host)
         mllp_form.addRow("Port:", self._port)
         mllp_form.addRow("Expect:", self._expect)
+        mllp_form.addRow("Framing:", self._raw_frame)
 
         self._dir = QLineEdit("./harness_io/in")
         file_page = QWidget()
@@ -155,20 +173,24 @@ class ComposePanel(QWidget):
                 timeout=10.0,
                 rate=0.0,
                 expect_ack=self._pending_expect != _NONE,
-                # Unchecked on purpose: a hand-edited message holding an MLLP frame byte is one of
-                # the malformations this tab exists to send (ADR 0205 rule 4 refuses it at ingress).
-                framer=frame,
+                framer=self._framer(),
             )
             worker.result.connect(self._on_mllp_result)
         else:
             worker = FileDropWorker(self._dir.text().strip(), [item], rate=0.0)
             worker.result.connect(self._on_file_result)
+        self._raw_frame.setChecked(False)  # one send per tick, either transport: see the docstring
         worker.finished.connect(self._on_finished)
         self._worker = worker
         worker.moveToThread(self._thread)
         self._thread.started.connect(worker.run)
         self._thread.start()
         self._send_btn.setEnabled(False)
+
+    def _framer(self) -> Callable[[str], bytes]:
+        """The checked framer unless the operator opted in to unchecked frame bytes (see the
+        module docstring)."""
+        return frame if self._raw_frame.isChecked() else frame_checked
 
     @staticmethod
     def _peek(raw: str) -> tuple[str, str, str]:

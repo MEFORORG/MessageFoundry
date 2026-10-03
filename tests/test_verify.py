@@ -745,6 +745,19 @@ def test_live_smoke_fails_when_unreachable() -> None:
     assert r.status is Status.FAIL
 
 
+def test_live_smoke_frames_through_the_checked_framer_before_dialling() -> None:
+    # ADR 0205 rule 1, as every other MLLP sender: a message holding a frame byte is refused with
+    # the byte and its position, and no connection is opened. The clean case is the AA test above.
+    with socket.create_server(("127.0.0.1", 0)) as srv:
+        srv.settimeout(0.3)
+        port = int(srv.getsockname()[1])
+        r = smoke.smoke_live(host="127.0.0.1", port=port, message="MSH|^~\\&|A\x0bB\r")
+        with pytest.raises(TimeoutError):
+            srv.accept()
+    assert r.status is Status.FAIL
+    assert r.detail.startswith("not sent: MLLP: payload holds the frame start byte 0x0B")
+
+
 # ---- live smoke over TLS (BACKLOG #1178, ASVS 12.3.1) -------------------------------------------
 #
 # The defect these cover, measured before the fix: smoke_live wrote a whole MLLP frame onto a bare

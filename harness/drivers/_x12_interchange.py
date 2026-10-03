@@ -30,9 +30,16 @@ def fresh_control_number() -> str:
     return f"{uuid4().int % 1_000_000_000:09d}"
 
 
+def is_control_number(value: str) -> bool:
+    """True when ``value`` is an X12 interchange control number: exactly nine ASCII digits.
+
+    ``str.isdigit`` alone also accepts non-ASCII digits, so ASCII is checked first."""
+    return len(value) == 9 and value.isascii() and value.isdigit()
+
+
 def isa(control: str, *, sender: str = SENDER, receiver: str = RECEIVER) -> str:
     """The 106-character ISA header (terminator included) for interchange ``control``."""
-    if len(control) != 9 or not control.isdigit():
+    if not is_control_number(control):
         raise ValueError(f"ISA13 must be nine digits, got {control!r}")
     fields = [
         "ISA",
@@ -80,9 +87,16 @@ def interchange(control: str, *, corrupt_trailer: bool = False) -> bytes:
 def ta1(acknowledged: str, code: str, *, control: str | None = None) -> bytes:
     """A TA1 interchange acknowledging interchange ``acknowledged`` with TA104 ``code``: ``A``
     accepted, ``E`` accepted with errors, ``R`` rejected. Its own ISA13 is ``control`` (fresh when
-    omitted); IEA01 is 0 because a TA1 interchange carries no functional group."""
+    omitted); IEA01 is 0 because a TA1 interchange carries no functional group.
+
+    ``acknowledged`` is usually the ISA13 of an interchange someone else sent, and this reply is
+    written with fixed delimiters, so it must be nine digits: a received ISA13 holding ``*`` or
+    ``~`` would otherwise add elements or segments to the reply, and could turn an accept into a
+    TA1-04 ``R`` (ASVS 1.1.2). Raising ValueError is the refusal; the caller decides what to send."""
     if code not in ("A", "E", "R"):
         raise ValueError(f"TA104 must be A, E or R, got {code!r}")
+    if not is_control_number(acknowledged):
+        raise ValueError("TA101 must be nine digits; the acknowledged ISA13 is not")
     own = control or fresh_control_number()
     note = "000" if code == "A" else "022"
     body = f"TA1*{acknowledged}*{_DATE}*{_TIME}*{code}*{note}~IEA*0*{own}~"
