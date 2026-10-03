@@ -28,12 +28,13 @@ and the two are deliberately parallel.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.__main__ import main
-from messagefoundry.config.settings import load_settings
+from messagefoundry.config.settings import _env_overrides, load_settings
 
 
 def _write(path: Path, body: str) -> Path:
@@ -135,10 +136,12 @@ def test_a_config_error_never_echoes_an_env_supplied_secret(
     that fails is NOT the ``[ai]`` block this subcommand projects: ``load_settings`` validates the
     whole file, so any section's failure renders through this arm.
 
-    THE CONTROL IS THE RAW RENDERING, asserted first. A test that only looked for the absence of a
-    string would pass just as well against an empty error, a renamed variable, or a value pydantic
-    never had -- so it first proves the planted secret IS in ``str(exc)`` on this exact config, which
-    is what makes its absence below attributable to the fix.
+    THE CONTROL IS THE PLANTED VALUE REACHING THE REFUSED MAPPING, asserted first. A test that only
+    looked for the absence of a string would pass just as well against an empty error, a renamed
+    variable, or a value the loader never read -- so it first proves the planted secret IS in the
+    ``[store]`` input this exact config fails on. It used to prove that through ``str(exc)``; since
+    BACKLOG #296 the settings models keep every input out of their errors, so the error itself can
+    no longer serve as the control.
 
     Both output spellings are checked because the error path does not branch on ``--json``: the
     payload formatter does, and the failure line is printed before it.
@@ -148,11 +151,8 @@ def test_a_config_error_never_echoes_an_env_supplied_secret(
 
     with pytest.raises(ValueError) as caught:  # ValidationError subclasses ValueError
         load_settings(config_path=str(cfg))
-    assert _CANARY in str(caught.value), (
-        "CONTROL FAILED: str(ValidationError) does not carry the planted secret on this config, so "
-        "the absence asserted below would prove nothing -- re-aim this guard at a config whose "
-        "rejected input still holds [store].password"
-    )
+    assert _env_overrides(os.environ)["store"]["password"] == _CANARY
+    assert "server, database, username" in str(caught.value)
 
     code = main(["ai-policy", "--service-config", str(cfg), *flags])
     out = capsys.readouterr().out

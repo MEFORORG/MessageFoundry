@@ -392,7 +392,7 @@ def _exchange(url: str) -> object:
     return oidc.exchange_code(
         token_endpoint=url,
         client_id="c",
-        client_secret=None,
+        client_auth=None,
         code="x",
         redirect_uri="http://localhost/cb",
         code_verifier="v",
@@ -1221,7 +1221,7 @@ def test_oidc_token_exchange_refuses_a_bare_cr() -> None:
         oidc.exchange_code(
             token_endpoint=url,
             client_id="c",
-            client_secret=None,
+            client_auth=None,
             code="x",
             redirect_uri="http://localhost/cb",
             code_verifier="v",
