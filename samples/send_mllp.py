@@ -22,6 +22,11 @@ It sends the whole file as ONE frame. A listener takes one message per frame and
 (MSA-3 ``more than one MSH in body``) to a frame holding several (ADR 0206), so
 ``samples/messages/adt_batch.hl7``, five messages with no envelope, is refused here. Drop a batch
 file in a ``File(...)`` inbox instead, which splits it into one message each.
+
+The ACK is the peer's text, printed to a terminal, so every control character in it except newline
+and tab -- C0, DEL and C1, after CR becomes a newline -- is printed as a visible ``\\xNN`` escape. A
+peer could otherwise move the cursor, retitle the window or rewrite what was printed above it with
+an escape sequence (ASVS 1.1.2).
 """
 
 from __future__ import annotations
@@ -37,6 +42,19 @@ from messagefoundry.parsing import normalize
 
 #: The exit status for a refused file. Not 2, which argparse uses for a usage error.
 _REFUSED = 3
+
+#: Each C0 control but newline and tab, DEL, and each C1 control, mapped to a visible escape.
+_CONTROL_ESCAPES = {
+    code: f"\\x{code:02x}"
+    for code in (*range(0x20), 0x7F, *range(0x80, 0xA0))
+    if chr(code) not in "\n\t"
+}
+
+
+def _printable(ack: bytes) -> str:
+    """The ACK as text that is safe to print to a terminal: CR as a newline, every other control
+    character but tab as ``\\xNN``."""
+    return ack.decode("utf-8", errors="replace").replace("\r", "\n").translate(_CONTROL_ESCAPES)
 
 
 async def _send(host: str, port: int, wire: bytes, timeout: float) -> bytes:
@@ -76,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         return _REFUSED
     ack = asyncio.run(_send(args.host, args.port, wire, args.timeout))
     print("--- ACK ---")
-    print(ack.decode("utf-8", errors="replace").replace("\r", "\n"))
+    print(_printable(ack))
     return 0
 
 

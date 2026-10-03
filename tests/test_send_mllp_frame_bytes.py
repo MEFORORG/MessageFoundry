@@ -12,6 +12,9 @@ route is seen; the clean case is the instrument's positive control, the same lis
 one connection and exactly one frame. Each hostile case also shows that the bare ``frame`` of the
 same payload is not one frame whose body is free of frame bytes, which is all the guard claims: the
 input is the shape the rule refuses, not a clean message refused by mistake. Synthetic data only.
+
+The ACK the script prints is the peer's text, so the last tests show a control character in it,
+ESC among them, printed as a visible ``\\xNN`` escape rather than passed to the terminal.
 """
 
 from __future__ import annotations
@@ -179,3 +182,45 @@ def test_the_check_runs_on_the_message_as_sent_after_crlf_is_collapsed(
 
     assert status == 3
     assert "0x1C at byte 3;" in capsys.readouterr().err
+
+
+def test_the_printed_ack_shows_control_characters_as_escapes(
+    listener: socket.socket, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A peer's ACK holding ESC sequences (a cursor move, a window retitle), DEL and a C1 CSI: each
+    # is printed as a visible escape, while CR still becomes a newline and tab stays a tab.
+    path = tmp_path / "clean.hl7"
+    path.write_bytes(_CLEAN.encode("utf-8"))
+    ack = (
+        "MSH|^~\\&|RECV|FAC|SEND|FAC|1||ACK|1|P|2.5.1\r"
+        "MSA|AA|CTRL1|\x1b[2J\x1b]0;owned\x07\x7f\u009b1m\tend\r"
+    )
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(5)
+            received = b""
+            while not received.endswith(bytes([EB, CR])):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                received += chunk
+            conn.sendall(frame(ack))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    status = _load().main([str(path), "--port", _port(listener), "--timeout", "5"])
+    thread.join(5)
+
+    assert status == 0
+    out = capsys.readouterr().out
+    assert out.startswith("--- ACK ---\nMSH|")
+    assert "MSA|AA|CTRL1|\\x1b[2J\\x1b]0;owned\\x07\\x7f\\x9b1m\tend\n" in out
+    assert not any(ch < " " and ch not in "\n\t" or "\x7f" <= ch < "\xa0" for ch in out)
+
+
+def test_printable_leaves_ordinary_text_alone() -> None:
+    # Control: a clean ACK prints exactly as before, CR as newline, non-ASCII text kept.
+    printable = _load()._printable
+    assert printable(b"MSH|^~\\&|A\rMSA|AA|X\t\xc3\xa9\r") == "MSH|^~\\&|A\nMSA|AA|X\té\n"
