@@ -49,6 +49,7 @@ import ssl
 import string
 from collections.abc import Mapping
 from email.errors import MessageError
+from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import getaddresses, parseaddr
 from typing import Any
@@ -92,34 +93,30 @@ def _as_recipients(value: Any) -> list[str]:
     return recipients
 
 
-def _to_header(recipients: list[str]) -> str:
-    """The ``To:`` header value the destination sends."""
-    return ", ".join(recipients)
-
-
 def envelope_recipients(value: Any) -> list[str]:
     """Every envelope address an Email destination with this ``recipients`` setting would send to.
 
-    One entry can hold several addresses, so this parses the joined ``To:`` header with the same
-    stdlib parser ``smtplib`` uses, rather than reading one address per entry. The destination
-    passes this list to ``send_message`` as ``to_addrs``, and the ``[egress]`` recipient-domain
-    check (vault BACKLOG #2616) checks the same list, so no header added later can widen the RCPT
-    set past what the gate saw. An address the parser cannot read comes back as ``""``. Raises
-    :class:`ValueError` for an empty or unparseable setting, as construction does."""
-    msg = EmailMessage()
+    One entry can hold several addresses, so this splits the entries joined with ``", "`` rather
+    than reading one address per entry. It uses :func:`email.utils.getaddresses`, which does NOT
+    decode RFC 2047 encoded words, so the text checked is the text sent. The destination passes
+    this list to ``send_message`` as ``to_addrs`` and builds ``To:`` from it without re-parsing, and
+    the ``[egress]`` recipient-domain check (vault BACKLOG #2616) checks the same list, so neither
+    the RCPT set nor the header can hold an address the check did not see. An address the parser
+    cannot read comes back as ``""``. Raises :class:`ValueError` for an empty or unparseable
+    setting, as construction does."""
+    joined = ", ".join(_as_recipients(value))
     try:
-        msg["To"] = _to_header(_as_recipients(value))
+        return [addr for _, addr in getaddresses([joined])]
     except (MessageError, IndexError) as exc:
-        # The stdlib header parser has been measured raising IndexError on malformed input.
         raise ValueError("Email destination 'recipients' is not a readable address list") from exc
-    return [addr for _, addr in getaddresses([str(h) for h in msg.get_all("To", [])])]
 
 
 #: What a recipient's local part may hold, between dots: RFC 5322 ``atext`` without ``%`` and ``!``,
-#: which some relays read as a further routing hop, and without ``|`` and ``/``, which some mail
-#: servers read as pipe or file delivery during alias expansion. An allowlist, not a denylist, so a
-#: character nobody thought of is refused rather than passed (vault BACKLOG #2616).
-_LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-=?^_`{}~")
+#: which some relays read as a further routing hop, without ``|`` and ``/``, which some mail servers
+#: read as pipe or file delivery during alias expansion, and without ``=`` and ``?``, so no part of
+#: an address can form an RFC 2047 encoded word that a later parse would decode. An allowlist, not
+#: a denylist, so a character nobody thought of is refused rather than passed (vault BACKLOG #2616).
+_LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-^_`{}~")
 #: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address.
 _MAX_LOCAL = 64
 _MAX_ADDRESS = 254
@@ -130,11 +127,12 @@ _DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
 def envelope_address_problem(address: str) -> str | None:
     """Why one :func:`envelope_recipients` address cannot be sent to as written, or ``None``.
 
-    The address must be a plain ``local@domain`` that reads back unchanged: a dot-separated local
-    part of :data:`_LOCAL_ATEXT` and a hostname-shaped domain. ``smtplib`` writes an address it
-    cannot re-read onto the ``RCPT TO`` line raw, so anything looser could put a mailbox there that
-    is not the one checked. Both the ``[egress]`` recipient-domain check and construction call this.
-    The text names no part of the address."""
+    The address must be a plain ``local@domain`` that reads back unchanged, within the RFC 5321
+    size limits: a dot-separated local part of :data:`_LOCAL_ATEXT` that does not start with ``-``,
+    and a hostname-shaped domain. ``smtplib`` writes an address it cannot re-read onto the
+    ``RCPT TO`` line raw, so anything looser could put a mailbox there that is not the one checked.
+    Both the ``[egress]`` recipient-domain check and construction call this. The text names no part
+    of the address."""
     if parseaddr(address)[1] != address:
         return "does not read back as the same address"
     local, at, domain = address.rpartition("@")
@@ -144,6 +142,9 @@ def envelope_address_problem(address: str) -> str | None:
         return "is longer than SMTP allows"
     if any(not part or set(part) - _LOCAL_ATEXT for part in local.split(".")):
         return "has a local part outside plain mailbox characters"
+    if local.startswith("-"):
+        # A leading hyphen reads as an option to some local delivery programs.
+        return "has a local part that starts with a hyphen"
     if not domain.isascii():
         return "has a non-ASCII domain; write it in its ASCII xn-- form"
     if set(domain) - _DOMAIN_TEXT:
@@ -358,9 +359,14 @@ class EmailDestination(DestinationConnector):
         msg = EmailMessage()
         msg["Subject"] = self.subject
         msg["From"] = self.sender
-        # The checked envelope list, not the raw setting: display names, comments and routes in
-        # the setting never reach the header, so every address a reader sees was checked.
-        msg["To"] = _to_header(self._envelope)
+        # The checked envelope list, not the raw setting, so every address a reader sees was
+        # checked. Handed over as Address objects, so the header is written from those strings and
+        # never re-parsed: a string here would go through policy.default's parser, which decodes
+        # RFC 2047 encoded words and could add an address the check never saw.
+        msg["To"] = [
+            Address(username=local, domain=domain)
+            for local, _, domain in (address.rpartition("@") for address in self._envelope)
+        ]
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
         msg.set_content(payload, charset=self.encoding)

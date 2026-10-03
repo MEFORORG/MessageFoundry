@@ -556,6 +556,10 @@ def test_listed_recipient_domain_passes(recipients: list[str]) -> None:
         ["a@Kospital.example"],  # a Unicode case fold must not reach an ASCII entry
         ["a|b@hospital.example"],  # a delivery-pipe character
         ["a/b@hospital.example"],  # a delivery-file character
+        ["-a@hospital.example"],  # a leading hyphen reads as an option to some delivery programs
+        ["a=b@hospital.example"],  # = and ? are refused, so no encoded word can form
+        ["a?b@hospital.example"],
+        [' :%.bK".b'],  # malformed enough that the stdlib header parser once raised on it
         ["x" * 65 + "@hospital.example"],  # longer than SMTP allows for a local part
     ],
 )
@@ -577,6 +581,44 @@ def test_recipient_domains_empty_refuses_every_email_destination(egress: EgressS
         check_egress_allowed(
             _email_dest("smtp.hospital.example", recipients=["a@hospital.example"]), egress
         )
+
+
+def _address_of_length(local_len: int, total_len: int) -> str:
+    """A plain address with a local part of ``local_len`` octets and ``total_len`` overall, ending
+    in ``hospital.example``. Long domains use three 63-octet labels plus one sized to fit."""
+    tail = "hospital.example"
+    if total_len == local_len + 1 + len(tail):
+        address = "a" * local_len + "@" + tail
+    else:
+        fixed = ".".join(["x" * 63] * 3)
+        last = total_len - local_len - 1 - len(fixed) - 1 - 1 - len(tail)
+        address = "a" * local_len + "@" + fixed + "." + "x" * last + "." + tail
+    assert len(address) == total_len, (len(address), total_len)
+    return address
+
+
+@pytest.mark.parametrize(
+    ("local_len", "total_len", "allowed"),
+    [
+        (64, 64 + 1 + len("hospital.example"), True),
+        (65, 65 + 1 + len("hospital.example"), False),
+        (20, 254, True),
+        (20, 255, False),
+    ],
+    ids=["local-64", "local-65", "address-254", "address-255"],
+)
+def test_the_rfc_5321_size_limits_are_the_boundary(
+    local_len: int, total_len: int, allowed: bool
+) -> None:
+    address = _address_of_length(local_len, total_len)
+    domain = address.rpartition("@")[2]
+    e = EgressSettings(allowed_smtp=["smtp.hospital.example"], allowed_recipient_domains=[domain])
+    dest = _email_dest("smtp.hospital.example", recipients=[address])
+    if allowed:
+        check_egress_allowed(dest, e)
+    else:
+        with pytest.raises(WiringError, match="longer than SMTP allows"):
+            check_egress_allowed(dest, e)
 
 
 class _WireCapture:
@@ -680,6 +722,54 @@ _NON_ROUND_TRIP = [
 ]
 
 
+def _encoded_word(charset: str, kind: str, text: str) -> str:
+    return "=" + "?" + charset + "?" + kind + "?" + text + "?" + "="
+
+
+def _b64_word(text: str) -> str:
+    import base64
+
+    return _encoded_word("utf-8", "b", base64.b64encode(text.encode()).decode())
+
+
+#: Local parts that a decoding parse would turn into something other than what was checked: an
+#: encoded word nested in an encoded word that decodes to an address list, and one that decodes to a
+#: line break. Built from parts.
+_INNER_LIST = _encoded_word("utf-8", "q", "other=40partner.example=2C_x")
+_ENCODED_LOCAL = [
+    _b64_word(_INNER_LIST) + "@hospital.example",
+    _b64_word("a" + chr(13) + chr(10) + "b") + "@hospital.example",
+]
+
+
+@pytest.mark.parametrize("value", _ENCODED_LOCAL, ids=["nested-encoded-list", "encoded-line-break"])
+async def test_an_encoded_word_local_part_is_refused_at_the_gate(
+    wire: _WireCapture, value: str
+) -> None:
+    dest = _wire_dest(wire.port, [value])
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(dest, _wire_egress(wire.port))
+    with pytest.raises(ValueError, match="recipient"):
+        EmailDestination(dest)
+    assert wire.connections == 0
+    assert wire.rcpt_lines == []
+
+
+async def test_the_to_line_is_written_from_the_checked_strings(wire: _WireCapture) -> None:
+    # Every character the allowlist admits, so a decoding or quoting step would show here.
+    local = "a#b$c&d'e*f+g-h^i_j`k{l}m~n.o"
+    dest = _wire_dest(wire.port, [local + "@hospital.example", "plain@hospital.example"])
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    await EmailDestination(dest).send("PID|1|synthetic")
+    assert [line.upper() for line in wire.rcpt_lines] == [
+        ("RCPT TO:<" + local + "@hospital.example>").upper().encode(),
+        b"RCPT TO:<PLAIN@HOSPITAL.EXAMPLE>",
+    ]
+    [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
+    expected = "To: " + local + "@hospital.example, plain@hospital.example"
+    assert to_line.rstrip(b"\r\n") == expected.encode()
+
+
 @pytest.mark.parametrize("value", _NON_ROUND_TRIP, ids=["parameter-after-mailbox", "stray-angle"])
 async def test_a_value_that_does_not_read_back_is_refused_before_any_rcpt(
     wire: _WireCapture, value: str
@@ -724,7 +814,7 @@ def test_a_gate_that_read_no_address_refuses(monkeypatch: pytest.MonkeyPatch) ->
 
 @pytest.mark.parametrize(
     "recipients",
-    [[""], [], [' :%.bK".b']],  # the last breaks the stdlib header parser
+    [[""], []],
 )
 def test_empty_recipients_are_refused_with_the_construction_message(
     recipients: list[str],

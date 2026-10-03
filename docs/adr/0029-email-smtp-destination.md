@@ -50,8 +50,11 @@ send the Handler's body outside the organisation through a permitted relay.
   is dropped rather than refused; the `To:` header is built from the checked list too. Each
   extracted address must be a plain `local@domain` that the stdlib parser reads back unchanged,
   within the RFC 5321 length limits. The local part is allowlisted, not denylisted: RFC 5322
-  `atext` and dots, without `%` and `!`, which some relays route on, and without `|` and `/`,
-  which some servers read as pipe or file delivery. `smtplib` writes an address it cannot re-read onto the `RCPT TO`
+  `atext` and dots, without `%` and `!`, which some relays route on, without `|` and `/`,
+  which some servers read as pipe or file delivery, and without `=` and `?`, so no RFC 2047
+  encoded word can form. A leading `-` is refused. The addresses are split with
+  `email.utils.getaddresses`, which does not decode encoded words, and the `To:` header is
+  written from the checked strings as `Address` objects, so no later parse decodes them. `smtplib` writes an address it cannot re-read onto the `RCPT TO`
   line raw, so a looser rule could put a mailbox there other than the one checked. The domain must
   be an ASCII host name; an internationalized domain is listed in its `xn--` form. Construction
   applies the same rule, so a build path that skipped the check still sends nothing.
