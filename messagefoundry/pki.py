@@ -174,14 +174,14 @@ def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
 def _parse_first_crl(
     pem: bytes,
 ) -> tuple[x509.CertificateRevocationList, datetime.datetime]:
-    """The first ``X509 CRL`` block of ``pem``, parsed, with its ``nextUpdate``."""
-    start = pem.find(_CRL_BEGIN)
-    if start < 0:
+    """The first ``X509 CRL`` block of ``pem`` that OpenSSL would load (:func:`_crl_blocks`),
+    parsed, with its ``nextUpdate``."""
+    block = next(_crl_blocks(pem), None)
+    if block is None:
         raise ValueError(_NO_CRL)
-    stop = pem.find(_CRL_END, start)
-    if stop < 0:
+    if _CRL_END not in block:
         raise ValueError("truncated CRL: an 'X509 CRL' block opened but never closed")
-    crl = x509.load_pem_x509_crl(pem[start : stop + len(_CRL_END)])
+    crl = x509.load_pem_x509_crl(block)
     nxt = crl.next_update_utc
     if nxt is None:
         # RFC 5280 makes nextUpdate optional, but OpenSSL treats a CRL without one as never
@@ -254,13 +254,19 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     block cannot hide a sibling that is about to lapse. A context load must not skip it: OpenSSL
     loads that block too, and a CRL with no ``nextUpdate`` is one OpenSSL treats as never expiring.
     So here any such block raises, naming its position, and a file with no CRL raises as
-    :func:`read_crl_facts` does.
+    :func:`read_crl_facts` does. So does a CRL that OpenSSL would not load at all (:func:`_crl_blocks`).
 
     **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it
     OpenSSL was measured to use a newer delta CRL as if it were complete. Revocations listed only
     in the base CRL were then dropped, and a revoked client was accepted. Give the setting base
     CRLs only."""
     blocks = list(_crl_blocks(pem))
+    if len(blocks) != pem.count(_CRL_BEGIN):
+        raise ValueError(
+            "it has an 'X509 CRL' BEGIN line that does not start at the beginning of a line, such "
+            "as an indented one. OpenSSL does not load that CRL, so the file would not hold what it "
+            "appears to. Put every BEGIN line at the start of its line"
+        )
     if not blocks:
         raise ValueError(_NO_CRL)
     judged: list[tuple[CrlFacts, CrlBlock]] = []
@@ -411,14 +417,27 @@ _CRL_END = b"-----END X509 CRL-----"
 _NO_CRL = "no CRL found in the supplied PEM (expected an 'X509 CRL' block)"
 
 
+def _begins_line(pem: bytes, at: int) -> bool:
+    """Whether offset ``at`` of ``pem`` starts a line: the file's start, or just after a LF."""
+    return at == 0 or pem[at - 1 : at] == b"\n"
+
+
 def _crl_blocks(pem: bytes) -> Iterator[bytes]:
-    """Yield each ``X509 CRL`` PEM block in ``pem``, in file order."""
+    """Yield each ``X509 CRL`` PEM block in ``pem`` that OpenSSL would load, in file order.
+
+    **OpenSSL loads a block only when its BEGIN line starts a line** (BACKLOG #299). Measured on
+    CPython 3.14.6 / OpenSSL 3.5.7, through ``load_verify_locations(cafile=)``: a BEGIN marker
+    after a space, a tab, other text or a lone CR is skipped, while trailing spaces and CRLF line
+    ends load. A parser that counted a skipped block would judge a CRL the context never holds. So
+    this yields only the blocks OpenSSL reads, and :func:`judge_every_crl` refuses a file that
+    carries any other BEGIN marker, rather than letting the two disagree in silence."""
     start = pem.find(_CRL_BEGIN)
     while start >= 0:
-        stop = pem.find(_CRL_END, start)
-        # Slice to this block's own bounds: a copy of the rest of the file per block grows with
-        # file size times block count. A truncated last block keeps the tail, so it still raises.
-        yield pem[start:] if stop < 0 else pem[start : stop + len(_CRL_END)]
+        if _begins_line(pem, start):
+            stop = pem.find(_CRL_END, start)
+            # Slice to this block's own bounds: a copy of the rest of the file per block grows with
+            # file size times block count. A truncated last block keeps the tail, so it still raises.
+            yield pem[start:] if stop < 0 else pem[start : stop + len(_CRL_END)]
         start = pem.find(_CRL_BEGIN, start + len(_CRL_BEGIN))
 
 

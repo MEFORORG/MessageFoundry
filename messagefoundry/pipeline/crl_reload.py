@@ -116,6 +116,7 @@ from messagefoundry.config.tls_policy import (
     crl_in_effect,
     crl_label,
     crl_not_in_effect,
+    crl_scratch_context,
     judge_crl_bytes,
 )
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
@@ -300,17 +301,17 @@ def _time_verdict(
     return _waiting(held, last.issuer, last.this_update)
 
 
-def _certificates_in(copy: Path, *, label: str) -> set[bytes]:
+def _certificates_in(copy: Path, blocks: Sequence[CrlBlock], *, label: str) -> set[bytes]:
     """The DER of each certificate in the CRL file at ``copy``, read on a scratch context.
 
     A load into the live context cannot be undone, so this is where a planted certificate is found
-    (BACKLOG #1890). A non-CA certificate refuses: the live store's own list (``get_ca_certs``) holds
-    only CA certificates, so one could never be proved already trusted. Raises ``ValueError``."""
-    scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots: the count starts at zero
-    scratch.load_verify_locations(cafile=str(copy))  # cafile= ONLY, as harden_crl_check says
+    (BACKLOG #1890), and where the CRLs OpenSSL loads are proved to be exactly the judged ``blocks``
+    (:func:`~messagefoundry.config.tls_policy.crl_scratch_context`). Without that proof a block
+    OpenSSL skips would be recorded as applied while the context kept checking the old CRL. A
+    non-CA certificate refuses: the live store's own list (``get_ca_certs``) holds only CA
+    certificates, so one could never be proved already trusted. Raises ``ValueError``."""
+    scratch = crl_scratch_context(str(copy), blocks, label=label)
     stats = scratch.cert_store_stats()
-    if stats.get("crl", 0) < 1:
-        raise ValueError(f"{label} loaded no CRL into a trust store")
     certificates = set(scratch.get_ca_certs(binary_form=True))
     if stats["x509"] != len(certificates):
         raise _NotProvable(
@@ -543,7 +544,7 @@ def _load(
         # second time, so a file swapped after the judgement cannot reach a context.
         copy = Path(private) / "crl.pem"
         copy.write_bytes(pem)
-        certificates = _certificates_in(copy, label=label)
+        certificates = _certificates_in(copy, blocks, label=label)
         signatures: dict[frozenset[bytes], tuple[str, bool] | None] = {}
         for ctx, held, wait in ready:
             try:

@@ -109,6 +109,7 @@ __all__ = [
     "crl_in_effect",
     "crl_label",
     "crl_not_in_effect",
+    "crl_scratch_context",
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
@@ -359,6 +360,8 @@ def harden_crl_check(
 
     pem = path.read_bytes()
     facts, blocks = judge_crl_bytes(pem, label=label, now=time.time())
+    # The guard behind the parser: the CRLs OpenSSL loads from the file must be the ones judged.
+    crl_scratch_context(str(path), blocks, label=label)
 
     certs_before = ctx.cert_store_stats()["x509"]  # a missing key raises: fail closed
     ctx.load_verify_locations(cafile=str(path))  # cafile= ONLY -- cadata= loads zero CRLs
@@ -396,6 +399,30 @@ def harden_crl_check(
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
+
+
+def crl_scratch_context(crl_file: str, blocks: Sequence[CrlBlock], *, label: str) -> ssl.SSLContext:
+    """A fresh context holding only what OpenSSL loads from ``crl_file``, and proof that it loaded
+    exactly the CRLs ``blocks`` describes (BACKLOG #299). Raises ``ValueError`` when not.
+
+    A context starts with no CRL, and OpenSSL keeps one copy of a CRL it is given twice, so its
+    count must equal the number of distinct CRLs judged. Fewer means OpenSSL skipped a CRL the
+    parser judged: a context would then be recorded as holding a CRL it never checks. Measured on
+    CPython 3.14.6 / OpenSSL 3.5.7 with a BEGIN line indented by one space. The parser now skips
+    that block too (:func:`messagefoundry.pki.judge_every_crl` refuses it), so this is the guard
+    for any other shape the two read differently. More means OpenSSL read a CRL the parser did not.
+    ``cafile=`` only, as :func:`harden_crl_check` says."""
+    scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots and no CRL
+    scratch.load_verify_locations(cafile=crl_file)
+    loaded = scratch.cert_store_stats().get("crl", 0)
+    judged = len({block.fingerprint for block in blocks})
+    if loaded != judged:
+        raise ValueError(
+            f"{label}: OpenSSL loads {loaded} CRL(s) from this file, but {judged} were checked. "
+            "A context would not hold what the engine judged. Write each CRL as a plain PEM "
+            "block, with its BEGIN and END lines at the start of a line"
+        )
+    return scratch
 
 
 def crl_label(crl_file: str, setting: str | None) -> str:

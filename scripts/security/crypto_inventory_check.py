@@ -422,7 +422,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # no trust decision (the chain was verified by the listener long before this runs).
     "messagefoundry/pipeline/cert_expiry.py": frozenset({"ssl"}),
     # BACKLOG #299: applies a replaced CRL file to the live TLS contexts that hold an older copy. It
-    # loads CRL bytes into a scratch ssl.SSLContext to find any certificate before the live load, then
+    # loads CRL bytes into a scratch ssl.SSLContext (tls_policy.crl_scratch_context, which also proves
+    # OpenSSL loads exactly the CRLs judged) to find any certificate before the live load, then
     # adds them to the live context with load_verify_locations(cafile=). It judges the bytes with
     # tls_policy.judge_crl_bytes, which reads the CRL fields, and checks each CRL's signature against
     # the hop's own CA certificates through pki.crl_signature_refusal (a public-key verify). No key
@@ -1145,7 +1146,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:via messagefoundry.config.tls_policy",
             "key_cert:via messagefoundry.pki",
             "tls_context:.load_verify_locations()",
-            "tls_context:ssl.SSLContext",
+            "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
     # ADR 0196: the runner charges archive frames to the store data sub-key's id, which

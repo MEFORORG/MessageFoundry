@@ -1330,7 +1330,8 @@ hop's context, with no restart (BACKLOG #299). OpenSSL then uses the newest CRL 
 issuer. The engine applies a replaced file only when all three of these hold:
 
 1. The file passes the rules a start applies. Every CRL parses, has a `nextUpdate`, is not a delta CRL
-   and has not expired. The file carries no certificate the hop does not already trust.
+   and has not expired. Its BEGIN line starts a line: OpenSSL skips an indented CRL block, so the
+   engine refuses one. The file carries no certificate the hop does not already trust.
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so a badly signed CRL would load and then fail every
    handshake it judges. The reload cannot see an intermediate CA that the peer sends in its handshake,

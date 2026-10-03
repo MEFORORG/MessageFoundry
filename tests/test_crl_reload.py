@@ -41,6 +41,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from messagefoundry.config import loaded_crls
+from messagefoundry.config import tls_policy as tls_policy_module
 from messagefoundry.config.loaded_crls import (
     ReloadRefusal,
     crl_fingerprint,
@@ -1041,3 +1042,82 @@ def test_a_badly_signed_crl_is_reported_over_one_whose_ca_is_not_listed(
     assert verdict is not None and verdict[1] is True and "block 2" in verdict[0]
     alone = crl_signature_refusal(other.crl.read_bytes(), anchors)  # control: unlisted alone
     assert alone is not None and alone[1] is False
+
+
+# --- Lander hold on PR 1963: a CRL block OpenSSL does not load -------------------------------------
+
+
+def _indented(pem: bytes) -> bytes:
+    """``pem`` with its BEGIN line indented one space. OpenSSL skips such a block; it loads the
+    rest of the file (measured, CPython 3.14.6 / OpenSSL 3.5.7)."""
+    return b" " + pem
+
+
+def test_openssl_skips_an_indented_crl_block(pki: _Pki, tmp_path: Path) -> None:
+    # The instrument the fix rests on, kept as a test so an OpenSSL that changes its PEM rule
+    # turns this red rather than leaving the parser and OpenSSL to disagree in silence.
+    path = tmp_path / "probe.pem"
+    path.write_bytes(pki.crl.read_bytes() + _indented(_fresher(pki)))
+    scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    scratch.load_verify_locations(cafile=str(path))
+    assert scratch.cert_store_stats()["crl"] == 1
+    path.write_bytes(pki.crl.read_bytes() + _fresher(pki))  # control: unindented, both load
+    scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    scratch.load_verify_locations(cafile=str(path))
+    assert scratch.cert_store_stats()["crl"] == 2
+
+
+def test_a_superseding_crl_in_an_indented_block_is_refused_and_the_alert_kept(
+    pki: _Pki,
+) -> None:
+    hop = pki.outbound_hop()
+    (old,) = held_crl_copies(pki.crl)
+    pki.crl.write_bytes(pki.crl.read_bytes() + _indented(_fresher(pki)))
+    assert _alerts(pki) == [5]
+
+    outcome = _reload(pki)
+
+    assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
+    assert (
+        outcome.refusal.remedy == FIX
+        and "does not start at the beginning of a line" in outcome.refusal.reason
+    )
+    assert held_crl_copies(pki.crl) == [old]  # not recorded as applied
+    assert _alerts(pki) == [5]  # the old copy's alert stays up
+    assert _accepts(hop, pki.server())  # and the hop still checks the old CRL
+    # Control: the same CRL in a plain block applies.
+    pki.crl.write_bytes(_fresher(pki))
+    applied = _reload(pki)
+    assert applied is not None and (applied.reloaded, applied.refusal) == (1, None)
+    assert not _accepts(hop, pki.server())
+
+
+def test_a_start_refuses_a_crl_in_an_indented_block(pki: _Pki) -> None:
+    pki.crl.write_bytes(pki.crl.read_bytes() + _indented(_fresher(pki)))
+    with pytest.raises(ValueError, match="does not start at the beginning of a line"):
+        pki.outbound_hop()
+
+
+def test_a_crl_count_openssl_disagrees_with_is_refused_at_start_and_at_reload(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The guard behind the parser, for any shape the two still read differently. Simulated by
+    # having the parser see one block more than OpenSSL loads.
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(_fresher(pki))
+    real = tls_policy_module.judge_crl_bytes
+
+    def one_more(pem: bytes, **kwargs: object) -> tuple[object, tuple[CrlBlock, ...]]:
+        facts, blocks = real(pem, **kwargs)  # type: ignore[arg-type]
+        return facts, (*blocks, replace(blocks[0], fingerprint=b"never loaded"))
+
+    monkeypatch.setattr(tls_policy_module, "judge_crl_bytes", one_more)
+    monkeypatch.setattr(crl_reload, "judge_crl_bytes", one_more)
+
+    outcome = _reload(pki)
+
+    assert outcome is not None and outcome.reloaded == 0 and outcome.refusal is not None
+    assert outcome.refusal.remedy == FIX and "OpenSSL loads 1 CRL(s)" in outcome.refusal.reason
+    assert _accepts(hop, pki.server())
+    with pytest.raises(ValueError, match="OpenSSL loads 1 CRL"):
+        pki.outbound_hop()
