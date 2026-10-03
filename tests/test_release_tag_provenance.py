@@ -158,14 +158,47 @@ def test_main_unions_the_server_set_with_the_file(
     assert tp.main(args) == 0
 
 
-def test_a_server_context_newer_than_the_commit_is_set_aside_and_no_other() -> None:
-    """A context the server added after the commit merged can never report on it, so it must not
-    refuse that commit forever. One the commit's file lists, or one that reported, still binds."""
-    reports = [_check(1, "reported", "failure")]
-    required, newer = tp.required_for(["newer", "reported", "listed"], ["listed"], reports)
-    assert newer == {"newer"}
-    assert required == {"reported", "listed"}
-    assert len(verdict("behind", required, reports)) == 2
+def test_a_server_only_context_that_never_reported_still_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Nothing tells a context added after the merge apart from one a bypass skipped, so the gate
+    holds the commit to every server context, and a red one refuses too."""
+    contexts = tmp_path / "required-contexts.txt"
+    contexts.write_text("listed\n", encoding="utf-8")
+    reports = [_check(1, "listed", "success"), _check(2, "red", "failure")]
+    monkeypatch.setattr(tp, "read_server", lambda *_a: ("behind", ["only-server", "red"], reports))
+    args = ["--repo", "o/r", "--sha", "abc", "--contexts-file", str(contexts)]
+    assert tp.main([*args, "--wait-seconds", "0"]) == 1
+    out = capsys.readouterr().out
+    assert "'only-server' never reported" in out and "'red' did not pass" in out, out
+
+
+def test_a_rules_page_that_is_not_a_list_refuses() -> None:
+    with pytest.raises(RuntimeError, match="not a list of rule objects"):
+        ruleset_contexts(["type"])
+
+
+def test_main_stops_waiting_when_a_settled_problem_already_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A commit not on main is refused at once, whatever is still running on it."""
+    contexts = tmp_path / "required-contexts.txt"
+    contexts.write_text("CI gate\n", encoding="utf-8")
+    monkeypatch.setattr(
+        tp, "read_server", lambda *_a: ("diverged", [], [_check(1, "CI gate", "", "in_progress")])
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    args = ["--repo", "o/r", "--sha", "abc", "--contexts-file", str(contexts)]
+    assert tp.main(args) == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("flag", [["--poll-seconds", "0"], ["--wait-seconds", "-1"]])
+def test_wait_arguments_out_of_range_are_usage_errors(flag: list[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        tp.main(["--repo", "o/r", "--sha", "abc", *flag])
+    assert raised.value.code == 2
 
 
 def test_unfinished_names_only_required_contexts_still_running() -> None:
@@ -209,7 +242,8 @@ def test_main_refuses_a_check_still_running_at_the_deadline(
     )
     args = ["--repo", "o/r", "--sha", "abc", "--contexts-file", str(contexts)]
     assert tp.main([*args, "--wait-seconds", "0"]) == 1
-    assert "in_progress" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "in_progress" in out and "gave up after 0s" in out, out
 
 
 def test_read_server_asks_gh_for_each_endpoint_and_reads_its_pages(

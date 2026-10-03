@@ -3480,6 +3480,11 @@ def test_only_the_publish_job_takes_a_release_out_of_draft_and_it_runs_last() ->
         f"jobs that take a release out of draft: {sorted(publishers)}; only {_PUBLISH_JOB} (and the "
         "console job, for its own release) may"
     )
+    # The console job may publish only because its own `if:` keeps it off engine tags.
+    console_if = _despace(str(jobs["release-webconsole"].get("if") or ""))
+    assert "startsWith(github.ref_name,'webconsole-')" in console_if and "||" not in console_if, (
+        "release-webconsole may take a release out of draft, so it must stay on console tags"
+    )
     # A status function would run the publish job after a job it needs had FAILED, publishing a
     # draft with that job's asset missing. The implicit success() is the control.
     publish_if = str(jobs[_PUBLISH_JOB].get("if") or "")

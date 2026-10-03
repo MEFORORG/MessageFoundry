@@ -101,8 +101,8 @@ jobs:
     if: github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ubuntu-latest
     # Read-only API calls, plus up to 30 minutes waiting for a required check still running on the
-    # tagged commit (tag_provenance.py --wait-seconds).
-    timeout-minutes: 40
+    # tagged commit (tag_provenance.py --wait-seconds), with room for one slow final read.
+    timeout-minutes: 50
     permissions:
       contents: read   # the compare and branch endpoints, and the checkout
       checks: read     # the check runs on the tagged commit

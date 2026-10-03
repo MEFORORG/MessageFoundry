@@ -30,9 +30,9 @@ reviewed commit. This script asks two questions before anything is built:
    owner may overturn it.) A required check still RUNNING is waited for, up to ``--wait-seconds``,
    so a tag pushed right after a merge is judged on the finished run.
 
-   A context the server requires now, that the commit's own file does not list and that never
-   reported on the commit, was added after the commit merged. It is set aside with a notice, since
-   nothing could ever make it report there.
+   A context the server requires now that never reported on the commit also refuses, even when it
+   was added after the commit merged. Nothing tells "added later" apart from "skipped by a bypass",
+   so the gate does not guess. The remedy is to tag a newer commit that ran the new check.
 
 **Where its promise ends.** It binds only a ref that carries this copy of ``release.yml``, as the
 workflow's header says of every guard in it. It is a gate inside the release; it is not a ruleset,
@@ -49,7 +49,7 @@ import argparse
 import subprocess
 import sys
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -96,8 +96,18 @@ class Report:
         return f"commit status {self.state}"
 
 
-def verdict(compare_status: str, required: Iterable[str], reports: Iterable[Report]) -> list[str]:
-    """Every reason to refuse the release. An empty list is a pass."""
+def verdict(
+    compare_status: str,
+    required: Iterable[str],
+    reports: Iterable[Report],
+    still_running: Iterable[str] = (),
+) -> list[str]:
+    """Every reason to refuse the release. An empty list is a pass.
+
+    ``still_running`` names contexts not to judge yet, so a caller that is waiting can ask whether
+    anything ELSE already refuses.
+    """
+    skip = set(still_running)
     problems: list[str] = []
     if compare_status not in ON_MAIN:
         problems.append(
@@ -116,7 +126,7 @@ def verdict(compare_status: str, required: Iterable[str], reports: Iterable[Repo
         held = latest.get(key)
         if held is None or report.id > held.id:
             latest[key] = report
-    for context in wanted:
+    for context in (c for c in wanted if c not in skip):
         lasts = [r for (name, _kind), r in latest.items() if name == context]
         if not lasts:
             problems.append(f"required context {context!r} never reported on the tagged commit")
@@ -164,21 +174,6 @@ def read_server(repo: str, sha: str, branch: str) -> tuple[str, list[str], list[
     return str(compare["status"]), server, reports_from(checks, statuses)
 
 
-def required_for(
-    server: Iterable[str], in_file: Iterable[str], reports: Iterable[Report]
-) -> tuple[set[str], set[str]]:
-    """(the contexts the commit is held to, server contexts set aside as newer than the commit).
-
-    The commit's own file binds in full. A context only the server names binds too, unless it never
-    reported on the commit: then it was added after the commit merged, and nothing can make it
-    report there now, so holding the commit to it would refuse that commit forever.
-    """
-    in_file = set(in_file)
-    reported = {r.context for r in reports}
-    newer = {c for c in server if c not in in_file and c not in reported}
-    return in_file | (set(server) - newer), newer
-
-
 def unfinished(required: Iterable[str], reports: Iterable[Report]) -> list[str]:
     """Required contexts whose latest report of some kind is still queued, running or pending."""
     latest: dict[tuple[str, str], Report] = {}
@@ -197,6 +192,16 @@ def unfinished(required: Iterable[str], reports: Iterable[Report]) -> list[str]:
     )
 
 
+def _at_least(minimum: int) -> Callable[[str], int]:
+    def parse(text: str) -> int:
+        value = int(text)
+        if value < minimum:
+            raise argparse.ArgumentTypeError(f"must be at least {minimum}, got {value}")
+        return value
+
+    return parse
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--repo", required=True, help="OWNER/NAME")
@@ -205,11 +210,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--contexts-file", type=Path, default=CANONICAL)
     parser.add_argument(
         "--wait-seconds",
-        type=int,
+        type=_at_least(0),
         default=1800,
         help="how long to wait for a required check that is still running (default 1800)",
     )
-    parser.add_argument("--poll-seconds", type=int, default=60)
+    parser.add_argument("--poll-seconds", type=_at_least(1), default=60)
     args = parser.parse_args(argv)
     in_file = file_contexts(args.contexts_file)
 
@@ -230,33 +235,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"::error::could not read the tagged commit's provenance, so it is refused: {exc}"
             )
             return 1
-        required, newer = required_for(server, in_file, reports)
+        required = set(server) | set(in_file)
         running = unfinished(required, reports)
         # A tag pushed minutes after a merge meets main's own push run still going. Wait for it
-        # rather than refuse: the rule judges a finished run, not one that has not ended.
-        if not running or time.monotonic() >= deadline:
+        # rather than refuse: the rule judges a finished run. But stop at once when something
+        # waiting cannot fix has already failed, such as a commit that is not on main.
+        settled = verdict(compare, required, reports, still_running=running)
+        left = deadline - time.monotonic()
+        if not running or settled or left <= 0:
             break
         print(f"waiting for {len(running)} required check(s) still running: {running}")
-        time.sleep(args.poll_seconds)
+        time.sleep(min(args.poll_seconds, left))
 
     print(
         f"commit {args.sha}: compare with {args.branch} reports {compare!r}; "
         f"{len(required)} required context(s) ({len(set(server))} on the server, {len(in_file)} "
         f"in the file); {len(reports)} report(s) on the commit"
     )
-    for context in sorted(newer):
-        print(
-            f"::notice::{context!r} is required on the server now but is not in this commit's "
-            "required-contexts.txt and never reported on it, so it is newer than the commit"
-        )
     problems = verdict(compare, required, reports)
     for problem in problems:
         print(f"::error::{problem}")
+    if running and not settled:
+        print(
+            f"::error::gave up after {args.wait_seconds}s waiting for {running}, still running. "
+            "Re-run the release once they finish."
+        )
     if problems:
         print(
             "::error::the release is refused (vault BACKLOG #2631). Tag a commit that is on "
             f"{args.branch} and passed every required check. A failed check counts against the "
-            "commit until it is re-run and passes; then re-run the release."
+            "commit until it is re-run and passes; a check still running counts until it ends. "
+            "Then re-run the release."
         )
         return 1
     print(f"the tagged commit is on {args.branch} and passed all {len(required)} required contexts")

@@ -3,7 +3,8 @@
   artifact. It asks the server whether the tagged commit is on `main`, and whether every required
   check passed on it, reading the required set from branch protection, any ruleset and
   `.github/required-contexts.txt`. Each check is judged on its latest run, so a red run after the
-  merge blocks the tag until it is re-run; a check still running is waited for. The rule is in
+  merge blocks the tag until it is re-run; a check still running is waited for. A check the
+  server requires that never ran on the commit refuses it too. The rule is in
   `scripts/release/tag_provenance.py`.
   (`vault BACKLOG #2631`)
 - **No asset is added to a GitHub release after it is published.** The engine release is created

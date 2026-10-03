@@ -124,7 +124,9 @@ Four facts the labels leave out:
   too. A separate job publishes it last, so no job adds an asset to a published release.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
-  passed. To clear it, re-run the failed job on that commit, then re-run the release.
+  passed. To clear it, re-run the failed job on that commit, then re-run the release. A check
+  still running is waited for. A check the server requires that never ran on the commit also
+  blocks it; tag a newer commit that ran it.
 
 ## What we publish, per release
 
