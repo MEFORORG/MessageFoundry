@@ -2610,14 +2610,22 @@ def test_data_plane_allowlist_listeners_match_the_transports() -> None:
     gaining the allow-list without a doc row reds CI.
 
     A module counts only if its code CALLS ``peer_ip_allowed`` (BACKLOG #1818): an import, an
-    ``__all__`` entry, or a comment quoting the call does not enforce anything.
+    ``__all__`` entry, or a comment quoting the call does not enforce anything. Since vault BACKLOG
+    #2606 the socket listeners call it through the shared ``ListenerAdmission``, so a module that
+    constructs one counts too, and ``admission.py`` itself, which owns the call, is not a listener.
     """
     transports = _ROOT / "messagefoundry" / "transports"
     enforcing = {
         path.stem
         for path in sorted(transports.glob("*.py"))
-        if _code_calls(path.read_text(encoding="utf-8"), "peer_ip_allowed")
+        if path.stem != "admission"
+        and (
+            _code_calls(path.read_text(encoding="utf-8"), "peer_ip_allowed")
+            or _code_calls(path.read_text(encoding="utf-8"), "ListenerAdmission")
+        )
     }
+    # CONTROL: the shared helper really does make the call the listeners rely on.
+    assert _code_calls((transports / "admission.py").read_text(encoding="utf-8"), "peer_ip_allowed")
     assert enforcing == set(_DATA_PLANE_LABELS), (
         "the set of transports enforcing [inbound].source_ip_allowlist changed: "
         f"{sorted(enforcing ^ set(_DATA_PLANE_LABELS))}. Add/remove its row in docs/SECURITY.md's "
