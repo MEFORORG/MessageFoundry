@@ -301,7 +301,7 @@ def test_a_later_refusal_line_carries_the_running_count(
             scp._admit_connection(("192.0.2.1", 40000))
         assert len(_warnings(caplog)) == 1
         # Age this address's line past the window, in place of sleeping through one.
-        scp._refusal_logged["192.0.2.1"] -= dicom_module._REFUSAL_LOG_WINDOW_SECONDS + 1
+        scp._refusal_log.logged["192.0.2.1"] -= dicom_module._REFUSAL_LOG_WINDOW_SECONDS + 1
         scp._admit_connection(("192.0.2.1", 40000))
     lines = _warnings(caplog)
     assert len(lines) == 2
@@ -322,12 +322,12 @@ def test_the_refusal_table_stays_bounded_whatever_arrives(
         for n in range(ceiling * 2):
             scp._admit_connection((f"198.51.{window}.{n}", 40000))
             seen += 1
-            assert len(scp._refusal_logged) <= ceiling
+            assert len(scp._refusal_log.logged) <= ceiling
         time.sleep(0.08)
-    assert scp._refusals == seen, "every refusal is counted, logged or not"
+    assert scp._refusal_log.refusals == seen, "every refusal is counted, logged or not"
     # CONTROL: the table was really in use, and aged entries really left it.
     scp._admit_connection(("203.0.113.9", 40000))
-    assert list(scp._refusal_logged) == ["203.0.113.9"]
+    assert list(scp._refusal_log.logged) == ["203.0.113.9"]
 
 
 # --- The TLS handshake is bounded, capped and off the accept loop --------------------------------

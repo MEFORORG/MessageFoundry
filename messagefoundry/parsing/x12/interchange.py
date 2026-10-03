@@ -102,6 +102,13 @@ class X12FrameReader:
         self._seg_start = 0
         self._scan = 0
 
+    @property
+    def in_frame(self) -> bool:
+        """``True`` while an interchange is open: its ``ISA`` has arrived and its ``IEA`` has not.
+        Noise before an ``ISA`` opens nothing. The listener's frame deadline runs off this
+        (vault BACKLOG #2606), as it runs off :attr:`FrameDecoder.in_frame` for delimiter framing."""
+        return self._buf.startswith(b"ISA")
+
     def feed(self, data: bytes) -> Iterator[bytes]:
         self._buf.extend(data)
         while True:

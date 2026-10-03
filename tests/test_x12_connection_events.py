@@ -223,9 +223,9 @@ def test_x12_emits_the_same_event_vocabulary_as_its_tcp_twin() -> None:
 
 async def test_capacity_refusal_is_recorded() -> None:
     source = _x12(max_connections=1)
-    source._active = 1  # the one slot is taken
+    source._admission.active = 1  # the one slot is taken
     assert _kinds(await _drive(source, _Eof(), _Peer())) == ["at_capacity"]
-    assert source._active == 1  # a refused client never took a slot
+    assert source._admission.active == 1  # a refused client never took a slot
 
 
 async def test_a_clean_connection_is_recorded_as_established_then_closed() -> None:
@@ -266,4 +266,4 @@ async def test_a_peer_reset_is_recorded_and_not_also_reported_as_a_clean_close()
         "a failed connection must not ALSO emit `closed` -- an operator counting clean closes "
         "would over-count them"
     )
-    assert source._active == 0  # the slot went back
+    assert source._admission.active == 0  # the slot went back

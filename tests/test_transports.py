@@ -1440,7 +1440,7 @@ async def test_mllp_stop_closes_established_clients() -> None:
     await source.start(handler)
     reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
     try:
-        await _until(lambda: source._active == 1)  # connection established + registered
+        await _until(lambda: source._admission.active == 1)  # connection established + registered
         await asyncio.wait_for(source.stop(), timeout=3.0)  # must NOT hang on the open connection
         assert await asyncio.wait_for(reader.read(), timeout=2.0) == b""  # client sees EOF
     finally:

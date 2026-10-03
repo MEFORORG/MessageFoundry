@@ -426,7 +426,9 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
     import ast as _ast
 
     emitted: set[str] = set()
-    targets = {"_emit_event", "_enqueue_connection_event", "HttpRequestError"}
+    # `Refusal` carries the refusal kinds the shared listener admission returns for a listener to
+    # emit (transports/admission.py, vault BACKLOG #2606), so its `kind=` literals are emit sites too.
+    targets = {"_emit_event", "_enqueue_connection_event", "HttpRequestError", "Refusal"}
     roots = [
         *(_ROOT / "messagefoundry" / "transports").glob("*.py"),
         _ROOT / "messagefoundry" / "pipeline" / "wiring_runner.py",

@@ -312,6 +312,13 @@ that list; see its amendment below.
    `receive_timeout` holds its slot indefinitely. `max_frame_seconds` is MLLP-only. This one is kept
    out of the run's catalogue and lives only as a strict xfail.
 
+   **Amendment 2026-10-02, defect 3 FIXED by vault BACKLOG #2606.** The raw-TCP and X12 listeners
+   now carry `max_frame_seconds` at MLLP's default, and the scanned posture applies its 1 s frame
+   deadline to all three planes. The two strict xfails became plain tests. They now run under the
+   same stall bound as the MLLP slowloris case. The 1 s bound they used before equalled the frame
+   deadline, so they could not have passed. The trickle cases stay out of the catalogue, so no floor
+   moved.
+
 **Still out of scope, after this amendment:** schema-driven breadth, DICOM DIMSE, the `/ui` console
 plane, a TLS black-box target (TLS listeners are not driven), the shipped-defaults controls probe, and
 the relaxed posture. The pass does not reach the HTTP inbound or any polling source.
