@@ -294,6 +294,12 @@ it is strictly weaker than measuring the property.
 > fires before rule 3 is reached. The rungs 1–2 objection is answered rather than dodged: that code
 > **reports on and gates against** the platform property; it never **provides** it.
 >
+> *Amended 2026-10-03: method section 2 no longer names three artifacts. It now also includes the
+> test harness wheel (owner ruling R1 of 2026-10-02) and the operator-run scripts (R3), and excludes
+> `tee/` (R4); [`ASVS-ASSESSMENT-METHOD.md`](../ASVS-ASSESSMENT-METHOD.md) §2 states the scope and
+> cites the rulings. The argument above does not change: every artifact it now names is software,
+> so memory encryption is still a property of none of them.*
+>
 > **The adversarial review this paragraph demanded has happened.** Two independent multi-agent research
 > runs with 3-vote refutation (25 claims verified, 12 killed in one; 8 confirmed of 25 in the other),
 > plus a second session that attacked the ruling directly and surfaced this very paragraph. What it

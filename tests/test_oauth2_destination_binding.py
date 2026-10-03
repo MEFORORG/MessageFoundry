@@ -59,9 +59,8 @@ from messagefoundry.transports.http_auth import (
     OAuth2ClientCredentialsProvider,
     with_oauth2_client_credentials,
 )
-from messagefoundry.transports.signing import b64u_decode
+from messagefoundry.transports.signing import CLIENT_ASSERTION_TYPE, b64u_decode
 from messagefoundry.transports.smart import (
-    _CLIENT_ASSERTION_TYPE,
     SmartBackendTokenProvider,
     token_provider_from_settings,
     with_smart_backend,
@@ -232,7 +231,7 @@ def test_the_asymmetric_binding_composes_onto_a_plain_rest_outbound(rsa_pem: str
     form = _posted_form(_drive(provider))
     assert set(form) == {"grant_type", "client_assertion_type", "client_assertion"}
     assert form["grant_type"] == "client_credentials"
-    assert form["client_assertion_type"] == _CLIENT_ASSERTION_TYPE
+    assert form["client_assertion_type"] == CLIENT_ASSERTION_TYPE
     assert _jwt_claims(form["client_assertion"])["aud"] == TOKEN_URL
 
 

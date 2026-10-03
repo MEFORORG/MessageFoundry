@@ -576,3 +576,36 @@ record for both.
 
 **Not decided here.** An account with no binding still enrols its first engine factor on proof of the
 directory credential alone. Closing that needs its own decision.
+
+---
+
+## Amendment D (2026-10-02) — the token request may authenticate with `private_key_jwt` (BACKLOG #296)
+
+> Built on the owner's go for BACKLOG #296's last open limb. This amendment does not change the
+> status line at the top of this ADR.
+
+Until this amendment the relying party authenticated to the token endpoint one way:
+`client_secret_post`, with the secret in the request body. A second, opt-in method is added.
+
+- **`[auth].oidc_token_endpoint_auth_method`** is `client_secret_post` (the default, unchanged on
+  the wire) or `private_key_jwt` (OIDC Core section 9, RFC 7523 section 2.2).
+- **Under `private_key_jwt` the request carries `client_assertion_type` and a `client_assertion`,
+  and no `client_secret`.** The assertion is minted per request: `iss` = `sub` = the client id,
+  `aud` = the pinned token endpoint (or the pinned issuer, by `oidc_client_assertion_audience`),
+  `iat`, a short `exp` (`CLIENT_ASSERTION_TTL_SECONDS`), and a fresh 256-bit `jti`. The claims and
+  the signature come from `transports/signing.py`, shared with the SMART client, so no second JWT
+  signer or claim builder exists. Its algorithm set is asymmetric only; `none` and HMAC cannot be
+  configured. An optional `oidc_client_certificate` adds its `x5t#S256` thumbprint to the header,
+  for an IdP that registers a certificate (Entra ID), and must hold the key's public half.
+- **One credential, the one that is sent.** Under `private_key_jwt` a configured client secret is
+  refused at load; under `client_secret_post` any assertion setting is. The key is resolved and
+  loaded when the auth service is built, so a missing, unreadable, weak or wrong-curve key refuses
+  startup, as an unresolvable secret already did.
+- **AC-10 is widened:** the system SHALL NOT log the signing key, its passphrase, or a client
+  assertion, as it already does not log the client secret.
+- **No discovery is added.** The endpoints stay operator-pinned, so the engine does not read the
+  IdP's `token_endpoint_auth_methods_supported`. Registering the client for `private_key_jwt`, and
+  withdrawing the secret at the IdP, are the operator's.
+
+**Not decided here.** Refusing `client_secret_post` outright, the enforce-refuse arm BACKLOG #296's
+gate once named, stays an owner decision. The default is unchanged.

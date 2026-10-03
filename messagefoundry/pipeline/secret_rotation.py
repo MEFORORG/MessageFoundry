@@ -125,6 +125,10 @@ _ENV_SECRET_CLASSES: tuple[tuple[str, str], ...] = (
     ("MEFOR_AUTH_AD_BIND_PASSWORD", "AD bind password"),
     ("MEFOR_ALERTS_EMAIL_PASSWORD", "SMTP alert password"),
     ("MEFOR_AUTH_OIDC_CLIENT_SECRET", "OIDC confidential-client secret"),
+    # BACKLOG #296: the private_key_jwt signing key when supplied inline, and its passphrase. A key
+    # given as a file path fingerprints the PATH, so a key replaced in place is not detected.
+    ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY", "OIDC private_key_jwt signing key"),
+    ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD", "OIDC private_key_jwt signing-key passphrase"),
     ("MEFOR_API_TLS_KEY_PASSWORD", "off-loopback TLS private-key passphrase"),
     ("MEFOR_STORE_VAULT_TOKEN", "Vault token — store DEK provider"),
     ("MEFOR_SECRETS_VAULT_TOKEN", "Vault token — connector KV provider"),
