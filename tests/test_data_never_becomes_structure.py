@@ -695,9 +695,10 @@ def test_split_batch_bytes_hands_a_single_message_over_without_decoding(
         raise AssertionError("a one-message file was decoded and split")
 
     monkeypatch.setattr(split_mod, "split_batch", _no_split)
-    for lead in (chr(0xFEFF), " ", ""):
+    # A file led by a byte order mark is decoded, so the mark can be read past; see below.
+    for lead in (" ", ""):
         raw = (lead + THREE[0]).encode("utf-8")
-        assert split_batch_bytes(raw, "utf-8") == [raw.removeprefix(chr(0xFEFF).encode("utf-8"))]
+        assert split_batch_bytes(raw, "utf-8") == [raw]
         lf = raw.replace(CR.encode(), chr(10).encode())
         assert split_batch_bytes(lf, "latin-1") == [lf]
 
@@ -1013,6 +1014,9 @@ def test_a_set_field_template_copying_a_leaf_writes_with_set_data_and_reads_back
         pytest.param(
             [{"path": "PID-3.1"}, {"text": "~"}, {"path": "PID-4.1"}], id="authored-repetition"
         ),
+        pytest.param(
+            [{"path": "PID-3"}, {"text": " "}, {"path": "PID-3.1"}], id="a-whole-field-read-too"
+        ),
     ],
 )
 def test_a_set_field_template_that_is_not_a_leaf_copy_keeps_set(
@@ -1038,6 +1042,53 @@ def test_an_inserted_set_field_template_copying_a_leaf_writes_with_set_data() ->
     )
     assert "msg.set_data(\"PV1-19\", f\"{msg['PID-3.1'] or ''}\")" in out
     assert _native_rows(out)[-1]["action"] == "set_field"
+
+
+def test_a_set_field_template_into_a_leaf_keeps_set() -> None:
+    # At a leaf destination set and set_data write the same thing, so the lens keeps set there.
+    out = _set_value(
+        LENS_SOURCE + '    msg.set("PV1-19.1", "X")\n', {"parts": [{"path": "PID-3.1"}]}
+    )
+    assert "    msg.set(\"PV1-19.1\", f\"{msg['PID-3.1'] or ''}\")\n" in out
+    assert _native_rows(out)[-1]["action"] == "set_field"
+
+
+def test_a_set_field_template_holding_a_field_separator_writes_with_set_data() -> None:
+    # set refuses a field separator in a whole field, so text holding one can only mean data.
+    parts = [{"text": "A|"}, {"path": "PID-3.1"}]
+    out = _set_value(LENS_SOURCE + '    msg.set("PV1-19", "X")\n', {"parts": parts})
+    assert "    msg.set_data(\"PV1-19\", f\"A|{msg['PID-3.1'] or ''}\")\n" in out
+    assert _native_rows(out)[-1]["param_parts"]["value"] == parts
+
+
+def _set_path(source: str, path: str) -> str:
+    row = _native_rows(source)[-1]
+    return rewrite_source(
+        source,
+        {
+            "op": "set_params",
+            "line_start": row["line_start"],
+            "line_end": row["line_end"],
+            "params": {"path": path},
+        },
+        contract=CONTRACT_V2,
+    )
+
+
+def test_a_set_field_path_edit_re_picks_the_write() -> None:
+    source = LENS_SOURCE + "    msg.set_data(\"PV1-19\", f\"{msg['PID-3.1'] or ''}\")\n"
+    to_leaf = _set_path(source, "PV1-19.1")
+    assert to_leaf.endswith("    msg.set(\"PV1-19.1\", f\"{msg['PID-3.1'] or ''}\")\n")
+    assert _native_rows(to_leaf)[-1]["action"] == "set_field"
+    back = _set_path(to_leaf, "PV1-20")
+    assert back.endswith("    msg.set_data(\"PV1-20\", f\"{msg['PID-3.1'] or ''}\")\n")
+    assert _native_rows(back)[-1]["action"] == "set_field"
+
+
+def test_an_edit_that_changes_nothing_leaves_a_hand_written_write_alone() -> None:
+    source = LENS_SOURCE + "    msg.set(\"PV1-19\", f\"{msg['PID-3.1'] or ''}\")\n"
+    row = _native_rows(source)[-1]
+    assert _set_value(source, {"parts": row["param_parts"]["value"]}) == source
 
 
 NO_MSH = "BHS|" + ENC + CR + "PID|1||111" + CR
@@ -1149,6 +1200,47 @@ async def test_the_file_source_hands_one_bom_led_message_over_without_its_mark(
     source._handler = handler
     assert await source._emit((chr(0xFEFF) + THREE[0]).encode("utf-8")) is True
     assert handler.bodies == [THREE[0].encode("utf-8")]
+
+
+ENVELOPED_ONE = "FHS|" + ENC + CR + "BHS|" + ENC + CR + THREE[0] + "BTS|1" + CR + "FTS|1" + CR
+
+
+async def test_one_enveloped_message_goes_over_as_the_split_reads_it(tmp_path: Path) -> None:
+    # The parser refuses a body led by FHS, so one message in an envelope goes as a batch member.
+    raw = ENVELOPED_ONE.encode("utf-8")
+    want = (THREE[0] + "BTS|1" + CR + "FTS|1" + CR).encode("utf-8")
+    assert split_batch_bytes(raw, "utf-8") == [want]
+    assert split_messages(raw) == [want]
+    source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path)}))
+    handler = _RecordingHandler()
+    source._handler = handler
+    assert await source._emit(raw) is True
+    assert handler.bodies == [want]
+
+
+async def test_one_enveloped_remote_message_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    client = _FakeClient(files={"/in/one.hl7": ENVELOPED_ONE.encode("utf-8")})
+    src = _remote_src(monkeypatch, client)
+    ic = _remote_ic()
+    runner = wiring_runner.RegistryRunner(_registry(ic), store)
+    src._handler = runner._make_handler(ic)
+    await _settle(src)
+    await src._poll_once()
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.RECEIVED.value]
+
+
+def test_one_bom_led_message_goes_over_as_the_split_reads_it() -> None:
+    # Past a byte order mark the message is handed over as a batch member is: line ends become CR.
+    lf = chr(10)
+    raw = (chr(0xFEFF) + THREE[0].replace(CR, lf)).encode("utf-8")
+    assert split_batch_bytes(raw, "utf-8") == [THREE[0].encode("utf-8")]
+    assert split_messages(raw) == [THREE[0].encode("utf-8")]
+    # With nothing the parser refuses before MSH, a one-message file keeps its own line ends.
+    plain = (" " + THREE[0].replace(CR, lf)).encode("utf-8")
+    assert split_batch_bytes(plain, "utf-8") == [plain]
+    assert split_messages(plain) == [plain]
 
 
 def _rewrite_all(fields: list[str], target: tuple[str, str, str, str, str]) -> list[str]:

@@ -52,7 +52,7 @@ from messagefoundry.parsing import (
 )
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.parsing.sniff import _lstrip_bom_ws
-from messagefoundry.parsing.split import strip_bom_before_msh
+from messagefoundry.parsing.split import one_message_bytes
 from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
@@ -1017,8 +1017,9 @@ def split_messages(raw: bytes) -> list[bytes]:
     U+0000..U+00FF: ``\\rMSH`` in that view is exactly ``b"\\x0dMSH"`` in the bytes. So the split is
     charset-agnostic — correct for every ASCII-compatible encoding without being told which one — and
     each member re-encodes to the file's own bytes. A payload holding a **single** message returns the
-    original bytes verbatim, less a leading UTF-8 byte order mark, exactly as the File source hands a
-    non-batch file off; only a true batch pays the normalize (line endings collapsed to ``\\r``, the ``FHS``/``BHS`` envelope
+    original bytes verbatim, exactly as the File source hands a non-batch file off, unless a byte
+    order mark or an ``FHS``/``BHS`` header the parser refuses leads it; only a true batch pays the
+    normalize (line endings collapsed to ``\\r``, the ``FHS``/``BHS`` envelope
     dropped), which is the same transformation that source applies to a batch.
 
     A UTF-16/32 payload has no ``b"\\x0dMSH"`` to find, so it comes back as one message and
@@ -1030,10 +1031,10 @@ def split_messages(raw: bytes) -> list[bytes]:
     # not see past it as the live split, which decodes first, does (ADR 0206). Strip it, with the
     # whitespace around it, before the view.
     messages = split_batch(_lstrip_bom_ws(raw).decode("latin-1"))
-    # A non-batch payload goes back byte-identical, as the File source hands one off, less a leading
-    # UTF-8 byte order mark, which that source drops too.
+    # A non-batch payload goes back byte-identical, as the File source hands one off, unless the
+    # parser would refuse what leads it; that source then hands the message as the split read it.
     if len(messages) == 1:
-        return [strip_bom_before_msh(raw)]
+        return [one_message_bytes(raw, raw.decode("latin-1"), messages[0], "latin-1")]
     return [m.encode("latin-1") for m in messages]
 
 

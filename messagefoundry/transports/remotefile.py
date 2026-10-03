@@ -2430,9 +2430,10 @@ class RemoteFileSource(SourceConnector):
         An ``hl7v2`` file is split on ``MSH`` boundaries first, as the File source splits one (ADR
         0206 rule 5): a batch file, with or without an ``FHS``/``BHS`` envelope, becomes one hand-off
         and one disposition per message, in file order. The listener refuses a body holding a second
-        ``MSH``, so a whole batch handed over unsplit would be one ``ERROR``. A single-message or
-        undecodable file is handed over as its original bytes. Any other content type is handed over
-        verbatim, never decoded.
+        ``MSH``, so a whole batch handed over unsplit would be one ``ERROR``. An undecodable file is
+        handed over as its original bytes, and so is a single-message file, unless a byte order mark
+        or an ``FHS``/``BHS`` header the parser refuses leads it (:func:`split_batch_bytes`). Any
+        other content type is handed over verbatim, never decoded.
 
         The split runs in a worker thread, so a cancellation at that await hands nothing over and
         leaves the file for the next poll. The stop is checked before every hand-off, the first

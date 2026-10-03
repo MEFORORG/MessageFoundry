@@ -48,7 +48,7 @@ from messagefoundry.config.models import (
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_hl7
-from messagefoundry.parsing.split import split_batch, strip_bom_before_msh
+from messagefoundry.parsing.split import one_message_bytes, split_batch
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
@@ -1345,10 +1345,12 @@ class FileSource(SourceConnector):
         non-UTF-8 batch (e.g. latin-1) splits without mojibake. If the file isn't decodable in that
         encoding, or it holds a single message, the **original bytes are handed off verbatim** (one
         hand-off): a single-message file is then byte-for-byte identical to before the split existed,
-        and an undecodable file flows to the pipeline unchanged so its ``normalize(errors="strict")``
-        records the proper ``ERROR`` disposition exactly as today (we don't pre-empt that here). A
-        true batch is split and each message **re-encoded with the same declared encoding**, so the
-        handler still receives ``bytes`` exactly as in the un-split path.
+        unless a byte order mark or an ``FHS``/``BHS`` header the parser refuses leads it, when the
+        message goes as the split read it (ADR 0206), and an undecodable file flows to the pipeline
+        unchanged so its ``normalize(errors="strict")`` records the proper ``ERROR`` disposition
+        exactly as today (we don't pre-empt that here). A true batch is split and each message
+        **re-encoded with the same declared encoding**, so the handler still receives ``bytes``
+        exactly as in the un-split path.
 
         Any exception (a durable-store failure on hand-off K) propagates to the caller, which then
         leaves the whole file in place for the next scan — preserving at-least-once with no partial
@@ -1372,10 +1374,10 @@ class FileSource(SourceConnector):
         )  # str in → no UTF-8 re-decode (normalize only fixes line endings)
         if len(messages) == 1:
             # Fast path / strict back-compat: a lone message is handed off as its original bytes, so a
-            # non-batch file behaves as before the split was introduced. A leading UTF-8 byte order
-            # mark goes first, as the split drops it from a batch's first message, so one message
-            # gets the disposition each member of a batch would (ADR 0206).
-            await self._handler(strip_bom_before_msh(raw, self.encoding))
+            # non-batch file behaves as before the split was introduced, unless the parser would
+            # refuse what leads them (a byte order mark, an FHS/BHS header): then it goes as the
+            # split read it, as a batch member does (ADR 0206).
+            await self._handler(one_message_bytes(raw, text, messages[0], self.encoding))
             return True
         for message in messages:
             if self._stop.is_set():

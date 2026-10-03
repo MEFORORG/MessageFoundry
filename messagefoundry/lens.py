@@ -320,7 +320,7 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
             return _NativeAction(
                 "copy_field", [("src", field_call.args[0]), ("dst", dst_or_path)], display
             )
-        if func.attr == "set_data" and _template_write_method(value) != "set_data":
+        if func.attr == "set_data" and _template_write_method(value, dst_or_path) != "set_data":
             return None
         return _NativeAction("set_field", [("path", dst_or_path), ("value", value)], display)
     if func.attr in ("delete_segments", "delete_segment"):
@@ -2582,8 +2582,9 @@ def _apply_set_params(
     if any(isinstance(v, dict) and set(v) == {"parts"} for v in params.values()):
         _refuse_overlong_template_lines(src, result, line_start, line_end)
     action = row.get("action")
-    if (action == "copy_field" and ("src" in params or "dst" in params)) or (
-        action == "set_field" and "value" in params
+    if result != src and (
+        (action == "copy_field" and ("src" in params or "dst" in params))
+        or (action == "set_field" and ("value" in params or "path" in params))
     ):
         repicked = _repick_write(result, line_start, line_end)
         if repicked != result:
@@ -2613,8 +2614,8 @@ def _refuse_overlong_repick(result: str, repicked: str, line_start: int, line_en
 
 def _repick_write(source: str, line_start: int, line_end: int) -> str:
     """Re-pick the write of the native Copy Field or Set Field at ``line_start``-``line_end`` of
-    ``source``, after an edit of a copy's ``src`` or ``dst`` or of a Set Field's ``value`` (ADR 0206
-    rule 1).
+    ``source``, after an edit of a copy's ``src`` or ``dst`` or of a Set Field's ``path`` or ``value``
+    (ADR 0206 rule 1).
 
     The write is the one an insert picks (:func:`_native_write_method`). Splicing only the arguments
     would keep the old method: a leaf read left on ``set`` into a whole field turns its decoded
@@ -2652,7 +2653,7 @@ def _repick_write(source: str, line_start: int, line_end: int) -> str:
     dst, value = call.args
     field_call = _msg_field_source(value)
     if field_call is None:
-        want = _template_write_method(value)
+        want = _template_write_method(value, dst)
     else:
         src = getattr(field_call.args[0], "value", None)
         if not isinstance(src, str) or _is_leaf_literal(getattr(dst, "value", None)):
@@ -4615,35 +4616,43 @@ def _copy_write_method(src: Any) -> str:
     return "set_data" if _is_leaf_literal(src) else "set"
 
 
-#: The standard HL7 delimiters. Template text holding one is taken as structure the author meant.
-_STANDARD_DELIMITERS = frozenset("|^~&" + chr(92))
+#: The delimiters that template text carries as structure the author meant: component,
+#: repetition, subcomponent and escape. A field separator is not among them, because a whole-field
+#: ``set`` refuses one anyway, so text holding it can only mean data.
+_AUTHORED_STRUCTURE = frozenset("^~&" + chr(92))
 
 
-def _template_write_method(value: ast.expr) -> str:
-    """The ``Message`` write a native Set Field with ``value`` uses (ADR 0206 rule 1).
+def _template_write_method(value: ast.expr, dst: ast.expr) -> str:
+    """The ``Message`` write a native Set Field writing ``value`` to ``dst`` uses (ADR 0206 rule 1).
 
-    ``set_data`` for a template that reads at least one literal component or subcomponent path,
-    whose read is decoded, and whose own text holds no standard delimiter; ``set`` for anything
-    else. A template whose text carries a delimiter is structure the author wrote, which
-    ``set_data`` would escape into one component, so it keeps ``set`` and the handler-security lint
-    still flags the leaf it copies. The lens is static and cannot know a message's own separators,
-    so the test uses the standard ones."""
+    ``set_data`` for a template whose every read is a literal component or subcomponent path, whose
+    read is decoded, and whose own text holds no component, repetition, subcomponent or escape
+    character; ``set`` for anything else. A whole-field read is raw text with its structure, which
+    ``set_data`` would escape into one component, and text holding one of those delimiters is
+    structure the author wrote, so either keeps ``set``, and the handler-security lint still flags
+    a leaf such a template copies. At a literal leaf destination the two writes are the same, so
+    ``set`` is kept there too. The lens is static and cannot know a message's own separators, so
+    the test uses the standard ones."""
+    if _is_leaf_literal(getattr(dst, "value", None)):
+        return "set"
     parts = _template_parts(value)
     if parts is None:
         return "set"
+    paths = [part[PART_PATH] for part in parts if PART_PATH in part]
     text = "".join(part.get(PART_TEXT, "") for part in parts)
-    if any(char in _STANDARD_DELIMITERS for char in text):
+    if not paths or any(char in _AUTHORED_STRUCTURE for char in text):
         return "set"
-    return "set_data" if any(_is_leaf_literal(part.get(PART_PATH)) for part in parts) else "set"
+    return "set_data" if all(_is_leaf_literal(path) for path in paths) else "set"
 
 
-def _native_write_method(value: ast.expr) -> str:
-    """The ``Message`` write a native ``set_field`` or ``copy_field`` with ``value`` uses: a copy's
-    by its source (:func:`_copy_write_method`), anything else by :func:`_template_write_method`."""
+def _native_write_method(value: ast.expr, dst: ast.expr) -> str:
+    """The ``Message`` write a native ``set_field`` or ``copy_field`` writing ``value`` to ``dst``
+    uses: a copy's by its source (:func:`_copy_write_method`), anything else by
+    :func:`_template_write_method`."""
     field_call = _msg_field_source(value)
     if field_call is not None:
         return _copy_write_method(getattr(field_call.args[0], "value", None))
-    return _template_write_method(value)
+    return _template_write_method(value, dst)
 
 
 def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> str:
@@ -4685,7 +4694,9 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
     if name == "set_field":
         path = _render_insert_value(params.get("path", ""), "path")
         value = _render_insert_value(params.get("value", ""), "value")
-        write = _native_write_method(ast.parse(value, mode="eval").body)
+        write = _native_write_method(
+            ast.parse(value, mode="eval").body, ast.parse(path, mode="eval").body
+        )
         return f"msg.{write}({path}, {value}{suffix})"
     if name == "copy_field":
         src = _render_insert_value(params.get("src", ""), "src")

@@ -124,12 +124,17 @@ open points settled below.
   so there the method is left as written. A re-pick that would push the line past the column limit
   is refused, since the lens never wraps a line itself. ADR 0106's palette table still shows the old shape as
   the record of that decision; `docs/STEPS-PALETTE.md` shows the new one. *Added in the final repair
-  round:* a native Set Field whose value is a template is picked the same way. When the template
-  reads at least one literal component or subcomponent path and its own text holds no standard
-  delimiter, the write is `msg.set_data`, on insert and on an edit of the value, and the recognizer
-  reads that `msg.set_data` back as `set_field`. A template whose text holds a delimiter is structure
-  the author wrote, so it keeps `msg.set`, and the lint still flags the leaf it copies. The lens
-  cannot know a message's own separators, so it tests the standard ones. At least four template
+  round:* a native Set Field whose value is a template is picked the same way. When every read in
+  the template is a literal component or subcomponent path, its own text holds no component,
+  repetition, subcomponent or escape character, and its destination is not a literal leaf, the
+  write is `msg.set_data`. That holds on insert and on an edit of the value or the path, and the
+  recognizer reads that `msg.set_data` back as `set_field`. A whole-field read in the template is raw
+  text with its structure, and text holding one of those delimiters is structure the author wrote,
+  so either keeps `msg.set`, and the lint still flags a leaf such a template copies. A field
+  separator in the text does not keep `msg.set`, because `set` refuses one in a whole field, so it
+  can only mean data. At a literal leaf destination the two writes are the same, so `msg.set` is kept
+  there. An edit that leaves the line unchanged leaves its write as written. The lens cannot know a
+  message's own separators, so it tests the standard ones. At least four template
   writes into a whole field still take decoded text as structure and are not changed here: the
   wrapper form `set_field(msg, ...)`, and templates into `add_repetition`, `append_to_field` and
   `replace_literal`, each of which writes with `set` or `add_repetition`.
@@ -225,15 +230,16 @@ open points settled below.
   records its `ERROR`. The File source calls `split_batch` too, so it is fixed by the same change.
   The dry-run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8 byte order mark is
   three characters, so it strips that mark first and splits as the live sources do. *Changed in the
-  final repair round:* a file holding one message led by a UTF-8 byte order mark used to be handed
-  over whole, and the parser refused it, while each message of a two-message file led the same way
-  was recorded. Now `strip_bom_before_msh` in `messagefoundry/parsing/split.py` drops the mark, and
-  the whitespace around it, before a one-message file is handed over, when an `MSH` follows them.
-  The File source, the remote-file source and the dry-run's `split_messages` all call it, so one
-  such message gets the disposition each member of a batch gets. It reads only a `utf-8` charset:
-  under a single-byte charset those bytes are three characters, which the batch split keeps too,
-  and a `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file is otherwise still
-  handed over as its own bytes.
+  final repair round:* a file holding one message led by a UTF-8 byte order mark, or by an
+  `FHS`/`BHS` envelope header, used to be handed over whole, and the parser refused it, while each
+  message of a two-message file led the same way was recorded. Now `one_message_bytes` in
+  `messagefoundry/parsing/split.py` hands such a file over as the split read it: past the mark or
+  the header, with its line ends made CR, as each member of a batch is. The File source, the
+  remote-file source and the dry-run's `split_messages` all call it, so one such message gets the
+  disposition each member of a batch gets. The mark is read in the decoded text, so under a
+  single-byte charset its bytes are three characters, which the batch split keeps too, and a
+  `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file whose decoded text starts
+  with `MSH` after whitespace is still handed over as its own bytes.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.
@@ -295,8 +301,10 @@ than one `MSH` is left to its own item.
 - **AC-6** -- WHEN the Steps view inserts a Copy Field from a literal leaf, THE SYSTEM SHALL emit
   `set_data` and read the line back as the same `copy_field` row; and WHEN an edit moves a copy's
   source or destination across that line, THE SYSTEM SHALL re-pick `set` or `set_data`; and WHEN
-  a Set Field template reads a literal leaf and its text holds no delimiter, THE SYSTEM SHALL
-  write it with `set_data` and read it back as `set_field`.
+  a Set Field template reads only literal leaves, its text holds no component, repetition,
+  subcomponent or escape character, and its destination is not a literal leaf, THE SYSTEM SHALL
+  write it with `set_data`, on insert and on an edit of its value or path, and read it back as
+  `set_field`; and WHEN an edit leaves the line unchanged, THE SYSTEM SHALL leave its write alone.
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_inserts_a_copy_from_a_leaf_with_set_data_and_reads_it_back`
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_keeps_set_for_a_whole_field_or_an_expression_source`
   -> `tests/test_data_never_becomes_structure.py::test_a_copy_edited_from_a_leaf_to_a_whole_field_source_writes_with_set`
@@ -306,6 +314,10 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_a_set_field_template_copying_a_leaf_writes_with_set_data_and_reads_back`
   -> `tests/test_data_never_becomes_structure.py::test_a_set_field_template_that_is_not_a_leaf_copy_keeps_set`
   -> `tests/test_data_never_becomes_structure.py::test_an_inserted_set_field_template_copying_a_leaf_writes_with_set_data`
+  -> `tests/test_data_never_becomes_structure.py::test_a_set_field_template_into_a_leaf_keeps_set`
+  -> `tests/test_data_never_becomes_structure.py::test_a_set_field_template_holding_a_field_separator_writes_with_set_data`
+  -> `tests/test_data_never_becomes_structure.py::test_a_set_field_path_edit_re_picks_the_write`
+  -> `tests/test_data_never_becomes_structure.py::test_an_edit_that_changes_nothing_leaves_a_hand_written_write_alone`
 - **AC-7** -- WHEN the delimiter override rewrites a message, THE SYSTEM SHALL keep every leaf reading
   the same under the target set: a target delimiter inside a leaf is escaped with the target escape
   character, a separator escape is decoded against the source set and re-escaped against the target
@@ -350,9 +362,9 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_the_remote_split_runs_off_the_event_loop_and_keeps_file_order`
 - **AC-12** -- WHEN a batch file starts with whitespace or a byte order mark, THE SYSTEM SHALL keep its
   first message, on the File and the remote-file source alike, and SHALL otherwise leave the File
-  source's batch split unchanged. WHEN a one-message file starts with a UTF-8 byte order mark
-  before its `MSH`, THE SYSTEM SHALL hand the message over without the mark, so it gets the
-  disposition a batch member gets.
+  source's batch split unchanged. WHEN a one-message file starts with a UTF-8 byte order mark or an
+  `FHS`/`BHS` envelope header before its `MSH`, THE SYSTEM SHALL hand the message over as the split
+  read it, so it gets the disposition a batch member gets.
   -> `tests/test_data_never_becomes_structure.py::test_every_message_of_a_noise_led_remote_file_gets_a_disposition`
   -> `tests/test_data_never_becomes_structure.py::test_split_batch_keeps_a_first_message_led_by_noise`
   -> `tests/test_data_never_becomes_structure.py::test_a_first_chunk_that_is_not_an_envelope_is_kept_for_the_parser`
@@ -361,6 +373,9 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_a_bom_led_remote_file_gets_the_same_disposition_per_message`
   -> `tests/test_data_never_becomes_structure.py::test_one_bom_led_message_loses_its_mark_before_hand_off`
   -> `tests/test_data_never_becomes_structure.py::test_the_file_source_hands_one_bom_led_message_over_without_its_mark`
+  -> `tests/test_data_never_becomes_structure.py::test_one_enveloped_message_goes_over_as_the_split_reads_it`
+  -> `tests/test_data_never_becomes_structure.py::test_one_enveloped_remote_message_is_recorded`
+  -> `tests/test_data_never_becomes_structure.py::test_one_bom_led_message_goes_over_as_the_split_reads_it`
   -> `tests/test_message_split.py`
 
 ## Options considered
@@ -390,7 +405,8 @@ unusual separators can no longer set a field through the override. A sender that
 into one MLLP frame or one HTTP request is told so, with an `AR` where it can be. A remote batch file
 is processed as the File source processes one, and an enveloped remote batch is no longer one
 `ERROR`. A batch file led by whitespace or a byte order mark keeps its first message on both file
-sources, and a one-message file led by a byte order mark is no longer an `ERROR`.
+sources, and a one-message file led by a byte order mark or an `FHS`/`BHS` envelope header is no
+longer an `ERROR`.
 
 **Negative / risks** -- Rule 3 is advisory: a Handler author can still write the unsafe form, and
 the lint sees only literal paths and has the blind spots listed above. A partner that reads a
