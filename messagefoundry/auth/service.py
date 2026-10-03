@@ -1828,6 +1828,14 @@ def oidc_client_auth_from_settings(
         literal=settings.oidc_client_private_key,
         setting="oidc_client_private_key",
     )
+    # The signer reads a value with no PEM header as a file path. A secret-store value must be the
+    # key itself, never a path the store chooses, so a reference that resolves to anything else is
+    # refused here, naming the reference rather than a file.
+    if settings.oidc_client_private_key_ref and "-----BEGIN" not in key:
+        raise SecretProviderError(
+            "[auth].oidc_client_private_key_ref did not resolve to a PEM key; the referenced "
+            "secret must hold the key itself"
+        )
     audience = (
         settings.oidc_issuer
         if settings.oidc_client_assertion_audience == "issuer"

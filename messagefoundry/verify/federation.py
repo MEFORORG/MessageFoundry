@@ -211,8 +211,9 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
     reference that does not resolve, a provider that is unset, and under ``private_key_jwt`` an
     unreadable file, a bad passphrase, a weak RSA key or a wrong curve), so it earns a PASS.
 
-    The same construction :class:`~messagefoundry.auth.service.AuthService` runs (BACKLOG #296). No
-    socket is opened and nothing is signed or sent."""
+    The same construction :class:`~messagefoundry.auth.service.AuthService` runs (BACKLOG #296).
+    Nothing is signed or sent to the identity provider, but a ``*_ref`` credential is read from the
+    ``[secrets]`` provider, which for Vault is a network read."""
     from messagefoundry.auth.oidc.client_auth import ClientSecretPost
     from messagefoundry.auth.service import oidc_client_auth_from_settings
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider

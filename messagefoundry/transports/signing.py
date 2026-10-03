@@ -234,7 +234,8 @@ def _load_private_key(setting: str, private_key: str, password: str | None) -> _
     if load_failed:
         raise SigningError(
             "could not load the signing private key — check the PEM, and the password for an "
-            "encrypted key (set private_key_password via env())"
+            "encrypted key (a connector's private_key_password via env(), or "
+            "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD for the [auth] OIDC key)"
         )
     if not isinstance(key, (rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey)):
         raise SigningError(

@@ -39,6 +39,7 @@ from messagefoundry.config.settings import (
     ServiceSettings,
     _InputHidingModel,
     _Section,
+    _section_models,
     load_settings,
     settings_error_detail,
 )
@@ -298,17 +299,10 @@ def test_a_refusal_from_auth_settings_directly_echoes_no_secret(case: str) -> No
     _assert_clean(constructed.value, case)
 
 
-def _section_models() -> dict[str, type[BaseModel]]:
-    out: dict[str, type[BaseModel]] = {}
-    for name, field in ServiceSettings.model_fields.items():
-        assert isinstance(field.annotation, type), name
-        out[name] = field.annotation
-    return out
-
-
 @pytest.mark.parametrize("section", sorted(_section_models()))
 def test_every_section_refuses_a_non_mapping_without_echoing_it(section: str) -> None:
     """The sweep that covers a section added later, with no case written for it."""
+    assert len(_section_models()) == len(ServiceSettings.model_fields)  # every field is a model
     model = _section_models()[section]
     assert issubclass(model, _InputHidingModel), section
     with pytest.raises(ValidationError) as direct:
@@ -400,6 +394,25 @@ def test_the_error_keeps_its_location_type_message_and_ctx() -> None:
         AuthSettings.model_validate({"password_extra_context_words": '["acme",'})
     ctx = refused.value.errors()[0]["ctx"]
     assert isinstance(ctx["error"], ValueError)
+
+
+def test_an_operator_brace_in_a_message_is_not_substituted_again() -> None:
+    """The rebuilt error renders from pydantic's own template, never from the rendered message,
+    so a ``{error}`` the operator wrote is not replaced once per wrapping model."""
+    with pytest.raises(ValidationError) as caught:
+        ServiceSettings.model_validate({"alerts": {"email_subject_template": "Alert: {error}"}})
+    (err,) = caught.value.errors()
+    assert err["msg"].count("email_subject_template") == 1, err["msg"]
+    assert "{error}" in err["msg"]
+
+
+def test_an_oidc_url_refusal_names_the_scheme_not_the_url() -> None:
+    """A URL can carry credentials in its userinfo, and a message is not hidden as input is."""
+    url = "http://client:" + _CLIENT_SECRET + "@idp.example/token"
+    with pytest.raises(ValidationError) as caught:
+        AuthSettings.model_validate(_auth(oidc_token_endpoint=url))
+    assert "got scheme 'http'" in str(caught.value)
+    _assert_clean(caught.value, "userinfo")
 
 
 # --- through load_settings and the CLI ----------------------------------------------------------

@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -59,7 +59,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_core import InitErrorDetails, PydanticCustomError, core_schema
+from pydantic_core import ErrorDetails, InitErrorDetails, PydanticCustomError, core_schema
 
 from messagefoundry.api_tls_source import api_tls_source
 from messagefoundry.childenv import outside_engine_namespace
@@ -303,6 +303,26 @@ def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
 HIDDEN_INPUT = "[not shown]"
 
 
+#: Every error type pydantic-core knows. One of these is rebuilt from its own template and ``ctx``,
+#: so the rendered message is never fed back in as a template, where a ``{error}`` the operator
+#: wrote would be substituted again at each level.
+_KNOWN_ERROR_TYPES = frozenset(get_args(core_schema.ErrorType))
+
+
+def _without_input(err: ErrorDetails) -> InitErrorDetails:
+    """One error, rebuilt with :data:`HIDDEN_INPUT` in place of its input."""
+    if err["type"] in _KNOWN_ERROR_TYPES:
+        detail = InitErrorDetails(type=err["type"], loc=err["loc"], input=HIDDEN_INPUT)
+        if "ctx" in err:
+            detail["ctx"] = err["ctx"]
+        return detail
+    # A validator's own PydanticCustomError: keep its type and rendered message, with no context,
+    # so the message is not formatted a second time.
+    return InitErrorDetails(
+        type=PydanticCustomError(err["type"], err["msg"]), loc=err["loc"], input=HIDDEN_INPUT
+    )
+
+
 def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
     """Validate ``value``; on a refusal, re-raise every error with its input replaced.
 
@@ -312,22 +332,17 @@ def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     that prints or logs the error would disclose them. ``hide_input_in_errors`` is not enough: it
     hides the input from ``str`` and ``repr`` only, and only on the outermost model.
 
-    Each error keeps its location, type, message and ``ctx``. The message and ``ctx`` are authored
-    by the validator, so they must name settings, never quote a secret value.
+    Each error keeps its location, type, message and ``ctx``. THIS HIDES THE INPUT ONLY. The message
+    and ``ctx`` are written by the validator, and a validator that quotes the value it refused
+    still shows it there: at least the ``[backup]`` and ``[dr]`` cloud-URL refusals and the
+    ``[api].trusted_proxies`` entry refusals do. None of those is meant to hold a secret, but a URL
+    can carry one, so a validator message must name the setting, never quote a secret value.
     """
     try:
         return handler(value)
     except ValidationError as exc:
         raise ValidationError.from_exception_data(
-            exc.title,
-            [
-                InitErrorDetails(
-                    type=PydanticCustomError(err["type"], err["msg"], err.get("ctx")),
-                    loc=err["loc"],
-                    input=HIDDEN_INPUT,
-                )
-                for err in exc.errors(include_url=False)
-            ],
+            exc.title, [_without_input(err) for err in exc.errors(include_url=False)]
         ) from None
 
 
@@ -3542,16 +3557,16 @@ class AuthSettings(_Section):
             raise ValueError(
                 "oidc_client_assertion_key_id is blank or has leading or trailing whitespace",
             )
-        # The key reference too: the resolver treats a whitespace-only reference as set.
+        # The key reference too: the resolver treats a whitespace-only reference as set, and an
+        # empty one as unset, so only the whitespace-only one is refused.
         blank = [
             name
-            for name in (
-                "oidc_client_certificate",
-                "oidc_client_private_key_password",
-                "oidc_client_private_key_ref",
-            )
+            for name in ("oidc_client_certificate", "oidc_client_private_key_password")
             if getattr(self, name) is not None and not given(getattr(self, name))
         ]
+        key_ref = self.oidc_client_private_key_ref
+        if key_ref and not given(key_ref):
+            blank.append("oidc_client_private_key_ref")
         if self.oidc_private_key_jwt and blank:
             raise ValueError(f"{', '.join(blank)} is set but blank; remove it or give a value")
         # The provider reference would win silently over the literal, so both is refused.
@@ -3578,10 +3593,11 @@ class AuthSettings(_Section):
                 "reference). An env var exported with no value counts as missing.",
             )
         # The signing key's two rules above, for the secret. The resolver reads a whitespace-only
-        # reference as set, and the reference wins silently over the literal.
+        # reference as set, and the reference wins silently over the literal. An EMPTY reference
+        # reads as unset everywhere (an env var exported with no value), so only whitespace refuses.
         secret_ref = self.oidc_client_secret_ref
         if not self.oidc_private_key_jwt:
-            if secret_ref is not None and not given(secret_ref):
+            if secret_ref and not given(secret_ref):
                 raise ValueError(
                     "oidc_client_secret_ref is set but blank; remove it or give a value"
                 )
@@ -3626,7 +3642,10 @@ class AuthSettings(_Section):
         ):
             parts = urlsplit(url or "")
             if parts.scheme != "https":
-                raise ValueError(f"[auth].{name} must be an https URL (got {url!r})")
+                # The scheme only: a URL can carry credentials in its userinfo.
+                raise ValueError(
+                    f"[auth].{name} must be an https URL (got scheme {parts.scheme!r})"
+                )
             if parts.hostname not in allowed:
                 raise ValueError(
                     f"[auth].{name} host {parts.hostname!r} is not in oidc_allowed_endpoints "
@@ -7654,18 +7673,22 @@ def settings_error_detail(exc: Exception) -> str:
     string. A long value is not safer: pydantic abbreviates a long ``input_value`` repr from the
     middle, so a 32-character password loses its head and discloses its tail.
 
-    SINCE BACKLOG #296 THE SETTINGS MODELS STRIP IT THEMSELVES. Every ``_Section`` and
+    SINCE BACKLOG #296 THE SETTINGS MODELS STRIP THE INPUT THEMSELVES. Every ``_Section`` and
     :class:`ServiceSettings` re-raises each error with its input replaced by :data:`HIDDEN_INPUT`
-    (``_InputHidingModel``), so ``str(exc)``, ``exc.errors()`` and ``exc.json()`` carry no configured
-    value whoever renders them. That covers the ``__main__.py`` arms that still print ``str(exc)``
-    (at least ``audit-verify``, ``rotate-key`` and the store commands behind
-    ``_host_gated_store_settings``). ``serve`` and ``supervise`` already rendered through this
-    function, by way of ``_load_service_settings``.
+    (``_InputHidingModel``), so no rendering of the error carries the refused mapping. That covers
+    the ``__main__.py`` arms that still print ``str(exc)`` (at least ``audit-verify``,
+    ``rotate-key`` and the store commands behind ``_host_gated_store_settings``). ``serve`` and
+    ``supervise`` already rendered through this function, by way of ``_load_service_settings``.
+
+    THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
+    refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``
+    cloud-URL refusals and the ``[api].trusted_proxies`` entry refusals do. None of them is meant to
+    hold a secret, but a URL can carry one, so a validator message must name the setting and never
+    quote a secret value. The OIDC URL refusals name only the scheme for that reason.
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
     is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is
-    not a settings model, such as an ``[[alerts.rules]]`` rule. The message and ``ctx`` are authored
-    by the validators, so neither may quote a secret value.
+    not a settings model, such as an ``[[alerts.rules]]`` rule.
     """
     from pydantic import ValidationError
 

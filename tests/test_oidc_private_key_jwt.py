@@ -572,6 +572,40 @@ def test_a_blank_secret_reference_or_both_secret_spellings_are_refused() -> None
         AuthSettings(**_auth(oidc_client_secret=SECRET, oidc_client_secret_ref="kv/mf#oidc"))
 
 
+def test_an_empty_reference_reads_as_unset(ec_key: ec.EllipticCurvePrivateKey) -> None:
+    """An env var exported with no value is unset, as the resolver reads it; only whitespace refuses."""
+    AuthSettings(**_auth(oidc_client_secret=SECRET, oidc_client_secret_ref=""))
+    AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_private_key_ref=""))
+    with pytest.raises(ValidationError, match="oidc_client_private_key_ref is set but blank"):
+        AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_private_key_ref=" "))
+
+
+class _StaticProvider:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def resolve(self, ref: str) -> str:
+        return self.value
+
+
+def test_a_key_reference_must_resolve_to_the_key_itself(
+    ec_key: ec.EllipticCurvePrivateKey, tmp_path: Path
+) -> None:
+    """The signer reads a header-less value as a path; a secret store must not pick that path."""
+    from messagefoundry.config.secretprovider import SecretProviderError
+
+    settings = AuthSettings(
+        **_pkjwt(_pem(ec_key), oidc_client_private_key=None, oidc_client_private_key_ref="kv/k#k")
+    )
+    auth = oidc_client_auth_from_settings(settings, _StaticProvider(_pem(ec_key)))
+    assert isinstance(auth, PrivateKeyJwtClientAuth)
+
+    key_file = tmp_path / "oidc.pem"
+    key_file.write_text(_pem(ec_key), encoding="utf-8")
+    with pytest.raises(SecretProviderError, match="did not resolve to a PEM key"):
+        oidc_client_auth_from_settings(settings, _StaticProvider(str(key_file)))
+
+
 @pytest.mark.parametrize(
     "extra",
     [
