@@ -30,7 +30,9 @@ never point it at a real mail server.
 
 **Egress.** ``serve`` refuses unrestricted egress, and these outbounds dial SMTP, so an instance
 serving ``harness/config`` behind an allowlist lists the sink too:
-``[egress].allowed_smtp = ["127.0.0.1:2661"]`` (or the port ``email_smtp`` is moved to).
+``[egress].allowed_smtp = ["127.0.0.1:2661"]`` (or the port ``email_smtp`` is moved to). The
+recipient list is gated as well, and that gate is deny-by-default: any instance serving this graph
+needs ``[egress].allowed_recipient_domains = ["harness.invalid"]``, or neither outbound loads.
 
 ``harness/config/direct/`` is the STARTTLS + S/MIME sibling. It needs certificates minted for the
 run, so it is served on its own rather than with this directory.

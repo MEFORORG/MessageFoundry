@@ -33,7 +33,7 @@ The durable, enforced layer (signals 1–8) is Built and verified in the real fi
 - a fail-closed forbidden-content scanner shared byte-for-byte across `publish.ps1` / pre-commit / CI;
 - a deny-by-default loopback bind guard that `--allow-insecure-bind` cannot relax past the no-auth refusal;
 - strongest-per-partner interface auth (mTLS / OAuth2-CC / SMART / WS-Security) with TLS everywhere;
-- a SHA-256 hash-chained, user-attributed, append-only audit log with dedicated tamper tests.
+- a hash-chained, user-attributed, append-only audit log with dedicated tamper tests. On a store with a key the chain is an HMAC-SHA-256 under an audit key derived from the store key, or held in Transit under `vault_transit`, so a table writer with no key cannot change a row unseen; rows cut from the end show only against an anchor held outside the database. On a keyless store it is plain SHA-256 and shows corruption only. *(Corrected 2026-10-03. This said "a SHA-256 hash-chained" log, which is the keyless digest only.)*
 
 That layer earns its "Strong" marks.
 
