@@ -21,7 +21,9 @@ harness.reconcile compare --max-file-bytes`` changes the cap.
 
 from __future__ import annotations
 
+import errno
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +37,8 @@ from harness.reconcile.normalize import (
 )
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.parsing.peek import normalize as _normalize_line_endings
+
+_log = logging.getLogger(__name__)
 
 #: Default per-connection match key — the message control id (``MSH-10``).
 DEFAULT_KEY: tuple[str, int] = ("MSH", 10)
@@ -63,8 +67,10 @@ DEFAULT_MAX_LOAD_FILE_BYTES = 64 * DEFAULT_MAX_MESSAGE_BYTES
 
 
 class LoadError(ValueError):
-    """An input file :func:`load_messages` refused to read: over the cap, or not a regular file.
-    ``over_cap`` says which, so a caller can name the setting that would help."""
+    """An input :func:`load_messages` refused: a file over the cap or not a regular file, or a JSONL
+    line that is not a capture record. ``over_cap`` says which, so a caller can name the setting that
+    would help. The message names the path and, for a line, its number; it never quotes content, so
+    a caller may print it."""
 
     def __init__(self, message: str, *, over_cap: bool) -> None:
         super().__init__(message)
@@ -79,6 +85,24 @@ def _read(path: Path, cap: int) -> bytes:
     return data
 
 
+def _record(path: Path, number: int, line: str) -> str:
+    """The ``raw`` of one JSONL capture line, or :class:`LoadError` naming the line, never its text."""
+    try:
+        record = json.loads(line)
+    except (json.JSONDecodeError, RecursionError):
+        # A JSONDecodeError counts its line within this one line, not the file; RecursionError is a
+        # line nested too deep. Both are malformed input, reported by the file's line number.
+        raise LoadError(f"{path}: line {number} is not valid JSON", over_cap=False) from None
+    raw = record.get("raw") if isinstance(record, dict) else None
+    if not isinstance(raw, str):
+        # A list or a number here used to raise TypeError, which the CLI did not catch, so it exited
+        # 1, the code for "the outputs differ".
+        raise LoadError(
+            f"{path}: line {number} is not an object with a string 'raw'", over_cap=False
+        )
+    return raw
+
+
 def load_messages(
     path: str | Path, *, max_file_bytes: int = DEFAULT_MAX_LOAD_FILE_BYTES
 ) -> list[str]:
@@ -87,49 +111,58 @@ def load_messages(
 
     Each file is capped at ``max_file_bytes`` (default :data:`DEFAULT_MAX_LOAD_FILE_BYTES`) and refused
     with :class:`LoadError` over it, before it is read whole; so is a named path that is not a regular
-    file. In a directory the cap is a TOTAL across its files, since every message is held at once;
-    only regular files are read, a symlink is not followed, as in the File tab's watch pane, and
-    anything else in it is skipped. A JSONL line that is not an object with a string ``raw`` raises
-    ``ValueError`` naming the line number, never its content."""
+    file, and a JSONL line that is not an object with a string ``raw``. In a directory the cap is a
+    TOTAL across its files, since every message is held at once; only regular files are read, and a
+    symlink, as in the File tab's watch pane, or anything else in it is skipped, with a warning that
+    counts the skips."""
     if max_file_bytes <= 0:
         raise ValueError(f"max_file_bytes must be a positive byte count, got {max_file_bytes}")
     p = Path(path)
     if p.is_dir():
         out: list[str] = []
         left = max_file_bytes
+        skipped = 0
         for child in sorted(p.iterdir()):
             # The directory's entries are another system's output, not paths the operator named, so a
             # symlink among them is not followed: it could point anywhere the operator can read.
-            if not child.is_file(follow_symlinks=False):
+            try:
+                data, reason = read_capped(child, left, follow_symlinks=False)
+            except OSError as exc:
+                if exc.errno != errno.ELOOP:
+                    raise  # unreadable or gone: exit 2, as for a named file
+                skipped += 1  # O_NOFOLLOW met a symlink swapped in after the lstat
                 continue
-            data, reason = read_capped(child, left, follow_symlinks=False)
             if reason == NOT_REGULAR:
-                continue  # swapped for a non-file since the listing: skipped, like any other
+                skipped += 1
+                continue
             if reason:
-                # ``left`` is what remains of the directory's total, not a per-file cap, so name both.
+                # The cap passed was what is left of the directory's total, so say so beside it.
                 raise LoadError(
-                    f"{child}: over the {left} bytes left of the {max_file_bytes}-byte total cap "
-                    "for this directory; not read",
+                    f"{child}: {reason}; in a directory that cap is what was left of the "
+                    f"{max_file_bytes}-byte total across its files",
                     over_cap=True,
                 )
             left -= len(data)
             out.extend(_split_batch(data.decode("latin-1")))
+        if skipped:
+            # A skip is silent in the result, and a key it hides reads as a one-sided difference.
+            _log.warning(
+                "%s: skipped %d entr%s that are not regular files (a symlink is not followed)",
+                p,
+                skipped,
+                "y" if skipped == 1 else "ies",
+            )
         return out
     # Decode straight away, so the bytes are not held beside the text while it is split.
     if p.suffix == ".jsonl":
-        msgs: list[str] = []
-        for number, line in enumerate(_read(p, max_file_bytes).decode("utf-8").splitlines(), 1):
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            raw = record.get("raw") if isinstance(record, dict) else None
-            if not isinstance(raw, str):
-                # Without this, a list or a number on a line raised TypeError, which the CLI did not
-                # catch, so it exited 1, the code for "the outputs differ".
-                raise ValueError(f"{p}: line {number} is not an object with a string 'raw'")
-            msgs.append(raw)
-        return msgs
+        # Split on "\n" only: the capture sink writes JSON with ensure_ascii=False, so a record can
+        # hold U+0085 or U+2028, which str.splitlines() would treat as line breaks.
+        text = _read(p, max_file_bytes).decode("utf-8")
+        return [
+            _record(p, number, line.strip())
+            for number, line in enumerate(text.split("\n"), 1)
+            if line.strip()
+        ]
     return _split_batch(_read(p, max_file_bytes).decode("latin-1"))
 
 

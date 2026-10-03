@@ -9,14 +9,18 @@ against engine-non-determinism, MEFOR-only / Corepoint-only, unkeyed, duplicate 
 
 from __future__ import annotations
 
+import errno
 import inspect
 import json
+import logging
 import os
 import threading
 from pathlib import Path
 
 import pytest
 
+from harness.bounded_file import read_capped
+from harness.reconcile import compare as compare_mod
 from harness.reconcile.__main__ import main as reconcile_main
 from harness.reconcile.compare import (
     DEFAULT_MAX_LOAD_FILE_BYTES,
@@ -143,19 +147,45 @@ def test_compare_cli_exits_two_on_a_jsonl_line_that_is_not_a_capture_record(
     batch.write_text(_msg("A"), encoding="latin-1")
     assert reconcile_main(["compare", "--mefor", str(jsonl), "--corepoint", str(batch)]) == 2
     err = capsys.readouterr().err
-    assert "could not be read" in err and "MSH" not in err  # by class only, never the content
+    assert "cap.jsonl: line 2 is not" in err and "MSH" not in err  # the line, never its content
+    assert "--max-file-bytes" not in err  # not a cap problem, so no cap hint
 
 
-def test_load_messages_names_the_jsonl_line_and_not_its_content(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "line", ['["PID|SECRET"]', '{"raw": "PID|SECRET"', "[" * 100_000], ids=["list", "bad", "deep"]
+)
+def test_load_messages_names_the_jsonl_line_and_not_its_content(tmp_path: Path, line: str) -> None:
+    """A library caller gets a LoadError (a ValueError) naming the FILE's line number, never the
+    line's text; a JSONDecodeError alone would count its line within the one line, and a line
+    nested too deep would escape as RecursionError."""
     jsonl = tmp_path / "cap.jsonl"
-    jsonl.write_text(json.dumps({"raw": _msg("A")}) + "\n" + '["PID|SECRET"]\n', encoding="utf-8")
-    with pytest.raises(ValueError, match="line 2 is not an object") as bad:
+    jsonl.write_text(json.dumps({"raw": _msg("A")}) + "\n" + line + "\n", encoding="utf-8")
+    with pytest.raises(LoadError, match="cap.jsonl: line 2 is not") as bad:
         load_messages(jsonl)
-    assert "SECRET" not in str(bad.value) and not isinstance(bad.value, LoadError)
+    assert "SECRET" not in str(bad.value) and not bad.value.over_cap
+
+
+def test_load_messages_jsonl_keeps_a_record_holding_a_unicode_line_separator(
+    tmp_path: Path,
+) -> None:
+    """The capture sink writes ensure_ascii=False, so a body decoded from latin-1 byte 0x85 carries a
+    raw U+0085, which str.splitlines() treats as a line break. The loader splits on newlines only."""
+    jsonl = tmp_path / "cap.jsonl"
+    bodies = [
+        _msg("A").replace("DOE^JANE", "DOE\x85JANE"),
+        _msg("B").replace("DOE^JANE", "X\u2028Y"),
+    ]
+    jsonl.write_text(
+        "\n".join(json.dumps({"raw": b}, ensure_ascii=False) for b in bodies) + "\n",
+        encoding="utf-8",
+    )
+    assert load_messages(jsonl) == bodies
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="no symlinks on this platform")
-def test_load_messages_directory_mode_does_not_follow_a_symlink(tmp_path: Path) -> None:
+def test_load_messages_directory_mode_does_not_follow_a_symlink(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """In a directory, a symlink is skipped, not followed, as the File tab's watch pane skips one:
     the entries are another system's output, and a link could point at any file the operator can
     read. A symlinked DIRECTORY the operator names is still read; only entries inside it are judged."""
@@ -168,15 +198,17 @@ def test_load_messages_directory_mode_does_not_follow_a_symlink(tmp_path: Path) 
         (d / "2.hl7").symlink_to(outside)
     except OSError:  # Windows without the symlink privilege
         pytest.skip("cannot create a symlink here")
-    assert [field_value(m, ("MSH", 10)) for m in load_messages(d)] == ["A"]
+    with caplog.at_level(logging.WARNING, logger="harness.reconcile.compare"):
+        assert [field_value(m, ("MSH", 10)) for m in load_messages(d)] == ["A"]
+    assert "skipped 1 entry" in caplog.text  # a skip is never silent: it hides a key
     linked = tmp_path / "linked"
     linked.symlink_to(d, target_is_directory=True)
     assert [field_value(m, ("MSH", 10)) for m in load_messages(linked)] == ["A"]
 
 
 def test_load_messages_directory_refusal_names_the_total_not_a_file_cap(tmp_path: Path) -> None:
-    """The directory budget is a total, so a refusal names what was left of it and the total, not
-    "the N-byte cap" as though N were a per-file cap the operator had set."""
+    """The directory budget is a total, so a refusal says the cap it names is what was left of that
+    total, not a per-file cap the operator set; it still names the file's own size."""
     one = _msg("A").encode("latin-1")
     d = tmp_path / "exp"
     d.mkdir()
@@ -187,7 +219,8 @@ def test_load_messages_directory_refusal_names_the_total_not_a_file_cap(tmp_path
         load_messages(d, max_file_bytes=total)
     text = str(over.value)
     assert "2.hl7" in text and over.value.over_cap
-    assert f"over the {len(one) - 1} bytes left of the {total}-byte total cap" in text
+    assert f"{len(one)} bytes, over the {len(one) - 1}-byte cap" in text
+    assert f"what was left of the {total}-byte total across its files" in text
 
 
 def test_reconcile_identical_is_clean() -> None:
@@ -238,3 +271,32 @@ def test_report_renders_text_and_json() -> None:
     blob = render_json(result)
     assert blob["connection"] == "IB_Y" and blob["clean"] is False
     assert blob["counts"]["mismatched"] == 1 and blob["mismatches"][0]["key"] == "K"
+
+
+def test_load_messages_directory_skips_a_symlink_swapped_in_after_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Where the OS has O_NOFOLLOW, a file swapped for a symlink between the lstat and the open fails
+    the open with ELOOP. That entry is skipped like any other symlink; any other OSError still ends
+    the load, so an unreadable file is never silently dropped."""
+    d = tmp_path / "exp"
+    d.mkdir()
+    (d / "1.hl7").write_text(_msg("A"), encoding="latin-1")
+    (d / "2.hl7").write_text(_msg("B"), encoding="latin-1")
+
+    def swapped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[bytes, str]:
+        if path.name == "2.hl7":
+            raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+        return read_capped(path, cap, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(compare_mod, "read_capped", swapped)
+    with caplog.at_level(logging.WARNING, logger="harness.reconcile.compare"):
+        assert [field_value(m, ("MSH", 10)) for m in load_messages(d)] == ["A"]
+    assert "skipped 1 entry" in caplog.text
+
+    def denied(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[bytes, str]:
+        raise PermissionError(errno.EACCES, "denied")
+
+    monkeypatch.setattr(compare_mod, "read_capped", denied)
+    with pytest.raises(PermissionError):
+        load_messages(d)
