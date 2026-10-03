@@ -20,7 +20,7 @@ import pytest
 
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
-from messagefoundry.config.settings import _env_overrides, load_settings
+from messagefoundry.config.settings import ServiceSettings, _env_overrides, load_settings
 from tests._phi_gate_provisions import (
     PHI_GATE_PROVISIONS_TOML,
     RETENTION_WINDOWS_ENV,
@@ -977,77 +977,71 @@ def test_serve_loopback_bind_needs_no_flag(
     assert "non-loopback" not in capsys.readouterr().err  # loopback never trips the guard
 
 
-def test_serve_non_loopback_with_auth_off_refused_despite_flag(
+def test_serve_refuses_a_config_that_still_sets_the_sign_in_switch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The opt-in flag accepts the cleartext-PHI risk; it must NOT also wave through serving a
-    # full-privilege, unauthenticated API to the network — that stays a hard refuse regardless.
+    # Vault BACKLOG #2719: `serve` always requires sign-in, and the switch that turned it off was
+    # removed. A config that still sets it is refused at load, on loopback as well as off it, and
+    # before any bind gate: the --allow-insecure-bind flag cannot reach it either.
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "messagefoundry.toml").write_text(
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    for toml in (
+        "security.require_sign_in = false\n",
         'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
         "security.require_sign_in = false\n",
-        encoding="utf-8",
-    )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind"]) == 2
-    err = capsys.readouterr().err
-    assert "enabled=false" in err  # the no-auth gate fired...
-    assert "refusing to serve the API on non-loopback" not in err  # ...not the bind gate
+    ):
+        (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
+        rc = main(
+            ["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "dev"]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "[security].require_sign_in was REMOVED" in err
+        assert "refusing to serve the API on non-loopback" not in err  # the load refused first
 
 
-def test_serve_refuses_auth_off_behind_declared_terminator(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # BACKLOG #1013 (positive regression): auth entirely off behind a DECLARED TLS terminator is exposed
-    # exactly like an off-loopback bind — the API would answer as a full-privilege identity with no
-    # authentication — so the auth-off startup arm must refuse it, not only the non-loopback case. A
-    # loopback bind (default local_access_only) + a declared terminator -> instance_exposed True, auth
-    # off. The arm returns before the env-required check (like the non-loopback case above), so no --env,
-    # store key, or server mock is needed.
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "messagefoundry.toml").write_text(
-        "security.require_sign_in = false\n"
-        "[api]\n"
-        "tls_terminated_upstream = true\n"
-        "plaintext_upstream_hop_acknowledged = true\n"
-        'trusted_proxies = ["10.0.0.1"]\n',  # settings.py requires this alongside the terminator
-        encoding="utf-8",
-    )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG)]) == 2
-    err = capsys.readouterr().err
-    # rc alone is not enough: the later env-required gate also returns 2, so the message asserts are
-    # what give this test teeth (they disappear if the arm reverts to the bare bind check).
-    assert "enabled=false" in err  # the no-auth gate fired
-    assert (
-        "tls_terminated_upstream" in err or "reverse proxy" in err
-    )  # named the terminator exposure
-
-
-#: A loopback instance with the shared PHI-gate provisions, so the sign-in arms decide the outcome.
+#: A loopback instance with the shared PHI-gate provisions, so the sign-in arm decides the outcome.
 _LOOPBACK_TOML = PHI_GATE_PROVISIONS_TOML + "security.local_access_only = true\n"
-_SIGN_IN_OFF_LOOPBACK_TOML = _LOOPBACK_TOML + "security.require_sign_in = false\n"
 
 
-def test_serve_auth_off_on_unexposed_loopback_still_starts(
+def _with_sign_in_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hand `serve` settings with [auth].enabled off. No config key can do that any more, so the
+    loader is wrapped: this is the caller that builds Settings in code, which the arm still guards."""
+    from messagefoundry.config import settings as settings_module
+
+    real = settings_module.load_settings
+
+    def _loaded_then_signed_out(*args: Any, **kwargs: Any) -> ServiceSettings:
+        loaded = real(*args, **kwargs)
+        loaded.auth.enabled = False
+        return loaded
+
+    monkeypatch.setattr(settings_module, "load_settings", _loaded_then_signed_out)
+
+
+def test_serve_refuses_auth_off_on_a_bare_loopback_bind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # BACKLOG #1013 (negative control): the arm was WIDENED, not broadened to fire on any auth-off. A
-    # true loopback dev instance with no declared terminator (instance_exposed False) is the supported
-    # no-auth flow and must still start silently.
-    rc, captured = _run_secure_serve(tmp_path, monkeypatch, _SIGN_IN_OFF_LOOPBACK_TOML, env="dev")
-    assert rc == 0
-    # The widened arm stayed silent because the instance is not exposed.
-    assert "refusing to serve with [auth] enabled=false" not in capsys.readouterr().err
-    # vault BACKLOG #2611: the factory denies by default, so `serve` is what asks it for the open mode.
-    assert captured["allow_no_auth"] is True
+    # Vault BACKLOG #2719: the arm used to refuse only an EXPOSED instance and let a bare loopback bind
+    # with no declared terminator run with no sign-in. That mode was removed, so the loopback case,
+    # the one it used to wave through, now refuses too, and the app is never built.
+    _with_sign_in_off(monkeypatch)
+    rc, captured = _run_secure_serve(tmp_path, monkeypatch, _LOOPBACK_TOML, env="dev")
+    assert rc == 2
+    assert "refusing to serve with authentication disabled" in capsys.readouterr().err
+    assert captured == {}  # create_managed_app was never reached
 
 
-def test_serve_does_not_ask_the_factory_for_the_open_mode_with_sign_in_on(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_serve_starts_with_auth_on_and_never_asks_for_the_open_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The control on the last assertion above: with sign-in on (the default), no opt-in is passed.
+    # The control on the test above: the same loopback config with sign-in on (the only way a config
+    # can load now) starts, and `serve` passes no allow_no_auth opt-in to the factory at all.
     rc, captured = _run_secure_serve(tmp_path, monkeypatch, _LOOPBACK_TOML, env="dev")
     assert rc == 0
-    assert captured["allow_no_auth"] is False
+    assert "refusing to serve with authentication disabled" not in capsys.readouterr().err
+    assert captured, "create_managed_app was not reached"
+    assert "allow_no_auth" not in captured
 
 
 def test_serve_auth_on_behind_terminator_unaffected_by_arm(
@@ -1076,7 +1070,7 @@ def test_serve_auth_on_behind_terminator_unaffected_by_arm(
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
-    assert "enabled=false" not in capsys.readouterr().err  # the arm did not fire (auth is on)
+    assert "authentication disabled" not in capsys.readouterr().err  # the arm did not fire
 
 
 def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(

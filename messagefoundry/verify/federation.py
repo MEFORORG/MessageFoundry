@@ -370,9 +370,9 @@ def _revocation_row(
     ALLOW on this host is PASS. ALLOW on a loaded CRL is MANUAL, because nothing offline can tell
     whether the CRL covers that leg's CA (BACKLOG #1925, recorded at
     :func:`~messagefoundry.auth.oidc_http.build_idp_opener`). Any other ALLOW crosses unchecked and
-    is MANUAL. The guards run only where the engine builds them: the lifespan builds the auth
-    service only when sign-in is required (``[security].require_sign_in``), so this row SKIPs
-    otherwise.
+    is MANUAL. The guards run only where the engine builds them, in the auth service. ``serve``
+    always builds one, since it refuses to start with sign-in off (vault BACKLOG #2719). Settings
+    built in code with ``[auth].enabled`` off have none, so this row SKIPs there.
 
     ``MEFOR_TLS_REVOCATION_ATTESTED`` is read from the environment ``verify`` runs in. Run it with the
     service's environment, or the WARN and ALLOW wording may describe a different decision."""
@@ -390,8 +390,8 @@ def _revocation_row(
             rid,
             title,
             Status.SKIP,
-            "[security].require_sign_in is false, so the engine builds no auth service and runs no "
-            "OIDC guard",
+            "sign-in is disabled on these settings ([auth].enabled is false), so no auth service and "
+            "no OIDC guard is built; `serve` refuses to start this way",
         )
     if opener is None:
         return CheckResult(

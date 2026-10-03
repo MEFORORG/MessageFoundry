@@ -19,8 +19,8 @@ If an exclusion or rule is not justified below for *your* deployment, do not add
 | Fact | Value |
 |---|---|
 | Windows service name | `MessageFoundry` (installed via **NSSM** wrapper) |
-| Registered service binary (`Application`) | `<repo>\.venv\Scripts\messagefoundry.exe` (a console-scripts shim) |
-| **Actual long-running process** (socket owner) | the venv **`python.exe`** that `messagefoundry.exe` re-execs |
+| Registered service program (`Application`) | `<repo>\.venv\Scripts\python.exe`, started with `-I -X disable-remote-debug -m messagefoundry serve ...` ([SERVICE.md](SERVICE.md#the-service-launch)) |
+| **Actual long-running process** (socket owner) | that venv **`python.exe`** |
 | Service wrapper process | `nssm.exe` (at `C:\Program Files\MessageFoundry\nssm\nssm.exe` by default, the installer's `-NssmDir`) |
 | `DataDir` default | `C:\ProgramData\MessageFoundry` |
 | Message store DB | `C:\ProgramData\MessageFoundry\messagefoundry.db` |
@@ -29,7 +29,7 @@ If an exclusion or rule is not justified below for *your* deployment, do not add
 | Logs | `C:\ProgramData\MessageFoundry\logs\service.out.log`, `...\service.err.log` (rotated at ~10 MiB) |
 | API bind (default) | `127.0.0.1:8765` (loopback) |
 
-> The service you see in `services.msc` and Task Manager is `messagefoundry.exe`, but the process that actually owns the listening/connecting sockets is the venv **`python.exe`** it launches. That distinction matters for program-scoped firewall rules below.
+> The service runs the venv **`python.exe`** directly. The `messagefoundry.exe` launcher beside it is not part of the service: it is what you run by hand for the one-off commands (`provision-admin`, `gen-key`). Program-scoped firewall rules below name `python.exe`.
 
 ---
 
@@ -72,7 +72,7 @@ Exclude these specific paths (substitute your real `DataDir`, repo path, and con
 | Process | Why exclude |
 |---|---|
 | venv **`python.exe`** (`<repo>\.venv\Scripts\python.exe`) | The real long-running engine process: listeners, connect sockets, store I/O. Interpreters are a frequent heuristic false-positive, and on-access scanning of its memory-mapped modules adds latency to a real-time message path. |
-| `messagefoundry.exe` (`<repo>\.venv\Scripts\messagefoundry.exe`) | The registered service shim that re-execs `python.exe`. Exclude so the launcher isn't blocked/quarantined. |
+| `messagefoundry.exe` (`<repo>\.venv\Scripts\messagefoundry.exe`) | The command-line launcher. The service does not run it; an operator does, for `provision-admin`, `gen-key` and the other one-off commands. Exclude so those are not blocked or quarantined. |
 | `nssm.exe` (`C:\Program Files\MessageFoundry\nssm\nssm.exe`) | The service wrapper. A quarantine here stops the whole service. |
 
 > There is **no** `.venv\Scripts\nssm.exe`. The service always runs the copy in the installer's `-NssmDir`. The installer fills that folder from `-NssmPath`, from an on-`PATH` `nssm`, or by downloading NSSM, and checks each against a pinned SHA-256 first.
@@ -175,7 +175,7 @@ New-NetFirewallRule `
   -RemoteAddress 10.0.50.10       # the specific downstream receiver host
 ```
 
-> **`-Program` targets `python.exe`, not the `messagefoundry.exe` shim**, because the venv `python.exe` is the process that actually owns the socket. (The shim only launches it.)
+> **`-Program` targets `python.exe`, not the `messagefoundry.exe` launcher**, because the venv `python.exe` is the program the service runs.
 >
 > **Firewall profile:** the samples omit `-Profile` so they apply to all profiles. If you scope by profile, **match the server's actual network profile** — `Domain` on a domain-joined host, but `Private`/`Public` on a workgroup/standalone test box (where there is no domain profile and a `-Profile Domain` rule would never be active).
 

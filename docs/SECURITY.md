@@ -132,7 +132,7 @@ Four more facts:
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer (`[security] require_sign_in = true` by default). Of the **115** engine route objects, **96 demand a
+auth layer, and no setting turns it off (vault BACKLOG #2719). Of the **115** engine route objects, **96 demand a
 specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -145,11 +145,13 @@ implicit.
 
 Both app factories are **fail-closed**. With no enabled `AuthService` attached, `create_app(engine)`
 and `create_managed_app(...)` deny every protected route (503) unless the caller explicitly opts out
-with `allow_no_auth=True` — the deliberate embedding/local-dev escape hatch. Neither factory reaches
-that mode by omission. The `serve`
-path runs auth-enabled by default; if `[security] require_sign_in = false` it sets that opt-in itself, and
-`__main__` refuses to serve auth-off on an exposed instance — a non-loopback host, or a loopback host
-behind a declared TLS terminator — and, even with auth enabled, a
+with `allow_no_auth=True`, the escape hatch for embedders and tests. Neither factory reaches
+that mode by omission, and `serve` never passes the opt-in. `serve` refuses to start with
+authentication off on every bind, loopback included (vault BACKLOG #2719). It used to allow a loopback
+bind with no declared terminator to run with sign-in off. That mode was removed: every request in it
+ran as one shared system identity, so the audit trail named no person, and it could not repair an
+account, because with no auth service the account and audit routes answer 503. A config that still
+sets `[security].require_sign_in` is refused at load. Even with auth enabled, a
 non-loopback bind requires an **operator certificate**: in-process (`[api].tls_cert_file`, WP-13a) or
 TLS terminated at a trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15). With
 neither, `serve` refuses: the only certificate left is the engine's self-signed placeholder (ADR 0172), which no trust
@@ -241,7 +243,7 @@ it opened. Under `[security].enforcement = "warn"`, or with the notice requireme
 (`[alerts].security_notifications_required = false`), the engine starts and routes HL7, logs one
 WARNING naming `provision-admin`, and nobody can sign in until it runs. Switching security notices
 off alone does not reach this point under `enforce`: the earlier notice-channel check refuses first.
-With `[security].require_sign_in = false` no account is needed and nothing is logged. A start
+There is no start that needs no account: `serve` always requires sign-in. A start
 refused because no enabled Administrator has a notification address names `messagefoundry
 admin-set-notify-email` instead, which fills a missing address from the host.
 
@@ -316,6 +318,22 @@ is written (ADR 0197 Amendment A). The second pass catches a sign-in made with t
 while the repair ran. Before that change
 it did neither. A session the earlier holder kept then became an Administrator session when the role
 was written, because every request re-reads the account's roles.
+
+#### Keep a local Administrator
+
+**Create a local Administrator before you need one.** `provision-admin` refuses while any enabled
+Administrator exists, and a directory or federated account counts. So if every Administrator signs
+in through Active Directory or an identity provider, and that service goes down, no host command
+gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #2711).
+
+- Keep at least one enabled local Administrator with a password, held by someone who can reach the
+  host during an outage.
+- At start, the engine checks for this. When every enabled Administrator needs an outside service,
+  it logs a WARNING naming them and writes one `auth.no_local_administrator` audit row. It never
+  refuses the start.
+- Turning sign-in off is not a way back in. `serve` refuses to start without it (vault BACKLOG
+  #2719). The old loopback mode could not repair an account anyway: with no auth service, creating
+  an account, unbinding one and reading the audit log all answered 503.
 
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
@@ -2308,9 +2326,9 @@ dict. Each model now gets a serializer over its own gated properties only
 ([`api/phi_gate.py`](../messagefoundry/api/phi_gate.py)). So the dict is untouched and the gap is
 closed. The published schema of every other gated model is unchanged.
 
-**Caveat.** With `[security].require_sign_in = false` every route resolves to the built-in system
-identity, which holds every role and therefore every permission, so the per-property gate withholds
-nothing. The gate survives as code only; that posture is out of scope for a PHI deployment.
+**Caveat, for embedders only.** An app built in code with `allow_no_auth=True` resolves every route to
+the built-in system identity, which holds every role and therefore every permission, so the
+per-property gate withholds nothing there. `serve` never builds that app (vault BACKLOG #2719).
 
 **Assurance — what CI actually asserts.** Three guards, deliberately covering the three distinct ways
 this gate can be forgotten (the previous claim here was overstated: the old pinning tests iterate the
@@ -2432,7 +2450,7 @@ slack.
 | Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`) or a passkey assertion that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied is not floored | **DENY** with the leg's ordinary failure, so nothing tells the caller about timing (`401 invalid code` on `POST /auth/mfa-verify`, the gate's own error on `POST /ui/mfa`); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`; no lockout count, no code or challenge spent | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
 | Time from a federated start to its callback | the flow cache's monotonic clock when the flow was staged vs at the callback | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off) |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
-| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | auth off on an exposed instance — a non-loopback bind **or** a declared terminator (`instance_exposed`); `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off, `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_sign_in`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
+| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (loopback-ness **or** a declared terminator) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | auth off on any bind, loopback included (vault BACKLOG #2719; no setting reaches this, so it guards settings built in code); `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the auth-off, `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind **or** a declared TLS terminator — never the console flag, BACKLOG #326) × `[approvals].enabled` | `admin_exposed` **and** `[approvals].enabled` off — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled` |
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited` on the sign-in start, or a **429** that re-renders the step-up page on `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages into the same cache; WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
 | `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped, because that GET then runs the POST leg | header **present** and not `navigate` (absent = allowed, for non-browser clients). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** the login limiter, so the audit write is itself rate-bounded | on | (no knob) |
@@ -4139,20 +4157,56 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-Two controls answer it, and they differ in strength:
+Three controls answer it, and they differ in strength:
 
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
-- **The engine process itself refuses the script.** `serve` and `supervise` start through a
-  console-script launcher, which cannot pass that option. So the command line installs an audit
-  hook as it starts, for every command (`messagefoundry/remotedebug.py`). The interpreter raises
-  an event before it runs an injected script, the hook raises on it, and the interpreter drops
-  the script.
+- **The shipped service launches start the engine with the interface off.** The Windows installer
+  and the container image run the interpreter itself, with `-X disable-remote-debug`, and no
+  longer the console-script launcher, which cannot pass an option
+  ([the next section](#isolated-mode-and-start-up-code-of-the-engines-interpreter)).
+- **The engine process refuses the script where the interface is still on.** A start through the
+  console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
+  installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
+  interpreter raises an event before it runs an injected script, the hook raises on it, and the
+  interpreter drops the script.
 
-The hook is the weaker of the two, so an engine that starts with the interface on reports it as
-the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported, what
-a default start reports and how to clear it are stated once, in
+The hook is the weakest of the three, so an engine that starts with the interface on reports it
+as the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported,
+which starts report it and how to clear it are stated once, in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
+
+### Isolated mode and start-up code of the engine's interpreter
+
+Two things put code inside a Python process before its first line runs: the `PYTHON*`
+environment variables, and the interpreter's start-up code (a `.pth` line that begins with
+`import`, and a `sitecustomize` module). On a first deployment either would run inside the
+engine, with everything the engine holds.
+
+Three controls answer it:
+
+- **The shipped service launches are isolated.** The Windows installer registers the install's
+  `python.exe` with `-I -X disable-remote-debug -m messagefoundry serve ...`, and the container
+  image's entry point is the same command with `-u -B` added. What the options do is stated once,
+  in [SERVICE.md](SERVICE.md#the-service-launch). `tests/test_isolated_launch.py` holds both
+  launches to one list of options, and each smoke leg reads the flags off the running engine.
+- **`serve` and `supervise` inventory the start-up code** (`messagefoundry/startupcode.py`).
+  Isolated mode does not stop it. Under `[security].enforcement = "enforce"` they refuse to start
+  on a file no installed package records. This is detection: start-up code runs before the check.
+- **The directories start-up code is read from should not be writable by the service account.**
+  That is the prevention, and it is a deployment requirement the engine checks and reports. The
+  container image meets it: its virtual environment is owned by root and the engine runs as
+  another user.
+
+What each control leaves open, what counts as expected start-up code, which entries a development
+start reports and how to clear each are stated once, in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-startup_directory_writable-what-runs-in-the-interpreter-before-the-engine-does).
+
+**The engine's Python children are not isolated.** The sandbox worker and each engine shard start
+with `-P -X disable-remote-debug`, and the engine hands them the `PYTHON*` variables it holds,
+by name (`messagefoundry/childenv.py`). So a `PYTHONPATH` in the service's environment that the
+engine ignores would still reach an engine shard. The engine reports that case as
+`python_variables_reach_children`, and its inventory searches the entries a child would inherit.
 
 ### HIPAA §164.312 alignment
 
@@ -4204,7 +4258,7 @@ former PySide6 desktop console was retired (BACKLOG #103).
 ## Configuration
 
 The engine-API authentication knobs live in three sections of `messagefoundry.toml`, not one; HTTP
-intake authentication is set per connection instead (`intake_auth`). Most are in `[auth]`. `[security]` holds at least the sign-in requirement (`require_sign_in`), the MFA requirement
+intake authentication is set per connection instead (`intake_auth`). Most are in `[auth]`. `[security]` holds at least the MFA requirement
 and its scope (`require_mfa`, `require_mfa_scope`, rejected under `[auth]`), the session timeouts, the
 console switch and the network allow-list. `[api]` holds the TLS settings and the mTLS identity map
 (`tls_client_cert_identities`). The AD bind password should come from `MEFOR_AUTH_AD_BIND_PASSWORD` or a

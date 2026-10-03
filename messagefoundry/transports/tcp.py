@@ -44,7 +44,14 @@ from messagefoundry.transports.base import (
     register_source,
     wait_for_intake,
 )
-from messagefoundry.transports.framing import FrameCodec, FrameError, codec_for
+from messagefoundry.transports.framing import (
+    FrameCodec,
+    FrameError,
+    check_frame_bytes,
+    codec_for,
+    frame_for_delivery,
+    frame_reply,
+)
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_FRAME_BYTES,
@@ -204,6 +211,12 @@ class TcpDestination(DestinationConnector):
         )
         self._hop_guard.enforce_construction()
 
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        """ADR 0205 rule 1 on ``payload`` without sending it, as :meth:`MLLPDestination.check_frame`
+        does, for a shadow outbound where :meth:`send` does not run. TCP has no delimiter rewrite,
+        so ``rewrite`` changes nothing."""
+        check_frame_bytes(self.codec, payload, self.encoding, transport="TCP")
+
     async def test_connection(self) -> None:
         # Reachability only: open + close a connection (no frame sent) so a test never delivers.
         await probe_tcp_reachable(self.host, self.port, self.connect_timeout, "TCP")
@@ -223,9 +236,11 @@ class TcpDestination(DestinationConnector):
             # Zero-I/O byte-crossing backstop (#200) before the first byte (defense in depth against a
             # reload routing PHI around the construction gate).
             self._hop_guard.assert_send()
+            # ADR 0205 rule 1: frame once, before any dial; both paths below only write bytes.
+            wire = frame_for_delivery(self.codec, payload, self.encoding, transport="TCP")
             if not self.persistent:
-                return await self._send_once(payload)
-            return await self._send_persistent(payload)
+                return await self._send_once(wire)
+            return await self._send_persistent(wire)
         finally:
             self._sending = False
 
@@ -239,14 +254,14 @@ class TcpDestination(DestinationConnector):
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"TCP connect to {self.host}:{self.port} failed: {exc}") from exc
 
-    async def _send_once(self, payload: str) -> DeliveryResponse | None:
+    async def _send_once(self, wire: bytes) -> DeliveryResponse | None:
         """Connect-per-send (``persistent=false``) — byte-identical wire behavior to the pre-#97 code,
         with the close now bounded (the #55 Proactor-wedge pattern; the legacy path awaited
         ``wait_closed()`` unbounded) and the fail-loud serial-``send()`` assert in :meth:`send`."""
         reader, writer = await self._dial()
         reply: bytes | None = None
         try:
-            writer.write(self.codec.frame(payload, self.encoding))
+            writer.write(wire)
             await asyncio.wait_for(writer.drain(), self.timeout)
             if self.expect_reply:
                 reply = await asyncio.wait_for(self._read_reply(reader), self.timeout)
@@ -262,7 +277,7 @@ class TcpDestination(DestinationConnector):
             )
         return None
 
-    async def _send_persistent(self, payload: str) -> DeliveryResponse | None:
+    async def _send_persistent(self, wire: bytes) -> DeliveryResponse | None:
         """One delivery over the cached connection (ADR 0067 §9): reuse-time liveness →
         reconnect-before-first-byte (uncharged) → write/drain → (``expect_reply``) read reply → re-cache
         on a fully-successful transaction unless the peer left extra bytes behind (desync guard)."""
@@ -298,7 +313,7 @@ class TcpDestination(DestinationConnector):
         leftover = False
         try:
             try:
-                writer.write(self.codec.frame(payload, self.encoding))
+                writer.write(wire)
                 await asyncio.wait_for(writer.drain(), self.timeout)
             except (TimeoutError, OSError) as exc:
                 raise DeliveryError(
@@ -629,7 +644,7 @@ class TcpSource(SourceConnector):
                             decoded += 1
                             reply = await self._handler(message)
                             if reply is not None:
-                                writer.write(self.codec.frame(reply, self.encoding))
+                                writer.write(frame_reply(self.codec, reply, self.encoding))
                                 await self._drain_reply(writer)
                         # Charge AFTER the messages in this chunk are fully handled.
                         if pacer is not None:

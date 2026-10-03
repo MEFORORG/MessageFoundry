@@ -24,6 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Union
 
+from messagefoundry.parsing._builtin_hl7 import escape_leaf
 from messagefoundry.parsing.dicom.dataset import DicomDataset, SrMeasurement
 
 __all__ = [
@@ -56,16 +57,14 @@ DEFAULT_SEPARATORS = Separators()
 
 
 def _escape_leaf(value: str, sep: Separators) -> str:
-    """Escape one leaf value so its structural delimiters are carried as data, and strip CR/LF so it
-    cannot inject a segment. The escape char is replaced **first** (so the escapes we insert are not
-    re-escaped)."""
+    """Escape one leaf value so its structural delimiters and control characters are carried as
+    data, and strip CR/LF so it cannot inject a segment. The escaping is the HL7 model's own leaf
+    escape (ADR 0205 rule 2), so a DICOM string holding an MLLP frame byte or NUL leaves as a
+    ``\\Xhh\\`` hex escape, never raw."""
     out = value.replace("\r", " ").replace("\n", " ")
-    out = out.replace(sep.escape, f"{sep.escape}E{sep.escape}")
-    out = out.replace(sep.field, f"{sep.escape}F{sep.escape}")
-    out = out.replace(sep.component, f"{sep.escape}S{sep.escape}")
-    out = out.replace(sep.repetition, f"{sep.escape}R{sep.escape}")
-    out = out.replace(sep.subcomponent, f"{sep.escape}T{sep.escape}")
-    return out
+    return escape_leaf(
+        out, (sep.field, sep.component, sep.repetition, sep.subcomponent, sep.escape)
+    )
 
 
 def _render_field(field: Field, sep: Separators) -> str:

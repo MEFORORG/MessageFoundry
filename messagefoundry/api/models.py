@@ -24,7 +24,7 @@ before moving a class between the two bases.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
@@ -51,6 +51,10 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     SecurityEnforcement,
 )
+
+if TYPE_CHECKING:
+    from messagefoundry.remotedebug import RemoteDebugPosture
+    from messagefoundry.startupcode import StartupPosture
 
 
 class ChannelInfo(BaseModel):
@@ -1346,6 +1350,76 @@ class StorePrivilegeView(BaseModel):
     detail: str = ""
 
 
+class StartupCodeItemView(BaseModel):
+    """One file that runs when the engine's interpreter starts (vault BACKLOG #2701): a ``.pth``
+    file with an ``import`` line, or a ``sitecustomize`` / ``usercustomize`` module.
+
+    It may be one that a Python child of the engine would run and the engine itself would not.
+    ``verdict`` is ``recorded``, ``interpreter`` or ``packaging_tool`` for a file the engine
+    expects, and ``modified`` or ``unrecorded`` for one it does not; ``expected`` says which.
+    ``owner`` is the installed distribution that lists the file, where one does. The rule is in
+    ``messagefoundry/startupcode.py``."""
+
+    kind: str
+    path: str
+    verdict: str
+    owner: str | None = None
+    expected: bool
+
+
+class InterpreterView(BaseModel):
+    """How the engine PROCESS that answered was started, and what its interpreter runs at start
+    (vault BACKLOG #2701, #2700). A reading of one process: an engine shard reports its own.
+
+    The four flags are ``sys.flags``. ``isolated`` is the one the shipped service launches set
+    (``-I``); it implies the other three. ``remote_debug_enabled`` is
+    ``sys.is_remote_debug_enabled()``. A hardened launch reads ``isolated`` true and
+    ``remote_debug_enabled`` false. ``startup_code`` and the directory lists are the reading taken
+    when the process started, so a file added since is not in them. Each deviation is also named
+    in ``loosenings``; this is the whole observation."""
+
+    isolated: bool
+    safe_path: bool
+    ignore_environment: bool
+    no_user_site: bool
+    remote_debug_enabled: bool
+    remote_debug_guard_installed: bool
+    #: Names only, never values: the ``PYTHON*`` variables set in the engine's environment that
+    #: change where an interpreter loads code from.
+    code_path_variables: list[str] = Field(default_factory=list)
+    startup_code: list[StartupCodeItemView] = Field(default_factory=list)
+    #: The directories start-up code is read from: the site directories and every directory on
+    #: the import path, the engine's own and the one it hands its Python children.
+    startup_dirs: list[str] = Field(default_factory=list)
+    #: The ones the engine's own account can add a file to. Empty is the safe reading only while
+    #: ``startup_dirs`` is not empty and ``unchecked_startup_dirs`` is.
+    writable_startup_dirs: list[str] = Field(default_factory=list)
+    unchecked_startup_dirs: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_readings(
+        cls, startup: StartupPosture, remote_debug: RemoteDebugPosture
+    ) -> InterpreterView:
+        """The view of the two process readings ``GET /security/posture`` takes."""
+        launch = startup.launch
+        return cls(
+            isolated=launch.isolated,
+            safe_path=launch.safe_path,
+            ignore_environment=launch.ignore_environment,
+            no_user_site=launch.no_user_site,
+            remote_debug_enabled=remote_debug.interpreter_enabled,
+            remote_debug_guard_installed=remote_debug.guard_installed,
+            code_path_variables=list(launch.code_path_variables),
+            startup_code=[
+                StartupCodeItemView.model_validate(item, from_attributes=True)
+                for item in startup.items
+            ],
+            startup_dirs=list(startup.startup_dirs),
+            writable_startup_dirs=list(startup.writable_startup_dirs),
+            unchecked_startup_dirs=list(startup.unchecked_startup_dirs),
+        )
+
+
 #: ``SecurityPosture.static_credential_hops_scope`` when the inventory was not read at all.
 STATIC_CREDENTIAL_HOPS_NOT_READ = "not read: this posture was built without the inventory"
 #: The same field when both halves of the inventory were read.
@@ -1432,6 +1506,10 @@ class SecurityPosture(BaseModel):
     # was not read at all, so a posture built without it can never pass for a clean, complete list.
     static_credential_hops: list[StaticCredentialHopView] = Field(default_factory=list)
     static_credential_hops_scope: str = STATIC_CREDENTIAL_HOPS_NOT_READ
+    # Vault BACKLOG #2701 / #2700: how the engine process was started (isolated mode, remote
+    # debugging) and the start-up code its interpreter runs. ``None`` means this posture was built
+    # without the reading, never that the launch is hardened. The route always fills it.
+    interpreter: InterpreterView | None = None
     # `synthetic_relaxation` SAT HERE and is gone with the declaration it described (BACKLOG #1279).
     # It reported that the strict PHI controls were relaxed instance-wide. Every instance carries
     # patient data now, so there is no such state to report: a relaxed control is a per-gate switch and
