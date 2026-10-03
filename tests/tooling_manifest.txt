@@ -101,6 +101,7 @@ tests/test_coord_presence.py
 tests/test_coord_recoverable.py
 tests/test_coord_workflow_cost.py
 tests/test_doc_guards_lane.py
+tests/test_import_db_ca_console_text.py
 tests/test_install_gate_allowlist_merge.py
 tests/test_install_gate_records_the_install.py
 tests/test_install_gate_upstream_provenance.py

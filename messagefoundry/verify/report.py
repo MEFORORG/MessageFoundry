@@ -8,6 +8,7 @@ import json
 from collections import Counter
 from collections.abc import Sequence
 
+from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.verify.model import FAILING, CheckResult, Status
 
 
@@ -21,11 +22,22 @@ def exit_code(results: Sequence[CheckResult]) -> int:
     return 1 if any(r.status in FAILING for r in results) else 0
 
 
+def _shown(text: str) -> str:
+    # A detail can carry what a peer wrote: a JWKS key id, an ACK, an exception naming a peer's
+    # reply. Escaped HERE, at the one console sink, and not in CheckResult, so the Markdown and JSON
+    # reports keep the value as it was (they are data, not a terminal). Every field gets the same
+    # rule, so a detail added later is covered without anyone deciding it is peer text. One line per
+    # check, so a newline is escaped too, or a peer's text could start a line reading as a check that
+    # passed; printable Unicode is kept, so the engine's own em dashes print as themselves.
+    return escape_for_terminal(text, single_line=True, keep_printable_unicode=True)
+
+
 def render_console(results: Sequence[CheckResult]) -> str:
-    """A compact, aligned one-line-per-check summary for stdout."""
+    """A compact, aligned one-line-per-check summary for stdout, peer text escaped (ASVS 1.1.2)."""
     counts = summarize(results)
     lines = [
-        f"{r.status.value:<6} {r.id:<14} {r.title}" + (f"  [{r.detail}]" if r.detail else "")
+        f"{r.status.value:<6} {_shown(r.id):<14} {_shown(r.title)}"
+        + (f"  [{_shown(r.detail)}]" if r.detail else "")
         for r in results
     ]
     tally = "  ".join(f"{s.value}={counts.get(s, 0)}" for s in Status)

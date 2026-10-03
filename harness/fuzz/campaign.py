@@ -34,6 +34,7 @@ from harness.fuzz.mutate import Case, first_frame, frames, make_case
 from harness.fuzz.transport import Transport
 from harness.scenarios._core import control_id_of
 from messagefoundry.apiclient import EngineClient
+from messagefoundry.terminal_text import escape_for_terminal
 
 Emit = Callable[[str], None]
 
@@ -293,7 +294,12 @@ class _Session:
         else:
             where = "before any case of the batch was sent (batch-level)"
         replay_note = " ".join(str(p) for p in paths) or "(none written)"
-        self.emit(f"FAIL seed={self.config.seed} {where} reason={reason} replay={replay_note}")
+        # The reason can quote a peer: an API reply body, a transport's error text. It stays as it
+        # was in the Failure above and is escaped only on this one line (ASVS 1.1.2).
+        shown_reason = escape_for_terminal(reason, single_line=True)
+        self.emit(
+            f"FAIL seed={self.config.seed} {where} reason={shown_reason} replay={replay_note}"
+        )
 
     def _write(self, case: Case) -> Path | None:
         name = f"fuzz-seed{case.seed}-iter{case.iteration}.{self.transport.kind}.bin"

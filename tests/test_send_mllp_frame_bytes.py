@@ -231,7 +231,9 @@ def test_printable_output_is_ascii_and_cannot_be_forged() -> None:
     # escaped control byte, and a backslash before an escaped byte stays distinguishable too.
     assert printable(b"\x1b" + b"\\x1b") == "\\x1b\\\\x1b"
     assert printable(b"\\\x1b") == "\\\\\\x1b"
-    assert printable(b"\\\\") == "\\\\\\"  # each backslash before a backslash is doubled
+    # A run of backslashes is doubled whole only before text that reads as an escape.
+    assert printable(b"\\\\x1b") == "\\\\\\\\x1b"
+    assert printable(b"\\\\") == "\\\\"
     # A bidirectional override, a non-ASCII letter and a byte that is not UTF-8 are escaped too,
     # so what the operator reads is in byte order and a cp1252 console can always encode it.
     shown = printable("A\u202eB\u00e9".encode() + b"\xff" + "\U0001f600".encode())
