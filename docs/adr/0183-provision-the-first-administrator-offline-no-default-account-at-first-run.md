@@ -9,6 +9,9 @@
   *What it must not break*, states the end state, and lays out the waves.
 - **Amended 2026-09-28:** Amendment B below. `provision-admin` enrols TOTP at the terminal, and the
   repair branch now clears the row's factors and sessions first (ADR 0197 Amendment A, N-A).
+- **Amended 2026-10-03:** open item (b), whether `scripts/` is inside cell 6.3.2's corpus, is
+  answered by owner ruling R3 of 2026-10-02; see the notes under *To resolve on acceptance* and
+  under item (b) of Amendment A.
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (the same host gate, argued there) · [ADR 0164](0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)
@@ -200,12 +203,17 @@ re-measurement. See Amendment A.*
 
 - [ ] Whether the wider refusal (no enabled administrator, rather than an empty table) should also
       subsume BACKLOG #1236's recovery affordance, or the two stay separate commands.
-- [ ] Whether `scripts/` is inside this cell's corpus. The method names three artifacts while the
+- [x] Whether `scripts/` is inside this cell's corpus. The method names three artifacts while the
       ASVS verifier scans four roots, and `scripts/dev/sqlserver-docker.ps1` carries a hard-coded
       default `sa` password that is in scope only under the wider reading.
 
 *Amended 2026-09-23: Amendment A carries a recommendation on each item. Neither is ruled, so both
 boxes stay open.*
+
+*Amended 2026-10-03: the second item is answered by owner ruling R3 of 2026-10-02, so its box is
+ticked. Its premise, that the method names three artifacts, no longer holds: see
+`docs/ASVS-ASSESSMENT-METHOD.md` section 2 for the current scope, and the note under item (b) of
+Amendment A. This note says nothing about the first item.*
 
 ## Amendment A (2026-09-23) — the default account is retired, by owner ruling
 
@@ -573,6 +581,15 @@ in the wheel. So it cannot be "present in the application". Two cautions keep th
 
 Fix the literal anyway, as hygiene that moves no verdict: require `MEFOR_STORE_PASSWORD`, or generate
 a random password per container.
+
+*Amended 2026-10-03: owner ruling R3 of 2026-10-02 answers item (b), and it answers it from a
+premise this recommendation did not have. Method section 2 no longer names three artifacts; it now
+includes the test harness wheel (R1) and the operator-run scripts (R3), and excludes `tee/` (R4),
+as `docs/ASVS-ASSESSMENT-METHOD.md` section 2 states and cites. Under that scope the recommendation
+holds for its one named file, `scripts/dev/sqlserver-docker.ps1`, which is development tooling. The
+first caution above now holds for the operator-run install tooling under `scripts/service/`, which
+is inside the assessed scope. What that means for the cell is record work, and this note grades
+nothing.*
 
 ## Amendment B (2026-09-28) -- the first Administrator enrols TOTP, and a repair clears the row first
 
