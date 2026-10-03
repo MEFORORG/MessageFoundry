@@ -43,6 +43,8 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on a venv witho
 
     yaml = pytest.importorskip("yaml")
 
+from scripts.ci.required_contexts import parse_contexts_file  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 CANONICAL_CONTEXTS = ROOT / ".github" / "required-contexts.txt"
@@ -52,9 +54,11 @@ _PLACEHOLDER = "\x00"
 
 
 def required_contexts() -> list[str]:
-    """The contexts recorded in ``.github/required-contexts.txt`` (comments/blanks stripped)."""
-    lines = CANONICAL_CONTEXTS.read_text(encoding="utf-8").splitlines()
-    return [s for line in lines if (s := line.strip()) and not s.startswith("#")]
+    """The contexts recorded in ``.github/required-contexts.txt`` (comments/blanks stripped).
+
+    Through the one stdlib parser the release runner and the drift script also use.
+    """
+    return parse_contexts_file(CANONICAL_CONTEXTS.read_text(encoding="utf-8"))
 
 
 def load_workflow(name: str) -> dict[Any, Any]:
@@ -66,6 +70,12 @@ def load_workflow(name: str) -> dict[Any, Any]:
     parsed = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
     assert isinstance(parsed, dict), f"{name} did not parse to a mapping"
     return parsed
+
+
+def needs_of(job: dict[str, Any]) -> list[str]:
+    """A job's ``needs:`` as a list: GitHub accepts a bare string for a single job."""
+    needs = job.get("needs") or []
+    return [needs] if isinstance(needs, str) else [str(n) for n in needs]
 
 
 def jobs_of(name: str) -> dict[str, dict[str, Any]]:
