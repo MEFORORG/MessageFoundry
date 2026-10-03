@@ -41,6 +41,17 @@ NOT A BENCHMARK, AND NOT A GATE. One short phase on SQLite in a temp dir; it ans
 service N msg/s through 4 connections", nothing about production capacity. It is `workflow_dispatch`
 only and asserts nothing -- a number that varies with runner weather must never gate a merge.
 
+THE ENGINE IS A SIGNED-IN ``serve``, AS IN EVERY OTHER RIG. Each repeat starts its own
+``messagefoundry serve`` subprocess on loopback with a fresh temp store (``failover.EngineNode``),
+provisions the rig Administrator in that store (``harness/load/rigadmin.py``), signs in, reads the
+API with that session, and stops the engine before the next repeat. Until 2026-10-03 the probe built
+the engine in-process with sign-in off and left its server thread running until the process exited;
+ADR 0203 named this fix. Rows taken before then are not directly comparable with rows taken after,
+for at least these reasons: the engine now runs in its own process instead of sharing this one's
+interpreter and CPU with the sender, sink and poller; its API hop is TLS; its queue workers fall
+back to ``serve``'s default 0.25 s poll rather than 0.05 s; and the poller's signed-in reads cost
+store commits (``harness/load/enginepoll.py`` says how many).
+
 Usage:  python -m harness.load.ingress_probe <rate> [--repeat N] [--duration S] [--pool N]
 """
 
@@ -49,56 +60,28 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import ssl
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
-import uvicorn
+import httpx
 
+from harness.load import rigadmin
+from harness.load.failover import EngineNode, FailoverError, _await_all_healthy
 from harness.load.profile import load_profile_text
 from harness.load.runner import run_load
 
 _CONFIG_DIR = Path("harness/config/load")
-_START_TIMEOUT_S = 15.0
-
-
-def _allow_repo_config_on_windows() -> None:
-    """Let the probe load `harness/config/load` from the checkout on a Windows CI runner.
-
-    The engine refuses to load config from a writable-by-others directory (SEC-003) because
-    `_exec_module` runs that config as the service account. A GitHub-hosted Windows workspace grants
-    `BUILTIN\\Users` (S-1-5-32-545) write on the checkout, so the guard fail-closes and the engine
-    never starts::
-
-        WiringError: refusing to load config from writable-by-others path harness\\config\\load
-
-    That is the control working correctly. It is also why the FIRST dispatched sweep returned no
-    Windows data at all: the probe was validated on Linux and on a developer Windows box, where those
-    ACLs do not apply, and never on the runner it exists to measure. ubuntu produced a full 12-run
-    table; both Windows legs died in the first second.
-
-    This sets the documented dev/test escape. The test suite meets the same refusal for the same
-    reason and answers it in-process instead
-    (`tests/conftest.py::_read_the_checkout_as_a_clean_config_source`), which is why
-    `tests/test_load_runner.py` loads this identical config dir on those runners and passes. Kept
-    win32-only: a POSIX checkout is not group/world-writable, so the escape must stay OFF so the
-    POSIX refusal path keeps being exercised.
-
-    The escape is honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` beside it (vault BACKLOG
-    #2599), so this sets both. The probe builds its engine without reading settings from the
-    environment, so the dial here unlocks the escape and changes nothing else about the engine.
-
-    `setdefault`, not assignment: an operator who deliberately set either one keeps that choice.
-
-    NEVER set in production. Scoped to a throwaway measurement whose engine binds loopback on
-    ephemeral ports, writes a temp SQLite file, and dies with the process.
-    """
-    if sys.platform != "win32":
-        return
-    os.environ.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
-    os.environ.setdefault("MEFOR_SECURITY_ENFORCEMENT", "warn")
+#: How long the engine has to answer ``/health`` once ``serve`` is spawned. The account step runs
+#: before the spawn under its own timeout (``rigadmin.provision``), so this covers only the process
+#: start: imports, store open, TLS, the graph load and the listeners. A cold Windows runner has been
+#: seen to take most of 15 s for that alone, which was this probe's budget when the engine ran in
+#: its own thread.
+_START_TIMEOUT_S = 60.0
+#: Settings prefixes the probe's engine never inherits from the shell (see :func:`_node_env`).
+_SHELL_SETTINGS_DROPPED = ("MEFOR_STORE_", "MEFOR_CLUSTER_", "MEFOR_API_")
 
 
 def _reserve() -> socket.socket:
@@ -141,55 +124,121 @@ duration_s = {duration_s}
 
 def probe(rate: float, duration_s: float = 1.5, pool_size: int = 4) -> int:
     """Run one phase at ``rate`` and print a single machine-parseable RESULT line."""
-    _allow_repo_config_on_windows()
-    tmp = tempfile.mkdtemp(prefix="mefor-ingress-probe-")
-    adt_s, res_s, oth_s, sink_s, api_s = (_reserve() for _ in range(5))
-    adt_port, sink_port, api_port = (
-        adt_s.getsockname()[1],
-        sink_s.getsockname()[1],
-        api_s.getsockname()[1],
-    )
-    os.environ.update(
-        MEFOR_LOAD_FANOUT="2",
-        MEFOR_LOAD_RESULTS_FANOUT="1",
-        MEFOR_LOAD_TRANSFORM="cheap",
-        MEFOR_LOAD_ADT_PORT=str(adt_port),
-        MEFOR_LOAD_RESULTS_PORT=str(res_s.getsockname()[1]),
-        MEFOR_LOAD_OTHER_PORT=str(oth_s.getsockname()[1]),
-        MEFOR_LOAD_SINK_PORT=str(sink_port),
-    )
-    from messagefoundry.api import create_managed_app
+    return asyncio.run(_probe(rate, duration_s, pool_size))
 
-    app = create_managed_app(
-        db_path=Path(tmp) / "probe.db",
-        config_dir=_CONFIG_DIR,
-        poll_interval=0.05,
-        # The load runner reads /stats with no bearer token, on a loopback socket and a temp store.
-        allow_no_auth=True,
-    )
-    uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="error"))
-    # Release the MLLP ports at the last moment; hand the still-bound API socket to uvicorn.
-    for s in (adt_s, res_s, oth_s, sink_s):
-        s.close()
-    threading.Thread(target=lambda: uv.run(sockets=[api_s]), daemon=True).start()
-    deadline = time.time() + _START_TIMEOUT_S
-    while not uv.started:
-        time.sleep(0.05)
-        if time.time() > deadline:
-            print(f"RESULT rate={rate:g} ERROR=engine_did_not_start", flush=True)
-            return 2
 
-    t0 = time.perf_counter()
-    report = asyncio.run(
-        run_load(
-            _profile(adt_port=adt_port, rate=rate, duration_s=duration_s, pool_size=pool_size),  # type: ignore[arg-type]
-            engine_url=f"http://127.0.0.1:{api_port}",
-            id_prefix="PROBE1",
-            sink_port=sink_port,
-            db_backend="sqlite",
+def _node_env(store: Path, *, adt: int, results: int, other: int, sink: int) -> dict[str, str]:
+    """The probe engine's environment: this process's, plus the load graph's shape and its store.
+
+    The load settings go to the ``serve`` child only, never into ``os.environ``, so a later repeat
+    cannot inherit a previous one's ports. The rig credential that provisioning publishes into
+    ``os.environ`` IS copied here; ``EngineNode`` drops it before ``serve`` sees the environment.
+
+    ``serve`` reads the environment, so the shell's own store, cluster and API settings are dropped
+    and the store backend and enforcement dial are SET, not defaulted. Otherwise a shell set up for
+    a server store, a cluster or ``enforce`` would point every repeat at a shared store (whose
+    existing Administrator refuses the rig's sign-in) or stop the engine starting. The probe
+    measures SQLite in a temp dir under the synthetic-load posture, every time.
+    """
+    inherited = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.upper().startswith(_SHELL_SETTINGS_DROPPED)
+    }
+    return {
+        **inherited,
+        "MEFOR_STORE_BACKEND": "sqlite",
+        "MEFOR_SECURITY_ENFORCEMENT": "warn",
+        "MEFOR_LOAD_FANOUT": "2",
+        "MEFOR_LOAD_RESULTS_FANOUT": "1",
+        "MEFOR_LOAD_TRANSFORM": "cheap",
+        "MEFOR_LOAD_ADT_PORT": str(adt),
+        "MEFOR_LOAD_RESULTS_PORT": str(results),
+        "MEFOR_LOAD_OTHER_PORT": str(other),
+        "MEFOR_LOAD_SINK_PORT": str(sink),
+        "MEFOR_STORE_PATH": str(store),
+    }
+
+
+def _setup_failed(rate: float, reason: str, exc: BaseException) -> int:
+    """Report a repeat whose engine never got as far as the measurement, and end the run."""
+    print(f"ingress probe: {reason}: {exc}", file=sys.stderr, flush=True)
+    print(f"RESULT rate={rate:g} ERROR={reason}", flush=True)
+    return 2
+
+
+async def _probe(rate: float, duration_s: float, pool_size: int) -> int:
+    with tempfile.TemporaryDirectory(
+        prefix="mefor-ingress-probe-", ignore_cleanup_errors=True
+    ) as tmp:
+        reserved = [_reserve() for _ in range(5)]
+        adt_port, results_port, other_port, sink_port, api_port = (
+            r.getsockname()[1] for r in reserved
         )
-    )
-    wall = time.perf_counter() - t0
+        env = _node_env(
+            Path(tmp) / "probe.db",
+            adt=adt_port,
+            results=results_port,
+            other=other_port,
+            sink=sink_port,
+        )
+        # EngineNode is the `serve` subprocess every other harness rig runs. It binds loopback,
+        # serves the run's own TLS certificate, takes the synthetic-load posture (warn dial, no
+        # store key, open loopback egress; the config-source escape on win32 only), and keeps the
+        # rig password out of the engine's environment. The API port in the name keeps each
+        # repeat's kept log (MEFOR_BENCH_KEEP_NODE_LOGS) from overwriting the last one's.
+        node: EngineNode | None = None
+        try:
+            try:
+                node = EngineNode(
+                    f"ingress-probe-{api_port}",
+                    api_port,
+                    env=env,
+                    config_dir=str(_CONFIG_DIR),
+                    cwd=Path.cwd(),
+                )
+                # Provision this repeat's fresh store while the ports are still held: it is a
+                # process start of its own, and releasing them first would leave them free to any
+                # other process for its whole length.
+                await node.provision()
+            except (FailoverError, OSError) as exc:
+                return _setup_failed(rate, "provision_failed", exc)
+            finally:
+                for r in reserved:
+                    r.close()
+            try:
+                await node.start(provision=False)
+                verify = ssl.create_default_context(cafile=node.cacert)
+                async with httpx.AsyncClient(timeout=4.0, verify=verify) as client:
+                    await _await_all_healthy([node], client, timeout=_START_TIMEOUT_S)
+            except (FailoverError, OSError) as exc:
+                return _setup_failed(rate, "engine_did_not_start", exc)
+            try:
+                # Each repeat has its own store, so it signs in afresh: a session from an earlier
+                # repeat's store would be refused here.
+                token = await asyncio.to_thread(rigadmin.sign_in, node.url, cacert=node.cacert)
+            except rigadmin.RigUnreachable as exc:
+                return _setup_failed(rate, "engine_stopped_answering", exc)
+            except rigadmin.RigAdminError as exc:
+                return _setup_failed(rate, "sign_in_refused", exc)
+
+            t0 = time.perf_counter()
+            report = await run_load(
+                _profile(adt_port=adt_port, rate=rate, duration_s=duration_s, pool_size=pool_size),  # type: ignore[arg-type]
+                engine_url=node.url,
+                id_prefix="PROBE1",
+                token=token,
+                sink_port=sink_port,
+                db_backend="sqlite",
+                cacert=node.cacert,
+            )
+            wall = time.perf_counter() - t0
+        finally:
+            # Every exit this code sees stops the engine: a finished repeat, a failed setup, an
+            # exception and Ctrl-C. An exit it does not see leaves the child running -- at least a
+            # SIGKILL or a SIGTERM of the probe, and a Windows TerminateProcess.
+            if node is not None:
+                await node.stop()
     c, nl = report.counters, report.no_loss
     pct = (c.timeouts / c.sent * 100.0) if c.sent else 0.0
     # NO derived per-second figure is printed. `engine_read / wall` looks like a service rate and is
