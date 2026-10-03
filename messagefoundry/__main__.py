@@ -982,16 +982,18 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     provision_schema.add_argument("--json", action="store_true", help="emit JSON")
 
     # BACKLOG #305 part E2 (ASVS 13.2.2): the read-only per-hop privilege read-out. It probes the store
-    # principal with the startup preflight's own probe and prints the identity and minimal grant of
-    # every other backend hop it cannot probe.
+    # principal with the startup preflight's own probe, each Vault token with a self-lookup and a
+    # capabilities read, and the AD bind account with Who am I and a read of its own groups; it
+    # prints the identity and minimal grant of the SMTP and IdP hops, which it cannot probe.
     check_privileges = sub.add_parser(
         "check-privileges",
-        help="read-only: probe the store principal's effective privileges, and print the identity "
-        "and minimal grant of the Vault, LDAP, SMTP and IdP hops (printed, not probed). "
+        help="read-only: probe the store principal's effective privileges, each Vault token's "
+        "policies and capabilities, and the AD bind account's identity and administrative groups; "
+        "print the identity and minimal grant of the SMTP and IdP hops (printed, not probed). "
         # The codes are literal so the parser stays import-light; test_store_privilege_check pins
         # them against messagefoundry.privilege_check.
-        "Exits 3 on an over-grant, 4 when the store probe could not observe the principal, 1 when "
-        "the settings do not load (BACKLOG #305)",
+        "Exits 3 on an over-grant, 4 when a probe could not observe its principal, 1 when the "
+        "settings do not load (BACKLOG #305)",
     )
     check_privileges.add_argument(
         "--service-config",
@@ -1737,6 +1739,7 @@ def _serve(args: argparse.Namespace) -> int:
         SyslogProtocol,
         forward_hop_disposition,
         hop_posture_from_ai,
+        oidc_second_factor_claim_exception,
         security_loosenings,
     )
     from messagefoundry.config.tls_policy import (
@@ -3139,6 +3142,9 @@ def _serve(args: argparse.Namespace) -> int:
     # identically (extend-never-weaken). It reads `instance_exposed`, NOT the mutated console flag: the
     # single-factor admin surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
     admin_exposed = instance_exposed
+    # Empty unless this config has the OIDC claim exception, so an AUDIT line never names one that
+    # does not exist here (settings.oidc_second_factor_claim_exception says why).
+    oidc_exception = oidc_second_factor_claim_exception(settings.auth)
     if admin_exposed and not settings.auth.require_mfa:
         exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
@@ -3151,11 +3157,10 @@ def _serve(args: argparse.Namespace) -> int:
                 f"error: {exposure_desc} on a {'production ' if production else ''}PHI "
                 f"instance ({env_name!r}) with [security].require_mfa off; refusing to start — every "
                 "account with no second factor enrolled, Administrators included, would "
-                "authenticate with a single factor over the network, unless an OIDC sign-in "
-                "carries a checked amr/acr claim. "
+                f"authenticate with a single factor over the network{oidc_exception}. "
                 "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
                 "API (on an AD-only deployment it binds directory principals too: each enrolls an "
-                "engine factor unless its OIDC sign-in carries a checked amr/acr claim); or set "
+                f"engine factor{oidc_exception}); or set "
                 "[security].allow_single_factor_admin_when_exposed=true to deliberately permit "
                 "single-factor sign-in at exposure (audited).",
                 file=sys.stderr,
@@ -3168,17 +3173,16 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).warning(
                 "AUDIT: %s on a %sPHI instance (environment %r) with [security].require_mfa "
                 "off, permitted because [security].allow_single_factor_admin_when_exposed=true — every "
-                "account with no second factor enrolled is single-factor over the network, unless "
-                "an OIDC sign-in carries a checked amr/acr claim.",
+                "account with no second factor enrolled is single-factor over the network%s.",
                 exposure_desc,
                 "production " if production else "",
                 env_name,
+                oidc_exception,
             )
         print(
             f"warning: {exposure_desc} in a PHI-carrying "
             f"environment ({env_name!r}) with [security].require_mfa off — every account with no "
-            "second factor enrolled is single-factor over the network, unless an OIDC sign-in "
-            "carries a checked amr/acr claim. Enable "
+            f"second factor enrolled is single-factor over the network{oidc_exception}. Enable "
             "[security].require_mfa=true (WP-14 native TOTP) before exposure.",
             file=sys.stderr,
         )
@@ -3200,7 +3204,7 @@ def _serve(args: argparse.Namespace) -> int:
             "on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
             "UNDECLARED reverse proxy, every account with no second factor enrolled is single-factor "
-            "over the network (unless an OIDC sign-in carries a checked amr/acr claim) and "
+            f"over the network{oidc_exception}, and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
             "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
             "trusted_proxies, or set [security].require_mfa=true.",
@@ -6002,21 +6006,23 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
 
 
 def _check_privileges(args: argparse.Namespace) -> int:
-    """Read the privilege posture of the store and four other backend hops, and change nothing
-    (BACKLOG #305 part E2).
+    """Read the privilege posture of the store and the other backend hops, and change nothing
+    (BACKLOG #305).
 
     The store principal is PROBED, with the same probe the startup preflight runs, over a
-    one-connection pool rather than a store open, so nothing is created, migrated or audited. The
-    other hops are printed with the identity the engine presents and the grant it needs, and marked
-    not probed: the engine has no read-only self-inspection for them (see
-    :mod:`messagefoundry.privilege_check`).
+    one-connection pool rather than a store open, so nothing is created, migrated or audited. Each
+    configured Vault token is PROBED with a token self-lookup and a capabilities read, and the AD bind
+    account with Who am I and a read of its own groups, each through the client the engine builds
+    for that hop (:mod:`messagefoundry.privilege_probes`). SMTP and the IdP are printed with the
+    identity the engine presents and the grant it needs, and marked not probed.
 
     Exit codes, which ``docs/DEPLOY-SERVER-DB.md`` §1.1 documents: 0 every probe that ran was clean;
-    1 the settings did not load; 3 a probe observed a privilege beyond the documented grant; 4 the
-    store probe could not observe the principal. 3 wins when both apply.
+    1 the settings did not load; 3 a probe observed a privilege beyond the documented grant; 4 a
+    probe could not observe its principal. 3 wins when both apply.
 
     A last ``serve:`` line (the ``serve`` key under ``--json``) says what ``serve`` would do with the
-    same observation under these settings (ADR 0199). The exit code does not follow it."""
+    store observation under these settings (ADR 0199). Only the store finding gates a start; the
+    line says so when another hop is over-granted. The exit code does not follow it."""
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (
@@ -6026,6 +6032,7 @@ def _check_privileges(args: argparse.Namespace) -> int:
         settings_hops,
         store_hop,
     )
+    from messagefoundry.privilege_probes import probe_vault, read_ldap_bind
     from messagefoundry.store.base import probe_store_privileges
 
     cli: dict[str, dict[str, object]] = {}
@@ -6036,9 +6043,12 @@ def _check_privileges(args: argparse.Namespace) -> int:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
-    hops = [store_hop(report, settings.store), *settings_hops(settings)]
+    others = settings_hops(
+        settings, vault_probe=probe_vault, ldap_probe=lambda: read_ldap_bind(settings, posture)
+    )
+    hops = [store_hop(report, settings.store), *others]
     code = exit_code_for(hops)
-    serve = serve_verdict(report, settings)
+    serve = serve_verdict(report, settings, hops)
     if args.json:
         _print_json(
             {"exit_code": code, "serve": serve, "hops": [h.as_dict() for h in hops]}, compact=True
@@ -6328,9 +6338,17 @@ _PROVISION_AUTH_REFUSALS = {
         "is installed in the environment that runs this command"
     ),
     "reference": (
-        "a secret the [auth] settings reference (the AD bind password or the OIDC client secret) "
-        "could not be resolved: check [secrets].provider, that its optional extra is installed, "
-        "and the reference, in the shell that runs this command"
+        "a secret the [auth] settings reference (the AD bind password, or the OIDC client secret "
+        "or signing key) could not be resolved: check [secrets].provider, that its optional extra "
+        "is installed, and the reference, in the shell that runs this command"
+    ),
+    # BACKLOG #296. SigningError's own text names the setting and never the key, but this command
+    # keeps to fixed texts, so it gets one.
+    "client_key": (
+        "the [auth] OIDC private_key_jwt credential could not be loaded: check "
+        "oidc_client_private_key (or its _ref) and its passphrase, oidc_client_certificate, and "
+        "oidc_client_assertion_algorithm, and that the account running this command can read them. "
+        "`messagefoundry verify --section federation` names the failing part"
     ),
     "ldap": (
         "the [auth] Active Directory settings could not build the directory connection: check "
@@ -6377,7 +6395,8 @@ def _build_provision_auth_service(
     existing anchor refusal. The others this function names become :class:`_ProvisionAuthRefused`,
     raised outside the handler so the original is not carried along as its context. A
     ``SecretProviderError`` loading the provider, a ``SecretProviderError`` resolving a reference,
-    an ``LdapError`` and a ``FileNotFoundError`` each get a fixed text. ``InsecureHopRefused``, a
+    an ``LdapError``, a ``FileNotFoundError`` and a ``SigningError`` (the OIDC private_key_jwt key or
+    certificate, BACKLOG #296) each get a fixed text. ``InsecureHopRefused``, a
     refusal ``serve`` also gives (an off-box OIDC IdP with no revocation check, at ``enforce``),
     keeps its own text, which names the hop, its host and the setting that clears it, and reads no
     secret. Any other exception is not this function's to name and reaches the caller as it is.
@@ -6387,6 +6406,7 @@ def _build_provision_auth_service(
     from messagefoundry.config.ai_policy import SecurityEnforcement
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
     from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.transports.signing import SigningError
 
     refusal: str | None = None
     try:
@@ -6420,6 +6440,8 @@ def _build_provision_auth_service(
         refusal = _PROVISION_AUTH_REFUSALS["file"]
     except InsecureHopRefused as exc:
         refusal = _sentence(exc)
+    except SigningError:
+        refusal = _PROVISION_AUTH_REFUSALS["client_key"]
     raise _ProvisionAuthRefused(refusal)
 
 
