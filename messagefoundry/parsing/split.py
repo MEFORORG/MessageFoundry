@@ -99,10 +99,10 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
     is handed back.
 
     A file holding no ``MSH`` after a line break, and no leading UTF-8 byte order mark, is one
-    message the parser reads as it is. Where a byte scan can tell (:func:`_may_hold_a_later_msh`),
+    message the parser reads as it is. Where a byte scan can tell (:func:`_needs_a_decode`),
     such a file is returned without a decode or a split, so the common single-message file pays one
     scan."""
-    if not _may_hold_a_later_msh(raw, encoding) and not _LEADING_BOM.match(raw):
+    if not _needs_a_decode(raw, encoding):
         return [raw]
     try:
         text = raw.decode(encoding)
@@ -129,15 +129,19 @@ def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> byt
     return message.encode(encoding)
 
 
-def _may_hold_a_later_msh(raw: bytes, encoding: str) -> bool:
-    """Whether ``raw`` may hold an ``MSH`` after a line break. It answers False only for an encoding
-    that writes each ASCII character as that one byte and uses no ASCII byte for anything else, with
-    neither byte sequence present. Any other encoding answers True, so the caller decodes."""
+def _needs_a_decode(raw: bytes, encoding: str) -> bool:
+    """Whether ``raw`` may hold an ``MSH`` after a line break, or, under UTF-8, may open with a
+    byte order mark the split reads past. It answers False only for an encoding that writes each
+    ASCII character as that one byte and uses no ASCII byte for anything else, with neither shape
+    present. Any other encoding answers True, so the caller decodes. Under a single-byte charset
+    the mark's bytes are three characters the split keeps, so they need no decode."""
     try:
         name = codecs.lookup(encoding).name
     except LookupError:
         return True
     if name not in _ASCII_SAFE_CODECS and not name.startswith(_ASCII_SAFE_PREFIXES):
+        return True
+    if name == "utf-8" and _LEADING_BOM.match(raw):
         return True
     return b"\rMSH" in raw or b"\nMSH" in raw
 

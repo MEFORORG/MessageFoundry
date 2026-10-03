@@ -444,8 +444,8 @@ def test_message_set_rejects_delimiter_injection() -> None:
         msg.set("NM1-03", "BAD~VALUE")  # segment terminator would inject a segment
 
 
-def test_set_data_is_set_on_an_x12_message() -> None:
-    # The Steps view writes msg.set_data for a component read, HL7 or X12 alike (ADR 0206).
+def test_set_data_is_set_on_an_x12_message_and_keeps_one_component() -> None:
+    # The Steps view writes msg.set_data for a template reading a component (ADR 0206).
     body = (
         isa()
         + "GS*HS*A*B*20240101*1200*1*X*005010X279A1~ST*270*0001~NM1*IL*1*DOE~SE*2*0001~"
@@ -461,6 +461,24 @@ def test_set_data_is_set_on_an_x12_message() -> None:
         a.set_data("NM1-03", "BAD*VALUE")
     with pytest.raises(KeyError):
         a.set_data("REF-02", "X")
+    # set takes a component separator in a whole element as structure; set_data refuses it.
+    b.set("NM1-03", "O:BRIEN")
+    assert b["NM1-03.2"] == "BRIEN"
+    with pytest.raises(ValueError, match="delimiter"):
+        a.set_data("NM1-03", "O:BRIEN")
+    assert a["NM1-03"] == "SMITH"
+
+
+def test_the_lens_set_field_template_line_runs_on_an_x12_message() -> None:
+    body = (
+        isa()
+        + "GS*HC*A*B*20240101*1200*1*X*005010X222A1~ST*837*0001~CLM*1*100***11:B:1~"
+        + "NM1*IL*1*DOE~SE*3*0001~GE*1*1~IEA*1*000000001~"
+    )
+    msg = X12Message.parse(body)
+    # The line the Steps view renders for a Set Field of NM1-03 from CLM-05.1 (ADR 0206).
+    msg.set_data("NM1-03", f"{msg['CLM-05.1'] or ''}")
+    assert msg["NM1-03"] == "11"
 
 
 def test_message_refuses_envelope_segment_edits() -> None:

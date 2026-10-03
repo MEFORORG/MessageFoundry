@@ -697,12 +697,15 @@ def test_split_batch_bytes_hands_a_single_message_over_without_decoding(
         raise AssertionError("a one-message file was decoded and split")
 
     monkeypatch.setattr(split_mod, "split_batch", _no_split)
-    # A file led by a byte order mark is decoded, so the mark can be read past; see below.
+    # A file led by a byte order mark is decoded under UTF-8, so the mark can be read past; see
+    # below. Under a single-byte charset those bytes are three characters, and no decode is paid.
     for lead in (" ", ""):
         raw = (lead + THREE[0]).encode("utf-8")
         assert split_batch_bytes(raw, "utf-8") == [raw]
         lf = raw.replace(CR.encode(), chr(10).encode())
         assert split_batch_bytes(lf, "latin-1") == [lf]
+    marked = (chr(0xFEFF) + THREE[0]).encode("utf-8")
+    assert split_batch_bytes(marked, "cp1252") == [marked]
 
 
 def test_the_msh_opening_check_is_the_parsers_strip() -> None:
@@ -1109,6 +1112,23 @@ def test_an_edit_that_changes_nothing_leaves_a_hand_written_write_alone() -> Non
     source = LENS_SOURCE + "    msg.set(\"PV1-19\", f\"{msg['PID-3.1'] or ''}\")\n"
     row = _native_rows(source)[-1]
     assert _set_value(source, {"parts": row["param_parts"]["value"]}) == source
+
+
+def test_an_edit_that_only_respells_a_quote_leaves_the_write_alone() -> None:
+    source = LENS_SOURCE + "    msg.set('PV1-19', f\"{msg['PID-3.1'] or ''}\")\n"
+    out = _set_path(source, "PV1-19")
+    assert "msg.set(" in out and "set_data" not in out
+
+
+def test_a_set_data_template_into_a_leaf_still_reads_back_as_set_field() -> None:
+    # At a leaf set_data is set, so a line the lens would write elsewhere still reads as a step.
+    source = LENS_SOURCE + "    msg.set_data(\"PV1-19.1\", f\"{msg['PID-3.1'] or ''}\")\n"
+    row = _native_rows(source)[-1]
+    assert row["action"] == "set_field"
+    assert row["param_parts"]["value"] == [{"path": "PID-3.1"}]
+    # A set_data template the lens would never write is code, not a step.
+    authored = LENS_SOURCE + "    msg.set_data(\"PV1-19\", f\"A^{msg['PID-3.1'] or ''}\")\n"
+    assert _native_rows(authored)[-1].get("action") != "set_field"
 
 
 NO_MSH = "BHS|" + ENC + CR + "PID|1||111" + CR

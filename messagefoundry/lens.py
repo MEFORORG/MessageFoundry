@@ -301,7 +301,7 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
     when unsure the lens degrades rather than risk a corrupting edit. ``occurrence=``/other keyword args
     are preserved as read-only ``display`` fields (never dropped, never editable in Phase A). A
     ``msg.set_data`` call is a ``set_field`` only when its value is a template the lens itself would
-    write with ``set_data`` (:func:`_template_write_method`); any other one that is not a copy is a
+    write with ``set_data`` (:func:`_template_is_data`); any other one that is not a copy is a
     ``code`` row, because ``set_field`` otherwise means :meth:`Message.set`."""
     func = call.func
     if not isinstance(func, ast.Attribute) or not _is_msg_method(func, func.attr):
@@ -320,7 +320,9 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
             return _NativeAction(
                 "copy_field", [("src", field_call.args[0]), ("dst", dst_or_path)], display
             )
-        if func.attr == "set_data" and _template_write_method(value, dst_or_path) != "set_data":
+        # At a literal leaf the lens writes set, but set_data writes the same thing there, so a
+        # set_data line it would write anywhere else still reads back as the Set Field it is.
+        if func.attr == "set_data" and not _template_is_data(value):
             return None
         return _NativeAction("set_field", [("path", dst_or_path), ("value", value)], display)
     if func.attr in ("delete_segments", "delete_segment"):
@@ -2586,7 +2588,8 @@ def _apply_set_params(
         (action == "copy_field" and ("src" in params or "dst" in params))
         or (action == "set_field" and ("value" in params or "path" in params))
     ):
-        repicked = _repick_write(result, line_start, line_end)
+        before = stmt.value if isinstance(stmt, ast.Expr) else stmt
+        repicked = _repick_write(result, line_start, line_end, ast.dump(before))
         if repicked != result:
             _refuse_overlong_repick(result, repicked, line_start, line_end)
         result = repicked
@@ -2612,7 +2615,7 @@ def _refuse_overlong_repick(result: str, repicked: str, line_start: int, line_en
             )
 
 
-def _repick_write(source: str, line_start: int, line_end: int) -> str:
+def _repick_write(source: str, line_start: int, line_end: int, before: str) -> str:
     """Re-pick the write of the native Copy Field or Set Field at ``line_start``-``line_end`` of
     ``source``, after an edit of a copy's ``src`` or ``dst`` or of a Set Field's ``path`` or ``value``
     (ADR 0206 rule 1).
@@ -2624,7 +2627,8 @@ def _repick_write(source: str, line_start: int, line_end: int) -> str:
     so there the method is left as written, and a source that is not a literal keeps its method. A
     Set Field always takes the picked method, so the row keeps reading back as ``set_field``.
     ``source`` is the already-spliced text, so the arguments read here are the ones the edit
-    wrote."""
+    wrote. ``before`` is the ``ast.dump`` of the call before the edit: an edit that changed no
+    argument, such as one that only respelled a string's quotes, leaves the write as written."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -2648,6 +2652,8 @@ def _repick_write(source: str, line_start: int, line_end: int) -> str:
     if len(found) != 1:
         return source
     call = found[0]
+    if ast.dump(call) == before:
+        return source
     func = call.func
     assert isinstance(func, ast.Attribute)
     dst, value = call.args
@@ -4633,20 +4639,26 @@ def _template_write_method(value: ast.expr, dst: ast.expr) -> str:
     a leaf such a template copies. At a literal leaf destination the two writes are the same, so
     ``set`` is kept there too. The lens is static and cannot know a message's own separators, so
     the test uses the standard ones."""
-    if _is_leaf_literal(getattr(dst, "value", None)):
-        return "set"
-    parts = _template_parts(value)
-    if parts is None:
-        return "set"
-    paths = [part[PART_PATH] for part in parts if PART_PATH in part]
-    text = "".join(part.get(PART_TEXT, "") for part in parts)
-    if (
-        not paths
-        or any(char in _AUTHORED_STRUCTURE for char in text)
-        or not all(_is_leaf_literal(path) for path in paths)
-    ):
+    if _is_leaf_literal(getattr(dst, "value", None)) or not _template_is_data(value):
         return "set"
     return "set_data"
+
+
+def _template_is_data(value: ast.expr) -> bool:
+    """Whether ``value`` is a template whose every read is a literal component or subcomponent path
+    and whose own text holds no component, repetition, subcomponent or escape character: the
+    template :func:`_template_write_method` writes with ``set_data`` at a whole-field destination.
+    A hand-written f-string may have no read at all, which is not one."""
+    parts = _template_parts(value)
+    if parts is None:
+        return False
+    paths = [part[PART_PATH] for part in parts if PART_PATH in part]
+    text = "".join(part.get(PART_TEXT, "") for part in parts)
+    return (
+        bool(paths)
+        and not any(char in _AUTHORED_STRUCTURE for char in text)
+        and all(_is_leaf_literal(path) for path in paths)
+    )
 
 
 def _native_write_method(value: ast.expr, dst: ast.expr) -> str:
