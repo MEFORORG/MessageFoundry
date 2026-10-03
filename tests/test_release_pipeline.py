@@ -3475,9 +3475,18 @@ def test_only_the_publish_job_takes_a_release_out_of_draft_and_it_runs_last() ->
         for key, job in jobs.items()
         if any("--draft=false" in _executed_shell(str(s.get("run") or "")) for s in job["steps"])
     }
-    assert publishers == {_PUBLISH_JOB}, (
-        f"jobs that take a release out of draft: {sorted(publishers)}; only {_PUBLISH_JOB} may"
+    # The console job may too: it finishes ITS OWN release when an interrupted create left a draft.
+    assert publishers == {_PUBLISH_JOB, "release-webconsole"}, (
+        f"jobs that take a release out of draft: {sorted(publishers)}; only {_PUBLISH_JOB} (and the "
+        "console job, for its own release) may"
     )
+    # A status function would run the publish job after a job it needs had FAILED, publishing a
+    # draft with that job's asset missing. The implicit success() is the control.
+    publish_if = str(jobs[_PUBLISH_JOB].get("if") or "")
+    overrides = [
+        f for f in ("always()", "cancelled()", "failure()", "success()") if f in publish_if
+    ]
+    assert not overrides, f"{_PUBLISH_JOB}'s `if:` overrides the needs' success with {overrides}"
     # Every job that attaches to a release, except the console's, which makes its own in one call.
     attaching = _gh_release_jobs("create|upload") - {"release-webconsole"}
     assert attaching >= {"release", "release-harness"}, sorted(attaching)
@@ -3497,6 +3506,7 @@ _FAKE_GH = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GH_LOG"
 if [ "$1" = release ] && [ "$2" = view ]; then
   if [ "$FAKE_RELEASE" = absent ]; then echo "release not found" >&2; exit 1; fi
+  if [ "$FAKE_RELEASE" = broken ]; then echo "HTTP 502: Bad Gateway" >&2; exit 1; fi
   case "$*" in *isDraft*) if [ "$FAKE_RELEASE" = draft ]; then echo true; else echo false; fi ;; esac
   case "$*" in *assets*) [ -z "$FAKE_ASSETS" ] || printf '%s\\n' $FAKE_ASSETS ;; esac
 fi
@@ -3573,6 +3583,11 @@ def _uploads(calls: Sequence[str]) -> list[str]:
         # The console: one call creates it with its asset; a re-run touches nothing.
         ("Create or update the console GitHub release", "absent", "", True, ["release create"]),
         ("Create or update the console GitHub release", "published", "", True, []),
+        # An interrupted create left a draft: attach to it (then publish, graded separately).
+        ("Create or update the console GitHub release", "draft", "", True, ["release upload"]),
+        # A read that fails for any reason but "not found" refuses rather than guessing "absent".
+        ("Create or update the GitHub release", "broken", "", False, []),
+        ("Create or update the console GitHub release", "broken", "", False, []),
     ],
     ids=[
         "engine-new",
@@ -3583,6 +3598,9 @@ def _uploads(calls: Sequence[str]) -> list[str]:
         "harness-published-missing-wheel",
         "console-new",
         "console-rerun",
+        "console-interrupted-draft",
+        "engine-read-error",
+        "console-read-error",
     ],
 )
 def test_no_release_step_uploads_to_a_published_release(
@@ -3602,6 +3620,10 @@ def test_no_release_step_uploads_to_a_published_release(
         assert not made, f"a step uploaded to a published release: {made}"
     if state == "absent" and "console" not in prefix:
         assert all("--draft" in c for c in made), f"the engine release was not a draft: {made}"
+    if state == "draft" and "console" in prefix:
+        assert calls[-1] == f"release edit {_TAG} --draft=false", f"draft left unpublished: {calls}"
+    if state == "broken":
+        assert "refusing to guess" in out and "HTTP 502" in out, out
 
 
 @pytest.mark.parametrize(("state", "edits"), [("draft", 1), ("published", 0)])

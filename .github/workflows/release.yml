@@ -100,8 +100,9 @@ jobs:
   tag-provenance:
     if: github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ubuntu-latest
-    # A handful of read-only API calls.
-    timeout-minutes: 10
+    # Read-only API calls, plus up to 30 minutes waiting for a required check still running on the
+    # tagged commit (tag_provenance.py --wait-seconds).
+    timeout-minutes: 40
     permissions:
       contents: read   # the compare and branch endpoints, and the checkout
       checks: read     # the check runs on the tagged commit
@@ -1072,7 +1073,15 @@ jobs:
           # publishes it last, once every job that attaches an asset has succeeded.
           # A re-run edits the draft; a release that is already published is left alone, because
           # nothing may change its assets and the run that published it attached every one.
-          if ! is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
+          # Only "release not found" means absent. Any other read failure (an API error, a rate
+          # limit) refuses, rather than trying a create that would fail and hide the real error.
+          err=$(mktemp)
+          if ! is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>"$err"); then
+            if ! grep -q "release not found" "$err"; then
+              cat "$err" >&2
+              echo "::error::could not read release $tag, and it is not reported missing; refusing to guess"
+              exit 1
+            fi
             gh release create "$tag" "${assets[@]}" --draft --title "$tag" --notes-file notes.md $pre_create
           elif [ "$is_draft" = "true" ]; then
             echo "Draft release $tag already exists — updating it in place (this is a re-run)."
@@ -1202,7 +1211,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      contents: write   # gh release upload (attach the console wheel)
+      contents: write   # gh release create (the console release, with its wheel)
       id-token: write   # PyPI Trusted Publishing (OIDC) — no API token anywhere
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1518,12 +1527,23 @@ jobs:
             --full-url "https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/packaging/messagefoundry-webconsole/CHANGELOG.md"
           pre_create=""; case "$ver" in *-*) pre_create="--prerelease" ;; esac
           # ONE CALL CREATES THE RELEASE WITH ITS ONE ASSET (vault BACKLOG #2631, limb 6). So a
-          # re-run leaves an existing release alone: the call that created it attached the wheel,
+          # re-run leaves a published release alone: the call that created it attached the wheel,
           # and a re-upload to a published release would be refused before the PyPI publish below.
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "::notice::Release $tag already exists; its assets are not changed (vault BACKLOG #2631)."
-          else
+          # `gh release create` makes a draft, uploads, then publishes, so an interrupted create can
+          # leave a DRAFT. A re-run finishes that one: attach, then publish.
+          err=$(mktemp)
+          if ! is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>"$err"); then
+            if ! grep -q "release not found" "$err"; then
+              cat "$err" >&2
+              echo "::error::could not read release $tag, and it is not reported missing; refusing to guess"
+              exit 1
+            fi
             gh release create "$tag" webconsole-dist/*.whl --title "$tag" --notes-file notes.md $pre_create
+          elif [ "$is_draft" = "true" ]; then
+            gh release upload "$tag" webconsole-dist/*.whl --clobber
+            gh release edit "$tag" --draft=false
+          else
+            echo "::notice::Release $tag is already published; its assets are not changed (vault BACKLOG #2631)."
           fi
 
       - name: Upload console artifact (dry-run / always)
