@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import atexit
 import functools
+import gc
 import inspect
 import logging
 import os
@@ -30,6 +31,7 @@ import pytest
 
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
+from tests._qt_cycles import collect_qobjects_in_cycles
 from tests._root_logging import root_logging_restored
 
 if TYPE_CHECKING:
@@ -443,6 +445,45 @@ def _quiesce_background_loggers_at_teardown(
     finally:
         # TEARDOWN: drop late emits at the source for the rest of the teardown/next-setup window.
         _quiesce_targets()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _no_qt_object_left_in_a_reference_cycle(request: pytest.FixtureRequest) -> Iterator[None]:
+    """In a Qt test module, keep automatic garbage collection off until the module ends, then
+    collect on the GUI thread and fail the module if that freed a Qt object.
+
+    A Qt object reachable only through a reference cycle is otherwise destroyed on whichever thread
+    triggers the next collection -- a uvicorn, executor or ``QThreadPool`` thread -- its armed timers
+    stay registered with the GUI thread, and a LATER file's ``processEvents()`` segfaults
+    (``tests/_qt_cycles.py`` has the mechanism). With automatic collection off, the collector's own
+    threshold cannot reclaim such a cycle off the GUI thread mid-module, and the cycle is still there
+    for this check to report. An explicit ``gc.collect()`` elsewhere is not stopped by this (the
+    engine makes at least two, in ``pipeline/crl_reload.py`` and ``pipeline/cert_expiry.py``).
+
+    A Qt module here is one that defines a ``qapp`` fixture. A module that builds QObjects without
+    one (``tests/test_harness_frame_bytes.py`` does) is not covered. The failure lands on the
+    module's last test, not the one that leaked. A traceback pytest keeps for a ``pytest.skip`` or an
+    xfail taken while a widget is a local also holds that widget in a cycle and is reported too."""
+    if not hasattr(request.module, "qapp"):
+        yield
+        return
+    was_enabled = gc.isenabled()
+    # Free earlier modules' garbage now, on this thread, so none of it is blamed on this module.
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        try:
+            leaked = collect_qobjects_in_cycles()
+        finally:
+            if was_enabled:
+                gc.enable()
+    if leaked:
+        pytest.fail(
+            "Qt objects were left in a reference cycle by this module (freed now, on the GUI "
+            f"thread): {', '.join(leaked)}. Break the cycle in the test or code that made it."
+        )
 
 
 @pytest.fixture

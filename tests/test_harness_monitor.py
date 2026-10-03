@@ -178,12 +178,13 @@ def test_poller_cancel_abandons_remaining_calls(qapp: Any) -> None:
     poller = MonitorPoller("http://127.0.0.1:1", None)
 
     class CountingClient:
-        def __init__(self) -> None:
+        def __init__(self, poller: MonitorPoller) -> None:
             self.calls: list[str] = []
+            self._poller = poller
 
         def stats(self) -> Any:
             self.calls.append("stats")
-            poller.request_cancel()  # cancel arrives mid-poll, after the first call
+            self._poller.request_cancel()  # cancel arrives mid-poll, after the first call
             return type("S", (), {"outbox_by_status": {}})()
 
         def connections(self) -> list[Any]:
@@ -194,19 +195,25 @@ def test_poller_cancel_abandons_remaining_calls(qapp: Any) -> None:
             self.calls.append("dead")
             return type("D", (), {"dead_letters": []})()
 
-    client = CountingClient()
+    client = CountingClient(poller)
     poller._client = client  # type: ignore[assignment]
-    emitted: list[Any] = []
-    poller.snapshot.connect(lambda s: emitted.append(s))
-    poller._poll()
-    assert client.calls == ["stats"]  # cancel skipped connections + dead-letters
-    assert emitted == []  # and no snapshot was emitted
+    try:
+        emitted: list[Any] = []
+        poller.snapshot.connect(lambda s: emitted.append(s))
+        poller._poll()
+        assert client.calls == ["stats"]  # cancel skipped connections + dead-letters
+        assert emitted == []  # and no snapshot was emitted
 
-    # A cancel before the poll even starts makes it a no-op.
-    poller._cancelled = True
-    client.calls.clear()
-    poller._poll()
-    assert client.calls == []
+        # A cancel before the poll even starts makes it a no-op.
+        poller._cancelled = True
+        client.calls.clear()
+        poller._poll()
+        assert client.calls == []
+    finally:
+        # The poller and its client hold each other: a cycle only the cyclic collector frees, on
+        # whatever thread runs it next, and a Qt object destroyed off the GUI thread can strand
+        # its timers.
+        poller._client = None
 
 
 def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
