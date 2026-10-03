@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import logging
 import ssl
+import sys
 import threading
+import traceback
 from collections.abc import Callable, Sequence
 from json import JSONDecodeError
 from pathlib import Path
@@ -477,6 +479,33 @@ def _read_pin(cacert: str) -> bytes | None:
         return None
 
 
+def _release_raising_frames(exc: BaseException, *, stop: BaseException | None) -> None:
+    """Clear the local variables of the finished frames that raised ``exc`` and the errors it chains.
+
+    A library can raise through ``err = SomeError(...); raise err``, which leaves the raising frame
+    holding the error whose traceback holds that frame: a cycle only the cyclic collector frees.
+    At least truststore does this when the OS trust store refuses a certificate on Windows and on
+    macOS (on Linux OpenSSL refuses in C, and no such frame exists). Every frame in that traceback
+    links by ``f_back`` to this client's callers, so the cycle also keeps whatever they hold -- a
+    harness widget, say -- and the collector later destroys it on whichever thread triggers it
+    (``tests/_qt_cycles.py`` has why that crashes). Clearing the locals breaks the cycle and keeps
+    the tracebacks printable. It runs on every transport error, not only a certificate refusal, so
+    those tracebacks lose their locals on purpose: which frames hold such a cycle is the library's
+    business, not this client's. The walk follows ``__cause__`` and ``__context__`` and stops at
+    ``stop``, the error the CALLER was already handling when the request began, so it does not
+    clear the caller's own frames. It does not open exception groups."""
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or current is stop or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__traceback__ is not None:
+            traceback.clear_frames(current.__traceback__)  # skips a frame still executing
+        pending.extend((current.__cause__, current.__context__))
+
+
 def _is_cert_verification_failure(exc: BaseException) -> bool:
     """True when ``exc`` is a CONNECT failure caused by failing to verify the peer's certificate.
 
@@ -883,6 +912,9 @@ class EngineClient:
         # transport THIS attempt failed on, and the replaced one must stay open until this attempt
         # lets go of it (BACKLOG #2091). The certificate retry runs after the release, as its own
         # attempt with its own hold, so the replaced transport can close while the retry runs.
+        # The caller's own in-flight error, if any: the frame release below stops there. Read
+        # before the transport hold, so nothing runs between the hold and its `finally`.
+        outer = sys.exception()
         transport = self._acquire_transport()
         try:
             # ASVS 4.2.5: bound the request line and the bearer this client emits. The limits are
@@ -936,6 +968,7 @@ class EngineClient:
                     transport.send(request, stream=True), limit=MAX_RESPONSE_BYTES
                 )
             except httpx.HTTPError as exc:
+                _release_raising_frames(exc, stop=outer)
                 if not (
                     _follow_pin
                     and _is_cert_verification_failure(exc)

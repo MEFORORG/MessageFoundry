@@ -195,6 +195,10 @@ def test_show_body_does_nothing_while_a_newer_open_is_in_flight(qapp: Any) -> No
         # And the button waits for the answer, so a double-click is one audited read, not two.
         assert not panel._show_body.isEnabled()
     finally:
+        # The stub lives on the panel's runner and the list holds a closure over the panel: a cycle
+        # only the cyclic collector frees, on whatever thread runs it next. Off the GUI thread that
+        # strands the panel's armed table timers and a later file's processEvents() segfaults.
+        submitted.clear()
         panel.stop()
 
 

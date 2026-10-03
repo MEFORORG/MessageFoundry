@@ -11,14 +11,18 @@ delivered message with its disposition.
 from __future__ import annotations
 
 import contextlib
+import gc
 import socket
+import ssl
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import uvicorn
 
@@ -28,7 +32,7 @@ from harness import monitor  # noqa: E402
 from harness.monitor import MonitorPanel  # noqa: E402
 from messagefoundry.api import create_managed_app  # noqa: E402
 from messagefoundry.api.auth_models import CurrentUser, LoginResponse  # noqa: E402
-from messagefoundry.apiclient import ApiError  # noqa: E402
+from messagefoundry.apiclient import ApiError, EngineClient  # noqa: E402
 
 ADT = "MSH|^~\\&|APP|FAC|RAPP|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
@@ -178,12 +182,13 @@ def test_poller_cancel_abandons_remaining_calls(qapp: Any) -> None:
     poller = MonitorPoller("http://127.0.0.1:1", None)
 
     class CountingClient:
-        def __init__(self) -> None:
+        def __init__(self, poller: MonitorPoller) -> None:
             self.calls: list[str] = []
+            self._poller = poller
 
         def stats(self) -> Any:
             self.calls.append("stats")
-            poller.request_cancel()  # cancel arrives mid-poll, after the first call
+            self._poller.request_cancel()  # cancel arrives mid-poll, after the first call
             return type("S", (), {"outbox_by_status": {}})()
 
         def connections(self) -> list[Any]:
@@ -194,19 +199,25 @@ def test_poller_cancel_abandons_remaining_calls(qapp: Any) -> None:
             self.calls.append("dead")
             return type("D", (), {"dead_letters": []})()
 
-    client = CountingClient()
+    client = CountingClient(poller)
     poller._client = client  # type: ignore[assignment]
-    emitted: list[Any] = []
-    poller.snapshot.connect(lambda s: emitted.append(s))
-    poller._poll()
-    assert client.calls == ["stats"]  # cancel skipped connections + dead-letters
-    assert emitted == []  # and no snapshot was emitted
+    try:
+        emitted: list[Any] = []
+        poller.snapshot.connect(lambda s: emitted.append(s))
+        poller._poll()
+        assert client.calls == ["stats"]  # cancel skipped connections + dead-letters
+        assert emitted == []  # and no snapshot was emitted
 
-    # A cancel before the poll even starts makes it a no-op.
-    poller._cancelled = True
-    client.calls.clear()
-    poller._poll()
-    assert client.calls == []
+        # A cancel before the poll even starts makes it a no-op.
+        poller._cancelled = True
+        client.calls.clear()
+        poller._poll()
+        assert client.calls == []
+    finally:
+        # The poller and its client hold each other: a cycle only the cyclic collector frees, on
+        # whatever thread runs it next, and a Qt object destroyed off the GUI thread can strand
+        # its timers.
+        poller._client = None
 
 
 def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
@@ -380,6 +391,59 @@ def test_a_mistyped_cert_path_is_reported_not_raised(qapp: Any, tmp_path: Path) 
         assert "cannot load TLS material" in panel._status.text()
     finally:
         panel.shutdown()
+
+
+def _refuse_like_truststore() -> None:
+    """Raise the way truststore does when the OS trust store refuses a certificate on Windows: bind
+    the error to a local, then raise it, so this frame and the error hold each other."""
+    err = ssl.SSLCertVerificationError("root certificate is not trusted by the trust provider")
+    raise err from None
+
+
+def _refusing_transport(request: httpx.Request) -> httpx.Response:
+    try:
+        _refuse_like_truststore()
+    except ssl.SSLCertVerificationError as exc:
+        # httpcore re-raises with `from None`, so the refusal is reachable through __context__ only.
+        raise httpx.ConnectError(str(exc), request=request) from None
+    raise AssertionError("unreachable")
+
+
+def test_a_refused_certificate_leaves_no_panel_in_a_reference_cycle(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows CI leg's module guard (``tests/conftest.py``) found the Cert-blank TLS control's
+    panel freed only by the cyclic collector. The refusal's frame-and-error cycle reached the panel
+    by ``f_back`` through ``EngineClient._request`` into ``_connect``. ``_release_raising_frames``
+    in ``messagefoundry/apiclient/client.py`` has the mechanism.
+
+    RED when: ``EngineClient._request`` keeps the locals of the frames that raised a transport error,
+    so the panel outlives its last reference with automatic collection off."""
+    real = EngineClient
+
+    def client_on_a_refusing_transport(*args: Any, **kwargs: Any) -> Any:
+        client = real(*args, **kwargs)
+        client._http.close()
+        client._http = httpx.Client(
+            base_url=client.base_url, transport=httpx.MockTransport(_refusing_transport)
+        )
+        return client
+
+    monkeypatch.setattr(monitor, "EngineClient", client_on_a_refusing_transport)
+    # Automatic collection is already off: the module-scoped guard in tests/conftest.py applies to
+    # every module that defines `qapp`, this one included, even when this test runs alone.
+    assert not gc.isenabled()
+    panel = MonitorPanel()
+    alive = weakref.ref(panel)
+    try:
+        panel._url.setText("http://127.0.0.1:1")
+        panel._connect_btn.click()
+        assert panel._client is None
+        assert "root certificate is not trusted" in panel._status.text()
+    finally:
+        panel.shutdown()
+        del panel
+    assert alive() is None, "the refused connect left the panel reachable only by a cycle"
 
 
 @pytest.mark.timeout(120)
