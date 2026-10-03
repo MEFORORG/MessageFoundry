@@ -41,12 +41,18 @@ send the Handler's body outside the organisation through a permitted relay.
 - **`[egress].allowed_recipient_domains: list[str] = []`** in `EgressSettings`, wired into `_split_list`
   (`MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS=a.example,b.example`). Each entry is a bare domain. A
   validator lowercases each entry at load and refuses one that could never match, such as an address,
-  a URL, a port, a wildcard or a leading-dot suffix.
+  a URL, a port, a wildcard, an IP address or a leading-dot suffix.
 - **`check_egress_allowed` runs it for every EMAIL destination**, after the host arm. It reads the
   addresses through the transport's own `envelope_recipients`: the entries are joined into one `To:`
   header and parsed with the stdlib address parser, so an entry holding two addresses yields two. Every address must have a domain
-  that matches a listed entry exactly, without regard to case. A subdomain needs its own entry. An
-  address with no readable domain is refused.
+  that matches a listed entry exactly, without regard to ASCII case. A subdomain needs its own entry.
+  An address with no readable domain is refused, and so is one whose local part carries a
+  mail-routing character, because a relay may forward on it past the listed domain. A non-ASCII
+  domain is refused; its `xn--` form can be listed.
+- **The transport sends to the checked list.** `EmailDestination` passes the same
+  `envelope_recipients` list to `send_message` as `to_addrs`, so a header added later cannot
+  widen the RCPT set past what the gate saw.
+- **Not covered: the envelope sender.** Bounces go to `sender`, and the list does not gate it.
 - **Deny-by-default on its own terms.** An empty list refuses every EMAIL destination, whatever
   `[security].block_unlisted_outbound` says. This is the `allowed_proxy` shape, not D4's opt-in shape: a
   permissive-when-empty recipient list would leave the gate off on exactly the default posture.

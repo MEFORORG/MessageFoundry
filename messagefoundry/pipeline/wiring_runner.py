@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Protocol, cast
+from typing import Any, Literal, NamedTuple, NoReturn, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
@@ -10087,22 +10087,26 @@ def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> Non
     except ValueError as exc:
         # The transport's own construction message, so the operator fixes the connection rather
         # than the allowlist.
+        log.warning("egress denied: outbound %r EMAIL recipients are unreadable", dest.name)
         raise WiringError(f"outbound {dest.name!r}: {exc}") from exc
     if not addresses:
         # Fail closed without leaning on the parser: a gate that checked nothing has not passed.
+        log.warning("egress denied: outbound %r EMAIL names no recipient address", dest.name)
         raise WiringError(f"outbound {dest.name!r}: EMAIL destination names no recipient address")
     permitted = set(allowed)
     for address in addresses:
         local, at, domain = address.rpartition("@")
-        domain = domain.lower()
         if not (at and local and domain):
-            log.warning(
-                "egress denied: outbound %r EMAIL recipient is not a readable address", dest.name
+            _refuse_email_recipient(dest.name, "is not a readable address")
+        if any(ch in local for ch in _LOCAL_PART_ROUTING_CHARS):
+            # A relay may treat these as a further hop, so the domain after the last "@" would not
+            # be where the mail ends up. Plain mailboxes never need them.
+            _refuse_email_recipient(dest.name, "has a local part with a routing character")
+        if not domain.isascii():
+            _refuse_email_recipient(
+                dest.name, "has a non-ASCII domain; write it in its ASCII xn-- form"
             )
-            raise WiringError(
-                f"outbound {dest.name!r}: an EMAIL recipient is not a readable address, so the "
-                "[egress].allowed_recipient_domains check cannot pass it"
-            )
+        domain = domain.lower()
         if domain not in permitted:
             log.warning(
                 "egress denied: outbound %r EMAIL recipient domain %r not in "
@@ -10114,6 +10118,18 @@ def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> Non
                 f"outbound {dest.name!r}: EMAIL recipient domain {domain!r} is not in the "
                 "[egress].allowed_recipient_domains allowlist (an empty list permits no recipient)"
             )
+
+
+#: Characters an EMAIL recipient's local part may not carry: each can name a further routing hop.
+_LOCAL_PART_ROUTING_CHARS = frozenset('%!@"')
+
+
+def _refuse_email_recipient(name: str, why: str) -> NoReturn:
+    log.warning("egress denied: outbound %r EMAIL recipient %s", name, why)
+    raise WiringError(
+        f"outbound {name!r}: an EMAIL recipient {why}, so the "
+        "[egress].allowed_recipient_domains check cannot pass it"
+    )
 
 
 def _mllp_egress_allowed(host: str, port: object, allowed: list[str]) -> bool:

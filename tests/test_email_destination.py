@@ -115,10 +115,11 @@ class _FakeSMTP:
         self.did_noop = True
         return (250, b"OK")
 
-    def send_message(self, msg: EmailMessage) -> dict[str, Any]:
+    def send_message(self, msg: EmailMessage, to_addrs: list[str] | None = None) -> dict[str, Any]:
         if self.fail_at == "send":
             raise smtplib.SMTPRecipientsRefused({"x@y.z": (550, b"no")})
         self.sent.append(msg)
+        self.to_addrs = to_addrs
         return {}
 
 
@@ -190,6 +191,9 @@ async def test_send_builds_message_and_starttls(monkeypatch: pytest.MonkeyPatch)
     assert msg["From"] == "engine@hospital.org"
     assert msg["To"] == "a@p.org, b@p.org"
     assert msg.get_content().strip() == "PID|1|patient"
+    # The RCPT set is the list the [egress] recipient-domain check reads, passed explicitly, so a
+    # header added later cannot widen it (vault BACKLOG #2616).
+    assert smtp.to_addrs == ["a@p.org", "b@p.org"]
 
 
 async def test_send_with_auth_logs_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -541,6 +545,12 @@ def test_listed_recipient_domain_passes(recipients: list[str]) -> None:
         ["no-at-sign"],  # not a readable address
         ["a@"],
         ['""@hospital.example'],  # listed domain, empty local part
+        # A routing character in the local part: the listed domain would not be the last hop.
+        ["a%partner.example@hospital.example"],
+        ["partner.example!a@hospital.example"],
+        ['"a@partner.example"@hospital.example'],
+        ["a@höspital.example"],  # non-ASCII domain: only the ASCII xn-- form can be listed
+        ["a@Kospital.example"],  # a Unicode case fold must not reach an ASCII entry
     ],
 )
 def test_unlisted_or_unreadable_recipient_is_refused(recipients: list[str] | str) -> None:
@@ -581,13 +591,26 @@ def test_recipient_domains_load_from_the_environment(tmp_path: Path) -> None:
     assert loaded.allowed_recipient_domains == ["hospital.example", "lab.example"]
 
 
-@pytest.mark.parametrize("recipients", [[""], []])
+def test_a_gate_that_read_no_address_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The stdlib parser never yields an empty list today; the gate must not depend on that.
+    import messagefoundry.pipeline.wiring_runner as wr
+
+    monkeypatch.setattr(wr, "envelope_recipients", lambda _value: [])
+    e = _relay_listed(["hospital.example"])
+    with pytest.raises(WiringError, match="no recipient address"):
+        check_egress_allowed(_email_dest("smtp.hospital.example"), e)
+
+
+@pytest.mark.parametrize(
+    "recipients",
+    [[""], [], [' :%.bK".b']],  # the last breaks the stdlib header parser
+)
 def test_empty_recipients_are_refused_with_the_construction_message(
     recipients: list[str],
 ) -> None:
     # The operator is told to fix the connection, not the allowlist.
     e = _relay_listed(["hospital.example"])
-    with pytest.raises(WiringError, match="non-empty 'recipients'"):
+    with pytest.raises(WiringError, match="Email destination.*'recipients'"):
         check_egress_allowed(_email_dest("smtp.hospital.example", recipients=recipients), e)
 
 
@@ -602,6 +625,10 @@ def test_empty_recipients_are_refused_with_the_construction_message(
         "[10.0.0.1]",
         "a.example,b.example",
         "hospital..example",
+        "10.0.0.1",
+        "-a-.example",
+        "x" * 64 + ".example",
+        ".",
     ],
 )
 def test_a_recipient_domain_that_can_never_match_is_refused_at_load(entry: str) -> None:

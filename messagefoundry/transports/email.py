@@ -92,8 +92,7 @@ def _as_recipients(value: Any) -> list[str]:
 
 
 def _to_header(recipients: list[str]) -> str:
-    """The ``To:`` header value the destination sends. ``smtplib`` takes the envelope recipients
-    from this header, so :func:`envelope_recipients` reads the same value."""
+    """The ``To:`` header value the destination sends."""
     return ", ".join(recipients)
 
 
@@ -101,14 +100,16 @@ def envelope_recipients(value: Any) -> list[str]:
     """Every envelope address an Email destination with this ``recipients`` setting would send to.
 
     One entry can hold several addresses, so this parses the joined ``To:`` header with the same
-    stdlib parser ``smtplib`` uses, rather than reading one address per entry. The ``[egress]``
-    recipient-domain check (vault BACKLOG #2616) calls it, so the gate reads the send path itself.
-    An address the parser cannot read comes back as ``""``. Raises :class:`ValueError` for an empty
-    setting, as construction does."""
+    stdlib parser ``smtplib`` uses, rather than reading one address per entry. The destination
+    passes this list to ``send_message`` as ``to_addrs``, and the ``[egress]`` recipient-domain
+    check (vault BACKLOG #2616) checks the same list, so no header added later can widen the RCPT
+    set past what the gate saw. An address the parser cannot read comes back as ``""``. Raises
+    :class:`ValueError` for an empty or unparseable setting, as construction does."""
     msg = EmailMessage()
     try:
         msg["To"] = _to_header(_as_recipients(value))
-    except MessageError as exc:
+    except (MessageError, IndexError) as exc:
+        # The stdlib header parser has been measured raising IndexError on malformed input.
         raise ValueError("Email destination 'recipients' is not a readable address list") from exc
     return [addr for _, addr in getaddresses([str(h) for h in msg.get_all("To", [])])]
 
@@ -134,6 +135,7 @@ class EmailDestination(DestinationConnector):
         self.port = int(s.get("port", 587))
         self.sender = sender
         self.recipients = _as_recipients(s.get("recipients"))
+        self._envelope = envelope_recipients(self.recipients)
         self.subject = str(s.get("subject", ""))
         username = s.get("username")
         password = s.get("password")
@@ -362,7 +364,7 @@ class EmailDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="EMAIL outbound",
                     )
-                smtp.send_message(msg)
+                smtp.send_message(msg, to_addrs=self._envelope)
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --

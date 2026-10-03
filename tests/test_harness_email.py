@@ -436,10 +436,14 @@ def test_an_unlisted_recipient_domain_fails_the_delivered_scenario(
     for row in listing:
         if row.role == "destination" and row.destination:
             outbound.setdefault(row.destination, set()).add(row.status)
+    inbound = {row.channel_id: row.status for row in listing if row.role == "source"}
     for name in ("OB_Harness_Email", "OB_Harness_Email_Rejected"):
         assert outbound[name] == {"failed"}, (name, outbound.get(name))
+    assert inbound["IB_Harness_Email"] == "running"
+    # It must fail BECAUSE delivery was refused: the message reached the engine and got no further.
     assert not result.ok
     assert "could not send" not in result.detail, result.detail
+    assert "0/1 reached 'processed'" in result.detail, result.detail
 
 
 def test_body_control_id_reads_the_plain_text_body_only() -> None:

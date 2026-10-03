@@ -3911,13 +3911,21 @@ class EgressSettings(_Section):
         ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry."""
         cleaned: list[str] = []
         for raw in value:
-            item = raw.strip().lower().rstrip(".")
-            if not item:
+            if not raw.strip():
                 continue
-            # Letters, digits, hyphens and dots, with no empty label: a hostname-shaped domain. This
-            # refuses an address, URL, port, wildcard, leading-dot suffix, address literal and a
-            # comma-joined pair, none of which the exact match below could ever hit.
-            if set(item) - _DOMAIN_CHARS or "" in item.split("."):
+            item = raw.strip().lower().rstrip(".")
+            labels = item.split(".")
+            # A hostname-shaped domain: letters, digits and hyphens in labels of 1 to 63 characters,
+            # no label starting or ending with a hyphen, and a final label that is not all digits.
+            # This refuses an address, URL, port, wildcard, leading-dot suffix, IP address and a
+            # comma-joined pair, none of which names a mail domain the exact match should accept.
+            if (
+                not item
+                or set(item) - _DOMAIN_CHARS
+                or any(not 0 < len(label) <= 63 for label in labels)
+                or any(label[0] == "-" or label[-1] == "-" for label in labels)
+                or labels[-1].isdigit()
+            ):
                 raise ValueError(
                     f"[egress].allowed_recipient_domains: {item!r} must be a bare domain such as "
                     "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
