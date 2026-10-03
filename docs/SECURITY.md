@@ -1811,8 +1811,8 @@ with no page.
     `ad_session_revoked` with reason `roles_changed`. The next sign-in then writes no
     `auth.ad_roles_resynced` row. That section lists when a pass revokes or alerts nothing.
     No pass runs at `[auth].ad_session_recheck_seconds = 0`. A pass probes at most
-    `ad_session_recheck_max_users` accounts (200 by default), least recently probed first, so on a
-    larger estate an account can wait several passes.
+    `ad_session_recheck_max_users` accounts (200 by default), least recently probed first. When more
+    directory accounts than that hold live sessions, an account can wait several passes.
 
 The check also flags some releases that changed nothing. A login that rehashes a password after an
 argon2 parameter change restamps `password_changed_at`, so each approver's first release after such a
@@ -2567,8 +2567,8 @@ listen source. The refusal action differs materially per listener, so each has i
 | **TCP** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event) |
 | **X12** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event); BACKLOG #1665 |
 | **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event |
-| **DICOM C-STORE SCP** | peer socket address at accept; `event.assoc.requestor.address` in the C-STORE backstop | not in `source_ip_allowlist` | **DENY** — the connection is closed at accept, before any TLS handshake or association; WARNING log naming the peer IP, at most one line per address per 60 s; **no connection event**. The backstop answers DIMSE status **`0x0124` (Not Authorized)** **before any durable commit** and logs each refusal with the calling AE; [DICOM.md](DICOM.md) section 3 says why a sender should not see it |
-| **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails and the connection **never reaches the accept path**, so there is **no** connection event and no allow-list evaluation. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
+| **DICOM C-STORE SCP** | peer socket address at accept; `event.assoc.requestor.address` in the C-STORE backstop | not in `source_ip_allowlist` | **DENY** — the connection is closed at accept, before any TLS handshake or association; WARNING log naming the peer IP, at most one line per address per 60 s and at most 20 addresses per 60 s in all; **no connection event**. The backstop answers DIMSE status **`0x0124` (Not Authorized)** **before any durable commit** and logs each refusal with the calling AE; [DICOM.md](DICOM.md) section 3 says why a sender should not see it |
+| **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails and the connection **never reaches the accept path**, so there is **no** connection event, and on MLLP and HTTP no allow-list evaluation. The DICOM SCP checks its allow-list at accept, before the handshake, so a peer outside the list is refused there first. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
 | **HTTP** — intake authentication (`intake_auth`, ADR 0154 D6) | the credential a peer presents: the `intake_api_key_header` header (default `x-api-key`) under `api_key`, `Authorization: Bearer` under `bearer`, or the verified client certificate's `CN:` / `SAN:` names under `mtls_subject` | `intake_auth` is not `none` and the key or token is missing or wrong, or the certificate's names are not in `intake_client_subjects`. **The default is `intake_auth = "none"`, which checks no credential: a default HTTP inbound admits any peer the rows above admit.** Under `api_key` / `bearer`, `GET`/`HEAD` probes are inside the check unless `intake_auth_health = "allow"`. Under `mtls_subject` the certificate is checked at accept, before the method is known, so no probe is exempt. A peer with no certificate from `tls_ca_file` never reaches this row: it fails the handshake in the peer-client-certificate row above | **DENY** — `401` for a missing or wrong key or token (read before any body byte), `400` for a credential header sent more than once, even with identical copies, and with `_` read as `-` in the header name, since the engine would keep the last copy while a front end may read the first (BACKLOG #2051; refused before any comparison, charged to the failed-attempt budget and audited `intake.auth_failed`), `403` for a verified certificate with an unlisted subject; nothing is committed. Audited `intake.auth_failed` / `intake.auth_subject_denied`, plus a connection event |
 | **HTTP** — intake failed-attempt budget (ADR 0154 D6) | the peer address, and the listener's failed-attempt count across all peers | the peer has spent `intake_auth_rate_limit` failed attempts in the window, or all peers together have spent `intake_auth_rate_limit_global` (defaults and the `0`/`None` off switch in [CONNECTIONS.md](CONNECTIONS.md)). A peer that authenticated inside the window is exempt from the global budget, so a flood cannot lock out a working partner. Counted in-process, so each engine shard keeps its own count | **THROTTLE** — `429` + `Retry-After: 60` before any credential is compared; audited `intake.auth_rate_limited`. A successful authentication never spends budget |
 | **HTTP** — peer-control start gate (ADR 0154 D7) | the listener's bind host × the presence of an **effective** peer control | non-loopback bind, `[security].enforcement = enforce` (the default), and **no** effective peer control: `intake_auth` is `none`, and `source_ip_allowlist` is unset or has an entry wider than a /8 (IPv4) or a /32 (IPv6), so `0.0.0.0/0` does not count. `tls` + `tls_ca_file` alone does not count either, because it binds no subject | **DENY at start** (`WiringError`); the connection degrades per ADR 0031 startup fault isolation. Loopback binds are exempt |
@@ -4064,23 +4064,27 @@ digest only, and it said any such change is detectable without that condition. I
 store that has a key can still hold a keyless chain, or one keyed only from a later row on"*; that
 was true until the keyed-from mark was removed. Verify the chain with
 `messagefoundry audit-verify` — exit 0 means at least that no surviving row was edited or
-reordered by someone who could not recompute the chain. Run it with the key settings the engine
-runs with: the store key in its environment, or under `cipher_provider = "vault_transit"` the Transit
-settings listed under `cipher_provider` in [CONFIGURATION.md](CONFIGURATION.md). A keyed chain cannot
-be verified without them. A shell that holds no key gets a `FAIL` line saying the chain is keyed and
-no key is configured, and exit 1. With the key,
+reordered by someone who could not recompute the chain. Run it with the key settings and environment
+the engine runs with, which under `cipher_provider = "vault_transit"` include the Transit settings
+listed under `cipher_provider` in [CONFIGURATION.md](CONFIGURATION.md). A keyed chain cannot be
+verified without them, and the verify exits 1. With no store key configured it prints a `FAIL` line
+saying the chain is keyed and no key is configured. Under `vault_transit` with the Transit settings
+missing, it stops with an error before it reads the chain. With the key,
 exit 0 also means every row is keyed. With no key, which only the keyless store mode allows, exit 0
 covers a keyless chain and says no more than the paragraph above. A store that has a key and opens
 onto keyless rows fails the verify, and is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
 **A scheduled job reads the exit code and nothing else, so
 these four are kept distinct:** `0` a clean walk over at least one row, `1` a chain that did not
-verify (a broken chain, or a keyed chain checked with no key; the `FAIL` line says which), `2` the
+verify, `2` the
 path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an
 absent path, a zero-byte file, a file carrying no `audit_log` table, and a path that is not a SQLite
 database at all — the verifier refuses each rather than creating or migrating the evidence it was
 asked to check, and it opens read-only so it cannot write to that file either way. It never spends
-`1` on any of them, because `1` is reserved for a chain that was read and did not verify. Exit 3
+`1` on any of them. Exit 1 covers at least a broken chain, a mismatch with `--expected-anchor`, and a
+keyed chain checked with no key, and the `FAIL` line says which. It also covers the `vault_transit`
+error above, which prints no `FAIL` line, so by the code alone a job cannot tell that case from a
+broken chain. Exit 3
 exists because "there was nothing to verify" is not a
 pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
