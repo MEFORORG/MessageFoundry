@@ -1992,7 +1992,8 @@ def X12(
     request/response** (ADR 0016): set ``capture_response`` (or ``reingress_to=`` a ``Loopback()``
     inbound) to capture the returned **271/TA1** as a reply — a **TA1** interchange acknowledgement is
     classified (TA1*A → accepted; TA1*R → permanent reject/dead-letter; TA1*E → accepted-with-warning,
-    *not* retried), a business 271/277/278 returned instead is itself the confirmation; ``ta1_required``
+    *not* retried) when its TA1-01 names the interchange sent (docs/CONNECTIONS.md), a business
+    271/277/278 returned instead is itself the confirmation; ``ta1_required``
     makes a no-reply a retry. Egress is gated by ``[egress].allowed_tcp`` (X12 shares the raw-TCP
     allowlist). Delivery is at-least-once → the receiver **must be idempotent** (a crash-re-send of a
     non-idempotent 270 yields a fresh 271 captured at the next ``response_seq``).
