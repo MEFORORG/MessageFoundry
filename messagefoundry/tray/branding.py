@@ -17,8 +17,9 @@ the venv is active and ``tray`` imports) and its own top-level runtime DLLs — 
 it (``python3XX.dll`` et al., ~7 MB, since a standalone interpreter's runtime is app-local, not in
 System32) — so the process image is ``MessageFoundryTray.exe``. Only its ``RT_VERSION`` resource is
 rewritten (a fresh ``VS_VERSIONINFO`` built here in pure stdlib) so ``FileDescription`` reads
-"MessageFoundry Tray". Autostart still pins the plain ``pythonw`` and lets this re-exec apply branding
-at runtime, so it never depends on the derived exe surviving between logins.
+"MessageFoundry Tray". Autostart still pins the plain ``pythonw`` (``tray/autostart.py`` says how
+it starts it) and lets this re-exec apply branding at runtime, so it never depends on the derived
+exe surviving between logins.
 
 Everything is fail-soft: any failure returns ``None``/``False`` and the tray simply runs unbranded
 (listed as "Python"). The builder (:func:`build_version_info`) is pure and unit-tested; the acid
@@ -39,7 +40,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 from messagefoundry.childenv import engine_environment, python_child_argv
-from messagefoundry.tray import __version__
+from messagefoundry.tray import ENTRY_MODULE, __version__
 
 log = logging.getLogger("messagefoundry.tray.branding")
 
@@ -345,9 +346,14 @@ def relaunch_branded() -> bool:
     try:
         # Started like the engine's Python children (vault BACKLOG #2801); childenv says what the
         # command line and the environment do. The tray keeps the user's whole environment.
+        # stderr goes to the null device because the branded launcher is a pythonw copy, which
+        # otherwise starts with no stderr at all. At least PYTHONFAULTHANDLER=1 and PYTHONDEVMODE=1
+        # then make the interpreter exit 1 before any code runs; measured on 3.14, and the base
+        # pythonw.exe does the same. tray.log, not stderr, is where the tray writes.
         child = subprocess.Popen(  # nosec B603 - fixed argv (our own branded launcher, the child interpreter flags, our own bootstrap script, a module name), shell=False
-            python_child_argv("messagefoundry.tray", executable=str(branded)),
+            python_child_argv(ENTRY_MODULE, executable=str(branded)),
             env=engine_environment(),
+            stderr=subprocess.DEVNULL,
             close_fds=True,
         )
     except OSError:

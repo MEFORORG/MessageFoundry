@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import struct
 import subprocess
@@ -13,8 +14,10 @@ from typing import Any
 
 import pytest
 
+import messagefoundry
 from messagefoundry import _child_bootstrap
-from messagefoundry.tray import branding
+from messagefoundry.tray import autostart, branding
+from tests.test_isolated_launch import _decoy
 
 
 def test_build_version_info_is_self_consistent() -> None:
@@ -96,6 +99,7 @@ def test_relaunch_hands_over_to_a_child_started_like_every_other_python_child(
     kept = str(tmp_path / "site")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([".", kept]))
     monkeypatch.setenv("MF_2801_ORDINARY", "crosses")
+    monkeypatch.setenv("PYTHONFAULTHANDLER", "1")
     started: list[tuple[Any, dict[str, Any]]] = []
 
     class _Alive:
@@ -119,6 +123,179 @@ def test_relaunch_hands_over_to_a_child_started_like_every_other_python_child(
     env = kwargs["env"]
     assert env["PYTHONPATH"] == kept
     assert env["MF_2801_ORDINARY"] == "crosses"  # the tray keeps the user's environment
+    assert env["PYTHONFAULTHANDLER"] == "1"  # whole, this one included
+    # A pythonw child needs a stderr handle, or at least this variable stops it at start-up.
+    assert kwargs["stderr"] is subprocess.DEVNULL
+
+
+# --- Real children through the bootstrap (vault BACKLOG #2822) -----------------------------------
+#
+# A broken bootstrap does not fail the tray loudly: the branded child dies inside the grace window
+# and the first process runs the tray unbranded. So these start real interpreters. Each runs a
+# trivial module in place of the tray, from a working directory holding a decoy `messagefoundry`
+# package, and reports what it saw. A `-m` start would import the decoy and exit nonzero.
+
+_PROBE_MODULE = "mf_2822_tray_probe"
+_PROBE_SOURCE = """\
+import json, sys
+import messagefoundry
+with open(sys.argv[1], "w", encoding="utf-8") as out:
+    json.dump({"executable": sys.executable, "safe_path": sys.flags.safe_path,
+               "remote_debug": sys.is_remote_debug_enabled(), "package": messagefoundry.__file__,
+               "orig_argv": sys.orig_argv}, out)
+"""
+
+#: Each would make the child report a flag on without the command line setting it, so neither may
+#: reach the child. ``_run`` in ``tests/test_isolated_launch.py`` drops these two among others.
+_FLAG_STAND_INS = ("PYTHONSAFEPATH", "PYTHON_DISABLE_REMOTE_DEBUG")
+
+
+def _probe_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """The probe's folder, a working directory with a decoy package in it, and the report path."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    (probe_dir / f"{_PROBE_MODULE}.py").write_text(_PROBE_SOURCE, encoding="utf-8")
+    return probe_dir, _decoy(tmp_path), tmp_path / "report.json"
+
+
+def _assert_this_build_with_the_flags(report: Path) -> dict[str, Any]:
+    seen: dict[str, Any] = json.loads(report.read_text(encoding="utf-8"))
+    assert Path(seen["package"]).resolve() == Path(messagefoundry.__file__).resolve()
+    assert seen["safe_path"] is True
+    assert seen["remote_debug"] is False
+    return seen
+
+
+def _assert_started_through_the_bootstrap(report: Path) -> dict[str, Any]:
+    seen = _assert_this_build_with_the_flags(report)
+    # A `-P -m` start passes the three checks above too, in an installed checkout. The interpreter's
+    # own command line says which start it was.
+    started = seen["orig_argv"]
+    assert "-m" not in started, started
+    bootstrap = Path(_child_bootstrap.__file__).resolve()
+    assert any(Path(arg).resolve() == bootstrap for arg in started[1:]), started
+    return seen
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="the tray is Windows-only")
+
+
+def _without_flag_stand_ins(probe_dir: Path) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k.upper() not in _FLAG_STAND_INS}
+    env["PYTHONPATH"] = str(probe_dir)
+    return env
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "installed", [False, True, None], ids=["checkout", "installed", "as-classified"]
+)
+def test_the_login_command_starts_a_real_first_process_with_the_flags(
+    tmp_path: Path, installed: bool | None
+) -> None:
+    """The Run-key string itself, parsed by Windows, from a working directory holding a decoy. Red
+    before vault BACKLOG #2822: a plain ``-m`` put the working directory first and the decoy
+    answered. ``None`` takes the form ``installed_in_site_packages`` picks for this interpreter, so
+    a short form chosen where ``-P -m`` cannot import the package fails here (vault BACKLOG #2837)."""
+    probe_dir, cwd, report = _probe_layout(tmp_path)
+    env = _without_flag_stand_ins(probe_dir)
+    if installed is True:
+        # The short form needs the package on the interpreter's own path, as an install puts it.
+        control = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
+            [sys.executable, "-P", "-c", "import messagefoundry; print(messagefoundry.__file__)"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=50,
+            check=False,
+        )
+        found = control.stdout.strip()
+        if control.returncode or Path(found).resolve() != Path(messagefoundry.__file__).resolve():
+            pytest.skip("this build is not installed into this interpreter, so -m cannot find it")
+    command = autostart.launcher_command(sys.executable, installed=installed)
+    assert command.endswith(" messagefoundry.tray"), command
+    command = command.removesuffix("messagefoundry.tray") + subprocess.list2cmdline(
+        [_PROBE_MODULE, str(report)]
+    )
+    done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
+        command, cwd=cwd, env=env, capture_output=True, text=True, timeout=50, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    if installed is None:
+        installed = autostart.installed_in_site_packages()
+    if installed:
+        seen = _assert_this_build_with_the_flags(report)
+        assert seen["orig_argv"][-3:-2] == ["-m"], seen["orig_argv"]
+    else:
+        _assert_started_through_the_bootstrap(report)
+
+
+@_WINDOWS_ONLY
+def test_the_relaunch_starts_a_real_branded_child_through_the_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``relaunch_branded`` itself, with a real branded launcher. Only the module name changes on
+    the way out, so the command line and the environment are the relaunch's own."""
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    branded = branding.ensure_branded_launcher(scripts_dir=scripts)
+    if branded is None:  # it returns None on any branding failure, not only a missing pythonw
+        pytest.skip("ensure_branded_launcher could not build a branded launcher on this host")
+    # The branded copy finds the standard library through the pyvenv.cfg one folder up, as it does
+    # in a real venv. Measured: without one it dies with "No module named 'encodings'".
+    (tmp_path / "pyvenv.cfg").write_text(
+        f"home = {branding._base_pythonw().parent}\n", encoding="utf-8"
+    )
+    probe_dir, cwd, report = _probe_layout(tmp_path)
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("PYTHONPATH", str(probe_dir))
+    for name in _FLAG_STAND_INS:
+        monkeypatch.delenv(name, raising=False)
+    # CI sets the first; with either, a pythonw child with no stderr exits 1 before any code runs,
+    # which was PR 1962's red on windows-2022 and windows-2025. The relaunch gives it a stderr.
+    monkeypatch.setenv("PYTHONFAULTHANDLER", "1")
+    monkeypatch.setenv("PYTHONDEVMODE", "1")
+    real_popen = subprocess.Popen
+    children: list[tuple[subprocess.Popen[Any], list[str], dict[str, Any]]] = []
+
+    def _popen(argv: list[str], **kwargs: Any) -> subprocess.Popen[Any]:
+        assert argv[-1] == "messagefoundry.tray", argv
+        probe_argv = [*argv[:-1], _PROBE_MODULE, str(report)]
+        child = real_popen(probe_argv, **kwargs)  # noqa: S603
+        children.append((child, probe_argv, kwargs))
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    monkeypatch.setattr(branding, "ensure_branded_launcher", lambda *a, **k: branded)
+    try:
+        branding.relaunch_branded()  # the probe may outlive the grace window or not; either is fine
+        [(child, probe_argv, kwargs)] = children
+        code = child.wait(timeout=50)
+        if code != 0:
+            # The relaunch sent the child's stderr to the null device. Run the same start again
+            # with stderr captured, so the failure says why. real_popen, because subprocess.run
+            # would reach the patched Popen above; listed, so the finally below reaps it too.
+            again = real_popen(  # noqa: S603 - the same command line the relaunch built
+                probe_argv,
+                env=kwargs.get("env"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            children.append((again, probe_argv, {}))
+            _out, err = again.communicate(timeout=50)
+            pytest.fail(
+                f"branded child exited {code}; the same start with stderr captured exited "
+                f"{again.returncode}, stderr: {err[-2000:]!r}"
+            )
+    finally:
+        for started, _argv, _kwargs in children:  # an orphan would hold tmp_path's runtime open
+            if started.poll() is None:
+                started.kill()
+                started.wait(timeout=30)
+    seen = _assert_started_through_the_bootstrap(report)
+    assert Path(seen["executable"]).name == branding.BRANDED_EXE_NAME
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="version resource + parser are Windows-only")
