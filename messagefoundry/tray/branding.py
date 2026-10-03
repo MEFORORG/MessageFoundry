@@ -343,18 +343,17 @@ def relaunch_branded() -> bool:
     branded = ensure_branded_launcher()
     if branded is None:
         return False
-    # Started like the engine's Python children (vault BACKLOG #2801); childenv says what the
-    # command line and the environment do. The tray keeps the user's whole environment, less
-    # PYTHONFAULTHANDLER: the branded launcher is a pythonw copy with no stderr, and the interpreter
-    # refuses to start when that variable asks faulthandler to write to a missing stderr. Measured
-    # on 3.14: exit 1, and so does the base pythonw.exe itself.
-    env = engine_environment()
-    for name in [n for n in env if n.upper() == "PYTHONFAULTHANDLER"]:
-        del env[name]
     try:
+        # Started like the engine's Python children (vault BACKLOG #2801); childenv says what the
+        # command line and the environment do. The tray keeps the user's whole environment.
+        # stderr goes to the null device because the branded launcher is a pythonw copy, which
+        # otherwise starts with no stderr at all. At least PYTHONFAULTHANDLER=1 and PYTHONDEVMODE=1
+        # then make the interpreter exit 1 before any code runs; measured on 3.14, and the base
+        # pythonw.exe does the same. tray.log, not stderr, is where the tray writes.
         child = subprocess.Popen(  # nosec B603 - fixed argv (our own branded launcher, the child interpreter flags, our own bootstrap script, a module name), shell=False
             python_child_argv(ENTRY_MODULE, executable=str(branded)),
-            env=env,
+            env=engine_environment(),
+            stderr=subprocess.DEVNULL,
             close_fds=True,
         )
     except OSError:
