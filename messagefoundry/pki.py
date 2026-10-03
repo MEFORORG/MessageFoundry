@@ -312,7 +312,8 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
     """Why some CRL in ``pem`` is not signed by a CA in ``ca_ders``, or ``None`` when each one is.
 
     The flag is True when a CA for the CRL's issuer was found and its key does not verify the CRL,
-    and False when no such CA was found. OpenSSL checks a CRL's signature at the handshake, not at
+    and False when no such CA was found. A block that fails to verify is reported over one whose CA
+    was not found, wherever it sits in the file. OpenSSL checks a CRL's signature at the handshake, not at
     the load. So a CRL with the right issuer name and Authority Key Identifier but a bad signature
     loads cleanly, and then every handshake it judges fails with ``CRL signature failure``. The
     running-hop reload calls this before a live load, because a load cannot be undone (BACKLOG #299).
@@ -327,12 +328,15 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
         except ValueError:
             continue
     blocks = list(_crl_blocks(pem))
+    unlisted: str | None = None
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
         where = f"CRL block {index} of {len(blocks)} (issuer {crl.issuer.rfc4514_string()!r})"
         issuers = [ca for ca in cas if ca.subject == crl.issuer and _fits_akid(crl, ca)]
         if not issuers:
-            return f"{where} names no CA certificate this hop lists as its issuer", False
+            # Go on: a block that is known to be badly signed is the stronger finding.
+            unlisted = unlisted or f"{where} names no CA certificate this hop lists as its issuer"
+            continue
         if not any(_signed_by(crl, ca) for ca in issuers):
             return (
                 f"{where} does not verify against the key of the CA certificate this hop trusts "
@@ -340,7 +344,7 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
                 "'CRL signature failure'",
                 True,
             )
-    return None
+    return None if unlisted is None else (unlisted, False)
 
 
 def _fits_akid(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:

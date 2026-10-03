@@ -73,7 +73,12 @@ from messagefoundry.pipeline.crl_reload import (
     reload_replaced_crls,
     supersede_refusal,
 )
-from messagefoundry.pki import CrlBlock, judge_every_crl, read_soonest_crl_facts
+from messagefoundry.pki import (
+    CrlBlock,
+    crl_signature_refusal,
+    judge_every_crl,
+    read_soonest_crl_facts,
+)
 from tests.test_cert_expiry import _RecordingSink
 from tests.test_crl_bundle_anchors import _ku
 from tests.test_trust_anchor_byte_binding import _handshake
@@ -993,3 +998,46 @@ def test_a_held_crl_that_lapses_outranks_a_restart() -> None:
     refusals.add("lapses", LAPSES_FIRST)
     refusals.add("waits", WAIT)
     assert refusals.strongest == ("lapses", LAPSES_FIRST)
+
+
+# --- code-review round two --------------------------------------------------------------------------
+
+
+def test_a_context_at_the_cap_still_reports_a_copy_that_lapses_first(pki: _Pki) -> None:
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(pki.crl_pem(issued=_DAY, lasts=6 * _DAY))  # supersedes, lapses in 6 days
+    assert (first := _reload(pki, max_reloads=1)) is not None and first.reloaded == 1
+    pki.crl.write_bytes(pki.crl_pem(issued=-7 * _DAY, lasts=60 * _DAY, revoke=True))
+
+    outcome = _reload(pki, max_reloads=1)
+
+    # A restart after the file takes effect would come a day too late: say so, not "restart".
+    assert outcome is not None and outcome.refusal is not None
+    assert outcome.refusal.remedy == LAPSES_FIRST and "lapses earlier" in outcome.refusal.reason
+    assert _accepts(hop, pki.server())
+
+
+def test_a_lapse_before_the_file_applies_is_found_beside_a_held_crl_with_no_successor() -> None:
+    now = _NOW.timestamp()
+    held = [_block("CN=a", 2, 1, b"a"), _block("CN=b", 2, 30, b"b")]
+    new = [_block("CN=a", -2, 30, b"a2")]
+    restart = supersede_refusal(held, new, now=now)
+    assert restart is not None and restart[1] == RESTART  # b has no successor
+    late = crl_reload._time_verdict(held, new, now=now)
+    assert late is not None and late[1] == LAPSES_FIRST  # and a lapses before a2 starts
+
+
+def test_a_badly_signed_crl_is_reported_over_one_whose_ca_is_not_listed(
+    pki: _Pki, tmp_path: Path
+) -> None:
+    (tmp_path / "other").mkdir()
+    other = _make_pki(tmp_path / "other", "mefor-299-unlisted-ca")
+    forged = pki.crl_pem(
+        issued=_DAY, lasts=60 * _DAY, signer=ec.generate_private_key(ec.SECP256R1())
+    )
+    anchors = [x509.load_pem_x509_certificate(pki.ca_pem).public_bytes(serialization.Encoding.DER)]
+    unlisted_first = other.crl.read_bytes() + forged
+    verdict = crl_signature_refusal(unlisted_first, anchors)
+    assert verdict is not None and verdict[1] is True and "block 2" in verdict[0]
+    alone = crl_signature_refusal(other.crl.read_bytes(), anchors)  # control: unlisted alone
+    assert alone is not None and alone[1] is False

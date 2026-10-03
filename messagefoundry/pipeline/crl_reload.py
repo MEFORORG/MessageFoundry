@@ -96,7 +96,7 @@ import ssl
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -156,8 +156,8 @@ RESTART = "Restart the engine to apply the file"
 FIX = "Fix the file: the engine would refuse to start on it too"
 WAIT = (
     "Wait: the engine applies the file once its CRL takes effect. Do not restart before then: a "
-    "start would refuse the file, or not use that CRL yet. To apply the rest of the file now, "
-    "take that CRL out of it"
+    "start would refuse the file, or not use that CRL yet. If that CRL is from an issuer the hop "
+    "does not hold yet, taking it out applies the rest of the file now"
 )
 LAPSES_FIRST = (
     "Fix the file now with a CRL that is in effect: the hop's copy lapses before the file's CRL "
@@ -254,24 +254,8 @@ def supersede_refusal(
         )
         return reason, RESTART
     same = {block.fingerprint for block in new}
-    waits: list[CrlBlock] = []
-    if (unmet := crl_not_in_effect(new, now=now)) is not None:
-        waits.append(unmet)
     for old in held:
-        if old.fingerprint in same:
-            continue
-        candidates = [
-            block
-            for block in new
-            if block.issuer == old.issuer
-            and block.selection == old.selection
-            and block.this_update > old.this_update
-            and block.next_update >= old.next_update
-        ]
-        if any(crl_in_effect(block, now=now) for block in candidates):
-            continue
-        if candidates:
-            waits.append(min(candidates, key=lambda block: block.this_update))
+        if old.fingerprint in same or _successors(old, new):
             continue
         reason = (
             f"it carries no CRL from issuer {old.issuer!r} that OpenSSL would choose over the one "
@@ -281,6 +265,35 @@ def supersede_refusal(
             "running hop can only add CRLs"
         )
         return reason, RESTART
+    return _time_verdict(held, new, now=now)
+
+
+def _successors(old: CrlBlock, new: Sequence[CrlBlock]) -> list[CrlBlock]:
+    """The CRLs in ``new`` OpenSSL would choose over ``old`` once they are in effect."""
+    return [
+        block
+        for block in new
+        if block.issuer == old.issuer
+        and block.selection == old.selection
+        and block.this_update > old.this_update
+        and block.next_update >= old.next_update
+    ]
+
+
+def _time_verdict(
+    held: Sequence[CrlBlock], new: Sequence[CrlBlock], *, now: float
+) -> tuple[str, str] | None:
+    """:data:`WAIT` or :data:`LAPSES_FIRST` when ``new`` can reach a context holding ``held`` only
+    once some CRL in it takes effect, else ``None``. That is a superseding CRL not in effect yet,
+    or an issuer with none in effect yet. The file applies once the last of those takes effect."""
+    same = {block.fingerprint for block in new}
+    waits: list[CrlBlock] = []
+    if (unmet := crl_not_in_effect(new, now=now)) is not None:
+        waits.append(unmet)
+    for old in held:
+        candidates = [] if old.fingerprint in same else _successors(old, new)
+        if candidates and not any(crl_in_effect(block, now=now) for block in candidates):
+            waits.append(min(candidates, key=lambda block: block.this_update))
     if not waits:
         return None
     last = max(waits, key=lambda block: block.this_update)
@@ -450,8 +463,15 @@ def _reload_path(
         facts, blocks = judge_crl_bytes(pem, label=label, now=now, require_in_effect=False)
         # The cheap rules first: a rollback refuses every context without touching a file.
         verdicts: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
+        timing: dict[tuple[CrlBlock, ...], tuple[str, str] | None] = {}
         ready: list[tuple[ssl.SSLContext, HeldCrl, tuple[str, str] | None]] = []
         for ctx, held in stale:
+            # First, for every context: does some CRL it holds lapse before the file can apply?
+            # That outranks every other verdict below, so no other path may hide it.
+            if held.blocks not in timing:
+                timing[held.blocks] = _time_verdict(held.blocks, blocks, now=now)
+            if (late := timing[held.blocks]) is not None and late[1] == LAPSES_FIRST:
+                refusals.add(f"{label}: {late[0]}", LAPSES_FIRST)
             if held.reloads >= max_reloads:
                 refusals.add(
                     f"{label}: this hop has taken {held.reloads} CRL reloads, and each one stays in "
@@ -496,6 +516,8 @@ def _reload_path(
             f"file too, since its CRL from issuer {unmet.issuer!r} is not in effect",
             remedy,
         )
+        # Judged again each pass, so the warning goes once its time has passed.
+        refusals.sticky = False
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
 
 
@@ -627,11 +649,7 @@ def _pending() -> tuple[dict[str, _Change], list[ReloadOutcome]]:
     A function of its own so the contexts it reads are released when it returns, before the
     collection that may follow it."""
     by_path = _held_by_path()
-    for state in (_SEEN, _FAILED):
-        for gone in [key for key in state if key not in by_path]:
-            del state[gone]
-    _UNREADABLE.intersection_update(by_path)
-    prune_reload_refusals(by_path)
+    _prune(by_path)
     pending: dict[str, _Change] = {}
     refused: list[ReloadOutcome] = []
     for key, pairs in by_path.items():
@@ -647,17 +665,23 @@ def _pending() -> tuple[dict[str, _Change], list[ReloadOutcome]]:
     return pending, refused
 
 
+def _prune(held: Collection[str]) -> None:
+    """Drop the pass state and the refusals of every path key not in ``held``. Under the pass lock."""
+    for state in (_SEEN, _FAILED):
+        for gone in [key for key in state if key not in held]:
+            del state[gone]
+    _UNREADABLE.intersection_update(held)
+    prune_reload_refusals(held)
+
+
 def _forget_all() -> None:
-    """Drop the pass state and the refusals of files no hop holds, as a pass would, when no hop
-    holds any. Never waits on the pass lock: it runs on the event loop, and a pass abandoned by
-    :meth:`CrlReloadRunner.stop` may still hold it, in which case the next pass prunes instead."""
+    """:func:`_prune` everything, when no hop holds any CRL. Never waits on the pass lock: it runs
+    on the event loop, and a pass abandoned by :meth:`CrlReloadRunner.stop` may still hold it, in
+    which case the next pass prunes instead."""
     if not _PASS_LOCK.acquire(blocking=False):
         return
     try:
-        _SEEN.clear()
-        _FAILED.clear()
-        _UNREADABLE.clear()
-        prune_reload_refusals(())
+        _prune(())
     finally:
         _PASS_LOCK.release()
 

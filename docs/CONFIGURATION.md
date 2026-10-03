@@ -1352,8 +1352,8 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 
 **A CRL that is not in effect yet is the exception: wait.** The engine applies it once it takes effect.
 Do not restart before then. A start refuses a file whose only CRL for some issuer is not in effect yet,
-because a hop would refuse every peer with it. Nothing else in the file reaches the hop either, so to
-apply the rest of it now, take that CRL out. One exception to the wait: some CRL the hop holds may
+because a hop would refuse every peer with it. Nothing else in the file reaches the hop either. If
+that CRL is from an issuer the hop does not hold yet, take it out to apply the rest now. One exception to the wait: some CRL the hop holds may
 lapse before the new CRL takes effect. Waiting then leaves a gap in which its peers are refused. So
 the engine says to fix the file with a CRL that is in effect now. A start and a reload both allow
 five minutes of clock skew, so a CRL from a CA whose clock runs a little ahead still counts as in
