@@ -10,6 +10,10 @@ Most of those legs run on a schedule, on dispatch and in the merge queue, and a 
 event skips them. So a step that went back to the old shape would first show in the queue. These
 checks read the workflow files, which a pull request does change, and fail there instead.
 
+THE SWITCH IS GONE NOW (stage B). ``serve`` refuses ``MEFOR_SECURITY_REQUIRE_SIGN_IN`` as a removed
+``[security]`` key, so a step that set it would fail at start. That failure would still first show in
+the queue, which is why the scan below stays: it reads a retired name to catch it at the pull request.
+
 THEY READ TEXT, NOT A RUN. They show a step still calls the rig helper around its ``serve``. They do
 not show the leg is green: its own result is that reading.
 

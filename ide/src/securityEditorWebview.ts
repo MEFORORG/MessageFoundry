@@ -49,9 +49,6 @@ export const FIELDS: Field[] = [
     desc: "Second audited ack (with 'Allow unencrypted PHI') REQUIRED to start a PHI instance keyless under strict enforcement (ADR 0140).",
     insecure: true, risk: "a PHI instance may start keyless under strict enforcement — PHI stored UNENCRYPTED at rest" },
   // ── Sign-in & identity ──────────────────────────────────────────
-  { key: "require_sign_in", label: "Require sign-in", type: "bool", group: "Sign-in & identity",
-    desc: "Authenticate every request.",
-    insecure: false, risk: "authentication is DISABLED (loopback-only; a non-loopback bind refuses)" },
   { key: "require_mfa", label: "Require MFA", type: "bool", group: "Sign-in & identity",
     desc: "Second factor (native TOTP) for admin step-up.",
     insecure: false, risk: "the Administrator role is single-factor — no TOTP second factor" },
