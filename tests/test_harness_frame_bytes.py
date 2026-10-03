@@ -15,8 +15,9 @@ delegate to it, and every harness site that is not a deliberate hostile injector
 * a send is REFUSED with the reason: the Send tab before it dials, the load sender on its open
   connection, and the raw-TCP sink's configured reply when the sink is built.
 
-The Compose tab, the fuzzer and the scenario drivers still frame unchecked, on purpose; each is
-named, with its reason and its number of bare uses, in ``_DELIBERATE`` below.
+The Compose tab (behind an opt-in checkbox only), the fuzzer and the scenario drivers still frame
+unchecked, on purpose; each is named, with its reason and its number of bare uses, in
+``_DELIBERATE`` below.
 
 Each site is driven with an echoed or sent value holding ``0x0B``, ``0x1C`` and ``0x1C 0x0D``, and
 each case has its positive control: the bare ``frame`` of the same bytes IS malformed, so a pass is
@@ -470,9 +471,9 @@ _DELIBERATE: dict[str, tuple[int, str]] = {
     # rule 4), and assert the ERROR and the NAK.
     "harness/drivers/mllp.py": (1, "scenario injector; hostile.py sends frame bytes through it"),
     "harness/drivers/tcp.py": (1, "scenario injector; a scenario chooses what reaches the engine"),
-    # The Compose tab sends hand-edited malformed messages on purpose; it hands the bare frame to
-    # SendWorker as its framer, where the Send tab keeps the checked default.
-    "harness/compose.py": (1, "operator-authored malformed messages, sent on purpose"),
+    # The Compose tab frames through frame_checked by default, like the Send tab; it hands the
+    # bare frame to SendWorker only when the operator ticks its opt-in checkbox.
+    "harness/compose.py": (1, "opt-in only: operator-chosen malformed framing, on purpose"),
 }
 
 _FRAME_MODULES = frozenset(

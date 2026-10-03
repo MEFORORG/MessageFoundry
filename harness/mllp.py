@@ -7,8 +7,8 @@ UI; receiving uses a ``QTcpServer`` (event-driven, mostly idle). Both reuse the 
 byte-level framing (:class:`MLLPDecoder`, and the frame-byte rule of ADR 0205) and ACK builder
 (:func:`build_ack`), so the harness frames and acknowledges like the engine: a send holding an MLLP
 frame byte is refused (:func:`frame_checked`), and an ACK echoing one is neutralised
-(:func:`frame_neutralised`). The Compose tab passes its own framer, because sending malformed
-messages is its job.
+(:func:`frame_neutralised`). The Compose tab keeps the checked framer too unless the operator
+ticks its opt-in to send frame bytes on purpose; only then does it pass the bare framer.
 """
 
 from __future__ import annotations
@@ -111,7 +111,7 @@ class SendWorker(QObject):
         framer: Callable[[str], bytes] = frame_checked,
     ) -> None:
         super().__init__()
-        # frame_checked unless the caller sends hostile framing on purpose (the Compose tab).
+        # frame_checked unless the caller sends hostile framing on purpose (the Compose tab's opt-in).
         self._framer = framer
         self._host = host
         self._port = port
