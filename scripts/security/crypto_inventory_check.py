@@ -1567,6 +1567,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via harness.load.tlsmat",
         }
     ),
+    "harness/load/ingress_probe.py": frozenset(
+        {
+            "key_cert:via harness.load.tlsmat",
+            "sign_verify:via harness.load.tlsmat",
+            "tls_context:via harness.load.tlsmat",
+        }
+    ),
     "harness/load/shardcert.py": frozenset(
         {
             "key_cert:via harness.load.tlsmat",

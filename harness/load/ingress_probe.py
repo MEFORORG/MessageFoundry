@@ -60,7 +60,6 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
-import ssl
 import sys
 import tempfile
 import time
@@ -72,6 +71,7 @@ from harness.load import rigadmin
 from harness.load.failover import EngineNode, FailoverError, _await_all_healthy
 from harness.load.profile import load_profile_text
 from harness.load.runner import run_load
+from harness.load.tlsmat import harness_ssl_context
 
 _CONFIG_DIR = Path("harness/config/load")
 #: How long the engine has to answer ``/health`` once ``serve`` is spawned. The account step runs
@@ -208,8 +208,9 @@ async def _probe(rate: float, duration_s: float, pool_size: int) -> int:
                     r.close()
             try:
                 await node.start(provision=False)
-                verify = ssl.create_default_context(cafile=node.cacert)
-                async with httpx.AsyncClient(timeout=4.0, verify=verify) as client:
+                # The run's own anchor is node.cacert here: _node_env drops any MEFOR_API_* the
+                # shell carries, so EngineNode hands serve harness_tls_material()'s pair.
+                async with httpx.AsyncClient(timeout=4.0, verify=harness_ssl_context()) as client:
                     await _await_all_healthy([node], client, timeout=_START_TIMEOUT_S)
             except (FailoverError, OSError) as exc:
                 return _setup_failed(rate, "engine_did_not_start", exc)
