@@ -93,7 +93,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -852,7 +852,11 @@ def _assigned_names(target: ast.expr) -> list[str]:
     return []  # an attribute/subscript target is not a local name this lint can resolve
 
 
-def _scope_assignments(body: Sequence[ast.stmt]) -> dict[str, list[tuple[ast.expr, bool]]]:
+#: A scope's assignments: each name to every ``(value, augmented)`` binding it takes.
+_Env = dict[str, list[tuple[ast.expr, bool]]]
+
+
+def _scope_assignments(body: Sequence[ast.stmt]) -> _Env:
     """Map each name this scope assigns to ``(value, augmented)`` pairs — every binding it takes, not
     only the last one.
 
@@ -977,28 +981,26 @@ def _phi_to_log_hit(call: ast.Call, msg_sym: str) -> bool:
     return any(_references_phi(arg, msg_sym) for arg in checked)
 
 
-def _lookup_scope_envs(tree: ast.Module) -> dict[int, dict[str, list[tuple[ast.expr, bool]]]]:
-    """``id(Call)`` to the assignment env that call should be read against: the assignments of the
-    scope holding it, over the module's own (so a module-level statement constant is visible inside a
-    function, and a same-named local shadows it).
+def _scoped_nodes(tree: ast.Module) -> Iterator[tuple[ast.AST, _Env]]:
+    """Each node in a scope's executable body, with the assignment env it should be read against:
+    the assignments of the scope holding it, over the module's own (so a module-level statement
+    constant is visible inside a function, and a same-named local shadows it).
 
-    Only calls in a scope's executable body get an entry. A call in a signature — a decorator or a
-    default argument — has no scope of its own here and is read as it always was, from its own
-    expression alone."""
-    envs: dict[int, dict[str, list[tuple[ast.expr, bool]]]] = {}
+    A node in a signature, a decorator or a default argument, has no scope of its own here and is
+    not yielded. Shared by ``unsafe-db-lookup`` and ``leaf-to-whole-field``."""
     module_env = _scope_assignments(tree.body)
-    bodies: list[Sequence[ast.stmt]] = [tree.body]
-    bodies += [
-        node.body
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-    for body in bodies:
-        env = {**module_env, **_scope_assignments(body)}
-        for node in _scope_nodes(body):
-            if isinstance(node, ast.Call):
-                envs[id(node)] = env
-    return envs
+    yield from ((node, module_env) for node in _scope_nodes(tree.body))
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            env = {**module_env, **_scope_assignments(fn.body)}
+            yield from ((node, env) for node in _scope_nodes(fn.body))
+
+
+def _lookup_scope_envs(scoped: Sequence[tuple[ast.AST, _Env]]) -> dict[int, _Env]:
+    """``id(Call)`` to the assignment env that call should be read against, from one
+    :func:`_scoped_nodes` walk. A call in a signature gets no entry and is read as it always was,
+    from its own expression alone."""
+    return {id(node): env for node, env in scoped if isinstance(node, ast.Call)}
 
 
 def _unsafe_lookup_hit(
@@ -1221,11 +1223,233 @@ def _unvetted_import_hits(
     return hits
 
 
+# leaf-to-whole-field (ADR 0206 rule 3): a value read decoded from a component or subcomponent and
+# written to a whole field through ``set``, which takes whole-field text as structure. The model
+# cannot tell the decoded value from authored text, so only the call site can be flagged. Paths
+# must be string literals for the AST to know their level; anything else is left alone.
+
+
+def _literal_is_leaf(node: ast.expr | None) -> bool | None:
+    """For a string-literal HL7 path, whether it names a component or subcomponent; None for
+    anything else (a dynamic or malformed path, whose level the AST cannot know)."""
+    # Imported here, as every engine import in this module is, so `messagefoundry check` loads
+    # only what the gate it runs needs.
+    from messagefoundry.parsing.peek import parse_path
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            return parse_path(node.value)[2] is not None
+        except ValueError:
+            return None
+    return None
+
+
+def _is_leaf_read(node: ast.AST) -> bool:
+    """A ``<name>.field("<leaf>")`` call or a ``<name>["<leaf>"]`` read: a decoded value."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "field"
+        and isinstance(node.func.value, ast.Name)
+        and node.args
+    ):
+        leaf = _literal_is_leaf(node.args[0])
+    elif (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(node.value, ast.Name)
+    ):
+        leaf = _literal_is_leaf(node.slice)
+    else:
+        return False
+    return leaf is True
+
+
+#: Calls whose result is not text taken from their arguments (a length, a truth value, a number),
+#: so a leaf passed to one does not reach the value.
+_NO_FLOW_CALLS = frozenset(
+    {"len", "bool", "int", "float", "isinstance", "hasattr", "callable", "any", "all", "sum", "ord"}
+)
+#: String methods whose result is not text taken from the receiver or the arguments.
+_NO_FLOW_METHODS = frozenset(
+    {
+        "startswith",
+        "endswith",
+        "count",
+        "find",
+        "rfind",
+        "index",
+        "rindex",
+        "isdigit",
+        "isalpha",
+        "isalnum",
+        "isnumeric",
+        "isdecimal",
+        "isspace",
+        "isupper",
+        "islower",
+        "istitle",
+    }
+)
+#: Methods whose first argument is a key that selects the value rather than becoming it.
+_KEY_FIRST_METHODS = frozenset({"get", "pop", "setdefault"})
+
+
+def _flows(node: ast.AST, tainted: Set[str]) -> bool:
+    """Whether a decoded leaf read reaches the VALUE of ``node``: read directly, or through a name
+    in ``tainted``.
+
+    Only the data flow counts. A conditional's test, a comprehension's filter, a subscript's key, a
+    mapping lookup's key, a ``key=`` function and the argument of a call that returns a length, a
+    truth value or a number select or measure the value and do not become it, so a leaf read there
+    is not followed.
+    A node of any other kind is read conservatively, through every child expression.
+
+    The walk keeps its own stack rather than recursing, so a long ``+`` chain, which nests as deep
+    as it has terms, cannot exhaust the interpreter's recursion limit. Only a comprehension's
+    iterable is read by a nested call, and brackets nest at most 200 deep."""
+    stack: list[tuple[ast.AST, Set[str]]] = [(node, tainted)]
+    while stack:
+        current, names = stack.pop()
+        step = _flow_step(current, names)
+        if step is True:
+            return True
+        if step is not False:
+            stack.extend(step)
+    return False
+
+
+def _flow_step(node: ast.AST, tainted: Set[str]) -> bool | list[tuple[ast.AST, Set[str]]]:
+    """One step of :func:`_flows`: True or False when ``node`` alone decides, otherwise the child
+    expressions, each with the names tainted there, whose flow decides it."""
+    if _is_leaf_read(node):
+        return True
+    if isinstance(node, ast.Name):
+        return node.id in tainted
+    if isinstance(node, (ast.Constant, ast.Compare)):
+        return False
+    if isinstance(node, ast.IfExp):
+        return [(node.body, tainted), (node.orelse, tainted)]
+    if isinstance(node, ast.UnaryOp):
+        return not isinstance(node.op, ast.Not) and [(node.operand, tainted)]
+    if isinstance(node, (ast.Subscript, ast.Attribute, ast.Starred, ast.NamedExpr, ast.Await)):
+        return [(node.value, tainted)]
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        return [(node.elt, _comprehension_names(node, tainted))]
+    if isinstance(node, ast.DictComp):
+        return [(node.value, _comprehension_names(node, tainted))]
+    if isinstance(node, ast.Lambda):
+        # Its body may be called; its parameters shadow outer names of the same spelling.
+        params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        return [(node.body, set(tainted) - {p.arg for p in params})]
+    if isinstance(node, ast.Call):
+        # A ``key=`` function orders or selects the result (``sorted``, ``max``) and is not it.
+        args: list[ast.expr] = [
+            *node.args,
+            *(kw.value for kw in node.keywords if kw.arg != "key"),
+        ]
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in _NO_FLOW_CALLS:
+            return False
+        if isinstance(func, ast.Attribute):
+            if func.attr in _NO_FLOW_METHODS:
+                return False
+            if func.attr in _KEY_FIRST_METHODS:
+                args = args[1:]
+        return [(child, tainted) for child in (func, *args)]
+    # BinOp, BoolOp, JoinedStr, FormattedValue, List, Tuple, Set, Dict (keys too: a dict's keys
+    # can come back out as values) and anything unforeseen.
+    return [(child, tainted) for child in ast.iter_child_nodes(node)]
+
+
+def _comprehension_names(
+    node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp, tainted: Set[str]
+) -> set[str]:
+    """The names tainted in a comprehension's result: each loop target takes the taint of what it
+    iterates, shadowing an outer name of the same spelling. Its ``if`` filters do not."""
+    local = set(tainted)
+    for gen in node.generators:
+        names = {n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)}
+        # The iterable is read before its targets are bound, so ``[x for x in x]`` reads the outer x.
+        carries = _flows(gen.iter, local)
+        local -= names
+        if carries:
+            local |= names
+    return local
+
+
+def _tainted_names(env: _Env) -> frozenset[str]:
+    """The names in ``env`` some binding of which carries a decoded leaf into its value.
+
+    Solved as a fixed point rather than by resolving each name on demand: a name is visited once
+    per pass, not once per path to it, so a chain where each name reads the one before twice costs
+    a pass per change instead of doubling at every link."""
+    tainted: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, bindings in env.items():
+            if name not in tainted and any(_flows(value, tainted) for value, _aug in bindings):
+                tainted.add(name)
+                changed = True
+    return frozenset(tainted)
+
+
+def _whole_field_write_value(node: ast.AST) -> ast.expr | None:
+    """The value of a whole-field write, ``<name>.set("<field>", v)`` or ``<name>["<field>"] = v``."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set"
+        and isinstance(node.func.value, ast.Name)
+        and len(node.args) >= 2
+    ):
+        return node.args[1] if _literal_is_leaf(node.args[0]) is False else None
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and _literal_is_leaf(target.slice) is False
+            ):
+                return node.value
+    return None
+
+
+def _leaf_to_whole_field_hits(scoped: Sequence[tuple[ast.AST, _Env]]) -> list[tuple[int, str]]:
+    """``(line, rule)`` for each whole-field write whose value is a decoded leaf, read against the
+    assignments of the scope holding the write (so ``v = msg.field("PID-3.1")`` a line earlier is
+    seen, as ``unsafe-db-lookup`` sees a statement composed earlier). ``scoped`` is one
+    :func:`_scoped_nodes` walk, which yields each scope's nodes in one run under one env, so each
+    env is solved once, and only when its scope holds a whole-field write.
+
+    A write the walk cannot finish (a ``RecursionError``) is reported as
+    ``leaf-to-whole-field-unscanned`` rather than raised, so the check never crashes; strict mode
+    then refuses it, as it would refuse a finding, rather than pass code nobody scanned."""
+    solved: _Env | None = None
+    tainted: frozenset[str] = frozenset()
+    hits: list[tuple[int, str]] = []
+    for node, env in scoped:
+        value = _whole_field_write_value(node)
+        if value is None:
+            continue
+        try:
+            if env is not solved:
+                # Marked solved only once it is: a scope whose solve fails fails each of its writes.
+                tainted, solved = _tainted_names(env), env
+            rule = "leaf-to-whole-field" if _flows(value, tainted) else None
+        except RecursionError:
+            rule = "leaf-to-whole-field-unscanned"
+        if rule is not None:
+            hits.append((getattr(node, "lineno", 0), rule))
+    return hits
+
+
 def _check_handler_security(
     config_dir: str | Path, *, strict: bool = False, allow: frozenset[str] = frozenset()
 ) -> CheckResult:
     """Flag risky patterns in the config-dir Router/Handler modules — a static compensating control
-    for ASVS 15.2.5 / 15.2.4 (ADR 0144). Five rule families:
+    for ASVS 15.2.5 / 15.2.4 (ADR 0144). Six rule families:
 
     * ``phi-to-log`` — the message body reaching a ``print``/INFO+ log call (CLAUDE.md §9).
     * ``unsafe-db-lookup`` — an f-string/concatenated statement into ``db_lookup``/``fhir_lookup``
@@ -1235,6 +1459,10 @@ def _check_handler_security(
     * ``impure-transform`` — a re-run-divergent nondeterministic source (wall clock / ``random`` /
       ``uuid4``) in a router/handler, breaking the at-least-once purity invariant (CLAUDE.md §2).
     * ``unvetted-import`` — an operator-added third-party import (supply-chain / slopsquat surface).
+    * ``leaf-to-whole-field``: a value read decoded from a component or subcomponent and written to a
+      whole field with ``set``, where its escaped separators would become structure; the safe write
+      is ``set_data`` (ADR 0206 rule 3). Literal paths only. A write it cannot finish walking is
+      reported as ``leaf-to-whole-field-unscanned`` instead.
 
     Static analysis catches only a fraction of insecure code, so this is a **filter, not a fix**.
     **Advisory by default** (``required=False``, prints, never blocks); ``strict=True`` (the opt-in
@@ -1245,7 +1473,7 @@ def _check_handler_security(
     reports those) so it never crashes the gate. ``impure-transform`` is scoped to ``@router``/``@handler``
     bodies (so an undecorated helper's wall-clock fallback is not a false positive); ``phi-to-log`` scans
     every function body — decorated or an undecorated ``_*`` transform helper — keying on the first
-    positional parameter as the message symbol (BACKLOG #337); the other three scan the whole module."""
+    positional parameter as the message symbol (BACKLOG #337); the other four scan the whole module."""
     base = Path(config_dir)
     if not base.is_dir():
         return CheckResult(
@@ -1275,7 +1503,8 @@ def _check_handler_security(
         # Whole-file rules — unsafe-db-lookup + ambient-authority (helpers + module level included).
         # unsafe-db-lookup reads each call against its own scope's assignments, so a statement
         # composed a line earlier and passed by name is seen (BACKLOG #1658).
-        lookup_envs = _lookup_scope_envs(tree)
+        scoped = list(_scoped_nodes(tree))
+        lookup_envs = _lookup_scope_envs(scoped)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -1283,6 +1512,7 @@ def _check_handler_security(
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
             if _ambient_authority_hit(node):
                 file_hits.append((node.lineno, "ambient-authority"))
+        file_hits += _leaf_to_whole_field_hits(scoped)
         # Per-FunctionDef body rules — phi-to-log + impure-transform, over each function's own body
         # only (not nested defs, not the signature), so each call is scanned once with its own message
         # symbol and an import-time default arg is never mistaken for per-message impurity. phi-to-log

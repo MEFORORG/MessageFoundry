@@ -1736,8 +1736,11 @@ def MLLP(
     rewrites MSH-1/MSH-2, and re-serializes the whole body with the new ones, so a downstream re-parse
     yields the same logical fields under the new delimiters. ``None`` (the default) leaves the payload
     **byte-identical** — fully backward compatible. The string is validated at connector build (exactly
-    five characters, all distinct); a non-HL7 payload that can't be parsed fails the delivery loud
-    (``DeliveryError``) rather than being silently corrupted.
+    five characters, all distinct). A non-HL7 payload that can't be parsed, or a value the new delimiters
+    cannot carry as data, fails the delivery permanently (a ``NegativeAckError`` with code ``reencode``,
+    ADR 0204 and ADR 0206), so the row is dead-lettered at once rather than silently corrupted. On a
+    batched outbound the whole envelope is rewritten, so the refusal takes the whole batch with it
+    (ADR 0206 records this gap).
 
     ``hl7_raw_separators`` (**outbound only**, BACKLOG #107) is a deliberate escape-hatch for a partner
     that **cannot decode HL7 escape sequences**: when ``True`` the connector emits the four reserved
@@ -1747,7 +1750,7 @@ def MLLP(
     slicing). ``False`` (the default) leaves the payload **byte-identical** — fully backward compatible.
     Enabling it can produce **non-conformant** output (a formerly-escaped ``^`` now reads as a component
     separator) — that is the point; use it only for such a broken partner. A non-HL7 payload that can't be
-    parsed fails the delivery loud (``DeliveryError``). It composes with ``encoding_characters`` (the
+    parsed fails the delivery permanently, as above. It composes with ``encoding_characters`` (the
     delimiter rewrite runs first, then the raw-separator emit).
 
     **TLS (WP-13b).** ``tls=True`` wraps the connection: inbound presents ``tls_cert_file``/``tls_key_file``

@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
+from messagefoundry.lens import CONTRACT_V2, parse_source, rewrite_source
 from messagefoundry.parsing.x12 import (
     X12FrameError,
     X12FrameReader,
@@ -442,6 +444,135 @@ def test_message_set_rejects_delimiter_injection() -> None:
         msg.set("NM1-03", "BAD*VALUE")  # element separator would inject a field
     with pytest.raises(ValueError, match="delimiter"):
         msg.set("NM1-03", "BAD~VALUE")  # segment terminator would inject a segment
+
+
+def test_set_data_is_set_on_an_x12_message_and_keeps_one_component() -> None:
+    # The Steps view writes msg.set_data for a template reading a component (ADR 0206).
+    body = (
+        isa()
+        + "GS*HS*A*B*20240101*1200*1*X*005010X279A1~ST*270*0001~NM1*IL*1*DOE~SE*2*0001~"
+        + "GE*1*1~IEA*1*000000001~"
+    )
+    a, b = X12Message.parse(body), X12Message.parse(body)
+    a.set_data("NM1-03", "SMITH")
+    a.set_data("NM1-04.2", "J")
+    b.set("NM1-03", "SMITH")
+    b.set("NM1-04.2", "J")
+    assert a.encode() == b.encode()
+    with pytest.raises(ValueError, match="delimiter"):
+        a.set_data("NM1-03", "BAD*VALUE")
+    with pytest.raises(KeyError):
+        a.set_data("REF-02", "X")
+    # set takes a component separator in a whole element as structure; set_data refuses it.
+    b.set("NM1-03", "O:BRIEN")
+    assert b["NM1-03.2"] == "BRIEN"
+    with pytest.raises(ValueError, match="delimiter"):
+        a.set_data("NM1-03", "O:BRIEN")
+    assert a["NM1-03"] == "SMITH"
+    # A bad path fails as set fails it, before the value is read.
+    with pytest.raises(X12PeekError):
+        a.set_data("bad path", "O:BRIEN")
+
+
+_CLAIM = (
+    "GS*HC*A*B*20240101*1200*1*X*005010X222A1~ST*837*0001~CLM*1*100***11{c}B{c}1~"
+    "NM1*IL*1*DOE~SE*3*0001~GE*1*1~IEA*1*000000001~"
+)
+
+_LENS_HANDLER = """from messagefoundry import handler, set_field
+
+
+@handler("H")
+def h(msg):
+    set_field(msg, "NM1-03", "X")
+"""
+
+
+def _claim(comp: str = ":") -> X12Message:
+    return X12Message.parse(isa(comp=comp) + _CLAIM.format(c=comp))
+
+
+def _lens_row(source: str) -> dict[str, Any]:
+    row: dict[str, Any] = parse_source(source, contract=CONTRACT_V2)[0]["rows"][-1]
+    return row
+
+
+def _lens_insert_set_field(path: str, expr: str) -> str:
+    """The source the Steps view writes when it inserts a Set Field of ``path`` to ``expr``."""
+    anchor = parse_source(_LENS_HANDLER)[0]["rows"][0]
+    out: str = rewrite_source(
+        _LENS_HANDLER,
+        {
+            "op": "insert_row",
+            "line_start": anchor["line_start"],
+            "line_end": anchor["line_end"],
+            "position": "after",
+            "action": "set_field",
+            "params": {"path": path, "value": {"expr": expr}},
+        },
+    )
+    return out
+
+
+def _lens_edit(source: str, params: dict[str, Any]) -> str:
+    """The source the Steps view writes when it edits the last row's ``params``."""
+    row = _lens_row(source)
+    out: str = rewrite_source(
+        source,
+        {
+            "op": "set_params",
+            "line_start": row["line_start"],
+            "line_end": row["line_end"],
+            "params": params,
+        },
+        contract=CONTRACT_V2,
+    )
+    return out
+
+
+def _run_last_line(source: str, msg: X12Message) -> None:
+    """Run the last line the lens wrote, the write itself, against ``msg``."""
+    line = source.splitlines()[-1].strip()
+    assert line.startswith("msg.set")
+    exec(line, {"msg": msg})  # the lens's own output, run as the handler body would run it
+
+
+def test_the_lens_set_field_template_line_runs_on_an_x12_message() -> None:
+    out = _lens_insert_set_field("NM1-03", "f\"{msg['CLM-05.1'] or ''}\"")
+    assert 'msg.set_data("NM1-03"' in out  # a leaf read into a whole element is data
+    msg = _claim()
+    _run_last_line(out, msg)
+    assert msg["NM1-03"] == "11"
+
+
+@pytest.mark.parametrize("comp", [":", ">"])
+def test_a_lens_template_whose_text_holds_the_component_separator_runs_on_x12(comp: str) -> None:
+    # The author typed the separator, so it is structure: the lens keeps set, which writes it.
+    expr = f"f\"{{msg['CLM-05.1'] or ''}}{comp}B{comp}1\""
+    inserted = _lens_insert_set_field("NM1-03", expr)
+    edited = _lens_edit(
+        _LENS_HANDLER.replace('set_field(msg, "NM1-03", "X")', 'msg.set("NM1-03", "X")'),
+        {"value": {"parts": [{"path": "CLM-05.1"}, {"text": f"{comp}B{comp}1"}]}},
+    )
+    for out in (inserted, edited):
+        assert "set_data" not in out
+        assert _lens_row(out)["action"] == "set_field"
+        msg = _claim(comp)
+        _run_last_line(out, msg)
+        assert msg["NM1-03"] == f"11{comp}B{comp}1"
+        assert msg["NM1-03.2"] == "B"
+
+
+def test_a_path_edit_keeps_set_for_a_template_holding_the_component_separator() -> None:
+    # The hand-written line from the review: its path edited to a whole element in the Steps view.
+    source = _LENS_HANDLER.replace(
+        'set_field(msg, "NM1-03", "X")', "msg.set(\"NM1-03\", f\"{msg['CLM-05.1'] or ''}:B:1\")"
+    )
+    out = _lens_edit(source, {"path": "CLM-05"})
+    assert out.splitlines()[-1] == "    msg.set(\"CLM-05\", f\"{msg['CLM-05.1'] or ''}:B:1\")"
+    msg = _claim()
+    _run_last_line(out, msg)
+    assert msg["CLM-05"] == "11:B:1"
 
 
 def test_message_refuses_envelope_segment_edits() -> None:

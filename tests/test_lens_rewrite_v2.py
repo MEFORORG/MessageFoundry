@@ -1237,7 +1237,8 @@ def test_insert_native_set_field_round_trips() -> None:
 
 def test_insert_native_copy_field_round_trips() -> None:
     out, rows = _insert_before_send("copy_field", {"src": "PID-5.1", "dst": "NK1-2.1"})
-    assert '    msg.set("NK1-2.1", msg.field("PID-5.1") or "")\n' in out
+    # A component source reads decoded, so the copy writes it as data (ADR 0206 rule 1).
+    assert '    msg.set_data("NK1-2.1", msg.field("PID-5.1") or "")\n' in out
     assert (rows[0]["kind"], rows[0]["action"]) == ("action", "copy_field")
     assert rows[0]["params"] == {"src": "PID-5.1", "dst": "NK1-2.1"}
     assert rows[0]["literal_params"] == ["src", "dst"]
@@ -1399,7 +1400,10 @@ def test_insert_native_adversarial_neighbors_byte_preserved() -> None:
     out = rewrite_source(_NATIVE_ADVERSARIAL, edit)
     # gate 2: only the inserted line is added; the CRLF terminator matches the anchor row.
     assert out == _oracle_insert(
-        _NATIVE_ADVERSARIAL, 6, "after", '    msg.set("NK1-2.1", msg.field("PID-5.1") or "")\r\n'
+        _NATIVE_ADVERSARIAL,
+        6,
+        "after",
+        '    msg.set_data("NK1-2.1", msg.field("PID-5.1") or "")\r\n',
     )
     # occurrence=, the comment, and the non-ASCII neighbour survived byte-for-byte.
     assert "occurrence=i)  # café — arrow →" in out

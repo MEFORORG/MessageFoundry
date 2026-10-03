@@ -128,6 +128,22 @@ class X12Message:
         comps[comp - 1] = value
         seg[elem] = self._delims.component.join(comps)
 
+    def set_data(self, path: str, value: str, *, occurrence: int = 1) -> None:
+        """Write ``value`` at ``path`` as data, under the name the HL7 ``Message`` gives its data
+        write (ADR 0206).
+
+        This is :meth:`set`, except that a whole element also refuses the component separator,
+        so the value stays one component. X12 has no escape, so refusing is the only way to keep
+        it data. The Steps view writes a Set Field template that reads a component path as
+        ``msg.set_data``, and it cannot tell an X12 handler from an HL7 one. Without this name
+        that line raised ``AttributeError`` on every X12 message. The value reaches this method
+        already built, so it cannot tell a separator the author typed from one a read returned;
+        the Steps view keeps ``set`` for a template whose own text holds one. A bad path fails
+        first, as it does under :meth:`set`."""
+        _parse_path(path)
+        self._reject_delimiters(value, whole_element=False)
+        self.set(path, value, occurrence=occurrence)
+
     def __setitem__(self, path: str, value: str) -> None:
         self.set(path, value)
 
