@@ -23,16 +23,12 @@ It sends the whole file as ONE frame. A listener takes one message per frame and
 ``samples/messages/adt_batch.hl7``, five messages with no envelope, is refused here. Drop a batch
 file in a ``File(...)`` inbox instead, which splits it into one message each.
 
-The ACK is the peer's text, printed to a terminal, so it is printed as printable ASCII, newline and
-tab only (ASVS 1.1.2). CR becomes a newline. Every other character -- a C0 control such as ESC or
-DEL as ``\\xNN``, and every code point past ASCII, a C1 control, a bidirectional override or an
-accented letter alike, as ``\\uNNNN`` or ``\\UNNNNNNNN`` -- is printed as a visible escape, and a
-byte that is not UTF-8 as ``\\ufffd``. A backslash is doubled only where it would otherwise read as
-the start of one of those escapes, so an ordinary ACK, ``MSH|^~\\&|`` included, prints unchanged.
-A peer could otherwise move the cursor, retitle the window, rewrite what was printed above it or
-reorder what it shows, and a character a Windows console cannot encode would stop the print. The
-reply is read under the engine's frame cap and one overall deadline, so a peer that never ends its
-frame, or trickles it, cannot hold the helper.
+The ACK is the peer's text, printed to a terminal, so CR becomes a newline and the rest prints by
+:func:`messagefoundry.terminal_text.escape_for_terminal` (ASVS 1.1.2): an ordinary ACK,
+``MSH|^~\\&|`` included, prints unchanged, and a control character, a bidirectional override or
+any other character past ASCII prints as a visible escape. That module states the rule. The reply
+is read under the engine's frame cap and one overall deadline, so a peer that never ends its frame,
+or trickles it, cannot hold the helper.
 """
 
 from __future__ import annotations
@@ -40,7 +36,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import re
 import sys
 from pathlib import Path
 
@@ -52,37 +47,15 @@ from messagefoundry.mllpcodec import (
     frame_checked,
 )
 from messagefoundry.parsing import normalize
+from messagefoundry.terminal_text import escape_for_terminal
 
 #: The exit status for a refused file. Not 2, which argparse uses for a usage error.
 _REFUSED = 3
 
 
-class _Escapes(dict[int, str]):
-    """A ``str.translate`` table that computes each code point's printed form once, on first use:
-    itself when printable ASCII, newline or tab, else ``\\xNN`` (ASCII) or ``\\uNNNN``/``\\UNNNNNNNN``."""
-
-    def __missing__(self, code: int) -> str:
-        if code in (0x09, 0x0A) or 0x20 <= code <= 0x7E:
-            shown = chr(code)
-        elif code < 0x80:
-            shown = f"\\x{code:02x}"
-        else:
-            shown = f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
-        self[code] = shown
-        return shown
-
-
-_ESCAPES = _Escapes()
-
-#: A backslash that would read as the start of an escape: one before x, u, U or another backslash,
-#: or before a character that is itself about to be escaped. Only that one is doubled.
-_AMBIGUOUS_BACKSLASH = re.compile(r"\\(?=[\\xuU]|[^\t\n -~])")
-
-
 def _printable(ack: bytes) -> str:
     """The ACK as text that is safe to print to any terminal: see the module docstring."""
-    text = ack.decode("utf-8", errors="replace").replace("\r", "\n")
-    return _AMBIGUOUS_BACKSLASH.sub(r"\\\\", text).translate(_ESCAPES)
+    return escape_for_terminal(ack.decode("utf-8", errors="replace").replace("\r", "\n"))
 
 
 async def _send(host: str, port: int, wire: bytes, timeout: float) -> bytes:

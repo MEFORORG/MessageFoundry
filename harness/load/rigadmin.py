@@ -504,6 +504,33 @@ def _cmd_run(args: argparse.Namespace) -> int:
         raise RigAdminError(f"could not start {command[0]}: {exc.strerror}") from None
 
 
+def _for_terminal(raw: bytes) -> str:
+    """A 200 body as ASCII that is safe to print to a terminal (ASVS 1.1.2).
+
+    ``get`` reads any route, the attachment route included, and that one answers with a sender's
+    bytes. Printed raw, a sender's ESC or OSC sequence would reach the terminal of whoever runs this.
+
+    A JSON body keeps its value, because callers parse it: a workflow step saves ``get
+    /security/posture`` to a file and loads it as JSON. So a body that parses as JSON prints by
+    :func:`~messagefoundry.terminal_text.escape_json_for_terminal`, which leaves plain JSON byte for
+    byte. Any other body prints by :func:`~messagefoundry.terminal_text.escape_for_terminal`. Both
+    are imported here and not at module level, so this file still imports nothing beyond the
+    standard library; every place that runs ``get`` has the engine installed.
+
+    There is no byte-exact path for a binary body: ``get`` has always decoded the body as text, and
+    no caller saves a binary one.
+    """
+    from messagefoundry.terminal_text import escape_for_terminal, escape_json_for_terminal
+
+    text = raw.decode("utf-8", "replace")
+    try:
+        # Numbers kept as text, so one past Python's integer digit limit still reads as JSON.
+        json.loads(text, parse_int=str, parse_float=str, parse_constant=str)
+    except (ValueError, RecursionError):  # json's nesting limit raises RecursionError
+        return escape_for_terminal(text)
+    return escape_json_for_terminal(text)
+
+
 def _cmd_get(args: argparse.Namespace) -> int:
     base = _checked_base(args.engine)
     path = args.path if args.path.startswith("/") else f"/{args.path}"
@@ -518,11 +545,11 @@ def _cmd_get(args: argparse.Namespace) -> int:
             print(f"error: GET {path} answered HTTP {status}", file=sys.stderr)
             return 1
         if args.field is None:
-            sys.stdout.write(raw.decode("utf-8", "replace"))
+            sys.stdout.write(_for_terminal(raw))
             return 0
         try:
             answer = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             answer = None
         value = answer.get(args.field) if isinstance(answer, dict) else None
         if not isinstance(value, int) or isinstance(value, bool):

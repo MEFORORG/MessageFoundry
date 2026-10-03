@@ -8,6 +8,7 @@ the harness reuses this dialog to authenticate its localhost API client.
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -71,6 +72,8 @@ class LoginDialog(QDialog):
         form.addRow("Provider", self._provider)
 
         self._error = QLabel("")
+        # Plain text: this shows the engine's own refusal, and AutoText would render HTML in it.
+        self._error.setTextFormat(Qt.TextFormat.PlainText)
         self._error.setStyleSheet(f"color: {ERROR_COLOR};")
         self._error.setWordWrap(True)
 

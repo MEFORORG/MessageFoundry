@@ -227,6 +227,9 @@ class MonitorPanel(QWidget):
         self._reload_btn.setEnabled(False)
         self._reload_btn.clicked.connect(self._reload_config)
         self._status = QLabel("disconnected")
+        # Plain text: the status carries the engine's own error and hold text, and a QLabel's
+        # default AutoText would render a string that looks like HTML as rich text (ASVS 1.1.2).
+        self._status.setTextFormat(Qt.TextFormat.PlainText)
 
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Engine:"))
@@ -396,6 +399,7 @@ class MonitorPanel(QWidget):
 
         # Live: stats summary + read-only connections table + inbound/outbound control.
         self._stats = QLabel("…")
+        self._stats.setTextFormat(Qt.TextFormat.PlainText)  # the engine names the stat keys
         self._live_table = ConfigurableTable(_LIVE_COLUMNS, settings_key="harness/monitor/live")
         start = QPushButton("Start")
         stop = QPushButton("Stop")

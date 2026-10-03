@@ -63,6 +63,8 @@ class ReceivePanel(QWidget):
         self._toggle = QPushButton("Start listening")
         self._toggle.clicked.connect(self._toggle_listen)
         self._status = QLabel("stopped")
+        # Plain text: a refusal names the peer, and AutoText would render HTML-looking text as rich.
+        self._status.setTextFormat(Qt.TextFormat.PlainText)
 
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Port:"))
