@@ -12,6 +12,7 @@ written to disk.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import random
 import textwrap
@@ -42,6 +43,7 @@ from messagefoundry.lens import (
     CONTRACT_V2,
     REFUSAL_COLUMN_LIMIT,
     LensRewriteError,
+    _argument_dump,
     parse_source,
     rewrite_source,
 )
@@ -1148,6 +1150,40 @@ def test_any_set_data_value_into_a_leaf_reads_back_as_set_field(value: str) -> N
     # At a leaf destination set_data and set write the same thing, so the value does not matter.
     row = _native_rows(LENS_SOURCE + f'    msg.set_data("PV1-19.1", {value})\n')[-1]
     assert row["action"] == "set_field"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param('"A^B"', id="plain-literal"),
+        pytest.param("family", id="expression"),
+        pytest.param("f\"A^{msg['PID-3.1'] or ''}\"", id="authored-structure"),
+    ],
+)
+def test_a_path_edit_never_moves_a_leafs_data_write_into_a_whole_field_as_set(value: str) -> None:
+    # set_data wrote the value as data at the leaf; set into a whole field would make its
+    # separators structure, and set_data there would not read back as a step. So it is refused.
+    source = LENS_SOURCE + f'    msg.set_data("PV1-19.1", {value})\n'
+    with pytest.raises(LensRewriteError, match="as data"):
+        _set_path(source, "PV1-19")
+    # Another leaf is fine: there the two writes are the same.
+    assert _native_rows(_set_path(source, "PV1-20.1"))[-1]["action"] == "set_field"
+    # A value edit is the author writing anew, so the pick runs as it does on insert.
+    if value != "family":
+        assert _set_value(source, "C^D").endswith('    msg.set("PV1-19.1", "C^D")\n')
+
+
+def test_a_set_data_template_holding_a_colon_is_a_code_row() -> None:
+    # The X12 separators keep set, so the lens never writes this line, and it reads as code.
+    source = LENS_SOURCE + "    msg.set_data(\"PV1-19\", f\"MRN: {msg['PID-3.1'] or ''}\")\n"
+    assert _native_rows(source)[-1].get("action") != "set_field"
+
+
+def test_the_no_change_test_leaves_the_tree_it_reads_as_it_was() -> None:
+    tree = ast.parse('msg.set(u"PV1-19", "x")')
+    first = ast.dump(tree)
+    assert _argument_dump(tree) == ast.dump(ast.parse('msg.set("PV1-19", "x")'))
+    assert ast.dump(tree) == first
 
 
 def test_a_set_data_template_into_a_leaf_still_reads_back_as_set_field() -> None:

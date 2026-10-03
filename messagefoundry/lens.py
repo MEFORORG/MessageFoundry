@@ -2594,7 +2594,10 @@ def _apply_set_params(
         or (action == "set_field" and ("value" in params or "path" in params))
     ):
         before = stmt.value if isinstance(stmt, ast.Expr) else stmt
-        repicked = _repick_write(result, line_start, line_end, _argument_dump(before))
+        path_only = action == "set_field" and "value" not in params
+        repicked = _repick_write(
+            result, line_start, line_end, _argument_dump(before), path_only=path_only
+        )
         if repicked != result:
             _refuse_overlong_repick(result, repicked, line_start, line_end)
         result = repicked
@@ -2635,7 +2638,9 @@ def _argument_dump(node: ast.AST) -> str:
             sub.kind = kind
 
 
-def _repick_write(source: str, line_start: int, line_end: int, before: str) -> str:
+def _repick_write(
+    source: str, line_start: int, line_end: int, before: str, *, path_only: bool = False
+) -> str:
     """Re-pick the write of the native Copy Field or Set Field at ``line_start``-``line_end`` of
     ``source``, after an edit of a copy's ``src`` or ``dst`` or of a Set Field's ``path`` or ``value``
     (ADR 0206 rule 1).
@@ -2649,7 +2654,12 @@ def _repick_write(source: str, line_start: int, line_end: int, before: str) -> s
     ``source`` is the already-spliced text, so the arguments read here are the ones the edit
     wrote. ``before`` is the :func:`_argument_dump` of the call before the edit: an edit that
     changed no argument, such as one that only respelled a string's quotes or dropped a ``u``
-    prefix, leaves the write as written."""
+    prefix, leaves the write as written.
+
+    ``path_only`` says the edit moved a Set Field's path and kept its value. A ``set_data`` such an
+    edit would move into a whole field as ``set`` is refused: ``set_data`` wrote that value as
+    data, and ``set`` would turn its separators into structure. Keeping ``set_data`` there instead
+    would leave a line the recognizer reads as code, so the edit is refused rather than guessed."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -2681,6 +2691,17 @@ def _repick_write(source: str, line_start: int, line_end: int, before: str) -> s
     field_call = _msg_field_source(value)
     if field_call is None:
         want = _template_write_method(value, dst)
+        if (
+            path_only
+            and func.attr == "set_data"
+            and want == "set"
+            and not _is_leaf_literal(getattr(dst, "value", None))
+        ):
+            raise LensRewriteError(
+                "this path edit would move a value written with msg.set_data into a whole field, "
+                "where the Steps view writes msg.set and the value's separators would become "
+                "structure: a value written as data stays data - edit it as text"
+            )
     else:
         src = getattr(field_call.args[0], "value", None)
         if not isinstance(src, str) or _is_leaf_literal(getattr(dst, "value", None)):

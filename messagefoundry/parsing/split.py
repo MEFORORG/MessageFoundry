@@ -100,9 +100,9 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
 
     A file holding no ``MSH`` after a line break is one message the parser reads as it is. Under
     UTF-8 only, it must also not open with a byte order mark, which the split reads past. Under a
-    single-byte charset the mark's bytes are three characters the split keeps. Where a byte scan can tell (:func:`_needs_a_decode`),
-    such a file is returned without a decode or a split, so the common single-message file pays one
-    scan."""
+    single-byte charset the mark's bytes are three characters the split keeps. Where a byte scan
+    can tell (:func:`_needs_a_decode`), such a file is returned without a decode or a split, so the
+    common single-message file pays one scan."""
     if not _needs_a_decode(raw, encoding):
         return [raw]
     try:

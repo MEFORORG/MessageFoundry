@@ -130,16 +130,22 @@ open points settled below.
   component, repetition, subcomponent and escape characters `^ ~ & \`, and the X12 `:` and `>`
   (component) and `*` (element). Its destination is not a literal leaf. The pick runs on insert
   and on an edit of the value or the path. The recognizer reads such a `msg.set_data` back as
-  `set_field`. At a literal leaf destination it reads any `msg.set_data` back as `set_field`,
-  whatever the value, because there the two writes are the same. A whole-field read is raw text
-  with its structure, so it keeps `msg.set`. Text holding one of those separators is structure the
+  `set_field`. At a literal leaf destination it reads any `msg.set_data` that is not a copy back
+  as `set_field`, whatever the value, because there the two writes are the same. A path edit that
+  would move such a line into a whole field, where the lens would write `msg.set`, is refused:
+  `msg.set_data` wrote that value as data, and `msg.set` would make its separators structure. A
+  `msg.set_data` into a whole field whose template text holds one of those separators, such as
+  `MRN: `, reads as a `code` row, because the lens never writes that line. A whole-field read is
+  raw text with its structure, so it keeps `msg.set`. Text holding one of those separators is structure the
   author wrote, so it keeps `msg.set` too, and the lint still flags a leaf it copies. A field
   separator in the text does not keep `msg.set`. `set` refuses one in a whole field, so it can only
   mean data. At a literal leaf destination the lens writes `msg.set`. An edit that changes no
   argument leaves the write as written, even when it respells a string's quotes or drops a `u`
   prefix. The lens cannot know a message's own separators, and it cannot tell an X12 handler from
-  an HL7 one, so it tests the separators in common use in both. An X12 composite path such as
-  `CLM-05.1` reads as a leaf, so a Set Field template over one is written `msg.set_data`. The X12
+  an HL7 one, so it tests the separators in common use in both. An X12 composite path with a
+  three-character segment id, such as `CLM-05.1`, reads as a leaf, so a Set Field template over one
+  is written `msg.set_data`. One with a two-character id, such as `N4-01.1`, does not match the
+  HL7 path grammar the lens uses, so it keeps `msg.set`. The X12
   message gained a `set_data` for that line, which raised `AttributeError` before. It is the X12
   `set`, except that a whole element also refuses the component separator. X12 has no escape, so
   refusing is how the value stays data. `set_data` receives the value already built, so it cannot
@@ -325,8 +331,9 @@ than one `MSH` is left to its own item.
   Field template reads only literal leaves into a whole field, and its text holds none of
   `^ ~ & \ : > *`, THE SYSTEM SHALL write it with `set_data` on insert and on an edit of its value
   or path, and read it back as `set_field`; WHEN its text holds one, THE SYSTEM SHALL keep `set`.
-  WHEN a `set_data` call writes a literal leaf, THE SYSTEM SHALL read it back as `set_field`,
-  whatever its value. WHEN an edit changes no argument, including one that only respells quotes or
+  WHEN a `set_data` call that is not a copy writes a literal leaf, THE SYSTEM SHALL read it back as
+  `set_field`, whatever its value; and WHEN a path edit would move it into a whole field as `set`,
+  THE SYSTEM SHALL refuse the edit. WHEN an edit changes no argument, including one that only respells quotes or
   drops a `u` prefix, THE SYSTEM SHALL leave its write alone. WHEN such a `set_data` line runs on an
   X12 message, THE SYSTEM SHALL write the value as `set` writes it, and SHALL raise `ValueError`
   rather than write the component separator into a whole element.
@@ -348,6 +355,9 @@ than one `MSH` is left to its own item.
   -> `tests/test_data_never_becomes_structure.py::test_a_set_field_template_holding_an_x12_separator_keeps_set`
   -> `tests/test_data_never_becomes_structure.py::test_a_set_data_template_into_a_leaf_still_reads_back_as_set_field`
   -> `tests/test_data_never_becomes_structure.py::test_any_set_data_value_into_a_leaf_reads_back_as_set_field`
+  -> `tests/test_data_never_becomes_structure.py::test_a_path_edit_never_moves_a_leafs_data_write_into_a_whole_field_as_set`
+  -> `tests/test_data_never_becomes_structure.py::test_a_set_data_template_holding_a_colon_is_a_code_row`
+  -> `tests/test_data_never_becomes_structure.py::test_the_no_change_test_leaves_the_tree_it_reads_as_it_was`
   -> `tests/test_x12_parsing.py::test_set_data_is_set_on_an_x12_message_and_keeps_one_component`
   -> `tests/test_x12_parsing.py::test_the_lens_set_field_template_line_runs_on_an_x12_message`
   -> `tests/test_x12_parsing.py::test_a_lens_template_whose_text_holds_the_component_separator_runs_on_x12`
