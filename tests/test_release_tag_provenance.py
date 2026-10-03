@@ -11,12 +11,13 @@ pure function of the readings, and that is what is tested. tests/test_release_pi
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from scripts.ci.required_contexts import branch_protection_contexts, ruleset_contexts
 from scripts.release import tag_provenance as tp
-from scripts.release.tag_provenance import Report, contexts_in_file, verdict
-from tests._workflow_contexts import required_contexts
+from scripts.release.tag_provenance import Report, reports_from, verdict
 
 _REQUIRED = ("CI gate", "cla")
 
@@ -86,13 +87,44 @@ def test_an_empty_required_set_is_refused() -> None:
     assert len(problems) == 1 and "no required context" in problems[0], problems
 
 
-def test_the_file_reader_matches_the_tests_reader() -> None:
-    """The script parses .github/required-contexts.txt itself, because the shared reader imports
-    PyYAML, which the release runner does not install. Two copies of one rule must agree."""
-    path = Path(tp.__file__).resolve().parents[2] / ".github" / "required-contexts.txt"
-    parsed = contexts_in_file(path.read_text(encoding="utf-8"))
-    assert parsed, "the reader found no context in the real file"
-    assert parsed == required_contexts()
+def test_a_check_run_and_a_status_of_one_name_are_each_judged_on_their_own_latest() -> None:
+    """The two kinds number their ids separately, so a high status id must not hide a red run."""
+    reports = [_check(1, "CI gate", "failure"), _status(10_000, "CI gate", "success")]
+    problems = verdict("behind", ["CI gate"], reports)
+    assert len(problems) == 1 and "check run completed/failure" in problems[0], problems
+    assert verdict("behind", ["CI gate"], [_check(2, "CI gate", "success"), *reports]) == []
+
+
+def test_reports_are_read_from_the_slurped_pages() -> None:
+    checks: list[dict[str, Any]] = [
+        {"check_runs": [{"id": 3, "name": "CI gate", "status": "completed", "conclusion": None}]},
+        {"check_runs": []},
+    ]
+    statuses = [[{"id": 4, "context": "cla", "state": "success"}]]
+    assert reports_from(checks, statuses) == [
+        Report(id=3, context="CI gate", kind="check", state="completed", conclusion=""),
+        Report(id=4, context="cla", kind="status", state="success"),
+    ]
+
+
+def test_an_absent_branch_protection_list_raises_rather_than_reading_as_empty() -> None:
+    assert branch_protection_contexts(
+        {"protection": {"required_status_checks": {"contexts": ["a"]}}}
+    ) == ["a"]
+    with pytest.raises(RuntimeError, match="not an empty required set"):
+        branch_protection_contexts({"protection": {}})
+
+
+def test_ruleset_contexts_are_read_from_every_required_checks_rule() -> None:
+    rules = [
+        {"type": "pull_request", "parameters": {}},
+        {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "x"}, {"context": "y"}]},
+        },
+    ]
+    assert ruleset_contexts(rules) == ["x", "y"]
+    assert ruleset_contexts([]) == []
 
 
 def test_main_refuses_when_the_server_cannot_be_read(
