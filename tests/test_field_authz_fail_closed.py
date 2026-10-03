@@ -33,6 +33,7 @@ from messagefoundry.api import create_app
 from messagefoundry.api.field_authz import PHI_FIELDS, redact_unauthorized, revealable
 from messagefoundry.api.models import MessageDetail, MessageSummary
 from messagefoundry.api.phi_gate import GATEABLE_PROPERTIES, PhiGatedModel
+from messagefoundry.api.security import public_route
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.config.settings import EgressSettings
@@ -155,10 +156,12 @@ async def test_a_route_that_forgets_redact_unauthorized_denies_rather_than_expos
     app = create_app(engine, allow_no_auth=True)
 
     @app.get("/test-forgot-the-call", response_model=MessageDetail)
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
     async def forgot() -> MessageDetail:
         return _detail()
 
     @app.get("/test-made-the-call", response_model=MessageDetail)
+    @public_route("a synthetic route this test plants; the engine refuses an undeclared one")
     async def remembered() -> MessageDetail:
         # Reveals every masked property so this control observes the COMPLETE value. Without it it
         # still be non-null and would still prove the route released something — but it would no

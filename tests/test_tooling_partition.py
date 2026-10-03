@@ -140,6 +140,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # which does not trip the tooling path gate, so as tooling it would face nothing there.
         "test_from_none_is_not_redaction.py",
         "test_licence_header_gate.py",
+        # Parses messagefoundry/api/app.py (the factories' allow_no_auth pass-through) and every
+        # other source file outside tests/ off disk without importing them. What it guards is a
+        # sign-in-off app appearing in shipped code, which can arrive as an ENGINE or harness diff
+        # that does not trip the tooling path gate (ADR 0203 amendment 2026-10-03).
+        "test_no_sign_in_off_app_outside_tests.py",
         # Scans the TRACKED messagefoundry/ and harness/ trees for files the release member gate
         # would refuse, so an engine commit adding one is exactly the diff it has to catch
         # (BACKLOG #1840). Listed as tooling it would be deselected on the engine legs AND unreached

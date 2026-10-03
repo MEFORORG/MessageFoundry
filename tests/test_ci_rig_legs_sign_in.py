@@ -17,9 +17,12 @@ the queue, which is why the scan below stays: it reads a retired name to catch i
 THEY READ TEXT, NOT A RUN. They show a step still calls the rig helper around its ``serve``. They do
 not show the leg is green: its own result is that reading.
 
-THEY COVER ``serve``, AND AT LEAST ONE ENGINE A WORKFLOW STARTS IS NOT ONE. ``ingress-rate-probe.yml``
-runs ``harness/load/ingress_probe.py``, which builds the engine in-process through the test factory
-with ``allow_no_auth=True`` and never runs ``serve``. Nothing here reads that path.
+THEY COVER ``serve``, AND AT LEAST ONE ENGINE A WORKFLOW STARTS IS NOT ONE. ``dast.yml`` runs
+``scripts/security/dast_auth_sweep.py``, which serves ``scripts/security/dast_target.py``
+in-process, with sign-in off in its open-auth canary. Nothing here reads that path.
+``ingress-rate-probe.yml`` runs ``harness/load/ingress_probe.py``, which starts its own signed-in
+``serve`` from Python, so no step text shows it either. It used to build the engine in-process with
+``allow_no_auth=True``; ``tests/test_no_sign_in_off_app_outside_tests.py`` refuses that shape now.
 """
 
 from __future__ import annotations

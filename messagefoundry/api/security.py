@@ -20,9 +20,10 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import HTTPException, Request, Response, WebSocket, status
+from fastapi import HTTPException, Request, Response, WebSocket, WebSocketException, status
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
+from starlette.requests import HTTPConnection
 
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
@@ -421,16 +422,147 @@ def answers_before_body[G: _Step](guard: G) -> G:
     return guard
 
 
-def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
-    """Mark a ``require*()`` closure with the step that authenticates its caller.
+# --- Every route declares its authorization (vault BACKLOG #2604) -----------------------------------
+# ``create_app`` installs :func:`refuse_undeclared_route` as an APP-LEVEL dependency, so it runs ahead of
+# every route's own dependencies on every route registered on the app. It refuses a matched route
+# unless the route DECLARES how it is authorized, in one of two ways:
+#
+# * a top-level dependency carrying the gate mark, which every ``require*()`` factory here and every
+#   ``require_ui*()`` factory in the web console sets through :func:`mark_route_gate`; or
+# * an endpoint marked :func:`public_route` with a reason, for the sign-in entry points and the other
+#   routes that are anonymous by design. A WebSocket endpoint that authorizes inside its own body is
+#   marked :func:`authorizes_in_body` instead, which an HTTP route may not use.
+#
+# A gate is recognised by its mark, never by its name. The route walk in
+# ``scripts/security/route_gates.py`` reads the same mark, so a dependency that is merely NAMED like a
+# gate reads as no gate at all, to both.
+#
+# WHAT IT DOES NOT COVER, at least:
+#
+# * A route inside a MOUNTED application. A mount carries no dependencies, so the refusal never runs
+#   there. ``/ui/static`` is the only mount the engine serves, and a test pins that.
+# * A Starlette ``Route`` added outside FastAPI's routing, which also has no dependencies. The only
+#   ones are the interactive docs and the schema, which ``expose_docs`` turns on.
+# * A gate nested inside another dependency, or added only by an ``include_router`` call. The check
+#   reads a route's own top-level dependencies, so such a route is refused, which is the safe side.
+#
+# It does not check that a gate is correct, only that the route declared one. The mark is the
+# declaration, and a factory that sets it takes on the duty to enforce.
 
-    Returns the SAME function object. The route-gate walk reads a gate's ``__qualname__`` and its
-    closure cells (see :func:`require`), and an attribute changes neither.
+#: The function attribute a gate dependency carries. Its value is ``True``.
+_ROUTE_GATE_ATTR = "__route_gate__"
+#: The function attribute an endpoint carries its :class:`RouteDeclaration` under.
+_ROUTE_DECLARATION_ATTR = "__route_declaration__"
+
+#: The ``detail`` of the refusal, so a caller and a test can tell it from a gate's own answer.
+UNDECLARED_ROUTE_DETAIL = "this route declares no authorization"
+
+
+@dataclass(frozen=True, slots=True)
+class RouteDeclaration:
+    """How an endpoint with no gate dependency is authorized, and why."""
+
+    #: True for a route anonymous by design. False for a WebSocket endpoint that authorizes in its
+    #: own body.
+    public: bool
+    #: Why. Never empty: a declaration with no reason is refused when it is made.
+    reason: str
+
+
+def mark_route_gate[G: Callable[..., Any]](gate: G) -> G:
+    """Mark a gate dependency, so the route check and the route walk know it as one.
+
+    Returns the SAME function object. Call it only from a factory whose dependency enforces
+    authentication; the mark is what every route check trusts."""
+    setattr(gate, _ROUTE_GATE_ATTR, True)
+    return gate
+
+
+def is_route_gate(call: object) -> bool:
+    """True when ``call`` carries the gate mark :func:`mark_route_gate` sets."""
+    return getattr(call, _ROUTE_GATE_ATTR, None) is True
+
+
+def _declare[F: Callable[..., Any]](public: bool, reason: str) -> Callable[[F], F]:
+    if not reason.strip():
+        raise ValueError("a route declaration needs a reason")
+
+    def mark(endpoint: F) -> F:
+        setattr(endpoint, _ROUTE_DECLARATION_ATTR, RouteDeclaration(public, reason))
+        return endpoint
+
+    return mark
+
+
+def public_route[F: Callable[..., Any]](reason: str) -> Callable[[F], F]:
+    """Declare an endpoint anonymous by design. Apply it BELOW the route decorator."""
+    return _declare(True, reason)
+
+
+def authorizes_in_body[F: Callable[..., Any]](reason: str) -> Callable[[F], F]:
+    """Declare a WebSocket endpoint that authorizes inside its own body. Refused on an HTTP route."""
+    return _declare(False, reason)
+
+
+def route_declaration_of(endpoint: object) -> RouteDeclaration | None:
+    """The :class:`RouteDeclaration` an endpoint was marked with, or ``None``."""
+    found = getattr(endpoint, _ROUTE_DECLARATION_ATTR, None)
+    return found if isinstance(found, RouteDeclaration) else None
+
+
+def route_is_declared(route: object, *, websocket: bool) -> bool:
+    """True when ``route`` declares its authorization, as the module note above defines it."""
+    dependant = getattr(route, "dependant", None)
+    dependencies = getattr(dependant, "dependencies", None) or ()
+    if any(is_route_gate(dependency.call) for dependency in dependencies):
+        return True
+    declared = route_declaration_of(getattr(route, "endpoint", None))
+    if declared is None:
+        return False
+    return declared.public or websocket
+
+
+#: The route attribute that caches :func:`route_is_declared`. A route's dependencies and endpoint are
+#: fixed once it is registered, so the answer is worked out on its first request only.
+_DECLARED_CACHE_ATTR = "_mefor_route_declared"
+
+
+async def refuse_undeclared_route(connection: HTTPConnection) -> None:
+    """The app-level dependency: refuse a matched route that declares no authorization.
+
+    An HTTP caller gets 403 with :data:`UNDECLARED_ROUTE_DETAIL`. A WebSocket is closed with policy
+    violation (1008) before it is accepted. Either way the route is a defect in the code that
+    registered it, so its first refusal is logged at ERROR."""
+    websocket = connection.scope.get("type") == "websocket"
+    route = connection.scope.get("route")
+    declared = getattr(route, _DECLARED_CACHE_ATTR, None)
+    if declared is None:
+        declared = route_is_declared(route, websocket=websocket)
+        if route is not None:
+            setattr(route, _DECLARED_CACHE_ATTR, declared)
+        if not declared:
+            log.error(
+                "refused route %s: it has no gate dependency and no public declaration",
+                getattr(route, "path", "<unknown>"),
+            )
+    if declared:
+        return
+    if websocket:
+        raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+    raise HTTPException(status.HTTP_403_FORBIDDEN, UNDECLARED_ROUTE_DETAIL)
+
+
+def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
+    """Mark a ``require*()`` closure as a gate, with the step that authenticates its caller.
+
+    Returns the SAME function object. The route-gate walk recognises a gate by the mark
+    :func:`mark_route_gate` sets and reads its permissions from the closure cells (see
+    :func:`require`); neither attribute changes those.
 
     A factory whose gate refuses AHEAD of its base's sign-in check must put that refusal in its
     step too, in the same order, as :func:`require_phi_read` does with the hop refusal."""
     setattr(dependency, _BEFORE_BODY_ATTR, BeforeBody(authenticate, authenticates=True))
-    return dependency
+    return mark_route_gate(dependency)
 
 
 def _authentication_of(gate: _Gate) -> _Step:
@@ -468,8 +600,10 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     already runs the gate before it reads anything; one with no gate; and one whose gate is not
     this module's (the web console's ``require_ui*``, whose routes declare no body).
 
-    WHAT IT DOES NOT COVER, at least. The engine has none of these, and this list is the one
-    place they are stated:
+    A body-taking route that declares no authorization is refused early too, with the answer
+    :func:`refuse_undeclared_route` gives.
+
+    WHAT IT DOES NOT COVER, at least. This list is the one place they are stated:
 
     * A route reached through ``include_router``. It is served by that router's route class,
       and FastAPI serves it from the include's own context. So a gate that the include call
@@ -478,7 +612,8 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     * A gate nested inside another dependency. Only a route's top-level dependencies are read,
       which is also all ``scripts/security/route_gates.py`` reads.
     * A dependency that sits ahead of the gate and carries no mark. The gate's refusal answers
-      before it, so a caller with no identity never reaches it.
+      before it, so a caller with no identity never reaches it. ``refuse_undeclared_route`` is one
+      on every route, and it never refuses a route that has a gate.
 
     The refusal is not a copy of the gate's. The step raises the same ``HTTPException`` from the
     same function the gate calls, and it travels through the same exception handlers and the same
@@ -492,6 +627,15 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
         # ``body_field`` is the very condition FastAPI reads a body on before it solves
         # dependencies, so it is FastAPI's test and not a second opinion kept here.
         steps = steps_before_body(self.dependant) if self.body_field is not None else ()
+        if (
+            not steps
+            and self.body_field is not None
+            and any(d.call is refuse_undeclared_route for d in self.dependant.dependencies)
+            and not route_is_declared(self, websocket=False)
+        ):
+            # Vault BACKLOG #2604: a route that declares no authorization is refused before its
+            # body is read too, so a malformed body cannot tell a caller that the route exists.
+            steps = ((refuse_undeclared_route, refuse_undeclared_route),)
         if not steps:
             return handler
         provider = self.dependency_overrides_provider

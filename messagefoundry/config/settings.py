@@ -536,8 +536,8 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
 
     **Where it does not hold.** A caller that builds an engine from settings it constructed itself,
     and never calls :func:`load_settings`, has a dial this function cannot see. The escape follows
-    the environment there, not those settings. ``harness/load/ingress_probe.py`` is such a caller,
-    on purpose.
+    the environment there, not those settings. ``harness/load/ingress_probe.py`` was such a caller
+    until 2026-10-03, when it moved to a ``serve`` subprocess.
 
     **Two limits, stated so nobody trips on them.** ``warn`` set only in the settings FILE does not
     unlock the escape; mirror it into the environment beside the escape. And the dial in the

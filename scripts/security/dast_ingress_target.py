@@ -108,13 +108,13 @@ class IngressTarget:
         if source is None:
             return 0
         assert isinstance(source, MLLPSource | TcpSource | X12Source), type(source)
-        return source._active
+        return source._admission.active
 
     def connection_tasks(self) -> int:
         """Per-connection listener tasks still running on this loop, released or not.
 
-        A listener drops ``_active`` BEFORE it closes the socket and writes the ``closed`` event, so
-        a connection can be released and its task still alive, holding a socket, until the store
+        A listener drops its admitted count BEFORE it closes the socket and writes the ``closed``
+        event, so a connection can be released and its task still alive, holding a socket, until the store
         write lands. The resource snapshot waits on this so a slow store write is not read as growth.
         Matched on each listener's own ``_on_client`` read with no default, so a rename raises rather
         than making the wait return at once.
@@ -183,6 +183,7 @@ def _registry(settings: Mapping[str, Any], *, canary: str | None) -> Registry:
                     "framing": "stx_etx",
                     "max_frame_bytes": cap,
                     "receive_timeout": idle,
+                    "max_frame_seconds": float(settings["max_frame_seconds"]),
                 },
             ),
             router="dast_router",
@@ -194,7 +195,12 @@ def _registry(settings: Mapping[str, Any], *, canary: str | None) -> Registry:
             X12_INBOUND,
             ConnectionSpec(
                 ConnectorType.X12,
-                {"port": x12_port, "max_interchange_bytes": cap, "receive_timeout": idle},
+                {
+                    "port": x12_port,
+                    "max_interchange_bytes": cap,
+                    "receive_timeout": idle,
+                    "max_frame_seconds": float(settings["max_frame_seconds"]),
+                },
             ),
             router="dast_router",
             content_type=ContentType.X12,
@@ -210,7 +216,9 @@ def _posture(settings: Mapping[str, Any], *, canary: str | None) -> dict[str, st
         "router": "one Router that routes nowhere, so an accepted message ends UNROUTED",
         "max_frame_bytes": f"{settings['max_frame_bytes']} (RELAXED from the shipped 16 MiB)",
         "receive_timeout": f"{settings['receive_timeout']}s (RELAXED from the shipped 60s)",
-        "max_frame_seconds": f"{settings['max_frame_seconds']}s on MLLP (RELAXED from the shipped 60s)",
+        "max_frame_seconds": (
+            f"{settings['max_frame_seconds']}s on MLLP, raw TCP and X12 (RELAXED from the shipped 60s)"
+        ),
         "tls": "none -- plaintext loopback; TLS listeners are outside this pass",
         "canary": canary or "none",
     }

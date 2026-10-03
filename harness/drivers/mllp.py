@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""MLLP driver: each payload on its own MLLP connection, keeping the first reply frame."""
+"""MLLP driver: each payload on its own MLLP connection, keeping the first reply frame.
+
+The reply is the engine's, so it is read under the engine's own MLLP frame cap (ASVS 5.1.1): a reply
+frame over :data:`~messagefoundry.mllpcodec.DEFAULT_MAX_FRAME_BYTES` is refused as an error, never
+buffered whole and never cut short.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,7 @@ from collections.abc import Sequence
 
 from harness.drivers import Driver, Injection
 from harness.endpoints import Endpoints
-from messagefoundry.mllpcodec import MLLPDecoder, frame
+from messagefoundry.mllpcodec import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder, MLLPFrameError, frame
 
 KIND = "mllp"
 
@@ -31,14 +36,17 @@ class MLLPDriver(Driver):
                 sock.settimeout(self.timeout)
                 sock.sendall(frame(payload))
                 return Injection(reply=_read_reply(sock))
+        except MLLPFrameError as exc:
+            return Injection(error=f"reply refused: {exc}")
         except OSError as exc:
             return Injection(error=str(exc))
 
 
 def _read_reply(sock: socket.socket) -> bytes | None:
     """The first complete reply frame, or None when the peer closes or times out first. A
-    NONE-ack inbound never answers, and the send itself still happened, so neither is an error."""
-    decoder = MLLPDecoder()
+    NONE-ack inbound never answers, and the send itself still happened, so neither is an error. A
+    reply frame over the cap raises :class:`MLLPFrameError`, which the caller records as an error."""
+    decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
     try:
         while True:
             chunk = sock.recv(4096)

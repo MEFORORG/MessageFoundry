@@ -13,6 +13,7 @@ byte past the cap. Stdlib only, and Qt-free, so the GUI pane and the headless si
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from pathlib import Path
@@ -20,6 +21,10 @@ from pathlib import Path
 #: The refusal for a directory, FIFO, device or (when not followed) symlink. A FIFO reports size 0
 #: and would block a plain open, which is why the handle is opened non-blocking where the OS has it.
 NOT_REGULAR = "not a regular file; not read"
+
+
+#: What ``os.open`` with ``O_NOFOLLOW`` raises on a symlink, as ``transports/file.py`` lists them.
+_LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
 
 
 def _over(size: int, cap: int) -> str:
@@ -30,11 +35,11 @@ def read_capped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[
     """``(data, "")`` for a regular file of at most ``cap`` bytes, else ``(b"", reason)``.
 
     ``reason`` is :data:`NOT_REGULAR`, an over-cap refusal naming the size, or a refusal for a file
-    that grew past ``cap`` while it was read; none quotes the file's content. Raises ``OSError`` for
-    a transient failure (the file vanished, is locked, or, where the OS has ``O_NOFOLLOW``, was
-    swapped for a symlink after the ``lstat`` when ``follow_symlinks`` is false), which a caller
-    retries on its next scan. Windows has no ``O_NOFOLLOW``, so there the ``lstat`` is the only
-    symlink check.
+    that grew past ``cap`` while it was read; none quotes the file's content. When
+    ``follow_symlinks`` is false, a file swapped for a symlink after the ``lstat`` is
+    :data:`NOT_REGULAR` too, where the OS has ``O_NOFOLLOW`` to catch it at the open. Windows has
+    no ``O_NOFOLLOW``, so there the ``lstat`` is the only symlink check. Raises ``OSError`` for a
+    transient failure (the file vanished or is locked), which a caller retries on its next scan.
     """
     st = path.stat() if follow_symlinks else path.lstat()
     if not stat.S_ISREG(st.st_mode):
@@ -44,7 +49,14 @@ def read_capped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     if not follow_symlinks:
         flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        # O_NOFOLLOW refuses a symlink with ELOOP, or EMLINK on FreeBSD: the path was swapped for a
+        # link after the lstat, so it is not a regular file now, and never will be by retrying.
+        if not follow_symlinks and exc.errno in _LINK_ERRNOS:
+            return b"", NOT_REGULAR
+        raise
     try:
         fh = os.fdopen(fd, "rb")
     except OSError:

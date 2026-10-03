@@ -97,8 +97,9 @@ def _run_compare(args: argparse.Namespace) -> int:
         hint = "; --max-file-bytes changes the cap" if exc.over_cap else ""
         print(f"compare: {exc}{hint}", file=sys.stderr)
         return 2
-    except (OSError, ValueError, KeyError) as exc:
-        # Unreadable, undecodable or malformed input is exit 2 too: 1 means "the outputs differ".
+    except (OSError, ValueError) as exc:
+        # Unreadable or undecodable input is exit 2 too: 1 means "the outputs differ". A malformed
+        # JSONL line is a LoadError above, which names the line and never its content.
         # By class only: a decode or JSON error can quote the input, which may be a message.
         print(f"compare: an input could not be read ({type(exc).__name__})", file=sys.stderr)
         return 2

@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from functools import cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -530,11 +530,6 @@ _CLIENT_ALLOWED: Mapping[str, _Allowance] = MappingProxyType(
             "reads the live connector registries, read-only, through the public registered_kinds "
             "accessor, to report which connector kinds the scenarios cover (vault BACKLOG #2672)",
         ),
-        "harness/load/ingress_probe.py": _Allowance(
-            frozenset({"messagefoundry.config"}),
-            "builds the explicit [egress] policy its in-process engine needs, since "
-            "create_managed_app takes no default (vault BACKLOG #2605)",
-        ),
         "harness/load/shardcert.py": _Allowance(
             frozenset({"messagefoundry.config", "messagefoundry.pipeline", "messagefoundry.store"}),
             "certifies an engine-shard plan by running the loader and the sharding planner itself",
@@ -985,6 +980,24 @@ class _TrayProbe(NamedTuple):
     loaded: frozenset[str]
 
 
+def _run_marked_probe(code: str, *, path_head: Path | None = None) -> Any:
+    """Run `code` in a fresh interpreter and return the JSON it printed after `_PROBE_MARK`.
+
+    `path_head` is prepended to `PYTHONPATH` so a control can supply a name this environment may not
+    have installed."""
+    env = dict(os.environ)
+    if path_head is not None:
+        inherited = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{path_head}{os.pathsep}{inherited}" if inherited else str(path_head)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    marked = [ln for ln in result.stdout.splitlines() if ln.startswith(_PROBE_MARK)]
+    assert len(marked) == 1, f"the probe printed {len(marked)} marked lines: {result.stdout!r}"
+    return json.loads(marked[0].removeprefix(_PROBE_MARK))
+
+
 def _tray_import_probe(plant: str = "", *, path_head: Path | None = None) -> _TrayProbe:
     """Import the tray shell in a fresh interpreter and report what landed in `sys.modules`.
 
@@ -1008,17 +1021,7 @@ def _tray_import_probe(plant: str = "", *, path_head: Path | None = None) -> _Tr
         f"print({_PROBE_MARK!r} + json.dumps("
         "{'found': sorted(found), 'loaded': sorted(loaded)}))\n"
     )
-    env = dict(os.environ)
-    if path_head is not None:
-        inherited = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = f"{path_head}{os.pathsep}{inherited}" if inherited else str(path_head)
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=300
-    )
-    assert result.returncode == 0, result.stderr
-    marked = [ln for ln in result.stdout.splitlines() if ln.startswith(_PROBE_MARK)]
-    assert len(marked) == 1, f"the probe printed {len(marked)} marked lines: {result.stdout!r}"
-    payload = json.loads(marked[0].removeprefix(_PROBE_MARK))
+    payload = _run_marked_probe(code, path_head=path_head)
     loaded = frozenset(payload["loaded"])
     # The tray import is the whole subject, and a plant runs BEFORE it, so without this line deleting
     # `import messagefoundry.tray.app` would leave every positive control below passing on the plant
@@ -1130,6 +1133,64 @@ def test_the_tray_probe_resolves_a_forbidden_package_by_its_dotted_prefix() -> N
         "the parent package is in the run, so the EXACT branch could have produced that match and "
         "this test no longer isolates the prefix branch"
     )
+
+
+# --- vault BACKLOG #2822: what the tray's process-start leaves import, on every interpreter ---------
+#
+# The tray starts its first process and its branded relaunch through `messagefoundry.childenv` and
+# the `_child_bootstrap.py` script. ADR 0113 lets the tray import `childenv` only because it is
+# stdlib-only. The tray probe above imports `tray.app` and never reaches `branding`, and
+# `tests/test_startup_import_budget.py` pins the first process's engine modules only on 3.15, so on
+# the 3.14 floor an engine import added to `childenv` would reach the tray unnoticed.
+#
+# AN ALLOWLIST, NOT AN ABSENCE LIST: the exact `messagefoundry` modules the three leaves load, and
+# no module outside the standard library. None of the three carries a `__lazy_modules__` list, so
+# the set is the same on 3.14 and 3.15. Counted against a snapshot taken at the start of the child,
+# so a `.pth` hook the interpreter runs at start-up is not charged to the tray.
+
+_TRAY_START_LEAVES = (
+    "messagefoundry._child_bootstrap",
+    "messagefoundry.tray.autostart",
+    "messagefoundry.tray.branding",
+)
+_TRAY_START_LOADS = frozenset({"messagefoundry", "messagefoundry.childenv", "messagefoundry.tray"})
+
+
+def _tray_leaf_probe(
+    plant: str = "", *, path_head: Path | None = None
+) -> tuple[set[str], set[str]]:
+    """The `messagefoundry` modules, and the top-level modules outside the standard library, that a
+    fresh interpreter loads importing `_TRAY_START_LEAVES`. `plant` runs first, as a control."""
+    code = (
+        "import json, sys\n"
+        "before = set(sys.modules)\n"
+        f"{plant}\n"
+        f"for name in {_TRAY_START_LEAVES!r}:\n"
+        "    __import__(name)\n"
+        "new = set(sys.modules) - before\n"
+        "ours = sorted(m for m in new if m.partition('.')[0] == 'messagefoundry')\n"
+        "other = sorted({m.partition('.')[0] for m in new} - set(sys.stdlib_module_names)\n"
+        "               - {'messagefoundry'})\n"
+        f"print({_PROBE_MARK!r} + json.dumps([ours, other]))\n"
+    )
+    ours, other = _run_marked_probe(code, path_head=path_head)
+    return set(ours), set(other)
+
+
+def test_the_tray_start_leaves_load_only_the_stdlib_and_the_named_engine_modules() -> None:
+    ours, other = _tray_leaf_probe()
+    assert ours == _TRAY_START_LOADS | set(_TRAY_START_LEAVES)
+    assert other == set()
+
+
+def test_the_tray_leaf_probe_sees_an_engine_import_and_a_third_party_one(tmp_path: Path) -> None:
+    """Both halves can fail. The plant runs after the snapshot, so it stands in for an import one of
+    the leaves gained."""
+    ours, _other = _tray_leaf_probe("import messagefoundry.redaction")
+    assert "messagefoundry.redaction" in ours - _TRAY_START_LOADS - set(_TRAY_START_LEAVES)
+    (tmp_path / "mf_2822_third_party.py").write_text("", encoding="utf-8")
+    _ours, other = _tray_leaf_probe("import mf_2822_third_party", path_head=tmp_path)
+    assert other == {"mf_2822_third_party"}
 
 
 # --- BACKLOG #1596: parsing/'s client carve-out, as one allowlist checked two ways -------------------

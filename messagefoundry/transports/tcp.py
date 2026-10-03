@@ -31,13 +31,13 @@ from collections.abc import Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.redaction import safe_exc
+from messagefoundry.transports.admission import FrameClock, ListenerAdmission
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
     InboundHandler,
     SourceConnector,
-    peer_ip_allowed,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -54,7 +54,9 @@ from messagefoundry.transports.framing import (
 )
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_CONNECTIONS_PER_HOST,
     DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_FRAME_SECONDS,
     DEFAULT_RECEIVE_TIMEOUT,
     InsecureHopGuard,
     _MessagePacer,
@@ -487,6 +489,20 @@ class TcpSource(SourceConnector):
             knob="max_frame_bytes",
             transport="TCP source",
         )
+        # vault BACKLOG #2606: the MLLP listener's per-host cap and frame deadline, at its defaults.
+        # See transports/admission.py for what each bounds and when to switch the per-host cap off.
+        self.max_connections_per_host: int | None = positive_cap(
+            s.get("max_connections_per_host", DEFAULT_MAX_CONNECTIONS_PER_HOST),
+            int,
+            knob="max_connections_per_host",
+            transport="TCP source",
+        )
+        self.max_frame_seconds: float | None = positive_cap(
+            s.get("max_frame_seconds", DEFAULT_MAX_FRAME_SECONDS),
+            float,
+            knob="max_frame_seconds",
+            transport="TCP source",
+        )
         # Message-rate pacing (BACKLOG #1114), read through the shared helper so this connector
         # cannot drift from MLLP on what "unset" means. Absent -> OFF, unlike the caps above. The
         # port changed REACHABILITY (raw TCP had no rate control in any configuration), never the
@@ -502,7 +518,12 @@ class TcpSource(SourceConnector):
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
-        self._active = 0
+        self._admission = ListenerAdmission(
+            transport="TCP",
+            max_connections=self.max_connections,
+            max_connections_per_host=self.max_connections_per_host,
+            source_ip_allowlist=self.source_ip_allowlist,
+        )
         # Live client writers + handler tasks so stop()/reload can actively close established
         # connections and bound the wait (mirrors MLLPSource, review H-2).
         self._clients: set[asyncio.StreamWriter] = set()
@@ -515,6 +536,7 @@ class TcpSource(SourceConnector):
         # so there is no shared-resource double-read to gate. Accepted only so the runner's call is
         # uniform across all sources (mirrors MLLPSource).
         self._handler = handler
+        self._admission.stopping = False  # a restart of this same instance serves again
         self._server = await asyncio.start_server(self._on_client, self.host, self.port)
 
     @property
@@ -525,23 +547,29 @@ class TcpSource(SourceConnector):
         return port
 
     async def stop(self) -> None:
+        # A connection reaching _on_client from here is refused unread.
+        self._admission.stopping = True
         if self._server is not None:
             self._server.close()
         # Close established clients BEFORE awaiting the server (server.wait_closed() hangs on
         # py3.12.1+ waiting for in-flight handlers of a peer holding its connection open). A message
         # mid-handler still finishes its commit (the body is durably stored before any reply, so
         # at-least-once holds). Then await the connection tasks with a bounded grace (review H-2).
-        for writer in list(self._clients):
-            writer.close()
-        pending = [task for task in self._client_tasks if not task.done()]
-        if pending:
-            _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
-            for task in still_running:
-                task.cancel()
-            if still_running:
-                await asyncio.gather(*still_running, return_exceptions=True)
-        self._clients.clear()
-        self._client_tasks.clear()
+        try:
+            for writer in list(self._clients):
+                writer.close()
+            pending = [task for task in self._client_tasks if not task.done()]
+            if pending:
+                _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
+                for task in still_running:
+                    task.cancel()
+                if still_running:
+                    await asyncio.gather(*still_running, return_exceptions=True)
+            self._clients.clear()
+            self._client_tasks.clear()
+        finally:
+            # Even when this stop() is cancelled: a task cancelled past its grace never released.
+            self._admission.reset()
         # Bound wait_closed() so a Windows ProactorEventLoop overlapped-op wedge can't hang teardown on
         # the suite's shared session loop (#55, mirrors MLLPSource.stop()). The listener is closed and
         # every client task is resolved, so a wait_closed() past the grace is an OS wedge, not in-flight
@@ -598,27 +626,32 @@ class TcpSource(SourceConnector):
         failed = False  # an error close is covered by its specific failure kind — don't double-emit
         close_reason = "eof"
         try:
-            if self.source_ip_allowlist is not None:
-                peer = writer.get_extra_info("peername")
-                if not peer_ip_allowed(peer, self.source_ip_allowlist):
-                    logger.warning(
-                        "TCP connection from %s refused: not in source_ip_allowlist", peer
-                    )
-                    await self._emit_event("peer_not_allowlisted", peer_host=peer_host)
-                    return  # not allowlisted — refuse (closed in the outer finally; _active untouched)
-            if self.max_connections is not None and self._active >= self.max_connections:
-                await self._emit_event("at_capacity", peer_host=peer_host)
-                return  # at capacity — refuse the new client (closed in the outer finally)
-            self._active += 1
-            established = True
-            await self._emit_event("established", peer_host=peer_host)
+            # vault BACKLOG #2606: stop, allowlist, global cap and per-host cap, decided in one place
+            # for every socket listener (transports/admission.py). Refused unread: nothing taken.
+            refusal = self._admission.check(writer, peer_host)
+            if refusal is not None:
+                if refusal.kind is not None:
+                    await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
+                return  # closed in the outer finally
+            self._admission.admit(peer_host)
             try:
+                # Inside the try whose finally releases the slot, so a cancellation delivered at
+                # this await cannot leak a per-host count.
+                established = True
+                await self._emit_event("established", peer_host=peer_host)
                 decoder = self.codec.decoder(max_frame_bytes=self.max_frame_bytes)
                 pacer = _MessagePacer.for_rate(
                     self.max_messages_per_second, self.message_burst, name=self._pacing_name
                 )
+                clock = FrameClock(
+                    transport="TCP",
+                    max_frame_seconds=self.max_frame_seconds,
+                    receive_timeout=self.receive_timeout,
+                )
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
+                    # The engine's own waits (pacing, an intake pause) do not spend the frame budget.
+                    withheld_from = time.monotonic()
                     if pacer is not None:
                         await pacer.pace()
                     # BACKLOG #290 slice 2: the engine-wide intake pause, BEFORE the read. Every
@@ -628,14 +661,11 @@ class TcpSource(SourceConnector):
                         self.intake_gate, stopped=lambda: writer.is_closing() or reader.at_eof()
                     ):
                         break  # stopping or closed while paused: close as on EOF, nothing was read
-                    if self.receive_timeout:
-                        try:
-                            chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
-                        except TimeoutError:
-                            close_reason = "idle_timeout"
-                            break  # idle past receive_timeout — close the connection
-                    else:
-                        chunk = await reader.read(4096)
+                    clock.withhold(withheld_from)
+                    chunk, bound = await clock.read(reader, writer)
+                    if bound is not None:
+                        close_reason = bound  # past the idle bound or the frame deadline
+                        break
                     if not chunk:
                         break
                     try:
@@ -673,11 +703,13 @@ class TcpSource(SourceConnector):
                             "framing_error", peer_host=peer_host, reason=safe_exc(exc)
                         )
                         break
+                    # Reached on the success path alone: every arm above breaks or raises.
+                    clock.after_read(in_frame=decoder.in_frame, decoded=decoded)
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._active -= 1
+                self._admission.release(peer_host)
         finally:
             self._clients.discard(writer)
             if task is not None:

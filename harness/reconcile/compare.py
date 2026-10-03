@@ -21,7 +21,8 @@ harness.reconcile compare --max-file-bytes`` changes the cap.
 
 from __future__ import annotations
 
-import json
+import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +36,9 @@ from harness.reconcile.normalize import (
 )
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.parsing.peek import normalize as _normalize_line_endings
+from messagefoundry.redaction import json_loads_or_refusal
+
+_log = logging.getLogger(__name__)
 
 #: Default per-connection match key — the message control id (``MSH-10``).
 DEFAULT_KEY: tuple[str, int] = ("MSH", 10)
@@ -63,8 +67,10 @@ DEFAULT_MAX_LOAD_FILE_BYTES = 64 * DEFAULT_MAX_MESSAGE_BYTES
 
 
 class LoadError(ValueError):
-    """An input file :func:`load_messages` refused to read: over the cap, or not a regular file.
-    ``over_cap`` says which, so a caller can name the setting that would help."""
+    """An input :func:`load_messages` refused: a file over the cap or not a regular file, or a JSONL
+    line that is not a capture record. ``over_cap`` says which, so a caller can name the setting that
+    would help. The message names the path and, for a line, its number; it never quotes content, so
+    a caller may print it."""
 
     def __init__(self, message: str, *, over_cap: bool) -> None:
         super().__init__(message)
@@ -79,37 +85,92 @@ def _read(path: Path, cap: int) -> bytes:
     return data
 
 
+#: One JSONL line and its break. A record's JSON cannot hold a raw CR or LF, so these are the only
+#: breaks; str.splitlines() would also split on U+0085 and U+2028, which the capture sink writes raw
+#: (``ensure_ascii=False``). Matched lazily, so a 1 GiB capture is not copied into a list of lines.
+_JSONL_LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+
+
+def _record(path: Path, number: int, line: str) -> str:
+    """The ``raw`` of one JSONL capture line, or :class:`LoadError` naming the line, never its text."""
+    # Returns rather than raises, so the refusal below chains no decode error: a JSONDecodeError
+    # carries the whole line in ``.doc``, and ``from None`` would still leave it on ``__context__``.
+    record, refusal = json_loads_or_refusal(line)
+    if refusal is not None:
+        raise LoadError(f"{path}: line {number} is not valid JSON", over_cap=False)
+    raw = record.get("raw") if isinstance(record, dict) else None
+    if not isinstance(raw, str):
+        # A list or a number here used to raise TypeError, which the CLI did not catch, so it exited
+        # 1, the code for "the outputs differ".
+        raise LoadError(
+            f"{path}: line {number} is not an object with a string 'raw'", over_cap=False
+        )
+    return raw
+
+
+def _parse(path: Path, data: bytes) -> list[str]:
+    """The messages in one file's bytes: a JSONL capture by its ``.jsonl`` name, else HL7."""
+    if path.suffix != ".jsonl":
+        return _split_batch(data.decode("latin-1"))
+    # utf-8-sig drops a byte-order mark, which some Windows tools write before UTF-8 text.
+    text = data.decode("utf-8-sig")
+    msgs: list[str] = []
+    for number, match in enumerate(_JSONL_LINE.finditer(text), 1):
+        line = match.group().strip()
+        if line:
+            msgs.append(_record(path, number, line))
+    return msgs
+
+
 def load_messages(
     path: str | Path, *, max_file_bytes: int = DEFAULT_MAX_LOAD_FILE_BYTES
 ) -> list[str]:
     """Load raw HL7 messages from a MEFOR JSONL capture, a directory of one-message files, or a single
-    batch file of concatenated messages (split on ``MSH`` line boundaries).
+    batch file of concatenated messages (split on ``MSH`` line boundaries). A file named ``*.jsonl``,
+    named or in a directory, is read as a capture; any other is read as HL7.
 
     Each file is capped at ``max_file_bytes`` (default :data:`DEFAULT_MAX_LOAD_FILE_BYTES`) and refused
     with :class:`LoadError` over it, before it is read whole; so is a named path that is not a regular
-    file. In a directory the cap is a TOTAL across its files, since every message is held at once;
-    only regular files are read, and anything else in it is skipped."""
+    file, and a JSONL line that is not an object with a string ``raw``. In a directory the cap is a
+    TOTAL across its files, since every message is held at once. Only regular files in it are read: a
+    symlink is not followed, as in the File tab's watch pane, and it, anything else that is not a
+    regular file, or an entry gone before it is read is skipped, with a warning that counts the skips."""
     if max_file_bytes <= 0:
         raise ValueError(f"max_file_bytes must be a positive byte count, got {max_file_bytes}")
     p = Path(path)
-    if p.is_dir():
-        out: list[str] = []
-        left = max_file_bytes
-        for child in sorted(p.iterdir()):
-            if child.is_file():
-                data = _read(child, left)
-                left -= len(data)
-                out.extend(_split_batch(data.decode("latin-1")))
-        return out
-    # Decode straight away, so the bytes are not held beside the text while it is split.
-    if p.suffix == ".jsonl":
-        msgs: list[str] = []
-        for line in _read(p, max_file_bytes).decode("utf-8").splitlines():
-            line = line.strip()
-            if line:
-                msgs.append(json.loads(line)["raw"])
-        return msgs
-    return _split_batch(_read(p, max_file_bytes).decode("latin-1"))
+    if not p.is_dir():
+        return _parse(p, _read(p, max_file_bytes))
+    out: list[str] = []
+    left = max_file_bytes
+    skipped = 0
+    for child in sorted(p.iterdir()):
+        # The directory's entries are another system's output, not paths the operator named, so a
+        # symlink among them is not followed: it could point anywhere the operator can read.
+        try:
+            data, reason = read_capped(child, left, follow_symlinks=False)
+        except FileNotFoundError:
+            reason = NOT_REGULAR  # removed since the listing, as a writer's temp file can be
+        if reason == NOT_REGULAR:
+            skipped += 1
+            continue
+        if reason:
+            # The cap passed was what is left of the directory's total, so say so beside it.
+            raise LoadError(
+                f"{child}: {reason}; in a directory that cap is what was left of the "
+                f"{max_file_bytes}-byte total across its files",
+                over_cap=True,
+            )
+        left -= len(data)
+        out.extend(_parse(child, data))
+    if skipped:
+        # A skip is silent in the result, and a key it hides reads as a one-sided difference.
+        _log.warning(
+            "%s: skipped %d %s not a regular file (a symlink is not followed)",
+            p,
+            skipped,
+            "entry that is" if skipped == 1 else "entries that are",
+        )
+    return out
 
 
 def _split_batch(text: str) -> list[str]:

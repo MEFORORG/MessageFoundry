@@ -478,17 +478,19 @@ async def test_a_peer_that_closes_during_a_pause_frees_its_slot() -> None:
     try:
         _reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
         for _ in range(100):
-            if src._active == 1:
+            if src._admission.active == 1:
                 break
             await asyncio.sleep(0.02)
-        assert src._active == 1
+        assert src._admission.active == 1
         writer.close()
         await asyncio.gather(writer.wait_closed(), return_exceptions=True)
         for _ in range(150):
-            if src._active == 0:
+            if src._admission.active == 0:
                 break
             await asyncio.sleep(0.02)
-        assert src._active == 0, "a closed peer kept its max_connections slot for the whole pause"
+        assert src._admission.active == 0, (
+            "a closed peer kept its max_connections slot for the whole pause"
+        )
     finally:
         await asyncio.wait_for(src.stop(), timeout=5.0)
 

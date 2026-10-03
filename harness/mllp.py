@@ -143,7 +143,9 @@ class SendWorker(QObject):
                     sock.sendall(frame(item.payload))
                     if not self._expect_ack:
                         return self._read_no_ack(item, sock, start)
-                    decoder = MLLPDecoder()
+                    # The reply is the engine's, another party's, so it is bounded like the receive
+                    # side (ASVS 5.1.1): an over-cap frame is refused below, never buffered whole.
+                    decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
                     ack = b""
                     while not ack:
                         chunk = sock.recv(4096)
@@ -158,6 +160,9 @@ class SendWorker(QObject):
             latency = (time.monotonic() - start) * 1000.0
             code = _ack_code(ack.decode("utf-8", "replace"))
             return SendResult(item, code in ("AA", "CA"), code, latency, "")
+        except MLLPFrameError as exc:
+            latency = (time.monotonic() - start) * 1000.0
+            return SendResult(item, False, "-", latency, f"reply refused: {exc}")
         except OSError as exc:
             latency = (time.monotonic() - start) * 1000.0
             return SendResult(item, False, "-", latency, str(exc))
@@ -174,9 +179,12 @@ class SendWorker(QObject):
         latency = (time.monotonic() - start) * 1000.0
         if not chunk:
             return SendResult(item, True, "(none)", latency, "")
-        for message in MLLPDecoder().feed(chunk):
-            code = _ack_code(message.decode("utf-8", "replace"))
-            return SendResult(item, False, code, latency, "unexpected ACK")
+        try:
+            for message in MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES).feed(chunk):
+                code = _ack_code(message.decode("utf-8", "replace"))
+                return SendResult(item, False, code, latency, "unexpected ACK")
+        except MLLPFrameError as exc:  # unreachable while one recv is 4096 bytes; kept for the cap
+            return SendResult(item, False, "-", latency, f"reply refused: {exc}")
         return SendResult(item, False, "?", latency, "unexpected reply")
 
 
