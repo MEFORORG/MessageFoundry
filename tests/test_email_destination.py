@@ -785,11 +785,14 @@ def test_a_to_header_that_parses_differently_is_refused_at_construction(
 
 
 @pytest.mark.parametrize("field", ["subject", "sender"])
-def test_a_control_character_in_a_header_setting_is_refused_at_load(field: str) -> None:
-    # Refused at construction, not dead-lettered as an internal error at every send.
+@pytest.mark.parametrize("separator", [13, 10, 0, 0x7F, 0x85, 0x2028, 0x2029])
+def test_a_control_character_in_a_header_setting_is_refused_at_load(
+    field: str, separator: int
+) -> None:
+    # Refused at construction, not dead-lettered as an internal error at every send. Covers every
+    # line separator policy.default refuses, the Unicode ones included.
     dest = _wire_dest(2525, ["a@hospital.example"])
-    value = "x" + chr(13) + chr(10) + "y" if field == "subject" else "e" + chr(10) + "@h.example"
-    dest.settings[field] = value
+    dest.settings[field] = "e" + chr(separator) + "x@hospital.example"
     with pytest.raises(ValueError, match="control character"):
         EmailDestination(dest)
 

@@ -179,10 +179,14 @@ class EmailDestination(DestinationConnector):
         for name, value in (("subject", self.subject), ("sender", self.sender)):
             # A control character in a header value would raise inside _build_message at every
             # send, where it dead-letters as an internal error. Refuse it here, at load.
-            if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            # policy.default refuses every str.splitlines() separator, which includes U+0085,
+            # U+2028 and U+2029 as well as the C0 controls, so test for both.
+            if any(
+                ord(ch) < 32 or ord(ch) == 127 or len(f"a{ch}b".splitlines()) > 1 for ch in value
+            ):
                 raise ValueError(f"Email destination '{name}' holds a control character")
-        # Build the To: header once now and refuse a mismatch here rather than at send time.
-        self._to_header()
+        # Build the To: addresses once, refusing a mismatch here rather than at send time.
+        self._to_addresses = self._to_header()
         username = s.get("username")
         password = s.get("password")
         self.username: str | None = str(username) if username else None
@@ -390,7 +394,7 @@ class EmailDestination(DestinationConnector):
         msg = EmailMessage()
         msg["Subject"] = self.subject
         msg["From"] = self.sender
-        msg["To"] = self._to_header()
+        msg["To"] = self._to_addresses
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
         msg.set_content(payload, charset=self.encoding)
