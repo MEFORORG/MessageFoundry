@@ -23,7 +23,7 @@ from pathlib import Path
 from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
 
 from harness.bounded_file import read_capped
-from harness.drivers.file import drop_atomic
+from harness.drivers.file import drop_atomic, drop_name
 from harness.mllp import Received, SendItem
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -82,8 +82,10 @@ class FileDropWorker(QObject):
 
     def _write_one(self, item: SendItem) -> DropResult:
         try:
+            # The control id is the message's own MSH-10 (the Compose tab parses it from what the
+            # operator pasted), so it is reduced to one safe file name before the join (ASVS 5.3.2).
             target = drop_atomic(
-                Path(self._directory), f"{item.control_id}.hl7", item.payload.encode("utf-8")
+                Path(self._directory), drop_name(item.control_id), item.payload.encode("utf-8")
             )
             return DropResult(item, target.name, "")
         except OSError as exc:

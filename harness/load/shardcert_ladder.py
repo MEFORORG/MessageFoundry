@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import logging
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -66,6 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from harness.bounded_file import read_capped
 from harness.config.shardcert._shape import BROADCAST
 from harness.load.coord import (
     DRIVE_START,
@@ -94,6 +96,31 @@ from harness.load.shardcert import (
     run_shardcert_engine,
     rung_fidelity,
 )
+
+log = logging.getLogger(__name__)
+
+#: The largest per-shard node log the ladder reads for its timing lines (ASVS 5.1.1). The engine under
+#: test writes that log, so it is another party's content and is read through the bounded reader
+#: rather than whole. 1 GiB is 64 times the engine's 16 MiB per-message cap and far past what an
+#: INFO-level node log reaches in a rung's hold; a larger log is refused, logged, and contributes
+#: nothing, the same as a missing one, and is never read in part.
+MAX_NODE_LOG_BYTES = 1 << 30
+
+
+def read_node_log(path: Path, *, max_bytes: int | None = None) -> str | None:
+    """The text of one node log, or ``None`` when it is missing, unreadable, not a regular file, or
+    over ``max_bytes`` (default :data:`MAX_NODE_LOG_BYTES`). A refusal is logged with the path and
+    the reason, never the log's content."""
+    cap = MAX_NODE_LOG_BYTES if max_bytes is None else max_bytes
+    try:
+        data, refused = read_capped(Path(path), cap)
+    except OSError:
+        return None
+    if refused:
+        log.warning("node log %s refused: %s", path, refused)
+        return None
+    return data.decode("utf-8", "replace")
+
 
 #: 45M messages/day as the sustained TOTAL message-event rate (inbound + outbound) the ladder pins
 #: against. NOT an ingress rate: one ingress message DELIVERED to ``delivering`` (D) destinations produces
@@ -308,9 +335,8 @@ def aggregate_phase_timing(
     md_max = 0.0
     windows = 0
     for path in log_paths:
-        try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = read_node_log(path)
+        if text is None:
             continue
         matches = _phase_lines(text)
         if drop_first_window:
@@ -447,9 +473,8 @@ def aggregate_claim_timing(
     windows = 0
     per_stage: dict[str, dict[str, float]] = {}
     for path in log_paths:
-        try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = read_node_log(path)
+        if text is None:
             continue
         matches = _claim_lines(text)
         if drop_first_window:
@@ -735,9 +760,8 @@ def aggregate_episode_timing(
     blend = _EpisodeAcc()
     per_stage: dict[str, _EpisodeAcc] = {}
     for path in log_paths:
-        try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        text = read_node_log(path)
+        if text is None:
             continue
         matches = _episode_lines(text)
         if drop_first_window:

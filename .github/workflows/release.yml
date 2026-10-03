@@ -1,7 +1,14 @@
 # Release — build, SBOM, Sigstore-sign, publish a GitHub release, and upload to PyPI when a `vX.Y.Z`
 # tag is pushed.
 #
-# Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main).
+# Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main;
+#                 the `tag-provenance` job refuses any other, vault BACKLOG #2631).
+#
+#                 THE GITHUB RELEASE IS A DRAFT UNTIL EVERY ASSET IS ON IT. `release` creates it as a
+#                 draft, `release-harness` attaches to the draft, and `publish-github-release` publishes
+#                 it last. No job adds an asset to a published release, which is what lets the owner
+#                 turn on immutable releases (vault BACKLOG #2631, limb 6). A console release is made
+#                 by one call that carries its one asset.
 # Dry-run:        run this workflow manually (workflow_dispatch) — it builds + SBOMs + signs and uploads
 #                 the artifacts for inspection. It does NOT create a GitHub release, does NOT publish
 #                 to PyPI and does NOT write an SLSA attestation, so the dry-run validates
@@ -50,7 +57,8 @@
 # stays a no-op until the OWNER (one-time): (1) configures a `messagefoundry-harness` PyPI Trusted
 # Publisher — a PENDING publisher for repo MEFORORG/MessageFoundry + workflow `release.yml` (blank
 # environment, matching the engine) — then (2) sets repo variable PUBLISH_HARNESS=true. Until then the
-# job still BUILDS + version-checks the harness wheel each release and attaches it to the GitHub release.
+# job still BUILDS + version-checks the harness wheel each release and attaches it to the draft GitHub
+# release.
 #
 # THIRD distribution — `messagefoundry-toolkit` (the authoring and development commands, ADR 0201,
 # packaging/messagefoundry-toolkit/) — is built, gated, smoked and published INSIDE the `release` job,
@@ -79,6 +87,44 @@ on:
 permissions: {}
 
 jobs:
+  # THE TAGGED COMMIT MUST BE ON `main` AND HAVE PASSED MAIN'S REQUIRED CHECKS, BEFORE ANYTHING IS
+  # BUILT (vault BACKLOG #2631, limb 2). Nothing asked this before, so a tag on an unmerged branch,
+  # or on a merge whose checks went red, would build, sign and publish like a tag on a reviewed
+  # commit. scripts/release/tag_provenance.py holds the rule and says where its promise ends.
+  #
+  # Its own job, so the read scopes it needs (checks, statuses) never sit in a job that signs or
+  # publishes. Every job that builds a release artifact `needs:` it. It RUNS on a dispatch too, with
+  # its one step skipped, because a skipped job would skip every job that needs it and so end the
+  # dry-run. On a dispatch the dry-run therefore builds from a commit nobody vouched for, which is
+  # fine: a dispatch publishes nothing (the header says so, and tests/test_release_pipeline.py holds it).
+  tag-provenance:
+    if: github.repository == 'MEFORORG/MessageFoundry'
+    runs-on: ubuntu-latest
+    # Read-only API calls, plus up to 30 minutes waiting for a required check still running on the
+    # tagged commit (tag_provenance.py --wait-seconds), with room for one slow final read.
+    timeout-minutes: 50
+    permissions:
+      contents: read   # the compare and branch endpoints, and the checkout
+      checks: read     # the check runs on the tagged commit
+      statuses: read   # the commit statuses on the tagged commit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # `git rev-parse HEAD`, not $GITHUB_SHA: the checkout above is the commit every build job
+      # checks out, and HEAD is that commit even when the tag is annotated.
+      - name: The tagged commit is on main and passed main's required checks
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/release/tag_provenance.py --repo "$GITHUB_REPOSITORY" --sha "$(git rev-parse HEAD)"
+
   # THE TWO ENGINE SBOMS ARE BUILT BY THE TWO UNPRIVILEGED JOBS BELOW, AND ONLY SIGNED BY `release`.
   #
   # Each holds `contents: read` and nothing else: no id-token, no attestations, no write. So the
@@ -250,7 +296,8 @@ jobs:
     # engine release built from `webconsole-v*` would ship the engine at the console's version.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
     # The two engine SBOMs it signs; the comment above `sbom-linux` says why they are built apart.
-    needs: [sbom-linux, sbom-windows]
+    # And the provenance gate, so nothing here is built from a commit that is not on main.
+    needs: [tag-provenance, sbom-linux, sbom-windows]
     runs-on: ubuntu-latest
     # Hang backstop against GitHub's 360-minute default; security.yml's `jobs:` note carries the
     # reasoning. The most generous cap in this file: it builds, signs and publishes, so it waits on
@@ -1020,14 +1067,31 @@ jobs:
                    messagefoundry-sbom.cdx.json messagefoundry-sbom.cdx.json.sigstore*
                    messagefoundry-sbom-windows.cdx.json messagefoundry-sbom-windows.cdx.json.sigstore*
                    messagefoundry-vex.openvex.json messagefoundry-vex.openvex.json.sigstore* )
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists — updating in place (this is a re-run)."
+          # A DRAFT, NOT A PUBLISHED RELEASE (vault BACKLOG #2631, limb 6). An immutable release
+          # refuses any asset change once it is published, and the harness job attaches its wheel
+          # after this one. So every asset goes onto a draft, and the `publish-github-release` job
+          # publishes it last, once every job that attaches an asset has succeeded.
+          # A re-run edits the draft; a release that is already published is left alone, because
+          # nothing may change its assets and the run that published it attached every one.
+          # Only "release not found" means absent. Any other read failure (an API error, a rate
+          # limit) refuses, rather than trying a create that would fail and hide the real error.
+          err=$(mktemp)
+          if ! is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>"$err"); then
+            if ! grep -q "release not found" "$err"; then
+              cat "$err" >&2
+              echo "::error::could not read release $tag, and it is not reported missing; refusing to guess"
+              exit 1
+            fi
+            gh release create "$tag" "${assets[@]}" --draft --title "$tag" --notes-file notes.md $pre_create
+          elif [ "$is_draft" = "true" ]; then
+            echo "Draft release $tag already exists — updating it in place (this is a re-run)."
             gh release edit "$tag" --title "$tag" --notes-file notes.md "$pre_edit"
             # --clobber: re-uploading an existing asset name errors otherwise, and a re-run regenerates
-            # every artifact (fresh signatures), so replacing is the correct semantic.
+            # every artifact (fresh signatures), so replacing is the correct semantic. It is safe only
+            # because the release is still a draft.
             gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" "${assets[@]}" --title "$tag" --notes-file notes.md $pre_create
+            echo "::notice::Release $tag is already published; its assets are not changed (vault BACKLOG #2631)."
           fi
 
       - name: Upload artifacts (dry-run / always)
@@ -1042,10 +1106,10 @@ jobs:
         # gated on a mutually exclusive ref), so the singular wording is the finding.
         # Every OTHER failure mode keeps the always() behaviour this step exists for: a build, sign,
         # SBOM, release or publish failure still uploads whatever dist/ holds. ONE EXCEPTION sits
-        # outside this job: when either SBOM job (`sbom-linux`, `sbom-windows`) fails, `needs:` skips
-        # this whole job, so a dry run uploads nothing. That job's own log names the cause, and a
-        # release that cannot produce both engine SBOMs must not ship, so the trade is taken
-        # deliberately.
+        # outside this job: when a job it needs (`tag-provenance`, `sbom-linux`, `sbom-windows`)
+        # fails, `needs:` skips this whole job, so nothing uploads. That job's own log names the
+        # cause, and a release that cannot produce both engine SBOMs, or whose commit is not on
+        # main, must not ship, so the trade is taken deliberately.
         # DELIBERATELY THE WHOLE STEP'S OUTCOME, not just its leak branch. The gate exits non-zero
         # from several paths and only one of them is "a member is outside the allowlist" — the rest
         # are "the listing did not succeed / did not cover the file / is not our archive". Narrowing
@@ -1141,10 +1205,13 @@ jobs:
     # tests/test_install_instruction_provenance.py holds the classification (`_PUBLISHED_DISTRIBUTIONS`)
     # and fails if any tracked text drifts back to the pre-claim claim.
     if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-')
+    # The provenance gate only, never `release`: the console's cadence is its own (see above), but a
+    # console tag must name a commit on main as much as an engine tag must.
+    needs: [tag-provenance]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      contents: write   # gh release upload (attach the console wheel)
+      contents: write   # gh release create (the console release, with its wheel)
       id-token: write   # PyPI Trusted Publishing (OIDC) — no API token anywhere
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1439,7 +1506,7 @@ jobs:
       # release) would fail with "release not found" on every console tag, killing the job BEFORE the
       # publish step below — i.e. the one job whose purpose is to claim the PyPI name could never claim it.
       #
-      # The update arm is equally load-bearing: v0.3.1 showed a bare `gh release create` turns a single
+      # The re-run arm is equally load-bearing: v0.3.1 showed a bare `gh release create` turns a single
       # PyPI failure into a permanent retry deadlock (every re-run dies here and SKIPS the publish, so a
       # re-run cannot even test the fix it exists to verify). Step ORDER is deliberate and matches the
       # engine: the reversible action (a GitHub release, deletable) precedes the irreversible one (a PyPI
@@ -1458,16 +1525,25 @@ jobs:
           # The same 125,000-character ceiling as the engine release step above.
           python scripts/release/release_notes.py notes.md \
             --full-url "https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/packaging/messagefoundry-webconsole/CHANGELOG.md"
-          case "$ver" in
-            *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
-            *)   pre_create="";             pre_edit="--prerelease=false" ;;
-          esac
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists — updating in place (this is a re-run)."
-            gh release edit "$tag" --title "$tag" --notes-file notes.md "$pre_edit"
-            gh release upload "$tag" webconsole-dist/*.whl --clobber
-          else
+          pre_create=""; case "$ver" in *-*) pre_create="--prerelease" ;; esac
+          # ONE CALL CREATES THE RELEASE WITH ITS ONE ASSET (vault BACKLOG #2631, limb 6). So a
+          # re-run leaves a published release alone: the call that created it attached the wheel,
+          # and a re-upload to a published release would be refused before the PyPI publish below.
+          # `gh release create` makes a draft, uploads, then publishes, so an interrupted create can
+          # leave a DRAFT. A re-run finishes that one: attach, then publish.
+          err=$(mktemp)
+          if ! is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>"$err"); then
+            if ! grep -q "release not found" "$err"; then
+              cat "$err" >&2
+              echo "::error::could not read release $tag, and it is not reported missing; refusing to guess"
+              exit 1
+            fi
             gh release create "$tag" webconsole-dist/*.whl --title "$tag" --notes-file notes.md $pre_create
+          elif [ "$is_draft" = "true" ]; then
+            gh release upload "$tag" webconsole-dist/*.whl --clobber
+            gh release edit "$tag" --draft=false
+          else
+            echo "::notice::Release $tag is already published; its assets are not changed (vault BACKLOG #2631)."
           fi
 
       - name: Upload console artifact (dry-run / always)
@@ -1796,11 +1872,28 @@ jobs:
           PYVER
           fi
 
-      - name: Attach the harness wheel to the GitHub release
+      # Onto the DRAFT (vault BACKLOG #2631, limb 6; the header says why). A published release means
+      # an earlier run finished, so this step checks the wheel is on it rather than uploading.
+      - name: Attach the harness wheel to the draft GitHub release
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" harness-dist/*.whl --clobber
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # One read: the first line is isDraft, the rest are the asset names.
+          view=$(gh release view "$tag" --json isDraft,assets --jq '.isDraft, .assets[].name')
+          if [ "${view%%$'\n'*}" = "true" ]; then
+            gh release upload "$tag" harness-dist/*.whl --clobber
+            exit 0
+          fi
+          attached="${view#*$'\n'}"
+          for wheel in harness-dist/*.whl; do
+            if ! grep -qxF "$(basename "$wheel")" <<<"$attached"; then
+              echo "::error::release $tag is published without $(basename "$wheel"), and a published release's assets cannot change (vault BACKLOG #2631)"
+              exit 1
+            fi
+          done
+          echo "::notice::Release $tag is already published with its harness wheel; nothing is uploaded."
 
       - name: Upload harness artifact (dry-run / always)
         # always() so a FAILED build still yields something to inspect -- but never an
@@ -1821,3 +1914,35 @@ jobs:
           packages-dir: harness-dist/
           skip-existing: true
           attestations: true
+
+  # PUBLISH THE ENGINE'S GITHUB RELEASE LAST, ONCE EVERY ASSET IS ON IT (vault BACKLOG #2631, limb 6;
+  # the header says why). Its `needs:` is every job that attaches an asset to the engine release. A
+  # job added later that attaches one must join it; tests/test_release_pipeline.py fails until it does.
+  #
+  # If `release-harness` fails, this job is skipped and the release stays a draft. The engine is
+  # already on PyPI by then, as it was before this job existed; re-running the failed jobs finishes
+  # the release. A draft is never published with an asset missing.
+  publish-github-release:
+    # The event-and-ref pair sits on the job, so a dispatch never schedules it at all.
+    if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [release, release-harness]
+    runs-on: ubuntu-latest
+    # One or two API calls.
+    timeout-minutes: 10
+    permissions:
+      contents: write   # gh release edit (take the release out of draft)
+    steps:
+      # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
+      - name: Publish the draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
+          if [ "$is_draft" = "true" ]; then
+            gh release edit "$tag" --draft=false
+            echo "Published release $tag."
+          else
+            echo "::notice::Release $tag is already published (this is a re-run)."
+          fi
