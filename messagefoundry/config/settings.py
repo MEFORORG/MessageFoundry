@@ -6807,9 +6807,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 #: The one sign-in that proves a second factor without an enrolled one, worded once for the MFA
 #: advisories here and the exposure texts in ``__main__._serve``. ``_check_mfa_gate`` checks the
 #: amr/acr claim, and the OIDC mint stamps the session verified, only while this setting is on.
-#: Neither this name nor the helper's below may hold ``mfa`` as a whole word, such as ``_mfa_``.
-#: CodeQL classes such a name as a password, so every log line carrying the text would raise
-#: ``py/clear-text-logging-sensitive-data``, though the text is a fixed sentence.
+#: Neither this name nor the helper's below may hold ``mfa`` as a separate word. CodeQL reads such a
+#: name as a password source (the ``mfa_verify_min_elapsed_seconds`` note above, same cause), so
+#: every log line carrying this fixed sentence would raise ``py/clear-text-logging-sensitive-data``.
 OIDC_SECOND_FACTOR_CLAIM_EXCEPTION = (
     "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
 )
