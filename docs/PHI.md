@@ -290,6 +290,77 @@ store key file, such as `provision-admin` and `rotate-key`, logs a warning and g
 and logs, so runtime PHI is never committed. Keep it that way — never `git add -f` a database or a
 real message file.
 
+### The test harness's own at-rest data (`harness/`)
+
+**`[MIXED]`** — the harness is a separately distributed wheel, and the owner ruling of 2026-10-02
+put it inside the ASVS assessed scope. Its at-rest data is inventoried here, apart from the engine
+table above, because the harness chooses where it lives, what protects it and how long it stays.
+Most of it is ordinary files written with whatever mode the harness code chose. Two kinds are
+databases: the engine stores the load rigs start, which hold the engine tiers above but which the
+harness creates for a run and never removes, and the SQL Server tables the database scenarios
+create. Each row is rated on the five-level scale above, at the level of the engine tier it
+matches where there is one (the TLS private key has none and is rated PL-3 as an authentication
+secret), and §3's per-level blocks list it. The census was taken from the code under `harness/` on 2026-10-03, and the rows below are
+**at least** what the harness writes; a writer added later is not covered until it is added here.
+
+**This table is the single statement of each harness store's facts.** §3, the threat matrix, §8,
+§10 and §12 point here rather than restating them.
+
+**Synthetic by default, and four stores are not.** Most harness commands generate their messages
+(`messagefoundry.generators`), so on a developer box most bodies below are synthetic. Four take
+whatever the operator feeds them: the reconcile capture and its compare report, which the
+shadow-phase procedure runs against a migrating site's real outbound stream; the Corepoint export
+that compare reads beside the capture; and the file drop, which the GUI's Compose tab feeds with
+any text an operator pastes. On a deploying site that runs them against a real feed, those stores
+**would hold PHI**. MessageFoundry has no production deployment today, so no harness file holds a
+site's PHI now; the gaps below are defects in the shipped code, not live exposures.
+
+**No harness store holds a password or a session token.** The rig Administrator's password lives
+only in process environments (`harness/load/rigadmin.py` says so and writes no file), the `--token`
+flag and the GUI's sign-in session are held in memory, and the SFTP share's and the database
+scenarios' credentials are read from the environment. A rig engine's own store holds the rig
+account's argon2id hash and hashed sessions, which are the engine's `users` / `sessions` tiers
+above. The one harness-written secret is the TLS private key row below.
+
+**Permissions, read once.** "Default mode" below means the file or directory was created by an
+ordinary `open` / `write_text` / `write_bytes` / `mkdir` with no mode argument: the process umask
+on POSIX (commonly `0644` for a file and `0755` for a directory) and the parent directory's
+inherited ACL on Windows. `mkdtemp` makes a directory with mode `0700` on POSIX and, on Windows,
+with the protected DACL Python writes for that mode, as the backup staging row above states; what
+is created inside such a directory inherits that DACL on Windows. `mkstemp` makes a file with mode
+`0600` on POSIX. No harness writer calls `restricted_file` or the engine's `icacls` enforcer.
+
+**How the last column grades.** None of these stores has a cipher of its own, so a PL-1 or PL-3 row
+is graded on the two controls the harness does or does not apply: access restricted to the account
+that ran it, and a bound on how long the data stays. **Yes** means both, **Partly** one, **No**
+neither. Whether the bodies are synthetic does not change the grade; it is stated in the Holds
+column, because the same code would hold a real body on the paths an operator can feed. A PL-4 row
+is graded against PL-4 instead, which asks for no cipher and accepts metadata kept indefinitely, so
+it reads **Yes** when it holds metadata only.
+
+| Harness store | Written by | Holds | Permissions as written | Retention | Protection level | Meets its level? |
+|---|---|---|---|---|---|---|
+| `reconcile capture --out` JSONL (`harness/reconcile/capture.py`, `CaptureSink`) | the reconcile capture subcommand | **Whole message bodies** — one JSON line per message an engine outbound delivered to the sink: `control_id`, the verbatim `raw` body, `received_at`. An unparseable delivery is captured too. Its docstring places it in the shadow phase, against the migrating site's real outbound stream | **Default mode**, for the file and the parent directory it creates. Opened in append mode, so a restart adds to it | **None** — never rotated, truncated or deleted by the harness. `compare` reads it and leaves it | **PL-1** | **No.** Default mode and no retention, over plaintext whole bodies. `CaptureSink` takes an `anonymizer` argument and fails closed when it raises, but the CLI passes none and has no flag for one, so the command line always writes raw bodies. The documented example path, `captures/<connection>.jsonl` relative to the working directory, is not matched by `.gitignore` (measured with `git check-ignore`), so a capture run from a checkout lands in an untracked, unignored file |
+| `reconcile compare --report-json` (`harness/reconcile/report.py`, `render_json`) | the reconcile compare subcommand | **Body slices** — per mismatched pair, the match key (MSH-10 by default, any field under `--key`) and each difference's `left` / `right` values: a field value, or a whole verbatim segment for a segment present on one side only. Plus the key lists of unmatched and duplicate messages, which are MRNs under `--key PID-3`. `compare` also prints up to 20 mismatched messages' differences and up to 20 unmatched keys of each side to stdout on every run, report or not | **Default mode**, file and parent directory | **None** | **PL-1** | **No.** Default mode and no retention, over slices of the same real-feed messages as the capture. Its other input, the Corepoint export named by `--corepoint`, is written by the operator, not the harness, and is a PL-1 copy of its own; its documented example path, `exports/<connection>.hl7`, is not matched by `.gitignore` either |
+| `MEFOR_BENCH_KEEP_NODE_LOGS` node logs (`harness/load/failover.py`, `EngineNode`; set per rung by the shardcert ladder's `--keep-logs-dir`, default `./shardcert-ladder-nodelogs`) | load rigs that start an engine node | The node engine's whole stdout and stderr: its application log, redacted as §7 describes and no further, over the rig's synthetic load corpus | **Kept mode:** `<dir>/<node_id>.log` at **default mode**, directory too. **Variable unset:** a `NamedTemporaryFile` in the OS temp dir, mode `0600` on POSIX | **Kept mode: none** — kept on purpose for post-run phase timing. Variable unset: unlinked at the node's `stop()`, so a harness crash or `SIGKILL` leaves it | **PL-1** | **No in kept mode**, where the engine's own log tier gets `[retention].app_log_days` and an installer ACL. **Partly** with the variable unset: restricted on POSIX, removed on a clean stop |
+| `mefor-estate-*`, `mefor-connscale-*` and `mefor-ingress-probe-*` rig store dirs; the `--db` file of a SQLite multishard run; and a rig's server-DB store named by its `MEFOR_STORE_*` environment | the load rigs (estate, connscale, the ingress probe, multishard, failover, shardcert, the batch drive) | A whole engine store holding every tier in the engine table above for the run's synthetic traffic, plus, on a rig that signs in, the rig Administrator account | The temp dirs are made by `mkdtemp`, and the store file and its `-wal` / `-shm` get the engine's own SQLite `_secure_file` when the engine opens it. A `--db` path is wherever the operator names, and a server-DB store's permissions are the DBA's | **None after the run** — the harness never removes these dirs (connscale makes one per matrix cell) and never purges a server-DB store it drove. While a node runs, its engine's own retention settings apply | **PL-1** | **Partly** for a SQLite store: the file is restricted, but nothing bounds it. **No** for a server-DB store, which the harness neither restricts nor purges. No rig supplies a store key, so the bodies are plaintext in the file; a node started through `EngineNode` also defaults `MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI` to `true`, the audited escape that lets a keyless store start. While a rig runs, its engine serves the store over its API to whatever sign-in that rig configured |
+| `dbo.mf_harness_inbox` / `dbo.mf_harness_outbox` (`harness/drivers/_database.py`) | the database scenarios (SQL Server only) | **Whole message bodies** in a `payload NVARCHAR(MAX)` column: the driver inserts each scenario message into the inbox, and the engine's DATABASE outbound writes its output into the outbox | The SQL Server's own grants, which are the DBA's; the harness applies none | **None** — the harness marks an inbox row `DONE` and never deletes a row from either table | **PL-1** | **No** — no harness control on access and no bound. Scenario bodies are generated |
+| `mefor-harness-tls-*` dir (`harness/load/tlsmat.py`) | the load harness: every `EngineNode` start, and the engine poller when it reads a loopback `https` URL with no CA file named, so a load run against an engine the operator started mints one too | A self-signed API certificate and **its private key**, minted once per harness process and inherited by child harness processes through the environment | `mkdtemp` dir. The key file is written at default mode inside it and then `chmod 0600`, which sets the POSIX mode and changes nothing on Windows, where the file keeps the directory's DACL | **None** — never removed | **PL-3** | **Partly.** Restricted by its directory, but not created through `restricted_file` as the engine's key files are, and never deleted. It is a throwaway anchor for loopback rigs: disclosure lets a local reader impersonate a rig engine, not a deployed one |
+| `harness-sftp-*` SFTP share root (`harness/sinks/_sftp_server.py`, `SftpShare`) | the remotefile scenarios | The bodies the engine's REMOTEFILE outbound delivers and the remotefile driver uploads, which are generated | `mkdtemp` root. Its two served directories are created at default mode inside it; a file a client creates is opened `0o600`, and a directory a client creates `0o700` | Removed by `SftpShare.stop()`, retried, then a WARNING naming the dir if it cannot be; a crash or `SIGKILL` leaves it | **PL-1** | **Partly.** Restricted by its root and removed on a clean stop; the crash residual is unbounded |
+| `remotefile_known_hosts` file (default `./harness_io/remotefile/known_hosts`) | the SFTP share, on start | Public host keys pinned for the share's loopback address | Rewritten through `mkstemp`, keeping the previous file's mode; the first write gets `0600` on POSIX | **None** | **PL-4** | **Yes** — public keys, not secrets |
+| Fuzz failing cases, `messagefoundry-harness-fuzz-*` or `--fuzz-out` (`harness/fuzz/campaign.py`) | the fuzz campaign | **Whole mutated message bodies**, one `.bin` per failing case, generated from the seed and iteration | The default dir is made by `mkdtemp`; each case file is written at **default mode**. A `--fuzz-out` dir is wherever the operator names | **None** | **PL-1** | **Partly** in the default dir, which restricts it; **No** under a `--fuzz-out` that does not |
+| `drop_atomic` file drop dirs (`harness/drivers/file.py`, used by the scenario file driver and the GUI File tab) | the scenario file driver and the GUI | A whole message per file: a generated one, or the Compose tab's pasted text | Each file is created by `mkstemp` and hard-linked to its final name, so it keeps mode `0600` on POSIX; the dir is created at default mode | Consumed by the engine's File inbound, after which the engine's File-connector row above governs. A file no inbound polls stays indefinitely | **PL-1** | **Partly.** Restricted per file on POSIX, with no bound of its own |
+| `pytest-of-<user>` basetemp dirs left by the acceptance runner's pytest child (`harness/acceptance/runner.py`) | the acceptance matrix | The backing test suites' temporary stores and synthetic messages | pytest's own: the parent dir is created mode `0700` | pytest keeps its most recent three runs by default | **PL-1** | **Yes** |
+| `MEFOR_COORD_DIR` coord files (default `C:\mefor_coord`, `harness/load/coord.py`) | the two-box load rigs | `<run_id>.<name>.json` handshake messages: ports, shard ids, timestamps, counts and synthetic topology labels. The module's own rule is never a control id or a body | **Default mode**, file and directory; often a shared mount between two boxes | Cleared per message name when the next run with the same `run_id` starts; otherwise **none** | **PL-4** | **Yes** |
+| `--report-json` / `--report-csv` / `--report-md` / `--report-compare` run reports, the acceptance `--xlsx` write-back and the `mefor-batch2box-*` per-process report dirs | the load, scenario, acceptance and batch commands | Counts, latencies, verdicts, ids and probe detail text; their writers state metadata only. **Except** the reconcile compare `--report-json`, which is PL-1 in its own row | **Default mode** (a batch report dir by `mkdtemp`) | **None** | **PL-4** | **Yes** |
+| Qt `QSettings` (`harness/_console_widgets.py`) | the GUI | Table column layout | The platform's own settings store (the registry on Windows) | Kept until removed | **PL-4** | **Yes** — no message data |
+
+Files the harness deletes in the same call are not listed: at least the acceptance runner's own
+`TemporaryDirectory` and its `NamedTemporaryFile` write probe. The scenario sinks for the network
+transports (MLLP, TCP, HTTP and the like under `harness/sinks/`) hold what they receive in memory;
+the file sink reads a directory the engine writes, which is the engine's File-connector row, and
+the database sink reads the scenario tables above.
+
 ### At-rest threat-coverage matrix
 
 **`[MIXED]`** — which encryption layer covers which at-rest threat, per backend. The layers are
@@ -306,6 +377,7 @@ different attackers, so the column below is "which threat does each layer answer
 | `summary`/`metadata` (MRN, patient name) | **Covered** (EF-3 — ciphered like `raw`) | Covered | Powered-off only |
 | Plaintext residual columns (`control_id`, `message_type` — low-sensitivity routing/dedup keys) | **Not** covered (by design — these stay plaintext for indexing) | **Covered** | Powered-off only |
 | Journals + version stores — SQLite `-wal`/`-shm`/temp; **SQL Server `.ldf` + tempdb version store**; Postgres `pg_wal` (**PL-5**) | Not covered (app cipher can't reach them) | **Covered** | Powered-off only |
+| Test-harness stores ([harness table above](#the-test-harnesss-own-at-rest-data-harness)), at least the reconcile capture and its compare report | **Not covered. Known gap:** no harness file has a cipher, and the rig stores run with no store key | **Not covered** for the harness files, which are not a database, or for a rig's SQLite store, where no rig turns SQLCipher on. For a rig's server-DB store and the scenario tables it is the DBA's TDE, as for the engine's own server store | Powered-off only; a live copy reads them in the clear |
 
 **Per-backend whole-DB layer.** SQLite = **SQLCipher** (the documented whole-DB alternative, §3) —
 a native dependency that replaces the connect path. SQL Server = **TDE** (Transparent Data
@@ -559,7 +631,21 @@ a statement about *what is built today*; where a control does not exist, it says
 `mefor-verify-*` staging dirs (a SQLite store's data dir, or `.mefor-staging` under the backup
 destination, or for a standalone verify a private dir under the OS temp dir) · `mefor-restore-*` staging dirs (the
 **destination** volume) · File-connector spill dirs · application log files (`[logging].log_dir`) ·
-the off-box forwarder spool (`[logging].forward_spool_dir`).
+the off-box forwarder spool (`[logging].forward_spool_dir`) · and, from the
+[test harness table](#the-test-harnesss-own-at-rest-data-harness), the `reconcile capture --out`
+JSONL · the `reconcile compare --report-json` report · `MEFOR_BENCH_KEEP_NODE_LOGS` node logs · the
+`mefor-estate-*` / `mefor-connscale-*` / `mefor-ingress-probe-*`, `--db` and server-DB rig stores ·
+the `dbo.mf_harness_inbox` / `dbo.mf_harness_outbox` scenario tables · the `harness-sftp-*` share ·
+`messagefoundry-harness-fuzz-*` cases · the `drop_atomic` file drops · `pytest-of-<user>` basetemp
+dirs.
+
+**The bullets below describe the engine's tiers. The harness tiers in that list get none of them
+once a run ends**; a rig store gets the engine's access and retention controls only while its node
+is running.
+The level's requirement still applies to them: a body is encrypted at rest or kept on an encrypted,
+restricted volume, read only by those entitled to it, and bounded in time. The harness table says
+per tier which of those its code provides, and an operator carries the rest
+([§10](#10-secure-deployment--operations-checklist)).
 
 - **Encryption**, stated per tier rather than as one blanket rule:
   - *Database cells and the `[store].uploads_dir` sidecars* — the store cipher (AES-256-GCM, or
@@ -688,7 +774,12 @@ the off-box forwarder spool (`[logging].forward_spool_dir`).
 
 #### PL-3 · Authentication secret
 
-**Applies to:** `users.totp_secret`.
+**Applies to:** `users.totp_secret` · and the test harness's TLS private key in its
+`mefor-harness-tls-*` dir.
+
+**Everything below this line is about `users.totp_secret` and none of it holds for the harness
+key**, which is a plaintext PEM file with no cipher and no retention. Its handling is in the
+[harness table](#the-test-harnesss-own-at-rest-data-harness).
 
 Encrypted with the store cipher (AAD `("users","totp_secret",id)`); integrity from the GCM tag.
 
@@ -712,7 +803,11 @@ is no plaintext to protect.
 `channel_id` · `messages.control_id` / `message_type` · `webauthn_credentials.public_key` · `state.namespace` /
 `state.key` · `reference.name` / `version` / `key` · `connection_event.peer_host` · the `attachment`
 header row (`content_type`, `total_bytes`, `refcount`, `created_at`) + the `message_attachment`
-linkage · `secret_rotation_meta` (all three backends) · `.mfbak` on the server backends.
+linkage · `secret_rotation_meta` (all three backends) · `.mfbak` on the server backends · and,
+from the [harness table](#the-test-harnesss-own-at-rest-data-harness), the `MEFOR_COORD_DIR` coord
+files · the load, scenario and acceptance run reports (`--report-json` and its siblings, but **not**
+the reconcile compare report, which is PL-1) · the `remotefile_known_hosts` pin file · the GUI's
+`QSettings` layout.
 
 Deliberately **not** ciphered, so that ids stay indexable and the audit trail stays greppable for
 incident response. Integrity for `audit_log` comes from the **tamper-evident hash chain** (the `client`
@@ -760,6 +855,8 @@ on the store-file ACL plus the volume/whole-DB layer for the rest.
   place by the watcher's upsert (all three backends since #1186).
 - `.mfbak` — keep-N (`[backup].retention_keep`), as PL-1; the canonical name only, with `.failed` / `.part`
   archives unbounded as PL-1 records.
+- The test harness's PL-4 files — each row of the
+  [harness table](#the-test-harnesss-own-at-rest-data-harness) states its own retention.
 
 **Logging.** Metadata only. Ids, counts, connection/destination names, client addresses and hashes may
 appear in the rotating log and in audit rows by design — that is what makes an incident traceable —
@@ -1584,6 +1681,7 @@ window purely so a replay can be richer — is precisely the defect ASVS 14.2.7 
 | `mefor-backup-*` / `mefor-verify-*` staging dirs | no window. Where these dirs live, what the engine applies to them, and how the next backup's lock-proven sweep removes what a crash leaves are stated once, in §2's row (BACKLOG #1174). That sweep runs only when a backup runs, so it is not a window, and §2's row lists what it leaves unbounded, at least. `verify_after_backup` (default `true`) still decrypts a full archive back out on **every** run. On a server-DB store each run's dir in `.mefor-staging` must be owner-only or the run refuses, but the blocks a removed file freed are still covered only by the operator's volume encryption: restrict the destination to the service account and encrypt its volume ([§10](#10-secure-deployment--operations-checklist)). A standalone verify stages in the OS temp dir instead, so there the cover is FDE on the temp volume ([§10](#10-secure-deployment--operations-checklist)) |
 | `mefor-restore-*` staging dirs | no window on a clean exit — the `TemporaryDirectory` unlinks, and a restore is an operator-driven one-shot rather than a scheduled repeat, so nothing accumulates. It survives a crash or `SIGKILL`, and unlike the backup and verify staging above no sweep removes it. The engine applies its file ACL here (`_secure_file` on the staged tar and on the extracted store), so the operator's directory ACL is the backstop rather than the only control. If the teardown itself fails -- on Windows, a scanner or the indexer still holding the extracted store open -- `restore` exits non-zero as `restore failed (cleanup)`, names the directory, and leaves the restored store and bundle in place rather than rolling them back; the directory still holds the decrypted archive and store, and is the operator's to delete once nothing holds it open (BACKLOG #1717) |
 | File-connector output / spill dirs (`.hl7`, `.processed`, `.error`) | no window, and no engine sweep of any kind — `pipeline/retention.py`'s only filesystem pass is `_sweep_app_logs`, which scans the log directory alone. These are operator-configured output paths, so the engine deleting from them would be deleting data an operator or a downstream system owns. On a first deployment they would accumulate plaintext **PL-1** bodies indefinitely; the cover is the operator's: volume or share encryption plus an ACL ([§10](#10-secure-deployment--operations-checklist)) |
+| Test-harness stores (the [harness table](#the-test-harnesss-own-at-rest-data-harness) in §2) | no engine sweep removes them after a run, and that table states each one's retention. The stores an operator can feed real messages, and which would then accumulate them, are named there: at least the reconcile capture, its compare report and the Compose-fed file drop |
 | `users.totp_secret` | no window by design — it lives and dies with the user row |
 | `audit_log`, `delivered_keys`, `resend_log` | keep-forever by design (see below) |
 | `messages.control_id`, `messages.message_type` | kept for the life of the message row by design (dedup/routing keys) |
@@ -1841,6 +1939,14 @@ For operators standing up the engine (see also [SERVICE.md](SERVICE.md)):
 - [ ] **Supply secrets via env**, never the TOML (`MEFOR_STORE_PASSWORD`,
       `MEFOR_AUTH_AD_BIND_PASSWORD`, future `MEFOR_STORE_ENCRYPTION_KEY`).
 - [ ] **Never feed real PHI to `dryrun`/`generate`** or redirect their output to shared locations (§7).
+- [ ] **Treat the harness's real-feed files as PHI.** Before running `python -m harness.reconcile`
+      against a real feed, put the capture (`--out`), the Corepoint export (`--corepoint`) and the
+      compare report (`--report-json`) in a directory restricted to the account that runs it, on an
+      encrypted volume, outside any source checkout, and delete all three once the connection is
+      signed off. Do not redirect `compare`'s stdout to a file, ticket or CI log: it prints field
+      values. Do not paste a real message into the harness GUI's Compose tab. The harness does none
+      of this itself ([§2 harness table](#the-test-harnesss-own-at-rest-data-harness),
+      [§12](#12-known-limitations-current-honest)).
 
 ---
 
@@ -1920,6 +2026,16 @@ enforced (`[egress]`, WP-11c) and **MLLP-over-TLS is built** (WP-13b, opt-in per
 strict-parse time budget · de-identification is **built** for HL7 v2 (the anonymizer, §9, ADR 0030)
 with X12/FHIR seams still to come. Each is tracked in
 [§11](#11-hardening-roadmap).
+
+**The test harness's at-rest data falls short of its protection levels.** The harness is in the
+ASVS assessed scope (owner ruling 2026-10-02); its stores, and how far each falls short, are in the
+[harness table](#the-test-harnesss-own-at-rest-data-harness) of §2. The gap that matters is the
+reconcile capture and its compare report: unencrypted, unrestricted and unbounded copies of
+message bodies, with no command-line way to anonymize the capture. The shadow-phase procedure runs
+them against a migrating site's real outbound stream, so a deploying site that follows it would
+hold a second plaintext copy of its PHI bodies wherever the operator pointed them. Nothing is
+deployed, so nothing holds such a copy today. Until the code changes, the operator's controls in
+[§10](#10-secure-deployment--operations-checklist) are the only ones.
 
 ---
 

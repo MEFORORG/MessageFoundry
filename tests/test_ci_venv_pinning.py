@@ -102,7 +102,7 @@ does not see a floor, and asserting the *exported lock* is `==`-pinned cannot se
 the install-site COUNT (five sites collapsed onto three table rows, so four were individually
 deletable), the export SELECTOR (`--group` for `--only-group` pulls the whole project runtime into a
 blocking scanner's install closure while staying pinned, hashed and byte-identical under DEP-1), and
-group names LEAKING into the four runtime exports (`--no-dev` only filters the group literally named
+group names LEAKING into the runtime exports (`--no-dev` only filters the group literally named
 `dev`, so it is not the protection it looks like).
 
 `semgrep` is deliberately NOT in a group and stays a version-pinned inline install: it hard-conflicts
@@ -1091,7 +1091,7 @@ def test_every_group_spec_has_a_declared_shape() -> None:
 
 
 def test_dependency_groups_do_not_leak_into_the_runtime_exports() -> None:
-    """No CI-toolchain name may appear in the four PRE-EXISTING DEP-1 artifacts.
+    """No CI-toolchain name may appear in the runtime DEP-1 artifacts.
 
     This is the load-bearing invariant `pyproject.toml` asserts in prose and nothing enforced: the groups
     must stay NON-DEFAULT, because a default group lands in `requirements.lock`, in the container image
@@ -1115,6 +1115,7 @@ def test_dependency_groups_do_not_leak_into_the_runtime_exports() -> None:
         "constraints.lock",
         "docker/locks/requirements-core.lock",
         "docker/locks/requirements-sqlserver.lock",
+        "security/locks/requirements-harness.lock",
     )
     groups = _dependency_groups()
     project_names = _project_declared_names()
