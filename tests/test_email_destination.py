@@ -782,17 +782,19 @@ async def test_the_to_line_names_exactly_the_checked_addresses(wire: _WireCaptur
     assert to_line.rstrip(b"\r\n") == expected.encode()
 
 
-def test_a_to_header_that_parses_differently_is_refused_at_construction(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("field", ["recipients", "sender"])
+def test_a_header_that_parses_differently_is_refused_at_construction(
+    monkeypatch: pytest.MonkeyPatch, field: str
 ) -> None:
     # Simulates a later widening of the local-part allowlist: with the address rule switched off,
-    # an encoded-word local part reaches the To: header, whose parse would decode it. The
+    # an encoded-word local part reaches the To: or From: header, whose parse would decode it. The
     # construction-time comparison must refuse it, so the allowlist is not the only control.
     import messagefoundry.transports.email as email_mod
 
     monkeypatch.setattr(email_mod, "envelope_address_problem", lambda _address: None)
-    dest = _wire_dest(2525, [_ENCODED_LOCAL[0]])
-    with pytest.raises(ValueError, match="does not match the checked recipients"):
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    dest.settings[field] = [_ENCODED_LOCAL[0]] if field == "recipients" else _ENCODED_LOCAL[0]
+    with pytest.raises(ValueError, match="does not match the checked " + field):
         EmailDestination(dest)
 
 
@@ -852,9 +854,9 @@ def _sender_shapes() -> dict[str, str]:
     as a recipe; the ids are neutral."""
     other = "other" + "@" + "partner.example"
     own = "engine" + "@" + "hospital.example"
-    return {
+    shapes = {
         "shape-a": _b64_word(other),
-        "shape-b": _b64_word("other") + "@" + "hospital.example",
+        "shape-b": _ENCODED_LOCAL[0],
         "shape-c": _b64_word("Ops") + " <" + own + ">",
         "shape-d": "grp" + ":" + " " + other + ";",
         "shape-e": "grp" + ":" + " " + own + ";",
@@ -863,47 +865,24 @@ def _sender_shapes() -> dict[str, str]:
         "shape-h": own + ", " + other,
         "shape-i": "Ops <" + own + ">",
     }
+    # Every line break policy.default refuses, the three Unicode ones included.
+    for code in (13, 10, 0x85, 0x2028, 0x2029):
+        shapes[f"break-{code:04x}"] = "engine" + chr(code) + "x@hospital.example"
+    return shapes
 
 
-_LINE_BREAKS = [13, 10, 0x85, 0x2028, 0x2029]
+_SENDER_SHAPES = _sender_shapes()
 
 
-@pytest.mark.parametrize("shape", sorted(_sender_shapes()))
+@pytest.mark.parametrize("value", list(_SENDER_SHAPES.values()), ids=list(_SENDER_SHAPES))
 async def test_a_sender_that_is_not_one_plain_address_is_refused_before_any_connection(
-    wire: _WireCapture, shape: str
+    wire: _WireCapture, value: str
 ) -> None:
-    dest = _wire_dest(wire.port, ["a@hospital.example"], sender=_sender_shapes()[shape])
+    dest = _wire_dest(wire.port, ["a@hospital.example"], sender=value)
     with pytest.raises(ValueError, match="sender"):
         EmailDestination(dest)
     assert wire.connections == 0
     assert wire.mail_lines == []
-
-
-@pytest.mark.parametrize("separator", _LINE_BREAKS)
-async def test_a_line_break_in_the_sender_is_refused_before_any_connection(
-    wire: _WireCapture, separator: int
-) -> None:
-    sender = "engine" + chr(separator) + "x@hospital.example"
-    dest = _wire_dest(wire.port, ["a@hospital.example"], sender=sender)
-    with pytest.raises(ValueError, match="sender"):
-        EmailDestination(dest)
-    assert wire.connections == 0
-    assert wire.mail_lines == []
-
-
-def test_a_from_header_that_parses_differently_is_refused_at_construction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Simulates a later widening of the address rule: with it switched off, an encoded-word sender
-    # reaches the From: header, whose parse would decode it. The construction-time comparison must
-    # refuse it, so the address rule is not the only control.
-    import messagefoundry.transports.email as email_mod
-
-    monkeypatch.setattr(email_mod, "envelope_address_problem", lambda _address: None)
-    sender = _b64_word("other") + "@" + "hospital.example"
-    dest = _wire_dest(2525, ["a@hospital.example"], sender=sender)
-    with pytest.raises(ValueError, match="does not match the checked sender"):
-        EmailDestination(dest)
 
 
 def test_recipient_domains_do_not_gate_direct() -> None:
