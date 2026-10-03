@@ -152,7 +152,14 @@ def test_compare_cli_exits_two_on_a_jsonl_line_that_is_not_a_capture_record(
 
 
 @pytest.mark.parametrize(
-    "line", ['["PID|SECRET"]', '{"raw": "PID|SECRET"', "[" * 100_000], ids=["list", "bad", "deep"]
+    "line",
+    [
+        '["PID|SECRET"]',
+        '{"raw": "PID|SECRET"',
+        "[" * 100_000,
+        '{"raw": "PID|SECRET", "n": ' + "1" * 5000 + "}",
+    ],
+    ids=["list", "bad", "deep", "int-over-digit-limit"],
 )
 def test_load_messages_names_the_jsonl_line_and_not_its_content(tmp_path: Path, line: str) -> None:
     """A library caller gets a LoadError (a ValueError) naming the FILE's line number, never the
@@ -163,6 +170,9 @@ def test_load_messages_names_the_jsonl_line_and_not_its_content(tmp_path: Path, 
     with pytest.raises(LoadError, match="cap.jsonl: line 2 is not") as bad:
         load_messages(jsonl)
     assert "SECRET" not in str(bad.value) and not bad.value.over_cap
+    # Nothing chained either: a JSONDecodeError holds the whole line in .doc, and from None would
+    # still leave it on __context__ for a logger or crash reporter that walks the chain.
+    assert bad.value.__cause__ is None and bad.value.__context__ is None
 
 
 def test_load_messages_jsonl_keeps_a_record_holding_a_unicode_line_separator(
@@ -273,26 +283,27 @@ def test_report_renders_text_and_json() -> None:
     assert blob["counts"]["mismatched"] == 1 and blob["mismatches"][0]["key"] == "K"
 
 
-def test_load_messages_directory_skips_a_symlink_swapped_in_after_the_check(
+def test_load_messages_directory_skips_an_entry_gone_before_its_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Where the OS has O_NOFOLLOW, a file swapped for a symlink between the lstat and the open fails
-    the open with ELOOP. That entry is skipped like any other symlink; any other OSError still ends
-    the load, so an unreadable file is never silently dropped."""
+    """An entry removed between the listing and its read, as a writer's temp file can be, is skipped
+    and counted, as the old ``is_file()`` pre-check skipped it; any other OSError still ends the
+    load, so an unreadable file is never silently dropped. (A symlink swapped in after the lstat is
+    the shared reader's to answer: see tests/test_harness_bounded_file.py.)"""
     d = tmp_path / "exp"
     d.mkdir()
     (d / "1.hl7").write_text(_msg("A"), encoding="latin-1")
     (d / "2.hl7").write_text(_msg("B"), encoding="latin-1")
 
-    def swapped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[bytes, str]:
+    def gone(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[bytes, str]:
         if path.name == "2.hl7":
-            raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+            raise FileNotFoundError(errno.ENOENT, "gone")
         return read_capped(path, cap, follow_symlinks=follow_symlinks)
 
-    monkeypatch.setattr(compare_mod, "read_capped", swapped)
+    monkeypatch.setattr(compare_mod, "read_capped", gone)
     with caplog.at_level(logging.WARNING, logger="harness.reconcile.compare"):
         assert [field_value(m, ("MSH", 10)) for m in load_messages(d)] == ["A"]
-    assert "skipped 1 entry" in caplog.text
+    assert "skipped 1 entry that is not a regular file" in caplog.text
 
     def denied(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[bytes, str]:
         raise PermissionError(errno.EACCES, "denied")
@@ -300,3 +311,25 @@ def test_load_messages_directory_skips_a_symlink_swapped_in_after_the_check(
     monkeypatch.setattr(compare_mod, "read_capped", denied)
     with pytest.raises(PermissionError):
         load_messages(d)
+
+
+def test_load_messages_reads_a_jsonl_capture_inside_a_directory(tmp_path: Path) -> None:
+    """A ``.jsonl`` file in a directory is a capture, not HL7: read as HL7 it split into nothing, so
+    every key on the other side read as a one-sided difference with no warning."""
+    d = tmp_path / "captures"
+    d.mkdir()
+    (d / "IB_X.jsonl").write_text(json.dumps({"raw": _msg("A")}) + "\n", encoding="utf-8")
+    (d / "more.hl7").write_text(_msg("B"), encoding="latin-1")
+    assert [field_value(m, ("MSH", 10)) for m in load_messages(d)] == ["A", "B"]
+
+
+def test_load_messages_jsonl_takes_a_bom_and_any_line_break(tmp_path: Path) -> None:
+    """A byte-order mark, as some Windows tools write, and CR-only or CRLF breaks, which
+    str.splitlines() accepted, are all read; a line number still counts the file's lines."""
+    records = [json.dumps({"raw": _msg(c)}) for c in ("A", "B", "C")]
+    jsonl = tmp_path / "cap.jsonl"
+    jsonl.write_bytes(("\ufeff" + records[0] + "\r" + records[1] + "\r\n" + records[2]).encode())
+    assert [field_value(m, ("MSH", 10)) for m in load_messages(jsonl)] == ["A", "B", "C"]
+    jsonl.write_bytes((records[0] + "\r\r\n" + "nope\n").encode())
+    with pytest.raises(LoadError, match="line 3 is not valid JSON"):
+        load_messages(jsonl)

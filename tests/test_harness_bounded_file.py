@@ -10,6 +10,7 @@ they run where PySide6 cannot load. Synthetic bytes only.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import threading
@@ -145,3 +146,29 @@ def test_the_file_sink_does_not_follow_a_symlink(tmp_path: Path) -> None:
         (out / "link.hl7").symlink_to(outside)
         names = [r.meta["name"] for r in sink.records()]
     assert len(names) >= 1 and names == ["ok.hl7"]
+
+
+@pytest.mark.parametrize("code", [errno.ELOOP, errno.EMLINK], ids=["ELOOP", "EMLINK"])
+def test_a_symlink_swapped_in_after_the_lstat_is_not_regular(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """Where O_NOFOLLOW exists, a file swapped for a symlink between the lstat and the open fails the
+    open with ELOOP (EMLINK on FreeBSD). Not following, that is NOT_REGULAR, as a symlink seen by the
+    lstat is, so every caller skips it alike; following, or for any other errno, it still raises."""
+    target = tmp_path / "f.hl7"
+    target.write_bytes(b"MSH|")
+
+    def refuse(path: object, flags: int, *args: object) -> int:
+        raise OSError(code, "link")
+
+    monkeypatch.setattr(os, "open", refuse)
+    assert read_capped(target, 1024, follow_symlinks=False) == (b"", NOT_REGULAR)
+    with pytest.raises(OSError):
+        read_capped(target, 1024)
+
+    def locked(path: object, flags: int, *args: object) -> int:
+        raise PermissionError(errno.EACCES, "locked")
+
+    monkeypatch.setattr(os, "open", locked)
+    with pytest.raises(PermissionError):
+        read_capped(target, 1024, follow_symlinks=False)
