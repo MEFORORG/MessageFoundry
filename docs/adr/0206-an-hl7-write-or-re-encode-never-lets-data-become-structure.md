@@ -134,7 +134,8 @@ open points settled below.
   as `set_field`, whatever the value, because there the two writes are the same. An edit that
   moves a Set Field's path off a literal leaf into a whole field and keeps its value is refused
   when the lens would write `msg.set` there and the value is not plain text, whichever write the
-  line was spelled with. At the leaf either write escaped the value, so it was data, and
+  line was spelled with. Plain text is a string literal holding none of those separators and no
+  `|`. At the leaf either write escaped the value, so it was data, and
   `msg.set` would make its separators structure. Whether the value was kept is read from the
   arguments, so naming it unchanged in the same edit is refused too. A `msg.set_data` into a whole
   field whose template text holds one of those separators, such as `MRN: `, reads as a `code`
@@ -336,11 +337,12 @@ than one `MSH` is left to its own item.
   or path, and read it back as `set_field`; WHEN its text holds one, THE SYSTEM SHALL keep `set`.
   WHEN a `set_data` call that is not a copy writes a literal leaf, THE SYSTEM SHALL read it back as
   `set_field`, whatever its value. WHEN an edit moves a Set Field's path off a literal leaf into a
-  whole field, keeps a value that is not plain text, and would write it with `set`, THE SYSTEM
-  SHALL refuse the edit, whichever write the line was spelled with. WHEN an edit changes no
-  argument, including one that only respells quotes or drops a `u` prefix, THE SYSTEM SHALL leave
-  its write alone. WHEN such a `set_data` line runs on an X12 message, THE SYSTEM SHALL write the value as `set` writes it, and SHALL raise `ValueError`
-  rather than write the component separator into a whole element.
+  whole field, keeps a value that is not plain text (a string literal holding none of
+  `^ ~ & \ : > * |`), and would write it with `set`, THE SYSTEM SHALL refuse the edit, whichever
+  write the line was spelled with. WHEN an edit changes no argument, including one that only
+  respells quotes or drops a `u` prefix, THE SYSTEM SHALL leave its write alone. WHEN such a
+  `set_data` line runs on an X12 message, THE SYSTEM SHALL write the value as `set` writes it, and
+  SHALL raise `ValueError` rather than write the component separator into a whole element.
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_inserts_a_copy_from_a_leaf_with_set_data_and_reads_it_back`
   -> `tests/test_data_never_becomes_structure.py::test_the_lens_keeps_set_for_a_whole_field_or_an_expression_source`
   -> `tests/test_data_never_becomes_structure.py::test_a_copy_edited_from_a_leaf_to_a_whole_field_source_writes_with_set`
