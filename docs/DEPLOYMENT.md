@@ -259,7 +259,7 @@ engine binds. Three planes sit at different exposure levels:
 
 | Plane | What it is | Where it binds | Posture |
 |---|---|---|---|
-| **Management** | web console (`/ui`) / IDE → engine API | loopback by default (or a restricted management subnet) | auth + RBAC + full audit, **on by default** (`[security].require_sign_in`, default `true`) — disabling it is refused on a non-loopback bind **or a loopback bind behind a declared TLS terminator**, but on a bare **loopback** bind with no declared terminator it is permitted and drops the plane to a full-privilege no-RBAC identity; smallest surface — keep it off general-user VLANs |
+| **Management** | web console (`/ui`) / IDE → engine API | loopback by default (or a restricted management subnet) | auth + RBAC + full audit, **always on**: `serve` refuses to start with sign-in off on any bind, loopback included, and no setting turns it off (vault BACKLOG #2719); smallest surface — keep it off general-user VLANs |
 | **Data** | inbound feeds you *receive* (MLLP, TCP/X12, DB-poll) | the **internal network interface** — feeds come from other systems on your LAN, not `127.0.0.1` | **TLS on the wire where the channel has it** (enable MLLP-over-TLS; **TCP/X12 have none** — segment them) + the `[egress]`/ingress allow-lists + your network segmentation. PHI must not cross the LAN in cleartext |
 | **Inbound web service** | a partner *calls into* MEFOR (`Http()` source) | its own connector-owned socket | built (ADR 0023) — per-connection TLS + opt-in mTLS + IP allow-list, **no bearer/basic partner auth**. Both peer controls are **optional and unenforced** — a TLS-on listener with neither accepts any peer; see the caveat below |
 
@@ -294,7 +294,7 @@ are an owner act and remain **pending**.
 | Control (ASVS) | Delegate to your environment | Or build into the engine |
 |---|---|---|
 | **Transport encryption** (12.x) | — *enable* the shipped native API/WSS TLS + MLLP-over-TLS | already built (Gate #4) |
-| **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there; MEFOR authenticates against it (see note below) | **native TOTP MFA is built and on by default** (ADR 0002 WP-14) — RFC 6238 for local accounts, `[security].require_mfa = true` with `require_mfa_scope = "every_local_account"` + the step-up gate; AD/Entra MFA stays delegated |
+| **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there. MEFOR authenticates against it, but counts its MFA only through a checked OIDC claim (see note below) | **a native second factor is built and required by default** (ADR 0002 WP-14) — RFC 6238 TOTP, `[security].require_mfa = true` with `require_mfa_scope = "every_local_account"` + the step-up gate. A WebAuthn passkey (WP-14b) is another factor, for the browser only, and it needs the optional `[webauthn]` extra. The factor reaches directory accounts too, on the rule [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
 | **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** (those three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3), and the **OAuth2 client-credentials token endpoint** (BACKLOG #2112) — are refused at construction on an enforcing PHI instance, unless revocation is **proven in front** (an upstream TLS terminator — API gate only) or **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **That env no longer clears an outbound hop on an enforcing instance.** There, an outbound hop crosses on loopback or on a CRL loaded on that hop. For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, DICOM C-STORE SCU over TLS, FTPS, the `dialect='sqlserver'` DATABASE destination, LDAPS, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
 | **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514). **Required under the shipped `enforce`**: `serve` refuses to start without verified TLS to a collector on another host, with `forward_tls_ca_file` and `forward_tls_crl_file` set (BACKLOG #1966); `enforcement = "warn"` only warns. A local agent on 127.0.0.1 does not satisfy it. Steps: [SERVICE.md](SERVICE.md#configure-off-box-log-forwarding-before-the-first-start) |
@@ -304,14 +304,20 @@ are an owner act and remain **pending**.
 for your own risk posture and for any ASVS-scoped review.
 
 **On MFA specifically.** Your **directory (AD / Entra) is the identity provider** and enforces MFA per
-your policy — which healthcare organizations are now **required** to do — so MEFOR does not re-implement
-it. One accuracy point for a security reviewer: a back-channel **LDAP simple-bind validates the password
-but does not itself prompt the second factor**, which is why MEFOR **retired that sign-in outright**
-(BACKLOG #1137) rather than documenting around it. MFA applies through **Kerberos / Windows SSO** (the
-workstation logon was already MFA'd), your **Conditional Access on a federated-SSO front**, or an
-**MFA-terminating reverse proxy**. Local accounts now have a **native second factor** — RFC 6238 TOTP
-(`[security].require_mfa`, WP-14) — **on by default for every local account**, so leave it on; AD / SSO
-remains preferable where your IdP already enforces and manages MFA centrally.
+your policy, which healthcare organizations are now **required** to do. The engine counts that MFA
+only where it can check it. One accuracy point for a security reviewer: a back-channel **LDAP
+simple-bind validates the password but does not itself prompt the second factor**, which is why MEFOR
+**retired that sign-in outright** (BACKLOG #1137) rather than documenting around it. A **Kerberos /
+Windows SSO** ticket carries no factor strength the engine can read, even when the workstation logon
+used MFA. So while `[security].require_mfa` is on, a Kerberos user enrolls an engine factor (TOTP or a
+passkey) and proves it. A **federated OIDC sign-in** meets the factor when the IdP's signed `amr` or
+`acr` claim carries a value the engine accepts: one in `[auth].oidc_mfa_amr_values` (default `mfa`)
+or `[auth].oidc_required_acr_values`. That holds while `[auth].oidc_require_mfa_claim` is on, the
+default, and it is where your **Conditional Access** counts. With that setting off and
+`require_mfa` on, an OIDC session owes an engine factor, as a Kerberos session does. An
+**MFA-terminating reverse proxy** in front adds a layer, but the engine does not read it as a second
+factor. [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states the full rule.
+`require_mfa` is on by default for every account, so leave it on.
 
 ### Caveat — accepting inbound web-service calls
 
@@ -374,9 +380,10 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    `[api].tls_cert_file` + `[api].tls_key_file` (in-process TLS) *or* `[api].tls_terminated_upstream = true`
    + `[api].trusted_proxies` + `[api].plaintext_upstream_hop_acknowledged = true` (front it with a TLS
    terminator; unless you also set `[api].tls_cert_file`, the acknowledgement is required because the
-   proxy-to-engine hop is plaintext and yours to secure). Keep `[security].require_sign_in = true`
-   (a non-loopback bind with sign-in disabled is refused, and no flag covers it). The legacy `[api].host`
-   / `[auth].enabled` keys are **rejected at load** — they moved to `[security]` (ADR 0118).
+   proxy-to-engine hop is plaintext and yours to secure). Sign-in is always on: `serve` refuses to
+   start without it, and no flag covers that (vault BACKLOG #2719). The legacy `[api].host` key is
+   **rejected at load**, since it moved to `[security]` (ADR 0118). `[auth].enabled` and
+   `[security].require_sign_in` are rejected at load too, as removed.
 
    **Neither branch alone starts a stock instance.** On the shipped default (PHI +
    `[security].enforcement = enforce`) each carries a second, *fail-closed* precondition — a refusal
@@ -437,8 +444,8 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    `enforce` this is required, not optional: set `forward_host` (a collector on another host),
    `forward_port` (usually 6514), `forward_protocol = "tls"`, `forward_tls_ca_file` and
    `forward_tls_crl_file`, or `serve` refuses to start (BACKLOG #1966). A local TLS agent on 127.0.0.1
-   does not satisfy it. Leave `[security].require_mfa` on (it defaults on for every local account;
-   AD/Entra MFA stays delegated to the IdP).
+   does not satisfy it. Leave `[security].require_mfa` on. It defaults on for every account,
+   directory accounts included ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)).
 
 ---
 
@@ -454,7 +461,7 @@ self-signed placeholder).
 
 | Channel | Bind default | TLS support | Auth | Ingress/egress gate | Off-loopback guarded? |
 |---|---|---|---|---|---|
-| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **required by default** (`[security].require_sign_in`, default `true`); `false` is refused on a non-loopback bind or a loopback bind behind a declared TLS terminator, and on a bare loopback bind with no declared terminator yields a full-privilege *system* identity with no RBAC | — (auth-gated) | **Yes** — refused without an operator certificate or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default); also refused if sign-in is disabled on a non-loopback bind or a loopback bind behind a declared terminator |
+| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **always required**; no setting turns it off, and `serve` refuses to start without it on any bind (vault BACKLOG #2719) | — (auth-gated) | **Yes** — refused without an operator certificate or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default) |
 | **MLLP source** | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`; ≥TLS 1.2. **Plaintext by default** | None (MLLP has no app auth) | — | **Yes** — non-loopback plaintext refused (`check_mllp_tls_exposure`) |
 | **HTTP source** (`Http()`, ADR 0023) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | mTLS client cert only — **no bearer/basic partner auth**, and **neither mTLS nor the IP allow-list is required**: with TLS on and both unset the listener accepts any peer | per-connection `source_ip_allowlist` — **optional, defaults to no restriction** | **Yes** — non-loopback plaintext refused (`check_http_tls_exposure`) — but the gate checks **only** that TLS is on, **never** that a peer control exists (unlike the DICOM SCP row below) |
 | **DICOM C-STORE SCP** (`DICOM()`, ADR 0025) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + cert/key; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `calling_ae_allowlist` / `require_called_ae_title` / mTLS (DIMSE has no transport auth of its own) | per-connection `source_ip_allowlist` | **Yes** — non-loopback plaintext refused (`check_dimse_tls_exposure`), **and** a non-loopback SCP with *no* peer control (calling-AE allow-list, IP allow-list, or mTLS) is refused at construction |
@@ -715,8 +722,8 @@ and **refuses to start** under `[security].enforcement = enforce` (it warns at `
 ## Bind-guard behavior (summary)
 
 - **API** ([`__main__.py`](../messagefoundry/__main__.py)): a non-loopback bind is refused unless
-  `[api].tls_cert_file` is configured, or `tls_terminated_upstream` + `trusted_proxies` are set; also
-  refused if `[security].require_sign_in = false`, which no flag covers. The refusal is not a cleartext
+  `[api].tls_cert_file` is configured, or `tls_terminated_upstream` + `trusted_proxies` are set. A
+  start with sign-in off is refused on every bind, and no flag covers it. The refusal is not a cleartext
   one: without a certificate the engine would serve TLS on its self-signed placeholder, which no trust
   store vouches for. Override (dev only): `serve --allow-insecure-bind`, which serves
   off-loopback on that placeholder — **clamped inert on an enforcing PHI instance**, i.e. on the
@@ -914,7 +921,7 @@ when it gained both, under the owner ruling of 2026-09-24. `tests/test_hop_refus
 `tests/test_hop_refusal_wiring.py` pin that the revocation lever is settable wherever the connection
 refusals name it, and `tests/test_hop_attested_not_offered.py` pins the same for `tls_hop_attested`.
 Neither checks the other levers those refusals name.
-Two more rules of thumb: state a control **with its default and its off-switch** (`require_sign_in`,
+Two more rules of thumb: state a control **with its default and its off-switch** (`require_mfa`,
 `enforcement`), and never describe `[egress]` as bounding a *transform* —
 it bounds declared **destinations**.
 Cross-referenced from `PHI.md` §4, `CLUSTERING.md`, and ADRs 0002 / 0078 / 0148 / 0153.*

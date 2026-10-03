@@ -250,7 +250,9 @@ def test_the_relocated_table_is_populated() -> None:
     # 15 until BACKLOG #1279 moved ([ai], data_class) out of the relocation table and into
     # _REMOVED_KEYS -- it relocated to nothing. The COMBINED floor is what the scan depends on, so
     # that is what is asserted; both tables are required to be non-empty so neither can vanish.
-    assert len(_RELOCATED_TO_SECURITY) >= 14, _RELOCATED_TO_SECURITY
+    # Vault BACKLOG #2719 moved ([auth], enabled) the same way: its relocation target,
+    # [security].require_sign_in, was removed, so both went to _REMOVED_KEYS. 14 became 13.
+    assert len(_RELOCATED_TO_SECURITY) >= 13, _RELOCATED_TO_SECURITY
     assert len(_REMOVED_KEYS) >= 2, _REMOVED_KEYS
     assert len(_REFUSED_KEYS) >= 16, _REFUSED_KEYS
 
@@ -489,7 +491,7 @@ def test_the_line_annotator_agrees_with_the_toml_fence_extractor() -> None:
 
 # THE MEASURED BASELINE, AND WHY THIS IS A RATCHET RATHER THAN A CLEAN GATE.
 #
-# 24 documents carry 54 of these citations -- the row count and the sum of the table below, pinned
+# 23 documents carry 54 of these citations -- the row count and the sum of the table below, pinned
 # by test_the_header_count_matches_the_table, because two drafts of this line have already drifted
 # from the dict they describe: one said 58 against a sum of 59, and the document count read 27
 # against 26 rows. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY -- the ASVS tracker
@@ -578,7 +580,10 @@ _BASELINE: dict[str, int] = {
     # #1279: was 2. Dotted spelling, PR #1364 review: was 5, the added one is the
     # `# was [ai].data_class = "phi"` migration note. Fence + section: was 6, and the two that went
     # are the `[security]`-block case -- correct replacement config, reported as a defect.
-    "docs/adr/0118-secure-by-default-security-configuration-section.md": 4,
+    # Vault BACKLOG #2719: was 4. The added one is `require_sign_in = true` in the decision's own
+    # `[security]` template, which that item removed. A dated note below the replacement map records
+    # the removal; rewriting the template in place would erase what was decided.
+    "docs/adr/0118-secure-by-default-security-configuration-section.md": 5,
     # Dotted spelling, PR #1364 review: a NEW row -- three `[store].allow_unencrypted_phi=true`,
     # all of them this ADR stating what the audited opt-out did, including its acceptance
     # criterion.
@@ -595,7 +600,6 @@ _BASELINE: dict[str, int] = {
     "docs/adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md": 1,
     "docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md": 2,
     "docs/adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md": 1,
-    "docs/CLOUD-PHI-HIPAA.md": 1,
     "docs/CONFIGURATION.md": 3,
     # Fence + section: was 9, the single largest false-positive cluster in the corpus and the one
     # that made both instruments load-bearing at once -- 6 were `python` fences (connector and
@@ -696,7 +700,7 @@ def test_the_header_count_matches_the_table() -> None:
     # `_SCAN_GENERATION == _SCAN_GENERATION` would pass whatever it said, which is the vacuous shape
     # this file keeps pairing controls against. Change the constant and this literal together.
     assert (len(_BASELINE), sum(_BASELINE.values()), _SCAN_GENERATION) == (
-        24,
+        23,
         54,
         "fence-aware + section-aware, 2026-09-20",
     )

@@ -207,7 +207,7 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     ``app-log.txt`` could carry an unredacted deployment path (BACKLOG #1571). They now report the
     branch, not the circumstances: the operator knows their own ``log_dir``, and the code says which
     step failed."""
-    from messagefoundry.support.redact import redact_log_text
+    from messagefoundry.support.redact import redact_log_text, split_log_lines
 
     if not log_dir:
         return None
@@ -224,7 +224,7 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
         text = newest.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
-    tail = text.splitlines()[-lines:]
+    tail = split_log_lines(text)[-lines:]
     return redact_log_text("\n".join(tail))
 
 

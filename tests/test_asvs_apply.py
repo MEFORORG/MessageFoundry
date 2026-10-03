@@ -3158,16 +3158,46 @@ def test_a_blank_reviewed_by_is_not_the_legacy_refusal(
 ) -> None:
     """A blank string is not the legacy form: the loader keeps it as the `blank` state, so the
     legacy refusal stays silent. Over the fixture's table it is still refused, by the blank-over-
-    table guard, and an EMPTY one is also refused as missing, the older guard. A whitespace-only
-    value over a cell with no table is written today; that gap predates #2168."""
+    table guard, and both are also refused as missing: a whitespace-only one too, since BACKLOG
+    #2276."""
     rec = _record(tmp_path)
     cell = _cell_111(reviewed_by=value)
     rc = main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"])
     out = capsys.readouterr().out
     assert rc == 1, out
     assert "legacy plain-string" not in out, out
-    if not value:
-        assert "1.1.1: missing reviewed_by" in out, out
+    assert "1.1.1: missing reviewed_by" in out, out
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("reviewed_by", "   "), ("reviewed_by", "\t\n"), ("last_verified", "  ")],
+    ids=["reviewed_by-spaces", "reviewed_by-tab-newline", "last_verified-spaces"],
+)
+def test_a_whitespace_only_required_field_over_a_cell_with_no_table_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str, value: str
+) -> None:
+    """BACKLOG #2276. With no `reviewed_by` table in the record, no guard saw a whitespace-only one:
+    it is truthy, so the missing-field check passed it, and the writer landed a blank. The record
+    here has its table removed, so only the missing-field check can refuse."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    no_table = FIXTURE.replace(_FIX_LINE, "", 1)
+    assert no_table != FIXTURE, "the splice did not land"
+    rec.write_text(no_table, encoding="utf-8")
+    before = rec.read_bytes()
+    cell = _cell_111(**{field: value})
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 1
+    assert rec.read_bytes() == before
+    assert f"1.1.1: missing {field}" in capsys.readouterr().out
+
+
+def test_a_table_over_a_cell_with_no_table_is_written(tmp_path: Path) -> None:
+    """The positive control for the arm above: the same record and payload, with a table, apply."""
+    rec = tmp_path / "asvs-scorecard.toml"
+    rec.write_text(FIXTURE.replace(_FIX_LINE, "", 1), encoding="utf-8")
+    cell = _cell_111(reviewed_by=_RB_FIXTURE)
+    assert main([str(_payload(tmp_path, [cell])), "--scorecard", str(rec), "--apply"]) == 0
+    assert _cell_after_apply(rec)["reviewed_by"] == _RB_FIXTURE
 
 
 def test_the_writer_refuses_to_rewrite_a_live_cell_still_carrying_a_legacy_string(

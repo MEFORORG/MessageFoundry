@@ -116,7 +116,7 @@ an identity rule binding transport config.
   web console — see [`docs/SECURITY.md`](docs/SECURITY.md)): local + AD (LDAP/Kerberos) users, fixed
   built-in roles, deny-by-default per-route permissions, opaque sessions, native TOTP MFA + browser
   WebAuthn passkeys (WP-14/WP-14b, ADR 0068 — `[webauthn]` extra) for local
-  accounts (AD MFA delegated), full audit. The API binds `127.0.0.1` by default and **always
+  and directory accounts, full audit. The API binds `127.0.0.1` by default and **always
   serves TLS** ([ADR 0172](docs/adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)):
   an operator-supplied `[api].tls_cert_file` wins if set, otherwise the engine mints and reuses a
   self-signed pair on first run. **One topology is deliberately excluded:**
@@ -882,9 +882,9 @@ gates a merge**, and no seat has to clear one.
 ### A Builder runs the checks before it commits, because nobody downstream can ask it to
 
 - New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy` (strict),
-  in the three legs `ci.yml` runs: `mypy --platform linux messagefoundry messagefoundry_webconsole
+  in the four legs `ci.yml` runs: `mypy --platform linux messagefoundry messagefoundry_webconsole
   messagefoundry_toolkit --exclude 'messagefoundry/tray/'`, `mypy --platform win32 messagefoundry
-  messagefoundry_toolkit` and `mypy --explicit-package-bases tests`. Then `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
+  messagefoundry_toolkit`, `mypy --explicit-package-bases tests` and `mypy --platform linux scripts/asvs`. Then `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
 - **Then review your own diff with the `code-review` SUBAGENT, at effort `xhigh`, named explicitly.**
   Ruff is style, mypy is types, pytest is regression, and `/simplify` above is a quality pass that
   points at `code-review` for bugs -- none of them looks for a NEW correctness defect. **Say
@@ -954,10 +954,11 @@ QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM=
 # format / lint / types
 ruff format .
 ruff check .
-# mypy: the three legs ci.yml runs. Name the platform, or a Windows box checks win32 only.
+# mypy: the four legs ci.yml runs. Name the platform, or a Windows box checks win32 only.
 mypy --platform linux messagefoundry messagefoundry_webconsole messagefoundry_toolkit --exclude 'messagefoundry/tray/'
 mypy --platform win32 messagefoundry messagefoundry_toolkit
 mypy --platform linux --explicit-package-bases tests   # CI runs it on linux. BACKLOG #1799; the profile and its exemptions: pyproject.toml
+mypy --platform linux scripts/asvs   # the ASVS verifier and writer, strict. BACKLOG #2276
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
 python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev

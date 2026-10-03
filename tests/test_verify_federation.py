@@ -471,11 +471,12 @@ def test_an_off_box_idp_with_no_crl_fails_as_the_engine_would_refuse() -> None:
 
 
 def test_auth_disabled_skips_because_the_engine_runs_no_guard() -> None:
-    """The lifespan builds the auth service, and so runs the guard, only when
-    [security].require_sign_in is true. A FAIL here would report a refusal the engine never makes."""
+    """The guard lives in the auth service, which settings built in code with [auth].enabled off do
+    not have (`serve` refuses that, vault BACKLOG #2719). A FAIL here would report a refusal the
+    engine never makes."""
     row = _revocation_result(_settings(enabled=False))
     assert row.status is Status.SKIP
-    assert "[security].require_sign_in is false" in row.detail
+    assert "[auth].enabled is false" in row.detail
 
 
 def test_on_box_legs_pass_because_the_engine_lets_them_cross() -> None:

@@ -1623,8 +1623,10 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     Otherwise the claim covers the shipped roots too, which read raw, so each is NAMED as an
     advisory (``view-inert``, ``view-blind``) and never silent. A mutation whose tokenizing stops
     early is blanked as far as it got: a match that ends there settles it, and otherwise it is
-    named ``view-undetermined`` rather than cleared. A view FAIL does not skip the FALSE check,
-    because the pattern is well-formed and its hits still mean something.
+    named ``view-undetermined`` rather than cleared. A stop with nothing but whitespace after it,
+    such as a fragment's unclosed bracket, left no text unblanked, so that view is judged whole
+    (BACKLOG #2275). A view FAIL does not skip the FALSE check, because the pattern is well-formed
+    and its hits still mean something.
     """
     raw_texts, pattern_texts, viewed = _absence_corpus(root)
     viewed_paths = {p for p in viewed if p is not None}
@@ -1641,6 +1643,10 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
             view_inert = False
             if not raw_inert:
                 mutation_view, cut = _code_only_view(a.mutation)
+                if cut is not None and not a.mutation[cut:].strip():
+                    # Every token was read before the stop, so the view is whole and the claim is
+                    # decided, not UNDETERMINED (BACKLOG #2275).
+                    cut = None
                 reach = len(a.mutation) if cut is None else cut
                 if not any(m.end() <= reach for m in re.finditer(a.pattern, mutation_view)):
                     if cut is not None:
@@ -1658,9 +1664,9 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                             "view-inert",
                             f"{c.id}: absence claim is INERT under the {_CODE_ONLY_LABEL} code-only "
                             f"view — {a.pattern!r} does not match its reintroduction "
-                            f"{a.mutation!r} once the view blanks it, so a reintroduction under "
-                            f"{_CODE_ONLY_LABEL} would stay quiet. The shipped roots read raw and "
-                            "still see it",
+                            f"{a.mutation!r} once the view blanks it, so a reintroduction in a "
+                            f"{_CODE_ONLY_LABEL} file the view reads would stay quiet. The shipped "
+                            "roots read raw and still see it",
                         )
             if raw_inert or view_inert:
                 # One site for both, so every INERT line has the one shape a parser reads.
@@ -1687,7 +1693,8 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
                 where = (
                     ""
                     if not seen_raw
-                    else f", in the code-only view {a.mutation_path!r} is read through,"
+                    else f", searched in the code-only view of every {_CODE_ONLY_LABEL} file "
+                    "that tokenizes,"
                 )
                 findings.problems.append(
                     f"{c.id}: absence claim is BLIND — its positive control "

@@ -257,6 +257,7 @@ def test_the_setting_ships_off_and_on_is_a_named_loosening() -> None:
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
+                startup=None,
             )
         )
 

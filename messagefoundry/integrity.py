@@ -80,9 +80,11 @@ __all__ = [
     "IntegrityError",
     "AttestationResult",
     "DriftEntry",
+    "RecordVerdict",
     "UnattestedReason",
     "attest_console",
     "attest_engine",
+    "record_verdict",
     "run_startup_attestation",
 ]
 
@@ -487,6 +489,58 @@ def _install_root(dist: metadata.Distribution) -> Path | None:
     if path is not None:
         return Path(str(path)).parent.resolve()
     return None
+
+
+#: What an installed distribution's ``RECORD`` says about one file: ``recorded`` (listed, and the
+#: bytes match), ``modified`` (listed, and the bytes differ or cannot be read) or ``unrecorded``
+#: (no distribution under that root lists it).
+RecordVerdict = Literal["recorded", "modified", "unrecorded"]
+
+
+def record_verdict(file: Path, install_root: Path) -> tuple[RecordVerdict, str | None]:
+    """Whether a distribution installed under ``install_root`` lists ``file`` in its ``RECORD``, and
+    whether the file still has the bytes that row names. Returns the verdict and the distribution.
+
+    The start-up code inventory (``messagefoundry/startupcode.py``, vault BACKLOG #2701) asks this
+    about a ``.pth`` file or a ``sitecustomize`` module. It is here so that the ``RECORD`` reader
+    and the hash stay in one module, and so the two callers read a row the same way.
+
+    A file two distributions list is ``recorded`` when either row matches. The baseline has the
+    limit the module docstring gives: it sits in the install it describes, so whoever can write
+    that install can write a matching row. Blocking file reads, like :func:`attest_engine`.
+    """
+    rel = _record_relpath(file, install_root)
+    if rel is None:
+        return "unrecorded", None
+    modified_by: str | None = None
+    actual: bytes | None = None
+    hashed = False
+    for dist in metadata.distributions(path=[str(install_root)]):
+        try:
+            record_text = dist.read_text("RECORD")
+        except (OSError, KeyError, UnicodeDecodeError):
+            record_text = None
+        # The name test skips the parse for every distribution that cannot list the file.
+        if not record_text or file.name not in record_text:
+            continue
+        expected = _parse_record(record_text).get(rel)
+        if expected is None:
+            continue
+        try:
+            owner = str(dist.name)
+        except (TypeError, KeyError, AttributeError, OSError):
+            # A dist-info directory with a RECORD and no readable METADATA has no name to give.
+            owner = "an unnamed distribution"
+        if not hashed:
+            hashed = True
+            try:
+                actual = hashlib.sha256(file.read_bytes()).digest()
+            except OSError:
+                actual = None  # unreadable: it matches no row
+        if actual == expected:
+            return "recorded", owner
+        modified_by = owner
+    return ("modified", modified_by) if modified_by is not None else ("unrecorded", None)
 
 
 def _nothing_attested(

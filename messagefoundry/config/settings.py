@@ -94,6 +94,7 @@ from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
 from messagefoundry.service_status import is_safe_service_name
+from messagefoundry.startupcode import StartupPosture, startup_loosenings
 
 __all__ = [
     "StoreBackend",
@@ -5651,13 +5652,16 @@ class SecuritySettings(_Section):
     static_credential_accepted: dict[str, str] = Field(default_factory=dict)
 
     # ── Sign-in & identity ───────────────────────────────────────────
-    require_sign_in: bool = True  # authenticate every request
+    # There is no sign-in switch here. `serve` always requires sign-in (vault BACKLOG #2719): the
+    # loopback no-auth mode it once offered was removed, not relocated, so `require_sign_in` is
+    # refused at load as a REMOVED key (_REMOVED_KEYS). AuthSettings.enabled survives only for
+    # embedders and tests that build the app themselves with allow_no_auth=True.
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
     # Who must enroll one when require_mfa is on. Default widens the gate past the Administrator role
     # to every local account (ASVS 6.3.3); "administrators" restores the pre-6.3.3 posture.
     require_mfa_scope: Literal["administrators", "every_local_account"] = "every_local_account"
     allow_single_factor_admin_when_exposed: bool = (
-        False  # ADR 0140: permit single-factor admin on an EXPOSED production-PHI bind
+        False  # ADR 0140: lift the require_mfa-off refusal at exposure under enforcement = enforce
     )
     sign_out_after_idle_minutes: int = 30
     max_session_hours: int = 12
@@ -6138,7 +6142,6 @@ _RELOCATED_TO_SECURITY: dict[tuple[str, str], str] = {
     ("api", "serve_ui"): "serve_web_console",
     ("api", "public_origin"): "web_console_public_address",
     ("store", "allow_unencrypted_phi"): "allow_unencrypted_phi",
-    ("auth", "enabled"): "require_sign_in",
     ("auth", "require_mfa"): "require_mfa",
     ("auth", "require_mfa_scope"): "require_mfa_scope",
     ("auth", "session_idle_timeout_minutes"): "sign_out_after_idle_minutes",
@@ -6185,6 +6188,22 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "Remove it from the config file, or unset MEFOR_API_SERVE_UI_EXPLICIT if the environment "
         "sets it. To request the web console explicitly, set [security].serve_web_console"
     ),
+    # Vault BACKLOG #2719. Named here rather than left to the unknown-key refusal, because that one
+    # offers the nearest spelling, and for this key the nearest is `require_mfa`: an operator following
+    # the hint would swap one loosening for another.
+    ("security", "require_sign_in"): (
+        "`serve` always requires sign-in, on every bind, and this switch was removed rather than "
+        "relocated (vault BACKLOG #2719). Remove this line, or unset MEFOR_SECURITY_REQUIRE_SIGN_IN "
+        "if the environment sets it. On a store with no Administrator yet, create the first one "
+        "with `messagefoundry provision-admin`"
+    ),
+    # Vault BACKLOG #2719. It had moved to [security].require_sign_in under ADR 0118, and that key is
+    # gone too, so the relocation notice would have named a key that no longer exists.
+    ("auth", "enabled"): (
+        "`serve` always requires sign-in, and the switch that turned it off was removed (vault "
+        "BACKLOG #2719). ADR 0118 had relocated it to [security].require_sign_in, and that key is "
+        "retired too. Remove this line, or unset MEFOR_AUTH_ENABLED if the environment sets it"
+    ),
     # BACKLOG #2090 (ADR 0066 §12): `false` could only start the mode that deadlocks.
     ("pipeline", "require_rcsi_for_pooled"): (
         "a SQL Server store no longer opens with READ_COMMITTED_SNAPSHOT off. The pooled start "
@@ -6200,7 +6219,6 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
 #: are handled explicitly in :func:`_desugar_security`.
 _SECURITY_PASSTHROUGH: tuple[tuple[str, str, str], ...] = (
     ("serve_web_console", "api", "serve_ui"),
-    ("require_sign_in", "auth", "enabled"),
     ("require_mfa", "auth", "require_mfa"),
     ("require_mfa_scope", "auth", "require_mfa_scope"),
     ("sign_out_after_idle_minutes", "auth", "session_idle_timeout_minutes"),
@@ -6815,6 +6833,7 @@ def security_loosenings(
     store_privilege: StorePrivilegePosture | None,
     audit_chain_unkeyed: bool | None,
     remote_debug: RemoteDebugPosture | None,
+    startup: StartupPosture | None,
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -6838,7 +6857,8 @@ def security_loosenings(
     with TLS unenforced (#333), ``tls_hop_attested`` (owner ruling 2026-09-24) and
     ``tls_revocation_attested`` (ADR 0173) -- the store principal's OBSERVED privilege posture
     (#1008), the OBSERVED keying of the audit chain (#1905), the OBSERVED remote-debugging state of
-    the engine process (vault BACKLOG #2700), and
+    the engine process (vault BACKLOG #2700), the OBSERVED launch flags and start-up code of its
+    interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
@@ -6899,6 +6919,12 @@ def security_loosenings(
     hook is installed. It is a fact about one process, so only a caller running IN the engine
     process passes a reading (``serve``, ``GET /security/posture``). ``None`` means this call site
     is some other process (``messagefoundry security show``), which says so in its own output.
+
+    ``startup`` is the second PROCESS observation (vault BACKLOG #2701), from
+    :func:`messagefoundry.startupcode.startup_posture`: whether the interpreter was started in
+    isolated mode, the start-up code (``.pth`` import lines, ``sitecustomize``) it does not know,
+    and whether the engine's own account can write the directories that code is read from.
+    ``None`` has the meaning it has for ``remote_debug``, for the same reason.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -7015,20 +7041,15 @@ def security_loosenings(
                 + " (ASVS 3.7.3)",
             )
         )
-    if not sec.require_sign_in:
-        out.append(
-            (
-                "require_sign_in",
-                "authentication is DISABLED — requests run as a full-privilege system identity "
-                "(loopback-only; a non-loopback bind refuses)",
-            )
-        )
+    # Vault BACKLOG #2798: each text names only the accounts its switch frees; the tests say why.
     if not sec.require_mfa:
         out.append(
             (
                 "require_mfa",
-                "every account is single-factor — no engine second factor is required, and a "
-                "directory session is admitted on a ticket that asserts no strength",
+                "an account with no second factor enrolled is single-factor, so a Kerberos session "
+                "enters on a ticket that asserts no strength. An enrolled account must still "
+                "satisfy its factor, and an OIDC sign-in still needs a checked amr/acr claim while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7037,15 +7058,20 @@ def security_loosenings(
         out.append(
             (
                 "require_mfa_scope",
-                "only Administrators must enroll a second factor — every other account, local or "
-                "directory, is single-factor until it opts in by enrolling",
+                "a local account without the Administrator role is single-factor until it enrolls "
+                "a second factor. Administrators and directory accounts still owe one; an OIDC "
+                "sign-in meets it with an amr/acr claim checked while "
+                "[auth].oidc_require_mfa_claim is on",
             )
         )
     if sec.allow_single_factor_admin_when_exposed:
         out.append(
             (
                 "allow_single_factor_admin_when_exposed",
-                "single-factor admin is permitted on an EXPOSED production-PHI bind — no second factor over the network",
+                "an EXPOSED instance under enforcement = enforce may start with "
+                "[security].require_mfa off, on an audited warning instead of the refusal. Every "
+                "account with no second factor enrolled is then single-factor over the network, "
+                "unless an OIDC sign-in carries a checked amr/acr claim",
             )
         )
     if not sec.encrypt_stored_data:
@@ -7166,9 +7192,9 @@ def security_loosenings(
     # Vault BACKLOG #2354: a plain ldap:// AD bind. ServiceSettings refuses it at load under enforce, so a
     # loaded config reaches this only at warn. Conditional on the bind being live: the flag beside an
     # ldaps:// address, with AD off, or with sign-in off (nothing builds the authenticator) changes
-    # nothing and is not named. Sign-in is read off [security], as for the limiter entries below, so
-    # `security set` turning it on shows this at once.
-    if sec.require_sign_in and auth.plain_ldap_bind:
+    # nothing and is not named. Sign-in is off only on an app an embedder or a test built itself;
+    # `serve` always requires it (vault BACKLOG #2719).
+    if auth.enabled and auth.plain_ldap_bind:
         out.append(
             (
                 "ad_allow_insecure_ldap",
@@ -7191,10 +7217,9 @@ def security_loosenings(
     # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
-    # Gated on [security].require_sign_in rather than [auth].enabled (the desugar makes them equal on
-    # every loaded path): `security set` passes the NEW [security] beside the [auth] it read before
-    # the edit, so turning sign-in on there must show these at once.
-    if sec.require_sign_in:
+    # Gated on [auth].enabled. A loaded config always has it on: `serve` requires sign-in and no key
+    # turns it off (vault BACKLOG #2719). Only an app an embedder or a test built itself has it off.
+    if auth.enabled:
         out.extend(_auth_limit_loosenings(auth))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
@@ -7435,6 +7460,10 @@ def security_loosenings(
     # The wording lives beside the hook, in one place for this registry and `supervise`.
     if remote_debug is not None and (entry := remote_debug_loosening(remote_debug)) is not None:
         out.append(entry)
+    # --- the engine PROCESS's observed launch and start-up code (vault BACKLOG #2701). The same
+    # kind of observation, with its wording beside its reader for the same reason.
+    if startup is not None:
+        out.extend(startup_loosenings(startup))
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.

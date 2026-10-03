@@ -259,6 +259,14 @@ changes what the ADR 0167 gate says and adds one WARNING.
 | `[security].enforcement = "warn"` | **It starts, routes HL7, and nobody can sign in.** The ADR 0167 gate already logs a warning here; its text names `provision-admin`. |
 | Sign-in required (`[security].require_sign_in`), with the notice requirement waived in writing, or notices off | **It starts, routes HL7, and nobody can sign in.** The gate is skipped, so the engine logs one WARNING naming `provision-admin`. With sign-in not required, no Administrator is needed and nothing is logged. |
 
+> **Note, 2026-10-02 (vault BACKLOG #2719).** The last row's closing sentence no longer holds. `serve`
+> now refuses to start with sign-in off, on every bind, and `[security].require_sign_in` is refused at
+> load as a removed key. So "sign-in not required" is not a posture any more, and every start needs
+> an Administrator. The rest of the row stands: sign-in is simply always required. The table is kept
+> as written because it records what this amendment measured. The same change added a start WARNING
+> for a store whose every enabled Administrator signs in through an outside identity service (vault
+> BACKLOG #2711, step 2), since `provision-admin` refuses while such an account exists.
+
 **Recommendation: add no new refusal. Confidence: medium.** Four reasons, and the second and fourth
 hold only if Wave 0 comes back green:
 
@@ -352,7 +360,9 @@ service that starts first locks the operator out. Re-read at this amendment's ba
 executed.** The bootstrap hides the problem today, because the service creates its own account inside
 its own process. After retirement the command is the only way in. So if ADR 0163's reading holds,
 **every Windows service install on SQLite under the default virtual account has no working order.**
-The hosted `windows-service-smoke` job cannot see this, because it runs with auth off. **Wave 0
+The hosted `windows-service-smoke` job cannot see this, because it runs with auth off. *(Note,
+2026-10-02: no longer true. Since vault BACKLOG #2719 that job provisions an Administrator and signs
+in, and `serve` cannot run with auth off.)* **Wave 0
 measures file access in both orders before anything is deleted.**
 
 A second path to the same lockout: `_provision_admin` opens the store with `create=True` before the

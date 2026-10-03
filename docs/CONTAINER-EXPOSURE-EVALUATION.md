@@ -49,7 +49,7 @@ operational notes.
 |---|---|---|
 | API/WSS in-process TLS (WP-13a) | [`api/tls.py`](../messagefoundry/api/tls.py) `build_api_ssl_context`; [`config/settings.py`](../messagefoundry/config/settings.py) `ApiSettings.tls_*` | `PROTOCOL_TLS_SERVER`, `minimum_version` from `tls_min_version` (1.2/1.3 floor), `load_cert_chain(cert, key, password)`, optional ciphers, inherited KEX groups (approved-group pin inert until Python 3.15 - see [PHI.md](PHI.md) §4) + strict X.509; opt-in mTLS via `tls_client_ca_file` → `CERT_REQUIRED`. Wired into the single `uvicorn.run(...)` via `ssl_context_factory` ([`__main__.py`](../messagefoundry/__main__.py) ~538-545). |
 | API bind guard ("exposed" gate) | [`__main__.py`](../messagefoundry/__main__.py) ~419-451 | Non-loopback `[api].host` → **allow** if `tls_enabled`, **allow** if `tls_terminated_upstream` (+`trusted_proxies`), **warn** if `--allow-insecure-bind`, else **refuse (exit 2)**. Auth-disabled non-loopback is refused by a separate earlier gate **regardless of** `--allow-insecure-bind`. |
-| MFA-at-exposure gate | [`__main__.py`](../messagefoundry/__main__.py) ~462-481 | Non-loopback + `auth.enabled` + **not** `require_mfa`: **refuse** on a production PHI instance, **warn** on a non-production PHI instance, quiet on synthetic. Gates every account `[security].require_mfa_scope` covers -- `every_local_account` by default, directory accounts included (BACKLOG #1144). |
+| MFA-at-exposure gate | [`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block | Exposed (a non-loopback bind or a declared TLS-terminating proxy) + `auth.enabled` + **not** `require_mfa`: **refuse** under `[security].enforcement = enforce`, the default, unless `[security].allow_single_factor_admin_when_exposed` is set; **warn** otherwise. It reads neither the PHI tier nor the kind of account. `require_mfa` gates every account `[security].require_mfa_scope` covers -- `every_local_account` by default, directory accounts included (BACKLOG #1144). |
 | MLLP-over-TLS (WP-13b) | [`transports/mllp.py`](../messagefoundry/transports/mllp.py) `_mllp_ssl_context`; `MLLP(...)` in [`config/wiring.py`](../messagefoundry/config/wiring.py) ~540-610 | Per-connection `tls=true`. Inbound presents `tls_cert_file`/`tls_key_file`; `tls_ca_file` opts into mTLS (`CERT_REQUIRED`). Outbound verifies the peer (`tls_verify=true` default; `false` refused unless `MEFOR_ALLOW_INSECURE_TLS`), optional client cert. `start_server(ssl=)` / `open_connection(ssl=, server_hostname=)`. TLS 1.2+. |
 | MLLP exposed gate | [`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py) `check_mllp_tls_exposure` ~1655-1678 | A non-loopback MLLP listener **without** `tls=true` raises `WiringError` at wiring time (before start); `--allow-insecure-bind` downgrades to a warning; loopback or `tls=true` pass. Sibling `check_dimse_tls_exposure` covers DICOM SCP. |
 | Reverse-proxy trust (WP-15) | `ApiSettings.tls_terminated_upstream` / `trusted_proxies`; `forwarded_allow_ips` in `uvicorn.run` ([`__main__.py`](../messagefoundry/__main__.py) ~531-533) | `tls_terminated_upstream` satisfies the gate **without** in-process TLS, but the model validator **requires** `trusted_proxies` to be set with it. `forwarded_allow_ips` trusts XFF/XFP only from the named proxies (empty = trust nothing). |
@@ -130,7 +130,7 @@ bind host is all that matters.
 
 | Topology | Bind address in container (`[security].listen_address`) | API gate outcome | Required config |
 |---|---|---|---|
-| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); `[security].require_sign_in = true` |
+| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); sign-in is always on (vault BACKLOG #2719) |
 | (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP) **and** `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055); no in-process cert needed |
 | (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — upstream branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** `plaintext_upstream_hop_acknowledged=true` (**refused** without it, in every mode, unless an operator `tls_cert_file` makes the engine serve that hop over TLS); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
@@ -148,7 +148,7 @@ MLLP gate (`check_mllp_tls_exposure`), per inbound's resolved host (`[inbound].b
 trusted, isolated segment** — e.g. a local integration rig where partners and console are on the same
 host and no real PHI flows. It downgrades both the API refuse-path and the MLLP `WiringError` to loud
 warnings. It is **never** a production setting and must not be baked into the shipped image's default
-command. (It also does **not** override the auth-disabled refusal or the production-PHI MFA refusal —
+command. (It also does **not** override the auth-disabled refusal or the MFA-at-exposure refusal —
 those stay fail-closed.)
 
 **Exact required config per topology** — one self-contained block each ([ADR
@@ -161,8 +161,7 @@ are **refused at config load**, so copy these, not the pre-0118 shapes):
 [security]
 local_access_only = false
 listen_address = "0.0.0.0"
-require_sign_in = true
-require_mfa = true                            # required on a production PHI instance with local admins
+require_mfa = true                            # the default; off on an exposed instance is refused under enforce
 
 [api]
 port = 8443
@@ -399,12 +398,15 @@ The console stays a **host-side process**; only its target URL changes.
      target. The asyncio/uvicorn/SQLite stack is OS-portable and the console stays on the host, so this
      is low-risk — but it is the first non-Windows runtime and deserves a CI leg.
 
-7. **Production-PHI + local accounts must enable MFA to even start.** The MFA-at-exposure gate
-   *refuses* a non-loopback bind on a production PHI instance with local accounts unless
-   `[security].require_mfa = true`. An all-AD deployment is no exception: BACKLOG #1144 retired the
-   directory delegation, so directory accounts are in scope too. The container's
-   default config and docs must make `require_mfa = true` the production default, or the operator hits
-   a hard startup refusal — which is correct, but should be expected, not surprising.
+7. **An exposed instance with MFA off is refused at start by default.** An instance is exposed when
+   it has an off-loopback bind or a declared TLS-terminating proxy. The MFA-at-exposure gate
+   *refuses* an exposed instance with `[security].require_mfa = false` under the shipped `enforce`,
+   unless `[security].allow_single_factor_admin_when_exposed` is set. Under `enforcement = warn` it
+   only warns. It reads neither the PHI tier nor the
+   kind of account. `require_mfa` defaults on, and it covers directory accounts too: BACKLOG #1144
+   retired the directory delegation ([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)).
+   The container's config and docs must keep `require_mfa = true`, or the operator hits a hard
+   startup refusal. That refusal is correct, but it should be expected, not surprising.
 
 8. **Doc/memory staleness.** The current-state doc staleness (MFA / mTLS / off-box logs described as
    "0.2 / not built") **was corrected in this change** (see header flag 2). The **project memory**

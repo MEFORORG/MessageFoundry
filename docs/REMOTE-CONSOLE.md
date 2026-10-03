@@ -183,21 +183,23 @@ carries the recommended hardening for an exposed console (client-certificate dev
 
 ### Authentication at exposure
 
-Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or AD/LDAP. Note:
+Auth is always on. Remote users sign in with a local account, or a directory account through
+Windows SSO or OIDC. The directory password sign-in is retired (BACKLOG #1137). A directory
+account is not exempt from the engine's second factor
+([the rule](SECURITY.md#multi-factor-authentication-totp-wp-14)). Note:
 
-- With `[security].require_sign_in = false`, an exposed instance is **hard-refused** — an off-loopback
-  bind, or a loopback bind behind a declared TLS terminator (a bare loopback bind with no declared
-  terminator is the only no-auth posture).
+- `serve` refuses to start with sign-in off, on every bind, loopback included. No setting turns it
+  off (vault BACKLOG #2719).
 - `[security].require_mfa` is **on by default**, and MFA is an access gate: an enrolled-pending session
   gets `403` + `X-MFA-Required: 1` on every authorized route. **Leave it on** — that default, not the
   startup gate below, is the control.
-- The startup gate is narrower than it looks. On an exposed **PHI** instance — any of `dev`/`staging`/
-  `prod`, since all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) —
-  an explicit `[security].require_mfa = false` **refuses to start**, but only when
+- The startup gate is narrower than it looks. On an exposed instance, an explicit
+  `[security].require_mfa = false` **refuses to start**, but only when
   `[security].enforcement = enforce` (the default) **and**
   `[security].allow_single_factor_admin_when_exposed` is not set
   ([`__main__.py`](../messagefoundry/__main__.py), the `admin_exposed` block). Either switch turns the
-  refusal into a loud, audited warning that starts. A non-PHI instance is silent.
+  refusal into a loud warning that starts, and under `enforce` the allow flag also writes an audit line. No instance
+  is exempt: the engine treats every instance as carrying PHI (BACKLOG #1279).
   **"Exposed" here is the bind-and-proxy posture, not the console**: an off-loopback bind, **or**
   `[api].tls_terminated_upstream` — whether or not `/ui` ends up mounted. So the recommended
   loopback-behind-a-terminator topology in §3 **does** trip it, including when the default-on console
@@ -207,8 +209,8 @@ Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or
   first, and would have missed exactly that topology on first deployment.) An **undeclared** proxy —
   a set `[security].web_console_public_address` with no `tls_terminated_upstream` — is outside the
   predicate and does **not** refuse: nothing was declared, so exposure would be an inference. It gets
-  its own **warning** instead, naming single-factor admin explicitly, on a PHI instance with
-  `require_mfa` off. That is a distinct arm — **not** the ADR 0068 §8 undeclared-proxy warning, which
+  its own **warning** instead, naming single-factor admin explicitly, whenever
+  `require_mfa` is off. That is a distinct arm — **not** the ADR 0068 §8 undeclared-proxy warning, which
   is about the `/ui` cookie and HSTS and is suppressed by §3's auto-degrade in the same posture. See
   the `allow_single_factor_admin_when_exposed` row in [`CONFIGURATION.md`](CONFIGURATION.md) and
   [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md).
