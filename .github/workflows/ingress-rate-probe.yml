@@ -17,8 +17,10 @@
 # DELIBERATELY workflow_dispatch ONLY, and deliberately NOT a required context. It has no
 # `pull_request` trigger, so it can never report on a PR and can never become the required-but-absent
 # trap; it is listed in `.github/required-contexts.txt` alongside the other advisory workflows. It also
-# ASSERTS NOTHING — the probe exits 0 even when the reconcile fails, because a machine too slow to keep
+# ASSERTS NOTHING ABOUT THE NUMBERS — the probe exits 0 even when the reconcile fails, because a machine too slow to keep
 # up is the finding, not an error. A number that moves with runner weather must never gate a merge.
+# What DOES red the step is a broken measurement pipeline: a missing or malformed RESULT line, or no
+# rate producing a measurement at all. See scripts/ci/ingress_probe_summary.py.
 #
 # REPEATS ARE NOT OPTIONAL. A single run proves nothing: one 600/s run on a developer box produced
 # 50.7% stranding and four repeats of the same command produced 0%, the difference being an unrelated
@@ -82,24 +84,51 @@ jobs:
           REPEAT: ${{ inputs.repeat }}
           OS_LABEL: ${{ matrix.os }}
         run: |
-          set -uo pipefail   # NOT -e: a probe that cannot start must not lose the rows already taken
+          # The named `shell: bash` already runs with -e. Each rate's pipeline is guarded with `||`
+          # below, so a probe that cannot start does not lose the rows already taken.
+          set -uo pipefail
           echo "## ingress rate probe — $OS_LABEL" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| offered | sent | acked | stranded | % | engine_read | reconcile ok |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          # The probe's output is DATA. Only its stdout is parsed, and only by
+          # scripts/ci/ingress_probe_summary.py, which accepts the two RESULT shapes the probe prints,
+          # checks every value against a pattern for its key, and writes the summary rows itself.
+          # stderr goes to the log and is never parsed. This step used to merge the two streams and
+          # `eval` what it grepped, which made any text reaching either stream shell code.
+          # A missing or malformed RESULT is a broken pipeline, not runner weather, so it fails the
+          # step -- after every rate has run, so no row already taken is lost.
+          # Both exit statuses are read. The probe's: 0, or 2 after a setup failure it has already
+          # reported as an ERROR row; anything else is a crash, even one after its last row. The
+          # parser's: 0 measured, 3 setup failure only, anything else a broken RESULT stream.
+          # `|| status=(...)` takes PIPESTATUS before any other command can reset it, and keeps a
+          # failing rate from ending the sweep under the -e of `shell: bash`.
+          bad=0
+          measured=0
           IFS=',' read -ra RATE_LIST <<< "$RATES"
           for rate in "${RATE_LIST[@]}"; do
             rate="$(echo "$rate" | tr -d '[:space:]')"
             [ -n "$rate" ] || continue
             echo "::group::rate ${rate}/s x ${REPEAT}"
-            python -m harness.load.ingress_probe "$rate" --repeat "$REPEAT" 2>&1 | tee /tmp/probe.out
+            status=(0 0)
+            python -m harness.load.ingress_probe "$rate" --repeat "$REPEAT" \
+              | python scripts/ci/ingress_probe_summary.py --rate "$rate" --repeat "$REPEAT" \
+              || status=("${PIPESTATUS[@]}")
             echo "::endgroup::"
-            grep '^RESULT' /tmp/probe.out | while read -r line; do
-              # Parse the k=v pairs the probe emits; missing keys render as "?" rather than breaking.
-              eval "$(echo "$line" | tr ' ' '\n' | grep '=' | sed 's/^/P_/')" 2>/dev/null || true
-              echo "| ${P_rate:-?}/s | ${P_sent:-?} | ${P_acked:-?} | ${P_stranded:-?} | ${P_pct:-?}% | ${P_read:-?} | ${P_ok:-?} |" >> "$GITHUB_STEP_SUMMARY"
-              unset P_rate P_sent P_acked P_stranded P_pct P_read P_ok
-            done
+            case "${status[0]}" in
+              0|2) ;;
+              *) echo "::error title=ingress probe::the probe exited ${status[0]} at rate ${rate}/s"; bad=1 ;;
+            esac
+            case "${status[1]}" in
+              0) measured=1 ;;
+              3) ;;
+              *) bad=1 ;;
+            esac
           done
+          if [ "$measured" -eq 0 ] && [ "$bad" -eq 0 ]; then
+            echo "::error title=ingress probe::no rate produced a measurement row"
+            bad=1
+          fi
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "_Repeats per rate: ${REPEAT}. Read the spread — a single row is not a measurement (BACKLOG #320)._" >> "$GITHUB_STEP_SUMMARY"
+          exit "$bad"
