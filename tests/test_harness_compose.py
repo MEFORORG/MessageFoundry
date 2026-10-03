@@ -202,8 +202,8 @@ def _listener() -> socket.socket:
 
 def test_compose_refuses_a_frame_byte_by_default_before_any_connection(qapp: Any) -> None:
     server = _listener()
+    panel = ComposePanel()
     try:
-        panel = ComposePanel()
         assert not panel._raw_frame.isChecked()  # the safe framer is the default
         panel._editor.setPlainText(_HOSTILE)
         panel._port.setValue(server.getsockname()[1])
@@ -214,6 +214,7 @@ def test_compose_refuses_a_frame_byte_by_default_before_any_connection(qapp: Any
         with pytest.raises(TimeoutError):
             server.accept()  # no connection was opened
     finally:
+        panel.shutdown()  # joins a worker still running if an assertion failed first
         server.close()
 
 
@@ -236,8 +237,8 @@ def test_compose_sends_the_frame_byte_when_the_operator_opts_in(qapp: Any) -> No
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
+    panel = ComposePanel()
     try:
-        panel = ComposePanel()
         panel._raw_frame.setChecked(True)
         panel._editor.setPlainText(_HOSTILE)
         panel._port.setValue(server.getsockname()[1])
@@ -246,6 +247,7 @@ def test_compose_sends_the_frame_byte_when_the_operator_opts_in(qapp: Any) -> No
         thread.join(timeout=5.0)
         assert not panel._raw_frame.isChecked()  # the opt-in covers one send, then clears
     finally:
+        panel.shutdown()
         server.close()
     # The bare frame went out: the payload's own 0x0B sits inside the frame, as the operator asked.
     assert got and got[0] == frame(_HOSTILE)

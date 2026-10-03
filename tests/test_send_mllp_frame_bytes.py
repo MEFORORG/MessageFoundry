@@ -13,8 +13,10 @@ one connection and exactly one frame. Each hostile case also shows that the bare
 same payload is not one frame whose body is free of frame bytes, which is all the guard claims: the
 input is the shape the rule refuses, not a clean message refused by mistake. Synthetic data only.
 
-The ACK the script prints is the peer's text, so the last tests show a control character in it,
-ESC among them, printed as a visible ``\\xNN`` escape rather than passed to the terminal.
+The ACK the script prints is the peer's text, so the last tests show it printed as printable ASCII:
+a control character, ESC among them, and every non-ASCII code point as a visible escape rather than
+passed to the terminal, an ordinary ACK unchanged, and the reply read under the frame cap and one
+overall deadline.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import ast
 import importlib.util
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -216,20 +219,23 @@ def test_the_printed_ack_shows_control_characters_as_escapes(
     assert status == 0
     out = capsys.readouterr().out
     assert out.startswith("--- ACK ---\nMSH|")
-    assert "MSA|AA|CTRL1|\\x1b[2J\\x1b]0;owned\\x07\\x7f\\x9b1m\tend\n" in out
+    assert "MSA|AA|CTRL1|\\x1b[2J\\x1b]0;owned\\x07\\x7f\\u009b1m\tend\n" in out
     assert not any(ch < " " and ch not in "\n\t" or "\x7f" <= ch < "\xa0" for ch in out)
 
 
 def test_printable_output_is_ascii_and_cannot_be_forged() -> None:
     printable = _load()._printable
-    # Control: printable ASCII, tab and CR (as a newline) print as themselves.
-    assert printable(b"MSA|AA|X\tY\r") == "MSA|AA|X\tY\n"
-    # A backslash is doubled, so text spelling an escape cannot pass for an escaped control byte.
+    # Control: an ordinary ACK prints unchanged, MSH-2's backslash and an HL7 escape included.
+    assert printable(b"MSH|^~\\&|A\rMSA|AA|X\\F\\Y\tZ\r") == "MSH|^~\\&|A\nMSA|AA|X\\F\\Y\tZ\n"
+    # A backslash that would start an escape is doubled, so text spelling one cannot pass for an
+    # escaped control byte, and a backslash before an escaped byte stays distinguishable too.
     assert printable(b"\x1b" + b"\\x1b") == "\\x1b\\\\x1b"
+    assert printable(b"\\\x1b") == "\\\\\\x1b"
+    assert printable(b"\\\\") == "\\\\\\"  # each backslash before a backslash is doubled
     # A bidirectional override, a non-ASCII letter and a byte that is not UTF-8 are escaped too,
     # so what the operator reads is in byte order and a cp1252 console can always encode it.
     shown = printable("A\u202eB\u00e9".encode() + b"\xff" + "\U0001f600".encode())
-    assert shown == "A\\u202eB\\xe9\\ufffd\\U0001f600"
+    assert shown == "A\\u202eB\\u00e9\\ufffd\\U0001f600"
     assert shown.encode("ascii").decode("cp1252") == shown
 
 
@@ -268,3 +274,38 @@ def test_an_ack_over_the_frame_cap_is_refused_not_buffered(
     assert captured.out == ""
     assert captured.err.startswith("send_mllp: reply refused: frame exceeded 64 bytes")
     assert "MSH" not in captured.err
+
+
+def test_a_trickled_ack_hits_one_overall_deadline(listener: socket.socket, tmp_path: Path) -> None:
+    # Each byte arrives inside --timeout, so only a deadline for the whole reply ends the wait.
+    path = tmp_path / "clean.hl7"
+    path.write_bytes(_CLEAN.encode("utf-8"))
+    done = threading.Event()
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(5)
+            received = b""
+            while not received.endswith(bytes([EB, CR])):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                received += chunk
+            try:
+                conn.sendall(bytes([SB]))
+                while not done.wait(0.2):
+                    conn.sendall(b"x")
+            except OSError:
+                return
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            _load().main([str(path), "--port", _port(listener), "--timeout", "1"])
+    finally:
+        done.set()
+    assert time.monotonic() - started < 4
+    thread.join(5)

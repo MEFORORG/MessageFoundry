@@ -9,10 +9,11 @@
   as the Send tab does. Sending such bytes on purpose, to test the engine's ingress refusal
   ([ADR 0205](../docs/adr/0205-an-outbound-frame-holds-exactly-one-message.md) rule 4), is a
   labelled opt-in checkbox that covers one send.
-- **`samples/send_mllp.py` prints the peer's ACK as printable ASCII.** CR becomes a newline and a
-  backslash is doubled; every other control character (ESC among them), bidirectional override or
-  non-ASCII character is printed as a visible `\xNN`, `\uNNNN` or `\UNNNNNNNN` escape, so an ACK
-  cannot act on the operator's terminal or reorder what it shows. The ACK is also read under the
-  engine's frame cap; an over-cap reply is refused, and the helper exits 1.
-- **`messagefoundry verify`'s live smoke frames through `frame_checked`**, like every other MLLP
-  sender, and refuses before dialling. Its message is synthetic, so this is consistency.
+- **`samples/send_mllp.py` prints the peer's ACK as printable ASCII.** CR becomes a newline. A C0
+  control (ESC among them) or DEL prints as `\xNN`, and every non-ASCII code point (a C1 control, a
+  bidirectional override, an accented letter) as `\uNNNN` or `\UNNNNNNNN`, so an ACK cannot act on
+  the operator's terminal or reorder what it shows. A backslash is doubled only where it would read
+  as the start of an escape, so an ordinary ACK prints unchanged. The ACK is also read under the
+  engine's frame cap, refused with exit 1 past it, and under one deadline for the whole reply.
+- **`messagefoundry verify`'s live smoke frames through `frame_checked`**, as the harness and
+  `send_mllp` do, and refuses before dialling. Its message is synthetic, so this is consistency.

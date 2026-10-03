@@ -24,13 +24,15 @@ It sends the whole file as ONE frame. A listener takes one message per frame and
 file in a ``File(...)`` inbox instead, which splits it into one message each.
 
 The ACK is the peer's text, printed to a terminal, so it is printed as printable ASCII, newline and
-tab only (ASVS 1.1.2). CR becomes a newline; a backslash is doubled; every other character -- a C0
-or C1 control such as ESC, DEL, a bidirectional override, any non-ASCII letter -- is printed as a
-visible ``\\xNN``, ``\\uNNNN`` or ``\\UNNNNNNNN`` escape, and a byte that is not UTF-8 as U+FFFD,
-``\\ufffd``. A peer could otherwise move the cursor, retitle the window, rewrite what was printed
-above it or reorder what it shows, and a character a Windows console cannot encode would stop the
-print. The reply is also read under the engine's frame cap, so a peer that never ends its frame
-cannot grow it without bound.
+tab only (ASVS 1.1.2). CR becomes a newline. Every other character -- a C0 control such as ESC or
+DEL as ``\\xNN``, and every code point past ASCII, a C1 control, a bidirectional override or an
+accented letter alike, as ``\\uNNNN`` or ``\\UNNNNNNNN`` -- is printed as a visible escape, and a
+byte that is not UTF-8 as ``\\ufffd``. A backslash is doubled only where it would otherwise read as
+the start of one of those escapes, so an ordinary ACK, ``MSH|^~\\&|`` included, prints unchanged.
+A peer could otherwise move the cursor, retitle the window, rewrite what was printed above it or
+reorder what it shows, and a character a Windows console cannot encode would stop the print. The
+reply is read under the engine's frame cap and one overall deadline, so a peer that never ends its
+frame, or trickles it, cannot hold the helper.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import re
 import sys
 from pathlib import Path
 
@@ -54,22 +57,32 @@ from messagefoundry.parsing import normalize
 _REFUSED = 3
 
 
-def _escape(char: str) -> str:
-    """``char`` as it is printed: itself when printable ASCII, newline or tab, else an escape."""
-    if char == "\\":
-        return "\\\\"  # doubled, so a literal "\\x1b" in the ACK cannot pass for an escaped ESC
-    if char in "\n\t" or " " <= char <= "~":
-        return char
-    code = ord(char)
-    if code <= 0xFF:
-        return f"\\x{code:02x}"
-    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+class _Escapes(dict[int, str]):
+    """A ``str.translate`` table that computes each code point's printed form once, on first use:
+    itself when printable ASCII, newline or tab, else ``\\xNN`` (ASCII) or ``\\uNNNN``/``\\UNNNNNNNN``."""
+
+    def __missing__(self, code: int) -> str:
+        if code in (0x09, 0x0A) or 0x20 <= code <= 0x7E:
+            shown = chr(code)
+        elif code < 0x80:
+            shown = f"\\x{code:02x}"
+        else:
+            shown = f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+        self[code] = shown
+        return shown
+
+
+_ESCAPES = _Escapes()
+
+#: A backslash that would read as the start of an escape: one before x, u, U or another backslash,
+#: or before a character that is itself about to be escaped. Only that one is doubled.
+_AMBIGUOUS_BACKSLASH = re.compile(r"\\(?=[\\xuU]|[^\t\n -~])")
 
 
 def _printable(ack: bytes) -> str:
     """The ACK as text that is safe to print to any terminal: see the module docstring."""
     text = ack.decode("utf-8", errors="replace").replace("\r", "\n")
-    return "".join(_escape(char) for char in text)
+    return _AMBIGUOUS_BACKSLASH.sub(r"\\\\", text).translate(_ESCAPES)
 
 
 async def _send(host: str, port: int, wire: bytes, timeout: float) -> bytes:
@@ -79,12 +92,15 @@ async def _send(host: str, port: int, wire: bytes, timeout: float) -> bytes:
         writer.write(wire)
         await writer.drain()
         decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
-        while True:
-            chunk = await asyncio.wait_for(reader.read(4096), timeout)
-            if not chunk:
-                raise RuntimeError("peer closed before sending an ACK")
-            for message in decoder.feed(chunk):
-                return message
+        # One deadline for the whole reply, not one per read, so a peer that trickles bytes cannot
+        # keep the helper waiting.
+        async with asyncio.timeout(timeout):
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    raise RuntimeError("peer closed before sending an ACK")
+                for message in decoder.feed(chunk):
+                    return message
     finally:
         writer.close()
         with contextlib.suppress(OSError):
