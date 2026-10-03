@@ -636,3 +636,32 @@ surface section G asks for; any change to what the engine wheel ships.
 - [ ] How the leak-gate token list is shared with a second public repository.
 - [ ] The order of this move against ADR 0201 slices 5 to 7, and the wording of the amendment
       to its slice 7 and its AC-7.
+
+## Amendment 2026-10-03: the ingress probe's named fix landed
+
+Section G's last row named one fix for `messagefoundry.api` (`create_managed_app`): *"Start a
+`serve` subprocess, as `failover.py` and `shardcert.py` do."* That fix has landed.
+`harness/load/ingress_probe.py` used to build the engine in-process with `allow_no_auth=True` and
+serve it on loopback from a daemon thread that nothing stopped, so the harness wheel carried an
+engine API with sign-in off, running as the system identity for the life of the process. Each
+repeat now starts a `messagefoundry serve` subprocess on loopback through `failover.EngineNode`,
+provisions the rig Administrator in a fresh temp store (`harness/load/rigadmin.py`), signs in,
+reads the API with that session, and stops the engine before the next repeat and on every exit
+the probe's own code sees. An exit it does not see, at least a SIGKILL or a SIGTERM of the probe,
+still leaves the child running.
+
+What this changes in section G, stated here rather than edited into the table above, which stays
+the record of what was measured on 2026-10-01:
+
+- The `messagefoundry.api` (`create_managed_app`) row now counts **0** statements under
+  `harness/`. `messagefoundry.api` itself leaves the set of names that section counts; the
+  harness still imports `messagefoundry.api.models`, which is its own row.
+- `tests/test_no_sign_in_off_app_outside_tests.py` refuses code outside a `tests` directory that
+  gives `allow_no_auth` anything but `False`. Its docstring says which spellings it reads and
+  which two files it excepts, and why.
+
+The probe's RESULT line keeps its fields. A setup failure now names its stage in `ERROR=`, where
+it used to read `engine_did_not_start` for every failure. Rows taken before this date are not directly comparable with rows
+taken after; the probe's own docstring says why.
+
+No other part of this ADR changes, and its status is unchanged.
