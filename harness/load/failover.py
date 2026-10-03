@@ -158,11 +158,10 @@ class EngineNode:
         # not covered: on a writable Windows checkout its shell must carry both variables.
         if sys.platform == "win32":
             self._env.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
-        # RIGS SIGN IN (harness.load.rigadmin). The node serves with sign-in on, whatever the calling
-        # shell holds: `start` provisions the rig Administrator in this node's store first, and the
-        # API reads below carry that account's session. The rig password stays out of the engine's
-        # environment; only the provisioning child is handed it.
-        self._env.pop("MEFOR_SECURITY_REQUIRE_SIGN_IN", None)
+        # RIGS SIGN IN (harness.load.rigadmin). `serve` always requires sign-in (vault BACKLOG #2719):
+        # `start` provisions the rig Administrator in this node's store first, and the API reads below
+        # carry that account's session. The rig password stays out of the engine's environment; only
+        # the provisioning child is handed it.
         self._env.pop(rigadmin.ADMIN_PASS_ENV, None)
         for name, value in rigadmin.SERVE_ENV.items():
             self._env.setdefault(name, value)

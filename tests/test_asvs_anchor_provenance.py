@@ -46,7 +46,7 @@ from anchor_provenance import (  # noqa: E402
     main,
     summarise,
 )
-from scorecard import Anchor, Cell  # noqa: E402
+from scorecard import Anchor, Cell, ScorecardError, load_scorecard  # noqa: E402
 
 #: The refusal code for a run that started and will not publish a number. This tool splits its two
 #: refusals: 2 says the INVOCATION is unusable and is decidable from the arguments alone, 3 says the
@@ -684,6 +684,60 @@ def test_a_control_record_from_before_the_reviewed_by_migration_still_loads() ->
     (cell,) = anchor_provenance._cells_from(legacy, "asvs-scorecard.toml")
     assert [a.expect for a in cell.evidence] == ["NEEDLE"]
     assert cell.reviewed_by is None and cell.review_notes == "a builder"
+
+
+def test_main_measures_a_pre_migration_control_ref_end_to_end(
+    history: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #2276. The arm above calls ``_cells_from`` directly; this one drives ``main`` with
+    ``--control-ref`` at a record commit that predates the ``reviewed_by`` migration, which is the
+    run every real control ref makes. The live record is migrated and repaired, as it is in the vault.
+
+    THE FIXTURE CAN FIRE: the live loader refuses the control record, so a ``main`` that read the
+    control ref without ``historical=True`` would refuse with 3 here instead of measuring.
+    """
+    repo, _early, later = history
+    root = tmp_path / "legacy-vault"
+    git("init", "-b", "main", str(root), cwd=tmp_path)
+    git("config", "user.email", "t@example.com", cwd=root)
+    git("config", "user.name", "t", cwd=root)
+    card = root / "docs" / "security" / "asvs-scorecard.toml"
+    card.parent.mkdir(parents=True)
+
+    structured = _record(2, later)
+    legacy = structured.replace(
+        'reviewed_by = { reviewer = "a builder", ref = "unrecorded", date = "unrecorded" }\n',
+        'reviewed_by = "a builder"\n',
+    )
+    assert legacy != structured, "the splice did not land"
+    card.write_text(legacy, encoding="utf-8")
+    git("add", "-A", cwd=root)
+    git("commit", "-m", "record before the reviewed_by migration", cwd=root)
+    pre = git("rev-parse", "HEAD", cwd=root)
+    with pytest.raises(ScorecardError, match="legacy plain-string"):
+        load_scorecard(card)
+
+    card.write_text(_record(4, later), encoding="utf-8")
+    git("add", "-A", cwd=root)
+    git("commit", "-m", "record migrated, and the line re-derived", cwd=root)
+
+    out = tmp_path / "annotation.json"
+    code, stream = _run(
+        [
+            "--scorecard", str(card), "--root", str(repo),
+            "--control-ref", pre, "--annotate", str(out),
+        ],
+        capsys,
+    )  # fmt: skip
+    assert code == 0, stream
+    assert f"control={pre[:12]}" in stream, stream
+    _assert_no_assessment_content(stream)
+    rows = _annotations(json.loads(out.read_text(encoding="utf-8")))
+    assert len(rows) == 1, rows
+    assert rows[0]["status"] == BORN_WRONG
+    assert rows[0]["recorded_line"] == 2 and rows[0]["found_line"] == 4
 
 
 @pytest.fixture

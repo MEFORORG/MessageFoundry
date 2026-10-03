@@ -848,8 +848,13 @@ def test_the_engine_homes_still_export_the_moved_names() -> None:
     for name in ("SB", "EB", "CR", "DEFAULT_MAX_FRAME_BYTES", "frame", "MLLPDecoder", "build_ack"):
         assert getattr(tmllp, name) is getattr(codec, name), name
     assert tmllp.MLLPFrameError is codec.MLLPFrameError
-    for name in tframing.__all__:
+    # Every name the leaf exports, not every name the engine home exports: the engine home also
+    # defines its own delivery and reply framers (ADR 0205), which the leaf must not carry.
+    for name in framing.__all__:
         assert getattr(tframing, name) is getattr(framing, name), name
+    for name in ("frame_for_delivery", "frame_reply", "check_frame_bytes"):
+        assert name in tframing.__all__, name
+        assert not hasattr(framing, name), name
 
 
 def test_importing_api_does_not_eagerly_pull_fastapi() -> None:

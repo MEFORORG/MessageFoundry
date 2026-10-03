@@ -89,7 +89,7 @@ Each one is in `_serve` in `messagefoundry/__main__.py`.
 
 | Guard | What it refuses |
 |---|---|
-| Sign-in off | `[security].require_sign_in = false` on an exposed instance. Exposed means a non-loopback operator bind or a declared TLS terminator (`[api].tls_terminated_upstream`) |
+| Sign-in off | Authentication disabled, on any bind, loopback included (vault BACKLOG #2719). No setting turns it off; a config that sets the removed `[security].require_sign_in` key is refused at load, before this guard |
 | Operator bind | A non-loopback operator bind that has neither an operator certificate (`[api].tls_cert_file`) nor a declared TLS terminator |
 | Certificate revocation | A non-loopback operator bind that serves TLS on an operator certificate with no declared terminator in front, unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set |
 | Plaintext proxy hop | A declared TLS terminator with no operator certificate, unless `[api].plaintext_upstream_hop_acknowledged` is true |

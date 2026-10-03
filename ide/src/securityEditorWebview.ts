@@ -49,9 +49,6 @@ export const FIELDS: Field[] = [
     desc: "Second audited ack (with 'Allow unencrypted PHI') REQUIRED to start a PHI instance keyless under strict enforcement (ADR 0140).",
     insecure: true, risk: "a PHI instance may start keyless under strict enforcement — PHI stored UNENCRYPTED at rest" },
   // ── Sign-in & identity ──────────────────────────────────────────
-  { key: "require_sign_in", label: "Require sign-in", type: "bool", group: "Sign-in & identity",
-    desc: "Authenticate every request.",
-    insecure: false, risk: "authentication is DISABLED (loopback-only; a non-loopback bind refuses)" },
   { key: "require_mfa", label: "Require MFA", type: "bool", group: "Sign-in & identity",
     desc: "Require an engine second factor at sign-in, from every account by default; a covered local account enrols TOTP before it adds a passkey. An OIDC sign-in meets it with an amr/acr claim checked while [auth].oidc_require_mfa_claim is on; require_mfa_scope can free a local account without the Administrator role.",
     insecure: false, risk: "an account with no second factor enrolled is single-factor, so a Kerberos session enters on a ticket that asserts no strength. An enrolled account owes its factor only while it keeps one, and its holder may remove the last. Where an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on, that claim stands in for the enrolled factor" },

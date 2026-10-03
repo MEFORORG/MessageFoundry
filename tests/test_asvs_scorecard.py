@@ -39,6 +39,7 @@ from scripts.asvs.scorecard import (
     Verdict,
     _base_line,
     _code_only,
+    _code_only_view,
     _copy_scratch,
     _humanise_age,
     _md_cell,
@@ -1097,12 +1098,45 @@ def test_absence_control_sighted_only_where_the_view_hides_it_is_BLIND_when_it_l
     assert f.advisories == []
 
 
+#: Tokenize stops at the unclosed string, before the match ends, and the text past it stays raw.
+_STOPS_EARLY = 'set_cookie("sid", samesite="none'
+#: Tokenize stops only at the end, on the unclosed bracket, so every string was blanked first.
+_STOPS_AT_END = 'set_cookie("sid", samesite="none"'
+
+
 def test_absence_mutation_that_will_not_tokenize_is_named_undetermined(tmp_path: Path) -> None:
     """A raw fallback would clear it, so it is named as UNDETERMINED instead."""
     root = _absence_tree(tmp_path, {})
-    f = _absence_findings(root, _SAMESITE[0], 'set_cookie("sid", samesite="none"')
+    f = _absence_findings(root, _SAMESITE[0], _STOPS_EARLY)
     assert f.problems == []
     assert f.advisory_kinds == {"view-undetermined": 1}
+
+
+def test_absence_mutation_that_stops_tokenizing_only_at_its_end_is_view_inert(
+    tmp_path: Path,
+) -> None:
+    """Nothing past the stop was left raw, so the view is whole: INERT, not UNDETERMINED (#2275)."""
+    view, cut = _code_only_view(_STOPS_AT_END)
+    assert cut == len(_STOPS_AT_END) and "none" not in view
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, _SAMESITE[0], _STOPS_AT_END)
+    assert f.problems == []
+    assert f.advisory_kinds == {"view-inert": 1}
+
+
+def test_absence_end_stop_mutation_landing_under_scripts_is_INERT(tmp_path: Path) -> None:
+    """Where the claim lands in the view, the same whole view is a FAIL (BACKLOG #2275)."""
+    root = _absence_tree(tmp_path, {"scripts/tool.py": "class Control: pass\n"})
+    f = _absence_findings(root, _SAMESITE[0], _STOPS_AT_END, mutation_path="scripts/tool.py")
+    assert len(f.problems) == 1 and "INERT" in f.problems[0], f.problems
+    assert f.advisories == []
+
+
+def test_absence_end_stop_mutation_the_view_keeps_is_not_named(tmp_path: Path) -> None:
+    """Negative control: a whole view that still matches settles the claim, and nothing is named."""
+    root = _absence_tree(tmp_path, {})
+    f = _absence_findings(root, r"hashlib\.md5", "hashlib.md5(b,")
+    assert f.problems == [] and f.advisories == []
 
 
 def test_absence_match_before_tokenizing_stops_settles_the_view(tmp_path: Path) -> None:
@@ -1117,9 +1151,7 @@ def test_absence_undetermined_mutation_landing_under_scripts_stays_an_advisory(
 ) -> None:
     """Pinned as chosen, not as proven right: UNDETERMINED is not a FAIL even where it lands."""
     root = _absence_tree(tmp_path, {"scripts/tool.py": "class Control: pass\n"})
-    f = _absence_findings(
-        root, _SAMESITE[0], 'set_cookie("sid", samesite="none"', mutation_path="scripts/tool.py"
-    )
+    f = _absence_findings(root, _SAMESITE[0], _STOPS_EARLY, mutation_path="scripts/tool.py")
     assert f.problems == []
     assert f.advisory_kinds == {"view-undetermined": 1}
 
@@ -1147,6 +1179,10 @@ def test_absence_landing_under_scripts_needs_its_control_in_a_code_only_view(
     root = _absence_tree(tmp_path, {"scripts/tool.py": "x = 1\n"})
     f = _absence_findings(root, "clamd", "import clamd", mutation_path="scripts/tool.py")
     assert len(f.problems) == 1 and "BLIND" in f.problems[0], f.problems
+    # The search covers every code-only view, so the text names the root, never the one file the
+    # claim lands in (BACKLOG #2275).
+    assert "every scripts/ file" in f.problems[0], f.problems
+    assert "scripts/tool.py" not in f.problems[0], f.problems
     f = _absence_findings(
         root, "clamd", "import clamd", control="x = 1", mutation_path="scripts/tool.py"
     )
@@ -1157,8 +1193,11 @@ def test_absence_mutation_path_to_an_untokenizable_script_is_read_raw(tmp_path: 
     """The corpus reads a script that will not tokenize RAW, so it is not a view the claim lands in."""
     root = _absence_tree(tmp_path, {"scripts/broken.py": 's = """never closed\n'})
     f = _absence_findings(root, *_SAMESITE, mutation_path="scripts/broken.py")
+    # So the FAIL text saying the file is read through the view is never printed for it, and the
+    # advisory claims quiet only for a file the view does read (BACKLOG #2275).
     assert f.problems == []
     assert f.advisory_kinds == {"view-inert": 1}
+    assert "file the view reads would stay quiet" in f.advisories[0], f.advisories
 
 
 def test_view_FAIL_lines_keep_the_INERT_and_BLIND_shapes_a_parser_reads(tmp_path: Path) -> None:
