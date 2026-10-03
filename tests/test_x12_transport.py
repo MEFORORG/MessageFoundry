@@ -347,7 +347,7 @@ async def test_reply_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> 
         # Unbounded, this never returns. The 2 s is how the regression FAILS, not the assertion.
         await asyncio.wait_for(client, timeout=2.0)
         assert peer.closed  # dropped, not left open on a peer that had stopped reading
-        assert source._active == 0  # ... and the max_connections slot went back
+        assert source._admission.active == 0  # ... and the max_connections slot went back
         # Pins the order and the absence of anything else; a failure must not also be reported as a
         # clean "closed" (BACKLOG #1665, mirroring the raw-TCP twin's assertion).
         assert events == ["established", "peer_reset"]

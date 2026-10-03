@@ -379,8 +379,9 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
             remotefile.SFTP_CHANNEL_READ_TIMEOUT_SECONDS,
             "transports.remotefile",
         ),
-        # BACKLOG #1725. Both are MLLP-listener-only, so the tables must not be read as stating a
-        # bound the raw-TCP/X12/HTTP/DICOM intakes also carry; the prose rows say so in words, and
+        # BACKLOG #1725. Both began MLLP-listener-only; vault BACKLOG #2606 gave the raw-TCP and X12
+        # listeners the same two at the same defaults, and the HTTP listener a per-host cap that
+        # ships off. The DICOM SCP carries neither. The prose rows say which listener has which, and
         # these two pins only hold the stated NUMBER to the constant.
         (
             "max_connections_per_host",

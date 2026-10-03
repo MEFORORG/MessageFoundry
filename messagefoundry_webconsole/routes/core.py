@@ -25,7 +25,11 @@ from messagefoundry.api.models import (
     PendingApprovalResponse,
     ResendRequest,
 )
-from messagefoundry.api.security import get_auth, pending_credential_deadline_for
+from messagefoundry.api.security import (
+    get_auth,
+    pending_credential_deadline_for,
+    public_route,
+)
 from messagefoundry.api.validation import EPOCH_SECONDS_MAX, ConnectionName, EpochSeconds
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
@@ -425,6 +429,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return JSONResponse({"expires_secs": remaining})
 
     @app.get("/ui/login", response_class=HTMLResponse)
+    @public_route("the sign-in form")
     async def ui_login_form(
         request: Request, e: str | None = Query(None, max_length=32)
     ) -> HTMLResponse:
@@ -456,6 +461,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return resp
 
     @app.post("/ui/login")
+    @public_route("sign-in itself; a session does not exist yet")
     async def ui_login(request: Request) -> Response:
         # ASVS 3.5.1 — FIRST statement, ahead of the per-address login budget below: a cross-site
         # credential POST is refused having spent no rate-limit token and run no password verify. The
@@ -521,6 +527,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return resp
 
     @app.post("/ui/logout")
+    @public_route("sign-out must work for a session every gate would refuse")
     async def ui_logout(request: Request) -> Response:
         # ASVS 3.5.1 — FIRST statement, before the session is revoked below. This route deliberately
         # carries NO Depends gate (so a must-change-confined session can still sign itself out — the
@@ -1255,6 +1262,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return await pending_credential_deadline_for(auth, identity.user_id)
 
     @app.get("/ui/mfa", response_class=HTMLResponse)
+    @public_route("the second-factor page for a session the gates refuse until it verifies")
     async def ui_mfa_form(request: Request) -> Response:
         """The ASVS 6.3.3 confinement page for an MFA-pending browser session.
 
@@ -1296,6 +1304,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
 
     @app.post("/ui/mfa")
+    @public_route("the second-factor check for a session the gates refuse until it verifies")
     async def ui_mfa_submit(request: Request) -> Response:
         assert_same_origin(request)
         auth = get_auth(request)
@@ -1348,6 +1357,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
 
     @app.get("/ui/reauth", response_class=HTMLResponse)
+    @public_route("the re-authentication page a step-up gate sends the browser to")
     async def ui_reauth_form(
         request: Request,
         next_: str = Query("", alias="next", max_length=512),
@@ -1401,6 +1411,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
 
     @app.post("/ui/reauth")
+    @public_route("the re-authentication a step-up gate sends the browser to")
     async def ui_reauth(request: Request) -> Response:
         assert_same_origin(request)
         auth = get_auth(request)
@@ -1570,6 +1581,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # handlers: a must-change session that still owes its factor must pass. For a passkey-only
     # account this is the only way to prove it (BACKLOG #1954).
     @app.post("/ui/reauth/webauthn")
+    @public_route("the passkey re-authentication a step-up gate sends the browser to")
     async def ui_reauth_webauthn(request: Request) -> Response:
         assert_same_origin(request)
         auth = get_auth(request)
@@ -1677,6 +1689,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return await _ui_dl_replay(request, channel_id, destination_name, engine, identity, gate)
 
     @app.post("/ui/csp-report")
+    @public_route("browsers send CSP violation reports without a session")
     async def ui_csp_report(request: Request) -> Response:
         # ASVS 3.5.1 — FIRST statement. The THIRD unguarded /ui POST is disposed of here, with the
         # NARROW guard rather than the full same-origin check, because the two are not interchangeable

@@ -19,10 +19,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
-from fastapi import Depends, FastAPI, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 
 from messagefoundry.api.app import create_app
-from messagefoundry.api.security import authorize_ws
+from messagefoundry.api.security import authorize_ws, mark_route_gate, require
 from messagefoundry.auth.permissions import Permission
 from scripts.security import route_gates
 
@@ -193,7 +193,7 @@ def require_ws_probe(*permissions: Permission) -> Callable[[WebSocket], Awaitabl
     async def dependency(websocket: WebSocket) -> None:
         assert permissions  # read, so the closure captures ``permissions`` as gate_of expects
 
-    return dependency
+    return mark_route_gate(dependency)
 
 
 async def _dependency_gated(websocket: WebSocket) -> None:
@@ -291,3 +291,99 @@ def test_a_gate_the_walk_cannot_read_raises_rather_than_under_reports(
 ) -> None:
     with pytest.raises(ValueError, match=needle):
         route_gates.route_rows(_app_with(endpoint))
+
+
+# --- vault BACKLOG #2604: the walk's blind spots ------------------------------------------------------
+# Each of the first, third and fourth tests below failed on the walk before #2604: the first read a
+# dependency NAMED require_* as a gate, and the other two never reported the planted route at all.
+
+
+def require_lookalike(*permissions: Permission) -> Callable[[Request], Awaitable[None]]:
+    """Named like a gate factory and capturing ``permissions`` as one does, but carrying no gate mark."""
+
+    async def dependency(request: Request) -> None:
+        assert permissions is not None
+
+    return dependency
+
+
+async def _ok() -> dict[str, str]:
+    return {"ok": "reached"}
+
+
+def _rows_by_key(app: FastAPI) -> dict[tuple[str, str], route_gates.RouteRow]:
+    return {(r.method, r.path): r for r in route_gates.route_rows(app)}
+
+
+def test_a_dependency_named_like_a_gate_is_not_read_as_one() -> None:
+    app = FastAPI()
+    app.add_api_route(
+        "/planted",
+        _ok,
+        dependencies=[Depends(require_lookalike(Permission.MESSAGES_VIEW_RAW))],
+    )
+    row = _rows_by_key(app)[("GET", "/planted")]
+    assert row.gate is None and row.permissions == (), row
+
+
+def test_a_marked_gate_is_read_whatever_its_name() -> None:
+    gate = mark_route_gate(require_lookalike(Permission.MESSAGES_VIEW_RAW))
+    app = FastAPI()
+    app.add_api_route("/planted", _ok, dependencies=[Depends(gate)])
+    row = _rows_by_key(app)[("GET", "/planted")]
+    assert row.gate == "require_lookalike", row
+    assert row.permissions == (Permission.MESSAGES_VIEW_RAW.value,), row
+
+
+def test_the_walk_descends_into_an_included_router() -> None:
+    sub = APIRouter(prefix="/sub")
+    sub.add_api_route("/open", _ok)
+    sub.add_api_route("/gated", _ok, dependencies=[Depends(require(Permission.MONITORING_READ))])
+    gated_by_include = APIRouter()
+    gated_by_include.add_api_route("/by-include", _ok)
+    app = FastAPI()
+    app.include_router(sub)
+    app.include_router(gated_by_include, dependencies=[Depends(require(Permission.AUDIT_READ))])
+    rows = _rows_by_key(app)
+    assert rows[("GET", "/sub/open")].gate is None
+    assert rows[("GET", "/sub/gated")].permissions == (Permission.MONITORING_READ.value,)
+    # A gate the include call adds is not the route's own, and the engine refuses such a route, so
+    # the walk must read it as no gate rather than vouch for it.
+    assert rows[("GET", "/by-include")].gate is None
+    assert not [key for key in rows if key[1] == ""], rows
+
+
+def test_an_included_websocket_reads_the_gate_its_include_adds() -> None:
+    """FastAPI serves an included WebSocket through a rebuilt route that carries the include's
+    dependencies, and the engine's refusal reads that rebuilt route, so the walk reads it too."""
+    sub = APIRouter()
+    sub.add_api_websocket_route("/ws/included", _dependency_gated)
+    app = FastAPI()
+    app.include_router(sub, dependencies=[Depends(require_ws_probe(Permission.FILES_BROWSE))])
+    (row,) = _ws_rows(app)
+    assert row.path == "/ws/included"
+    assert row.gates == ("require_ws_probe",), row
+
+
+def test_the_walk_descends_into_a_mounted_application_with_routes() -> None:
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_route("/inner", _ok)
+    app = FastAPI()
+    app.mount("/mounted", inner)
+    rows = _rows_by_key(app)
+    assert rows[("GET", "/mounted/inner")].gate is None
+    assert (route_gates.MOUNT_METHOD, "/mounted") not in rows
+
+
+def test_a_mount_with_no_routes_stays_one_ungated_row(ui_app: FastAPI) -> None:
+    rows = _rows_by_key(ui_app)
+    assert rows[(route_gates.MOUNT_METHOD, "/ui/static")].gate is None
+
+
+def test_the_full_surface_app_walks_the_flag_registered_routes(ui_app: FastAPI) -> None:
+    """The OIDC console routes register only with ``oidc_enabled`` on, so neither the default app nor
+    a plain ``serve_ui`` app shows them. The full-surface app does."""
+    rows = _rows_by_key(route_gates.full_surface_app())
+    for key in [("GET", "/ui/oidc/callback"), ("GET", "/docs"), ("GET", "/ui/login")]:
+        assert key in rows, key
+    assert ("GET", "/ui/oidc/callback") not in _rows_by_key(ui_app)
