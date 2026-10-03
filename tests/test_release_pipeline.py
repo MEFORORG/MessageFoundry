@@ -3458,6 +3458,16 @@ def test_each_publish_job_checks_the_digests_its_producer_recorded() -> None:
             s for s in steps if str(s.get("uses") or "").startswith("actions/download-artifact@")
         )
         assert fetched["with"]["name"] == handover["with"]["name"], (key, fetched["with"])
+        # WHERE THE FILES LAND. upload-artifact roots an artifact at the common ancestor of its
+        # paths, so ONE directory is stored without its own name, and several top-level ones keep
+        # theirs. Each handed-over directory must land at its own name, or the digest manifest and
+        # `packages-dir` point at nothing on a real tag; a dispatch never downloads, so only this
+        # catches it.
+        target = str(fetched["with"].get("path") or ".").rstrip("/") or "."
+        for directory in handed:
+            name = directory.rstrip("/")
+            landed = target if len(handed) == 1 else f"{target}/{name}".removeprefix("./")
+            assert landed == name, (key, directory, "lands at", landed)
         for i in publishes:
             assert steps[i]["with"]["packages-dir"] in handed, (key, steps[i]["with"])
     assert len(bodies) == 1, "the publish jobs' digest checks differ; they must be one body"

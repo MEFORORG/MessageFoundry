@@ -46,6 +46,10 @@
 # `pypi` environment and limit that environment to tags with an approval, without the approval
 # also gating the build, and without refusing the dispatch dry-run: a publish job never runs on a
 # dispatch, so the environment is never asked for. The OWNER creates that environment and its rules.
+# One environment serves engine (`v*`) and console (`webconsole-v*`) tags, so a tag rule on it must
+# admit both patterns. And it binds only once each PyPI Trusted Publisher (engine, toolkit, console,
+# harness) is edited to name environment `pypi`: a publisher with a blank environment accepts a
+# token from any job in this workflow.
 # A job naming an environment that does not exist creates it with no rules, which would publish
 # exactly as before while reading as a control that is not there.
 #
@@ -60,7 +64,7 @@
 # below (same version, same tag). Its PyPI publish is GATED on the `PUBLISH_HARNESS` repo variable so it
 # stays a no-op until the OWNER (one-time): (1) configures a `messagefoundry-harness` PyPI Trusted
 # Publisher — a PENDING publisher for repo MEFORORG/MessageFoundry + workflow `release.yml` (environment
-# `pypi`, matching the engine) — then (2) sets repo variable PUBLISH_HARNESS=true. Until then the
+# `pypi`, as every publisher here should be) — then (2) sets repo variable PUBLISH_HARNESS=true. Until then the
 # job still BUILDS + version-checks the harness wheel each release and attaches it to the GitHub release.
 #
 # THIRD distribution — `messagefoundry-toolkit` (the authoring and development commands, ADR 0201,
@@ -272,7 +276,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write       # create the release + upload its assets
-      id-token: write       # Sigstore signing, PyPI Trusted Publishing, + provenance — all via the GitHub OIDC identity
+      id-token: write       # Sigstore signing + SLSA provenance via the GitHub OIDC identity (PyPI publishes from publish-pypi)
       attestations: write   # write the SLSA build-provenance attestation (actions/attest-build-provenance)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -962,7 +966,7 @@ jobs:
       # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
       # builder workflow identity, transparency-logged via the OIDC identity above. This is the
       # GitHub-native artifact attestation for the GitHub release assets, COMPLEMENTING the PyPI-side
-      # PEP 740 attestations emitted by the publish step below (dist-pub/ is a byte-identical copy, so
+      # PEP 740 attestations emitted by the publish-pypi job (dist-pub/ is a byte-identical copy, so
       # the digests match either source). Verify a downloaded artifact with (BACKLOG #2534):
       #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry \
       #     --signer-workflow MEFORORG/MessageFoundry/.github/workflows/release.yml \
@@ -1104,7 +1108,9 @@ jobs:
       # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
       # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
       # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the hand-over too.
+      # Unconditional, so a dispatch dry-run exercises the hand-over too. Kept 30 days, so an
+      # approval on the `pypi` environment, or a late re-run, still finds the files. An artifact
+      # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
         run: |
@@ -1122,7 +1128,7 @@ jobs:
             dist-pub/
             toolkit-dist/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
 
   # PUBLISH THE ENGINE AND THE TOOLKIT TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631,
   # limb 1). The header says why the publish is split from the build.
@@ -1282,16 +1288,15 @@ jobs:
             echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
           fi
           echo "packaging pin from constraints.lock: $PKG_PIN"
-          # A THROWAWAY VENV, not this job's interpreter (ADR 0034). This job holds contents: write +
-          # id-token: write, and the steps after this one attach the wheel to a GitHub release and
-          # publish it to PyPI — so anything resolved into the main interpreter here sits inside the
-          # publishing identity. The engine job has always done it this way (/tmp/relsmoke); the console
+          # A THROWAWAY VENV, not this job's interpreter (ADR 0034). This job holds contents: write,
+          # and the steps after this one attach the wheel to a GitHub release and hand it to the PyPI
+          # publish — so anything resolved into the main interpreter here sits beside that scope. The engine job has always done it this way (/tmp/relsmoke); the console
           # was the one wheel job still installing into the job interpreter.
           python -m venv /tmp/webconsolesmoke
           /tmp/webconsolesmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. `messagefoundry-webconsole` depends on
           # `messagefoundry`, and this job has no `needs: release`, so a full install would resolve that
-          # engine FROM PYPI inside a job holding id-token: write. Install the built wheel alone.
+          # engine FROM PYPI inside a job holding contents: write. Install the built wheel alone.
           /tmp/webconsolesmoke/bin/pip install --quiet --no-deps webconsole-dist/*.whl
           # Then INSPECT it rather than import it. messagefoundry_webconsole/__init__.py eagerly imports
           # .pages, ._auth and .mount, so under --no-deps (no fastapi, no engine) an import would fail on
@@ -1562,7 +1567,9 @@ jobs:
       # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
       # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
       # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the hand-over too.
+      # Unconditional, so a dispatch dry-run exercises the hand-over too. Kept 30 days, so an
+      # approval on the `pypi` environment, or a late re-run, still finds the files. An artifact
+      # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
         run: |
@@ -1579,7 +1586,7 @@ jobs:
           path: |
             webconsole-dist/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
 
   # PUBLISH THE CONSOLE TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631, limb 1). The
   # variable gate sits on the job as well as the step, so the environment is never asked for while
@@ -1599,7 +1606,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: pypi-webconsole
-          path: .
+          path: webconsole-dist
 
       # The same body in every publish job; tests/test_release_pipeline.py holds them identical and
       # runs it. Every file must match its digest, and no file may be present that was not listed.
@@ -1714,8 +1721,8 @@ jobs:
           # Pin DERIVED from constraints.lock + installed outside the tag guard — see the engine job's
           # wheel smoke above for the full rationale — and into a THROWAWAY VENV, not this job's
           # interpreter, which is the other half of ADR 0034's recommendation. This job holds
-          # contents: write + id-token: write and the steps AFTER this one attach the wheel to the
-          # release and publish it to PyPI, so an install resolved into the main interpreter here sits
+          # contents: write and the steps AFTER this one attach the wheel to the release and hand it
+          # to the PyPI publish, so an install resolved into the main interpreter here sits
           # inside the publishing identity.
           PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
           if [ -z "$PKG_PIN" ]; then
@@ -1726,8 +1733,9 @@ jobs:
           /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. messagefoundry-harness depends on
           # messagefoundry[harness], so a full install would resolve the ENGINE AND PySide6 FROM PYPI
-          # inside a job holding id-token: write — and at this moment the engine release above has just
-          # published, so it would also be a live index round-trip on the release path. Install the
+          # inside a job holding contents: write — and the engine may not be on PyPI yet, since
+          # publish-pypi runs beside this job, so it would also be a live index round-trip on the
+          # release path. Install the
           # built wheel alone; the import below is chosen to need nothing else.
           /tmp/harnesssmoke/bin/pip install --quiet --no-deps harness-dist/*.whl
           # A failure inside this command substitution fails the step: Actions runs the block as
@@ -1918,7 +1926,7 @@ jobs:
           # builds metadata-only stub engine wheels in a temp dir and resolves this wheel against each
           # with --no-index --dry-run --ignore-installed: an older and a newer engine must be REFUSED,
           # and the engine at this wheel's own version must resolve. No index is contacted and nothing
-          # is installed, so it adds no network to a job holding id-token: write.
+          # is installed, so it adds no network to a job holding contents: write.
           # tests/test_packaging.py runs the same script against the pyproject's real table in CI.
           /tmp/harnesssmoke/bin/python -I scripts/release/harness_resolution_check.py harness-dist/*.whl
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
@@ -1959,7 +1967,9 @@ jobs:
       # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
       # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
       # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the hand-over too.
+      # Unconditional, so a dispatch dry-run exercises the hand-over too. Kept 30 days, so an
+      # approval on the `pypi` environment, or a late re-run, still finds the files. An artifact
+      # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
         run: |
@@ -1976,7 +1986,7 @@ jobs:
           path: |
             harness-dist/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
 
   # PUBLISH THE HARNESS TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631, limb 1). It
   # needs publish-pypi so the engine the harness pins is on PyPI first, as it was when this step
@@ -1996,7 +2006,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: pypi-harness
-          path: .
+          path: harness-dist
 
       # The same body in every publish job; tests/test_release_pipeline.py holds them identical and
       # runs it. Every file must match its digest, and no file may be present that was not listed.
