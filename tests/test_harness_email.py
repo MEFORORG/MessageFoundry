@@ -18,6 +18,7 @@ Every certificate and key is minted per test under ``tmp_path``; none is committ
 
 from __future__ import annotations
 
+import dataclasses
 import smtplib
 import socket
 import ssl
@@ -54,7 +55,12 @@ from harness.sinks.email import MAX_LINE_BYTES, EmailSink, parse
 from messagefoundry import pki
 from messagefoundry.apiclient import EngineClient
 from messagefoundry.config.wiring import EnvRef, load_config
-from tests._harness_engine import HARNESS_CONFIG, ephemeral_overrides, serve_harness_config
+from tests._harness_engine import (
+    HARNESS_CONFIG,
+    ephemeral_overrides,
+    harness_egress,
+    serve_harness_config,
+)
 from tests.test_direct_transport import _mint_ca, _mint_leaf, _write_key, _write_pem
 
 _EMAIL_SCENARIOS = ("email_delivered", "email_rejected_recipient")
@@ -398,6 +404,46 @@ def test_a_rejected_scenario_fails_when_the_sink_accepts_the_recipient(
         result = run_scenario(accepted, client, timeout=5.0, endpoints=eps)
     assert not result.ok
     assert "0/1" in result.detail
+
+
+@pytest.mark.parametrize(
+    "toml",
+    [
+        pytest.param('[egress]\nallowed_http = ["127.0.0.1"]\n', id="no-recipient-domains"),
+        pytest.param(
+            '[egress]\nallowed_http = ["127.0.0.1"]\nallowed_recipient_domains = ["other.invalid"]\n',
+            id="another-domain",
+        ),
+    ],
+)
+def test_an_unlisted_recipient_domain_fails_the_delivered_scenario(
+    tmp_path: Path, toml: str
+) -> None:
+    """Control for the passing Email runs: they pass because ``allowed_recipient_domains`` names
+    the harness mail domain (vault BACKLOG #2616). With the list empty or naming another domain, the
+    engine refuses both Email outbounds and the delivered scenario fails."""
+    scenario = SCENARIOS["email_delivered"]
+    assert isinstance(scenario, EmailScenario)
+    egress = harness_egress(tmp_path, toml)
+    with serve_harness_config(tmp_path, ephemeral_overrides(tmp_path), egress=egress) as served:
+        api_url, eps = served
+        with EngineClient(api_url) as client:
+            listing = client.connections()
+            result = run_scenario(
+                dataclasses.replace(scenario, count=1), client, timeout=3.0, endpoints=eps
+            )
+    outbound: dict[str, set[str]] = {}
+    for row in listing:
+        if row.role == "destination" and row.destination:
+            outbound.setdefault(row.destination, set()).add(row.status)
+    inbound = {row.channel_id: row.status for row in listing if row.role == "source"}
+    for name in ("OB_Harness_Email", "OB_Harness_Email_Rejected"):
+        assert outbound[name] == {"failed"}, (name, outbound.get(name))
+    assert inbound["IB_Harness_Email"] == "running"
+    # It must fail BECAUSE delivery was refused: the message reached the engine and got no further.
+    assert not result.ok
+    assert "could not send" not in result.detail, result.detail
+    assert "0/1 reached 'processed'" in result.detail, result.detail
 
 
 def test_body_control_id_reads_the_plain_text_body_only() -> None:

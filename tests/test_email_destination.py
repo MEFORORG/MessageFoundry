@@ -7,19 +7,25 @@ in-process fake SMTP (no real server is ever contacted)."""
 from __future__ import annotations
 
 import smtplib
+import socket
 import ssl
+import threading
+from collections.abc import Iterator
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings, load_settings
 from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
     active_hop_posture,
 )
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.email import EmailDestination
@@ -112,10 +118,11 @@ class _FakeSMTP:
         self.did_noop = True
         return (250, b"OK")
 
-    def send_message(self, msg: EmailMessage) -> dict[str, Any]:
+    def send_message(self, msg: EmailMessage, to_addrs: list[str] | None = None) -> dict[str, Any]:
         if self.fail_at == "send":
             raise smtplib.SMTPRecipientsRefused({"x@y.z": (550, b"no")})
         self.sent.append(msg)
+        self.to_addrs = to_addrs
         return {}
 
 
@@ -187,6 +194,9 @@ async def test_send_builds_message_and_starttls(monkeypatch: pytest.MonkeyPatch)
     assert msg["From"] == "engine@hospital.org"
     assert msg["To"] == "a@p.org, b@p.org"
     assert msg.get_content().strip() == "PID|1|patient"
+    # The RCPT set is the list the [egress] recipient-domain check reads, passed explicitly, so a
+    # header added later cannot widen it (vault BACKLOG #2616).
+    assert smtp.to_addrs == ["a@p.org", "b@p.org"]
 
 
 async def test_send_with_auth_logs_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -448,20 +458,34 @@ async def test_test_connection_failure_raises_delivery_error(
 # --- [egress].allowed_smtp deny-by-default / host gate ----------------------------------------------
 
 
-def _email_dest(host: str, port: int = 587) -> Destination:
+#: The recipient domain every host-gate test below lists, so those tests exercise the host arm alone.
+_RCPT_DOMAINS = ["y.org"]
+
+
+def _email_dest(
+    host: str, port: int = 587, recipients: list[str] | str | None = None
+) -> Destination:
     return Destination(
         name="OB_EMAIL",
         type=ConnectorType.EMAIL,
-        settings={"host": host, "sender": "s@x.org", "recipients": ["r@y.org"], "port": port},
+        settings={
+            "host": host,
+            "sender": "s@x.org",
+            "recipients": ["r@y.org"] if recipients is None else recipients,
+            "port": port,
+        },
     )
 
 
-def test_allowed_smtp_empty_is_unrestricted() -> None:
-    check_egress_allowed(_email_dest("any.smtp.example"), EgressSettings())  # no raise
+def test_allowed_smtp_empty_leaves_the_relay_host_unrestricted() -> None:
+    e = EgressSettings(allowed_recipient_domains=_RCPT_DOMAINS)
+    check_egress_allowed(_email_dest("any.smtp.example"), e)  # no raise
 
 
 def test_allowed_smtp_host_and_port_gate() -> None:
-    e = EgressSettings(allowed_smtp=["smtp.partner.org:587", "10.0.0.9"])
+    e = EgressSettings(
+        allowed_smtp=["smtp.partner.org:587", "10.0.0.9"], allowed_recipient_domains=_RCPT_DOMAINS
+    )
     check_egress_allowed(_email_dest("smtp.partner.org", 587), e)  # exact host:port
     check_egress_allowed(_email_dest("10.0.0.9", 2525), e)  # host-only entry → any port
     with pytest.raises(Exception, match="allowed_smtp"):
@@ -479,10 +503,375 @@ def test_allowed_smtp_deny_by_default_refuses_empty() -> None:
 
 
 def test_allowed_smtp_deny_by_default_honours_set_list() -> None:
-    e = EgressSettings(deny_by_default=True, allowed_smtp=["smtp.partner.org:587"])
+    e = EgressSettings(
+        deny_by_default=True,
+        allowed_smtp=["smtp.partner.org:587"],
+        allowed_recipient_domains=_RCPT_DOMAINS,
+    )
     check_egress_allowed(_email_dest("smtp.partner.org", 587), e)  # listed → allowed
     with pytest.raises(Exception, match="allowed_smtp"):
         check_egress_allowed(_email_dest("evil.relay.example", 587), e)
+
+
+# --- [egress].allowed_recipient_domains (vault BACKLOG #2616) ---------------------------------------
+
+
+def _relay_listed(domains: list[str]) -> EgressSettings:
+    """The relay host is listed, so only the recipient-domain arm can refuse."""
+    return EgressSettings(allowed_smtp=["smtp.hospital.example"], allowed_recipient_domains=domains)
+
+
+@pytest.mark.parametrize(
+    "recipients",
+    [
+        ["a@hospital.example"],
+        ["Ops <ops@HOSPITAL.example>"],  # display name, and the domain match ignores case
+        ["a@hospital.example", "", "b@hospital.example"],  # a blank entry is not a recipient
+    ],
+)
+def test_listed_recipient_domain_passes(recipients: list[str]) -> None:
+    e = _relay_listed(["Hospital.Example"])
+    check_egress_allowed(_email_dest("smtp.hospital.example", recipients=recipients), e)
+
+
+@pytest.mark.parametrize(
+    "recipients",
+    [
+        ["a@partner.example"],  # unlisted domain
+        ["a@hospital.example", "b@partner.example"],  # every recipient must be listed
+        # The transport joins the entries into one To: header, so every address inside one entry
+        # is checked, whether the setting is a list or a lone string.
+        ["a@hospital.example, b@partner.example"],
+        "a@hospital.example, b@partner.example",
+        ["a@mail.hospital.example"],  # a subdomain is a different domain
+        ["a@nothospital.example"],  # a listed domain as a suffix does not match
+        ["no-at-sign"],  # not a readable address
+        ["a@"],
+        ['""@hospital.example'],  # listed domain, empty local part
+        # A routing character in the local part: the listed domain would not be the last hop.
+        ["a%partner.example@hospital.example"],
+        ["partner.example!a@hospital.example"],
+        ['"a@partner.example"@hospital.example'],
+        ["a@höspital.example"],  # non-ASCII domain: only the ASCII xn-- form can be listed
+        ["a@Kospital.example"],  # a Unicode case fold must not reach an ASCII entry
+        ["a|b@hospital.example"],  # a delivery-pipe character
+        ["a/b@hospital.example"],  # a delivery-file character
+        ["-a@hospital.example"],  # a leading hyphen reads as an option to some delivery programs
+        ["a=b@hospital.example"],  # = and ? are refused, so no encoded word can form
+        ["a?b@hospital.example"],
+        [' :%.bK".b'],  # malformed enough that the stdlib header parser once raised on it
+        ["x" * 65 + "@hospital.example"],  # longer than SMTP allows for a local part
+    ],
+)
+def test_unlisted_or_unreadable_recipient_is_refused(recipients: list[str] | str) -> None:
+    e = _relay_listed(["hospital.example"])
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(_email_dest("smtp.hospital.example", recipients=recipients), e)
+
+
+@pytest.mark.parametrize(
+    "egress",
+    [EgressSettings(), EgressSettings(allowed_smtp=["smtp.hospital.example"])],
+    ids=["nothing-listed", "relay-listed"],
+)
+def test_recipient_domains_empty_refuses_every_email_destination(egress: EgressSettings) -> None:
+    # Deny-by-default on its own terms: no list means no recipient is permitted, whatever the host
+    # lists and whatever [security].block_unlisted_outbound says.
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(
+            _email_dest("smtp.hospital.example", recipients=["a@hospital.example"]), egress
+        )
+
+
+def _address_of_length(local_len: int, total_len: int) -> str:
+    """A plain address with a local part of ``local_len`` octets and ``total_len`` overall, ending
+    in ``hospital.example``. Long domains use three 63-octet labels plus one sized to fit."""
+    tail = "hospital.example"
+    if total_len == local_len + 1 + len(tail):
+        address = "a" * local_len + "@" + tail
+    else:
+        fixed = ".".join(["x" * 63] * 3)
+        last = total_len - local_len - 1 - len(fixed) - 1 - 1 - len(tail)
+        address = "a" * local_len + "@" + fixed + "." + "x" * last + "." + tail
+    assert len(address) == total_len, (len(address), total_len)
+    return address
+
+
+@pytest.mark.parametrize(
+    ("local_len", "total_len", "allowed"),
+    [
+        (64, 64 + 1 + len("hospital.example"), True),
+        (65, 65 + 1 + len("hospital.example"), False),
+        (20, 254, True),
+        (20, 255, False),
+    ],
+    ids=["local-64", "local-65", "address-254", "address-255"],
+)
+def test_the_rfc_5321_size_limits_are_the_boundary(
+    local_len: int, total_len: int, allowed: bool
+) -> None:
+    address = _address_of_length(local_len, total_len)
+    domain = address.rpartition("@")[2]
+    e = EgressSettings(allowed_smtp=["smtp.hospital.example"], allowed_recipient_domains=[domain])
+    dest = _email_dest("smtp.hospital.example", recipients=[address])
+    if allowed:
+        check_egress_allowed(dest, e)
+    else:
+        with pytest.raises(WiringError, match="longer than SMTP allows"):
+            check_egress_allowed(dest, e)
+
+
+class _WireCapture:
+    """A loopback SMTP listener that records each ``RCPT`` command line exactly as it arrives, so a
+    test reads the recipient the relay would act on rather than a list handed to a fake client."""
+
+    def __init__(self) -> None:
+        self._sock = socket.create_server(("127.0.0.1", 0))
+        self.port: int = self._sock.getsockname()[1]
+        self.rcpt_lines: list[bytes] = []
+        self.data: list[bytes] = []
+        self.connections = 0
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            self.connections += 1
+            with conn, conn.makefile("rb") as reader:
+                conn.sendall(b"220 capture\r\n")
+                for raw in reader:
+                    line = raw.rstrip(b"\r\n")
+                    verb = line[:4].upper()
+                    if verb == b"RCPT":
+                        self.rcpt_lines.append(line)
+                    if verb == b"DATA":
+                        conn.sendall(b"354 go\r\n")
+                        for body in reader:
+                            if body.rstrip(b"\r\n") == b".":
+                                break
+                            self.data.append(body)
+                    elif verb == b"QUIT":
+                        conn.sendall(b"221 bye\r\n")
+                        break
+                    conn.sendall(b"250 ok\r\n")
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+@pytest.fixture
+def wire() -> Iterator[_WireCapture]:
+    capture = _WireCapture()
+    try:
+        yield capture
+    finally:
+        capture.close()
+
+
+def _wire_dest(port: int, recipients: list[str]) -> Destination:
+    return Destination(
+        name="OB_EMAIL",
+        type=ConnectorType.EMAIL,
+        settings={
+            "host": "127.0.0.1",
+            "port": port,
+            "sender": "engine@hospital.example",
+            "recipients": recipients,
+            "use_tls": False,
+            "timeout_seconds": 5.0,
+        },
+        cleartext_accepted=True,
+        cleartext_reason="loopback capture listener in a unit test",
+    )
+
+
+def _wire_egress(port: int) -> EgressSettings:
+    return EgressSettings(
+        allowed_smtp=[f"127.0.0.1:{port}"], allowed_recipient_domains=["hospital.example"]
+    )
+
+
+async def test_the_rcpt_line_on_the_wire_names_exactly_the_checked_address(
+    wire: _WireCapture,
+) -> None:
+    dest = _wire_dest(wire.port, ["Ops <a@hospital.example>", "b.c+d@HOSPITAL.example"])
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    await EmailDestination(dest).send("PID|1|synthetic")
+    assert [line.upper() for line in wire.rcpt_lines] == [
+        b"RCPT TO:<A@HOSPITAL.EXAMPLE>",
+        b"RCPT TO:<B.C+D@HOSPITAL.EXAMPLE>",
+    ]
+    # The To: header is built from the same checked list, so the display name does not reach it.
+    [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
+    assert to_line.rstrip(b"\r\n") == b"To: a@hospital.example, b.c+d@HOSPITAL.example"
+
+
+def _quote() -> str:
+    return chr(34)
+
+
+#: Recipient values whose parse does not read back as the plain address it seems to name. Built from
+#: parts so no single literal reads as a recipe.
+_NON_ROUND_TRIP = [
+    _quote() + "<" + "relaylocal" + ">" + " " + "ORCPT" + "=" + "rfc822;x" + "@hospital.example",
+    _quote() + "relaylocal" + ">" + "@hospital.example",
+]
+
+
+def _encoded_word(charset: str, kind: str, text: str) -> str:
+    return "=" + "?" + charset + "?" + kind + "?" + text + "?" + "="
+
+
+def _b64_word(text: str) -> str:
+    import base64
+
+    return _encoded_word("utf-8", "b", base64.b64encode(text.encode()).decode())
+
+
+#: Local parts that a decoding parse would turn into something other than what was checked: an
+#: encoded word nested in an encoded word that decodes to an address list, and one that decodes to a
+#: line break. Built from parts.
+_INNER_LIST = _encoded_word("utf-8", "q", "other=40partner.example=2C_x")
+_ENCODED_LOCAL = [
+    _b64_word(_INNER_LIST) + "@hospital.example",
+    _b64_word("a" + chr(13) + chr(10) + "b") + "@hospital.example",
+]
+
+
+@pytest.mark.parametrize("value", _ENCODED_LOCAL, ids=["nested-encoded-list", "encoded-line-break"])
+async def test_an_encoded_word_local_part_is_refused_at_the_gate(
+    wire: _WireCapture, value: str
+) -> None:
+    dest = _wire_dest(wire.port, [value])
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(dest, _wire_egress(wire.port))
+    with pytest.raises(ValueError, match="recipient"):
+        EmailDestination(dest)
+    assert wire.connections == 0
+    assert wire.rcpt_lines == []
+
+
+async def test_the_to_line_names_exactly_the_checked_addresses(wire: _WireCapture) -> None:
+    # Every character the allowlist admits, so a decoding or quoting step would show here.
+    local = "a#b$c&d'e*f+g-h^i_j`k{l}m~n.o"
+    dest = _wire_dest(wire.port, [local + "@hospital.example", "plain@hospital.example"])
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    await EmailDestination(dest).send("PID|1|synthetic")
+    assert [line.upper() for line in wire.rcpt_lines] == [
+        ("RCPT TO:<" + local + "@hospital.example>").upper().encode(),
+        b"RCPT TO:<PLAIN@HOSPITAL.EXAMPLE>",
+    ]
+    [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
+    expected = "To: " + local + "@hospital.example, plain@hospital.example"
+    assert to_line.rstrip(b"\r\n") == expected.encode()
+
+
+def test_a_to_header_that_parses_differently_is_refused_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Simulates a later widening of the local-part allowlist: with the address rule switched off,
+    # an encoded-word local part reaches the To: header, whose parse would decode it. The
+    # construction-time comparison must refuse it, so the allowlist is not the only control.
+    import messagefoundry.transports.email as email_mod
+
+    monkeypatch.setattr(email_mod, "envelope_address_problem", lambda _address: None)
+    dest = _wire_dest(2525, [_ENCODED_LOCAL[0]])
+    with pytest.raises(ValueError, match="does not match the checked recipients"):
+        EmailDestination(dest)
+
+
+@pytest.mark.parametrize("field", ["subject", "sender"])
+@pytest.mark.parametrize("separator", [13, 10, 0, 0x7F, 0x85, 0x2028, 0x2029])
+def test_a_control_character_in_a_header_setting_is_refused_at_load(
+    field: str, separator: int
+) -> None:
+    # Refused at construction, not dead-lettered as an internal error at every send. Covers every
+    # line separator policy.default refuses, the Unicode ones included.
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    dest.settings[field] = "e" + chr(separator) + "x@hospital.example"
+    with pytest.raises(ValueError, match="control character"):
+        EmailDestination(dest)
+
+
+@pytest.mark.parametrize("value", _NON_ROUND_TRIP, ids=["parameter-after-mailbox", "stray-angle"])
+async def test_a_value_that_does_not_read_back_is_refused_before_any_rcpt(
+    wire: _WireCapture, value: str
+) -> None:
+    dest = _wire_dest(wire.port, [value])
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(dest, _wire_egress(wire.port))
+    # Construction holds the same rule, so a build path that skipped the check sends nothing either.
+    with pytest.raises(ValueError, match="recipient"):
+        EmailDestination(dest)
+    assert wire.connections == 0
+    assert wire.rcpt_lines == []
+
+
+def test_recipient_domains_do_not_gate_direct() -> None:
+    # DIRECT encrypts to one partner certificate, so the row scopes this list to EMAIL only.
+    d = Destination(
+        name="OB_DIRECT",
+        type=ConnectorType.DIRECT,
+        settings={"host": "hisp.example", "recipients": ["a@partner.example"], "port": 587},
+    )
+    check_egress_allowed(d, EgressSettings())  # no raise
+
+
+def test_recipient_domains_load_from_the_environment(tmp_path: Path) -> None:
+    empty = tmp_path / "settings.toml"
+    empty.write_text("", encoding="utf-8")
+    environ = {"MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS": "Hospital.Example., lab.example"}
+    loaded = load_settings(config_path=empty, environ=environ).egress
+    assert loaded.allowed_recipient_domains == ["hospital.example", "lab.example"]
+
+
+def test_a_gate_that_read_no_address_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The stdlib parser never yields an empty list today; the gate must not depend on that.
+    import messagefoundry.pipeline.wiring_runner as wr
+
+    monkeypatch.setattr(wr, "envelope_recipients", lambda _value: [])
+    e = _relay_listed(["hospital.example"])
+    with pytest.raises(WiringError, match="no recipient address"):
+        check_egress_allowed(_email_dest("smtp.hospital.example"), e)
+
+
+@pytest.mark.parametrize(
+    "recipients",
+    [[""], []],
+)
+def test_empty_recipients_are_refused_with_the_construction_message(
+    recipients: list[str],
+) -> None:
+    # The operator is told to fix the connection, not the allowlist.
+    e = _relay_listed(["hospital.example"])
+    with pytest.raises(WiringError, match="Email destination.*'recipients'"):
+        check_egress_allowed(_email_dest("smtp.hospital.example", recipients=recipients), e)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "a@hospital.example",
+        "https://hospital.example",
+        "hospital.example:25",
+        "*.example",
+        ".hospital.example",
+        "[10.0.0.1]",
+        "a.example,b.example",
+        "hospital..example",
+        "10.0.0.1",
+        "-a-.example",
+        "x" * 64 + ".example",
+        ".",
+    ],
+)
+def test_a_recipient_domain_that_can_never_match_is_refused_at_load(entry: str) -> None:
+    with pytest.raises(ValidationError, match="bare domain"):
+        EgressSettings(allowed_recipient_domains=[entry])
 
 
 # --- registry + factory surface ---------------------------------------------------------------------
