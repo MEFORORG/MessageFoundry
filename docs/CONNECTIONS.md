@@ -533,7 +533,7 @@ when each interchange is wrapped in a fixed sentinel (STX/ETX, VT/FS). The paylo
 | `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
 | `timeout_seconds` | out | `30.0` | send / await-reply timeout (s) |
-| `persistent` | out | `false` | **(ADR 0067 §9 / BACKLOG #97)** reuse **one** lazily-established connection across deliveries (opt-in; default `false` = connect-per-send, byte-identical). A stale socket is redialed once **before any byte is written** (uncharged); any post-write failure is charged + retried. A returned TA1/business interchange is a complete transaction on a healthy transport, so the connection **stays cached** across a captured reply (and a TA1\*R reject). |
+| `persistent` | out | `false` | **(ADR 0067 §9 / BACKLOG #97)** reuse **one** lazily-established connection across deliveries (opt-in; default `false` = connect-per-send, byte-identical). A stale socket is redialed once **before any byte is written** (uncharged); any post-write failure is charged + retried. A returned TA1/business interchange is a complete transaction on a healthy transport, so the connection **stays cached** across a captured reply (and a TA1\*R reject); a TA1 naming another interchange discards it. |
 | `idle_timeout_seconds` | out | `60.0` | (applies when `persistent=true`) don't reuse a connection idle longer than this. `None`/`0` = never expire on idle. |
 | `max_connection_age_seconds` | out | — (off) | (applies when `persistent=true`) recycle the persistent connection once it is this old (LB/firewall hygiene). `None`/`0` = off. |
 | `expect_reply` | out | `false` | read one returned interchange and treat receiving it as confirmation (not parsed). `false` = fire-and-forget after the write. |
@@ -578,7 +578,16 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 - **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
   the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
   **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
-  accepted-with-warning (delivered, **not** retried, logged). A business **271/277/278** returned
+  accepted-with-warning (delivered, **not** retried, logged). **A TA1 is acted on only when its
+  TA1-01 names the ISA13 just sent.** Both are compared as nine-digit control numbers, and a shorter
+  all-digit TA1-01 is zero-padded. If the sent ISA13 is not nine digits, only an exact echo matches;
+  a blank one matches nothing. If the sent payload has no readable ISA there is nothing to
+  correlate, and the TA1 is classified on TA1-04 alone. A reply carrying several TA1s is searched,
+  up to the first 32, for the one naming the interchange sent. A reply with no TA1 naming it (stale
+  on the socket, misdirected, or from a partner that echoes the wrong field) is **neither a reject
+  nor an accept**: it is logged at WARNING with control numbers only, the delivery is **retried**
+  (`DeliveryError`), and a `persistent` connection is discarded rather than reused. Unlike MLLP's
+  opt-in `verify_ack_control_id`, this check is always on and also covers a reject. A business **271/277/278** returned
   *instead of* a TA1 is itself the confirmation and rides re-ingress. Only a **TA1** is a transport
   retry gate — **999/997** functional acks are content, routed by a Handler. A non-idempotent 270
   re-sent in the at-least-once crash window yields a fresh 271 captured at the next `response_seq`
