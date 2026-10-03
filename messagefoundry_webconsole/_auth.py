@@ -20,7 +20,12 @@ from urllib.parse import quote, urlsplit
 from fastapi import HTTPException, Request, Response, WebSocket, status
 from fastapi.responses import RedirectResponse
 
-from messagefoundry.api.security import client_ip, enforce_phi_read_hop, get_auth
+from messagefoundry.api.security import (
+    client_ip,
+    enforce_phi_read_hop,
+    get_auth,
+    mark_route_gate,
+)
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
 
@@ -512,7 +517,7 @@ def require_ui(
                 )
         return identity
 
-    return dependency
+    return mark_route_gate(dependency)
 
 
 def allow_reauth_attempt(auth: AuthService, identity: Identity, client: str | None) -> bool:
@@ -867,7 +872,7 @@ def require_ui_step_up(
             raise _reauth_redirect(request, nxt)
         return identity
 
-    return dependency
+    return mark_route_gate(dependency)
 
 
 def require_ui_reauth_only(
@@ -901,7 +906,7 @@ def require_ui_reauth_only(
             )
         return identity
 
-    return dependency
+    return mark_route_gate(dependency)
 
 
 async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: str) -> bool:
@@ -951,7 +956,7 @@ def require_ui_step_up_action(
             raise _reauth_redirect(request, nxt)
         return identity
 
-    return dependency
+    return mark_route_gate(dependency)
 
 
 def require_ui_reauth_only_action(
@@ -1002,7 +1007,7 @@ def require_ui_reauth_only_action(
             raise _reauth_redirect(request, nxt)
         return identity
 
-    return dependency
+    return mark_route_gate(dependency)
 
 
 async def authorize_ui_ws(
