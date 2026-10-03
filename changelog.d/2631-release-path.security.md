@@ -1,8 +1,10 @@
 - **A release now refuses a tag whose commit is not on `main`, or whose required checks did not
   pass.** A new `tag-provenance` job in `release.yml` runs before any job that builds a release
   artifact. It asks the server whether the tagged commit is on `main`, and whether every required
-  check passed on it, reading the required set from branch protection and from
-  `.github/required-contexts.txt`. The rule is in `scripts/release/tag_provenance.py`.
+  check passed on it, reading the required set from branch protection, any ruleset and
+  `.github/required-contexts.txt`. Each check is judged on its latest run, so a red run after the
+  merge blocks the tag until it is re-run; a check still running is waited for. The rule is in
+  `scripts/release/tag_provenance.py`.
   (`vault BACKLOG #2631`)
 - **No asset is added to a GitHub release after it is published.** The engine release is created
   as a draft, the harness wheel is attached to the draft, and a new `publish-github-release` job

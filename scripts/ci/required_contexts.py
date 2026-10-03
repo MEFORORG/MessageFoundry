@@ -45,14 +45,18 @@ def gh_api(args: Sequence[str]) -> Any:
     )
     if out.returncode != 0:
         raise RuntimeError(f"gh api exited {out.returncode}: {out.stderr.strip()[:400]}")
-    return json.loads(out.stdout or "null")
+    if not out.stdout.strip():
+        raise RuntimeError("gh api returned no output")
+    return json.loads(out.stdout)
 
 
-def branch_protection_contexts(payload: dict[str, Any]) -> list[str]:
+def branch_protection_contexts(payload: Any) -> list[str]:
     """The contexts classic branch protection requires, from a ``branches/{branch}`` payload.
 
     That endpoint answers an anonymous reader, so no admin scope is needed.
     """
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"the branch payload is a {type(payload).__name__}, not an object")
     protection = payload.get("protection") or {}
     checks = protection.get("required_status_checks") or {}
     contexts = checks.get("contexts")
@@ -64,11 +68,13 @@ def branch_protection_contexts(payload: dict[str, Any]) -> list[str]:
     return [str(c) for c in contexts]
 
 
-def ruleset_contexts(rules: list[dict[str, Any]]) -> list[str]:
+def ruleset_contexts(rules: Any) -> list[str]:
     """The contexts every ruleset on a branch requires, from a ``rules/branches/{branch}`` payload.
 
     An empty list is a real answer here: a branch with no ruleset requires nothing through one.
     """
+    if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+        raise RuntimeError("the branch rules payload is not a list of rule objects")
     return [
         str(check["context"])
         for rule in rules

@@ -10,6 +10,8 @@ pure function of the readings, and that is what is tested. tests/test_release_pi
 
 from __future__ import annotations
 
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -154,3 +156,95 @@ def test_main_unions_the_server_set_with_the_file(
 
     reports.append(_check(2, "from-file", "success"))
     assert tp.main(args) == 0
+
+
+def test_a_server_context_newer_than_the_commit_is_set_aside_and_no_other() -> None:
+    """A context the server added after the commit merged can never report on it, so it must not
+    refuse that commit forever. One the commit's file lists, or one that reported, still binds."""
+    reports = [_check(1, "reported", "failure")]
+    required, newer = tp.required_for(["newer", "reported", "listed"], ["listed"], reports)
+    assert newer == {"newer"}
+    assert required == {"reported", "listed"}
+    assert len(verdict("behind", required, reports)) == 2
+
+
+def test_unfinished_names_only_required_contexts_still_running() -> None:
+    reports = [
+        _check(1, "CI gate", "", "in_progress"),
+        _check(2, "other", "", "queued"),
+        _status(3, "cla", "pending"),
+        _check(4, "done", "failure"),
+    ]
+    assert tp.unfinished(["CI gate", "cla", "done"], reports) == ["CI gate", "cla"]
+    assert tp.unfinished(["CI gate"], [*reports, _check(9, "CI gate", "success")]) == []
+
+
+def test_main_waits_for_a_running_check_then_judges_the_finished_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tag pushed right after a merge meets main's push run still going; it is waited for."""
+    contexts = tmp_path / "required-contexts.txt"
+    contexts.write_text("CI gate\n", encoding="utf-8")
+    readings: Iterator[tuple[str, list[str], list[Report]]] = iter(
+        [
+            ("behind", [], [_check(1, "CI gate", "", "in_progress")]),
+            ("behind", [], [_check(1, "CI gate", "success")]),
+        ]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(tp, "read_server", lambda *_a: next(readings))
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    args = ["--repo", "o/r", "--sha", "abc", "--contexts-file", str(contexts)]
+    assert tp.main([*args, "--poll-seconds", "5"]) == 0
+    assert sleeps == [5]
+
+
+def test_main_refuses_a_check_still_running_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    contexts = tmp_path / "required-contexts.txt"
+    contexts.write_text("CI gate\n", encoding="utf-8")
+    monkeypatch.setattr(
+        tp, "read_server", lambda *_a: ("behind", [], [_check(1, "CI gate", "", "in_progress")])
+    )
+    args = ["--repo", "o/r", "--sha", "abc", "--contexts-file", str(contexts)]
+    assert tp.main([*args, "--wait-seconds", "0"]) == 1
+    assert "in_progress" in capsys.readouterr().out
+
+
+def test_read_server_asks_gh_for_each_endpoint_and_reads_its_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gh arguments and the page shapes, which the tests above replace wholesale."""
+    answers: dict[str, Any] = {
+        "compare/main...abc?per_page=1": {"status": "behind"},
+        "branches/main": {"protection": {"required_status_checks": {"contexts": ["a"]}}},
+        "rules/branches/main": [
+            [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {"required_status_checks": [{"context": "b"}]},
+                }
+            ],
+            [],
+        ],
+        "commits/abc/check-runs?per_page=100": [
+            {"check_runs": [{"id": 1, "name": "a", "status": "completed", "conclusion": "success"}]}
+        ],
+        "commits/abc/statuses?per_page=100": [[{"id": 2, "context": "b", "state": "success"}]],
+    }
+    calls: list[list[str]] = []
+
+    def fake(args: list[str]) -> Any:
+        calls.append(list(args))
+        endpoint = next(a for a in args if a.startswith("repos/"))
+        return answers[endpoint.removeprefix("repos/o/r/")]
+
+    monkeypatch.setattr(tp, "gh_api", fake)
+    compare, server, reports = tp.read_server("o/r", "abc", "main")
+    assert (compare, server) == ("behind", ["a", "b"])
+    assert [r.context for r in reports] == ["a", "b"]
+    paginated = [c[-1] for c in calls if "--paginate" in c]
+    assert all("--slurp" in c for c in calls if "--paginate" in c)
+    assert len(paginated) == 3, calls
+    assert calls[0][1:] == ["--jq", "{status}"], calls[0]

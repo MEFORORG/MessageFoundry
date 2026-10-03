@@ -23,10 +23,16 @@ reviewed commit. This script asks two questions before anything is built:
    ``success``, ``neutral`` or ``skipped``. A commit status passes on ``success``. A context with no
    report at all refuses.
 
-   **The latest report decides, so a red post-merge run blocks the tag** even when the merge-queue
-   run passed. A release gate fails closed. The remedy is to re-run the failed job on that commit,
-   then re-run the release. (Manager ruling under the owner's driver rule, 2026-10-03; the owner may
-   overturn it.)
+   **The latest report decides, so a red run after the merge blocks the tag** even when the
+   merge-queue run passed. That covers main's own push run, the nightly run and a dispatched run
+   on the same commit. A release gate fails closed. The remedy is to re-run the failed job on that
+   commit, then re-run the release. (Manager ruling under the owner's driver rule, 2026-10-03; the
+   owner may overturn it.) A required check still RUNNING is waited for, up to ``--wait-seconds``,
+   so a tag pushed right after a merge is judged on the finished run.
+
+   A context the server requires now, that the commit's own file does not list and that never
+   reported on the commit, was added after the commit merged. It is set aside with a notice, since
+   nothing could ever make it report there.
 
 **Where its promise ends.** It binds only a ref that carries this copy of ``release.yml``, as the
 workflow's header says of every guard in it. It is a gate inside the release; it is not a ruleset,
@@ -42,6 +48,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -143,9 +150,11 @@ def reports_from(check_pages: list[dict[str, Any]], status_pages: list[list[Any]
 
 def read_server(repo: str, sha: str, branch: str) -> tuple[str, list[str], list[Report]]:
     """(compare status, contexts the server requires, every report on ``sha``) read through gh."""
-    compare = gh_api([f"repos/{repo}/compare/{branch}...{sha}", "--jq", "{status}"])
+    # per_page=1: only `status` is wanted, and the endpoint otherwise pages in commits and patches.
+    compare = gh_api([f"repos/{repo}/compare/{branch}...{sha}?per_page=1", "--jq", "{status}"])
     server = branch_protection_contexts(gh_api([f"repos/{repo}/branches/{branch}"]))
-    server += ruleset_contexts(gh_api([f"repos/{repo}/rules/branches/{branch}"]) or [])
+    rule_pages = gh_api(["--paginate", "--slurp", f"repos/{repo}/rules/branches/{branch}"])
+    server += ruleset_contexts([rule for page in rule_pages for rule in page])
     checks = gh_api(
         ["--paginate", "--slurp", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"]
     )
@@ -155,41 +164,99 @@ def read_server(repo: str, sha: str, branch: str) -> tuple[str, list[str], list[
     return str(compare["status"]), server, reports_from(checks, statuses)
 
 
+def required_for(
+    server: Iterable[str], in_file: Iterable[str], reports: Iterable[Report]
+) -> tuple[set[str], set[str]]:
+    """(the contexts the commit is held to, server contexts set aside as newer than the commit).
+
+    The commit's own file binds in full. A context only the server names binds too, unless it never
+    reported on the commit: then it was added after the commit merged, and nothing can make it
+    report there now, so holding the commit to it would refuse that commit forever.
+    """
+    in_file = set(in_file)
+    reported = {r.context for r in reports}
+    newer = {c for c in server if c not in in_file and c not in reported}
+    return in_file | (set(server) - newer), newer
+
+
+def unfinished(required: Iterable[str], reports: Iterable[Report]) -> list[str]:
+    """Required contexts whose latest report of some kind is still queued, running or pending."""
+    latest: dict[tuple[str, str], Report] = {}
+    for report in reports:
+        key = (report.context, report.kind)
+        if key not in latest or report.id > latest[key].id:
+            latest[key] = report
+    wanted = set(required)
+    return sorted(
+        {
+            name
+            for (name, _kind), r in latest.items()
+            if name in wanted
+            and (r.state == "pending" if r.kind == "status" else r.state != "completed")
+        }
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--repo", required=True, help="OWNER/NAME")
     parser.add_argument("--sha", required=True, help="the commit the tag names")
     parser.add_argument("--branch", default="main")
     parser.add_argument("--contexts-file", type=Path, default=CANONICAL)
+    parser.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=1800,
+        help="how long to wait for a required check that is still running (default 1800)",
+    )
+    parser.add_argument("--poll-seconds", type=int, default=60)
     args = parser.parse_args(argv)
-
-    try:
-        compare, server, reports = read_server(args.repo, args.sha, args.branch)
-    except (
-        RuntimeError,
-        ValueError,
-        KeyError,
-        TypeError,
-        subprocess.SubprocessError,
-        OSError,
-    ) as exc:
-        print(f"::error::could not read the tagged commit's provenance, so it is refused: {exc}")
-        return 1
     in_file = file_contexts(args.contexts_file)
-    required = set(server) | set(in_file)
+
+    deadline = time.monotonic() + args.wait_seconds
+    while True:
+        try:
+            compare, server, reports = read_server(args.repo, args.sha, args.branch)
+        except (
+            RuntimeError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            subprocess.SubprocessError,
+            OSError,
+        ) as exc:
+            print(
+                f"::error::could not read the tagged commit's provenance, so it is refused: {exc}"
+            )
+            return 1
+        required, newer = required_for(server, in_file, reports)
+        running = unfinished(required, reports)
+        # A tag pushed minutes after a merge meets main's own push run still going. Wait for it
+        # rather than refuse: the rule judges a finished run, not one that has not ended.
+        if not running or time.monotonic() >= deadline:
+            break
+        print(f"waiting for {len(running)} required check(s) still running: {running}")
+        time.sleep(args.poll_seconds)
+
     print(
         f"commit {args.sha}: compare with {args.branch} reports {compare!r}; "
         f"{len(required)} required context(s) ({len(set(server))} on the server, {len(in_file)} "
         f"in the file); {len(reports)} report(s) on the commit"
     )
+    for context in sorted(newer):
+        print(
+            f"::notice::{context!r} is required on the server now but is not in this commit's "
+            "required-contexts.txt and never reported on it, so it is newer than the commit"
+        )
     problems = verdict(compare, required, reports)
     for problem in problems:
         print(f"::error::{problem}")
     if problems:
         print(
             "::error::the release is refused (vault BACKLOG #2631). Tag a commit that is on "
-            f"{args.branch} and passed every required check. A failed or unfinished check counts "
-            "against the commit until it is re-run and passes; then re-run the release."
+            f"{args.branch} and passed every required check. A failed check counts against the "
+            "commit until it is re-run and passes; then re-run the release."
         )
         return 1
     print(f"the tagged commit is on {args.branch} and passed all {len(required)} required contexts")
