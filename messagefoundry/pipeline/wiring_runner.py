@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Protocol, cast
+from typing import Any, Literal, NamedTuple, NoReturn, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
@@ -206,6 +206,7 @@ from messagefoundry.transports.base import (
     SyncReplyResolver,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
+from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.rest import PROXY_DEFAULT, refuse_url_credentials
@@ -9974,7 +9975,9 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     """Fail-closed: refuse (raise :class:`WiringError`) an outbound destination not on the ``[egress]``
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
-    exfiltrate PHI. Opt-in per transport (an empty list = unrestricted), checked against the resolved
+    exfiltrate PHI. Opt-in per transport (an empty list = unrestricted), except for lists that
+    are deny-by-default on their own terms, such as ``allowed_proxy`` and
+    ``allowed_recipient_domains``. Checked against the resolved
     (``env()``-substituted) destination at config load/reload/start. Webhook/SMTP alert sinks carry no
     PHI bodies and keep their own ``[alerts]`` host allowlists.
 
@@ -10159,6 +10162,54 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 f"outbound {dest.name!r}: DIRECT host {host!r} is not in the "
                 "[egress].allowed_direct allowlist"
             )
+    if dest.type is ConnectorType.EMAIL:
+        # The host arm above gates only the relay hop, which forwards to any address. This arm bounds
+        # where the mail ends up (vault BACKLOG #2616), and it is deny-by-default on its own terms.
+        _check_email_recipient_domains(dest, egress.allowed_recipient_domains)
+
+
+def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> None:
+    """Refuse an EMAIL destination with any recipient outside ``[egress].allowed_recipient_domains``.
+    An empty list refuses every EMAIL destination. Matching is exact and case-insensitive on the
+    domain after the last ``@``; a subdomain needs its own entry. The log line and the error name
+    the destination and the domain, never the full address. ``EgressSettings`` has already
+    normalised the entries."""
+    try:
+        addresses = envelope_recipients(dest.settings.get("recipients"))
+    except ValueError as exc:
+        # The transport's own construction message, so the operator fixes the connection rather
+        # than the allowlist.
+        log.warning("egress denied: outbound %r EMAIL recipients are unreadable", dest.name)
+        raise WiringError(f"outbound {dest.name!r}: {exc}") from exc
+    if not addresses:
+        # Fail closed without leaning on the parser: a gate that checked nothing has not passed.
+        log.warning("egress denied: outbound %r EMAIL names no recipient address", dest.name)
+        raise WiringError(f"outbound {dest.name!r}: EMAIL destination names no recipient address")
+    permitted = set(allowed)
+    for address in addresses:
+        problem = envelope_address_problem(address)
+        if problem is not None:
+            _refuse_email_recipient(dest.name, problem)
+        domain = address.rpartition("@")[2].lower()
+        if domain not in permitted:
+            log.warning(
+                "egress denied: outbound %r EMAIL recipient domain %r not in "
+                "[egress].allowed_recipient_domains",
+                dest.name,
+                domain,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: EMAIL recipient domain {domain!r} is not in the "
+                "[egress].allowed_recipient_domains allowlist (an empty list permits no recipient)"
+            )
+
+
+def _refuse_email_recipient(name: str, why: str) -> NoReturn:
+    log.warning("egress denied: outbound %r EMAIL recipient %s", name, why)
+    raise WiringError(
+        f"outbound {name!r}: an EMAIL recipient {why}, so the "
+        "[egress].allowed_recipient_domains check cannot pass it"
+    )
 
 
 def _mllp_egress_allowed(host: str, port: object, allowed: list[str]) -> bool:

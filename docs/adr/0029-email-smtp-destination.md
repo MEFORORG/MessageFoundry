@@ -31,6 +31,54 @@
 
 ---
 
+## Amendment 2026-10-02: the recipients are gated, by domain, and the gate is deny-by-default
+
+D4 below gates the SMTP **host** and nothing else. That bounds the relay hop, not where the mail goes:
+a listed relay forwards to whatever address `recipients` names, so a typing mistake in that list would
+send the Handler's body outside the organisation through a permitted relay.
+[vault BACKLOG #2616](../BACKLOG.md) adds a second EMAIL arm to the same check.
+
+- **`[egress].allowed_recipient_domains: list[str] = []`** in `EgressSettings`, wired into `_split_list`
+  (`MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS=a.example,b.example`). Each entry is a bare domain. A
+  validator lowercases each entry at load and refuses one that could never match, such as an address,
+  a URL, a port, a wildcard, an IP address or a leading-dot suffix.
+- **`check_egress_allowed` runs it for every EMAIL destination**, after the host arm. It reads the
+  addresses through the transport's own `envelope_recipients`: the entries are joined into one `To:`
+  header and parsed with the stdlib address parser, so an entry holding two addresses yields two. Every address must have a domain
+  that matches a listed entry exactly, without regard to ASCII case. A subdomain needs its own entry.
+  The rule runs on the addresses the parser extracts, so a display name or comment in the setting
+  is dropped rather than refused; the `To:` header is built from the checked list too. Each
+  extracted address must be a plain `local@domain` that the stdlib parser reads back unchanged,
+  within the RFC 5321 length limits. The local part is allowlisted, not denylisted: RFC 5322
+  `atext` and dots, without `%` and `!`, which some relays route on, without `|` and `/`,
+  which some servers read as pipe or file delivery, and without `=` and `?`, so no RFC 2047
+  encoded word can form. A leading `-` is refused. The addresses are split with
+  `email.utils.getaddresses`, which does not decode encoded words. The `To:` header is built
+  from the checked strings, but `policy.default` still parses and folds it, and that step does
+  decode encoded words. So construction folds the header under both send policies and refuses
+  any result that is not exactly the checked list. The allowlist keeps encoded words out, and
+  that comparison is the second control if the allowlist is ever widened. Construction also
+  refuses a control character in `subject` or `sender`, which would otherwise fail every send. `smtplib` writes an address it cannot re-read onto the `RCPT TO`
+  line raw, so a looser rule could put a mailbox there other than the one checked. The domain must
+  be an ASCII host name; an internationalized domain is listed in its `xn--` form. Construction
+  applies the same rule, so a build path that skipped the check still sends nothing.
+- **The transport sends to the checked list.** `EmailDestination` passes the same
+  `envelope_recipients` list to `send_message` as `to_addrs`, so a header added later cannot
+  widen the RCPT set past what the gate saw.
+- **Not covered: the envelope sender.** Bounces go to `sender`, and the list does not gate it.
+- **Deny-by-default on its own terms.** An empty list refuses every EMAIL destination, whatever
+  `[security].block_unlisted_outbound` says. This is the `allowed_proxy` shape, not D4's opt-in shape: a
+  permissive-when-empty recipient list would leave the gate off on exactly the default posture.
+- **DIRECT is out of scope.** [ADR 0085](0085-direct-hisp-smime-connector.md) encrypts to one partner
+  certificate that must chain to `trust_anchor`, so a wrong address there receives ciphertext it cannot
+  read. The list does not gate it.
+- **Not counted by the open-egress startup gate**, like `allowed_smtp` itself.
+
+An `[egress].allowed_http` path prefix and an `[egress].allowed_db` database name were proposed beside
+this. They are a separate, larger change and were not made here.
+
+---
+
 ## Amendment 2026-08-02 — the SMTP TLS posture this ADR describes is now VERIFIED on all three cells
 
 D3 below says the connector takes "the same posture `send_plain_email` already takes". That sentence was
@@ -182,6 +230,9 @@ beside `allowed_mllp`/`allowed_http`/`allowed_db`/…), wire it into the `_split
   the list — the `_mllp_egress_allowed(host, port, egress.allowed_smtp)` host[:port] matching the MLLP/TCP/DB
   branches already use. Empty list = unrestricted (today's opt-in default), checked against the resolved
   (`env()`-substituted) destination at config load/reload/start.
+
+*(Amended 2026-10-02: this gates the host only. The recipients are gated by the deny-by-default
+`[egress].allowed_recipient_domains`; see the amendment at the top of this ADR.)*
 
 This makes EMAIL a **first-class egress citizen**: an SMTP destination is bounded by the same fail-closed,
 opt-in, deny-by-default-aware allowlist as MLLP/HTTP/DB egress, so a fat-fingered or hostile mail host can't
