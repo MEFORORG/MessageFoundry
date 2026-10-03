@@ -7474,8 +7474,8 @@ def security_loosenings(
     # source address poisons the audit trail either way.
     # CodeQL's name heuristic reads `trusted_proxies` as a secret (main's alert 209 is that source on
     # an INFO line). The entries reach the serve WARNING and stdout below; no flow is reported today,
-    # but a refactor of the helper may raise one. Fix it at the source, as the MFA floor above does
-    # (ADR 0034's 2026-10-03 amendment).
+    # but a refactor of the helper may raise one. The ranges are quoted on purpose: they are the
+    # finding. ADR 0034's 2026-10-03 amendment, rule 3, says how to triage such an alert.
     trust_all = _trust_every_peer_entries(api.trusted_proxies)
     if trust_all:
         out.append(

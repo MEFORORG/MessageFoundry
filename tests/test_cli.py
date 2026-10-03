@@ -1455,11 +1455,11 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
     assert "amr/acr" not in audit  # OIDC is off here: the audit record names no exception
 
 
-# OIDC on with its claim gate on, built from test_settings' fixture so the two cannot drift. Dotted
-# root keys, because `_expose_toml` puts `relax` ahead of its own tables and an `[auth]` header there
-# would swallow the keys after it.
+# OIDC on with its claim gate on, built from test_settings' fixture so its values are written once.
+# Dotted root keys, because `_expose_toml` puts `relax` ahead of its own tables and an `[auth]` header
+# there would swallow the keys after it. Only `key = value` lines are carried over.
 _OIDC_CLAIM_ON = "".join(
-    f"auth.{line}\n" for line in (_OIDC_AD + _OIDC_BLOCK).splitlines() if line != "[auth]"
+    f"auth.{line}\n" for line in (_OIDC_AD + _OIDC_BLOCK).splitlines() if " = " in line
 ) + ("auth.oidc_require_mfa_claim = true\n")
 _OIDC_EXCEPTION = (
     ", unless an OIDC sign-in carries an amr/acr claim checked while "
@@ -1485,10 +1485,9 @@ def test_serve_names_the_oidc_exception_when_oidc_and_its_claim_gate_are_on(
     """Vault BACKLOG #1133. The OIDC-off tests above prove the exposure texts stay quiet about the
     exception; this is the other arm, end to end through ``_serve``. RED when the refusal, the
     warning or the AUDIT line drops the exception with OIDC and its claim gate on, and RED when the
-    refusal's AD-only parenthetical names it too: that clause describes a deployment with no OIDC."""
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
-    for secret in ("MEFOR_AUTH_AD_BIND_PASSWORD", "MEFOR_AUTH_OIDC_CLIENT_SECRET"):
-        monkeypatch.setenv(secret, _OIDC_ENV[secret])
+    refusal prints it twice. OIDC needs AD on, so the refusal's directory clause has the exception
+    too, and it points back at the sentence that names it."""
+    _setenv_oidc_secrets(monkeypatch)
     monkeypatch.chdir(tmp_path)
     _expose_toml(tmp_path, relax=_OIDC_CLAIM_ON + relax, public_origin="https://mefor.example.org")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
@@ -1509,7 +1508,42 @@ def test_serve_names_the_oidc_exception_when_oidc_and_its_claim_gate_are_on(
         assert line.count(_OIDC_EXCEPTION) == 1, line
         if needle == "refusing to start":
             assert f"over the network{_OIDC_EXCEPTION}. Enable" in line
-            assert "each enrolls an engine factor); or set" in line
+            assert "each enrolls an engine factor, with the OIDC exception above); or set" in line
+
+
+def _setenv_oidc_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The store key plus every ``[auth]`` secret test_settings' OIDC fixture needs."""
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    for name, value in _OIDC_ENV.items():
+        if name.startswith("MEFOR_AUTH_"):
+            monkeypatch.setenv(name, value)
+
+
+def test_serve_undeclared_proxy_warning_names_the_oidc_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #1133. The undeclared-proxy arm (a loopback bind with a public address and no
+    declared terminator) is the third exposure text that names the OIDC exception only when this
+    config has it. RED when it drops the exception with OIDC and its claim gate on."""
+    _setenv_oidc_secrets(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(
+        _OIDC_CLAIM_ON + "security.require_mfa = false\n"
+        "security.block_unlisted_outbound = true\n"
+        'security.web_console_public_address = "https://mefor.example.org"\n'
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "messagefoundry.config.tls_probe.probe_tls_floor", lambda origin: _PassingProbe()
+    )
+    main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"])
+    err = capsys.readouterr().err
+    line = next(text for text in err.splitlines() if "UNDECLARED reverse proxy" in text)
+    assert line.count(f"over the network{_OIDC_EXCEPTION}, and") == 1, line
 
 
 def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(

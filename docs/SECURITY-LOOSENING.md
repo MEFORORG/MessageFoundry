@@ -372,7 +372,7 @@ false premise.
   outside MessageFoundry** — an authenticating reverse proxy / mTLS admin gateway. AD/Kerberos MFA
   delegated to the directory is **no longer** one of them: BACKLOG #1144 retired that delegation, so
   this flag reaches every account with no second factor enrolled, directory ones included, and not
-  only Administrators.
+  only Administrators. The OIDC exception above still applies.
 - **Compensating controls:** front the admin surface with an MFA-enforcing proxy; prefer `require_mfa = true`
   (native TOTP); enable `admin_new_ip_step_up`. A startup **AUDIT** line records the override and the posture
   view (`GET /security/posture`) names it.

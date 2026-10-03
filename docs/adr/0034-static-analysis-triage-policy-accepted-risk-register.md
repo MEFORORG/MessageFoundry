@@ -855,7 +855,7 @@ appears, it is not this one: triage it as new, under the convergence rule above.
 `py/clear-text-logging-sensitive-data` decides that a value is a password partly by the name of its
 source. The 2026-09-16 amendment names two axes: what the sink renders, and which mapping a value was
 read from. This is a third: what the source is called. Three notes in
-`messagefoundry/config/settings.py` hit it, and each now points here rather than stating the rule.
+`messagefoundry/config/settings.py` name the alert at their own site and point here for the rule.
 
 ### What the heuristic reads
 
@@ -872,20 +872,26 @@ reading is attributed to that pull request and was not re-measured here.
 1. Where the engine chooses the name, a module constant or a helper, choose one the heuristic does
    not read. PR 1959 renamed the two `OIDC_MFA_*` names to `OIDC_SECOND_FACTOR_CLAIM_EXCEPTION` and
    `oidc_second_factor_claim_exception()`, with the text and behaviour unchanged.
-2. Where an operator writes the name, a config field, the name stays. The log text carries a literal
-   that the value selects, never the value. The `mfa_verify_min_elapsed_seconds` floor entry and its
-   `_floor_verdict` are the worked example.
-3. Prefer either fix to a dismissal for a new alert of this class. Options considered 3 still holds:
-   nothing is suppressed.
+2. Where an operator writes the name, a config field, the name stays. Where the value adds nothing
+   the operator needs, the log text carries a literal that the value selects instead. The
+   `mfa_verify_min_elapsed_seconds` floor entry and its `_floor_verdict` are the worked example.
+3. Where the value IS the finding, it is quoted. The `trusted_proxies` loosening names the ranges
+   that trust every peer, because a posture review needs to see which. An alert there is a
+   *Misclassified value* dismissal, as 122 was, and the discriminator below must hold first.
+4. Otherwise prefer a fix to a dismissal. Options considered 3 still holds: nothing is suppressed.
 
-`tests/test_security_config.py::test_no_logged_settings_text_is_named_like_a_password` guards rule 1
-for the module-level names in `config.settings`, because CodeQL is not a required check. It reaches
-no other module and no config field. Rule 2 has no guard but a reader.
+`tests/test_security_config.py::test_no_logged_settings_text_is_named_like_a_password` guards part
+of rule 1, because CodeQL is not a required check. It reads one word, `mfa`, and only the module-level
+`str` constants and `-> str` helpers in `config.settings`. It does not see another word the heuristic
+reads, such as `secret`, a helper returning another type, another module, or a config field. Rule 2
+and rule 3 have no guard but a reader.
 
 The guard stops at one module on purpose. Measured 2026-10-03, the same scan over every module in
-the `messagefoundry` package flags 17 names in `auth/`, `api/` and `pipeline/`: audit-event and
-step-up action constants such as `MFA_ENABLED` and `STEP_UP_ACTION_MFA_ENROLL`. Renaming those is a
-separate decision, not a wording fix, so a package-wide guard would start red.
+the `messagefoundry` package flags 7 distinct names, all defined in `auth/notifications.py` and
+`auth/service.py`: audit-event and step-up action constants such as `MFA_ENABLED` and
+`STEP_UP_ACTION_MFA_ENROLL`. Counting their re-imports in `api/` and `pipeline/` it flags 17
+bindings. Renaming those is a separate decision, not a wording fix, so a package-wide guard would
+start red.
 
 ### The discriminator
 

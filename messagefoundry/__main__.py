@@ -3144,8 +3144,10 @@ def _serve(args: argparse.Namespace) -> int:
     admin_exposed = instance_exposed
     # Empty unless this config has the OIDC claim exception, so an AUDIT line never names one that
     # does not exist here (messagefoundry.config.settings.oidc_second_factor_claim_exception says
-    # why). The refusal's AD-only clause leaves it out: an AD-only deployment has no OIDC.
+    # why). OIDC needs AD on, so the refusal's directory clause has the exception too; it points
+    # back at the sentence that names it rather than printing it twice.
     oidc_exception = oidc_second_factor_claim_exception(settings.auth)
+    directory_exception = ", with the OIDC exception above" if oidc_exception else ""
     if admin_exposed and not settings.auth.require_mfa:
         exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
@@ -3161,7 +3163,7 @@ def _serve(args: argparse.Namespace) -> int:
                 f"authenticate with a single factor over the network{oidc_exception}. "
                 "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
                 "API (on an AD-only deployment it binds directory principals too: each enrolls an "
-                "engine factor); or set "
+                f"engine factor{directory_exception}); or set "
                 "[security].allow_single_factor_admin_when_exposed=true to deliberately permit "
                 "single-factor sign-in at exposure (audited).",
                 file=sys.stderr,
