@@ -36,6 +36,7 @@ from messagefoundry.config.loaded_crls import HeldCrlSnapshot, crl_fingerprint
 from messagefoundry.config.loaded_crls import snapshot as held_crl_snapshot
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.crl_reload import RELOAD_INTERVAL_SECONDS
 from messagefoundry.pki import (
     CertFacts,
     CrlFacts,
@@ -438,8 +439,9 @@ def _judge_crl(
     differs from the file is judged too, and the soonest ``nextUpdate`` of the file and those copies
     decides, by the rule the file's own blocks follow (:func:`~messagefoundry.pki.soonest_crl`).
 
-    The alert therefore stays up until every context holding the old copy is gone: a restart, or a
-    rebuild of that hop. A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
+    The alert therefore stays up until no context holds the old copy: the reload pass applied the file
+    to it (:mod:`messagefoundry.pipeline.crl_reload`), or a restart or a rebuild of that hop replaced
+    it. A copy the reload refused names the refusal in the log line. A file that cannot be read or parsed (``file_facts`` is ``None``) no longer
     silences the check while a hop still holds a copy of it. ``None`` only when nothing can be judged.
     A failure judging the held copies is logged and leaves the file's own verdict standing."""
     stale: list[CrlFacts] = []
@@ -463,8 +465,18 @@ def _judge_crl(
                     "Restore a valid CRL file before restarting: the engine refuses to start "
                     "on one it cannot parse",
                 )
+            elif fingerprint is not None and (refused := held.refusal(cert.path, fingerprint)):
+                # BACKLOG #299: the reload pass tried the file on the running hop and refused it.
+                why = "that differs from the file, which the engine refused to apply to it"
+                remedy = f"Reason: {refused.reason}. {refused.remedy}"
             else:
-                why, remedy = "that differs from the file", "Restart the engine to apply the file"
+                # No refusal recorded: the reload pass (pipeline/crl_reload.py) has not judged
+                # these bytes yet, and will within its interval.
+                why, remedy = (
+                    "that differs from the file",
+                    "A reload is pending: the engine applies the file to the running hop within "
+                    f"{RELOAD_INTERVAL_SECONDS:g} seconds, unless it refuses the file and logs why",
+                )
             holders = sorted({copy.setting or "a connection's tls_crl_file" for copy in copies})
             log.warning(
                 "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s), "

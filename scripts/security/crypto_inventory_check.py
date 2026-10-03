@@ -424,6 +424,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # arithmetic on an ALREADY-VERIFIED cert: it builds no SSLContext, reads no key material, and makes
     # no trust decision (the chain was verified by the listener long before this runs).
     "messagefoundry/pipeline/cert_expiry.py": frozenset({"ssl"}),
+    # BACKLOG #299: applies a replaced CRL file to the live TLS contexts that hold an older copy. It
+    # loads CRL bytes into a scratch ssl.SSLContext (tls_policy.crl_scratch_context, which also proves
+    # OpenSSL loads exactly the CRLs judged) to find any certificate before the live load, then
+    # adds them to the live context with load_verify_locations(cafile=). It judges the bytes with
+    # tls_policy.judge_crl_bytes, which reads the CRL fields, and checks each CRL's signature against
+    # the hop's own CA certificates through pki.crl_signature_refusal (a public-key verify). No key
+    # material, no new trust: a certificate the hop does not already trust refuses the reload.
+    "messagefoundry/pipeline/crl_reload.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ASVS 11.3.4 (#301): the periodic AES-GCM invocation-reserve refill runner reads the live
     # cipher's key_id + per-key bound through the store.crypto seam — no direct stdlib crypto import.
     "messagefoundry/pipeline/gcm_invocations.py": frozenset({"messagefoundry.store.crypto"}),
@@ -1158,6 +1166,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/pipeline/cert_expiry.py": frozenset(
         {"key_cert:ssl.cert_time_to_seconds", "key_cert:via messagefoundry.pki"}
+    ),
+    # BACKLOG #299: the running-hop CRL reload; the INVENTORY row above says what each token does.
+    "messagefoundry/pipeline/crl_reload.py": frozenset(
+        {
+            "key_cert:via messagefoundry.config.tls_policy",
+            "key_cert:via messagefoundry.pki",
+            "tls_context:.load_verify_locations()",
+            "tls_context:via messagefoundry.config.tls_policy",
+        }
     ),
     # ADR 0196: the runner charges archive frames to the store data sub-key's id, which
     # store_data_key_id derives (HKDF) and fingerprints (SHA-256) through the store.crypto seam.
