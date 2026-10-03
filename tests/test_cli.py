@@ -10,6 +10,7 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import textwrap
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -19,7 +20,7 @@ import pytest
 
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
-from messagefoundry.config.settings import ServiceSettings, load_settings
+from messagefoundry.config.settings import ServiceSettings, _env_overrides, load_settings
 from tests._phi_gate_provisions import (
     PHI_GATE_PROVISIONS_TOML,
     RETENTION_WINDOWS_ENV,
@@ -3397,10 +3398,12 @@ def test_the_boot_path_never_echoes_an_env_supplied_secret(
     instance runs this today, so that is what a first deployment WOULD hit, not something anyone is
     living with.
 
-    THE CONTROL IS THE RAW RENDERING, ASSERTED FIRST. A test that only looked for the absence of a
-    string would pass just as well against an empty error, a renamed variable, or a value pydantic
-    never had -- so it first proves the planted secret IS in ``str(exc)`` on this exact config,
-    which is what makes its absence below attributable to the rendering rather than to luck.
+    THE CONTROL IS THE PLANTED VALUE REACHING THE REFUSED MAPPING, asserted first. A test that only
+    looked for the absence of a string would pass just as well against an empty error, a renamed
+    variable, or a value the loader never read -- so it first proves the planted secret IS in the
+    ``[store]`` input this exact config fails on. It used to prove that through ``str(exc)``; since
+    BACKLOG #296 the settings models keep every input out of their errors, so the error itself can
+    no longer serve as the control.
     """
     monkeypatch.setenv("MEFOR_STORE_PASSWORD", _BOOT_CANARY)
     cfg = tmp_path / "messagefoundry.toml"
@@ -3408,11 +3411,8 @@ def test_the_boot_path_never_echoes_an_env_supplied_secret(
 
     with pytest.raises(ValueError) as caught:  # ValidationError subclasses ValueError
         load_settings(config_path=str(cfg))
-    assert _BOOT_CANARY in str(caught.value), (
-        "CONTROL FAILED: str(ValidationError) does not carry the planted secret on this config, so "
-        "the absence asserted below would prove nothing -- re-aim this guard at a config whose "
-        "rejected input still holds [store].password"
-    )
+    assert _env_overrides(os.environ)["store"]["password"] == _BOOT_CANARY
+    assert "server, database, username" in str(caught.value)
 
     assert main([command, "--service-config", str(cfg)]) == 2
     captured = capsys.readouterr()

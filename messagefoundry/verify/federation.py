@@ -206,33 +206,48 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
     return rows
 
 
-def _secret_row(settings: ServiceSettings) -> CheckResult:
-    """Resolve the client secret exactly as the engine does. This CAN fail (a Vault reference that
-    does not resolve, a provider that is unset), so it earns a PASS."""
-    from messagefoundry.config.secretprovider import (
-        SecretProviderError,
-        resolve_connector_secret,
-        resolve_secret_provider,
-    )
+def _client_credential_row(settings: ServiceSettings) -> CheckResult:
+    """Resolve the configured client credential exactly as the engine does. This CAN fail (a Vault
+    reference that does not resolve, a provider that is unset, and under ``private_key_jwt`` an
+    unreadable file, a bad passphrase, a weak RSA key or a wrong curve), so it earns a PASS.
 
-    rid, title = "fed.client_secret", "OIDC client secret resolves"
+    The same construction :class:`~messagefoundry.auth.service.AuthService` runs (BACKLOG #296).
+    Nothing is signed or sent to the identity provider, but a ``*_ref`` credential is read from the
+    ``[secrets]`` provider, which for Vault is a network read."""
+    from messagefoundry.auth.oidc.client_auth import ClientSecretPost
+    from messagefoundry.auth.service import oidc_client_auth_from_settings
+    from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
+
     auth = settings.auth
+    if auth.oidc_private_key_jwt:
+        rid, title = "fed.client_key", "OIDC private_key_jwt signing key loads"
+        if auth.oidc_client_private_key_ref:
+            source = "[secrets] provider reference"
+        elif "-----BEGIN" in (auth.oidc_client_private_key or ""):
+            source = "inline PEM (environment or config file)"
+        else:
+            source = "PEM file oidc_client_private_key names"
+    else:
+        rid, title = "fed.client_secret", "OIDC client secret resolves"
+        source = "[secrets] provider reference" if auth.oidc_client_secret_ref else "environment"
     try:
-        provider = resolve_secret_provider(settings.secrets)
-        value = resolve_connector_secret(
-            provider,
-            ref=auth.oidc_client_secret_ref,
-            literal=auth.oidc_client_secret,
-            label="[auth].oidc_client_secret",
-        )
-    except SecretProviderError as exc:
+        credential = oidc_client_auth_from_settings(auth, resolve_secret_provider(settings.secrets))
+    # SigningError is a ValueError; catching the base keeps this module off the signing seam.
+    except (SecretProviderError, ValueError) as exc:
         return CheckResult(rid, title, Status.FAIL, str(exc))
     except Exception as exc:  # never raise out of a check
         return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
-    if not value:
-        return CheckResult(rid, title, Status.FAIL, "resolved to an empty value")
-    source = "[secrets] provider reference" if auth.oidc_client_secret_ref else "environment"
-    return CheckResult(rid, title, Status.PASS, f"resolved from the {source} (value not shown)")
+    if isinstance(credential, ClientSecretPost):
+        return CheckResult(rid, title, Status.PASS, f"resolved from the {source} (value not shown)")
+    return CheckResult(
+        rid,
+        title,
+        Status.PASS,
+        f"loaded from the {source} for {auth.oidc_client_assertion_algorithm.value}, "
+        f"aud={credential.audience}"
+        + (", with an x5t#S256 certificate thumbprint" if auth.oidc_client_certificate else "")
+        + " (key not shown; confirm the IdP holds its public half)",
+    )
 
 
 _ACL_WORDS = {True: "owner-only", False: "writable by a non-owner", None: "could not be read"}
@@ -634,7 +649,7 @@ def run_federation_checks(
         return [_disabled_row()]
 
     rows = _config_rows(settings)
-    rows.append(_secret_row(settings))
+    rows.append(_client_credential_row(settings))
     tls_row, opener = _tls_row(settings)
     rows.append(tls_row)
     rows.append(_revocation_row(settings, opener))
