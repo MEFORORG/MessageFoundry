@@ -272,6 +272,11 @@ HARNESS_FOREIGN_FILE_READS: dict[str, str] = {
 }
 
 
+#: The fewest calls the whole-read walk must see in each file of :data:`HARNESS_FOREIGN_FILE_READS`
+#: before its "reads nothing whole" verdict means anything.
+_MIN_FOREIGN_READ_FILE_CALLS = 10
+
+
 def harness_frame_readers(src: Path, root: Path) -> dict[str, tuple[bool, list[ast.Call]]]:
     """``<file>::<unit>`` -> (starts a server, its frame-reader calls), for every top-level class or
     function in ``src`` that builds a frame reader (:data:`_FRAME_READER_CALLS`)."""
@@ -839,9 +844,12 @@ def test_every_foreign_file_read_is_bounded_and_keys_a_row() -> None:
     through ``read_capped`` or read only a tail, and its file must read nothing whole."""
     assert harness_ladder.MAX_NODE_LOG_BYTES == 64 * DEFAULT_MAX_MESSAGE_BYTES
     assert harness_coord.MAX_COORD_MESSAGE_BYTES == 1 << 20
+    trees = {
+        rel: ast.parse((_ROOT / rel).read_text(encoding="utf-8"))
+        for rel in HARNESS_FOREIGN_FILE_READS
+    }
     for rel, unit in HARNESS_FOREIGN_FILE_READS.items():
-        tree = ast.parse((_ROOT / rel).read_text(encoding="utf-8"))
-        node = next((n for n in tree.body if getattr(n, "name", None) == unit), None)
+        node = next((n for n in trees[rel].body if getattr(n, "name", None) == unit), None)
         assert node is not None, f"{rel}::{unit} is gone"
         names = {_call_name(c) for c in ast.walk(node) if isinstance(c, ast.Call)}
         if rel == "harness/load/failover.py":
@@ -849,16 +857,23 @@ def test_every_foreign_file_read_is_bounded_and_keys_a_row() -> None:
             assert "seek" in names and "read_capped" not in names, f"{rel}::{unit} changed shape"
         else:
             assert "read_capped" in names, f"{rel}::{unit} does not read through read_capped"
-        whole = [
-            f"{rel}:{c.lineno}"
-            for c in ast.walk(tree)
-            if isinstance(c, ast.Call)
-            and (
-                _call_name(c) in _WHOLE_FILE_READS
-                or (_call_name(c) == "read" and not c.args and isinstance(c.func, ast.Attribute))
-            )
-        ]
-        assert not whole, f"reads a file whole: {whole}"
+        file_calls = sum(isinstance(c, ast.Call) for c in ast.walk(trees[rel]))
+        assert file_calls >= _MIN_FOREIGN_READ_FILE_CALLS, f"{rel}: the call walk found too little"
+    calls = [
+        (rel, c) for rel, tree in trees.items() for c in ast.walk(tree) if isinstance(c, ast.Call)
+    ]
+    # Floor under the census taken when this landed (coord.py 28 calls, failover.py 256,
+    # shardcert_ladder.py 463), so a walk that sees nothing cannot pass the absence check below.
+    assert len(calls) >= len(trees) * _MIN_FOREIGN_READ_FILE_CALLS, "the call walk found too little"
+    whole = [
+        f"{rel}:{c.lineno}"
+        for rel, c in calls
+        if (
+            _call_name(c) in _WHOLE_FILE_READS
+            or (_call_name(c) == "read" and not c.args and isinstance(c.func, ast.Attribute))
+        )
+    ]
+    assert not whole, f"reads a file whole: {whole}"
     log_row = _harness_row_for("harness/load/shardcert_ladder.py")
     assert "`harness/load/failover.py`" in log_row.split("|")[1]
     assert has_figure(log_row, f"MAX_NODE_LOG_BYTES` = {_size(harness_ladder.MAX_NODE_LOG_BYTES)}")
