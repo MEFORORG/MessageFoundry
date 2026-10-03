@@ -2434,13 +2434,17 @@ class RemoteFileSource(SourceConnector):
         undecodable file is handed over as its original bytes. Any other content type is handed over
         verbatim, never decoded.
 
-        The stop is checked before every hand-off, the first included: a stop set while the file was
-        retrieved or scanned hands nothing over, so the next start does not ingest a message twice."""
+        The split runs in a worker thread, so a cancellation at that await hands nothing over and
+        leaves the file for the next poll. The stop is checked before every hand-off, the first
+        included: a stop set while the file was retrieved or scanned hands nothing over, so the next
+        start does not ingest a message twice."""
         assert self._handler is not None
         if self.content_type is not None and self.content_type is not ContentType.HL7V2:
             messages = [raw]
         else:
-            messages = split_batch_bytes(raw, self._encoding)
+            # Off the event loop, as every other blocking step of a poll is: a large batch file is a
+            # decode, a regex split and a re-encode per message.
+            messages = await asyncio.to_thread(split_batch_bytes, raw, self._encoding)
         for message in messages:
             if self._stop.is_set():
                 return True

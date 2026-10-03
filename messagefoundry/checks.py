@@ -986,7 +986,7 @@ def _scoped_nodes(tree: ast.Module) -> Iterator[tuple[ast.AST, _Env]]:
     the assignments of the scope holding it, over the module's own (so a module-level statement
     constant is visible inside a function, and a same-named local shadows it).
 
-    A node in a signature — a decorator or a default argument — has no scope of its own here and is
+    A node in a signature, a decorator or a default argument, has no scope of its own here and is
     not yielded. Shared by ``unsafe-db-lookup`` and ``leaf-to-whole-field``."""
     module_env = _scope_assignments(tree.body)
     yield from ((node, module_env) for node in _scope_nodes(tree.body))
@@ -1303,7 +1303,25 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
     mapping lookup's key, a ``key=`` function and the argument of a call that returns a length, a
     truth value or a number select or measure the value and do not become it, so a leaf read there
     is not followed.
-    A node of any other kind is read conservatively, through every child expression."""
+    A node of any other kind is read conservatively, through every child expression.
+
+    The walk keeps its own stack rather than recursing, so a long ``+`` chain, which nests as deep
+    as it has terms, cannot exhaust the interpreter's recursion limit. Only a comprehension's
+    iterable is read by a nested call, and brackets nest at most 200 deep."""
+    stack: list[tuple[ast.AST, Set[str]]] = [(node, tainted)]
+    while stack:
+        current, names = stack.pop()
+        step = _flow_step(current, names)
+        if step is True:
+            return True
+        if step is not False:
+            stack.extend(step)
+    return False
+
+
+def _flow_step(node: ast.AST, tainted: Set[str]) -> bool | list[tuple[ast.AST, Set[str]]]:
+    """One step of :func:`_flows`: True or False when ``node`` alone decides, otherwise the child
+    expressions, each with the names tainted there, whose flow decides it."""
     if _is_leaf_read(node):
         return True
     if isinstance(node, ast.Name):
@@ -1311,19 +1329,19 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
     if isinstance(node, (ast.Constant, ast.Compare)):
         return False
     if isinstance(node, ast.IfExp):
-        return _flows(node.body, tainted) or _flows(node.orelse, tainted)
+        return [(node.body, tainted), (node.orelse, tainted)]
     if isinstance(node, ast.UnaryOp):
-        return not isinstance(node.op, ast.Not) and _flows(node.operand, tainted)
+        return not isinstance(node.op, ast.Not) and [(node.operand, tainted)]
     if isinstance(node, (ast.Subscript, ast.Attribute, ast.Starred, ast.NamedExpr, ast.Await)):
-        return _flows(node.value, tainted)
+        return [(node.value, tainted)]
     if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
-        return _comprehension_flows(node, node.elt, tainted)
+        return [(node.elt, _comprehension_names(node, tainted))]
     if isinstance(node, ast.DictComp):
-        return _comprehension_flows(node, node.value, tainted)
+        return [(node.value, _comprehension_names(node, tainted))]
     if isinstance(node, ast.Lambda):
         # Its body may be called; its parameters shadow outer names of the same spelling.
         params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
-        return _flows(node.body, set(tainted) - {p.arg for p in params})
+        return [(node.body, set(tainted) - {p.arg for p in params})]
     if isinstance(node, ast.Call):
         # A ``key=`` function orders or selects the result (``sorted``, ``max``) and is not it.
         args: list[ast.expr] = [
@@ -1338,19 +1356,17 @@ def _flows(node: ast.AST, tainted: Set[str]) -> bool:
                 return False
             if func.attr in _KEY_FIRST_METHODS:
                 args = args[1:]
-        return _flows(func, tainted) or any(_flows(arg, tainted) for arg in args)
+        return [(child, tainted) for child in (func, *args)]
     # BinOp, BoolOp, JoinedStr, FormattedValue, List, Tuple, Set, Dict (keys too: a dict's keys
     # can come back out as values) and anything unforeseen.
-    return any(_flows(child, tainted) for child in ast.iter_child_nodes(node))
+    return [(child, tainted) for child in ast.iter_child_nodes(node)]
 
 
-def _comprehension_flows(
-    node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
-    result: ast.expr,
-    tainted: Set[str],
-) -> bool:
-    """Whether a leaf reaches a comprehension's ``result``: each loop target takes the taint of
-    what it iterates, shadowing an outer name of the same spelling. Its ``if`` filters do not."""
+def _comprehension_names(
+    node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp, tainted: Set[str]
+) -> set[str]:
+    """The names tainted in a comprehension's result: each loop target takes the taint of what it
+    iterates, shadowing an outer name of the same spelling. Its ``if`` filters do not."""
     local = set(tainted)
     for gen in node.generators:
         names = {n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)}
@@ -1359,7 +1375,7 @@ def _comprehension_flows(
         local -= names
         if carries:
             local |= names
-    return _flows(result, local)
+    return local
 
 
 def _tainted_names(env: _Env) -> frozenset[str]:
@@ -1400,23 +1416,32 @@ def _whole_field_write_value(node: ast.AST) -> ast.expr | None:
     return None
 
 
-def _leaf_to_whole_field_hits(scoped: Sequence[tuple[ast.AST, _Env]]) -> list[int]:
-    """Line numbers of whole-field writes whose value is a decoded leaf, read against the
+def _leaf_to_whole_field_hits(scoped: Sequence[tuple[ast.AST, _Env]]) -> list[tuple[int, str]]:
+    """``(line, rule)`` for each whole-field write whose value is a decoded leaf, read against the
     assignments of the scope holding the write (so ``v = msg.field("PID-3.1")`` a line earlier is
     seen, as ``unsafe-db-lookup`` sees a statement composed earlier). ``scoped`` is one
     :func:`_scoped_nodes` walk, which yields each scope's nodes in one run under one env, so each
-    env is solved once, and only when its scope holds a whole-field write."""
+    env is solved once, and only when its scope holds a whole-field write.
+
+    A write the walk cannot finish (a ``RecursionError``) is reported as
+    ``leaf-to-whole-field-unscanned`` rather than raised, so the check never crashes; strict mode
+    then refuses it, as it would refuse a finding, rather than pass code nobody scanned."""
     solved: _Env | None = None
     tainted: frozenset[str] = frozenset()
-    hits: list[int] = []
+    hits: list[tuple[int, str]] = []
     for node, env in scoped:
         value = _whole_field_write_value(node)
         if value is None:
             continue
-        if env is not solved:
-            solved, tainted = env, _tainted_names(env)
-        if _flows(value, tainted):
-            hits.append(getattr(node, "lineno", 0))
+        try:
+            if env is not solved:
+                # Marked solved only once it is: a scope whose solve fails fails each of its writes.
+                tainted, solved = _tainted_names(env), env
+            rule = "leaf-to-whole-field" if _flows(value, tainted) else None
+        except RecursionError:
+            rule = "leaf-to-whole-field-unscanned"
+        if rule is not None:
+            hits.append((getattr(node, "lineno", 0), rule))
     return hits
 
 
@@ -1434,9 +1459,10 @@ def _check_handler_security(
     * ``impure-transform`` — a re-run-divergent nondeterministic source (wall clock / ``random`` /
       ``uuid4``) in a router/handler, breaking the at-least-once purity invariant (CLAUDE.md §2).
     * ``unvetted-import`` — an operator-added third-party import (supply-chain / slopsquat surface).
-    * ``leaf-to-whole-field`` — a value read decoded from a component or subcomponent and written to a
+    * ``leaf-to-whole-field``: a value read decoded from a component or subcomponent and written to a
       whole field with ``set``, where its escaped separators would become structure; the safe write
-      is ``set_data`` (ADR 0206 rule 3). Literal paths only.
+      is ``set_data`` (ADR 0206 rule 3). Literal paths only. A write it cannot finish walking is
+      reported as ``leaf-to-whole-field-unscanned`` instead.
 
     Static analysis catches only a fraction of insecure code, so this is a **filter, not a fix**.
     **Advisory by default** (``required=False``, prints, never blocks); ``strict=True`` (the opt-in
@@ -1486,9 +1512,7 @@ def _check_handler_security(
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
             if _ambient_authority_hit(node):
                 file_hits.append((node.lineno, "ambient-authority"))
-        file_hits += [
-            (lineno, "leaf-to-whole-field") for lineno in _leaf_to_whole_field_hits(scoped)
-        ]
+        file_hits += _leaf_to_whole_field_hits(scoped)
         # Per-FunctionDef body rules — phi-to-log + impure-transform, over each function's own body
         # only (not nested defs, not the signature), so each call is scanned once with its own message
         # symbol and an import-time default arg is never mistaken for per-message impurity. phi-to-log

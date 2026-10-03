@@ -1165,9 +1165,19 @@ class _LeafRewrite:
         # source separator or the source escape character is never data in a field's text (and the
         # field separator never appears in it at all), so each is left out.
         self._codes = {c: k for c, k in self._target_codes.items() if c not in source}
+        # Each target delimiter to its escape, for the text after an escape character nothing closes.
+        self._escape_table = {ord(c): t_esc + k + t_esc for c, k in self._target_codes.items()}
         # A field holding no source escape character is structure and plain data only, so one
         # translate maps its separators and escapes its data characters at once.
-        self._data_table = {**table, **{ord(c): t_esc + k + t_esc for c, k in self._codes.items()}}
+        self._data_table = {**table, **{ord(c): self._escape_table[ord(c)] for c in self._codes}}
+        # Where the escape character is also a separator the separator wins, so only the character
+        # walk reads it right; a split on the escape character would read it the other way.
+        self._walks = self._s_esc in structure
+        self._separators = tuple(structure)
+        self._unclosed_head = self._data(self._s_esc)
+        # A message repeats few distinct escape sequences (a line break, one separator), so each is
+        # rewritten once per message. Bounded by the message, which this object does not outlive.
+        self._sequences: dict[str, str] = {}
 
     def _holds_code(self, text: str) -> bool:
         # At most five characters, each a C-level substring scan; no pattern is built from config.
@@ -1181,18 +1191,61 @@ class _LeafRewrite:
     def __call__(self, text: str) -> str:
         if self._s_esc not in text:
             return text.translate(self._data_table)
+        if self._walks:
+            return self._walk(text)
+        # Split on the escape character, so only the escape sequences are handled one at a time and
+        # the text between them takes the same single translate as a field with none. That keeps a
+        # large field near translate speed; a walk character by character was about 50 times slower.
+        # Each piece after the first is the text after an escape character: an escape sequence when
+        # the next escape character closes it before any separator, otherwise data up to the
+        # separator, or to the end of the field, after which the text is plain again.
+        pieces = text.split(self._s_esc)
+        table, sequences = self._data_table, self._sequences
+        out = [pieces[0].translate(table)]
+        last = len(pieces) - 1
+        i = 1
+        while i <= last:
+            run = pieces[i]
+            cut = self._first_separator(run)
+            if cut == len(run) and i < last:
+                rewritten = sequences.get(run)
+                if rewritten is None:
+                    rewritten = sequences[run] = self._sequence(run)
+                out.append(rewritten)
+                out.append(pieces[i + 1].translate(table))
+                i += 2
+            else:
+                out.append(self._unclosed(run[:cut]))
+                out.append(run[cut:].translate(table))
+                i += 1
+        return "".join(out)
+
+    def _first_separator(self, text: str) -> int:
+        """The index of the first source separator in ``text``, or its length when it holds none.
+        At most three C-level scans."""
+        first = len(text)
+        for separator in self._separators:
+            index = text.find(separator, 0, first)
+            if index >= 0:
+                first = index
+        return first
+
+    def _walk(self, text: str) -> str:
+        """The rewrite read one character at a time. Used only when the escape character is also a
+        separator, where the separator wins, as the parser reads it, and a split on the escape
+        character would read it the other way."""
         structure, s_esc, data = self._structure, self._s_esc, self._data
         out: list[str] = []
         run: list[str] | None = None  # the text of an open escape sequence
         for char in text:
             if char in structure:
                 if run is not None:  # an escape nothing closed ends with its leaf
-                    out.append(self._unclosed(run))
+                    out.append(self._unclosed("".join(run)))
                     run = None
                 out.append(structure[char])
             elif run is not None:
                 if char == s_esc:
-                    out.append(self._sequence(run))
+                    out.append(self._sequence("".join(run)))
                     run = None
                 else:
                     run.append(char)
@@ -1201,15 +1254,14 @@ class _LeafRewrite:
             else:
                 out.append(data(char))
         if run is not None:
-            out.append(self._unclosed(run))
+            out.append(self._unclosed("".join(run)))
         return "".join(out)
 
-    def _sequence(self, run: list[str]) -> str:
+    def _sequence(self, text: str) -> str:
         """A closed escape sequence, rewritten for the target set. A separator escape (``F``, ``S``,
         ``R``, ``T``, ``E``) is decoded against the source set and re-escaped against the target, so
         the receiver reads the character the engine read. Any other sequence keeps its text under the
         target escape character, which only works while that text holds no target delimiter."""
-        text = "".join(run)
         decoded = self._decode.get(text)
         if decoded is not None:
             return self._data(decoded)
@@ -1220,8 +1272,9 @@ class _LeafRewrite:
             )
         return self._t_esc + text + self._t_esc
 
-    def _unclosed(self, run: list[str]) -> str:
+    def _unclosed(self, run: str) -> str:
         # unescape() keeps an escape character nothing closes as data, with the text after it. So
         # both are written as data under the target set: the source escape character and each
-        # character after it, each escaped where it is a target delimiter.
-        return self._data(self._s_esc) + "".join(self._data(char) for char in run)
+        # character after it, each escaped where it is a target delimiter. ``run`` holds neither the
+        # escape character nor a separator, so one translate does it.
+        return self._unclosed_head + run.translate(self._escape_table)

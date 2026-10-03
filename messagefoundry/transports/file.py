@@ -48,7 +48,7 @@ from messagefoundry.config.models import (
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_hl7
-from messagefoundry.parsing.split import split_batch
+from messagefoundry.parsing.split import split_batch, strip_bom_before_msh
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
@@ -1371,9 +1371,11 @@ class FileSource(SourceConnector):
             text
         )  # str in → no UTF-8 re-decode (normalize only fixes line endings)
         if len(messages) == 1:
-            # Fast path / strict back-compat: a lone message is handed off verbatim (its original
-            # bytes), so a non-batch file behaves byte-for-byte as before the split was introduced.
-            await self._handler(raw)
+            # Fast path / strict back-compat: a lone message is handed off as its original bytes, so a
+            # non-batch file behaves as before the split was introduced. A leading UTF-8 byte order
+            # mark goes first, as the split drops it from a batch's first message, so one message
+            # gets the disposition each member of a batch would (ADR 0206).
+            await self._handler(strip_bom_before_msh(raw, self.encoding))
             return True
         for message in messages:
             if self._stop.is_set():

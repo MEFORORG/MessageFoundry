@@ -291,16 +291,18 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
 
     Recognizes exactly the ADR 0089 Phase A forms:
 
-    * ``msg.set(path, value)`` → ``set_field`` (path + value editable slots).
-    * ``msg.set(dst, msg.field(src))`` / ``msg.set(dst, msg.field(src) or "")`` → ``copy_field``, and
+    * ``msg.set(path, value)`` reads as ``set_field`` (path + value editable slots).
+    * ``msg.set(dst, msg.field(src))`` / ``msg.set(dst, msg.field(src) or "")`` read as ``copy_field``, and
       the same two shapes through ``msg.set_data``, the write a copy from a leaf uses (ADR 0206).
-    * ``msg.delete_segments("SEG")`` / ``msg.delete_segment("SEG")`` → ``delete_segment``.
+    * ``msg.delete_segments("SEG")`` / ``msg.delete_segment("SEG")`` read as ``delete_segment``.
 
     A ``*args`` / ``**kwargs`` splat, the wrong positional arity (``msg.set`` with != 2, ``delete`` with
     != 1), a non-``msg`` receiver, or any other method makes it unrecognized (→ a read-only ``code`` row):
     when unsure the lens degrades rather than risk a corrupting edit. ``occurrence=``/other keyword args
     are preserved as read-only ``display`` fields (never dropped, never editable in Phase A). A
-    ``msg.set_data`` call that is not a copy is a ``code`` row: ``set_field`` means :meth:`Message.set`."""
+    ``msg.set_data`` call is a ``set_field`` only when its value is a template the lens itself would
+    write with ``set_data`` (:func:`_template_write_method`); any other one that is not a copy is a
+    ``code`` row, because ``set_field`` otherwise means :meth:`Message.set`."""
     func = call.func
     if not isinstance(func, ast.Attribute) or not _is_msg_method(func, func.attr):
         return None
@@ -318,7 +320,7 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
             return _NativeAction(
                 "copy_field", [("src", field_call.args[0]), ("dst", dst_or_path)], display
             )
-        if func.attr == "set_data":
+        if func.attr == "set_data" and _template_write_method(value) != "set_data":
             return None
         return _NativeAction("set_field", [("path", dst_or_path), ("value", value)], display)
     if func.attr in ("delete_segments", "delete_segment"):
@@ -2579,8 +2581,11 @@ def _apply_set_params(
     result = _splice_slots(src, slots, params, moded=(row["kind"], row.get("action")))
     if any(isinstance(v, dict) and set(v) == {"parts"} for v in params.values()):
         _refuse_overlong_template_lines(src, result, line_start, line_end)
-    if row.get("action") == "copy_field" and ("src" in params or "dst" in params):
-        repicked = _repick_copy_write(result, line_start, line_end)
+    action = row.get("action")
+    if (action == "copy_field" and ("src" in params or "dst" in params)) or (
+        action == "set_field" and "value" in params
+    ):
+        repicked = _repick_write(result, line_start, line_end)
         if repicked != result:
             _refuse_overlong_repick(result, repicked, line_start, line_end)
         result = repicked
@@ -2588,7 +2593,7 @@ def _apply_set_params(
 
 
 def _refuse_overlong_repick(result: str, repicked: str, line_start: int, line_end: int) -> None:
-    """Refuse a Copy Field re-pick that pushes one of the row's lines past the column limit.
+    """Refuse a write re-pick that pushes one of the row's lines past the column limit.
 
     ``set`` to ``set_data`` adds five columns, and the lens never wraps a line itself, so a line it
     would push past the limit is refused rather than left for ``ruff format`` to re-wrap, as
@@ -2599,50 +2604,61 @@ def _refuse_overlong_repick(result: str, repicked: str, line_start: int, line_en
         if new > _MAX_LINE_LENGTH and new > _display_width(old_lines[i]):
             raise LensRewriteError(
                 f"this edit would make line {i + 1} {new} columns wide, past the "
-                f"{_MAX_LINE_LENGTH}-column limit: a copy from a component or subcomponent writes "
-                "with msg.set_data (ADR 0206), which is longer than msg.set - shorten the paths, or "
-                "edit it as text",
+                f"{_MAX_LINE_LENGTH}-column limit: a value copied from a component or subcomponent "
+                "writes with msg.set_data (ADR 0206), which is longer than msg.set - shorten the "
+                "paths, or edit it as text",
                 code=REFUSAL_COLUMN_LIMIT,
             )
 
 
-def _repick_copy_write(source: str, line_start: int, line_end: int) -> str:
-    """Re-pick the write of the native Copy Field at ``line_start``-``line_end`` of ``source``, after
-    an edit of its ``src`` or ``dst`` (ADR 0206 rule 1).
+def _repick_write(source: str, line_start: int, line_end: int) -> str:
+    """Re-pick the write of the native Copy Field or Set Field at ``line_start``-``line_end`` of
+    ``source``, after an edit of a copy's ``src`` or ``dst`` or of a Set Field's ``value`` (ADR 0206
+    rule 1).
 
-    The write is the one :func:`_copy_write_method` picks on insert. Splicing only the paths would
-    keep the old method: a leaf source left on ``set`` into a whole field turns its decoded
-    separators into structure, and a whole-field source moved to ``set_data`` escapes the field's
-    structure into one component. The two writes are the same at a literal leaf destination, so
-    there the method is left as written. A source that is not a literal cannot be classified and
-    keeps its method. ``source`` is the already-spliced text, so the paths read here are the ones the
-    edit wrote."""
+    The write is the one an insert picks (:func:`_native_write_method`). Splicing only the arguments
+    would keep the old method: a leaf read left on ``set`` into a whole field turns its decoded
+    separators into structure, and authored text moved to ``set_data`` escapes the structure it
+    meant into one component. For a copy the two writes are the same at a literal leaf destination,
+    so there the method is left as written, and a source that is not a literal keeps its method. A
+    Set Field always takes the picked method, so the row keeps reading back as ``set_field``.
+    ``source`` is the already-spliced text, so the arguments read here are the ones the edit
+    wrote."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return source
-    # The copy statement spanning exactly the row's lines. Two copies sharing those lines (``;``)
-    # cannot be told apart here, so neither is touched.
+    # The write statement spanning exactly the row's lines. Two writes sharing those lines (``;``)
+    # cannot be told apart here, so neither is touched. The recognizer is not used to find it: a
+    # Set Field still spelled ``set_data`` around a value just edited to plain text reads as code.
     found = [
-        (stmt.value.func, native)
+        stmt.value
         for stmt in ast.walk(tree)
         if isinstance(stmt, ast.Expr)
         and stmt.lineno == line_start
         and stmt.end_lineno == line_end
         and isinstance(stmt.value, ast.Call)
         and isinstance(stmt.value.func, ast.Attribute)
-        and (native := _recognize_native_method(stmt.value)) is not None
-        and native.action == "copy_field"
+        and stmt.value.func.attr in ("set", "set_data")
+        and _is_msg_method(stmt.value.func, stmt.value.func.attr)
+        and len(stmt.value.args) == 2
+        and _native_display(stmt.value) is not None
     ]
     if len(found) != 1:
         return source
-    func, native = found[0]
-    slots = dict(native.slots)
-    src, dst = (getattr(slots[name], "value", None) for name in ("src", "dst"))
-    if not isinstance(src, str) or _is_leaf_literal(dst) or func.end_col_offset is None:
-        return source
-    want = _copy_write_method(src)
-    if func.attr == want:
+    call = found[0]
+    func = call.func
+    assert isinstance(func, ast.Attribute)
+    dst, value = call.args
+    field_call = _msg_field_source(value)
+    if field_call is None:
+        want = _template_write_method(value)
+    else:
+        src = getattr(field_call.args[0], "value", None)
+        if not isinstance(src, str) or _is_leaf_literal(getattr(dst, "value", None)):
+            return source
+        want = _copy_write_method(src)
+    if func.attr == want or func.end_col_offset is None:
         return source
     data = source.encode("utf-8")
     end = _line_byte_starts(data)[(func.end_lineno or func.lineno) - 1] + func.end_col_offset
@@ -4599,18 +4615,50 @@ def _copy_write_method(src: Any) -> str:
     return "set_data" if _is_leaf_literal(src) else "set"
 
 
+#: The standard HL7 delimiters. Template text holding one is taken as structure the author meant.
+_STANDARD_DELIMITERS = frozenset("|^~&" + chr(92))
+
+
+def _template_write_method(value: ast.expr) -> str:
+    """The ``Message`` write a native Set Field with ``value`` uses (ADR 0206 rule 1).
+
+    ``set_data`` for a template that reads at least one literal component or subcomponent path,
+    whose read is decoded, and whose own text holds no standard delimiter; ``set`` for anything
+    else. A template whose text carries a delimiter is structure the author wrote, which
+    ``set_data`` would escape into one component, so it keeps ``set`` and the handler-security lint
+    still flags the leaf it copies. The lens is static and cannot know a message's own separators,
+    so the test uses the standard ones."""
+    parts = _template_parts(value)
+    if parts is None:
+        return "set"
+    text = "".join(part.get(PART_TEXT, "") for part in parts)
+    if any(char in _STANDARD_DELIMITERS for char in text):
+        return "set"
+    return "set_data" if any(_is_leaf_literal(part.get(PART_PATH)) for part in parts) else "set"
+
+
+def _native_write_method(value: ast.expr) -> str:
+    """The ``Message`` write a native ``set_field`` or ``copy_field`` with ``value`` uses: a copy's
+    by its source (:func:`_copy_write_method`), anything else by :func:`_template_write_method`."""
+    field_call = _msg_field_source(value)
+    if field_call is not None:
+        return _copy_write_method(getattr(field_call.args[0], "value", None))
+    return _template_write_method(value)
+
+
 def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> str:
     """Render the NATIVE Message-API form of an inserted ``set_field``/``copy_field``/``delete_segment``.
 
     The single source of truth for the inserted native text — chosen so that re-parsing the line
     recognizes the SAME editable action row (:func:`_recognize_native_method`):
 
-    * ``set_field {path, value}``     → ``msg.set(<path>, <value>)``
-    * ``copy_field {src, dst}``       → ``msg.set(<dst>, msg.field(<src>) or "")``, or ``msg.set_data``
+    * ``set_field {path, value}`` renders ``msg.set(<path>, <value>)``, or ``msg.set_data`` when the
+      value copies a decoded leaf (:func:`_native_write_method`, ADR 0206)
+    * ``copy_field {src, dst}`` renders ``msg.set(<dst>, msg.field(<src>) or "")``, or ``msg.set_data``
       in place of ``msg.set`` when ``src`` is a literal component or subcomponent path (ADR 0206)
-    * ``delete_segment {segment_id}`` → ``msg.delete_segments(<segment_id>)``
-    * ``add_segment {line}``          → ``msg.add_segment(<line>)`` (ADR 0106 §3 Group 1)
-    * ``add_repetition {path, value}``→ ``msg.add_repetition(<path>, <value>)`` (ADR 0106 §3 Group 1)
+    * ``delete_segment {segment_id}`` renders ``msg.delete_segments(<segment_id>)``
+    * ``add_segment {line}`` renders ``msg.add_segment(<line>)`` (ADR 0106 section 3, Group 1)
+    * ``add_repetition {path, value}`` renders ``msg.add_repetition(<path>, <value>)`` (ADR 0106 section 3, Group 1)
 
     Values are rendered via :func:`_render_insert_value` (literal-vs-``{"expr"}`` handling + the single-
     line invariant are identical to the wrapper path). A missing/empty param renders as an empty string
@@ -4637,7 +4685,8 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
     if name == "set_field":
         path = _render_insert_value(params.get("path", ""), "path")
         value = _render_insert_value(params.get("value", ""), "value")
-        return f"msg.set({path}, {value}{suffix})"
+        write = _native_write_method(ast.parse(value, mode="eval").body)
+        return f"msg.{write}({path}, {value}{suffix})"
     if name == "copy_field":
         src = _render_insert_value(params.get("src", ""), "src")
         dst = _render_insert_value(params.get("dst", ""), "dst")

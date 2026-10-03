@@ -449,30 +449,39 @@ class _Tracer:
             _active_recorder.reset(token)
 
 
-# --- Message.set patch (msg[...] / msg.set(...) write capture) ----------------
+# --- Message write patch (msg[...] / msg.set(...) / msg.set_data(...) write capture) ----------------
 
-_ORIG_MESSAGE_SET = Message.set
+# ``set``, ``set_data`` and ``__setitem__`` all write through ``Message._write``, so one patch there
+# records each write once, with the value the Handler passed and never the escaped text set_data
+# stores (ADR 0206).
+_ORIG_MESSAGE_WRITE = Message._write
 
 
-def _recording_set(
-    self: Message, path: str, value: str, *, occurrence: int = 1, repetition: int | None = None
+def _recording_write(
+    self: Message,
+    path: str,
+    value: str,
+    occurrence: int,
+    repetition: int | None,
+    *,
+    as_data: bool,
 ) -> None:
     rec = _active_recorder.get()
     if rec is not None:
         rec.record_write(path, value)
-    _ORIG_MESSAGE_SET(self, path, value, occurrence=occurrence, repetition=repetition)
+    _ORIG_MESSAGE_WRITE(self, path, value, occurrence, repetition, as_data=as_data)
 
 
 @contextmanager
 def _patched_message_writes() -> Iterator[None]:
-    """Record ``msg.set(...)`` / ``msg[...] = ...`` (``__setitem__`` delegates to ``set``) writes for the
-    active recorder, then restore the original method. A no-op passthrough whenever no recorder is active,
-    so it never perturbs the mutation itself."""
-    Message.set = _recording_set  # type: ignore[method-assign]
+    """Record ``msg.set(...)`` / ``msg[...] = ...`` / ``msg.set_data(...)`` writes for the active
+    recorder, then restore the original method. A no-op passthrough whenever no recorder is active, so
+    it never perturbs the mutation itself."""
+    Message._write = _recording_write  # type: ignore[method-assign]
     try:
         yield
     finally:
-        Message.set = _ORIG_MESSAGE_SET  # type: ignore[method-assign]
+        Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
 
 
 def trace_dry_run(

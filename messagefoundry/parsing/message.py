@@ -293,6 +293,15 @@ class Message:
         then not contain the repetition separator). Without ``repetition``, a whole-field write
         assigns the caller's text verbatim (their structure, repetitions and all). Raises
         ``KeyError`` if the target segment (occurrence) isn't present."""
+        self._write(path, value, occurrence, repetition, as_data=False)
+
+    def _write(
+        self, path: str, value: str, occurrence: int, repetition: int | None, *, as_data: bool
+    ) -> None:
+        """The one write behind :meth:`set` and :meth:`set_data`, so both check the same things in
+        the same order and fail the same way. ``as_data`` escapes a whole-field value as one leaf
+        once the target is known to exist, except at ``MSH-1`` and ``MSH-2``, which hold the
+        delimiters themselves and so have no escaped form."""
         if "\r" in value or "\n" in value:
             raise ValueError("HL7 field value may not contain a segment separator (CR/LF)")
         if occurrence < 1:
@@ -307,6 +316,8 @@ class Message:
         field_sep, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
 
         if comp is None:
+            if as_data and not (seg == "MSH" and fld in (1, 2)):
+                value = self._escape_leaf(value, field_sep, comp_sep, rep_sep, esc, sub_sep)
             # Whole-field write assigns the caller's structure verbatim — but the field separator
             # would split it into extra fields downstream, so reject it (review M-12). Components and
             # repetitions are the caller's intended structure and remain allowed.
@@ -371,12 +382,12 @@ class Message:
 
             msg.set_data("PV1-19", msg.field("PID-3.1") or "")
 
-        Raises as :meth:`set` does: ``ValueError`` on a CR or LF, ``KeyError`` on an absent segment."""
-        if parse_path(path)[2] is None and "\r" not in value and "\n" not in value:
-            # CR and LF stay raw through the escaper, so set() below refuses them as it always has.
-            field_sep, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
-            value = self._escape_leaf(value, field_sep, comp_sep, rep_sep, esc, sub_sep)
-        self.set(path, value, occurrence=occurrence, repetition=repetition)
+        It raises exactly what :meth:`set` raises for the same arguments, ``ValueError`` on a CR or
+        LF and ``KeyError`` on an absent segment among them, because both are one implementation.
+        ``MSH-1`` and ``MSH-2`` hold the delimiters themselves, have no escaped form, and are written
+        as :meth:`set` writes them. A dry-run trace records the value as passed here, as it records
+        the value passed to :meth:`set`, never the escaped text."""
+        self._write(path, value, occurrence, repetition, as_data=True)
 
     def __setitem__(self, path: str, value: str) -> None:
         self.set(path, value)

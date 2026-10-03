@@ -26,9 +26,15 @@ import re
 
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import normalize
-from messagefoundry.parsing.sniff import _LEADING_WS_STR
+from messagefoundry.parsing.sniff import _LEADING_WS, _LEADING_WS_STR
 
-__all__ = ["encode_batch", "split_batch", "split_batch_bytes", "split_by_obr"]
+__all__ = [
+    "encode_batch",
+    "split_batch",
+    "split_batch_bytes",
+    "split_by_obr",
+    "strip_bom_before_msh",
+]
 
 # Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment. We match
 # ``\rMSH`` *without* the trailing field separator so a batch whose MSH-1 isn't ``|`` (e.g.
@@ -50,7 +56,7 @@ def split_batch(raw: str | bytes) -> list[str]:
 
     A real file connection delivers each ``MSH``-delimited message separately; mirror that so a
     batch file (or an ``FHS``/``BHS`` envelope wrapping several messages) yields every message, in
-    file order — not just the first. Each returned message is ``\r``-delimited. The leading
+    file order, not just the first. Each returned message is ``\r``-delimited. The leading
     ``FHS``/``BHS`` envelope header lines before the first ``MSH`` are dropped, since each split
     message is routed on its own and the batch framing has no per-message meaning.
 
@@ -81,24 +87,49 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
 
     The bytes are decoded with the connection's declared ``encoding`` at ``errors="strict"`` so the
     ``MSH`` boundaries are found in the right characters, split by :func:`split_batch`, and each
-    message is re-encoded in the same ``encoding``. Two shapes come back as ``[raw]``, untouched: a
-    file holding one message, so a non-batch file is handed over byte for byte, and a file that does
-    not decode (or names an unknown codec), so the listener's own strict decode records its
-    ``ERROR``. Every message :func:`split_batch` finds is handed back.
+    message is re-encoded in the same ``encoding``. A file holding one message comes back as
+    ``[raw]``, so a non-batch file is handed over byte for byte, except that a leading UTF-8 byte
+    order mark goes first, as :func:`strip_bom_before_msh` says, so the message is handed over as a
+    batch member would be. A file that does not decode (or names an unknown codec) comes back as
+    ``[raw]`` untouched, so the listener's own strict decode records its ``ERROR``. Every message
+    :func:`split_batch` finds is handed back.
 
     A file holding no ``MSH`` after a line break is one message by :func:`split_batch`'s own
     boundary. Where a byte scan can tell (:func:`_may_hold_a_later_msh`), such a file is returned
     without a decode or a split, so the common single-message file pays one scan."""
     if not _may_hold_a_later_msh(raw, encoding):
-        return [raw]
+        return [strip_bom_before_msh(raw, encoding)]
     try:
         text = raw.decode(encoding)
     except (UnicodeDecodeError, LookupError):
         return [raw]
     messages = split_batch(text)
     if len(messages) == 1:
-        return [raw]
+        return [strip_bom_before_msh(raw, encoding)]
     return [message.encode(encoding) for message in messages]
+
+
+def strip_bom_before_msh(raw: bytes, encoding: str = "utf-8") -> bytes:
+    """``raw`` without its leading UTF-8 byte order mark, and the whitespace around the mark, when
+    an ``MSH`` follows them; otherwise ``raw`` unchanged.
+
+    For a source that hands a one-message file over whole. :func:`split_batch` reads a batch's
+    first message past that mark, but the parser refuses a body that starts with it, so without
+    this one message led by the mark was an ``ERROR`` where the same message in a batch was not.
+    Only a ``utf-8`` charset is read this way: under a single-byte charset those three bytes are
+    three characters, which :func:`split_batch` keeps too, and a ``utf-8-sig`` or UTF-16 decode
+    drops the mark itself."""
+    try:
+        name = codecs.lookup(encoding).name
+    except LookupError:
+        return raw
+    if name != "utf-8":
+        return raw
+    head = raw.lstrip(_LEADING_WS)
+    if not head.startswith(codecs.BOM_UTF8):
+        return raw
+    head = head[len(codecs.BOM_UTF8) :].lstrip(_LEADING_WS)
+    return head if head.startswith(b"MSH") else raw
 
 
 def _may_hold_a_later_msh(raw: bytes, encoding: str) -> bool:
