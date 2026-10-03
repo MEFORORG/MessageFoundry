@@ -3140,11 +3140,14 @@ def _serve(args: argparse.Namespace) -> int:
     # BEHIND a declared proxy) puts the admin interface on the network exactly as an off-loopback bind
     # does, so an enforcing instance behind a declared proxy with require_mfa off is refused
     # identically (extend-never-weaken). It reads `instance_exposed`, NOT the mutated console flag: the
-    # single-factor admin surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
+    # single-factor sign-in surface is the JSON API, so whether /ui happens to be mounted is irrelevant.
     admin_exposed = instance_exposed
     # Empty unless this config has the OIDC claim exception, so an AUDIT line never names one that
-    # does not exist here (settings.oidc_second_factor_claim_exception says why).
+    # does not exist here (messagefoundry.config.settings.oidc_second_factor_claim_exception says
+    # why). OIDC needs AD on, so the refusal's directory-deployment clause has the exception too;
+    # it points back at the sentence that names it rather than printing it twice.
     oidc_exception = oidc_second_factor_claim_exception(settings.auth)
+    directory_exception = ", with the OIDC exception above" if oidc_exception else ""
     if admin_exposed and not settings.auth.require_mfa:
         exposure_desc = (
             f"API bound to non-loopback host {settings.api.host!r}"
@@ -3159,15 +3162,15 @@ def _serve(args: argparse.Namespace) -> int:
                 "account with no second factor enrolled, Administrators included, would "
                 f"authenticate with a single factor over the network{oidc_exception}. "
                 "Enable native TOTP MFA with [security].require_mfa=true (WP-14) before exposing the "
-                "API (on an AD-only deployment it binds directory principals too: each enrolls an "
-                f"engine factor{oidc_exception}); or set "
+                "API (on a directory deployment it binds directory principals too: each enrolls an "
+                f"engine factor{directory_exception}); or set "
                 "[security].allow_single_factor_admin_when_exposed=true to deliberately permit "
                 "single-factor sign-in at exposure (audited).",
                 file=sys.stderr,
             )
             return 2
         if enforcing:
-            # ADR 0140: single-factor admin at exposure under strict enforcement was explicitly
+            # ADR 0140: single-factor sign-in at exposure under strict enforcement was explicitly
             # acknowledged — emit a loud WARNING-level AUDIT line, then fall through to the shared
             # warn posture (permitted-but-audited, never silent).
             logging.getLogger(__name__).warning(
