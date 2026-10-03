@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""How the harness's MLLP receivers read a ``max_frame_bytes`` setting.
+"""How the harness's MLLP receivers read a ``max_frame_bytes`` setting, and the ``argparse`` type for
+a byte cap that cannot be turned off (the reconcile loader's ``--max-file-bytes``).
 
 It matches the engine's MLLP source: ``0`` (or ``None``) turns the cap off. A negative value is
 refused here, when the setting is read. A live negative cap would refuse every frame, so a typo would
@@ -35,4 +36,15 @@ def max_frame_bytes_arg(text: str) -> int:
         raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
     if value < 0:
         raise argparse.ArgumentTypeError(f"must be zero or more (0 turns the cap off), got {value}")
+    return value
+
+
+def positive_bytes_arg(text: str) -> int:
+    """``argparse`` type for a byte cap that cannot be turned off: a whole number above zero."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be above zero, got {value}")
     return value
