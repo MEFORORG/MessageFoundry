@@ -142,7 +142,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as out:
 """
 
 #: Each would make the child report a flag on without the command line setting it, so neither may
-#: reach the child (the same list as ``_run`` in ``tests/test_isolated_launch.py``).
+#: reach the child. ``_run`` in ``tests/test_isolated_launch.py`` drops these two among others.
 _FLAG_STAND_INS = ("PYTHONSAFEPATH", "PYTHON_DISABLE_REMOTE_DEBUG")
 
 
@@ -186,7 +186,7 @@ def test_the_login_command_starts_a_real_first_process_through_the_bootstrap(
     env = {k: v for k, v in os.environ.items() if k.upper() not in _FLAG_STAND_INS}
     env["PYTHONPATH"] = str(probe_dir)
     done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
-        command, cwd=cwd, env=env, capture_output=True, text=True, timeout=120, check=False
+        command, cwd=cwd, env=env, capture_output=True, text=True, timeout=50, check=False
     )
     assert done.returncode == 0, done.stderr
     _assert_started_through_the_bootstrap(report)
@@ -201,8 +201,8 @@ def test_the_relaunch_starts_a_real_branded_child_through_the_bootstrap(
     scripts = tmp_path / "Scripts"
     scripts.mkdir()
     branded = branding.ensure_branded_launcher(scripts_dir=scripts)
-    if branded is None:
-        pytest.skip("no base pythonw.exe available to brand")
+    if branded is None:  # it returns None on any branding failure, not only a missing pythonw
+        pytest.skip("ensure_branded_launcher could not build a branded launcher on this host")
     # The branded copy finds the standard library through the pyvenv.cfg one folder up, as it does
     # in a real venv. Measured: without one it dies with "No module named 'encodings'".
     (tmp_path / "pyvenv.cfg").write_text(
@@ -227,7 +227,7 @@ def test_the_relaunch_starts_a_real_branded_child_through_the_bootstrap(
     try:
         branding.relaunch_branded()  # the probe may outlive the grace window or not; either is fine
         [child] = children
-        assert child.wait(timeout=120) == 0
+        assert child.wait(timeout=50) == 0
     finally:
         for started in children:  # an orphan would hold the copied runtime in tmp_path open
             if started.poll() is None:
