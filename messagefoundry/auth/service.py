@@ -1809,8 +1809,8 @@ def oidc_client_auth_from_settings(
     federation``, so the check resolves exactly what the engine sends. Only the configured method's
     credential is resolved, which may call the ``[secrets]`` provider.
 
-    Raises :class:`SecretProviderError` for a reference that does not resolve or a credential that
-    resolves empty, and :class:`~messagefoundry.transports.signing.SigningError` for a key or
+    Raises :class:`SecretProviderError` for a reference that does not resolve, a credential that
+    resolves empty, or a key reference that resolves to anything but a PEM key, and :class:`~messagefoundry.transports.signing.SigningError` for a key or
     certificate that cannot be read, parsed or used with the configured algorithm. None of these
     messages carries a credential.
     """

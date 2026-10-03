@@ -30,6 +30,7 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError, model_validator
+from pydantic_core import PydanticCustomError
 
 from messagefoundry.__main__ import main
 from messagefoundry.config import settings as settings_module
@@ -406,13 +407,39 @@ def test_an_operator_brace_in_a_message_is_not_substituted_again() -> None:
     assert "{error}" in err["msg"]
 
 
-def test_an_oidc_url_refusal_names_the_scheme_not_the_url() -> None:
-    """A URL can carry credentials in its userinfo, and a message is not hidden as input is."""
-    url = "http://client:" + _CLIENT_SECRET + "@idp.example/token"
+@pytest.mark.parametrize(
+    ("url", "fragment"),
+    [
+        # A message is not hidden as input is, so neither refusal may quote the URL.
+        ("http://client:" + _CLIENT_SECRET + "@idp.example/token", "must be an https URL"),
+        # No "https://": urlsplit reads the userinfo before the first ':' as the scheme.
+        (_CLIENT_SECRET + ":x@idp.example/token", "must be an https URL"),
+        ("https://client:" + _CLIENT_SECRET + "@idp.example/token", "user name or password"),
+    ],
+)
+def test_an_oidc_url_refusal_never_quotes_the_url(url: str, fragment: str) -> None:
     with pytest.raises(ValidationError) as caught:
         AuthSettings.model_validate(_auth(oidc_token_endpoint=url))
-    assert "got scheme 'http'" in str(caught.value)
-    _assert_clean(caught.value, "userinfo")
+    assert fragment in str(caught.value)
+    _assert_clean(caught.value, url)
+
+
+def test_a_custom_error_reusing_a_known_type_still_hides_its_input() -> None:
+    """``PydanticCustomError('value_error', ...)`` has no ``error`` in its ctx, so the known
+    template refuses it. The rebuild must fall back rather than raise a TypeError whose context
+    is the original, input-bearing error."""
+
+    class _Custom(_Section):
+        secret: str = ""
+
+        @model_validator(mode="after")
+        def _refuse(self) -> _Custom:
+            raise PydanticCustomError("value_error", "bad {reason}", {"reason": "shape"})
+
+    with pytest.raises(ValidationError) as caught:
+        _Custom(secret=_CLIENT_SECRET)
+    assert caught.value.errors()[0]["msg"] == "bad shape"
+    _assert_clean(caught.value, "custom")
 
 
 # --- through load_settings and the CLI ----------------------------------------------------------

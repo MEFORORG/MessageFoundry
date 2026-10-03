@@ -574,7 +574,9 @@ def test_a_blank_secret_reference_or_both_secret_spellings_are_refused() -> None
 
 def test_an_empty_reference_reads_as_unset(ec_key: ec.EllipticCurvePrivateKey) -> None:
     """An env var exported with no value is unset, as the resolver reads it; only whitespace refuses."""
-    AuthSettings(**_auth(oidc_client_secret=SECRET, oidc_client_secret_ref=""))
+    settings = AuthSettings(**_auth(oidc_client_secret=SECRET, oidc_client_secret_ref=""))
+    # And the resolver reads it as unset too: no provider is asked for, the literal is sent.
+    assert isinstance(oidc_client_auth_from_settings(settings, None), ClientSecretPost)
     AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_private_key_ref=""))
     with pytest.raises(ValidationError, match="oidc_client_private_key_ref is set but blank"):
         AuthSettings(**_pkjwt(_pem(ec_key), oidc_client_private_key_ref=" "))

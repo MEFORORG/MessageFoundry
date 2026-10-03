@@ -315,7 +315,14 @@ def _without_input(err: ErrorDetails) -> InitErrorDetails:
         detail = InitErrorDetails(type=err["type"], loc=err["loc"], input=HIDDEN_INPUT)
         if "ctx" in err:
             detail["ctx"] = err["ctx"]
-        return detail
+        # A PydanticCustomError may reuse a known type name with another ctx (pydantic's own
+        # EmailStr raises 'value_error' with a 'reason'), which the known template refuses.
+        try:
+            ValidationError.from_exception_data("probe", [detail])
+        except (TypeError, ValueError, KeyError):
+            pass
+        else:
+            return detail
     # A validator's own PydanticCustomError: keep its type and rendered message, with no context,
     # so the message is not formatted a second time.
     return InitErrorDetails(
@@ -332,7 +339,8 @@ def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     that prints or logs the error would disclose them. ``hide_input_in_errors`` is not enough: it
     hides the input from ``str`` and ``repr`` only, and only on the outermost model.
 
-    Each error keeps its location, type, message and ``ctx``. THIS HIDES THE INPUT ONLY. The message
+    Each error keeps its location, type and message, and a known type keeps its ``ctx`` (a
+    validator's own ``PydanticCustomError`` keeps its rendered message only). THIS HIDES THE INPUT ONLY. The message
     and ``ctx`` are written by the validator, and a validator that quotes the value it refused
     still shows it there: at least the ``[backup]`` and ``[dr]`` cloud-URL refusals and the
     ``[api].trusted_proxies`` entry refusals do. None of those is meant to hold a secret, but a URL
@@ -341,9 +349,10 @@ def _refuse_without_input(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     try:
         return handler(value)
     except ValidationError as exc:
-        raise ValidationError.from_exception_data(
-            exc.title, [_without_input(err) for err in exc.errors(include_url=False)]
-        ) from None
+        title, errors = exc.title, exc.errors(include_url=False)
+    # Rebuilt OUTSIDE the handler: anything raised while rebuilding would otherwise carry the
+    # original, input-bearing error on its __context__.
+    raise ValidationError.from_exception_data(title, [_without_input(err) for err in errors])
 
 
 class _InputHidingModel(BaseModel):
@@ -353,6 +362,10 @@ class _InputHidingModel(BaseModel):
     direct construction and for the model nested in another one. A per-raise helper cannot, since
     the next plain ``ValueError`` added to a validator would bring the echo back.
     """
+
+    # Keeps the placeholder, and its misleading input_type of str, out of str(exc); errors() and
+    # json() still carry the placeholder. Inherited and merged into each subclass's own config.
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -3641,11 +3654,14 @@ class AuthSettings(_Section):
             ("oidc_jwks_uri", self.oidc_jwks_uri),
         ):
             parts = urlsplit(url or "")
+            # Neither refusal quotes the URL: it can carry credentials in its userinfo, and with
+            # no "https://" urlsplit reads the text before the first ':' as the scheme.
             if parts.scheme != "https":
-                # The scheme only: a URL can carry credentials in its userinfo.
-                raise ValueError(
-                    f"[auth].{name} must be an https URL (got scheme {parts.scheme!r})"
-                )
+                raise ValueError(f"[auth].{name} must be an https URL")
+            # A user name or password in a pinned URL would be printed by verify and, for the
+            # token endpoint, sent as the assertion's aud. Refused rather than stripped.
+            if parts.username is not None or parts.password is not None:
+                raise ValueError(f"[auth].{name} must not carry a user name or password")
             if parts.hostname not in allowed:
                 raise ValueError(
                     f"[auth].{name} host {parts.hostname!r} is not in oidc_allowed_endpoints "
@@ -7675,7 +7691,8 @@ def settings_error_detail(exc: Exception) -> str:
 
     SINCE BACKLOG #296 THE SETTINGS MODELS STRIP THE INPUT THEMSELVES. Every ``_Section`` and
     :class:`ServiceSettings` re-raises each error with its input replaced by :data:`HIDDEN_INPUT`
-    (``_InputHidingModel``), so no rendering of the error carries the refused mapping. That covers
+    (``_InputHidingModel``), so ``str(exc)``, ``exc.errors()`` and ``exc.json()`` carry the
+    placeholder, never the refused mapping. That covers
     the ``__main__.py`` arms that still print ``str(exc)`` (at least ``audit-verify``,
     ``rotate-key`` and the store commands behind ``_host_gated_store_settings``). ``serve`` and
     ``supervise`` already rendered through this function, by way of ``_load_service_settings``.
@@ -7684,7 +7701,7 @@ def settings_error_detail(exc: Exception) -> str:
     refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``
     cloud-URL refusals and the ``[api].trusted_proxies`` entry refusals do. None of them is meant to
     hold a secret, but a URL can carry one, so a validator message must name the setting and never
-    quote a secret value. The OIDC URL refusals name only the scheme for that reason.
+    quote a secret value. The OIDC URL refusals quote no part of the URL for that reason.
 
     THIS IS STILL THE RENDERER TO REACH FOR. Field path plus message is shorter than pydantic's text,
     is capped at ``_ERROR_DETAIL_ROWS``, and stays safe for a ``ValidationError`` from a model that is
