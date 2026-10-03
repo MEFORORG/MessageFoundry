@@ -155,7 +155,7 @@ async def test_a_paused_mllp_listener_still_stops_promptly() -> None:
     try:
         writer.write(frame(_ADT.format(cid="M1")))
         await writer.drain()
-        assert await _eventually(lambda: src._active == 1)
+        assert await _eventually(lambda: src._admission.active == 1)
         loop = asyncio.get_running_loop()
         began = loop.time()
         await asyncio.wait_for(src.stop(), timeout=5.0)
@@ -176,10 +176,10 @@ async def test_an_mllp_peer_that_closes_during_a_pause_frees_its_slot() -> None:
     await src.start(handler)
     try:
         _reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
-        assert await _eventually(lambda: src._active == 1)
+        assert await _eventually(lambda: src._admission.active == 1)
         writer.close()
         await asyncio.gather(writer.wait_closed(), return_exceptions=True)
-        assert await _eventually(lambda: src._active == 0), "a closed peer kept its slot"
+        assert await _eventually(lambda: src._admission.active == 0), "a closed peer kept its slot"
     finally:
         await asyncio.wait_for(src.stop(), timeout=5.0)
 

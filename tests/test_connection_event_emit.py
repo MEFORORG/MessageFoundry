@@ -122,7 +122,7 @@ async def test_emits_at_capacity() -> None:
     await source.start(_ack_handler)
     try:
         _r1, w1 = await asyncio.open_connection("127.0.0.1", source.sockport)
-        assert await _wait_for(lambda: source._active == 1)  # first client established
+        assert await _wait_for(lambda: source._admission.active == 1)  # first client established
         r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
         assert await asyncio.wait_for(r2.read(), 2.0) == b""  # second refused → EOF
         assert await _wait_for(lambda: "at_capacity" in cap.kinds())
@@ -242,7 +242,7 @@ async def test_ack_write_drain_is_bounded(monkeypatch: pytest.MonkeyPatch) -> No
         # Unbounded, this never returns. The 2 s is how the regression FAILS, not the assertion.
         await asyncio.wait_for(client, timeout=2.0)
         assert peer.closed  # dropped, not left open on a peer that had stopped reading
-        assert source._active == 0  # ... and the max_connections slot went back
+        assert source._admission.active == 0  # ... and the max_connections slot went back
         assert "peer_reset" in cap.kinds()
         assert "closed" not in cap.kinds()  # a failure kind is not also reported as a clean close
     finally:
@@ -571,7 +571,7 @@ async def test_per_host_cap_refuses_a_further_connection_from_the_same_address()
     try:
         _r1, w1 = await asyncio.open_connection("127.0.0.1", source.sockport)
         _r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
-        assert await _wait_for(lambda: source._active == 2)
+        assert await _wait_for(lambda: source._admission.active == 2)
         r3, w3 = await asyncio.open_connection("127.0.0.1", source.sockport)
         assert await asyncio.wait_for(r3.read(), 2.0) == b""  # third from 127.0.0.1 refused -> EOF
         assert await _wait_for(lambda: "at_capacity" in cap.kinds())
@@ -581,21 +581,21 @@ async def test_per_host_cap_refuses_a_further_connection_from_the_same_address()
         # pre-ingress and momentary, not a ban.
         w1.close()
         await w1.wait_closed()
-        assert await _wait_for(lambda: source._per_host.get("127.0.0.1", 0) == 1)
+        assert await _wait_for(lambda: source._admission.per_host.get("127.0.0.1", 0) == 1)
         _r4, w4 = await asyncio.open_connection("127.0.0.1", source.sockport)
-        assert await _wait_for(lambda: source._active == 2)
+        assert await _wait_for(lambda: source._admission.active == 2)
         for w in (w2, w3, w4):
             w.close()
             with contextlib.suppress(ConnectionResetError):
                 await w.wait_closed()
         # Checked BEFORE stop(), which clears the table itself: asserted after it, a `_release` that
         # left `{host: 0}` behind would still read as empty and this guard would prove nothing.
-        assert await _wait_for(lambda: source._active == 0)
-        assert source._per_host == {}, (
+        assert await _wait_for(lambda: source._admission.active == 0)
+        assert source._admission.per_host == {}, (
             "a peer address was left in the per-host table after every connection closed; a table "
-            f"that only grows is the leak the cap would otherwise introduce: {source._per_host}"
+            f"that only grows is the leak the cap would otherwise introduce: {source._admission.per_host}"
         )
-        assert source._host_capacity_warned == set()
+        assert source._admission.host_capacity_warned == set()
     finally:
         # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
         # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
@@ -612,7 +612,7 @@ async def test_the_global_cap_refusal_is_still_unqualified() -> None:
     await source.start(_ack_handler)
     try:
         _r1, w1 = await asyncio.open_connection("127.0.0.1", source.sockport)
-        assert await _wait_for(lambda: source._active == 1)
+        assert await _wait_for(lambda: source._admission.active == 1)
         r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
         assert await asyncio.wait_for(r2.read(), 2.0) == b""
         assert await _wait_for(lambda: "at_capacity" in cap.kinds())

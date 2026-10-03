@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.security import get_auth
+from messagefoundry.api.security import get_auth, public_route
 
 from .. import pages
 from .._auth import (
@@ -28,6 +28,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     Kerberos-only SINGLE-LEG, off by default ([auth].kerberos_enabled, experimental)."""
 
     @app.get("/ui/sso")
+    @public_route("Kerberos sign-in itself; a session does not exist yet")
     async def ui_sso(request: Request) -> Response:
         auth = get_auth(request)
         if auth is None or not auth.kerberos_available:

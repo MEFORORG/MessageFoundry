@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-0373347d22a1c64b
+b49aefc202788fe1
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -114,8 +114,10 @@ enforce_phi_read_hop: (request: 'Request') -> 'None'
 enforce_phi_read_pacing: (request: 'Request', identity: 'Identity') -> 'None'
 get_auth: (request: 'Request') -> 'AuthService | None'
 initial_credential_window_hours: (auth: 'AuthService') -> 'float | None'
+mark_route_gate: (gate: 'G') -> 'G'
 pending_credential_deadline: (auth: 'AuthService', user: 'UserRecord | None') -> 'float | None'
 pending_credential_deadline_for: (auth: 'AuthService', user_id: 'str') -> 'float | None'
+public_route: (reason: 'str') -> 'Callable[[F], F]'
 
 ## auth.service names imported by the console
 AuthService: class; its members are the AuthService section

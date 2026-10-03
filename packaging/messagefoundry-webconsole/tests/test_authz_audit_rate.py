@@ -55,7 +55,7 @@ from _ui_clients import create_local_user_chosen
 from fastapi import Request
 
 from messagefoundry.api import create_app
-from messagefoundry.api.security import _grant_audit_permission, get_auth
+from messagefoundry.api.security import _grant_audit_permission, get_auth, mark_route_gate
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, DiagnosticsSettings, SecuritySettings
@@ -225,7 +225,9 @@ def _mirror_grant_into_require_ui(monkeypatch: pytest.MonkeyPatch, app_state: An
                 await auth.audit_permission_granted(identity, audited, request.url.path)
             return identity
 
-        return dependency
+        # It wraps a real gate, so it carries the gate mark too. Without it the engine would refuse
+        # every route it guards (vault BACKLOG #2604).
+        return mark_route_gate(dependency)
 
     patched = 0
     for module in _REGISTRARS:

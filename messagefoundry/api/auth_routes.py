@@ -77,6 +77,7 @@ from messagefoundry.api.security import (
     get_auth,
     pending_credential_deadline,
     pending_credential_deadline_for,
+    public_route,
     require,
     require_reauth_only_action,
     require_step_up,
@@ -371,6 +372,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)
+    @public_route("a client asks which sign-in methods exist before it has a session")
     async def providers(
         request: Request, service: AuthService = Depends(_service)
     ) -> ProvidersInfo:
@@ -392,6 +394,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         response_model=LoginResponse,
         dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
+    @public_route("sign-in itself; a session does not exist yet")
     async def login(
         body: LoginRequest, request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:
@@ -440,6 +443,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         response_model=LoginResponse,
         dependencies=[Depends(_no_store_reply)],  # the body carries a credential
     )
+    @public_route("Kerberos sign-in itself; a session does not exist yet")
     async def negotiate(
         request: Request, service: AuthService = Depends(_service)
     ) -> LoginResponse:

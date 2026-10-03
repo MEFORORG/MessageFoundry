@@ -100,6 +100,11 @@ from messagefoundry.parsing.dicom._inflate import (
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.redaction import safe_exc
+from messagefoundry.transports.admission import (
+    REFUSAL_LOG_MAX_PER_WINDOW,
+    REFUSAL_LOG_WINDOW_SECONDS,
+    RefusalLog,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -188,7 +193,8 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"
 #: A refused peer address earns one WARNING per this many seconds, however often it is refused
 #: (vault BACKLOG #2583). A refused connection costs the peer nothing, so a line per refusal would let
 #: a peer the allowlist turns away fill the service log. See :meth:`DicomScpSource._log_refused_peer`.
-_REFUSAL_LOG_WINDOW_SECONDS = 60.0
+#: The throttle is the one the socket listeners share (vault BACKLOG #2606), at its defaults.
+_REFUSAL_LOG_WINDOW_SECONDS = REFUSAL_LOG_WINDOW_SECONDS
 
 #: How often a pending inbound TLS handshake looks at whether the listener is stopping. It is a poll
 #: interval, not a bound: the bound is ``_TLS_HANDSHAKE_TIMEOUT``, the MLLP listener's constant,
@@ -208,7 +214,7 @@ _MAX_PENDING_HANDSHAKES_PER_HOST = DEFAULT_MAX_CONNECTIONS_PER_HOST
 
 #: The most refusal lines one SCP writes per window over every address together. The per-address
 #: bound alone would still let many addresses earn a line each.
-_REFUSAL_LOG_MAX_PER_WINDOW = 20
+_REFUSAL_LOG_MAX_PER_WINDOW = REFUSAL_LOG_MAX_PER_WINDOW
 
 
 #: Why the allowlist refuses a peer. One wording for the accept gate and for the C-STORE backstop.
@@ -588,13 +594,12 @@ class DicomScpSource(SourceConnector):
         #: Whether this pause's first refused association was logged (BACKLOG #290). Written from
         #: association threads without a lock: a race costs at most one extra INFO line.
         self._pause_refusal_logged = False
-        #: Refusal lines written inside the current window, as address -> when; see
-        #: _log_refused_peer. The accept loop and the association threads both reach it, so it has
-        #: a lock.
-        self._refusal_logged: dict[str, float] = {}
-        self._refusal_log_lock = threading.Lock()
-        #: Every refusal since this SCP was built, logged or not. Each line that is written reports it.
-        self._refusals = 0
+        #: Which refusals earn a line; see _log_refused_peer. The accept loop and the association
+        #: threads both reach it, and it carries its own lock. It also counts every refusal since
+        #: this SCP was built, logged or not, and each line that is written reports that count.
+        self._refusal_log = RefusalLog(
+            window_seconds=_REFUSAL_LOG_WINDOW_SECONDS, max_per_window=_REFUSAL_LOG_MAX_PER_WINDOW
+        )
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
         self._ssl = _server_ssl_context(s, name=config.name or "")
         # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #316):
@@ -776,19 +781,13 @@ class DicomScpSource(SourceConnector):
         holds more than :data:`_REFUSAL_LOG_MAX_PER_WINDOW` addresses, whatever arrives. The MLLP
         listener's once-per-episode line is not reusable here: it is tied to that listener's table
         of live connections per host, and its episode ends when the host has none left. A refused
-        peer never holds a connection, so it has no episode to end.
+        peer never holds a connection, so it has no episode to end. The window throttle is
+        :class:`~messagefoundry.transports.admission.RefusalLog`, which the socket listeners use for
+        their allowlist refusals too (vault BACKLOG #2606).
         """
-        now = time.monotonic()
-        with self._refusal_log_lock:
-            self._refusals += 1
-            total = self._refusals
-            logged = self._refusal_logged
-            cutoff = now - _REFUSAL_LOG_WINDOW_SECONDS
-            for aged in [address for address, at in logged.items() if at <= cutoff]:
-                del logged[aged]
-            if peer_ip in logged or len(logged) >= _REFUSAL_LOG_MAX_PER_WINDOW:
-                return
-            logged[peer_ip] = now
+        total = self._refusal_log.note(peer_ip)
+        if total is None:
+            return
         logger.warning(
             "DICOM server (SCP) %s refused %s from %s: %s. An address is logged at most once every "
             "%gs. %d refused in all since this server started.",
@@ -796,7 +795,7 @@ class DicomScpSource(SourceConnector):
             what,
             peer_ip,
             reason,
-            _REFUSAL_LOG_WINDOW_SECONDS,
+            self._refusal_log.window_seconds,
             total,
         )
 

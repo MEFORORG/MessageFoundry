@@ -284,12 +284,16 @@ from typing import Any
 #: started (isolated mode, remote debugging) and the start-up code its interpreter runs. The status
 #: page renders it. The field has a default; the digest moved because the DTO surface grew.
 #:
+#: Vault BACKLOG #2604: the console imports ``mark_route_gate`` and ``public_route`` from
+#: ``api.security``. Every ``require_ui*`` gate carries the mark, and each anonymous console route is
+#: declared public, because the engine now refuses a route that declares neither.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "0373347d22a1c64b"
+ENGINE_UI_SEAM: str = "b49aefc202788fe1"
 
 
 @dataclass(frozen=True, slots=True)

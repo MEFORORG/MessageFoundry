@@ -22,6 +22,10 @@ this line.**
 
 ### Security
 
+- **Every console route declares its authorization.** Each `require_ui*` gate carries the engine's
+  gate mark, and each sign-in and re-authentication route is marked `public_route` with a reason.
+  The engine now refuses a route that declares neither. The supported engine seam moved because the
+  console imports both names from `api.security`. (vault BACKLOG #2604)
 - **Activate DR and Release DR ask for a fresh sign-in proof.** `POST /ui/dr/activate` and
   `POST /ui/dr/release` now sit behind `require_ui_step_up`, like the stepdown control. A session
   whose step-up window has lapsed is sent to `/ui/reauth`, then back to the status page to press
