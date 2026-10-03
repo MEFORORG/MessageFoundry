@@ -6614,7 +6614,7 @@ class RegistryRunner:
                 # path a re-encode refusal (permanent, code "reencode": ADR 0204, ADR 0206)
                 # dead-letters in shadow as it would live. A shadow BATCH does not: it checks each
                 # member with rewrite=False and never rewrites the envelope. A hydration failure is
-                # neither, so it stays what shadow made it before, a completed delivery.
+                # not a refusal, so it stays what shadow made it before, a completed delivery.
                 if _frames(connector):
                     try:
                         connector.check_frame(await self._hydrate_payload(item.payload))

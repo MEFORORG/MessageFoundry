@@ -155,10 +155,11 @@ open points settled below.
   send retries it, described the retryable refusal this ADR replaced. Two batch gaps stay open.
   A live MLLP batch rewrites the whole envelope in `send()`, so one member the target set cannot
   carry dead-letters every member of that batch at once; before this ADR that member was not
-  refused at all, and its leaf became structure. A shadow batch checks members with
-  `rewrite=False` and never rewrites the envelope, so it marks that batch `PROCESSED`. A
-  per-member rewrite check was
-  dropped under ADR 0205 because it refused a member with no `MSH` that the envelope carries.
+  refused at all, and its text became structure. A shadow batch checks members with
+  `rewrite=False` and never rewrites the envelope, so it marks that batch `PROCESSED`. ADR 0205
+  dropped a full per-member rewrite for two reasons: it raised a retryable error on a member with
+  no `MSH`, re-pending the whole batch, and it stripped a trailing frame byte the envelope still
+  carries. A narrower per-member check, for this ADR's refusal alone, is not built and stays open.
 - **RemoteFileSource (rule 5): it splits, like the File source.** It reads whole files, as the File
   source does, and a remote drop is where a partner's batch file arrives: several `MSH` messages, with
   or without an `FHS`/`BHS` envelope, the shape `samples/messages/adt_batch.hl7` holds. Refusing would

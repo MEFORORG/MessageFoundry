@@ -1738,7 +1738,9 @@ def MLLP(
     **byte-identical** — fully backward compatible. The string is validated at connector build (exactly
     five characters, all distinct). A non-HL7 payload that can't be parsed, or a value the new delimiters
     cannot carry as data, fails the delivery permanently (a ``NegativeAckError`` with code ``reencode``,
-    ADR 0204 and ADR 0206), so the row is dead-lettered at once rather than silently corrupted.
+    ADR 0204 and ADR 0206), so the row is dead-lettered at once rather than silently corrupted. On a
+    batched outbound the whole envelope is rewritten, so the refusal takes the whole batch with it
+    (ADR 0206 records this gap).
 
     ``hl7_raw_separators`` (**outbound only**, BACKLOG #107) is a deliberate escape-hatch for a partner
     that **cannot decode HL7 escape sequences**: when ``True`` the connector emits the four reserved
