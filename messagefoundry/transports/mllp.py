@@ -81,7 +81,9 @@ from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.transports.admission import (
     ListenerAdmission,
     frame_seconds_left,
-    read_budget,
+)
+from messagefoundry.transports.admission import (
+    read_budget as _shared_read_budget,
 )
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -1861,7 +1863,7 @@ class MLLPSource(SourceConnector):
         # a load balancer / per-node ports distribute inbound connections), so there is no
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
-        self._stopping = False  # a restart of this same instance serves again (see __init__)
+        self._stopping = False  # a restart of this same instance serves again (see `_stopping`)
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None
         )
@@ -2257,7 +2259,7 @@ class MLLPSource(SourceConnector):
         ``idle_timeout``. The guard sits in ``__init__`` rather than as a clamp here, because a clamp
         would turn a typo into a silent bound.
         """
-        return read_budget(self.receive_timeout, frame_left)
+        return _shared_read_budget(self.receive_timeout, frame_left)
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None

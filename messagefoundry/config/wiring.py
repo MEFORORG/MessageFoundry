@@ -2049,9 +2049,8 @@ def Http(
     | None = 60.0,  # bound the whole-request read (slow-loris guard), seconds
     max_body_bytes: int | None = 16 * 1024 * 1024,  # cap one request body's bytes (OOM guard)
     max_header_bytes: int | None = 64 * 1024,  # cap the request line + headers (header-flood guard)
-    # Cap concurrent clients from ONE peer address. Ships OFF here, unlike MLLP/TCP/X12: one request
-    # per connection behind a reverse proxy would make any cap the listener's whole capacity.
-    max_connections_per_host: int | None = None,
+    max_connections_per_host: int
+    | None = None,  # cap clients from ONE peer address; OFF by default
     # Message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Defaults to OFF for the ruled
     # reason in MLLP(). Scoped to the LISTENER, not the connection: this connector answers one
     # request per connection, so a per-connection bucket would pace nothing at all.

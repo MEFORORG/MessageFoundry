@@ -795,7 +795,7 @@ class DicomScpSource(SourceConnector):
             what,
             peer_ip,
             reason,
-            _REFUSAL_LOG_WINDOW_SECONDS,
+            self._refusal_log.window_seconds,
             total,
         )
 

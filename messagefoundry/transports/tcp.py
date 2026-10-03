@@ -555,18 +555,21 @@ class TcpSource(SourceConnector):
         # py3.12.1+ waiting for in-flight handlers of a peer holding its connection open). A message
         # mid-handler still finishes its commit (the body is durably stored before any reply, so
         # at-least-once holds). Then await the connection tasks with a bounded grace (review H-2).
-        for writer in list(self._clients):
-            writer.close()
-        pending = [task for task in self._client_tasks if not task.done()]
-        if pending:
-            _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
-            for task in still_running:
-                task.cancel()
-            if still_running:
-                await asyncio.gather(*still_running, return_exceptions=True)
-        self._clients.clear()
-        self._client_tasks.clear()
-        self._admission.reset()
+        try:
+            for writer in list(self._clients):
+                writer.close()
+            pending = [task for task in self._client_tasks if not task.done()]
+            if pending:
+                _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
+                for task in still_running:
+                    task.cancel()
+                if still_running:
+                    await asyncio.gather(*still_running, return_exceptions=True)
+            self._clients.clear()
+            self._client_tasks.clear()
+        finally:
+            # Even when this stop() is cancelled: a task cancelled past its grace never released.
+            self._admission.reset()
         # Bound wait_closed() so a Windows ProactorEventLoop overlapped-op wedge can't hang teardown on
         # the suite's shared session loop (#55, mirrors MLLPSource.stop()). The listener is closed and
         # every client task is resolved, so a wait_closed() past the grace is an OS wedge, not in-flight

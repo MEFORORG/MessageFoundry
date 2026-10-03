@@ -239,6 +239,51 @@ async def test_the_frame_deadline_closes_a_peer_trickling_inside_a_frame(kind: s
 
 
 @pytest.mark.parametrize("kind", ["tcp", "x12"])
+async def test_the_frame_deadline_also_closes_a_peer_trickling_outside_any_frame(kind: str) -> None:
+    """Bytes the decoder discards outside a frame reset the idle bound too, so the deadline must
+    start on them as well, or such a peer would hold its slot for as long as it kept sending."""
+    events = _Events()
+    source = _build(kind, max_frame_seconds=0.5, receive_timeout=5.0)
+    source.on_connection_event = events
+
+    async def body(port: int) -> None:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        closed = asyncio.ensure_future(reader.read())
+        try:
+            for _ in range(40):  # 4 s of one non-frame byte every 0.1 s
+                if closed.done():
+                    break
+                with contextlib.suppress(OSError):
+                    writer.write(b"Z")
+                    await writer.drain()
+                await asyncio.sleep(0.1)
+            assert closed.done(), "a peer trickling bytes outside any frame was never closed"
+        finally:
+            closed.cancel()
+            with contextlib.suppress(BaseException):
+                await closed
+            await _close(writer)
+        assert await _until(lambda: events.count("closed") == 1)
+        assert events.reasons("closed") == ["frame_deadline"]
+
+    await _run(source, body)
+
+
+def test_a_late_stop_does_not_wipe_a_restarted_listeners_counts() -> None:
+    gate = ListenerAdmission(
+        transport="TCP", max_connections=None, max_connections_per_host=2, source_ip_allowlist=None
+    )
+    gate.stopping = False  # restarted
+    gate.admit("192.0.2.7")
+    gate.reset()  # the previous run's stop() finishing late
+    assert gate.per_host == {"192.0.2.7": 1}
+    # CONTROL: while stopping, reset clears.
+    gate.stopping = True
+    gate.reset()
+    assert gate.per_host == {}
+
+
+@pytest.mark.parametrize("kind", ["tcp", "x12"])
 async def test_with_the_frame_deadline_off_the_trickling_peer_stays(kind: str) -> None:
     """CONTROL for the test above: the same drive, with only the deadline switched off."""
     source = _build(kind, max_frame_seconds=0, receive_timeout=5.0)

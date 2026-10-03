@@ -197,7 +197,13 @@ class ListenerAdmission:
             self.host_capacity_warned.discard(peer_host)
 
     def reset(self) -> None:
-        """Forget the per-host tables, at stop. ``active`` is left to the releases still running."""
+        """Forget the per-host tables, at stop. ``active`` is left to the releases still running.
+
+        A no-op once the listener has started again: a stop() that finishes after a restart must
+        not wipe the counts of connections the restarted listener has admitted. Call it from a
+        ``finally`` so a cancelled stop() still clears the tables."""
+        if not self.stopping:
+            return
         self.per_host.clear()
         self.host_capacity_warned.clear()
 
@@ -268,8 +274,8 @@ class FrameClock:
 
     ``receive_timeout`` resets on every byte, so it bounds silence and never reaches a peer that
     trickles one byte at a time inside a frame. ``max_frame_seconds`` bounds the frame itself, from
-    the read that carried its first byte to the read that completed it. The clock runs off the
-    decoder's ``in_frame`` signal, and restarts for each frame.
+    the first read that carried bytes to the read that completed a frame. It restarts for each
+    frame, from the decoder's ``in_frame`` signal after a completed one.
 
     Use: :meth:`withhold` around any wait the ENGINE imposes (pacing, an intake pause), since that is
     not the peer being slow; :meth:`read` for each read; :meth:`after_read` after each read the
@@ -331,10 +337,17 @@ class FrameClock:
         )
 
     def after_read(self, *, in_frame: bool, decoded: int) -> None:
-        """Restamp after the decoder consumed a read. ``decoded`` is what makes this per frame: a
-        pipelined sender's reads rarely end on a frame boundary, so an open frame after a read that
-        completed one is a NEW frame and its clock starts now."""
-        if not in_frame:
-            self.opened_at = None
-        elif decoded or self.opened_at is None:
+        """Restamp after the decoder consumed a non-empty read.
+
+        A read that completed a frame restarts the clock: a NEW frame if one is open after it, none
+        otherwise. ``decoded`` is what makes this per frame, since a pipelined sender's reads rarely
+        end on a frame boundary. A read that completed nothing starts the clock if it is not already
+        running, WHETHER OR NOT the decoder counts a frame as open: bytes the decoder discards
+        outside a frame reset the idle bound just as frame bytes do, so a deadline that waited for
+        ``in_frame`` would never reach a peer trickling them. So any bytes must lead to a completed
+        frame within ``max_frame_seconds``.
+        """
+        if decoded:
+            self.opened_at = time.monotonic() if in_frame else None
+        elif self.opened_at is None:
             self.opened_at = time.monotonic()

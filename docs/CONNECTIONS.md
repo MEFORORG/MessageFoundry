@@ -528,7 +528,7 @@ when each interchange is wrapped in a fixed sentinel (STX/ETX, VT/FS). The paylo
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
 | `max_interchange_bytes` | both | `16 MiB` | reject a single interchange larger than this before it completes (OOM guard); applies inbound and to any returned interchange. `None`/`0` = unlimited. |
 | `max_connections_per_host` | in | `32` | cap on concurrent connections from **one peer address** (vault BACKLOG #2606), as on MLLP and `Tcp(...)`. **Set it to `None`/`0` behind a source-NAT proxy.** |
-| `max_frame_seconds` | in | `60.0` | close a client whose interchange takes longer than this from its `ISA` to its `IEA` (vault BACKLOG #2606). Bytes before an `ISA` open no interchange. Closes with a `frame_deadline` reason. **Raise it with `max_interchange_bytes`.** `None`/`0` = no deadline. |
+| `max_frame_seconds` | in | `60.0` | close a client whose interchange takes longer than this from its `ISA` to its `IEA` (vault BACKLOG #2606). Bytes that arrive outside an interchange start the same clock, so any bytes must lead to a complete interchange in time. Closes with a `frame_deadline` reason. **Raise it with `max_interchange_bytes`.** `None`/`0` = no deadline. |
 | `max_messages_per_second` | in | **off** | sustained **interchange**-rate ceiling per **connection** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported; one token per `ISA…IEA`). Over budget the listener **pauses reading**, so TCP back-pressures the sender — **nothing is dropped, refused or reordered**. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
@@ -3125,7 +3125,7 @@ Facts that are easy to get wrong, stated plainly first:
   also run `max_frame_seconds` (default 60 s), which bounds one frame from its **start byte to its
   end byte** and closes the connection with a `frame_deadline` reason when it is exceeded (BACKLOG
   #1725 for MLLP, vault BACKLOG #2606 for raw TCP and X12). On X12 the frame is the interchange, from
-  its `ISA` to its `IEA`; bytes before an `ISA` open no frame. The two bounds run **together** and
+  its `ISA` to its `IEA`. On raw TCP and X12, bytes that arrive outside any frame start the same clock, so a peer that sends anything must complete a frame in time. The two bounds run **together** and
   neither replaces the other — a peer that opens a socket and sends nothing never opens a frame, so
   only the idle bound reaches it. **Raise `max_frame_seconds` whenever you raise `max_frame_bytes` or
   `max_interchange_bytes`.** The **HTTP** listener spends that same
