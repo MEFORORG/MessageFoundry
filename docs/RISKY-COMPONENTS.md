@@ -246,25 +246,25 @@ nothing about trust.
 All of Qt is compiled C++, so a fault in its socket or text handling is a memory-safety event in the
 harness's process, not a Python exception.
 
-### Read on ASVS's examples by hand, and the part not read
+### What the ASVS reading shows for these four, and what it cannot show
 
-The generated reading further down covers the `sqlserver` closure only, so these four names are not
-in its snapshot. Each was read by hand on 2026-10-03, against the same tests that reading applies,
-from the PyPI JSON and Simple APIs:
+The generated reading further down reads these four names with every other component on this page,
+on all three of ASVS's examples. Its last table is *The names the assessed extras add*. For each of
+the four it gives the newest release, the count of advisories OSV lists under the name, and the
+examples it is risky on. OSV is the Open Source Vulnerabilities database.
 
-| Component | Newest release | Releases in the 730 days before | Project status | Development Status | Pinned 6.11.2 yanked |
-|---|---|---|---|---|---|
-| `pyside6` | 2026-08-18 | 19 | `active` | 5 - Production/Stable | no |
-| `pyside6-addons` | 2026-08-18 | 19 | `active` | 5 - Production/Stable | no |
-| `pyside6-essentials` | 2026-08-18 | 19 | `active` | 5 - Production/Stable | no |
-| `shiboken6` | 2026-08-18 | 19 | `active` | 5 - Production/Stable | no |
+The results are stated there and not copied here, so a later re-read cannot leave this section
+behind.
 
-So none of the four is risky on maintenance or on support, on that date.
+**A 0 in that table's advisory column is about a PyPI name, not about Qt.** OSV matches an advisory
+to a component by its PyPI name. For these four, a 0 means OSV lists no advisory naming the
+`pyside6`, `pyside6-addons`, `pyside6-essentials` or `shiboken6` PyPI packages. It does not mean the
+Qt code inside those wheels has no known flaws.
 
-**The vulnerability-history example was NOT read for them.** The OSV API, which that example reads,
-was not reachable from the session that wrote this section. That is a gap, not a clean result. It
-closes when `scripts/security/component_readings.py` reads this closure as well, and the guard
-described under *Keeping it true* goes red when it does, so this paragraph cannot outlive it.
+A flaw filed against Qt itself, and not against one of those PyPI names, does not show up in that
+reading. So the vulnerability-history example is read for the names of the wheels and not for the Qt
+they carry. That is a limit of the instrument, and this page does not close it. A reader who needs
+the Qt side has to check Qt's own security notices against the Qt version the pinned wheels carry.
 
 ## Risky by ASVS's own examples, read from public data
 
@@ -276,7 +276,7 @@ vulnerabilities". This section reads every component on those examples.
 
 <!-- BEGIN component-readings: rendered by scripts/security/component_readings.py from security/risky-component-readings.json. Do not edit by hand. -->
 
-> **Snapshot date: 2026-09-29. Re-read by: 2026-12-28.** Every reading below comes from public data
+> **Snapshot date: 2026-10-04. Re-read by: 2027-01-02.** Every reading below comes from public data
 > on the snapshot date: PyPI, the Python Package Index, and OSV, the Open Source Vulnerabilities
 > database. It covers the versions the closure files pinned that day. Support status and advisory
 > history go stale. After the re-read date, treat this section as out of date until
@@ -287,10 +287,10 @@ The readings, their sources and their windows are recorded in
 
 ### What is read, and the test for each example
 
-All 36 distributions in the `sqlserver` closure are read: the 34 in the core closure and the 2 the
-extra adds. That is not only the designated part. A library can be risky on these examples even
-where the tiers did not designate it. The names the `harness` extra adds are not in this snapshot.
-The `harness` section above reads them itself, and says what it could not read.
+All 40 distributions this page assesses are read: the 34 in the core closure and the 6 that the
+assessed extras add to it. The `sqlserver` extra adds 2: `aioodbc` and `pyodbc`. The `harness` extra
+adds 4: `pyside6`, `pyside6-addons`, `pyside6-essentials` and `shiboken6`. That is not only the
+designated part. A library can be risky on these examples even where the tiers did not designate it.
 
 | Example | A component is risky on it when | Source |
 |---|---|---|
@@ -307,11 +307,16 @@ record's CVSS 3 vector and rates it on that system's scale. CVSS is the Common V
 System. An advisory with neither does not count. The ones in the window are named below so a reader
 can judge them.
 
+OSV matches an advisory to a component by its PyPI name. A flaw in code a wheel carries inside it,
+such as a compiled library, shows up here only when an advisory names the PyPI package. So where a
+component has no advisory below, OSV lists none under that name. That does not show the code inside
+its wheel is free of known flaws.
+
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.
 
-**Risky on at least one example: 10 of 36. On maintenance: 2. On support: 0. On vulnerability
-history: 8. Not risky on any: 26. 10 plus 26 is 36.**
+**Risky on at least one example: 10 of 40. On maintenance: 2. On support: 0. On vulnerability
+history: 8. Not risky on any: 30. 10 plus 30 is 40.**
 
 ### Poorly maintained
 
@@ -337,7 +342,7 @@ None on the snapshot date.
 | `pyasn1` | 5 | 2026-07-14 | yes, tier 2 |
 | `starlette` | 5 | 2026-06-15 | yes, tier 3 |
 
-On the snapshot date OSV listed no advisory against any pinned version, in any of the 36. The table
+On the snapshot date OSV listed no advisory against any pinned version, in any of the 40. The table
 above counts past advisories only.
 
 Every advisory in the window carries a rating from one of the two sources.
@@ -352,8 +357,8 @@ Every advisory in the window carries a rating from one of the two sources.
 
 | Components | Designated above |
 |---|---|
-| `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyspnego`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
-| `aiosqlite`, `annotated-doc`, `annotated-types`, `psutil`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
+| `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyside6-essentials`, `pyspnego`, `shiboken6`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
+| `aiosqlite`, `annotated-doc`, `annotated-types`, `psutil`, `pyside6`, `pyside6-addons`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
 
 ### How this reading and the tiers fit together
 
@@ -376,6 +381,21 @@ the two agree is where to look first.
 2 components are risky here and not designated above: `anyio` (vulnerability history), `click`
 (vulnerability history). The tiers did not designate them under the exposure criterion. The reading
 names them so that choice stays visible, and a reviewer can revisit it.
+
+### The names the assessed extras add
+
+The same readings again, for the names an assessed extra adds to the core closure. The advisory
+column counts every advisory OSV lists under that PyPI name, of any severity and any date. Read it
+under the limit stated above: a 0 is about the name, not about the code inside the wheel.
+
+| Component | Added by | Newest release | Advisories OSV lists under the name | Risky on |
+|---|---|---|---|---|
+| `aioodbc` | `sqlserver` | 2023-10-28 | 0 | maintenance |
+| `pyodbc` | `sqlserver` | 2025-10-17 | 0 | none |
+| `pyside6` | `harness` | 2026-08-18 | 0 | none |
+| `pyside6-addons` | `harness` | 2026-08-18 | 0 | none |
+| `pyside6-essentials` | `harness` | 2026-08-18 | 0 | none |
+| `shiboken6` | `harness` | 2026-08-18 | 0 | none |
 
 <!-- END component-readings -->
 
@@ -416,10 +436,12 @@ out of both tables is not available.
 
 The same test holds the ASVS reading to its snapshot,
 [`security/risky-component-readings.json`](../security/risky-component-readings.json), with no
-network. Every name in the `sqlserver` closure must have exactly one reading, and no reading may
-name anything else. Each verdict must follow from its recorded readings under the recorded
-criteria. The section between the markers must be exactly what the snapshot and the tiers above
-render, so a tier change needs `python scripts/security/component_readings.py --render-only`.
+network. Every name this page assesses must have exactly one reading. That is each name in the core
+closure, and each name the `sqlserver` or `harness` closure adds to it. No reading may name anything
+else. So an extra that has a section on this page, and that the script does not read, turns the test
+red. Each verdict must follow from its recorded readings under the recorded criteria. The section
+between the markers must be exactly what the snapshot and the tiers above render, so a tier change
+needs `python scripts/security/component_readings.py --render-only`.
 
 The test does not go red when the re-read date passes, because a date alone would then fail every
 unrelated pull request. Keeping the re-read date is a maintainer task. Run

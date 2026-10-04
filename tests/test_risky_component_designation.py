@@ -22,8 +22,9 @@ and a dependency bump that adds a package nobody classified is exactly the drift
 The page also reads every component on ASVS's own examples of a risky component (maintenance,
 support, vulnerability history), from a dated snapshot of public PyPI and OSV data:
 ``security/risky-component-readings.json``, written by ``scripts/security/component_readings.py``.
-The tests for it need NO network. They hold the snapshot to the population, re-derive each verdict
-from its recorded readings, and hold the page's tables, counts and dates to the snapshot. None of
+The tests for it need NO network. They hold the snapshot to the population, which is the core
+closure plus what each assessed extra adds (BACKLOG #2414 brought ``harness`` in). They re-derive
+each verdict from its recorded readings, and hold the page's tables, counts and dates to the snapshot. None of
 them reads today's date, so none goes red when the re-read date passes.
 
 Each test names the mutation that must turn it RED.
@@ -392,29 +393,46 @@ def test_the_harness_extra_is_not_listed_as_unassessed() -> None:
     assert "`harness`" not in unassessed, "the scope section still lists `harness` as unassessed"
 
 
-def test_the_harness_reading_gap_is_stated_while_it_is_open() -> None:
-    """RED when: the readings snapshot starts reading the harness additions, or the page stops
-    saying it does not.
+def test_the_generator_reads_every_extra_the_page_assesses() -> None:
+    """RED when: the page gives an extra a section and the readings generator does not read its
+    closure, or the generator reads a closure the page has no section for.
 
-    The generated ASVS reading covers the sqlserver closure. The harness section reads its four
-    names on maintenance and support by hand and says the vulnerability-history example was not
-    read. Once a run of the generator reads them, that paragraph is false, and this goes red so it
-    is rewritten in the same change.
+    Three lists of the assessed extras must agree: the page's own ``## The `X` extra`` headings,
+    this module's ``_EXTRAS``, and the generator's ``EXTRAS``. The ``harness`` extra had a section
+    for a time while the generator read the ``sqlserver`` closure only (BACKLOG #2414). The
+    snapshot side of the same property is ``test_every_population_member_has_exactly_one_reading``.
     """
-    additions = _additions(_HARNESS_CLOSURE)
-    assert len(additions) >= 4, f"the harness closure adds only {sorted(additions)}"
-    readings = _readings(_snapshot())
-    assert len(readings) >= 20, f"{_READINGS.name} parsed to {len(readings)} readings"
-    read = sorted(n for n in readings if n in additions)
-    assert not read, (
-        f"{_READINGS.name} now reads {read}; rewrite the harness section's hand reading and its "
-        "statement of what was not read, then drop this test"
+    page = _DOC.read_text(encoding="utf-8")
+    on_page = re.findall(r"^## The `([^`]+)` extra$", page, re.MULTILINE)
+    assert on_page, f"{_DOC.name} has no extra section; the heading pattern here has gone stale"
+    assert sorted(on_page) == sorted(_EXTRAS), (
+        f"{_DOC.name} has sections for {on_page}; this module's _EXTRAS names {sorted(_EXTRAS)}"
     )
+    read = component_readings.EXTRAS
+    # The page's order, which is the order the rendered section lists them in.
+    assert list(read) == on_page, (
+        f"the readings generator reads the extras {list(read)}; {_DOC.name} assesses {on_page}. "
+        "Add the closure to EXTRAS in scripts/security/component_readings.py and run it"
+    )
+    assert read == {extra: path for extra, (path, *_) in _EXTRAS.items()}, (
+        "the readings generator reads an extra from a different closure file than this module"
+    )
+    assert component_readings.CORE == _CLOSURE
+
+
+def test_the_harness_section_rests_on_the_generated_reading() -> None:
+    """RED when: the harness section stops naming the rendered table it rests on, or stops saying
+    that a 0 there is about the PyPI names and not about the Qt inside the wheels.
+
+    OSV matches an advisory by PyPI name, so a 0 for these names is not a clean result for Qt. The
+    section copies no figure from the snapshot, so a re-read cannot leave it behind.
+    """
     section = " ".join(_region(_HARNESS_START, _ASVS_START).split())
-    assert "**The vulnerability-history example was NOT read for them.**" in section
-    hand = _table_names(_region(_HARNESS_START, _ASVS_START).partition("### Read on ASVS")[2])
-    assert hand == additions, (
-        f"the hand reading names {sorted(hand)}, the extra adds {sorted(additions)}"
+    assert f"*{_EXTRA_NAMES.removeprefix('### ')}*" in section, (
+        "the harness section no longer names the rendered table that carries its readings"
+    )
+    assert "It does not mean the Qt code inside those wheels has no known flaws." in section, (
+        "the harness section no longer states the limit of an OSV reading by PyPI name"
     )
 
 
@@ -681,6 +699,9 @@ def test_the_regenerator_rewrites_a_drifted_extra_closure(tmp_path: Path, extra:
 
 _NOT_RISKY = "### Not risky on any of the three"
 _FIT = "### How this reading and the tiers fit together"
+#: The rendered section's last table: what was read for the names the assessed extras add. Each
+#: extra's own section points at it instead of copying its figures.
+_EXTRA_NAMES = "### The names the assessed extras add"
 #: Each ASVS example's subsection in the rendered section, and the subsection after it.
 _AXIS_SECTIONS = (
     ("maintenance", "### Poorly maintained", "### Unsupported or end of life"),
@@ -752,6 +773,10 @@ def _stated_facts_drift(page: str, data: dict[str, Any]) -> list[str]:
     named = _table_names(_region(_NOT_RISKY, _FIT, page))
     if named != clean:
         problems.append(f"not risky: page names {sorted(named)}, snapshot {sorted(clean)}")
+    named = _table_names(_region(_EXTRA_NAMES, _END, page))
+    added = {n for n, r in readings.items() if r["added_by"]}
+    if named != added:
+        problems.append(f"extras' names: page names {sorted(named)}, snapshot {sorted(added)}")
     return problems
 
 
@@ -764,7 +789,8 @@ def test_the_readings_snapshot_parses_and_is_not_empty() -> None:
     data = _snapshot()
     readings = _readings(data)
     assert len(readings) >= 20, f"{_READINGS.name} parsed to {len(readings)} readings"
-    assert {"tomlkit", "cryptography", "pyodbc"} <= readings.keys()
+    # Two core names, and the one name each assessed extra must add.
+    assert {"tomlkit", "cryptography"} | {e[3] for e in _EXTRAS.values()} <= readings.keys()
     dt.date.fromisoformat(data["snapshot_date"])
     assert data["criteria"] == component_readings.criteria(), (
         "the snapshot records different criteria from the generator's; a changed threshold "
@@ -773,23 +799,109 @@ def test_the_readings_snapshot_parses_and_is_not_empty() -> None:
     assert all(set(r["risky"]) == set(component_readings.AXES) for r in readings.values())
 
 
-def test_every_population_member_has_exactly_one_reading() -> None:
-    """RED when: a closure name has no reading, a reading names a non-member, or core is misflagged.
+def _assessed_population() -> dict[str, list[str]]:
+    """Name to the assessed extras whose closure adds it, sorted; empty for a core name.
+
+    Read from the closure files and this module's ``_EXTRAS``, never through the generator, so a
+    generator that reads too few closures cannot agree with itself here.
+    """
+    population: dict[str, list[str]] = {name: [] for name in _closure()}
+    for extra in sorted(_EXTRAS):
+        for name in _additions(_EXTRAS[extra][0]):
+            population.setdefault(name, []).append(extra)
+    return population
+
+
+def _population_drift(data: dict[str, Any]) -> list[str]:
+    """Where the snapshot's readings are not exactly the assessed population.
 
     Names only, never versions. The readings are dated to the pins of the snapshot day, and a lock
     bump that moved a version would otherwise turn every Dependabot pull request red.
     """
-    data = _snapshot()
     readings = _readings(data)
-    assert data["population"] == _SQLSERVER_CLOSURE.relative_to(_ROOT).as_posix()
-    population = set(_closure_pins(_SQLSERVER_CLOSURE))
-    missing = sorted(population - readings.keys())
-    assert not missing, f"no reading for {missing}; run scripts/security/component_readings.py"
-    stray = sorted(readings.keys() - population)
-    assert not stray, f"{_READINGS.name} reads {stray}, which the assessed closure does not carry"
-    core = _closure()
-    wrong_core = sorted(n for n, r in readings.items() if r["in_core"] != (n in core))
-    assert not wrong_core, f"in_core is wrong for {wrong_core}"
+    expected = _assessed_population()
+    problems = []
+    declared = {
+        "core": _CLOSURE.relative_to(_ROOT).as_posix(),
+        "extras": {e: v[0].relative_to(_ROOT).as_posix() for e, v in _EXTRAS.items()},
+    }
+    if data["population"] != declared:
+        problems.append(f"the snapshot says it read {data['population']}, not {declared}")
+    missing = sorted(expected.keys() - readings.keys())
+    if missing:
+        problems.append(f"no reading for {missing}; run scripts/security/component_readings.py")
+    stray = sorted(readings.keys() - expected.keys())
+    if stray:
+        problems.append(f"{_READINGS.name} reads {stray}, which no assessed closure carries")
+    wrong = sorted(
+        n
+        for n in expected.keys() & readings.keys()
+        if sorted(readings[n]["added_by"]) != expected[n]
+    )
+    if wrong:
+        problems.append(f"added_by does not name the extras that add {wrong}")
+    return problems
+
+
+def test_every_population_member_has_exactly_one_reading() -> None:
+    """RED when: an assessed name has no reading, a reading names a non-member, or a reading says
+    the wrong extras add its name.
+
+    The population is the core closure plus what every assessed extra adds to it. So an extra the
+    page assesses and the generator did not read fails here: its names have no reading.
+    """
+    drift = _population_drift(_snapshot())
+    assert not drift, f"{_READINGS.name} is not the assessed population:\n  " + "\n  ".join(drift)
+
+
+def test_the_population_check_can_fail() -> None:
+    """RED when: the population check stops seeing an unread extra, a stray reading, a wrong
+    ``added_by`` or a wrong population record.
+
+    THE POSITIVE CONTROL FOR THE TEST ABOVE. The first mutation is the gap BACKLOG #2414 closed: a
+    snapshot with no reading for any name one extra adds.
+    """
+    data = _snapshot()
+    assert not _population_drift(data)
+    for extra, (_, _, _, marker) in _EXTRAS.items():
+        unread = [r for r in data["readings"] if extra not in r["added_by"]]
+        assert len(unread) < len(data["readings"]), f"no reading says the {extra} extra adds it"
+        drift = _population_drift({**data, "readings": unread})
+        assert any("no reading for" in line and marker in line for line in drift), drift
+    first = data["readings"][0]
+    stray = {**data, "readings": [*data["readings"], {**first, "name": "not-a-member"}]}
+    assert any("not-a-member" in line for line in _population_drift(stray))
+    core = next(r for r in data["readings"] if not r["added_by"])
+    moved = [{**r, "added_by": ["harness"]} if r is core else r for r in data["readings"]]
+    assert any(core["name"] in line for line in _population_drift({**data, "readings": moved}))
+    old_record = {**data, "population": _SQLSERVER_CLOSURE.relative_to(_ROOT).as_posix()}
+    assert any("says it read" in line for line in _population_drift(old_record))
+
+
+def test_the_population_is_the_core_closure_plus_what_each_extra_adds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the generator drops an extra's additions, says an extra adds a core name, or
+    accepts one name pinned at two versions.
+
+    A reading records one pin per name, so two closures that disagree on a version must stop the
+    run rather than record whichever was read first.
+    """
+    core, one, two = (tmp_path / f"{n}.txt" for n in ("core", "one", "two"))
+    core.write_text("# header\na==1\nb==2\n", encoding="utf-8")
+    one.write_text("a==1\nb==2\nc==3\n", encoding="utf-8")
+    two.write_text("a==1\nb==2\nc==3\nd==4\n", encoding="utf-8")
+    monkeypatch.setattr(component_readings, "CORE", core)
+    monkeypatch.setattr(component_readings, "EXTRAS", {"one": one, "two": two})
+    assert component_readings.population() == {
+        "a": ("1", []),
+        "b": ("2", []),
+        "c": ("3", ["one", "two"]),
+        "d": ("4", ["two"]),
+    }
+    two.write_text("a==1\nb==9\nc==3\nd==4\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="two.txt pins b at 9"):
+        component_readings.population()
 
 
 def test_every_verdict_follows_from_its_readings() -> None:
@@ -931,6 +1043,11 @@ def test_the_section_checks_can_fail() -> None:
     # Any table row naming a component: a flagged one, or a not-risky group row.
     row = next(ln for ln in tracked.splitlines() if ln.startswith("| `"))
     assert _stated_facts_drift(page.replace(row + "\n", ""), data)
+    # A row of the last table, which only the extras' names check reads.
+    extras_table = tracked.partition(f"\n{_EXTRA_NAMES}\n")[2]
+    row = next(ln for ln in extras_table.splitlines() if ln.startswith("| `"))
+    drift = _stated_facts_drift(page.replace(row + "\n", ""), data)
+    assert any(line.startswith("extras' names") for line in drift), drift
 
 
 def test_the_generator_reads_a_component_from_fake_replies() -> None:
@@ -998,8 +1115,9 @@ def test_the_generator_reads_a_component_from_fake_replies() -> None:
         return replies[url]
 
     reading = component_readings.read_component(
-        "demo", "1.0", in_core=True, as_of=as_of, fetch=fetch
+        "demo", "1.0", added_by=["harness"], as_of=as_of, fetch=fetch
     )
+    assert reading["added_by"] == ["harness"]
     assert reading["newest_upload"] == "2023-06-01"
     assert reading["pinned_yanked"] is True
     assert reading["development_status"] == ["Development Status :: 7 - Inactive"]
@@ -1038,7 +1156,7 @@ def test_a_fully_yanked_project_is_read_not_refused() -> None:
         return {} if url == component_readings.OSV_QUERY else replies[url]
 
     reading = component_readings.read_component(
-        "gone", "0.9", in_core=False, as_of=as_of, fetch=fetch
+        "gone", "0.9", added_by=[], as_of=as_of, fetch=fetch
     )
     assert reading["newest_upload"] is None and reading["pinned_yanked"] is True
     assert reading["risky"] == {"maintenance": True, "support": True, "advisory_history": False}
