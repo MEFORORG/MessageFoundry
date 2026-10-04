@@ -1178,17 +1178,17 @@ async def _provision_audit(store: MessageStore) -> dict[str, object]:
     ("new_email", "moved"),
     [
         pytest.param("operator@example.invalid", True, id="email-moved"),
-        pytest.param(None, False, id="no-email-given"),
         pytest.param("holder@example.invalid", False, id="same-email-given"),
     ],
 )
 async def test_a_takeover_notifies_the_address_the_account_held_before(
-    new_email: str | None, moved: bool
+    new_email: str, moved: bool
 ) -> None:
     """The notice goes to the address read BEFORE the repair wrote anything.
 
     ``--email`` may replace it, and the new address belongs to the operator doing the takeover, so a
-    notice sent after the write would tell the one person who already knows.
+    notice sent after the write would tell the one person who already knows. The arm with no
+    ``--email`` is gone since BACKLOG #2288: that repair is refused, see the tests below.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -1219,7 +1219,112 @@ async def test_a_takeover_notifies_the_address_the_account_held_before(
         assert detail["holder_notice"] == HOLDER_NOTICE_DISPATCHED
         assert detail["notify_email_moved"] is moved
         # `notified` keeps its meaning: an address was supplied with --email.
-        assert detail["notified"] is (new_email is not None)
+        assert detail["notified"] is True
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2288: a row that holds an address is completed only when --email is given ----------
+
+
+@pytest.mark.parametrize("given", [None, "   "], ids=["no-email", "blank-email"])
+async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_email(
+    given: str | None,
+) -> None:
+    """Kept silently, the stored address would receive the sole Administrator's notices.
+
+    The refusal writes nothing: the row keeps its address, gains no role and no credential, a
+    session on it survives, and nobody is told of a takeover that did not happen. The text does
+    not print the stored address, which may be somebody else's.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _Recorder()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _roleless_account(store, email="holder@example.invalid")
+        before = await store.get_user("roleless")
+
+        with pytest.raises(FirstAdministratorRefused, match="--email") as refused:
+            await service.provision_first_administrator(
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email=given,
+                actor="test",
+                **provision_totp(),
+            )
+        assert "holder@example.invalid" not in str(refused.value)
+        # The courtesy pre-check gives the same answer, so no prompt is shown first.
+        assert await service.provision_refusal("site-admin", notify_email=given) == str(
+            refused.value
+        )
+
+        after = await store.get_user("roleless")
+        assert after == before
+        assert await store.get_user_role_ids("roleless") == []
+        assert notifier.events == []
+        actions = [dict(r)["action"] for r in await store.list_audit(limit=50)]
+        assert "auth.first_administrator_provisioned" not in actions
+    finally:
+        await store.close()
+
+
+async def test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_create() -> None:
+    """A run given ``--email`` that stops after ``create_user`` leaves its own address on the row.
+
+    The same command run again carries the same ``--email``, so it completes the row. This is the
+    case a flat refusal of every addressed row would strand.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        real_set_password = store.set_password
+
+        async def stop_before_the_credential(*a: object, **k: object) -> bool:
+            raise RuntimeError("synthetic stop after create_user")
+
+        store.set_password = stop_before_the_credential  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="synthetic stop"):
+            await service.provision_first_administrator(
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email="operator@example.invalid",
+                actor="test",
+                **provision_totp(),
+            )
+        store.set_password = real_set_password  # type: ignore[method-assign]
+        half = await store.get_user_by_username("site-admin")
+        assert half is not None and half.notify_email == "operator@example.invalid"
+        assert await service.provision_refusal("site-admin", notify_email=None) is not None
+        assert (
+            await service.provision_refusal("site-admin", notify_email="operator@example.invalid")
+            is None
+        )
+
+        outcome = await service.provision_first_administrator(
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email="operator@example.invalid",
+            actor="test",
+            **provision_totp(),
+        )
+        assert outcome.repaired is True
+        assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(half.id)
+    finally:
+        await store.close()
+
+
+async def test_a_row_with_no_address_is_still_completed_without_an_email() -> None:
+    """The control: the refusal asks about the stored address, not about ``--email`` alone."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        await _roleless_account(store, email=None)
+        assert await service.provision_refusal("site-admin", notify_email=None) is None
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+        )
+        assert outcome.repaired is True
+        assert outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS
     finally:
         await store.close()
 
@@ -1295,7 +1400,11 @@ async def test_a_takeover_with_no_channel_records_that_nothing_was_sent(
         await _roleless_account(store, email="holder@example.invalid")
         with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
             outcome = await service.provision_first_administrator(
-                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email="operator@example.invalid",
+                actor="test",
+                **provision_totp(),
             )
         assert outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL
         assert (await _provision_audit(store))["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
@@ -1319,7 +1428,11 @@ async def test_a_notifier_that_raises_is_recorded_as_no_hand_off() -> None:
         service = AuthService(store, AuthSettings(), security_notifier=_Raising())
         await _roleless_account(store, email="holder@example.invalid")
         outcome = await service.provision_first_administrator(
-            username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email="operator@example.invalid",
+            actor="test",
+            **provision_totp(),
         )
         assert outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL
         assert (await _provision_audit(store))["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
@@ -1397,16 +1510,41 @@ def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
         "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) == 0
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db)]
+    assert main([*argv, "--email", "operator@example.invalid"]) == 0
     out = capsys.readouterr().out
 
     assert recorder.started and recorder.queued_at_close == 1
     assert [e.email for e in recorder.events] == ["holder@example.invalid"]
     assert "completed the existing roleless account" in out
     assert "Queued a takeover notice" in out
-    # The account keeps an address, so the "no notification address" warning would be false here.
+    # An address was given, so the "no notification address" warning would be false here.
     assert "WARNING: no notification address" not in out
-    assert "WARNING: the account keeps its earlier notification address" in out
+
+
+def test_cli_refuses_a_row_that_holds_an_address_before_any_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #2288: without ``--email`` the command stops before the password prompt, so no
+    authenticator key is shown for a run the store would then refuse, and nobody is told."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
+    recorder = _Recorder()
+    monkeypatch.setattr(
+        "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
+    )
+
+    def no_prompt(*_a: object, **_k: object) -> str:
+        raise AssertionError("the command prompted before it refused")
+
+    monkeypatch.setattr("getpass.getpass", no_prompt)
+    assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
+    captured = capsys.readouterr()
+    assert "--email" in captured.out + captured.err
+    assert "holder@example.invalid" not in captured.out + captured.err
+    assert recorder.events == [] and not recorder.started
 
 
 def test_cli_says_nobody_was_told_when_the_account_had_no_address(
@@ -1454,6 +1592,7 @@ def test_cli_sends_through_the_real_notifier_before_it_exits(
     monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", fake_send)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    argv += ["--email", "operator@example.invalid"]
     assert main([*argv, "--db", str(db), "--json"]) == 0
     assert sent == [(["holder@example.invalid"], _SUBJECTS[FIRST_ADMINISTRATOR_TAKEOVER])]
 
@@ -1467,7 +1606,8 @@ def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
     db = tmp_path / "p.db"
     _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
-    assert main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]) == 0
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
+    assert main([*argv, "--email", "operator@example.invalid"]) == 0
     assert json.loads(capsys.readouterr().out)["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
 
 

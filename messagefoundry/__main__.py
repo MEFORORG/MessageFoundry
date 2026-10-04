@@ -6593,7 +6593,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
             # and before an authenticator key is shown for an account that would then be refused.
-            return False, await service.provision_refusal(username)
+            # BACKLOG #2288: with --email, because a row that holds an address needs one.
+            return False, await service.provision_refusal(username, notify_email=args.email)
         finally:
             store_slot.current = None
             await store.close()
@@ -6830,11 +6831,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
     _safe_print(
         f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
-    email_given = bool(args.email and args.email.strip())
-    kept_prior_address = outcome.holder_notice in (
-        HOLDER_NOTICE_DISPATCHED,
-        HOLDER_NOTICE_NO_CHANNEL,
-    )
     if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED:
         _safe_print(
             "Queued a takeover notice to the account's earlier notification address. Delivery is "
@@ -6849,14 +6845,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")
-    if kept_prior_address and not email_given:
-        # A WARNING, not a note: that address now receives every notice for the sole Administrator.
-        _safe_print(
-            "WARNING: the account keeps its earlier notification address, so every security notice "
-            "for this Administrator still goes there. If it is not yours, change it from the web "
-            "console; this command refuses to run again now that an Administrator exists."
-        )
-    if not email_given and not kept_prior_address:
+    # No --email means the account has no address at all: a repair of a row that held one is
+    # refused without --email (BACKLOG #2288), so no earlier address can be kept silently.
+    if not (args.email and args.email.strip()):
         # Not `!r` (BACKLOG #1985): cmd.exe does not read single quotes as quoting.
         user_arg = _paste_safe_option("--username", outcome.username)
         hint = (
