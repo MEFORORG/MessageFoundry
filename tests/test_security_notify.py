@@ -16,6 +16,7 @@ import pytest
 
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
+    ADMIN_NEW_IP,
     EMAIL_CHANGED,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
@@ -316,6 +317,17 @@ def test_body_states_the_remaining_recovery_code_count() -> None:
     assert "Recovery codes remaining: 3" in body
     assert "spent" in body.lower()
     assert "last recovery code" not in body.lower()  # only the zero arm says that
+
+
+def test_admin_new_ip_body_says_when_the_session_stops_reporting() -> None:
+    """vault BACKLOG #2159: the notice for the first address past the per-session cap says later
+    new addresses go unreported, so the holder does not read the silence as "no more"."""
+    capped = _build_body(
+        SecurityEvent(ADMIN_NEW_IP, username="bob", email="bob@x", detail={"cap_reached": 8})
+    )
+    assert "not reported until it re-verifies" in capped
+    plain = _build_body(SecurityEvent(ADMIN_NEW_IP, username="bob", email="bob@x"))
+    assert "not reported until it re-verifies" not in plain
 
 
 def test_reset_body_states_the_deadline_in_the_api_surfaces_format() -> None:

@@ -33,7 +33,6 @@ from messagefoundry.auth import webauthn
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_ENROLL,
     AuthService,
-    _FlaggedNewIps,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -154,7 +153,7 @@ async def test_the_new_ip_dedupe_survives_rotation(engine: Engine) -> None:
     tests/test_admin_new_ip.py; this pins only that the entry moves.
     """
     service, token = await _service_and_token(engine)
-    flagged = _FlaggedNewIps(None, {"10.11.12.13"})
+    flagged = {"10.11.12.13"}
     service._new_ip_seen[hash_token(token)] = flagged
 
     rotated = await service._rotate_session_token(token)

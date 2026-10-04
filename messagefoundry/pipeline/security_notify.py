@@ -365,6 +365,14 @@ def _build_body(event: SecurityEvent) -> str:
         roles = event.detail.get("roles")
         if isinstance(roles, list) and roles:
             lines.append("Roles: " + ", ".join(str(r) for r in roles))
+    if event.event_type == ADMIN_NEW_IP and event.detail.get("cap_reached"):
+        # vault BACKLOG #2159: past this notice the session reports no further new addresses until
+        # it re-verifies, so silence after it must not read as "no more new locations".
+        lines.append(
+            "This session has now been used from many new addresses. Further new addresses for "
+            "this session are not reported until it re-verifies. If this was not you, contact "
+            "your MessageFoundry administrator."
+        )
     if event.event_type == RECOVERY_CODE_USED:
         remaining = event.detail.get("remaining")
         if isinstance(remaining, int):

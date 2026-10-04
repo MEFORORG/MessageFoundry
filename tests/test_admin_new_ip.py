@@ -12,7 +12,10 @@ loopback deployment, are no-ops (the request and the session share one address).
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -317,6 +320,11 @@ async def test_one_epoch_audits_at_most_the_per_session_cap() -> None:
         capped = [d for d in details if "cap_reached" in d]
         assert [d["seen_ip"] for d in capped] == [addresses[_NEW_IP_PER_SESSION_MAX]]
         assert capped[0]["cap_reached"] == _NEW_IP_PER_SESSION_MAX
+        # The holder's notice for that address says so too; the eight before it do not.
+        sent = [e for e in notifier.events if e.event_type == ADMIN_NEW_IP]
+        assert [e.client_ip for e in sent if e.detail.get("cap_reached")] == [
+            addresses[_NEW_IP_PER_SESSION_MAX]
+        ]
         # Re-verifying from the anchor opens a new epoch with a fresh cap.
         reauthed = await service.reauth(identity, PW, token=token, client="10.1.1.1")
         assert reauthed.ok is True and reauthed.token is not None
@@ -324,6 +332,29 @@ async def test_one_epoch_audits_at_most_the_per_session_cap() -> None:
         assert await _new_ip_rows(store) == [*reported, addresses[-1]]
     finally:
         await store.close()
+
+
+def test_every_reanchor_restarts_the_dedupe() -> None:
+    """Each function that re-anchors a session (``mark_session_reauthed``) also restarts the
+    new-address dedupe. A new re-verification leg that forgot would leave addresses reported
+    before it suppressed after it, which is the gap BACKLOG #2159 closed."""
+    source = Path(inspect.getfile(AuthService)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    anchoring: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            called = {
+                n.func.attr
+                for n in ast.walk(node)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            }
+            if "mark_session_reauthed" in called:
+                anchoring[node.name] = called
+    assert len(anchoring) >= 3, sorted(anchoring)  # control: the probe finds the known legs
+    missing = sorted(
+        name for name, called in anchoring.items() if "_restart_new_ip_dedupe" not in called
+    )
+    assert missing == [], missing
 
 
 def test_the_per_session_cap_is_the_value_security_md_states() -> None:
@@ -375,21 +406,26 @@ async def test_a_failed_audit_write_does_not_mark_the_address_reported(
         await store.close()
 
 
-async def test_a_stale_session_read_does_not_roll_the_epoch_back() -> None:
-    """A request that read the session just before a re-verification landed carries the OLDER
-    ``reauth_at``. It is checked against the current epoch; it must not clear what that epoch has
-    already reported."""
+async def test_a_reanchor_resets_without_reading_the_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reset rides the re-anchor call, not ``reauth_at``: a wall clock stepped BACK between two
+    re-verifications must still start the dedupe over."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
         await service.initialize()
-        assert service._first_new_ip_flag("h", 1.0, "10.2.2.2") == "audit"
-        assert service._first_new_ip_flag("h", 2.0, "10.3.3.3") == "audit"
-        assert service._first_new_ip_flag("h", 1.0, "10.3.3.3") == "repeat"
-        assert service._first_new_ip_flag("h", 2.0, "10.3.3.3") == "repeat"
-        # The epoch-2 set no longer holds the epoch-1 address, so it reports again, once.
-        assert service._first_new_ip_flag("h", 1.0, "10.2.2.2") == "audit"
-        assert service._first_new_ip_flag("h", 2.0, "10.2.2.2") == "repeat"
+        token, identity = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        real_time = time.time
+        for client, skew in (("10.2.2.2", -100.0), ("10.1.1.1", -50.0)):
+            monkeypatch.setattr(time, "time", lambda skew=skew: real_time() + skew)
+            reauthed = await service.reauth(identity, PW, token=token, client=client)
+            assert reauthed.ok is True and reauthed.token is not None
+            token = reauthed.token
+        monkeypatch.setattr(time, "time", real_time)
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        assert await _new_ip_rows(store) == ["10.2.2.2", "10.2.2.2"]
     finally:
         await store.close()
 
