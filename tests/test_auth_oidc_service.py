@@ -20,6 +20,7 @@ what it needs itself. ADR 0184's AC-1 to AC-4 are pinned in the section named fo
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import time
@@ -301,13 +302,19 @@ async def _oidc_login(
     service: AuthService,
     monkeypatch: pytest.MonkeyPatch,
     rsa_key: rsa.RSAPrivateKey,
+    *,
+    client: str | None = None,
     **claim_over: Any,
 ) -> LoginOutcome:
     """Run one federated login, stubbing the token exchange to return a freshly-minted id_token whose
-    claims are ``_claims(**claim_over)`` (so a test can vary ``sub`` / ``preferred_username``)."""
+    claims are ``_claims(**claim_over)`` (so a test can vary ``sub`` / ``preferred_username``).
+
+    ``client`` is the callback's client address. When given, the flow is staged from that same
+    address, as a real sign-in's start and callback would be."""
     _stub_exchange(monkeypatch, _mint(rsa_key, _claims(**claim_over)))
+    flow = _flow() if client is None else dataclasses.replace(_flow(), client_ip=client)
     return await service.authenticate_oidc(
-        AUTH_CODE, _flow(), redirect_uri="https://ops.example/ui/oidc/callback"
+        AUTH_CODE, flow, redirect_uri="https://ops.example/ui/oidc/callback", client=client
     )
 
 

@@ -3021,7 +3021,9 @@ class AuthService:
             mechanism=SessionMechanism.PASSWORD,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
-        await self._record_login_address(address, user, client=client, provider="local")
+        await self._record_login_address(
+            address, user, client=client, provider="local", mechanism=None
+        )
         success_detail: dict[str, Any] = {"provider": "local", "mfa_required": mfa_required}
         if combined:
             success_detail["second_factor"] = "totp"
@@ -6957,7 +6959,7 @@ class AuthService:
         *,
         client: str | None,
         provider: str,
-        mechanism: SessionMechanism | None = None,
+        mechanism: SessionMechanism | None,
     ) -> None:
         """Write what :meth:`_classify_login_address` decided, after the session is minted.
 
@@ -6969,10 +6971,11 @@ class AuthService:
         nobody. This never refuses a login: the challenge is the session minted without step-up
         freshness, which the caller arranges.
 
-        ``mechanism`` is passed by the directory leg only, where ``provider`` is ``ad`` for Kerberos
-        and OIDC alike, and lands in every row and notice as ``mech``, the key and spellings the
-        directory leg's other audit rows already use (vault BACKLOG #2156). The local leg passes
-        none, so its rows keep exactly ``{provider}``."""
+        ``mechanism`` is required so that a directory caller cannot drop it by omission. The
+        directory leg passes its session mechanism, because ``provider`` is ``ad`` for Kerberos and
+        OIDC alike; it lands in every row and in the notice's event detail as ``mech``, the key and
+        spellings the directory leg's other audit rows already use (vault BACKLOG #2156). The local
+        leg passes None, so its rows keep exactly ``{provider}``."""
         if verdict is _LoginAddress.KNOWN:
             return
         detail: dict[str, object] = {"provider": provider}
