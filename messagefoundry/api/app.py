@@ -3033,15 +3033,25 @@ def create_app(
         change). A **code-first** connection has no TOML home and is refused **409** (the scope fork).
         Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path."""
         try:
-            await engine.set_connection_flag(name, direction=req.direction, flagged=req.flagged)
+            fingerprint = await engine.set_connection_flag(
+                name, direction=req.direction, flagged=req.flagged
+            )
         except WiringError as exc:
             # Not TOML-managed (scope fork) OR a validate-before-persist failure — the edit never landed.
             raise HTTPException(409, str(exc)) from exc
+        # The digest of connections.toml as this write left it, so the next start reads this row as
+        # its baseline and does not report the toggle as a config change (vault BACKLOG #2597).
         await engine.store.record_audit(
             "connection_flag_set",
             actor=identity.username,
             detail=json.dumps(
-                {"connection": name, "direction": req.direction, "flagged": req.flagged}
+                {
+                    "connection": name,
+                    "direction": req.direction,
+                    "flagged": req.flagged,
+                    "node": engine.coordinator.node_id,
+                    **(fingerprint or {}),
+                }
             ),
             client=client_ip(request),
         )

@@ -1777,7 +1777,9 @@ class Engine:
         reloads the startup ``--config`` dir."""
         await self.reload(propagate=False)
 
-    async def set_connection_flag(self, name: str, *, direction: str, flagged: bool) -> None:
+    async def set_connection_flag(
+        self, name: str, *, direction: str, flagged: bool
+    ) -> dict[str, object] | None:
         """Set the operator "object of interest" flag on a ``connections.toml``-managed connection (#131,
         ADR 0007 amendment) — the FIRST console→``connections.toml`` write seam.
 
@@ -1793,6 +1795,12 @@ class Engine:
         FORK: a *code-first* connection has no TOML home, so the console flag is refused there (the
         universal-object flag would need a store table, deliberately not built) — when no config dir is
         known, or when the validated write fails. The caller maps that to a 409.
+
+        Returns the ADR 0041 D1 fingerprint of the directory just written, taken under the same
+        lock, so the caller's ``connection_flag_set`` row names the bytes on disk after this write
+        and no other writer's (vault BACKLOG #2597). A start compares its own digest with that row,
+        so without it the next restart would read the toggle as an unexplained change. ``None``
+        when the digest could not be taken; the write still stands.
         """
         from messagefoundry.config import connections_edit
         from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
@@ -1858,6 +1866,14 @@ class Engine:
                     rr.registry.outbound[name] = replace(
                         rr.registry.outbound[name], flagged=flagged
                     )
+            # Still under the lock, so no second toggle lands between the write and its digest. The
+            # write has landed, so nothing here may raise: a raise would report it as failed.
+            try:
+                fingerprint, _reason = await self.fingerprint_bundle(cfg_dir)
+            except Exception:  # noqa: BLE001 - fingerprint_bundle lets an unexpected type through
+                log.exception("the connection flag was written; its config fingerprint was not")
+                fingerprint = None
+        return fingerprint
 
     @property
     def running_config_dir(self) -> Path | None:
