@@ -11022,15 +11022,19 @@ class SqlServerStore:
     async def latest_audit_of(self, actions: Sequence[str]) -> dict[str, Any] | None:
         """The newest audit row whose action is one of ``actions``, or ``None`` (vault BACKLOG #2597).
 
-        Returns ``id``, ``ts``, ``actor``, ``action`` and ``detail``. Each action is a bound ``?``;
-        only the placeholder count is formatted into the SQL. An empty ``actions`` matches nothing."""
+        Returns ``id``, ``ts``, ``actor``, ``action`` and ``detail``. One newest-row seek per action
+        on ``ix_audit_action``, then the newest of those, rather than sorting every matching row.
+        Each action is a bound ``?``; only the branch count shapes the SQL. An empty ``actions``
+        matches nothing."""
         if not actions:
             return None
-        marks = ",".join("?" * len(actions))
+        branches = " UNION ALL ".join(
+            "SELECT * FROM (SELECT TOP (1) id, ts, actor, action, detail FROM audit_log"
+            f" WHERE action = ? ORDER BY id DESC) b{i}"
+            for i in range(len(actions))
+        )
         return await self._fetchone(
-            "SELECT TOP (1) id, ts, actor, action, detail FROM audit_log"
-            f" WHERE action IN ({marks}) ORDER BY id DESC",
-            tuple(actions),
+            f"SELECT TOP (1) * FROM ({branches}) u ORDER BY id DESC", tuple(actions)
         )
 
     async def security_events_for_user(

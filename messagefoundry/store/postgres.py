@@ -7091,14 +7091,19 @@ class PostgresStore:
     async def latest_audit_of(self, actions: Sequence[str]) -> dict[str, Any] | None:
         """The newest audit row whose action is one of ``actions``, or ``None`` (vault BACKLOG #2597).
 
-        Returns ``id``, ``ts``, ``actor``, ``action`` and ``detail``. The actions are one bound array
-        parameter. An empty ``actions`` matches nothing."""
+        Returns ``id``, ``ts``, ``actor``, ``action`` and ``detail``. One newest-row seek per action
+        on ``ix_audit_action``, then the newest of those, so the plan cannot become a backward walk
+        of the primary key filtering on ``action``. Each action is a bound ``$N``; only the branch
+        count shapes the SQL. An empty ``actions`` matches nothing."""
         if not actions:
             return None
+        branches = " UNION ALL ".join(
+            "SELECT * FROM (SELECT id, ts, actor, action, detail FROM audit_log"
+            f" WHERE action = ${i + 1} ORDER BY id DESC LIMIT 1) b{i}"
+            for i in range(len(actions))
+        )
         row = await self._fetchone(
-            "SELECT id, ts, actor, action, detail FROM audit_log"
-            " WHERE action = ANY($1::text[]) ORDER BY id DESC LIMIT 1",
-            list(actions),
+            f"SELECT * FROM ({branches}) u ORDER BY id DESC LIMIT 1", *actions
         )
         return dict(row) if row is not None else None
 

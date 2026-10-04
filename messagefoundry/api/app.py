@@ -1111,11 +1111,14 @@ class _StartConfigComparison:
 
     fingerprint: str
     previous_fingerprint: str
-    changed: bool
     baseline_action: str
     baseline_actor: str | None
     baseline_at: str
     baseline_node: str | None
+
+    @property
+    def changed(self) -> bool:
+        return not fingerprint_matches(self.fingerprint, self.previous_fingerprint)
 
 
 def _iso_utc(ts: Any) -> str:
@@ -1126,8 +1129,8 @@ def _iso_utc(ts: Any) -> str:
         return ""
 
 
-async def _bounded[T](coro: Coroutine[Any, Any, T]) -> T:
-    """Await ``coro`` for at most :data:`_CONFIG_BASELINE_TIMEOUT_SECONDS`, then raise TimeoutError.
+async def _bounded[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
+    """Await ``coro`` for at most ``timeout`` seconds, then raise TimeoutError.
 
     Not ``asyncio.wait_for``: that waits for the cancelled read to unwind, and a store driver can
     take its time over that (returning a pooled connection to a server that stopped answering).
@@ -1135,14 +1138,14 @@ async def _bounded[T](coro: Coroutine[Any, Any, T]) -> T:
     caller is never held past the bound. The left-behind task's outcome is retrieved, never raised."""
     task = asyncio.ensure_future(coro)
     try:
-        done, _pending = await asyncio.wait({task}, timeout=_CONFIG_BASELINE_TIMEOUT_SECONDS)
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
     except BaseException:
         task.cancel()
         raise
     if not done:
         task.cancel()
         task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
-        raise TimeoutError(f"no answer within {_CONFIG_BASELINE_TIMEOUT_SECONDS}s")
+        raise TimeoutError(f"no answer within {timeout}s")
     return task.result()
 
 
@@ -1169,11 +1172,20 @@ async def _compare_start_config(
         return None
     scheme = snapshot.get("scheme")
     try:
-        row = await _bounded(engine.store.latest_audit_of(_CONFIG_BASELINE_ACTIONS))
+        row = await _bounded(
+            engine.store.latest_audit_of(_CONFIG_BASELINE_ACTIONS), _CONFIG_BASELINE_TIMEOUT_SECONDS
+        )
         if row is None:
             _log.info("config change check: no earlier config row; this start is the baseline")
             return None
-        detail = json.loads(row["detail"] or "null")
+        detail, refusal = json_loads_or_refusal(row["detail"] or "null")
+        if refusal is not None:
+            _log.warning(
+                "config change check skipped: the store's newest %s row is not JSON (%s)",
+                row["action"],
+                refusal,
+            )
+            return None
         previous = detail.get("fingerprint") if isinstance(detail, dict) else None
         if not isinstance(previous, str) or not previous:
             _log.info(
@@ -1195,7 +1207,6 @@ async def _compare_start_config(
         return _StartConfigComparison(
             fingerprint=current,
             previous_fingerprint=previous,
-            changed=not fingerprint_matches(current, previous),
             baseline_action=str(row["action"]),
             baseline_actor=actor if isinstance(actor, str) else None,
             baseline_at=_iso_utc(row["ts"]),
@@ -1237,7 +1248,6 @@ async def _record_start_audit(
     *,
     fingerprint_failed: bool = False,
     comparison: _StartConfigComparison | None = None,
-    alert_sink: AlertSink | None = None,
 ) -> None:
     """Write the start's ``config_loaded`` row through :func:`_record_reload_audit` (vault BACKLOG
     #2597), so a restart records which code and which posture the engine started with.
@@ -1249,9 +1259,8 @@ async def _record_start_audit(
     could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is.
 
     ``comparison`` is :func:`_compare_start_config`'s result. The row records its
-    ``previous_fingerprint`` and ``changed``, both ``None`` when no comparison was made, and a
-    change raises ``config_changed`` on ``alert_sink`` (the logging sink when there is no
-    notifier), whether or not the row itself was written."""
+    ``previous_fingerprint`` and ``changed``, both ``None`` when no comparison was made. The
+    caller raises the alert, through :func:`_raise_config_changed`."""
     switches: list[str] | None
     try:
         pairs, _scope = _posture_loosenings(
@@ -1276,8 +1285,6 @@ async def _record_start_audit(
             "changed": comparison.changed if comparison else None,
         },
     )
-    if comparison is not None and comparison.changed:
-        _raise_config_changed(alert_sink or LoggingAlertSink(), engine, comparison)
 
 
 def _summary(row: Row) -> MessageSummary:
@@ -8506,8 +8513,10 @@ def create_managed_app(
                     engine,
                     fingerprint_failed=start_fingerprint_failure is not None,
                     comparison=start_config,
-                    alert_sink=notifier,
                 )
+                # Whether or not the row was written: the helper above never raises.
+                if start_config is not None and start_config.changed:
+                    _raise_config_changed(notifier or LoggingAlertSink(), engine, start_config)
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
                 await auth.initialize()
