@@ -630,8 +630,7 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
     assert not reconcile.hold_latches(undetermined=1, latched=False)
     assert not reconcile.hold_latches(undetermined=0, latched=True)
 
-    # The first-seen address baseline: 200 rows of each kind, 90 days back.
-    assert auth_service._LOGIN_ADDRESS_HISTORY_ROWS == 200
+    # The first-seen address baseline: the known-address record, 90 days back (vault BACKLOG #2145).
     assert auth_service._LOGIN_ADDRESS_LOOKBACK_SECONDS == 90 * 86400
 
     # The directory-password sign-in is refused, not dispatched.

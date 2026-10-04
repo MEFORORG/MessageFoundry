@@ -2,12 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4).
 
-At every session mint the engine compares the sign-in's client address with the account's own
-``auth.login_success`` history. A first-seen address writes ``auth.login_new_ip``, sends the
-``login_new_ip`` notice, and mints the session WITHOUT step-up freshness. That is a challenge
-only: the login itself always succeeds. With nothing to compare against -- the account's first
-sign-in ever, or no client address at all -- the signal fails open and audits
-``auth.login_address_unevaluated`` with the reason.
+At every session mint the engine compares the sign-in's client address with the account's
+known-address record (vault BACKLOG #2145), which holds the addresses of sign-ins that finished every
+factor they owed. A first-seen address writes ``auth.login_new_ip``, sends the ``login_new_ip``
+notice, and mints the session WITHOUT step-up freshness. That is a challenge only: the login itself
+always succeeds. With nothing to compare against -- the account's first sign-in ever, or no client
+address at all -- the signal fails open and audits ``auth.login_address_unevaluated`` with the reason.
 
 Synthetic accounts and RFC 5737 / RFC 1918 addresses only.
 """
@@ -15,15 +15,17 @@ Synthetic accounts and RFC 5737 / RFC 1918 addresses only.
 from __future__ import annotations
 
 import json
+import time
 import urllib.parse
 from typing import Any
 
 import pytest
+from _totp_clock import fresh_totp, pin_totp_clock
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, totp
 from messagefoundry.auth import service as service_module
-from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import LOGIN_NEW_IP, SecurityEvent
 from messagefoundry.auth.service import AuthService, LoginOutcome
@@ -109,6 +111,24 @@ async def _no_sleep(deadline: float) -> None:
     return None
 
 
+async def _enrol_totp(
+    service: AuthService,
+    identity: Identity,
+    token: str,
+    *,
+    client: str,
+    now: float | None = None,
+) -> str:
+    """Confirm a real TOTP enrolment from ``client``; returns the shared secret. Pass ``now`` with
+    the TOTP clock pinned there when the test verifies a later code, since enrolment consumes its
+    step."""
+    enroll = await service.begin_mfa_enrollment(identity)
+    code = totp.totp(enroll.secret, now=now) if now is not None else fresh_totp(enroll.secret)
+    elevation = await service.confirm_mfa_enrollment(identity, code, token=token, client=client)
+    assert elevation.ok, "the enrolment confirm was refused"
+    return enroll.secret
+
+
 async def test_first_login_ever_fails_open_and_audits_no_baseline() -> None:
     store = await MessageStore.open(":memory:")
     try:
@@ -169,9 +189,19 @@ async def test_a_first_seen_address_is_audited_notified_and_unseeded() -> None:
         assert notices[0].email == "oper@example.org"
         assert notices[0].detail == {"provider": "local"}
         assert (await _actions(store, "oper"))[-1] == "auth.login_success"
-        # Once signed in from it, the address is known: the next sign-in is not challenged.
+        # vault BACKLOG #2145: signing in again does NOT pass the challenge. The audit baseline this
+        # replaced counted the challenged login's own row, so the second sign-in was seeded.
         again = await service.login("oper", PW, client="198.51.100.7")
-        assert again.ok and await _seeded(store, again.token)
+        assert again.ok and again.token is not None and again.identity is not None
+        assert not await _seeded(store, again.token)
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
+        # A step-up from that address passes it: the next sign-in is seeded, and writes no row.
+        stepped = await service.reauth(again.identity, PW, token=again.token, client="198.51.100.7")
+        assert stepped.ok
+        third = await service.login("oper", PW, client="198.51.100.7")
+        assert third.ok and await _seeded(store, third.token)
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
+        # The audit row is written every time; the notice is debounced per account and address.
         assert len(_new_ip_notices(notifier)) == 1
     finally:
         await store.close()
@@ -340,7 +370,10 @@ async def test_the_windows_sso_entry_point_records_the_kerberos_mechanism(
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
+        # require_mfa off: a Kerberos session asserts no factor, so under the default it would owe
+        # one, and a sign-in that owes a factor seeds no baseline (vault BACKLOG #2145).
         settings = AuthSettings(
+            require_mfa=False,
             ad_enabled=True,
             kerberos_enabled=True,
             ad_server="ldaps://x",
@@ -508,8 +541,10 @@ async def test_a_password_step_row_that_still_owed_a_factor_is_not_a_baseline() 
         assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
         # The audit row is written every time; the notice is debounced per account.
         assert len(_new_ip_notices(notifier)) == 1
-        # A finished second factor from that address is what makes it known.
-        await store.record_audit("auth.mfa_verified", actor="oper", client="203.0.113.5")
+        # vault BACKLOG #2145: a first factor enrolment confirmed from that address finishes the
+        # sign-in, and is what makes it known. The audit baseline left no trace of it.
+        assert second.identity is not None and second.token is not None
+        await _enrol_totp(owed, second.identity, second.token, client="203.0.113.5")
         assert (await owed.login("oper", PW, client="203.0.113.5")).ok
         assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
     finally:
@@ -524,13 +559,13 @@ async def test_a_failed_history_read_fails_open(monkeypatch: pytest.MonkeyPatch)
         await _operator(service)
         assert (await service.login("oper", PW, client="10.1.1.1")).ok
 
-        async def _broken(**_kw: object) -> list[object]:
+        async def _broken(*_a: object, **_kw: object) -> list[str]:
             raise RuntimeError("synthetic store fault")
 
-        real = store.list_audit
-        monkeypatch.setattr(store, "list_audit", _broken)
+        real = store.list_known_login_addresses
+        monkeypatch.setattr(store, "list_known_login_addresses", _broken)
         out = await service.login("oper", PW, client="203.0.113.9")
-        monkeypatch.setattr(store, "list_audit", real)
+        monkeypatch.setattr(store, "list_known_login_addresses", real)
         assert out.ok and await _seeded(store, out.token)
         rows = await store.list_audit(actor="oper", action="auth.login_address_unevaluated")
         assert any('"reason": "read_failed"' in str(r["detail"]) for r in rows)
@@ -547,8 +582,9 @@ async def test_a_second_new_address_inside_the_debounce_window_is_still_notified
         notifier = _FakeNotifier()
         owed = AuthService(store, AuthSettings(require_mfa=True), security_notifier=notifier)
         await owed.initialize()
-        await _operator(owed)
-        await store.record_audit("auth.mfa_verified", actor="oper", client="10.1.1.1")
+        uid = await _operator(owed)
+        # A known address that is neither of the two below, so both read as NEW.
+        await store.remember_login_address(uid, "10.1.1.1", now=time.time(), forget_before=0.0)
         assert (await owed.login("oper", PW, client="203.0.113.5")).ok
         assert (await owed.login("oper", PW, client="203.0.113.6")).ok
         assert [e.client_ip for e in _new_ip_notices(notifier)] == ["203.0.113.5", "203.0.113.6"]
@@ -567,5 +603,147 @@ async def test_an_ipv4_mapped_form_matches_its_ipv4_history() -> None:
         out = await service.login("oper", PW, client="::ffff:10.1.1.1")
         assert out.ok and await _seeded(store, out.token)
         assert _new_ip_notices(notifier) == []
+    finally:
+        await store.close()
+
+
+# --- the known-address record (vault BACKLOG #2145): one test per gap the audit baseline left ---
+
+
+async def test_a_directory_sign_in_that_still_owes_a_factor_marks_nothing_known() -> None:
+    """Gap 1, and the #2156 review's R1-1. A directory ``auth.login_success`` row carries no
+    ``mfa_required`` marker, so the audit baseline counted a directory sign-in that stopped short of
+    its factor. The record is written only once nothing more is owed."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        settings = AuthSettings(
+            require_mfa=True,
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        )
+        service = AuthService(
+            store,
+            settings,
+            ldap=_FakeLdap(),  # type: ignore[arg-type]
+            security_notifier=notifier,
+        )
+        await service.initialize()
+        await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
+        # A sign-in that owes nothing (the factor was asserted) seeds the baseline.
+        assert (
+            await service._complete_ad_login(_principal("jsmith"), "10.2.2.2", mfa_verified=True)
+        ).ok
+        for _ in range(2):
+            owed = await service._complete_ad_login(
+                _principal("jsmith"), "198.51.100.50", mfa_verified=False
+            )
+            assert owed.ok and owed.mfa_required
+        # Both read as NEW: the first one, which still owed its factor, did not make it known.
+        assert len(await store.list_audit(actor="jsmith", action="auth.login_new_ip")) == 2
+        account = await store.get_user_by_username("jsmith")
+        assert account is not None
+        assert await store.list_known_login_addresses(account.id, since=0.0) == ["10.2.2.2"]
+    finally:
+        await store.close()
+
+
+async def test_a_second_factor_proved_from_a_new_address_makes_it_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The factor leg writes the record: ``verify_mfa`` from a first-seen address makes it known, so
+    the next sign-in from it is not reported again."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = AuthService(
+            store,
+            AuthSettings(
+                require_mfa=True, mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1
+            ),
+            security_notifier=_FakeNotifier(),
+        )
+        await owed.initialize()
+        await _operator(owed)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        first = await owed.login("oper", PW, client="10.1.1.1")
+        assert first.ok and first.identity is not None and first.token is not None
+        secret = await _enrol_totp(owed, first.identity, first.token, client="10.1.1.1", now=t0)
+        new = await owed.login("oper", PW, client="203.0.113.8")
+        assert new.ok and new.mfa_required and new.token is not None
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        assert (
+            await owed.verify_mfa(new.token, totp.totp(secret, now=t1), client="203.0.113.8")
+        ).ok
+        assert (await owed.login("oper", PW, client="203.0.113.8")).ok
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
+    finally:
+        await store.close()
+
+
+async def test_the_record_is_keyed_on_the_account_not_the_username() -> None:
+    """Gap 4. The audit actor is a username, so the old read had to bound a re-created namesake by
+    ``created_at``. The record is keyed on the account id and deleted with the account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        first = await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        assert await store.list_known_login_addresses(first, since=0.0) == ["10.1.1.1"]
+        await service.delete_user(first, actor="t")
+        assert await store.list_known_login_addresses(first, since=0.0) == []
+        await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        reasons = [
+            json.loads(str(r["detail"]))["reason"]
+            for r in await store.list_audit(actor="oper", action="auth.login_address_unevaluated")
+        ]
+        # Both accounts' first sign-ins fail open; the namesake inherits no baseline.
+        assert reasons == ["no_baseline", "no_baseline"]
+    finally:
+        await store.close()
+
+
+async def test_the_signal_never_reads_the_audit_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gap 5. The baseline read is one primary-key lookup on the record; ``audit_log``, which has
+    no actor index, is not read at all. A ``list_audit`` that raises cannot change the verdict."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _service(store, notifier)
+        await _operator(service)
+
+        async def _refused(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError("the first-seen signal read audit_log")
+
+        monkeypatch.setattr(store, "list_audit", _refused)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        known = await service.login("oper", PW, client="10.1.1.1")
+        new = await service.login("oper", PW, client="203.0.113.9")
+        monkeypatch.undo()
+        assert known.ok and await _seeded(store, known.token)
+        assert new.ok and not await _seeded(store, new.token)
+        assert [e.client_ip for e in _new_ip_notices(notifier)] == ["203.0.113.9"]
+    finally:
+        await store.close()
+
+
+async def test_an_address_too_long_to_key_is_never_remembered() -> None:
+    """A client string longer than the record's key column is not written, so it reads as NEW at
+    every sign-in rather than failing the write."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        client = "h" * (service_module._LOGIN_ADDRESS_KEY_MAX + 1)
+        assert (await service.login("oper", PW, client=client)).ok
+        again = await service.login("oper", PW, client=client)
+        assert again.ok and not await _seeded(store, again.token)
+        assert await store.list_known_login_addresses(uid, since=0.0) == []
     finally:
         await store.close()
