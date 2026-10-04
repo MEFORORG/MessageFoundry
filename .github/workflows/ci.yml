@@ -4386,19 +4386,15 @@ jobs:
       #
       # So the Service Control Manager is asked, with the same bounded wait the token step uses for
       # its stop, and a service that is not Stopped after it still fails the step. The stop is sent
-      # ONCE. That job shows a stop that arrived, so nothing shows a second one is needed, and what
-      # a second one does to a service that is already stopping has not been measured. A stop that
-      # is lost goes red here with the state the Service Control Manager reports, and that reading
-      # is what would justify a resend.
+      # ONCE: that job shows a stop that arrived, and a lost one goes red here with the state the
+      # Service Control Manager reports, which is the reading that would justify a resend. The
+      # line the step prints holds the two readings the open question above is short of.
       #
       # `if: always()`, so this also runs after a failed install, when there is no service. That is
       # said in one line and the step passes: the red is the earlier step's, and an error from a
-      # stop sent to nothing would read as a second fault. A service that IS registered never takes
-      # that branch. The control is a service Windows always has, so a read that can see no service
-      # at all is not taken for "not installed" over an engine that is still running.
-      #
-      # The exit code is printed, and so is what the service read as the command returned. Those
-      # two readings are what the open question above is short of.
+      # stop sent to nothing would read as a second fault. The control is a service Windows always
+      # has, so a read that can see no service at all is not taken for "not installed" over an
+      # engine that is still running.
       - name: Stop the service (graceful)
         if: always()
         run: |

@@ -33,6 +33,7 @@ script still CALLS it -- which is exactly the #1699 complaint about this file.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -791,12 +792,13 @@ _SMOKE_NSSM = '"$env:SMOKE_NSSM_DIR\\nssm.exe"'
 # What nssm 2.24 printed, with exit 1, in the job the ci.yml comment names.
 _NSSM_UNEXPECTED = "MessageFoundry: Unexpected status SERVICE_RUNNING in response to STOP control."
 _NOTHING_TO_STOP = "no MessageFoundry service is registered, so there is nothing to stop"
-_SLEEP = "STAND-IN SLEEP"
-_SLEPT = f"{_SLEEP} 500"
+_SLEPT = "STAND-IN SLEEP 500"
 
 
+@functools.cache
 def _smoke_stop_script() -> str:
-    """The step's run script, without its comment lines.
+    """The step's run script, without its comment lines. Cached: every arm below reads the same
+    script, and each read parses the whole of ci.yml.
 
     Imported here: without PyYAML that module skips whoever imports it.
     """
@@ -850,7 +852,7 @@ function Get-Service {{
   $global:Reads++
   return [pscustomobject]@{{ Status = $global:States[$i] }}
 }}
-function Start-Sleep {{ param($Milliseconds) "{_SLEEP} $Milliseconds" }}
+function Start-Sleep {{ param($Milliseconds) "STAND-IN SLEEP $Milliseconds" }}
 """
     f = tmp_path / f"smoke-stop-{uuid.uuid4().hex}.ps1"
     f.write_text(
@@ -950,12 +952,14 @@ def test_the_smoke_stop_does_not_read_a_blind_scm_as_nothing_to_stop(tmp_path: P
 def test_the_smoke_stop_runs_after_a_failed_step_and_before_the_uninstall() -> None:
     """The step keeps ``if: always()`` and its place: after the token step, whose probe it stops,
     and before the uninstall, which removes the service it asks about."""
-    from tests._workflow_contexts import jobs_of, step_script
+    from tests._workflow_contexts import jobs_of
 
     steps = jobs_of("ci.yml")["windows-service-smoke"]["steps"]
 
-    def at(name: str) -> int:
-        return step_script("ci.yml", "windows-service-smoke", name)[0]
+    def at(name_starts: str) -> int:
+        found = [i for i, s in enumerate(steps) if str(s.get("name", "")).startswith(name_starts)]
+        assert len(found) == 1, f"expected one step named {name_starts!r}, found {len(found)}"
+        return found[0]
 
     stop = at(_SMOKE_STOP_STEP)
     assert steps[stop].get("if") == "always()", steps[stop].get("if")
