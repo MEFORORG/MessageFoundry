@@ -30,7 +30,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Final, TypeVar
+from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
 
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
@@ -217,6 +217,14 @@ _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
 
+# BACKLOG #2159: the most new addresses one session may have audited between two re-verifications.
+# The signal runs on every sensitive request, so this, plus one row saying the cap is reached, is the
+# ceiling on audit rows and notices one token can cause before its holder proves the credential
+# again. A real operator roams across a few networks, not eight; a token used from more hosts than
+# that has already been reported nine times, and the step-up stays forced for every further address.
+# With _NEW_IP_DEDUP_MAX it bounds the cache at 4096 x 9 address keys.
+_NEW_IP_PER_SESSION_MAX = 8
+
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). It reads the account's own
 # ``auth.login_success`` audit rows at every session mint, so both bounds are there to keep that read
 # cheap: at most this many rows, from at most this far back. An address last used before the window,
@@ -247,16 +255,29 @@ class _LoginAddress(Enum):
     UNEVALUATED_READ_FAILED = "read_failed"
 
 
-def _unmapped(address: str) -> str:
-    """An IPv4-mapped IPv6 address as its IPv4 form, so a bind change between ``0.0.0.0`` and
-    ``::`` does not make every stored address read as new. Anything else is returned unchanged."""
+def _host_key(address: str) -> str:
+    """One string per host, for comparing and remembering client addresses.
+
+    An IPv4-mapped IPv6 address folds to its IPv4 form, so a bind change between ``0.0.0.0`` and
+    ``::`` does not make every stored address read as new. Every loopback address folds to ``::1``,
+    so a dual-stack box that presents ``127.0.0.1`` on one connection and ``::1`` on the next is one
+    host. Any other address takes its canonical text, so ``2001:DB8::1`` and ``2001:db8::1`` match.
+    Text that does not parse as an address is its own key, which is an exact-match fallback."""
     try:
-        parsed = ipaddress.ip_address(address)
+        parsed: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(address)
     except ValueError:
         return address
     if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
-        return str(parsed.ipv4_mapped)
-    return address
+        parsed = parsed.ipv4_mapped
+    if parsed.is_loopback:
+        return "::1"
+    return str(parsed)
+
+
+#: What :meth:`AuthService._first_new_ip_flag` decided for one request: write the ordinary row, write
+#: the one row that says the session's cap is now reached, or write nothing because the address is a
+#: repeat or the cap was already reached.
+_NewIpFlag = Literal["audit", "audit_cap_reached", "repeat", "over_cap"]
 
 
 def _owed_a_factor(detail: object) -> bool:
@@ -1977,8 +1998,10 @@ class AuthService:
             else None
         )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
-        # last new client address already flagged for that session. Bounded (_NEW_IP_DEDUP_MAX).
-        self._new_ip_seen: dict[str, str] = {}
+        # host keys already flagged since the session's last re-verification (BACKLOG #2159). Every
+        # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
+        # and _NEW_IP_PER_SESSION_MAX + 1 keys each (the last is the cap-reached row's address).
+        self._new_ip_seen: dict[str, set[str]] = {}
         # BACKLOG #288: (user id, address) -> monotonic time of the last ``login_new_ip`` notice.
         self._login_new_ip_noticed: dict[tuple[str, str], float] = {}
         # In-flight WebAuthn ceremony challenges (ADR 0068 §2): bounded, TTL'd, process-local —
@@ -4026,6 +4049,7 @@ class AuthService:
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
         await self._store.mark_session_reauthed(token_hash, client=client)
+        self._restart_new_ip_dedupe(token_hash)
         grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
             token_hash, purpose
         )
@@ -5730,8 +5754,10 @@ class AuthService:
           just completed silently no-ops and the next route demands another step-up.
         * ``_webauthn_challenges`` — a live ceremony. Stranded ⇒ a passkey registration/assertion
           started before the rotation can never be finished, which is a dead end, not a retry.
-        * ``_new_ip_seen`` — the WP-L3-13 dedupe. Stranded ⇒ a *second* new-IP step-up + audit row
-          for an address the session already re-verified from.
+        * ``_new_ip_seen`` — the WP-L3-13 dedupe. Only the audit row and notice depend on it, never
+          the step-up. A re-verification drops the entry before it rotates (BACKLOG #2159), so a
+          strand costs something on a rotation WITHOUT one, such as a passkey assertion or an
+          enrolment confirm: every address already reported would be audited and notified again.
         * ``_reproof_session_failures`` — the BACKLOG #1138 per-session re-proof budget. Stranded,
           any rotation would hand the session a fresh budget of guesses.
 
@@ -6553,6 +6579,7 @@ class AuthService:
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
             # by a roamed/new client IP (WP-L3-13) clears once the caller re-proves from there.
             await self._store.mark_session_reauthed(hash_token(token), client=client)
+            self._restart_new_ip_dedupe(hash_token(token))
             # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
             # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
             # asking after would refuse every such grant on a session that is perfectly fine. It
@@ -6879,24 +6906,45 @@ class AuthService:
 
     @staticmethod
     def _same_host(a: str, b: str) -> bool:
-        """Whether two client addresses denote the same host: an exact match, **or** both loopback (so a
-        dual-stack box that presents ``::1`` on one connection and ``127.0.0.1`` on another is treated as
-        one host — this keeps the loopback default a genuine no-op rather than a string mismatch).
-        Unparseable values fall back to exact match."""
-        if a == b:
-            return True
-        try:
-            return ipaddress.ip_address(a).is_loopback and ipaddress.ip_address(b).is_loopback
-        except ValueError:
-            return False
+        """Whether two client addresses denote the same host, by :func:`_host_key`. At least these
+        match: an exact match, both loopback (this keeps the loopback default a genuine no-op
+        rather than a string mismatch), and one the IPv4-mapped IPv6 form of the other. Both
+        address signals compare by :func:`_host_key`, so they agree on what counts as a new
+        address (BACKLOG #2159)."""
+        return _host_key(a) == _host_key(b)
 
-    def _remember_new_ip(self, token_hash: str, client_ip: str) -> None:
-        """Record the last new client IP flagged for a session — best-effort, per-process dedup of the
-        audit/notify side effects only. Bounded so session/address churn can't grow it without limit;
-        the step-up decision never depends on this cache (eviction only risks one extra audit row)."""
-        if len(self._new_ip_seen) >= _NEW_IP_DEDUP_MAX and token_hash not in self._new_ip_seen:
-            self._new_ip_seen.pop(next(iter(self._new_ip_seen)))
-        self._new_ip_seen[token_hash] = client_ip
+    def _first_new_ip_flag(self, token_hash: str, address_key: str) -> _NewIpFlag:
+        """Record a new address for a session, and say whether this request should audit it.
+
+        Best-effort, per-process dedup of the audit/notify side effects only; the step-up decision
+        never depends on it. An address audits the first time it shows up since the session last
+        re-anchored, because every re-anchor drops the session's entry (:meth:`_restart_new_ip_dedupe`,
+        BACKLOG #2159). The first address past ``_NEW_IP_PER_SESSION_MAX`` audits once more, as the
+        row that says the cap is reached; after that the session audits nothing until it re-anchors.
+
+        Bounded so session churn cannot grow it without limit: past ``_NEW_IP_DEDUP_MAX`` sessions
+        the oldest entry goes, which only risks re-auditing that session's addresses once more."""
+        flagged = self._new_ip_seen.get(token_hash)
+        if flagged is None:
+            if len(self._new_ip_seen) >= _NEW_IP_DEDUP_MAX:
+                self._new_ip_seen.pop(next(iter(self._new_ip_seen)))
+            flagged = self._new_ip_seen[token_hash] = set()
+        if address_key in flagged:
+            return "repeat"
+        if len(flagged) > _NEW_IP_PER_SESSION_MAX:
+            return "over_cap"
+        flagged.add(address_key)
+        return "audit" if len(flagged) <= _NEW_IP_PER_SESSION_MAX else "audit_cap_reached"
+
+    def _restart_new_ip_dedupe(self, token_hash: str) -> None:
+        """Start the new-address dedupe over for a session that just re-anchored, so an address
+        reported before the re-anchor is reported again (BACKLOG #2159).
+
+        Every leg that calls ``mark_session_reauthed`` calls this straight after it, before it
+        rotates the token; tests/test_admin_new_ip.py pins the pairing. Keying the reset on the
+        re-anchor rather than on ``reauth_at`` keeps it free of the wall clock, which can step
+        back."""
+        self._new_ip_seen.pop(token_hash, None)
 
     async def _classify_login_address(self, user: UserRecord, client: str | None) -> _LoginAddress:
         """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).
@@ -6931,6 +6979,7 @@ class AuthService:
         if not client:
             return _LoginAddress.UNEVALUATED_UNKNOWN_ADDRESS
         since = max(time.time() - _LOGIN_ADDRESS_LOOKBACK_SECONDS, user.created_at)
+        client_key = _host_key(client)
         seen = False
         try:
             for action in ("auth.login_success", "auth.mfa_verified", "auth.webauthn_verified"):
@@ -6946,9 +6995,7 @@ class AuthService:
                     if row["client"] and not _owed_a_factor(row["detail"])
                 ]
                 seen = seen or bool(addresses)
-                if any(
-                    self._same_host(_unmapped(client), _unmapped(address)) for address in addresses
-                ):
+                if any(_host_key(address) == client_key for address in addresses):
                     return _LoginAddress.KNOWN
         except Exception:
             _log.exception(
@@ -6971,7 +7018,7 @@ class AuthService:
         mail is held back. Per process and bounded, so eviction can only ever send one extra
         notice."""
         now = time.monotonic()
-        key = (user_id, client or "")
+        key = (user_id, _host_key(client) if client else "")
         last = self._login_new_ip_noticed.get(key)
         if last is not None and now - last < _LOGIN_NEW_IP_NOTICE_SECONDS:
             return False
@@ -7023,11 +7070,15 @@ class AuthService:
     ) -> bool:
         """Admin-interface contextual-risk signal (ASVS 8.4.2, WP-L3-13): return ``True`` when this
         sensitive request arrives from a client address that differs from the one the caller's session
-        last verified from. On the **first** observation of a given (session, address) it emits an
-        ``auth.admin_action_new_ip`` audit event + a best-effort out-of-band notice; **repeat** hits from
-        the same un-cleared address still return ``True`` (so the step-up stays forced) but only log to
-        the rotating ops log — so a token replayed in a tight loop from one address cannot inflate the
-        audit table / notification channel (mirrors the ``_rate_limited`` precedent). The step-up
+        last verified from. On the **first** observation of a given (session, address) since the
+        session's last re-verification it emits an ``auth.admin_action_new_ip`` audit event + a
+        best-effort out-of-band notice; **repeat** hits from an address already flagged in that
+        epoch still return ``True`` (so the step-up stays forced) but only log to the rotating ops
+        log — so a token replayed in a tight loop, from one address or alternating between several,
+        cannot inflate the audit table / notification channel (mirrors the ``_rate_limited``
+        precedent). One epoch audits at most ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
+        carrying ``cap_reached`` for the first address past that, because this runs on every
+        sensitive request (BACKLOG #2159). The step-up
         dependencies treat ``True`` as "force a fresh step-up"; a successful re-verify (``POST
         /me/reauth`` **or** ``/auth/mfa-verify``) re-anchors the session to the new address (see
         :meth:`reauth` / :meth:`verify_mfa`), so the signal clears and the caller proceeds. An
@@ -7048,30 +7099,66 @@ class AuthService:
             return False
         # No baseline address (older session / unknown login source) or the same host → not new. A
         # session with no recorded address is not penalized, to avoid spurious admin friction.
-        if not session.client or not client_ip or self._same_host(client_ip, session.client):
+        if not session.client or not client_ip:
             return False
+        if self._same_host(client_ip, session.client):
+            return False
+        seen_key = _host_key(client_ip)
         # New address → force a step-up (return True unconditionally). Emit the audit + notice once per
-        # (session, address); suppress repeats from the same un-cleared address so a replayed token
-        # cannot amplify the audit log / notifications.
-        if self._new_ip_seen.get(token_hash) == client_ip:
+        # (session, address) between re-verifications, and for at most _NEW_IP_PER_SESSION_MAX
+        # addresses, so a replayed token cannot amplify the audit log / notifications even when it
+        # alternates between addresses (BACKLOG #2159).
+        flag = self._first_new_ip_flag(token_hash, seen_key)
+        if flag == "repeat":
             _log.warning(
-                "admin action from already-flagged new client IP (repeat suppressed): path=%s", path
+                "admin action from a new client IP already flagged since the session's last "
+                "re-verification (audit suppressed): path=%s",
+                path,
             )
             return True
-        self._remember_new_ip(token_hash, client_ip)
-        user = await self._store.get_user(session.user_id)
-        username = user.username if user is not None else session.user_id
-        await self._audit(
-            "auth.admin_action_new_ip",
-            actor=username,
-            detail=_json({"path": path, "known_ip": session.client, "seen_ip": client_ip}),
-        )
+        if flag == "over_cap":
+            # Past the cap no row is written, so this line is the only record of where the token
+            # is being used from. The address is attacker-supplied text on a proxied hop.
+            _log.warning(
+                "admin action from a new client IP past the per-session cap of %d (audit "
+                "suppressed): path=%s seen_ip=%s",
+                _NEW_IP_PER_SESSION_MAX,
+                path,
+                scrub_log_argument(client_ip),
+            )
+            return True
+        detail: dict[str, object] = {
+            "path": path,
+            "known_ip": session.client,
+            "seen_ip": client_ip,
+        }
+        if flag == "audit_cap_reached":
+            # The last row before the session re-verifies, so it says why the next new address
+            # will write none.
+            detail["cap_reached"] = _NEW_IP_PER_SESSION_MAX
+        written = False
+        try:
+            user = await self._store.get_user(session.user_id)
+            username = user.username if user is not None else session.user_id
+            await self._audit("auth.admin_action_new_ip", actor=username, detail=_json(detail))
+            written = True
+        finally:
+            if not written:
+                # No row, so the address must not count as reported: the next request from it
+                # tries again (BACKLOG #2159). A ``finally`` rather than a catch, so nothing is
+                # swallowed and a cancellation is covered too.
+                flagged = self._new_ip_seen.get(token_hash)
+                if flagged is not None:
+                    flagged.discard(seen_key)
+        notice: dict[str, object] = {"known_ip": session.client}
+        if flag == "audit_cap_reached":
+            notice["cap_reached"] = _NEW_IP_PER_SESSION_MAX
         await self._notify_security(
             ADMIN_NEW_IP,
             username=username,
             email=user.notify_email if user is not None else None,
             client=client_ip,
-            detail={"known_ip": session.client},
+            detail=notice,
         )
         return True
 
@@ -7540,6 +7627,7 @@ class AuthService:
                 # signal with one credential proof rather than being forced into a separate password
                 # step-up.
                 await self._store.mark_session_reauthed(hash_token(token), client=client)
+                self._restart_new_ip_dedupe(hash_token(token))
                 await self._store.record_login_success(user.id, now=now)
                 await self._audit("auth.mfa_verified", actor=user.username, client=client)
                 return await self._elevated(
