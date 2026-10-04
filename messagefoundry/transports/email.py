@@ -13,7 +13,9 @@ plain-text SMTP message to a configured server and maps the outcome onto the eng
 Standard library only (``smtplib`` + ``email.message``) — no new dependency (ADR 0029 §"What this
 must not break"; CLAUDE.md §7). The synchronous SMTP core is **lifted** from
 ``pipeline/alert_sinks.py``'s ``send_plain_email`` (a transport must not import ``pipeline/`` — the
-one-way dependency rule, CLAUDE.md §4); the two copies are deliberately independent.
+one-way dependency rule, CLAUDE.md §4); the two copies are deliberately independent. The address
+check runs the allowed way: :func:`checked_envelope` lives here, and ``send_plain_email`` and the
+Direct destination import it (vault BACKLOG #2870).
 
 **STARTTLS by default** (``use_tls=True``): the connector issues ``STARTTLS`` before ``AUTH``/data on
 the ``587`` submission port; port ``465`` (implicit TLS) maps to ``smtplib.SMTP_SSL``. Disabling TLS
@@ -49,6 +51,7 @@ import smtplib
 import ssl
 import string
 from collections.abc import Mapping
+from dataclasses import dataclass
 from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import getaddresses, parseaddr
@@ -75,7 +78,13 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
 
-__all__ = ["EmailDestination", "envelope_address_problem", "envelope_recipients"]
+__all__ = [
+    "CheckedEnvelope",
+    "EmailDestination",
+    "checked_envelope",
+    "envelope_address_problem",
+    "envelope_recipients",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +140,8 @@ def envelope_address_problem(address: str) -> str | None:
     size limits: a dot-separated local part of :data:`_LOCAL_ATEXT` that does not start with ``-``,
     and a hostname-shaped domain. ``smtplib`` writes an address it cannot re-read onto the
     ``RCPT TO`` line raw, so anything looser could put a mailbox there that is not the one checked.
-    Both the ``[egress]`` recipient-domain check and construction call this, and construction
-    applies it to the sender too, which is ``MAIL FROM``. The text names no part of the address."""
+    The ``[egress]`` recipient-domain check calls this, and so does :func:`checked_envelope`, which
+    also applies it to the sender, which is ``MAIL FROM``. The text names no part of the address."""
     if parseaddr(address)[1] != address:
         return "does not read back as the same address"
     local, at, domain = address.rpartition("@")
@@ -150,6 +159,100 @@ def envelope_address_problem(address: str) -> str | None:
     if set(domain) - _DOMAIN_TEXT:
         return "has a domain that is not a host name"
     return None
+
+
+def _holds_control_char(value: str) -> bool:
+    """Whether ``value`` holds a character ``policy.default`` refuses in a header: every
+    ``str.splitlines()`` separator, which is the C0 controls the shared alphabet covers plus the
+    three outside it named in :data:`_UNICODE_LINE_BREAKS`."""
+    return has_control_char(value) or any(ch in _UNICODE_LINE_BREAKS for ch in value)
+
+
+def _checked_header(cell: str, field: str, checked: list[str], what: str) -> list[Address]:
+    """The ``From:`` or ``To:`` addresses, built from checked address strings rather than from the
+    raw setting.
+
+    ``policy.default`` still parses whatever a header is given, Address objects included, and that
+    parser decodes RFC 2047 encoded words. Two things keep it from naming an unchecked address.
+    :data:`_LOCAL_ATEXT` admits no ``=`` or ``?``, so no encoded word can form. And this function
+    sets the header on a scratch message and folds it under both policies a send can use (``SMTP``
+    and ``SMTPUTF8``), which is the text the generator writes. It refuses any result that is not
+    exactly the checked list, so a later widening of that allowlist fails closed at construction
+    instead of reaching the wire."""
+    addresses = [
+        Address(username=local, domain=domain)
+        for local, _, domain in (address.rpartition("@") for address in checked)
+    ]
+    probe = EmailMessage()
+    probe[field] = addresses
+    header = probe[field]
+    expected = ", ".join(checked)
+    # Folding breaks the line only after a comma, so dropping each CRLF leaves the joined text.
+    written = [
+        header.fold(policy=pol).partition(":")[2].replace("\r\n", "").strip()
+        for pol in (email.policy.SMTP, email.policy.SMTPUTF8)
+    ]
+    if str(header) != expected or any(text != expected for text in written):
+        raise ValueError(f"{cell}: the {field} header does not match the checked {what}")
+    return addresses
+
+
+@dataclass(frozen=True)
+class CheckedEnvelope:
+    """One SMTP cell's envelope and its ``From:`` and ``To:`` headers, all built from addresses that
+    passed :func:`envelope_address_problem`. Build it with :func:`checked_envelope`.
+
+    Given no ``from_addr`` or ``to_addrs``, ``smtplib``'s ``send_message`` derives ``MAIL FROM`` and
+    ``RCPT TO`` from a parse of the headers, and that parse decodes encoded words and expands groups.
+    So the envelope could differ from the text that was checked. :meth:`send` passes both halves
+    explicitly. The Email, Direct and alert-mail cells all send through it (vault BACKLOG #2841,
+    #2870)."""
+
+    sender: str
+    recipients: tuple[str, ...]
+    from_header: tuple[Address, ...]
+    to_header: tuple[Address, ...]
+
+    def address(self, msg: EmailMessage) -> None:
+        """Set ``From:`` and ``To:`` on ``msg`` from the checked addresses."""
+        msg["From"] = list(self.from_header)
+        msg["To"] = list(self.to_header)
+
+    def send(self, smtp: smtplib.SMTP, msg: EmailMessage) -> None:
+        """Submit ``msg`` with ``MAIL FROM`` and ``RCPT TO`` taken from the checked addresses."""
+        smtp.send_message(msg, from_addr=self.sender, to_addrs=list(self.recipients))
+
+
+def checked_envelope(cell: str, sender: str, recipients: Any) -> CheckedEnvelope:
+    """Check ``sender`` and every :func:`envelope_recipients` address of ``recipients`` against
+    :func:`envelope_address_problem`, then build the headers from the checked text.
+
+    Raises :class:`ValueError` naming ``cell`` and the problem, never the address. A display name on
+    a recipient is dropped, as :func:`envelope_recipients` reads it. The sender gets no such reading:
+    it must already be one plain address, because it is ``MAIL FROM``, where bounces go."""
+    try:
+        entries = _as_recipients(recipients)
+    except ValueError:
+        raise ValueError(f"{cell} requires a non-empty 'recipients' setting") from None
+    # The address parser drops a bare CR or LF, so "a<LF>b@host" would be checked and sent as
+    # "ab@host": consistent, but not the address that was written. Refuse it instead.
+    if any(_holds_control_char(entry) for entry in entries):
+        raise ValueError(f"{cell}: a recipient holds a control character")
+    envelope = envelope_recipients(entries)
+    for address in envelope:
+        problem = envelope_address_problem(address)
+        if problem is not None:
+            raise ValueError(f"{cell}: a recipient {problem}")
+    # Its domain is not gated: that is a policy question, not an address-shape one.
+    problem = envelope_address_problem(sender)
+    if problem is not None:
+        raise ValueError(f"{cell}: the sender {problem}")
+    return CheckedEnvelope(
+        sender=sender,
+        recipients=tuple(envelope),
+        from_header=tuple(_checked_header(cell, "From", [sender], "sender")),
+        to_header=tuple(_checked_header(cell, "To", envelope, "recipients")),
+    )
 
 
 class EmailDestination(DestinationConnector):
@@ -173,29 +276,17 @@ class EmailDestination(DestinationConnector):
         self.port = int(s.get("port", 587))
         self.sender = sender
         self.recipients = _as_recipients(s.get("recipients"))
-        self._envelope = envelope_recipients(self.recipients)
-        for address in self._envelope:
-            # The same rule the [egress] check applies, held here too so no build path that skips
-            # that check can put an unchecked mailbox on the RCPT line.
-            problem = envelope_address_problem(address)
-            if problem is not None:
-                raise ValueError(f"Email destination: a recipient {problem}")
         self.subject = str(s.get("subject", ""))
         for name, value in (("subject", self.subject), ("sender", self.sender)):
             # A control character in a header value would raise inside _build_message at every
             # send, where it dead-letters as an internal error. Refuse it here, at load.
-            # policy.default refuses every str.splitlines() separator: the C0 controls the shared
-            # alphabet covers, plus three outside it, named in _UNICODE_LINE_BREAKS.
-            if has_control_char(value) or any(ch in _UNICODE_LINE_BREAKS for ch in value):
+            if _holds_control_char(value):
                 raise ValueError(f"Email destination '{name}' holds a control character")
-        # The sender is MAIL FROM, where bounces go, so it gets the recipients' rule: one plain
-        # address that reads back unchanged (vault BACKLOG #2841). Its domain is not gated.
-        problem = envelope_address_problem(self.sender)
-        if problem is not None:
-            raise ValueError(f"Email destination: the sender {problem}")
-        # Build the From: and To: addresses once, refusing a mismatch here rather than at send time.
-        self._from_addresses = self._checked_header("From", [self.sender], "sender")
-        self._to_addresses = self._checked_header("To", self._envelope, "recipients")
+        # Each recipient gets the rule the [egress] check applies, held here too so no build path
+        # that skips that check can put an unchecked mailbox on the RCPT line. The sender is MAIL
+        # FROM, where bounces go, so it gets the same rule (vault BACKLOG #2841). The headers are
+        # built once, so a mismatch is refused here rather than at send time.
+        self._envelope = checked_envelope("Email destination", self.sender, self.recipients)
         username = s.get("username")
         password = s.get("password")
         self.username: str | None = str(username) if username else None
@@ -370,42 +461,10 @@ class EmailDestination(DestinationConnector):
         await asyncio.to_thread(self._send, payload)
         return None
 
-    @staticmethod
-    def _checked_header(field: str, checked: list[str], what: str) -> list[Address]:
-        """The ``From:`` or ``To:`` addresses, built from checked address strings rather than from
-        the raw setting.
-
-        ``policy.default`` still parses whatever a header is given, Address objects included, and
-        that parser decodes RFC 2047 encoded words. Two things keep it from naming an unchecked
-        address. :data:`_LOCAL_ATEXT` admits no ``=`` or ``?``, so no encoded word can form. And this
-        method sets the header on a scratch message and folds it under both policies the send can
-        use (``SMTP`` and ``SMTPUTF8``), which is the text the generator writes. It refuses any
-        result that is not exactly the checked list, so a later widening of that allowlist fails
-        closed at construction instead of reaching the wire."""
-        addresses = [
-            Address(username=local, domain=domain)
-            for local, _, domain in (address.rpartition("@") for address in checked)
-        ]
-        probe = EmailMessage()
-        probe[field] = addresses
-        header = probe[field]
-        expected = ", ".join(checked)
-        # Folding breaks the line only after a comma, so dropping each CRLF leaves the joined text.
-        written = [
-            header.fold(policy=pol).partition(":")[2].replace("\r\n", "").strip()
-            for pol in (email.policy.SMTP, email.policy.SMTPUTF8)
-        ]
-        if str(header) != expected or any(text != expected for text in written):
-            raise ValueError(
-                f"Email destination: the {field} header does not match the checked {what}"
-            )
-        return addresses
-
     def _build_message(self, payload: str) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = self.subject
-        msg["From"] = self._from_addresses
-        msg["To"] = self._to_addresses
+        self._envelope.address(msg)
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
         msg.set_content(payload, charset=self.encoding)
@@ -454,9 +513,7 @@ class EmailDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="EMAIL outbound",
                     )
-                # Both halves of the envelope are passed explicitly. Left to itself, smtplib derives
-                # MAIL FROM from a parse of the From header, which decodes encoded words.
-                smtp.send_message(msg, from_addr=self.sender, to_addrs=self._envelope)
+                self._envelope.send(smtp, msg)
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --

@@ -892,6 +892,59 @@ def _sender_shapes() -> dict[str, str]:
 _SENDER_SHAPES = _sender_shapes()
 
 
+def _recipient_shapes() -> dict[str, str]:
+    """Recipient values that are not one plain address, even with a display name or group dropped.
+    The Direct and alert-mail tests share them (vault BACKLOG #2870). Built from parts; the ids are
+    neutral."""
+    other = "other" + "@" + "partner.example"
+    shapes = {
+        "shape-a": _b64_word(other),
+        "shape-b": _ENCODED_LOCAL[0],
+        "shape-c": _ENCODED_LOCAL[1],
+        "shape-d": "undisclosed" + ":" + ";",
+        "shape-e": other + " <" + "ok" + "@" + "hospital.example" + ">",
+        "shape-f": _NON_ROUND_TRIP[0],
+        "shape-g": _NON_ROUND_TRIP[1],
+    }
+    for code in (13, 10, 0x85, 0x2028, 0x2029):
+        shapes[f"break-{code:04x}"] = "ok" + chr(code) + "x@hospital.example"
+    return shapes
+
+
+_RECIPIENT_SHAPES = _recipient_shapes()
+
+#: Every character the local-part allowlist admits, so a decoding or quoting step would show.
+_ALL_ATEXT_SENDER = "a#b$c&d'e*f+g-h^i_j`k{l}m~n.o@Hospital.example"
+
+#: Recipient values that read as one plain address once a display name or group is dropped, mapped
+#: to the one address RCPT TO and To: must carry. Shared like the shapes above; the ids are neutral.
+_NORMALISED_RECIPIENTS = {
+    "plain": ("b.c+d@HOSPITAL.example", "b.c+d@HOSPITAL.example"),
+    "display-comma": (
+        _quote() + "other@partner.example, x" + _quote() + " <ok@hospital.example>",
+        "ok@hospital.example",
+    ),
+    "display-encoded": (
+        _b64_word("other@partner.example, x") + " <ok@hospital.example>",
+        "ok@hospital.example",
+    ),
+    "group-member": ("grp: ok@hospital.example;", "ok@hospital.example"),
+}
+
+
+@pytest.mark.parametrize("value", list(_RECIPIENT_SHAPES.values()), ids=list(_RECIPIENT_SHAPES))
+async def test_a_recipient_that_is_not_one_plain_address_is_refused_before_any_connection(
+    wire: _WireCapture, value: str
+) -> None:
+    # The line-break ids were accepted before vault BACKLOG #2870: the address parser drops a bare
+    # CR or LF, so the RCPT line named an address with the break removed.
+    dest = _wire_dest(wire.port, [value])
+    with pytest.raises(ValueError, match="recipient"):
+        EmailDestination(dest)
+    assert wire.connections == 0
+    assert wire.rcpt_lines == []
+
+
 @pytest.mark.parametrize("value", list(_SENDER_SHAPES.values()), ids=list(_SENDER_SHAPES))
 async def test_a_sender_that_is_not_one_plain_address_is_refused_before_any_connection(
     wire: _WireCapture, value: str

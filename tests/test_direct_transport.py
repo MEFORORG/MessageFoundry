@@ -30,6 +30,7 @@ import inspect
 import smtplib
 import ssl
 import traceback
+from collections.abc import Iterator
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,13 @@ from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.direct import DirectDestination
+from tests.test_email_destination import (
+    _ALL_ATEXT_SENDER,
+    _NORMALISED_RECIPIENTS,
+    _RECIPIENT_SHAPES,
+    _SENDER_SHAPES,
+    _WireCapture,
+)
 
 # A synthetic (never-real-PHI) HL7 body for the crypto round-trip (CLAUDE.md §9).
 _SYNTHETIC_HL7 = (
@@ -238,10 +246,17 @@ class _FakeSMTP:
         self.did_noop = True
         return (250, b"OK")
 
-    def send_message(self, msg: EmailMessage) -> dict[str, Any]:
+    def send_message(
+        self,
+        msg: EmailMessage,
+        from_addr: str | None = None,
+        to_addrs: list[str] | None = None,
+    ) -> dict[str, Any]:
         if self.fail_at == "send":
             raise smtplib.SMTPRecipientsRefused({"x@y.z": (550, b"no")})
         self.sent.append(msg)
+        self.from_addr = from_addr
+        self.to_addrs = to_addrs
         return {}
 
 
@@ -408,6 +423,111 @@ def test_cleartext_refusals(monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
     with active_hop_posture(HopPosture(enforcing=False)):
         d = DirectDestination(_dest(pki, use_tls=False))
     assert d.use_tls is False
+
+
+# --- the SMTP envelope on the wire (vault BACKLOG #2870) ---------------------------------------------
+#
+# Each test reads the MAIL and RCPT lines a loopback listener received, so it checks what a relay
+# would act on rather than what the connector handed smtplib.
+
+
+@pytest.fixture
+def wire() -> Iterator[_WireCapture]:
+    capture = _WireCapture()
+    try:
+        yield capture
+    finally:
+        capture.close()
+
+
+def _wire_direct(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], port: int, **overrides: Any
+) -> DirectDestination:
+    """A Direct destination aimed at the capture listener. Cleartext needs the escape and a warn
+    posture; the S/MIME body is built as usual."""
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    settings: dict[str, Any] = {
+        "host": "127.0.0.1",
+        "port": port,
+        "use_tls": False,
+        "timeout_seconds": 5.0,
+        **overrides,
+    }
+    with active_hop_posture(HopPosture(enforcing=False)):
+        return DirectDestination(_dest(pki, **settings))
+
+
+@pytest.mark.parametrize(
+    "setting, address",
+    list(_NORMALISED_RECIPIENTS.values()),
+    ids=list(_NORMALISED_RECIPIENTS),
+)
+async def test_direct_mail_from_and_rcpt_name_exactly_the_checked_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+    pki: dict[str, Any],
+    wire: _WireCapture,
+    setting: str,
+    address: str,
+) -> None:
+    d = _wire_direct(monkeypatch, pki, wire.port, sender=_ALL_ATEXT_SENDER, recipients=[setting])
+    await d.send(_SYNTHETIC_HL7)
+    assert wire.mail_lines == [("mail from:<" + _ALL_ATEXT_SENDER + ">").encode()]
+    assert wire.rcpt_lines == [("rcpt to:<" + address + ">").encode()]
+    # The headers are built from the same checked text, so no display name or group reaches them.
+    [from_line] = [line for line in wire.data if line.lower().startswith(b"from:")]
+    assert from_line.rstrip(b"\r\n") == ("From: " + _ALL_ATEXT_SENDER).encode()
+    [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
+    assert to_line.rstrip(b"\r\n") == ("To: " + address).encode()
+
+
+async def test_direct_envelope_does_not_follow_the_headers(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], wire: _WireCapture
+) -> None:
+    # A plain address reads the same either way, so change both headers after the build: MAIL FROM
+    # and RCPT TO must still be the checked settings, which they are only when passed explicitly.
+    build = DirectDestination._build_smime
+
+    def changed_headers(self: DirectDestination, payload: str) -> EmailMessage:
+        msg = build(self, payload)
+        msg.replace_header("From", "another@partner.example")
+        msg.replace_header("To", "another@partner.example")
+        return msg
+
+    monkeypatch.setattr(DirectDestination, "_build_smime", changed_headers)
+    d = _wire_direct(monkeypatch, pki, wire.port)
+    await d.send(_SYNTHETIC_HL7)
+    assert wire.mail_lines == [b"mail from:<sender@hisp.example>"]
+    assert wire.rcpt_lines == [b"rcpt to:<recipient@hisp.example>"]
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("sender", v) for v in _SENDER_SHAPES.values()]
+    + [("recipients", v) for v in _RECIPIENT_SHAPES.values()],
+    ids=[f"sender-{k}" for k in _SENDER_SHAPES] + [f"recipient-{k}" for k in _RECIPIENT_SHAPES],
+)
+def test_direct_refuses_an_address_that_is_not_one_plain_mailbox_before_any_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    pki: dict[str, Any],
+    wire: _WireCapture,
+    field: str,
+    value: str,
+) -> None:
+    setting: Any = [value] if field == "recipients" else value
+    with pytest.raises(ValueError, match="sender" if field == "sender" else "recipient"):
+        _wire_direct(monkeypatch, pki, wire.port, **{field: setting})
+    assert wire.connections == 0
+    assert wire.mail_lines == []
+
+
+async def test_direct_send_passes_both_halves_of_the_envelope(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    _install_fake(monkeypatch)
+    await DirectDestination(_dest(pki)).send(_SYNTHETIC_HL7)
+    [smtp] = _FakeSMTP.instances
+    assert smtp.from_addr == "sender@hisp.example"
+    assert smtp.to_addrs == ["recipient@hisp.example"]
 
 
 # --- DeliveryError mapping + PHI/secret-safe error text ---------------------------------------------

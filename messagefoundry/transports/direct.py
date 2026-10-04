@@ -81,6 +81,7 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
+from messagefoundry.transports.email import checked_envelope
 
 __all__ = ["DirectDestination"]
 
@@ -250,6 +251,11 @@ class DirectDestination(DestinationConnector):
         self.port = int(s.get("port", 587))
         self.sender = sender
         self.recipients = _as_recipients(s.get("recipients"))
+        # The Email destination's address rule, for the sender and each recipient, with the headers
+        # built from the checked text. MAIL FROM and RCPT TO are then passed explicitly at send, so a
+        # header parse that decodes an encoded word or expands a group cannot move the envelope
+        # (vault BACKLOG #2870). Checked before the crypto material, so _probe_build uses it too.
+        self._envelope = checked_envelope("Direct destination", self.sender, self.recipients)
         self.subject = str(s.get("subject", ""))
         username = s.get("username")
         password = s.get("password")
@@ -627,8 +633,7 @@ class DirectDestination(DestinationConnector):
         )
         msg = EmailMessage()
         msg["Subject"] = self.subject
-        msg["From"] = self.sender
-        msg["To"] = ", ".join(self.recipients)
+        self._envelope.address(msg)
         # RFC 5751 S/MIME enveloped-data content type; the enveloped DER is the body.
         msg.set_content(
             enveloped,
@@ -704,7 +709,7 @@ class DirectDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="DIRECT outbound",
                     )
-                smtp.send_message(msg)
+                self._envelope.send(smtp, msg)
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --
