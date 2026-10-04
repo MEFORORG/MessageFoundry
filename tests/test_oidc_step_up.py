@@ -523,3 +523,36 @@ async def _user_id(service: AuthService, token: str) -> str:
     identity = await service.identity_for_token(token, activity=False)
     assert identity is not None
     return identity.user_id
+
+
+# --- the known-address record (vault BACKLOG #2145) --------------------------------------------------
+
+
+@pytest.mark.parametrize(("require_mfa", "recorded"), [(False, ["10.0.0.9"]), (True, [])])
+async def test_the_idp_step_up_records_its_address_only_for_an_account_that_owes_no_factor(
+    rsa_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    require_mfa: bool,
+    recorded: list[str],
+) -> None:
+    """A step-up is how a first-seen address passes its challenge, so the IdP leg writes the
+    callback's address to the account's known-address record. It writes only for an account that
+    owes no second factor. Under the shipped ``require_mfa`` every directory account owes one (the
+    directory floor), so there the step-up writes nothing and the factor legs write instead.
+
+    The sign-in passes no client address, so it writes nothing itself; the row the first case finds
+    can only have come from the step-up."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, require_mfa=require_mfa)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        uid = await _user_id(service, token)
+        assert await store.list_known_login_addresses(uid, since=0.0) == []
+        flow_id, _url = await _begin(service, token, client="10.0.0.8")
+
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, client="10.0.0.9")
+
+        assert out.ok, out
+        assert await store.list_known_login_addresses(uid, since=0.0) == recorded
+    finally:
+        await store.close()

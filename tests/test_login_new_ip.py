@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
 from messagefoundry.auth.notifications import LOGIN_NEW_IP, SecurityEvent
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.auth.tokens import hash_token
@@ -240,7 +240,7 @@ async def test_no_client_address_fails_open_and_audits_unknown_address() -> None
 async def test_an_address_outside_the_lookback_reads_as_new(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A returning account whose history aged out is NOT the first-login case: it has signed in
+    """A returning account whose known address aged out is NOT the first-login case: it has signed in
     before (``last_login_at`` is set), so an unrecognised address is NEW, not unevaluated."""
     store = await MessageStore.open(":memory:")
     try:
@@ -360,6 +360,10 @@ class _ResolvingLdap(_FakeLdap):
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return _principal(username)
 
+    def probe_principal(self, username: str, **_: object) -> DirectoryProbe:
+        """``verify_mfa`` asks the directory to vouch for a directory account (BACKLOG #2023)."""
+        return DirectoryProbe(DirectoryAnswer.FOUND, _principal(username))
+
 
 async def test_the_windows_sso_entry_point_records_the_kerberos_mechanism(
     monkeypatch: pytest.MonkeyPatch,
@@ -403,6 +407,77 @@ async def test_the_windows_sso_entry_point_records_the_kerberos_mechanism(
         assert json.loads(str(row["detail"])) == {"provider": "ad", "mech": "kerberos"}
         [notice] = _new_ip_notices(notifier)
         assert notice.detail == {"provider": "ad", "mech": "kerberos"}
+    finally:
+        await store.close()
+
+
+async def test_kerberos_under_the_default_require_mfa_builds_its_baseline_at_the_factor_leg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default path, which the test above steps around. Under the shipped ``require_mfa`` every
+    Kerberos session owes a factor, so no Kerberos SIGN-IN writes the record. The factor legs do:
+    the first sign-in finishes at enrolment, and each later one at ``verify_mfa``. So only the
+    account's first-ever sign-in is unjudged; the second is KNOWN and a third, from another host,
+    is NEW. Each later sign-in is classified before its own ``verify_mfa`` runs."""
+    monkeypatch.setattr(service_module, "kerberos_principal", lambda token, settings: "jsmith")
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        settings = AuthSettings(
+            ad_enabled=True,
+            kerberos_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+            mfa_verify_min_elapsed_seconds=0,
+            mfa_recovery_code_count=1,
+        )
+        assert settings.require_mfa, "this test is about the shipped default"
+        service = AuthService(
+            store,
+            settings,
+            ldap=_ResolvingLdap(),  # type: ignore[arg-type]
+            security_notifier=notifier,
+        )
+        await service.initialize()
+        await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
+
+        def _reasons() -> Any:
+            return store.list_audit(actor="jsmith", action="auth.login_address_unevaluated")
+
+        async def _new_ip_rows() -> list[str]:
+            rows = await store.list_audit(actor="jsmith", action="auth.login_new_ip")
+            return [str(r["client"]) for r in reversed(rows)]
+
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        first = await service.authenticate_kerberos(b"ticket", client="10.2.2.2")
+        assert first.ok and first.mfa_required
+        assert first.identity is not None and first.token is not None
+        uid = first.identity.user_id
+        # The sign-in that owes a factor wrote nothing.
+        assert await store.list_known_login_addresses(uid, since=0.0) == []
+        [unevaluated] = await _reasons()
+        assert json.loads(str(unevaluated["detail"]))["reason"] == "no_baseline"
+        secret = await _enrol_totp(service, first.identity, first.token, client="10.2.2.2", now=t0)
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.2.2.2"]
+
+        for step, client in enumerate(("10.2.2.2", "198.51.100.48"), start=1):
+            out = await service.authenticate_kerberos(b"ticket", client=client)
+            assert out.ok and out.mfa_required and out.token is not None
+            t = t0 + step * totp.DEFAULT_PERIOD
+            pin_totp_clock(monkeypatch, t)
+            assert (await service.verify_mfa(out.token, totp.totp(secret, now=t), client=client)).ok
+
+        # The second sign-in was KNOWN and the third NEW; no further sign-in failed open.
+        assert len(await _reasons()) == 1
+        assert await _new_ip_rows() == ["198.51.100.48"]
+        assert [e.client_ip for e in _new_ip_notices(notifier)] == ["198.51.100.48"]
+        assert sorted(await store.list_known_login_addresses(uid, since=0.0)) == [
+            "10.2.2.2",
+            "198.51.100.48",
+        ]
     finally:
         await store.close()
 
@@ -521,10 +596,11 @@ async def test_a_binding_withdrawn_at_the_oidc_mint_leaves_no_new_address_row(
         await store.close()
 
 
-async def test_a_password_step_row_that_still_owed_a_factor_is_not_a_baseline() -> None:
-    """Review finding, BACKLOG #288: ``auth.login_success`` is written at the PASSWORD step, even
-    when a second factor is still owed. A holder of the password alone must not be able to plant an
-    address as known by stopping at the MFA prompt. The factor leg's own row does count."""
+async def test_a_sign_in_that_still_owed_a_factor_marks_nothing_known() -> None:
+    """Review finding, BACKLOG #288: a sign-in that stops at the MFA prompt has proved only the
+    password. A holder of the password alone must not be able to plant an address as known that way,
+    so the local leg writes the known-address record only once nothing more is owed (vault BACKLOG
+    #2145). The factor leg writes it instead."""
     store = await MessageStore.open(":memory:")
     try:
         baseline = await _service(store)
@@ -537,9 +613,9 @@ async def test_a_password_step_row_that_still_owed_a_factor_is_not_a_baseline() 
         assert first.ok and first.mfa_required
         second = await owed.login("oper", PW, client="203.0.113.5")
         assert second.ok and second.mfa_required
-        # Both attempts read as NEW: the first one's password-step row did not make the address known.
+        # Both read as NEW: the first one, which stopped at the factor, did not make it known.
         assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
-        # The audit row is written every time; the notice is debounced per account.
+        # The audit row is written every time; the notice is debounced per account and address.
         assert len(_new_ip_notices(notifier)) == 1
         # vault BACKLOG #2145: nor does enrolling a factor from it. ADR 0197 Amendment A lets a
         # holder of the password alone enrol an authenticator they control, so an enrolment from a
@@ -552,7 +628,7 @@ async def test_a_password_step_row_that_still_owed_a_factor_is_not_a_baseline() 
         await store.close()
 
 
-async def test_a_failed_history_read_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_failed_record_read_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
@@ -593,7 +669,7 @@ async def test_a_second_new_address_inside_the_debounce_window_is_still_notified
         await store.close()
 
 
-async def test_an_ipv4_mapped_form_matches_its_ipv4_history() -> None:
+async def test_an_ipv4_mapped_form_matches_its_known_ipv4_address() -> None:
     """A bind change between 0.0.0.0 and :: renders one client both ways; it is one host."""
     store = await MessageStore.open(":memory:")
     try:
@@ -900,5 +976,35 @@ async def test_a_password_step_up_on_an_account_that_owes_a_factor_records_nothi
         )
         assert stepped.ok
         assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
+    finally:
+        await store.close()
+
+
+async def test_a_step_up_from_a_roamed_address_records_it_and_moves_the_anchor() -> None:
+    """A session minted at one address and used from another steps up there. On an account that
+    owes no factor the password is the whole credential, so the step-up proves as much from the new
+    address as a sign-in from it would: the address joins the record. ``reauth`` also re-anchors the
+    session, so after a password step-up the two address signals agree. A passkey assertion does
+    not re-anchor, and tests/test_webauthn.py pins that leg."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        out = await service.login("oper", PW, client="10.1.1.1")
+        assert out.ok and out.identity is not None and out.token is not None
+        # The mid-session signal reports the roamed address before the step-up.
+        assert await service.flag_new_client_ip(out.token, "198.51.100.80", path="/ui/x")
+
+        stepped = await service.reauth(out.identity, PW, token=out.token, client="198.51.100.80")
+
+        assert stepped.ok and stepped.token is not None
+        assert sorted(await store.list_known_login_addresses(uid, since=0.0)) == [
+            "10.1.1.1",
+            "198.51.100.80",
+        ]
+        assert not await service.flag_new_client_ip(stepped.token, "198.51.100.80", path="/ui/x")
+        again = await service.login("oper", PW, client="198.51.100.80")
+        assert again.ok and await _seeded(store, again.token)
+        assert await store.list_audit(actor="oper", action="auth.login_new_ip") == []
     finally:
         await store.close()
