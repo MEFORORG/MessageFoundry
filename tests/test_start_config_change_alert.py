@@ -380,6 +380,55 @@ async def test_a_flag_toggle_then_a_restart_raises_no_alert(
     assert rows[-1]["changed"] is False and rows[-1]["previous_fingerprint"] == after
 
 
+async def test_two_flag_toggles_move_the_provenance_baseline(
+    tmp_path: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """The flag is reflected live, so the loaded digest moves with each toggle: the second toggle
+    still counts as the one change since the load, and provenance reports no drift."""
+    cfg = _toml_config(tmp_path)
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app), _client(app) as c:
+        for flagged in (True, False):
+            r = await c.post(
+                "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": flagged}
+            )
+            assert r.status_code == 200, r.text
+        prov = (await c.get("/config/provenance")).json()
+    assert prov["drift"] is False
+    assert prov["fingerprint"] == config_fingerprint(cfg)
+    rows = await _start(tmp_path, cfg)
+    assert alerts == []
+    assert rows[-1]["changed"] is False
+
+
+async def test_a_flag_toggle_does_not_vouch_for_an_unloaded_edit(
+    tmp_path: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """An edit made on disk and never loaded, then a toggle, then a restart: the toggle's row
+    must not carry a digest that covers the edit, or the restart would raise nothing."""
+    cfg = _toml_config(tmp_path)
+    loaded = config_fingerprint(cfg)
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app), _client(app) as c:
+        with (cfg / "logic.py").open("a", encoding="utf-8") as fh:
+            fh.write("# an edit nobody loaded\n")
+        r = await c.post(
+            "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}
+        )
+        assert r.status_code == 200, r.text
+        engine: Engine = app.state.engine
+        flag = json.loads(
+            (await engine.store.list_audit(action="connection_flag_set"))[0]["detail"]
+        )
+    assert flag["fingerprint"] == loaded, "the row keeps the digest the running graph loaded"
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1
+    assert alerts[0]["previous_fingerprint"] == loaded
+    assert alerts[0]["fingerprint"] == config_fingerprint(cfg)
+    assert alerts[0]["baseline_action"] == "connection_flag_set"
+    assert rows[-1]["changed"] is True
+
+
 # --- the alert kind ------------------------------------------------------------------------------
 
 

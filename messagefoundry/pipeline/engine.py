@@ -1796,14 +1796,17 @@ class Engine:
         universal-object flag would need a store table, deliberately not built) — when no config dir is
         known, or when the validated write fails. The caller maps that to a 409.
 
-        Returns the ADR 0041 D1 fingerprint of the directory just written, taken under the same
-        lock, so the caller's ``connection_flag_set`` row names the bytes on disk after this write
-        and no other writer's (vault BACKLOG #2597). A start compares its own digest with that row,
-        so without it the next restart would read the toggle as an unexplained change. ``None``
-        when the digest could not be taken; the write still stands.
+        Returns the ADR 0041 D1 fingerprint the caller's ``connection_flag_set`` row records (vault
+        BACKLOG #2597). A start compares its own digest with that row. When the directory held the
+        loaded bytes before this write, it is the digest of the directory just written, taken under
+        the same lock, and :attr:`loaded_config_fingerprint` moves to it, since the flag was
+        reflected live. Otherwise some other edit sits on disk unloaded, and a digest of the whole
+        directory would vouch for it, so the loaded digest is returned unchanged and the next start
+        reports the difference. ``None`` when no loaded digest exists; the write still stands.
         """
         from messagefoundry.config import connections_edit
         from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
+        from messagefoundry.config.fingerprint import fingerprint_matches
         from messagefoundry.pipeline.wiring_runner import build_check_registry
 
         if direction not in ("inbound", "outbound"):
@@ -1853,6 +1856,9 @@ class Engine:
         # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
         # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
         async with self._toml_write_lock:
+            # vault BACKLOG #2597: whether the directory still holds the bytes the running graph
+            # loaded, read before this write changes it. See the return below.
+            before, _reason = await self.fingerprint_bundle(cfg_dir)
             await asyncio.to_thread(_write)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
@@ -1867,13 +1873,23 @@ class Engine:
                         rr.registry.outbound[name], flagged=flagged
                     )
             # Still under the lock, so no second toggle lands between the write and its digest. The
-            # write has landed, so nothing here may raise: a raise would report it as failed.
-            try:
-                fingerprint, _reason = await self.fingerprint_bundle(cfg_dir)
-            except Exception:  # noqa: BLE001 - fingerprint_bundle lets an unexpected type through
-                log.exception("the connection flag was written; its config fingerprint was not")
-                fingerprint = None
-        return fingerprint
+            # digest covers the whole directory, so it may vouch for this toggle only when the toggle
+            # is the one change since the load. Otherwise another edit is on disk that the running
+            # graph never loaded, and the row keeps the loaded digest, so the next start reports it.
+            after, _reason = await self.fingerprint_bundle(cfg_dir)
+            loaded = self.loaded_config_fingerprint
+            if (
+                before is not None
+                and after is not None
+                and loaded is not None
+                and isinstance(loaded_fp := loaded.get("fingerprint"), str)
+                and fingerprint_matches(before.get("fingerprint"), loaded_fp)
+            ):
+                # The running graph now matches these bytes (the flag was reflected live), so the
+                # provenance baseline moves with it.
+                self.loaded_config_fingerprint = after
+                return after
+            return loaded
 
     @property
     def running_config_dir(self) -> Path | None:

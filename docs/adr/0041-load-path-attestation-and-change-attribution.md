@@ -114,7 +114,9 @@ reload-audit detail; a fingerprint failure is logged and never blocks the audit.
 store's baseline and alerts on a change.* The baseline is the newest `config_loaded`,
 `config_reload` or `connection_flag_set` row from any node or engine shard, since all of them share
 one config directory and a node id changes on every restart. A flag toggle's row carries the digest
-of the `connections.toml` it wrote. Only the `fingerprint` key is compared. The detail now records a
+of the whole directory as written, but only when the toggle was the one change since the load;
+otherwise it carries the loaded digest, so a toggle never vouches for an edit nobody loaded. Only
+the `fingerprint` key is compared. The detail now records a
 `scheme` tag, and a baseline under another scheme, or with none, is not comparable, so a change to
 what is hashed does not read as a changed config. A change raises the `config_changed` alert, and the
 start row records `previous_fingerprint` and `changed`. The check is alert-only: a failed or slow

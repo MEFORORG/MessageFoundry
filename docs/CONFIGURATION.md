@@ -1221,11 +1221,15 @@ another node on the same store may still be paused there.
 **`config_changed` says a start loaded different config bytes than the store last recorded** (vault
 BACKLOG #2597). At each start the engine compares its config fingerprint (ADR 0041 D1) with the
 newest `config_loaded`, `config_reload` or `connection_flag_set` audit row. That row may come from
-any node or engine shard, because they all share one config directory. A change raises one
-`config_changed`, and the start's `config_loaded` row records `previous_fingerprint` and `changed`.
+any node or engine shard, because they all share one config directory. A start that sees a change
+raises `config_changed` once, and its `config_loaded` row records `previous_fingerprint` and
+`changed`. Starts that race, such as engine shards started together, can each raise it; the alert
+list folds them into one instance.
 
 - A change applied with `POST /config/reload` and then restarted does not alert. A change that only
   a restart picked up does, by design: nothing else tells that deploy apart from an unrecorded edit.
+- A connection flag toggle does not alert either. Its row vouches for the directory it wrote only
+  when nothing else changed since the load, so a toggle never hides an edit nobody loaded.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at

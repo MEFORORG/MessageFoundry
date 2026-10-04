@@ -1146,6 +1146,10 @@ async def _bounded[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
         task.cancel()
         task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
         raise TimeoutError(f"no answer within {timeout}s")
+    if task.cancelled():
+        # Cancelled by something other than this caller (a pool shutting down): a failed read,
+        # never a CancelledError that would read as the caller being cancelled.
+        raise RuntimeError("the read was cancelled")
     return task.result()
 
 
@@ -3203,8 +3207,9 @@ def create_app(
         except WiringError as exc:
             # Not TOML-managed (scope fork) OR a validate-before-persist failure — the edit never landed.
             raise HTTPException(409, str(exc)) from exc
-        # The digest of connections.toml as this write left it, so the next start reads this row as
-        # its baseline and does not report the toggle as a config change (vault BACKLOG #2597).
+        # The config digest the engine vouches for after this write (vault BACKLOG #2597): the
+        # directory as written when the toggle was the one change since the load, else the loaded
+        # digest. The next start reads this row as its baseline.
         await engine.store.record_audit(
             "connection_flag_set",
             actor=identity.username,
@@ -8412,6 +8417,10 @@ def create_managed_app(
                 if security_notifier is not None:
                     security_notifier.start()
             await engine.start()
+            # vault BACKLOG #2597: as soon as the changed config is serving, before any later startup
+            # step that could abort the start, so a crash loop on new bytes still pages each time.
+            if config_dir is not None and start_config is not None and start_config.changed:
+                _raise_config_changed(notifier or LoggingAlertSink(), engine, start_config)
             # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
             # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
             # re-reading engine.registry_runner each call keeps it correct across a config reload that swaps the
@@ -8514,9 +8523,6 @@ def create_managed_app(
                     fingerprint_failed=start_fingerprint_failure is not None,
                     comparison=start_config,
                 )
-                # Whether or not the row was written: the helper above never raises.
-                if start_config is not None and start_config.changed:
-                    _raise_config_changed(notifier or LoggingAlertSink(), engine, start_config)
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
                 await auth.initialize()
