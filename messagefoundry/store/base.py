@@ -1994,7 +1994,22 @@ class AuthStore(Protocol):
         self, user_id: str, *, email: str, now: float | None = None
     ) -> None: ...
 
+    # Also deletes the account's ``known_login_addresses`` rows (vault BACKLOG #2145).
     async def delete_user(self, user_id: str) -> None: ...
+
+    # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
+    # One row per (account id, host key). The caller folds the address to its host key; the store
+    # compares it byte for byte. Both reads and writes go through the (user_id, address) primary key.
+    #
+    # The addresses the account finished a sign-in from with ``last_seen >= since``, in no order.
+    async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]: ...
+
+    # Upsert one address (``first_seen`` kept, ``last_seen`` set to ``now``), then delete this
+    # account's rows with ``last_seen < forget_before``, in one transaction. The delete is the table's
+    # only retention: a row outside the reader's lookback can never match, so it is not kept.
+    async def remember_login_address(
+        self, user_id: str, address: str, *, now: float, forget_before: float
+    ) -> None: ...
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
     async def set_totp_secret(
