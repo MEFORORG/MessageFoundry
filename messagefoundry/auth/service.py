@@ -6966,8 +6966,8 @@ class AuthService:
         Called after the mint so a login that then fails (a withdrawn federated binding) leaves no
         row claiming a sign-in happened, and before the ``auth.login_success`` row so that row stays
         the newest one for the login. ``KNOWN`` writes nothing. ``NEW`` audits
-        ``auth.login_new_ip`` and sends the ``login_new_ip`` notice, debounced per account. The
-        fail-open verdicts audit ``auth.login_address_unevaluated`` with the reason and notify
+        ``auth.login_new_ip`` and sends the ``login_new_ip`` notice, debounced by
+        :meth:`_login_new_ip_notice_due`. The fail-open verdicts audit ``auth.login_address_unevaluated`` with the reason and notify
         nobody. This never refuses a login: the challenge is the session minted without step-up
         freshness, which the caller arranges.
 
@@ -6994,7 +6994,7 @@ class AuthService:
                     username=user.username,
                     email=user.notify_email,
                     client=client,
-                    detail=detail,
+                    detail=dict(detail),
                 )
             return
         await self._audit(
