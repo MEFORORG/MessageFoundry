@@ -310,8 +310,8 @@ notification address the account held **before** the repair (BACKLOG #2019).
   `--email`.
 - **An account that already holds a notification address needs `--email`** (BACKLOG #2288).
   Without it the command refuses before the password prompt and writes nothing. Kept silently,
-  that address would receive every later notice for the new Administrator. A first run that
-  stopped after creating the account left its own `--email` address there, so run the same
+  that address would receive every later notice for the new Administrator. A first run given
+  `--email` that stopped after creating the account left that address there, so run the same
   command again, with `--email`. You may give the address the account already holds.
 
 The repair first ends every session on the account and removes its TOTP key, its recovery codes

@@ -118,9 +118,15 @@ holds. See Amendment A.*
   repaired rather than created.
   → `tests/test_provision_first_administrator.py::test_an_interrupted_provision_is_completed_by_re_running`
   (parametrized over both points)
+  *(Amended 2026-10-04 by Amendment C: a re-run of a run given `--email` completes the row only
+  when it is given `--email` too, which the same command already carries.
+  → `tests/test_provision_first_administrator.py::test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_create`)*
 - **AC-5** — IF the named account holds roles, is disabled, or is directory-owned, THEN THE SYSTEM
   SHALL refuse rather than take it over.
   → `tests/test_provision_first_administrator.py::test_it_refuses_to_take_over_an_account_somebody_is_using`
+  *(Amended 2026-10-04 by Amendment C: it also refuses an account that holds a notification
+  address when no `--email` is given.
+  → `tests/test_provision_first_administrator.py::test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_email`)*
 - **AC-6** — IF no terminal is attached, THEN THE SYSTEM SHALL refuse, and THE SYSTEM SHALL expose no
   flag that supplies the password from argv or a file.
   → `tests/test_provision_first_administrator.py::test_cli_refuses_without_a_terminal`,

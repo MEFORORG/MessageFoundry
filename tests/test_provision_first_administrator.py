@@ -1348,12 +1348,22 @@ async def test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_
         await store.close()
 
 
-async def test_a_row_with_no_address_is_still_completed_without_an_email() -> None:
-    """The control: the refusal asks about the stored address, not about ``--email`` alone."""
+@pytest.mark.parametrize("stored", [None, "   "], ids=["null", "blank"])
+async def test_a_row_with_no_address_is_still_completed_without_an_email(
+    stored: str | None,
+) -> None:
+    """The control: the refusal asks about the stored address, not about ``--email`` alone. A
+    blank stored address counts as none, as it does for the holder notice."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings())
         await _roleless_account(store, email=None)
+        if stored is not None:
+            # No store API writes a blank address, so the legacy shape is written directly.
+            await store._db.execute(
+                "UPDATE users SET notify_email = ? WHERE id = 'roleless'", (stored,)
+            )
+            await store._db.commit()
         assert await service.provision_refusal("site-admin", notify_email=None) is None
         outcome = await service.provision_first_administrator(
             username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
@@ -1561,22 +1571,17 @@ def test_cli_refuses_a_row_that_holds_an_address_before_any_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """BACKLOG #2288: without ``--email`` the command stops before the password prompt, so no
-    authenticator key is shown for a run the store would then refuse, and nobody is told."""
+    authenticator key is shown for a run the store would then refuse. That nothing is written is
+    pinned at the service, by the refusal test above."""
     monkeypatch.chdir(tmp_path)
     key = _key_in_this_shell(monkeypatch)
     db = tmp_path / "p.db"
     _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
-    recorder = _Recorder()
-    monkeypatch.setattr(
-        "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
-    )
-
     _no_prompt(monkeypatch)
     assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
     captured = capsys.readouterr()
     assert "--email" in captured.out + captured.err
     assert "holder@example.invalid" not in captured.out + captured.err
-    assert recorder.events == [] and not recorder.started
 
 
 def test_cli_says_nobody_was_told_when_the_account_had_no_address(
