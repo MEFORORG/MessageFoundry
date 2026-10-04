@@ -12,6 +12,7 @@ loopback deployment, are no-ops (the request and the session share one address).
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import ADMIN_NEW_IP, SecurityEvent
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import _NEW_IP_PER_SESSION_MAX, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -194,6 +195,122 @@ async def test_repeat_from_same_new_ip_is_deduped() -> None:
         actions = [r["action"] for r in await store.list_audit(limit=50)]
         assert actions.count("auth.admin_action_new_ip") == 2
         assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == 2
+    finally:
+        await store.close()
+
+
+async def _new_ip_rows(store: MessageStore) -> list[str]:
+    """The ``seen_ip`` of every ``auth.admin_action_new_ip`` row, oldest first."""
+    rows = await store.list_audit(action="auth.admin_action_new_ip", limit=100)
+    return [json.loads(str(r["detail"]))["seen_ip"] for r in reversed(rows)]
+
+
+async def test_alternating_new_addresses_audit_once_each() -> None:
+    """BACKLOG #2159: the dedupe holds a SET per session, not the last address. Alternating between
+    two new addresses used to write a row and a notice on every switch."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(admin_new_ip_step_up=True), security_notifier=notifier
+        )
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        for seen in ("10.2.2.2", "10.3.3.3", "10.2.2.2", "10.3.3.3", "10.2.2.2"):
+            assert await service.flag_new_client_ip(token, seen, path="/users") is True
+        assert await _new_ip_rows(store) == ["10.2.2.2", "10.3.3.3"]
+        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == 2
+    finally:
+        await store.close()
+
+
+async def test_a_reanchor_starts_the_dedupe_over() -> None:
+    """BACKLOG #2159: after a re-verification moves the anchor, an address flagged before it is a new
+    event again. It used to stay suppressed, so the forced step-up left no audit row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, identity = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        # Re-verify from a THIRD address: the session is now anchored there.
+        reauthed = await service.reauth(identity, PW, token=token, client="10.3.3.3")
+        assert reauthed.ok is True and reauthed.token is not None
+        token = reauthed.token
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        assert await _new_ip_rows(store) == ["10.2.2.2", "10.2.2.2"]
+    finally:
+        await store.close()
+
+
+async def test_a_reanchor_back_to_the_same_address_still_starts_over() -> None:
+    """The anchor includes ``reauth_at``, not the address alone. Anchored at A, flag B, re-verify from
+    B, then from A again: the anchor ADDRESS is A both times, but B was re-verified in between, so a
+    later request from B is a new event and writes a row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, identity = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        for client in ("10.2.2.2", "10.1.1.1"):
+            reauthed = await service.reauth(identity, PW, token=token, client=client)
+            assert reauthed.ok is True and reauthed.token is not None
+            token = reauthed.token
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        assert await _new_ip_rows(store) == ["10.2.2.2", "10.2.2.2"]
+    finally:
+        await store.close()
+
+
+async def test_ipv4_mapped_ipv6_is_the_same_host() -> None:
+    """BACKLOG #2159: ``_same_host`` folds ``::ffff:a.b.c.d`` to ``a.b.c.d``, as the sign-in signal
+    already did. A bind change between ``0.0.0.0`` and ``::`` must not trip the signal, and one new
+    host seen in both forms is one audit row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.0.0.5")
+        assert await service.flag_new_client_ip(token, "::ffff:10.0.0.5", path="/users") is False
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        assert await service.flag_new_client_ip(token, "::ffff:10.2.2.2", path="/users") is True
+        assert await _new_ip_rows(store) == ["10.2.2.2"]
+    finally:
+        await store.close()
+
+
+def test_same_host_folds_mapped_loopback_and_case() -> None:
+    assert AuthService._same_host("::ffff:10.0.0.5", "10.0.0.5")
+    assert AuthService._same_host("::ffff:127.0.0.1", "::1")
+    assert AuthService._same_host("2001:DB8::1", "2001:db8::1")
+    assert AuthService._same_host("not-an-address", "not-an-address")
+    assert not AuthService._same_host("10.0.0.5", "10.0.0.6")
+    assert not AuthService._same_host("::ffff:10.0.0.5", "::ffff:10.0.0.6")
+    assert not AuthService._same_host("not-an-address", "::1")
+
+
+async def test_one_epoch_audits_at_most_the_per_session_cap() -> None:
+    """The signal runs on every sensitive request, so one session audits at most
+    ``_NEW_IP_PER_SESSION_MAX`` addresses between re-verifications. Past the cap the step-up is still
+    forced; only the row and the notice are held back."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(admin_new_ip_step_up=True), security_notifier=notifier
+        )
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        addresses = [f"10.9.0.{n}" for n in range(1, _NEW_IP_PER_SESSION_MAX + 3)]
+        for _ in range(2):
+            for seen in addresses:
+                assert await service.flag_new_client_ip(token, seen, path="/users") is True
+        assert await _new_ip_rows(store) == addresses[:_NEW_IP_PER_SESSION_MAX]
+        assert (
+            sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP)
+            == _NEW_IP_PER_SESSION_MAX
+        )
     finally:
         await store.close()
 

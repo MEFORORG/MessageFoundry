@@ -33,6 +33,7 @@ from messagefoundry.auth import webauthn
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_ENROLL,
     AuthService,
+    _FlaggedNewIps,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -152,13 +153,14 @@ async def test_the_new_ip_dedupe_survives_rotation(engine: Engine) -> None:
     the session already re-verified from.
     """
     service, token = await _service_and_token(engine)
-    service._new_ip_seen[hash_token(token)] = "10.11.12.13"
+    flagged = _FlaggedNewIps(("10.0.0.1", None), {"10.11.12.13"})
+    service._new_ip_seen[hash_token(token)] = flagged
 
     rotated = await service._rotate_session_token(token)
     assert rotated is not None
 
     assert hash_token(token) not in service._new_ip_seen
-    assert service._new_ip_seen.get(hash_token(rotated)) == "10.11.12.13"
+    assert service._new_ip_seen.get(hash_token(rotated)) is flagged
 
 
 async def test_the_reproof_budget_survives_rotation(engine: Engine) -> None:
