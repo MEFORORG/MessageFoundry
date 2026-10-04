@@ -583,17 +583,35 @@ def test_the_credential_lock_key_folds_every_spelling_a_backend_may_match() -> N
     assert _credential_lock_key("alice") != _credential_lock_key("bob")
 
 
-def test_the_credential_lock_key_reads_a_bounded_prefix() -> None:
+def test_the_credential_lock_key_reads_a_bounded_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     """The key is computed on the event loop before any check, and NFKD expands U+FDFA about
-    eighteenfold, so an unbounded name would stall the loop. Only a bounded prefix is read."""
+    eighteenfold, so an unbounded name would stall the loop. Only a bounded prefix is read.
+
+    The bound is asserted on the INPUT that reaches the normaliser, not on elapsed time. A
+    wall-clock limit here measured the runner: a stalled Windows runner took 2.55 s over work that
+    is bounded by construction (BACKLOG #2556).
+
+    RED when: the name is normalised whole and cut afterwards. That returns the same key, so only
+    the size of what the normaliser was handed can tell the two apart.
+    """
     import messagefoundry.auth.service as svc
 
     cap = svc._CREDENTIAL_KEY_INPUT_MAX
     assert cap >= 256  # the store's column width: no real name is cut
-    huge = "\ufdfa" * 1_000_000
-    started = time.monotonic()
+    real_normalize = svc.unicodedata.normalize
+    normalised_lengths: list[int] = []
+
+    def spy(form: str, text: str) -> str:
+        normalised_lengths.append(len(text))
+        return real_normalize(form, text)
+
+    monkeypatch.setattr(svc.unicodedata, "normalize", spy)
+    huge = "\ufdfa" * (cap * 8)
     key = _credential_lock_key(huge)
-    assert time.monotonic() - started < 1.0
+    assert normalised_lengths, "the key no longer normalises through unicodedata.normalize"
+    assert max(normalised_lengths) <= cap, (
+        f"the normaliser was handed {max(normalised_lengths)} characters, over the {cap} cap"
+    )
     assert key == _credential_lock_key("\ufdfa" * cap)
     # A cut merges names past the cap into one queue, which is coarser and so safe.
     assert _credential_lock_key("a" * cap + "x") == _credential_lock_key("a" * cap + "y")
