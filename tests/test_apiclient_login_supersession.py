@@ -13,8 +13,7 @@ counts (BACKLOG #2096 is the engine half, #2281 this client's).
 
 The first tests drive a real engine end to end, because the closing test is what the engine does
 with each token. The rest stub the transport to pin what an end-to-end run cannot force: which
-token ``login`` names, and what a poll clone does with a read that is refused while a sign-in is
-replacing the shared token. ``set_token`` signs nothing in, so it still ends the token it replaces
+token ``login`` names. ``set_token`` signs nothing in, so it still ends the token it replaces
 with ``POST /auth/logout``. The tests that a failed revoke never fails a call and never prompts now
 drive ``set_token``.
 """
@@ -24,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
@@ -475,8 +473,8 @@ def test_set_token_holds_the_new_token_before_it_revokes_the_replaced_one() -> N
     A poll clone reads the token through the cell it shares with this client. While the revoke is
     in flight, a clone that still read the replaced token would send a token the engine is ending,
     and its background reads would fail. The stub records what the clone reads at that moment.
-    ``login`` cannot order it this way, because the engine ends the old token inside the sign-in;
-    the poll-clone tests at the end of this file cover that case."""
+    ``login`` cannot order it this way, because the engine ends the old token inside the sign-in
+    request. A clone read in that span is refused once, as in a rotation race."""
     client = EngineClient(_BASE)
     poll = client.for_polling()
     seen_by_poll: list[str | None] = []
@@ -645,117 +643,3 @@ def test_set_token_still_ends_the_issued_token_when_the_new_one_is_refused() -> 
         client.close()
     assert excinfo.value.status == 401
     assert _logouts(sent) == [f"Bearer {issued}"]
-
-
-# --- a read refused while a sign-in replaces the shared token (BACKLOG #2281) ----------------
-
-
-def test_a_poll_read_refused_mid_sign_in_waits_for_it_and_follows_the_new_token() -> None:
-    """RED when: a poll clone's read, refused because a sign-in on the shared cell has just ended
-    its token, reaches the caller as a 401 instead of following the sign-in.
-
-    ``login`` names the held token as ``supersedes``, so the engine ends it INSIDE the sign-in
-    request, before the new token reaches the cell. The stub holds the sign-in open until the
-    clone's read has been refused, then checks the clone is still waiting before it answers.
-    Without the cell's ``replacing`` lock the clone would find the old token still in the cell and
-    give up at once."""
-    client = EngineClient(_BASE)
-    poll = client.for_polling()
-    _scripted(client, _ok)
-    client.login("op", PW)
-    old = client.token
-    poll_bearers: list[str] = []
-    refused = threading.Event()
-    outcome: list[CurrentUser | ApiError] = []
-
-    def _poll_send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
-        bearer = request.headers["authorization"]
-        poll_bearers.append(bearer)
-        if bearer == f"Bearer {old}":
-            refused.set()
-            return httpx.Response(401, json={"detail": "invalid token"}, request=request)
-        return _engine(request)
-
-    poll._http.send = _poll_send  # type: ignore[method-assign]
-
-    def _read() -> None:
-        try:
-            outcome.append(poll.me())
-        except ApiError as exc:
-            outcome.append(exc)
-
-    reader = threading.Thread(target=_read, daemon=True)
-    still_waiting: list[bool] = []
-    send_login = client._http.send
-
-    def _sign_in_held_open(
-        request: httpx.Request, *args: object, **kwargs: object
-    ) -> httpx.Response:
-        if request.url.path == "/auth/login":
-            reader.start()
-            assert refused.wait(5), "the poll read never reached the engine"
-            reader.join(0.2)
-            still_waiting.append(reader.is_alive())
-        return send_login(request)  # the scripted engine reads only the request
-
-    client._http.send = _sign_in_held_open  # type: ignore[method-assign]
-    try:
-        result = client.login("op", PW)
-        reader.join(10)
-    finally:
-        poll.close()
-        client.close()
-    assert still_waiting == [True], "the refused read did not wait for the sign-in in flight"
-    assert not reader.is_alive()
-    assert len(outcome) == 1 and isinstance(outcome[0], CurrentUser), outcome
-    assert poll_bearers == [f"Bearer {old}", f"Bearer {result.token}"]
-
-
-def test_a_refused_read_is_sent_once_when_nothing_replaced_its_token() -> None:
-    """RED when: a 401 on a read is retried although the cell still holds the token it was sent on.
-    That 401 is the engine's real answer, such as an expired session, and must reach the caller."""
-    client = EngineClient(_BASE)
-    sent = _scripted(client, _refused(401))
-    try:
-        client.login("op", PW)
-        with pytest.raises(ApiError) as excinfo:
-            client.me()
-    finally:
-        client.close()
-    assert excinfo.value.status == 401
-    assert [r.url.path for r in sent] == ["/auth/login", "/auth/me"]
-
-
-def _replaces_and_refuses(client: EngineClient) -> Callable[[httpx.Request], httpx.Response]:
-    """Refuse every call with a 401, after moving the shared cell to a fresh token, as a sign-in
-    that finished while the call was in flight would."""
-    replaced: list[str] = []
-
-    def _answer(request: httpx.Request) -> httpx.Response:
-        replaced.append(f"tok-replaced-{len(replaced) + 1}")
-        client._hold_issued(replaced[-1])
-        return httpx.Response(401, json={"detail": "invalid token"}, request=request)
-
-    return _answer
-
-
-@pytest.mark.parametrize(
-    ("method", "sends"), [("GET", 2), ("POST", 1)], ids=["read-once-more", "write-never"]
-)
-def test_a_read_refused_after_its_token_was_replaced_is_resent_once_and_a_write_never(
-    method: str, sends: int
-) -> None:
-    """RED when: a refused read is not followed onto the token now in the cell, is followed more
-    than once, or a refused WRITE is sent twice. A 401 on a write can be the route's own answer,
-    such as a wrong code on ``/auth/mfa-verify``, so a second send would count twice."""
-    client = EngineClient(_BASE)
-    sent = _scripted(client, _replaces_and_refuses(client))
-    try:
-        client.login("op", PW)
-        with pytest.raises(ApiError) as excinfo:
-            client._request(method, "/auth/me")
-    finally:
-        client.close()
-    assert excinfo.value.status == 401
-    bearers = [r.headers["authorization"] for r in sent[1:]]
-    assert bearers == ["Bearer tok-1", "Bearer tok-replaced-1"][:sends]

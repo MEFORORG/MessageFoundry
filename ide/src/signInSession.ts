@@ -13,16 +13,26 @@
 // session first, before the cap counts (BACKLOG #2096).
 //
 // THE COST IS THE ORDER ON THIS SIDE. The old token now dies inside the request, before the new one is
-// in the cache. Two things follow.
-//   1. A call already running on the old token can be refused with a 401 in that span. Each sign-in is
-//      therefore tracked from before its request leaves until the new token is stored, and a caller
-//      that gets a 401 awaits `signInSettled` before it reads the cache. Without that, `withAuth`
-//      would find its own dead token still cached, clear the cache and prompt again, and the clear
-//      could land after the store and drop the new token.
-//   2. A lost reply leaves the cache holding a dead token. If the engine minted the new session and
-//      ended the old one, and the reply never arrived, the next authenticated call gets a 401 and
-//      `withAuth` signs in again. Before, the old token stayed live in that case. That is the accepted
-//      price of ending the old session ahead of the cap; it is not harmless.
+// in the cache. Four things follow.
+//   1. A reader of the cache could pick up the dead token in that span. Each sign-in is therefore
+//      tracked from before its request leaves until the new token is stored, and `peekToken` in
+//      auth.ts awaits `signInSettled` before it reads. A call already sent on the old token can still
+//      get a 401, and `withAuth` then reads the cache again through `peekToken`.
+//   2. Two sign-ins for one engine run one after the other. The second reads the cache only once the
+//      first has stored its token, so it names THAT token and the first one's session ends too. Run
+//      side by side, both would name the same old token, and the first new session would be left live
+//      and unreachable.
+//   3. A wait is bounded by SIGN_IN_WAIT_MS, because `postJson` has no timeout of its own. A sign-in
+//      that hangs past it is no longer waited for: a reader then sees the old token, and a second
+//      sign-in names it again, which is the order this file had before the bound.
+//   4. The tracking lives in one extension host, which is one VS Code window, while SecretStorage is
+//      shared by every window. A sign-in in one window is NOT waited for in another. A call there on
+//      the old token can get a 401 and prompt for a sign-in the user already made. The bounded cost is
+//      that extra prompt, and nothing here can wait across windows.
+// A lost reply also leaves the cache holding a dead token: if the engine minted the new session and
+// ended the old one and the reply never arrived, the next authenticated call gets a 401 and `withAuth`
+// signs in again. Before, the old token stayed live in that case. That is the accepted price of ending
+// the old session ahead of the cap; it is not harmless.
 
 /** The slice of `vscode.SecretStorage` a sign-in needs. */
 export interface TokenCache {
@@ -30,8 +40,23 @@ export interface TokenCache {
   store(key: string, value: string): PromiseLike<void>;
 }
 
-/** Sign-ins between "request about to leave" and "new token stored", by cache key. */
+/** The longest any wait here lasts, in ms. `postJson` has no timeout, so an unbounded wait could hang. */
+export const SIGN_IN_WAIT_MS = 30_000;
+
+/** Sign-ins between "request about to leave" and "new token stored", by cache key. Never rejects. */
 const inFlight = new Map<string, Promise<void>>();
+
+/** `pending`, or `ms` elapsing, whichever comes first. Never rejects. */
+function bounded(pending: Promise<void> | undefined, ms: number): Promise<void> {
+  if (pending === undefined) {
+    return Promise.resolve();
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  return Promise.race([pending, expiry]).finally(() => clearTimeout(timer));
+}
 
 /**
  * Send one sign-in for the engine cached under `key`, and store the token it returns.
@@ -40,22 +65,28 @@ const inFlight = new Map<string, Promise<void>>();
  * `supersedes`; with nothing cached the field is omitted, so the body is exactly `credentials`. A
  * refused sign-in rejects with whatever `post` threw and leaves the cache as it was: the engine ends
  * the named session only once it has accepted the new credential.
+ *
+ * A sign-in already in flight for `key` is waited for first, up to `waitMs`, so this one names the
+ * token that one stored.
  */
 export function signInSuperseding<R extends { token: string }>(
   cache: TokenCache,
   key: string,
   credentials: Record<string, string>,
   post: (body: Record<string, string>) => Promise<R>,
+  waitMs: number = SIGN_IN_WAIT_MS,
 ): Promise<R> {
+  const earlier = inFlight.get(key);
   const attempt = (async () => {
+    await bounded(earlier, waitMs);
     const prior = await cache.get(key);
     const reply = await post(prior ? { ...credentials, supersedes: prior } : credentials);
     await cache.store(key, reply.token);
     return reply;
   })();
-  // Chained onto any sign-in already in flight for this key, so one await covers them all. Set in the
-  // same tick the attempt starts, which is before its request can leave.
-  const settled = Promise.allSettled([inFlight.get(key), attempt]).then(() => undefined);
+  // Chained onto the earlier sign-in, so one await covers them all, but only as long as this attempt
+  // waited for it. Set in the same tick the attempt starts, which is before its request can leave.
+  const settled = Promise.allSettled([bounded(earlier, waitMs), attempt]).then(() => undefined);
   inFlight.set(key, settled);
   void settled.then(() => {
     if (inFlight.get(key) === settled) {
@@ -66,9 +97,10 @@ export function signInSuperseding<R extends { token: string }>(
 }
 
 /**
- * Resolves once no sign-in tracked for `key` is still between its request and its store. Never
- * rejects: a failed sign-in settles it too. Resolves at once when none is in flight.
+ * Resolves once no sign-in tracked for `key` is still between its request and its store, or after
+ * `waitMs`, whichever is first. Never rejects: a failed sign-in settles it too. Resolves at once when
+ * none is in flight.
  */
-export async function signInSettled(key: string): Promise<void> {
-  await inFlight.get(key);
+export function signInSettled(key: string, waitMs: number = SIGN_IN_WAIT_MS): Promise<void> {
+  return bounded(inFlight.get(key), waitMs);
 }

@@ -108,11 +108,16 @@ export async function signOut(ctx: vscode.ExtensionContext, url: string): Promis
  * The cached token for `url`, or undefined — NEVER prompts. For background callers (the live-status
  * poll): a poll must not pop a sign-in from a timer, so it reads passively and degrades to "no live
  * data" when there is no session. Interactive flows keep using {@link ensureToken}/{@link withAuth}.
+ *
+ * It first waits, bounded, for a sign-in in flight for `url`. That sign-in has the engine end the
+ * cached token inside its request, so reading before its reply is stored would hand out a dead token
+ * (BACKLOG #2281; signInSession.ts says why). Every reader of the cache goes through here for that.
  */
 export async function peekToken(
   ctx: vscode.ExtensionContext,
   url: string,
 ): Promise<string | undefined> {
+  await signInSettled(secretKey(url));
   return await ctx.secrets.get(secretKey(url));
 }
 
@@ -185,7 +190,7 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
     // sign-in names the cached one as `supersedes` and the engine ends that session itself, once it
     // has accepted the new credential and before its session cap counts. A failed sign-in therefore
     // signs nobody out, and only that one token ends, never the user's other sessions. No
-    // `/auth/logout` follows. signInSession.ts states why, and what the order costs. `withAuth`
+    // `/auth/logout` follows. signInSession.ts says why, and what the order costs. `withAuth`
     // clears the cache before it re-signs in after a 401, so the case this covers is the status
     // bar's explicit "Sign in" over a token that is still cached and still live.
     let res: LoginResponse;
@@ -232,7 +237,7 @@ export async function ensureToken(
   ctx: vscode.ExtensionContext,
   url: string,
 ): Promise<string | undefined> {
-  return (await ctx.secrets.get(secretKey(url))) ?? (await signIn(ctx, url));
+  return (await peekToken(ctx, url)) ?? (await signIn(ctx, url));
 }
 
 /**
@@ -261,10 +266,9 @@ export async function withAuth<T>(
       if (!(e instanceof HttpError && e.status === 401) || attempt >= 2) {
         throw e;
       }
-      // The engine ends a superseded token INSIDE the sign-in request, before the new one is stored.
-      // A sign-in still in flight would leave this call's dead token in the cache, and the clear
-      // below could then drop the new one. So wait for it before reading the cache.
-      await signInSettled(secretKey(url));
+      // peekToken waits for a sign-in in flight first. Without that, a sign-in that ended this call's
+      // token would leave it cached until its reply is stored, and the clear below could drop the
+      // new token.
       const cached = await peekToken(ctx, url);
       if (cached !== undefined && cached !== token) {
         token = cached;

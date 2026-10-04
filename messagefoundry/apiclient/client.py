@@ -548,21 +548,13 @@ class _TokenCell:
     (:meth:`EngineClient.set_token`). :meth:`EngineClient.login` names the token it replaces to the
     engine as superseded only when it is True, because a token from outside may be in use by
     another process.
-
-    ``replacing`` is held by :meth:`EngineClient.login` from before its request leaves until the new
-    token is in the cell. The engine ends the superseded token inside that request, so for that
-    span the cell holds a token the engine already refuses. A read on a clone that is refused with
-    a 401 waits on this lock and then looks at the cell again: see
-    :meth:`EngineClient._replaced_since`. It is re-entrant, so a read made on the signing-in thread
-    itself never waits on its own sign-in.
     """
 
-    __slots__ = ("issued_here", "replacing", "value")
+    __slots__ = ("issued_here", "value")
 
     def __init__(self, value: str | None = None) -> None:
         self.value = value
         self.issued_here = False
-        self.replacing = threading.RLock()
 
 
 class EngineClient:
@@ -846,10 +838,9 @@ class EngineClient:
         reference, not a lock. That is a plain retry (one background read 401s and the next succeeds),
         not the permanent breakage a stale copy would cause.
 
-        A read racing a SIGN-IN is retried here instead of failing. :meth:`login` has the engine end
-        the token it replaces inside the sign-in request, so a ``GET`` sent on that token can be
-        refused before the new one is in the cell. Such a ``GET`` waits for the sign-in to finish
-        and is sent once more on the new token (:meth:`_replaced_since`).
+        A read racing a SIGN-IN is the same plain retry. :meth:`login` has the engine end the token
+        it replaces inside the sign-in request, so a read sent on that token before the reply
+        arrives is refused once, and the next read carries the new token.
         """
         # The absolute paths fixed at construction, when there are any: a relative path resolved
         # now could name a different file than this client pins, after a change of directory.
@@ -905,7 +896,6 @@ class EngineClient:
         _allow_step_up: bool = True,
         _allow_mfa: bool = True,
         _follow_pin: bool = True,
-        _follow_replaced: bool = True,
         _bearer: str | None = None,
         **kw: object,
     ) -> httpx.Response:
@@ -999,7 +989,6 @@ class EngineClient:
                 _allow_step_up=_allow_step_up,
                 _allow_mfa=_allow_mfa,
                 _follow_pin=False,
-                _follow_replaced=_follow_replaced,
                 _bearer=_bearer,
                 **kw,
             )
@@ -1021,7 +1010,6 @@ class EngineClient:
                 _allow_step_up=_allow_step_up,
                 _allow_mfa=False,
                 _follow_pin=True,
-                _follow_replaced=_follow_replaced,
                 # Always None here, since a ``_bearer`` call disarms this retry. Keep it: strict
                 # mypy refuses to let ``**kw: object`` fill the typed ``_bearer`` parameter.
                 _bearer=_bearer,
@@ -1048,65 +1036,12 @@ class EngineClient:
                     _allow_step_up=False,
                     _allow_mfa=_allow_mfa,
                     _follow_pin=True,
-                    _follow_replaced=_follow_replaced,
                     _bearer=_bearer,  # always None here; kept for mypy, as in the MFA retry above
                     **kw,
                 )
-        # A sign-in on the shared cell ended the token this read carried (BACKLOG #2281): send it
-        # once more, on the token that sign-in was issued. Only a GET, and only once; see
-        # _replaced_since for why both limits are there.
-        if (
-            _follow_replaced
-            and response.status_code == 401
-            and method == "GET"
-            and _bearer is None
-            and bearer is not None
-            and self._replaced_since(bearer)
-        ):
-            return self._request(
-                method,
-                path,
-                _allow_step_up=_allow_step_up,
-                _allow_mfa=_allow_mfa,
-                _follow_pin=True,
-                _follow_replaced=False,
-                _bearer=None,  # this branch runs only when it is None; kept for mypy, as above
-                **kw,
-            )
         if response.status_code >= 400:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response
-
-    def _replaced_since(self, sent: str) -> bool:
-        """After a 401 on ``sent``: True when the shared cell now holds a different token.
-
-        :meth:`login` names the token it replaces as ``supersedes``, and the engine ends that token
-        inside the sign-in request. The new token reaches the cell only when the reply does. A
-        :meth:`for_polling` clone that sends a read in between presents a token the engine has
-        already ended, and is refused. That refusal says nothing about the user's session, which
-        is about to continue on the new token, so it must not reach the caller as a sign-out.
-
-        So this waits for a sign-in in flight on the cell, then compares. True means the caller
-        sends the request again, on the token now in the cell. False means the 401 stands: the
-        cell still holds ``sent`` (no sign-in replaced it, or the sign-in failed), or it was
-        cleared. The wait is bounded by the client timeout, and a wait that runs out reads as False.
-
-        Three limits keep the second send safe:
-
-        * **Only a GET.** The clones exist for reads. A 401 on a write could also be the route's own
-          answer, such as a wrong code on ``/auth/mfa-verify``, and sending that twice counts twice.
-        * **Only once.** The second attempt is sent with this follow disarmed.
-        * **Only the held token.** A request sent on another token (``_bearer``) is never followed.
-
-        A rotation (:meth:`_adopt_rotated`) takes no lock, so a read refused before the rotated
-        token is adopted still fails once. One refused after it is retried here.
-        """
-        cell = self._token_cell
-        if not cell.replacing.acquire(timeout=self._timeout):
-            return False
-        cell.replacing.release()
-        current = cell.value
-        return current is not None and current != sent
 
     def _adopt_rotated(self, response: httpx.Response) -> None:
         """Adopt the re-keyed session token an elevation route hands back (ASVS 7.2.4).
@@ -1660,10 +1595,8 @@ class EngineClient:
         **The cost is the order on this side.** The old token now dies inside the request, before
         the new one is in the shared cell. Two things follow.
 
-        * A :meth:`for_polling` clone can send a read on the old token in that span and be refused.
-          ``login`` holds the cell's ``replacing`` lock from before the request until the new token
-          is held, and a refused ``GET`` on a clone waits for it and is sent once more on the new
-          token. See :meth:`_replaced_since`. A write sent on a clone in that span is not retried.
+        * A :meth:`for_polling` clone that sends a request on the old token in that span is
+          refused once, the same plain retry a rotation race causes (see :meth:`for_polling`).
         * **A lost reply leaves this client signed out.** If the engine mints the new session and
           ends the old one, and the reply then fails to arrive or to decode, this client still
           holds the old token, which is dead, and never learns the new one. ``login`` raises
@@ -1677,14 +1610,11 @@ class EngineClient:
         body = {"username": username, "password": password, "provider": provider}
         if totp_code and totp_code.strip():
             body["totp_code"] = totp_code.strip()
-        cell = self._token_cell
-        # Held across the request AND the adoption: see _replaced_since for who waits on it.
-        with cell.replacing:
-            prior = cell.value
-            if prior and cell.issued_here:
-                body["supersedes"] = prior
-            result = _decode(self._request("POST", "/auth/login", json=body), LoginResponse)
-            self._hold_issued(result.token)
+        prior = self._token
+        if prior and self._token_cell.issued_here:
+            body["supersedes"] = prior
+        result = _decode(self._request("POST", "/auth/login", json=body), LoginResponse)
+        self._hold_issued(result.token)
         self._user = result.user
         # A step-up purpose stashed for the old session must not bind the new one's next reauth().
         self._pending_step_up_action = None

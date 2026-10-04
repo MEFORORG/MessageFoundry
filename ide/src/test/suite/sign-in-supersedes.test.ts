@@ -191,37 +191,93 @@ suite("a caller can wait out a sign-in in flight (BACKLOG #2281)", () => {
     await second;
     await waiting;
   });
+
+  test("a second sign-in waits for the first and names the token the first one stored", async () => {
+    const cache = new MapCache();
+    cache.values.set(KEY, "tok-old");
+    const named: Array<string | undefined> = [];
+    const first = heldPost();
+    const signingInFirst = signInSuperseding(cache, KEY, CREDENTIALS, (body) => {
+      named.push(body.supersedes);
+      return first.post(body);
+    });
+    await first.sent;
+    const signingInSecond = signInSuperseding(cache, KEY, CREDENTIALS, async (body) => {
+      named.push(body.supersedes);
+      return { token: "tok-second" };
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // RED when: both sign-ins read the cache up front. Both then name tok-old, and the first new
+    // session is overwritten in the cache and left live on the engine.
+    assert.deepStrictEqual(named, ["tok-old"], "the second sign-in did not wait for the first");
+    first.answer("tok-first");
+    await signingInFirst;
+    await signingInSecond;
+    assert.deepStrictEqual(named, ["tok-old", "tok-first"]);
+    assert.strictEqual(cache.values.get(KEY), "tok-second");
+  });
+
+  test("a sign-in that never answers is waited for only as long as the bound", async () => {
+    const cache = new MapCache();
+    cache.values.set(KEY, "tok-old");
+    const hung = heldPost();
+    void signInSuperseding(cache, KEY, CREDENTIALS, hung.post, 20).catch(() => undefined);
+    await hung.sent;
+    // RED when: the wait has no bound. postJson has no timeout, so a reader would hang with it.
+    await signInSettled(KEY, 20);
+    assert.strictEqual(cache.values.get(KEY), "tok-old");
+    hung.fail(new Error("cleanup")); // release it, so the next test starts with nothing in flight
+    await signInSettled(KEY, 1000);
+  });
 });
 
 suite("auth.ts routes sign-in through the superseding path (BACKLOG #2281)", () => {
   // auth.ts needs the Extension Host, so this reads its source. A scan that silently matches nothing
-  // is indistinguishable from a clean file, hence the control lines below.
+  // is indistinguishable from a clean file, hence the controls below.
   const AUTH_TS = path.resolve(__dirname, "../../../src/auth.ts");
+
+  /** The source of the top-level function `name`, from its declaration to the next one. */
+  function functionSource(text: string, name: string): string {
+    const start = text.search(new RegExp(`export async function ${name}[(<]`));
+    assert.ok(start >= 0, `${name} was not found in auth.ts`);
+    const next = text.indexOf("\nexport ", start + 1);
+    return text.slice(start, next < 0 ? undefined : next);
+  }
+
+  /** The lines that post `/auth/logout`. */
+  const logoutSites = (text: string): string[] =>
+    text.split(/\r?\n/).filter((l) => l.includes('"/auth/logout"'));
 
   test("signIn posts through signInSuperseding and no longer revokes afterwards", () => {
     const text = fs.readFileSync(AUTH_TS, "utf8");
     assert.ok(text.includes("signInSuperseding(ctx.secrets, secretKey(url), body"), "signIn's call moved");
-    const logouts = text.split(/\r?\n/).filter((l) => l.includes('"/auth/logout"'));
-    assert.strictEqual(
-      logouts.length,
-      1,
-      `only signOut may post /auth/logout; found ${logouts.length} call sites`,
-    );
-    assert.ok(/postJson<unknown>\(url, "\/auth\/logout", \{\}, token\)/.test(logouts[0]), logouts[0]);
-    // The line the file carried before the fix must fail the same count.
-    const defect = '      void postJson<unknown>(url, "/auth/logout", {}, prior).catch(() => undefined);';
-    assert.ok(defect.includes('"/auth/logout"'), "the control line does not reach the predicate");
+    const sites = logoutSites(text);
+    assert.strictEqual(sites.length, 1, `only signOut may post /auth/logout; found ${sites.length}`);
+    assert.ok(/postJson<unknown>\(url, "\/auth\/logout", \{\}, token\)/.test(sites[0]), sites[0]);
+    // Control: the same count over the pre-fix shape, signOut's line plus the trailing revoke that
+    // signIn carried, must find both.
+    const before = [
+      '    await postJson<unknown>(url, "/auth/logout", {}, token);',
+      '      void postJson<unknown>(url, "/auth/logout", {}, prior).catch(() => undefined);',
+    ].join("\n");
+    assert.strictEqual(logoutSites(before).length, 2, "the predicate cannot see the old revoke");
   });
 
-  test("withAuth waits for a sign-in in flight BEFORE it reads the cache after a 401", () => {
+  test("every cache read waits for a sign-in in flight, and withAuth reads before it clears", () => {
     const text = fs.readFileSync(AUTH_TS, "utf8");
-    const body = text.slice(text.indexOf("export async function withAuth"));
-    assert.ok(body.length > 0 && body.length < text.length, "withAuth was not found");
-    const wait = body.indexOf("await signInSettled(secretKey(url));");
-    const read = body.indexOf("const cached = await peekToken(ctx, url);");
-    const clear = body.indexOf("await clearToken(ctx, url);");
-    assert.ok(wait > 0, "withAuth no longer waits for a sign-in in flight");
-    assert.ok(read > wait, "the cache is read before the wait");
-    assert.ok(clear > read, "the clear moved ahead of the cache read");
+    const peek = functionSource(text, "peekToken");
+    const wait = peek.indexOf("await signInSettled(secretKey(url));");
+    const read = peek.indexOf("ctx.secrets.get(secretKey(url))");
+    assert.ok(wait > 0, "peekToken no longer waits for a sign-in in flight");
+    assert.ok(read > wait, "peekToken reads the cache before the wait");
+    // Every other read of the cache goes through peekToken.
+    const direct = text.split(/\r?\n/).filter((l) => l.includes("ctx.secrets.get("));
+    assert.strictEqual(direct.length, 1, `a cache read bypasses peekToken: ${direct.join(" | ")}`);
+    assert.ok(functionSource(text, "ensureToken").includes("await peekToken(ctx, url)"));
+    const withAuth = functionSource(text, "withAuth");
+    const cached = withAuth.indexOf("const cached = await peekToken(ctx, url);");
+    const clear = withAuth.indexOf("await clearToken(ctx, url);");
+    assert.ok(cached > 0, "withAuth no longer reads the cache through peekToken after a 401");
+    assert.ok(clear > cached, "the clear moved ahead of the cache read");
   });
 });
