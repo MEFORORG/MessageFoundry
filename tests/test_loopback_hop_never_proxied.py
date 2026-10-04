@@ -39,6 +39,7 @@ from messagefoundry.pipeline import alert_sinks
 from messagefoundry.transports import build_destination, rest
 from messagefoundry.transports.bounded_read import build_strict_opener, is_never_proxied_host
 from messagefoundry.transports.rest import RestDestination
+from tests._egress_policy import permitting
 
 #: The proxy every test points at. A reserved name, so nothing could reach it.
 _PROXY_HOST = "proxy-marker.invalid:9"
@@ -263,7 +264,8 @@ def _rest(url: str, **extra: object) -> RestDestination:
     settings = Rest(url=url).settings
     settings.update(extra)
     dest = build_destination(
-        Destination(name="OB_REST", type=ConnectorType.REST, settings=settings)
+        Destination(name="OB_REST", type=ConnectorType.REST, settings=settings),
+        egress=permitting(settings),
     )
     assert isinstance(dest, RestDestination)
     return dest

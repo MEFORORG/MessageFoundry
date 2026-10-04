@@ -18,7 +18,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.fingerprint import config_fingerprint
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.engine import ConfigReloadDenied
 from tests import _fs_spy
@@ -27,7 +27,11 @@ from tests._admin_account import create_local_user_chosen
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "api.db", poll_interval=0.05)
+    eng = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
@@ -202,7 +206,12 @@ async def test_reload_endpoint_empty_dir_422(client: httpx.AsyncClient, tmp_path
 async def test_reload_rejects_path_outside_allowed_roots(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
     _write_valid_config(allowed, tmp_path / "in", tmp_path / "out")
-    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=allowed)
+    eng = await Engine.create(
+        tmp_path / "a.db",
+        poll_interval=0.05,
+        config_dir=allowed,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -220,7 +229,12 @@ async def test_reload_rejects_path_outside_allowed_roots(tmp_path: Path) -> None
 async def test_reload_defaults_to_startup_config_dir_and_audits(tmp_path: Path) -> None:
     cfg = tmp_path / "cfg"
     _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
-    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=cfg)
+    eng = await Engine.create(
+        tmp_path / "a.db",
+        poll_interval=0.05,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -238,7 +252,12 @@ async def test_reload_audit_records_fingerprint(tmp_path: Path) -> None:
     # reviewer can prove which bytes the reload activated — not just the connection counts.
     cfg = tmp_path / "cfg"
     _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
-    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=cfg)
+    eng = await Engine.create(
+        tmp_path / "a.db",
+        poll_interval=0.05,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -272,7 +291,12 @@ async def test_dry_run_reload_audits_config_reload_check_under_the_acting_user(
     pw = "Correct-Horse-Battery-Staple-9"
     cfg = tmp_path / "cfg"
     _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
-    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=cfg)
+    eng = await Engine.create(
+        tmp_path / "a.db",
+        poll_interval=0.05,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(eng.store, AuthSettings(require_mfa=False))
         await service.initialize()
@@ -329,6 +353,7 @@ async def test_reload_allows_extra_configured_root(tmp_path: Path) -> None:
         poll_interval=0.05,
         config_dir=startup,
         config_reload_roots=[str(staging)],
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
@@ -367,7 +392,12 @@ async def test_a_refused_reload_path_is_never_touched(
         str(allowed / "sub" / ".." / ".." / "probe-climb"),
         *_fs_spy.NON_LOCAL_SHAPES,
     ]
-    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=allowed)
+    eng = await Engine.create(
+        tmp_path / "a.db",
+        poll_interval=0.05,
+        config_dir=allowed,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -407,7 +437,12 @@ async def test_the_engines_own_reload_of_its_startup_dir_is_never_refused(tmp_pa
     if os.name == "nt":
         spellings.append("\\\\?\\" + str(cfg))
     for spelling in spellings:
-        eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=spelling)
+        eng = await Engine.create(
+            tmp_path / "a.db",
+            poll_interval=0.05,
+            config_dir=spelling,
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
         try:
             assert eng.config_dir is not None
             registry = await eng.reload(eng.config_dir, dry_run=True)
@@ -429,7 +464,12 @@ async def test_a_link_inside_a_root_that_leaves_it_is_still_refused(tmp_path: Pa
         link.symlink_to(outside, target_is_directory=True)
     except OSError:
         pytest.skip("this account cannot create a symbolic link")
-    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=allowed)
+    eng = await Engine.create(
+        tmp_path / "a.db",
+        poll_interval=0.05,
+        config_dir=allowed,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -469,7 +509,11 @@ async def test_reload_with_a_malformed_env_value_file_is_422_and_audited(tmp_pat
         )
 
     eng = await Engine.create(
-        tmp_path / "a.db", poll_interval=0.05, config_dir=cfg, env_values_provider=provider
+        tmp_path / "a.db",
+        poll_interval=0.05,
+        config_dir=cfg,
+        env_values_provider=provider,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))

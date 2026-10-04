@@ -219,7 +219,9 @@ def _spec(name: str, path: Path, refresh: float = 3600.0) -> ReferenceSpec:
 async def test_file_sync_materializes(tmp_path: Path) -> None:
     csv = _csv(tmp_path / "codes.csv", "key,value\nA,1\nB,2\n")
     store = await MessageStore.open(tmp_path / "r.db")
-    runner = ReferenceSyncRunner(store, lambda: [_spec("codes", csv)], REF)
+    runner = ReferenceSyncRunner(
+        store, lambda: [_spec("codes", csv)], REF, egress=EgressSettings(deny_by_default=False)
+    )
     result = await runner.sync_all()
     assert result.synced == 1 and result.failed == 0
     assert store.reference_view()["codes"] == {"A": "1", "B": "2"}
@@ -231,7 +233,11 @@ async def test_sync_respects_cadence(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "r.db")
     clock = {"t": 1000.0}
     runner = ReferenceSyncRunner(
-        store, lambda: [_spec("codes", csv, refresh=100.0)], REF, clock=lambda: clock["t"]
+        store,
+        lambda: [_spec("codes", csv, refresh=100.0)],
+        REF,
+        clock=lambda: clock["t"],
+        egress=EgressSettings(deny_by_default=False),
     )
     assert (await runner.run_once()).synced == 1  # never-synced -> due
     clock["t"] += 50  # within refresh window
@@ -245,7 +251,9 @@ async def test_sync_source_failure_keeps_last_good(tmp_path: Path) -> None:
     csv = _csv(tmp_path / "codes.csv", "key,value\nA,1\n")
     store = await MessageStore.open(tmp_path / "r.db")
     specs = [_spec("codes", csv, refresh=0.0)]
-    runner = ReferenceSyncRunner(store, lambda: specs, REF)
+    runner = ReferenceSyncRunner(
+        store, lambda: specs, REF, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.sync_all()
     assert store.reference_view()["codes"] == {"A": "1"}
     csv.unlink()  # source disappears
@@ -259,7 +267,9 @@ async def test_sync_isolates_one_bad_among_many(tmp_path: Path) -> None:
     good = _csv(tmp_path / "good.csv", "key,value\nA,1\n")
     store = await MessageStore.open(tmp_path / "r.db")
     specs = [_spec("good", good), _spec("missing", tmp_path / "nope.csv")]
-    runner = ReferenceSyncRunner(store, lambda: specs, REF)
+    runner = ReferenceSyncRunner(
+        store, lambda: specs, REF, egress=EgressSettings(deny_by_default=False)
+    )
     result = await runner.sync_all()
     assert result.synced == 1 and result.failed == 1
     assert store.reference_view()["good"] == {"A": "1"}  # the healthy set still synced
@@ -270,7 +280,13 @@ async def test_sync_env_path_resolution(tmp_path: Path) -> None:
     csv = _csv(tmp_path / "codes.csv", "key,value\nA,1\n")
     store = await MessageStore.open(tmp_path / "r.db")
     spec = ReferenceSpec(name="codes", source=FileRef(path=env("npi_csv")))
-    runner = ReferenceSyncRunner(store, lambda: [spec], REF, env_values={"npi_csv": str(csv)})
+    runner = ReferenceSyncRunner(
+        store,
+        lambda: [spec],
+        REF,
+        env_values={"npi_csv": str(csv)},
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert (await runner.sync_all()).synced == 1
     assert store.reference_view()["codes"] == {"A": "1"}
     await store.close()
@@ -278,7 +294,9 @@ async def test_sync_env_path_resolution(tmp_path: Path) -> None:
 
 async def test_runner_enabled_false_when_no_specs(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "r.db")
-    runner = ReferenceSyncRunner(store, lambda: [], REF)
+    runner = ReferenceSyncRunner(
+        store, lambda: [], REF, egress=EgressSettings(deny_by_default=False)
+    )
     assert runner.enabled is False
     runner.start()  # no-op; spawns no task
     assert runner._task is None
@@ -360,7 +378,9 @@ async def test_database_source_materializes(
 ) -> None:
     pool = _patch_pool(monkeypatch, ["provider_id", "npi"], [("MED1", 999), ("MED2", 888)])
     store = await MessageStore.open(tmp_path / "r.db")
-    runner = ReferenceSyncRunner(store, lambda: [_db_spec()], REF)
+    runner = ReferenceSyncRunner(
+        store, lambda: [_db_spec()], REF, egress=EgressSettings(deny_by_default=False)
+    )
     assert (await runner.sync_all()).synced == 1
     assert store.reference_view()["provider_npi"] == {"MED1": 999, "MED2": 888}
     assert pool.closed is True  # the sync pool is closed after the read
@@ -373,7 +393,9 @@ async def test_database_source_whole_row_value(
     _patch_pool(monkeypatch, ["id", "npi", "flag"], [("A", "9", "Y")])
     store = await MessageStore.open(tmp_path / "r.db")
     spec = _db_spec(key_column="id", value_column=None, statement="SELECT id, npi, flag FROM p")
-    runner = ReferenceSyncRunner(store, lambda: [spec], REF)
+    runner = ReferenceSyncRunner(
+        store, lambda: [spec], REF, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.sync_all()
     assert store.reference_view()["provider_npi"]["A"] == {"npi": "9", "flag": "Y"}
     await store.close()
@@ -409,7 +431,12 @@ async def test_database_source_acquire_is_bounded(
 
     store = await MessageStore.open(tmp_path / "r.db")
     try:
-        runner = ReferenceSyncRunner(store, lambda: [_db_spec(acquire_timeout=0.05)], REF)
+        runner = ReferenceSyncRunner(
+            store,
+            lambda: [_db_spec(acquire_timeout=0.05)],
+            REF,
+            egress=EgressSettings(deny_by_default=False),
+        )
         result = await asyncio.wait_for(runner.sync_all(), timeout=10.0)
         assert result.failed == 1 and result.synced == 0
         assert "provider_npi" not in store.reference_view()  # nothing was materialized
@@ -479,7 +506,13 @@ async def test_sync_failure_does_not_log_or_alert_the_key(
     bad = _csv(tmp_path / "pts.csv", "key,value\nMRN999SECRET,a\nMRN999SECRET,b\n")  # duplicate key
     store = await MessageStore.open(tmp_path / "r.db")
     alerts = _CapturingAlerts()
-    runner = ReferenceSyncRunner(store, lambda: [_spec("pts", bad)], REF, alert_sink=alerts)
+    runner = ReferenceSyncRunner(
+        store,
+        lambda: [_spec("pts", bad)],
+        REF,
+        alert_sink=alerts,
+        egress=EgressSettings(deny_by_default=False),
+    )
     with caplog.at_level("WARNING"):
         result = await runner.sync_all()
     assert result.failed == 1
@@ -525,7 +558,9 @@ async def test_reload_arms_reference_added_by_reload(tmp_path: Path) -> None:
     no_ref, with_ref = tmp_path / "a", tmp_path / "b"
     _write_reference_config(no_ref, tmp_path / "in", tmp_path / "out", csv, with_ref=False)
     _write_reference_config(with_ref, tmp_path / "in", tmp_path / "out", csv, with_ref=True)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.05)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.05, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         await eng.reload(no_ref)  # graph with zero reference sets
         assert "codes" not in eng.store.reference_view()
@@ -542,7 +577,9 @@ async def test_empty_start_then_reload_syncs_reference(tmp_path: Path) -> None:
     csv = _csv(tmp_path / "codes.csv", "key,value\nA,1\n")
     cfg = tmp_path / "cfg"
     _write_reference_config(cfg, tmp_path / "in", tmp_path / "out", csv, with_ref=True)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.05)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.05, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         await eng.start()  # no graph
         await eng.reload(cfg)
@@ -746,7 +783,7 @@ async def test_engine_start_refuses_graph_with_reference_set_on_unsupporting_bac
     store = await MessageStore.open(tmp_path / "start.db")
     store.backend = StoreBackend.SQLSERVER
     store.supports_reference_sets = False
-    engine = Engine(store)
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
     engine.add_registry(_ref_graph(csv))
     try:
         with pytest.raises(WiringError) as exc:
@@ -773,7 +810,7 @@ async def test_reload_refuses_adding_a_reference_set_on_unsupporting_backend(
     store = await MessageStore.open(tmp_path / "reload.db")
     store.backend = StoreBackend.SQLSERVER
     store.supports_reference_sets = False
-    engine = Engine(store)
+    engine = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
     engine.add_registry(_ref_graph(csv, with_reference=False))
     try:
         await engine.start()  # no reference set -> starts clean on an unsupporting backend
@@ -820,7 +857,11 @@ async def test_sync_does_not_retry_a_backend_that_cannot_materialize(
     store.write_reference_snapshot = raising_write  # type: ignore[method-assign]
     alerts = _CapturingAlerts()
     runner = ReferenceSyncRunner(
-        store, lambda: [_spec("provider_npi", csv)], REF, alert_sink=alerts
+        store,
+        lambda: [_spec("provider_npi", csv)],
+        REF,
+        alert_sink=alerts,
+        egress=EgressSettings(deny_by_default=False),
     )
     try:
         with caplog.at_level("WARNING"):
@@ -851,7 +892,11 @@ async def test_genuine_source_failure_still_retries_and_keeps_last_good(
     store = await MessageStore.open(tmp_path / "flaky.db")
     alerts = _CapturingAlerts()
     runner = ReferenceSyncRunner(
-        store, lambda: [_spec("provider_npi", missing)], REF, alert_sink=alerts
+        store,
+        lambda: [_spec("provider_npi", missing)],
+        REF,
+        alert_sink=alerts,
+        egress=EgressSettings(deny_by_default=False),
     )
     try:
         with caplog.at_level("WARNING"):

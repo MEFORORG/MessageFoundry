@@ -30,7 +30,7 @@ from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.notifications import ACCOUNT_CREATED
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings
+from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings, EgressSettings
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink, _subject
@@ -69,7 +69,11 @@ class _RaisingSink(LoggingAlertSink):
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "provenance.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "provenance.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

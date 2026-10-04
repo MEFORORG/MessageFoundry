@@ -7,8 +7,8 @@
 :mod:`messagefoundry.transports.soap` does — rather than wrapping ``RestDestination``: the no-redirect,
 http(s)-only, TLS-verifying opener (a 3xx can't divert a PHI-bearing request; ASVS 15.3.2), the
 cleartext-credential refusal, the outbound length limits, and the optional detached-JWS signer. The
-fail-closed ``[egress].allowed_http`` host gate is enforced by the runner (it folds FHIR into the
-REST/SOAP arm — see wiring_runner ``_allowlist_for``/``check_egress_allowed``).
+fail-closed ``[egress].allowed_http`` host gate is enforced by ``build_destination`` (it folds FHIR into the
+REST/SOAP arm — see transports.egress ``_allowlist_for``/``check_egress_allowed``).
 
 **FHIR-specific layer (on top of REST):**
 - Media type ``application/fhir+json`` on both ``Content-Type`` and ``Accept`` (JSON-only MVP; FHIR-XML
@@ -59,6 +59,7 @@ from messagefoundry.config.models import (
     Destination,
     hop_attestation_from_settings,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import InsecureHopRefused, TrustAnchorPolicy
 from messagefoundry.connection_names import fhir_lookup_record_name
 from messagefoundry.controlchars import has_control_char
@@ -1211,8 +1212,15 @@ class FhirLookupExecutor:
         self,
         connections: Mapping[str, Mapping[str, Any]],
         *,
+        egress: EgressSettings,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
     ) -> None:
+        # `egress` is required and every connection is checked against it before anything is built,
+        # so no caller can construct an executor that reads from an unchecked host (vault BACKLOG #2605).
+        from messagefoundry.transports.egress import check_fhir_lookup_allowed
+
+        for cname, s in connections.items():
+            check_fhir_lookup_allowed(cname, s, egress)
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
         # trust_anchor_policy (#1180, ADR 0093): the instance [tls] client anchor policy, threaded by
         # the runner. A FhirLookup connection has no Destination to carry it (unlike every other

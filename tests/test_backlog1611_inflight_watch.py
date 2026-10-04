@@ -30,6 +30,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import BuildupThreshold, ConnectorType, StallThreshold
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -151,6 +152,7 @@ async def test_watch_pages_an_ingress_row_held_past_the_buildup_age(
         store,
         alert_sink=sink,
         buildup_default=BuildupThreshold(max_oldest_seconds=60.0),
+        egress=EgressSettings(deny_by_default=False),
     )
     await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
     await store.claim_next_fifo("IB", now=100.0, stage=Stage.INGRESS.value)
@@ -179,6 +181,7 @@ async def test_watch_pages_an_outbound_row_on_its_stall_threshold(
         store,
         alert_sink=sink,
         stall_default=StallThreshold(max_oldest_seconds=30.0),
+        egress=EgressSettings(deny_by_default=False),
     )
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0)
     await store.claim_next_fifo("OB", now=100.0)
@@ -199,7 +202,9 @@ async def test_a_default_engine_pages_a_strand_through_the_buildup_age(
     """No threshold configured at all. The buildup age defaults on (300 s) and the stall alert off, so
     a default engine still pages an in-flight hold, on both an outbound and an ingress lane."""
     sink = _RecordingSink()
-    runner = RegistryRunner(_registry(tmp_path), store, alert_sink=sink)
+    runner = RegistryRunner(
+        _registry(tmp_path), store, alert_sink=sink, egress=EgressSettings(deny_by_default=False)
+    )
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0)
     await store.claim_next_fifo("OB", now=100.0)
     await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
@@ -222,6 +227,7 @@ async def test_watch_reads_nothing_while_every_age_is_off(
         store,
         alert_sink=_RecordingSink(),
         buildup_default=BuildupThreshold(max_oldest_seconds=None),
+        egress=EgressSettings(deny_by_default=False),
     )
 
     async def boom(**_k: Any) -> dict[str, tuple[int, float]]:
@@ -249,6 +255,7 @@ async def test_only_the_leader_pages(store: MessageStore, tmp_path: Path, leader
         alert_sink=sink,
         buildup_default=BuildupThreshold(max_oldest_seconds=60.0),
         coordinator=None if leader else _Follower(),
+        egress=EgressSettings(deny_by_default=False),
     )
     await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
     await store.claim_next_fifo("IB", now=100.0, stage=Stage.INGRESS.value)
@@ -261,7 +268,12 @@ async def test_watch_skips_the_response_read_without_a_loopback_inbound(
 ) -> None:
     """Re-ingress tokens drain only on a loopback lane, so a graph with none reads no RESPONSE rows.
     The other three stages are still read."""
-    runner = RegistryRunner(_registry(tmp_path), store, alert_sink=_RecordingSink())
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        alert_sink=_RecordingSink(),
+        egress=EgressSettings(deny_by_default=False),
+    )
     read: list[str] = []
     real = store.inflight_by_lane
 
@@ -284,7 +296,11 @@ async def test_watch_reads_and_pages_response_rows_on_loopback_lanes_only(
     reg.add_inbound(InboundConnection("LB", ConnectionSpec(ConnectorType.LOOPBACK, {}), router="r"))
     sink = _RecordingSink()
     runner = RegistryRunner(
-        reg, store, alert_sink=sink, buildup_default=BuildupThreshold(max_oldest_seconds=60.0)
+        reg,
+        store,
+        alert_sink=sink,
+        buildup_default=BuildupThreshold(max_oldest_seconds=60.0),
+        egress=EgressSettings(deny_by_default=False),
     )
     read: list[str] = []
 
@@ -310,6 +326,7 @@ async def test_a_pending_check_and_the_watch_page_a_lane_once_per_window(
         store,
         alert_sink=sink,
         buildup_default=BuildupThreshold(max_oldest_seconds=60.0),
+        egress=EgressSettings(deny_by_default=False),
     )
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "a")], now=1.0)
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "b")], now=1.0)
@@ -338,6 +355,7 @@ async def test_an_outbound_hold_past_both_thresholds_logs_once(
         alert_sink=sink,
         buildup_default=BuildupThreshold(max_oldest_seconds=300.0),
         stall_default=StallThreshold(max_oldest_seconds=120.0),
+        egress=EgressSettings(deny_by_default=False),
     )
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0)
     await store.claim_next_fifo("OB", now=100.0)
@@ -405,7 +423,11 @@ async def test_pooled_route_handoff_fault_recovers_through_t17(
     calls: dict[str, int] = {}
     _fail_once(monkeypatch, store, "route_handoff", calls)
     runner = RegistryRunner(
-        _registry(tmp_path), store, claim_mode="pooled", pooled_sweep_interval=0.05
+        _registry(tmp_path),
+        store,
+        claim_mode="pooled",
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -449,6 +471,7 @@ async def test_pooled_double_fault_strands_and_the_watch_pages_it(
         buildup_default=BuildupThreshold(max_oldest_seconds=0.3),
         claim_mode="pooled",
         pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
         await runner.start()

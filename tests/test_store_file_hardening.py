@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import SqlAuth, StoreBackend, StoreSettings
+from messagefoundry.config.settings import EgressSettings, SqlAuth, StoreBackend, StoreSettings
 from messagefoundry.store.sqlserver import connection_string
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.file import render_filename
@@ -116,7 +116,8 @@ async def test_concurrent_writes_do_not_clobber(tmp_path: Path) -> None:
             name="archive",
             type=ConnectorType.FILE,
             settings={"directory": str(tmp_path), "filename": "fixed.hl7"},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     await asyncio.gather(*[dest.send(ADT) for _ in range(5)])
     written = sorted(p.name for p in tmp_path.iterdir() if p.suffix == ".hl7")

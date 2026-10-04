@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from messagefoundry.api import create_managed_app
 from messagefoundry.config.fingerprint import config_fingerprint
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests.test_reload_dir_only_moves_on_apply import _write_valid_config
@@ -34,6 +35,7 @@ def _app(tmp_path: Path, *, with_config: bool = True) -> tuple[FastAPI, Path]:
         config_dir=cfg if with_config else None,
         poll_interval=0.05,
         allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     return app, cfg
 

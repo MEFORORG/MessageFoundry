@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.engine import ConfigReloadDenied
@@ -47,7 +48,11 @@ async def _engine(tmp_path: Path) -> tuple[Engine, Path, Path]:
     _write_valid_config(live, tmp_path / "in", tmp_path / "out")
     _write_valid_config(staging, tmp_path / "in2", tmp_path / "out2")
     eng = await Engine.create(
-        tmp_path / "r.db", poll_interval=0.05, config_dir=live, config_reload_roots=[str(staging)]
+        tmp_path / "r.db",
+        poll_interval=0.05,
+        config_dir=live,
+        config_reload_roots=[str(staging)],
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     return eng, live, staging
 

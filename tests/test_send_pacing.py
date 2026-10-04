@@ -19,6 +19,7 @@ import pytest
 from _pace_probe import install_pace_probe
 
 from messagefoundry.config.models import ConnectorType, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -62,7 +63,9 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 
 def _runner(store: MessageStore) -> RegistryRunner:
-    return RegistryRunner(Registry(), store, poll_interval=0.02)
+    return RegistryRunner(
+        Registry(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
 
 
 # --- _resolve_send_pace: None/absent/0 → off; positive kept; negative clamped ----------------------

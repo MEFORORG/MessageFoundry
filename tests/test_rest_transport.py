@@ -19,10 +19,10 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Rest, WiringError
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
 from messagefoundry.transports import rest as rest_mod
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.rest import RestDestination, outbound_headers_from_metadata
 
 URL = "https://api.example.com/ingest"
@@ -44,7 +44,8 @@ def _dest(
             settings=settings,
             cleartext_accepted=_cleartext_accepted,
             cleartext_reason=_cleartext_reason,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, RestDestination)
     return d
@@ -132,7 +133,10 @@ async def test_rest_connection_error_is_transient() -> None:
 def test_rest_rejects_non_http_scheme() -> None:
     with pytest.raises(ValueError):
         build_destination(
-            Destination(name="OB", type=ConnectorType.REST, settings=Rest(url="ftp://x/y").settings)
+            Destination(
+                name="OB", type=ConnectorType.REST, settings=Rest(url="ftp://x/y").settings
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -146,7 +150,8 @@ def test_rest_rejects_over_length_url() -> None:
     long_url = URL + "a" * 9000
     with pytest.raises(ValueError, match="over the 8192-char limit"):
         build_destination(
-            Destination(name="OB", type=ConnectorType.REST, settings=Rest(url=long_url).settings)
+            Destination(name="OB", type=ConnectorType.REST, settings=Rest(url=long_url).settings),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -281,7 +286,8 @@ def _signing_dest(pem: str, key_id: str) -> RestDestination:
             name="OB_REST_SIGNED",
             type=ConnectorType.REST,
             settings={"url": URL, "sign_private_key": pem, "sign_key_id": key_id},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, RestDestination)
     return d
@@ -360,7 +366,8 @@ def test_rest_credentials_over_cleartext_http_refused(monkeypatch: pytest.Monkey
                 name="OB",
                 type=ConnectorType.REST,
                 settings=Rest(url="http://api.example.com/x", bearer_token="tok").settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -379,7 +386,8 @@ def test_rest_credentials_over_cleartext_http_allowed_when_accepted(
                 settings=Rest(url="http://api.example.com/x", bearer_token="tok").settings,
                 cleartext_accepted=True,
                 cleartext_reason="legacy partner endpoint has no TLS",
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     assert isinstance(dest, RestDestination)  # built (warns + audits), not refused
 
@@ -389,7 +397,8 @@ def test_rest_cleartext_http_without_credentials_is_allowed() -> None:
     dest = build_destination(
         Destination(
             name="OB", type=ConnectorType.REST, settings=Rest(url="http://localhost/x").settings
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, RestDestination)
 
@@ -402,7 +411,8 @@ def test_rest_cleartext_http_loopback_ip_without_credentials_is_allowed() -> Non
             name="OB",
             type=ConnectorType.REST,
             settings=Rest(url="http://127.0.0.1:8000/x").settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, RestDestination)
 
@@ -419,7 +429,8 @@ def test_rest_cleartext_http_nonloopback_refused_without_escape(
                 name="OB",
                 type=ConnectorType.REST,
                 settings=Rest(url="http://api.example.com/x").settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -438,7 +449,8 @@ def test_rest_cleartext_http_nonloopback_allowed_when_accepted(
                 settings=Rest(url="http://api.example.com/x").settings,
                 cleartext_accepted=True,
                 cleartext_reason="legacy partner endpoint has no TLS",
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     assert isinstance(dest, RestDestination)  # built (warns loudly + audits), not refused
 
@@ -460,7 +472,9 @@ def test_rest_egress_unrestricted_when_empty() -> None:
     dest = Destination(
         name="OB", type=ConnectorType.REST, settings=Rest(url="https://anywhere.example/x").settings
     )
-    check_egress_allowed(dest, EgressSettings())  # empty allowlist = unrestricted
+    check_egress_allowed(
+        dest, EgressSettings(deny_by_default=False)
+    )  # empty allowlist = unrestricted
 
 
 # --- per-message dynamic HTTP headers (BACKLOG #68) -------------------------------------------------

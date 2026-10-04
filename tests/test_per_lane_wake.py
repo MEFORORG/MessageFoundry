@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -117,7 +118,13 @@ def _json_inbounds(*names: str) -> Registry:
 def test_lane_event_get_or_create_returns_the_same_object(store: MessageStore) -> None:
     """Get-or-create MUST return the SAME Event for a (stage, lane) — never replace it. A replace between
     a producer's set() and the worker's first wait() would drop the sticky set (lost wakeup)."""
-    r = RegistryRunner(_json_inbounds("A"), store, claim_mode="per_lane", per_lane_wake=True)
+    r = RegistryRunner(
+        _json_inbounds("A"),
+        store,
+        claim_mode="per_lane",
+        per_lane_wake=True,
+        egress=EgressSettings(deny_by_default=False),
+    )
     e1 = r._lane_event(Stage.INGRESS, "A")
     e2 = r._lane_event(Stage.INGRESS, "A")
     assert e1 is e2
@@ -127,14 +134,26 @@ def test_lane_event_get_or_create_returns_the_same_object(store: MessageStore) -
 
 
 def test_wake_lane_off_sets_singleton_and_never_populates_registry(store: MessageStore) -> None:
-    r = RegistryRunner(_json_inbounds("A"), store, claim_mode="per_lane", per_lane_wake=False)
+    r = RegistryRunner(
+        _json_inbounds("A"),
+        store,
+        claim_mode="per_lane",
+        per_lane_wake=False,
+        egress=EgressSettings(deny_by_default=False),
+    )
     r._wake_lane(Stage.INGRESS, "A")
     assert r._ingress_work.is_set()  # OFF path = the historical singleton
     assert all(len(d) == 0 for d in r._lane_events.values())  # registry never touched when OFF
 
 
 def test_wake_lane_on_targets_only_that_lane(store: MessageStore) -> None:
-    r = RegistryRunner(_json_inbounds("A", "B"), store, claim_mode="per_lane", per_lane_wake=True)
+    r = RegistryRunner(
+        _json_inbounds("A", "B"),
+        store,
+        claim_mode="per_lane",
+        per_lane_wake=True,
+        egress=EgressSettings(deny_by_default=False),
+    )
     r._wake_lane(Stage.INGRESS, "A")
     assert r._lane_event(Stage.INGRESS, "A").is_set()
     assert not r._lane_event(
@@ -144,7 +163,13 @@ def test_wake_lane_on_targets_only_that_lane(store: MessageStore) -> None:
 
 
 def test_wake_all_on_wakes_every_registered_lane_of_the_stages(store: MessageStore) -> None:
-    r = RegistryRunner(_json_inbounds("A"), store, claim_mode="per_lane", per_lane_wake=True)
+    r = RegistryRunner(
+        _json_inbounds("A"),
+        store,
+        claim_mode="per_lane",
+        per_lane_wake=True,
+        egress=EgressSettings(deny_by_default=False),
+    )
     for k in ("d1", "d2", "d3"):
         r._lane_event(Stage.OUTBOUND, k)  # register three idle outbound lanes
     r._lane_event(Stage.INGRESS, "A")
@@ -156,7 +181,13 @@ def test_wake_all_on_wakes_every_registered_lane_of_the_stages(store: MessageSto
 def test_wake_all_off_sets_only_the_passed_stage_singletons(store: MessageStore) -> None:
     """The reload tail passes (INGRESS, ROUTED, OUTBOUND) when OFF (byte-identical to the pre-B12 tail,
     which has always OMITTED _response_work); the RESPONSE-lane wake is an ON-only promptness fix."""
-    r = RegistryRunner(_json_inbounds("A"), store, claim_mode="per_lane", per_lane_wake=False)
+    r = RegistryRunner(
+        _json_inbounds("A"),
+        store,
+        claim_mode="per_lane",
+        per_lane_wake=False,
+        egress=EgressSettings(deny_by_default=False),
+    )
     r._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.OUTBOUND)
     assert r._ingress_work.is_set() and r._routed_work.is_set() and r._work.is_set()
     assert not r._response_work.is_set()  # RESPONSE omitted → byte-identical reload tail
@@ -165,7 +196,13 @@ def test_wake_all_off_sets_only_the_passed_stage_singletons(store: MessageStore)
 def test_wake_all_snapshots_the_registry(store: MessageStore) -> None:
     """_wake_all must snapshot each stage's Event list before iterating (await-free) so a concurrent
     reload/producer mutating _lane_events can't raise 'dict changed size during iteration'."""
-    r = RegistryRunner(_json_inbounds("A"), store, claim_mode="per_lane", per_lane_wake=True)
+    r = RegistryRunner(
+        _json_inbounds("A"),
+        store,
+        claim_mode="per_lane",
+        per_lane_wake=True,
+        egress=EgressSettings(deny_by_default=False),
+    )
     for i in range(200):
         r._lane_event(Stage.OUTBOUND, f"d{i}")
     r._wake_all(Stage.OUTBOUND)  # a large registry — must not raise
@@ -178,7 +215,13 @@ def test_wake_all_snapshots_the_registry(store: MessageStore) -> None:
 async def test_ingress_producer_on_wakes_only_target_lane(store: MessageStore) -> None:
     """Committing an ingress row for inbound A wakes A's router lane and NOT B's (the herd collapse)."""
     reg = _json_inbounds("A", "B")
-    r = RegistryRunner(reg, store, claim_mode="per_lane", per_lane_wake=True)
+    r = RegistryRunner(
+        reg,
+        store,
+        claim_mode="per_lane",
+        per_lane_wake=True,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await r._handle_inbound(reg.inbound["A"], b'{"n": 1}')
     assert r._lane_event(Stage.INGRESS, "A").is_set()
     assert not r._lane_event(Stage.INGRESS, "B").is_set()
@@ -187,7 +230,13 @@ async def test_ingress_producer_on_wakes_only_target_lane(store: MessageStore) -
 
 async def test_ingress_producer_off_sets_singleton_only(store: MessageStore) -> None:
     reg = _json_inbounds("A", "B")
-    r = RegistryRunner(reg, store, claim_mode="per_lane", per_lane_wake=False)
+    r = RegistryRunner(
+        reg,
+        store,
+        claim_mode="per_lane",
+        per_lane_wake=False,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await r._handle_inbound(reg.inbound["A"], b'{"n": 1}')
     assert r._ingress_work.is_set()
     assert all(len(d) == 0 for d in r._lane_events.values())
@@ -256,7 +305,12 @@ async def test_end_to_end_fanout_delivers_both_arms(
     (inbox / "m.hl7").write_bytes(ADT.format(cid="MSG1").encode("utf-8"))
     reg = _delivery_registry(inbox, out_a, out_b)
     r = RegistryRunner(
-        reg, pw_store, claim_mode="per_lane", poll_interval=0.02, per_lane_wake=per_lane_wake
+        reg,
+        pw_store,
+        claim_mode="per_lane",
+        poll_interval=0.02,
+        per_lane_wake=per_lane_wake,
+        egress=EgressSettings(deny_by_default=False),
     )
     await r.start()
     try:
@@ -282,7 +336,14 @@ async def test_multi_message_fifo_order_preserved_under_per_lane_wake(
     inbox, out_a, out_b = tmp_path / "in", tmp_path / "a", tmp_path / "b"
     inbox.mkdir()
     reg = _delivery_registry(inbox, out_a, out_b)
-    r = RegistryRunner(reg, store, claim_mode="per_lane", poll_interval=0.02, per_lane_wake=True)
+    r = RegistryRunner(
+        reg,
+        store,
+        claim_mode="per_lane",
+        poll_interval=0.02,
+        per_lane_wake=True,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await r.start()
     try:
         for i in range(3):

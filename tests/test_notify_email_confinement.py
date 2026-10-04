@@ -37,7 +37,7 @@ from messagefoundry.auth.notifications import (
     SecurityEvent,
 )
 from messagefoundry.auth.service import AuthService, InvalidNotifyEmail, NotifyEmailAlreadySet
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._admin_account import create_local_user_chosen, provision_totp
@@ -425,7 +425,11 @@ async def test_filling_the_address_ends_it_audits_and_notifies_the_new_address()
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "notify_confine.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "notify_confine.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

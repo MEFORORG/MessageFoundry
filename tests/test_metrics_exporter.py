@@ -32,7 +32,7 @@ from messagefoundry.api.metrics import (
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import OutboxStatus
 from tests._admin_account import create_local_user_chosen
@@ -59,7 +59,11 @@ PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the 
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "metrics.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "metrics.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     # The fixture never calls start(), so started_at stays 0.0 and `since=started_at or now`
     # would window the counters to `now`, hiding pre-seeded rows. Pin it to a small truthy
     # value before any seeded timestamp so the process-lifetime counters cover the test data.

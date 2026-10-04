@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import OrderingMode
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.log_backoff import FailureRun, is_emission
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
@@ -262,7 +263,13 @@ async def _stop(runner: RegistryRunner, task: asyncio.Future[None]) -> None:
 
 
 def _runner(store: Any) -> RegistryRunner:
-    runner = RegistryRunner(Registry(), store, poll_interval=0.001, claim_mode="per_lane")
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.001,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     runner._running = True
     return runner
 

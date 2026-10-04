@@ -20,7 +20,7 @@ from messagefoundry import (
     SaturationThreshold,
     StallThreshold,
 )
-from messagefoundry.config.settings import DeliverySettings, load_settings
+from messagefoundry.config.settings import DeliverySettings, EgressSettings, load_settings
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import Engine
 
@@ -174,7 +174,9 @@ async def test_runner_resolves_internal_error_override_over_global(tmp_path: Pat
     assert reg.outbound["ob_default"].internal_error is None  # unset → inherit global later
     assert reg.outbound["ob_override"].internal_error is InternalErrorPolicy.STOP
     engine = await Engine.create(
-        tmp_path / "mf.db", internal_error_default=InternalErrorPolicy.CONTINUE
+        tmp_path / "mf.db",
+        internal_error_default=InternalErrorPolicy.CONTINUE,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     engine.add_registry(reg)
     await engine.start()
@@ -209,7 +211,11 @@ async def test_runner_resolves_override_over_global_default(tmp_path: Path) -> N
             """
         )
     )
-    engine = await Engine.create(tmp_path / "mf.db", delivery_defaults=RetryPolicy(max_attempts=42))
+    engine = await Engine.create(
+        tmp_path / "mf.db",
+        delivery_defaults=RetryPolicy(max_attempts=42),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(load_config(cfgdir))
     await engine.start()
     try:

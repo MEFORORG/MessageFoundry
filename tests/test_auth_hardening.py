@@ -37,7 +37,7 @@ from messagefoundry.auth import Role, hash_password
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
 from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
@@ -48,7 +48,11 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "auth_hardening.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "auth_hardening.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

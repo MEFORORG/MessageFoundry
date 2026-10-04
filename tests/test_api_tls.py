@@ -55,7 +55,12 @@ from messagefoundry.api.tls_client_cert import (
 )
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import ApiSettings, AuthSettings, CertMonitorSettings
+from messagefoundry.config.settings import (
+    ApiSettings,
+    AuthSettings,
+    CertMonitorSettings,
+    EgressSettings,
+)
 from messagefoundry.config.tls_policy import validate_proxy_tls_posture
 from messagefoundry.credential import (
     VERIFIED_ISSUER_KEY,
@@ -826,7 +831,9 @@ def test_the_app_factories_derive_the_rp_flag_from_their_own_settings(
     if factory == "create_app":
         app = create_app(**kwargs)
     else:
-        app = create_managed_app(db_path=tmp_path / "unused.db", **kwargs)
+        app = create_managed_app(
+            db_path=tmp_path / "unused.db", egress_settings=EgressSettings(), **kwargs
+        )
     assert app.state.webauthn_rp_from_request is expected
 
 
@@ -1516,7 +1523,11 @@ def _cert_request(app: object, peercert: object | None) -> Request:
 
 
 async def test_resolve_client_cert_identity_positive_and_negative(tmp_path: Path) -> None:
-    engine = await Engine.create(tmp_path / "mtls.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "mtls.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
@@ -1573,7 +1584,11 @@ async def test_a_renamed_account_keeps_its_cert_and_the_name_does_not_move(tmp_p
     # released by a rename and taken by another row, and a map keyed by name would then hand the cert
     # to that other account. Here the first account is renamed and a second row takes its old name;
     # the cert still reaches the first account.
-    engine = await Engine.create(tmp_path / "mtls_rename.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "mtls_rename.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
@@ -1612,7 +1627,11 @@ async def test_a_renamed_account_keeps_its_cert_and_the_name_does_not_move(tmp_p
 
 
 async def test_an_unknown_account_id_resolves_to_nothing(tmp_path: Path) -> None:
-    engine = await Engine.create(tmp_path / "mtls_unknown.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "mtls_unknown.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
@@ -1633,7 +1652,11 @@ async def test_disabled_mapped_account_denied_via_cert_path(tmp_path: Path) -> N
     # AUTHN-18 CELL B: identity_for_cert_user_id's disabled branch fails CLOSED through the
     # cert plane. A VALID, MAPPED, verified cert whose backing account was DISABLED is still denied — a
     # pinned cert map can never keep a deactivated service account alive.
-    engine = await Engine.create(tmp_path / "mtls_disabled.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "mtls_disabled.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
@@ -1727,7 +1750,11 @@ async def test_service_cert_inside_warn_window_raises_cert_expiry(tmp_path: Path
     # The residual's acceptance test: a service-cert handshake inside the warn window raises cert_expiry
     # with the caller's label. The engine never holds this cert as a FILE — the handshake is the only
     # place its expiry is observable — so without this arm a service caller's cert expires unannounced.
-    engine = await Engine.create(tmp_path / "certwarn.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "certwarn.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         sink = _RecordingCertSink()
         app = await _cert_app(
@@ -1748,7 +1775,11 @@ async def test_service_cert_inside_warn_window_raises_cert_expiry(tmp_path: Path
 
 
 async def test_service_cert_outside_warn_window_is_silent(tmp_path: Path) -> None:
-    engine = await Engine.create(tmp_path / "certok.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "certok.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         sink = _RecordingCertSink()
         app = await _cert_app(
@@ -1767,7 +1798,11 @@ async def test_client_cert_expiry_alert_is_throttled_per_cert(tmp_path: Path) ->
     # This runs on a PER-REQUEST path: without the throttle a chatty caller would drive an
     # alert_instance upsert per request (durable alert-state is written BEFORE the sink's own
     # notification throttle). A renewed cert (new notAfter) must still alert immediately.
-    engine = await Engine.create(tmp_path / "certthrottle.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "certthrottle.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         sink = _RecordingCertSink()
         app = await _cert_app(
@@ -1788,7 +1823,11 @@ async def test_client_cert_expiry_alert_is_throttled_per_cert(tmp_path: Path) ->
 async def test_client_cert_expiry_silent_when_monitor_off_or_unwired(tmp_path: Path) -> None:
     # warn_days=0 disables the monitor; an app with no [cert_monitor] on state (the direct create_app /
     # embedding path) is likewise inert — deny-by-default for a monitoring signal.
-    engine = await Engine.create(tmp_path / "certoff.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "certoff.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         off = _RecordingCertSink()
         app_off = await _cert_app(
@@ -1812,7 +1851,11 @@ async def test_client_cert_expiry_silent_when_monitor_off_or_unwired(tmp_path: P
 async def test_unmapped_cert_never_raises_an_expiry_alert(tmp_path: Path) -> None:
     # The alert label space must stay bounded by the operator's OWN allow-list: an unmapped/spoofed cert
     # is denied before the check, so a stranger cannot drive alert volume or grow the throttle dict.
-    engine = await Engine.create(tmp_path / "certunmapped.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "certunmapped.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         sink = _RecordingCertSink()
         app = await _cert_app(
@@ -1832,7 +1875,11 @@ async def test_unmapped_cert_never_raises_an_expiry_alert(tmp_path: Path) -> Non
 async def test_client_cert_expiry_check_never_breaks_authentication(tmp_path: Path) -> None:
     # A monitoring signal hangs off an AUTH path: a sink that raises must degrade to "no alert", never
     # to a failed authentication.
-    engine = await Engine.create(tmp_path / "certraise.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "certraise.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         app = await _cert_app(
             engine,
@@ -1849,7 +1896,11 @@ async def test_client_cert_expiry_check_never_breaks_authentication(tmp_path: Pa
 
 async def test_cert_without_notafter_still_authenticates(tmp_path: Path) -> None:
     # A peer cert dict carrying no parseable notAfter simply yields no alert (the pre-6.4.5 shape).
-    engine = await Engine.create(tmp_path / "certnona.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "certnona.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         sink = _RecordingCertSink()
         app = await _cert_app(
@@ -2375,7 +2426,9 @@ _SVC_PW = "Correct-horse-battery-9"
 
 async def _svc_app(tmp_path: Path, db: str, *roles: Role) -> tuple[Any, Any]:
     """An engine + create_app wired with a cert-identity map for username 'svc' (given ``roles``)."""
-    engine = await Engine.create(tmp_path / db, poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / db, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     uid = await create_local_user_chosen(
@@ -4510,7 +4563,11 @@ def test_the_lifespan_writes_one_audit_row_per_replacement(tmp_path: Path) -> No
         new_sha256="bb" * 32,
         new_not_after="2027-09-26T00:00:00+00:00",
     )
-    app = create_managed_app(db_path=tmp_path / "managed.db", api_tls_replacements=[event])
+    app = create_managed_app(
+        db_path=tmp_path / "managed.db",
+        api_tls_replacements=[event],
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     with TestClient(app) as tc:
         store = app.state.engine.store
         rows = tc.portal.call(
@@ -4537,7 +4594,9 @@ def test_the_lifespan_writes_no_audit_row_when_nothing_was_replaced(tmp_path: Pa
 
     from messagefoundry.api.app import create_managed_app
 
-    app = create_managed_app(db_path=tmp_path / "managed.db")
+    app = create_managed_app(
+        db_path=tmp_path / "managed.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
     with TestClient(app) as tc:
         store = app.state.engine.store
         rows = tc.portal.call(

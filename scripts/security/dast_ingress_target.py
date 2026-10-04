@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.mllpcodec import AckMode, build_ack
 from messagefoundry.pipeline import Engine
@@ -270,7 +271,10 @@ async def ingress_target(
     if canary is not None and canary not in CANARY_DETECTOR:
         raise ValueError(f"unknown canary {canary!r}; expected one of {CANARIES}")
     tmp = tempfile.TemporaryDirectory(prefix="mefor-dast-ingress-", ignore_cleanup_errors=True)
-    engine = await Engine.create(Path(tmp.name) / "dast-ingress.db", poll_interval=0.02)
+    # The stock deny policy, stated: the target declares no outbound, so nothing may dial out.
+    engine = await Engine.create(
+        Path(tmp.name) / "dast-ingress.db", poll_interval=0.02, egress_settings=EgressSettings()
+    )
     target: IngressTarget | None = None
     try:
         runner = engine.add_registry(_registry(settings, canary=canary))

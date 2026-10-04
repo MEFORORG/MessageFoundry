@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     Http,
     WiringError,
@@ -132,7 +133,7 @@ async def _runner(store: MessageStore, ic) -> RegistryRunner:
 
     reg = Registry()
     reg.add_inbound(ic)
-    return RegistryRunner(reg, store)
+    return RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
 
 async def _start_source(
@@ -143,7 +144,7 @@ async def _start_source(
     runner = await _runner(store, ic)
     cfg = _source_config(ic, "127.0.0.1", {})
     cfg.settings["port"] = 0  # ephemeral test port
-    source = build_source(cfg)
+    source = build_source(cfg, egress=EgressSettings(deny_by_default=False))
     assert isinstance(source, HttpSource)
     if events is not None:
 

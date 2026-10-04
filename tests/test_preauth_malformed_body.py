@@ -70,7 +70,7 @@ from messagefoundry.api.app import create_app
 from messagefoundry.api.security import require
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from scripts.security import route_gates
 from scripts.security.dast_auth_sweep import DEFAULT_POLICY, _key, load_policy
@@ -190,7 +190,11 @@ class _Sweep:
 
 async def _engine_and_app(directory: Path) -> tuple[Engine, FastAPI]:
     """The app every case here walks: the console mounted and federated sign-in on."""
-    engine = await Engine.create(directory / "preauth.db", poll_interval=0.05)
+    engine = await Engine.create(
+        directory / "preauth.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
         await service.initialize()

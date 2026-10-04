@@ -58,7 +58,7 @@ from messagefoundry.api.security import (
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings, SecuritySettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings, SecuritySettings
 from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.pipeline import Engine
 from scripts.security import route_gates
@@ -94,7 +94,11 @@ def _fingerprint(response: httpx.Response) -> _Fingerprint:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "auth_before_body.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "auth_before_body.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

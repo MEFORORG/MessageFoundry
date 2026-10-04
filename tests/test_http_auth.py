@@ -19,7 +19,7 @@ import urllib.request
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Rest, Soap
 from messagefoundry.transports import build_destination
@@ -396,7 +396,8 @@ def test_digest_cleartext_allowed_when_attested(monkeypatch: pytest.MonkeyPatch)
 
 def _rest_from(spec_settings: dict[str, object]) -> RestDestination:
     d = build_destination(
-        Destination(name="OB_REST", type=ConnectorType.REST, settings=spec_settings)
+        Destination(name="OB_REST", type=ConnectorType.REST, settings=spec_settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, RestDestination)
     return d
@@ -575,7 +576,8 @@ def test_oauth2_cc_on_soap_injects_bearer() -> None:
         Soap(url=URL), token_url=TOKEN_URL, client_id="cid", client_secret="s"
     )
     d = build_destination(
-        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=spec.settings)
+        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=spec.settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, SoapDestination)
     assert isinstance(d._token_provider, OAuth2ClientCredentialsProvider)

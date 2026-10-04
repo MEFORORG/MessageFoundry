@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
@@ -187,7 +188,7 @@ async def test_engine_single_node_resets_and_spawns_no_leader_task() -> None:
     unconditional reset_stale_inflight (today's behavior) and spawns NO LeaderMaintenanceRunner."""
     store = _RecordingStore()
     coord = _Coordinator(leader=True, reclaims=False)
-    engine = Engine(store, coordinator=coord)  # type: ignore[arg-type]  # spy store
+    engine = Engine(store, coordinator=coord, egress_settings=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]  # spy store
     await engine.start()
     try:
         assert store.reset_calls == 1  # unconditional self-recovery ran
@@ -203,7 +204,7 @@ async def test_engine_clustered_skips_reset_and_spawns_leader_task() -> None:
     steal a live sibling's in-flight rows) and DOES start a LeaderMaintenanceRunner."""
     store = _RecordingStore()
     coord = _Coordinator(leader=True, reclaims=True)
-    engine = Engine(store, coordinator=coord)  # type: ignore[arg-type]  # spy store
+    engine = Engine(store, coordinator=coord, egress_settings=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]  # spy store
     await engine.start()
     try:
         assert store.reset_calls == 0  # clustered: the leader sweep recovers, not the startup reset
@@ -226,6 +227,7 @@ async def test_engine_clustered_reclaim_interval_from_settings(tmp_path: Path) -
         store,  # type: ignore[arg-type]
         coordinator=coord,
         cluster_settings=ClusterSettings(reclaim_interval_seconds=7.0),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     await engine.start()
     try:

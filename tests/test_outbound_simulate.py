@@ -17,7 +17,7 @@ import pytest
 
 from messagefoundry.config.connections_edit import list_connections, upsert_connection
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import ServiceSettings, ShadowSettings
+from messagefoundry.config.settings import EgressSettings, ServiceSettings, ShadowSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -276,7 +276,9 @@ async def test_simulate_capturing_outbound_captures_nothing(
     )
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("mllp_out", m))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         await _until_message(store, MessageStatus.PROCESSED.value)
@@ -291,7 +293,12 @@ async def test_simulate_capturing_outbound_captures_nothing(
 async def test_reload_toggles_simulate(store: MessageStore, tmp_path: Path) -> None:
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
-    runner = RegistryRunner(_registry(inbox, outdir, simulate=False), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _registry(inbox, outdir, simulate=False),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert runner.outbound_simulated("file_out") is False
@@ -309,7 +316,12 @@ async def test_simulate_suppresses_egress_but_finalizes_processed(
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
-    runner = RegistryRunner(_registry(inbox, outdir, simulate=True), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _registry(inbox, outdir, simulate=True),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         await _until_stat(store, OutboxStatus.DONE.value, 1)  # the outbound row finalizes done...
@@ -328,7 +340,12 @@ async def test_non_simulate_delivers_normally(store: MessageStore, tmp_path: Pat
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
-    runner = RegistryRunner(_registry(inbox, outdir, simulate=False), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _registry(inbox, outdir, simulate=False),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         await _until_stat(store, OutboxStatus.DONE.value, 1)
@@ -346,7 +363,11 @@ async def test_simulate_all_egress_master_switch(store: MessageStore, tmp_path: 
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
     runner = RegistryRunner(
-        _registry(inbox, outdir, simulate=False), store, poll_interval=0.02, simulate_all=True
+        _registry(inbox, outdir, simulate=False),
+        store,
+        poll_interval=0.02,
+        simulate_all=True,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:

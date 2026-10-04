@@ -35,7 +35,7 @@ from messagefoundry.api.header_floor import (
     WEBSOCKET_DENIAL_EXTENSION,
     SecurityHeaderFloorMiddleware,
 )
-from messagefoundry.config.settings import SecuritySettings
+from messagefoundry.config.settings import EgressSettings, SecuritySettings
 from messagefoundry.pipeline import Engine
 
 _DNS_HOST = "ops.example.com"
@@ -45,7 +45,11 @@ _DNS_HOST = "ops.example.com"
 async def engine(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator[Engine]:
     # Module-scoped: every refusal here happens before the route touches the engine, so one
     # never-started engine serves the whole file (the session loop makes this safe).
-    eng = await Engine.create(tmp_path_factory.mktemp("wsfloor") / "wsfloor.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path_factory.mktemp("wsfloor") / "wsfloor.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

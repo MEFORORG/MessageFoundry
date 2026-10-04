@@ -7778,7 +7778,7 @@ def create_managed_app(
     settings_crls: Sequence[MonitoredCert] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
-    egress_settings: EgressSettings | None = None,
+    egress_settings: EgressSettings,
     tls_settings: TlsSettings | None = None,
     shadow_settings: ShadowSettings | None = None,
     sandbox_settings: SandboxSettings | None = None,

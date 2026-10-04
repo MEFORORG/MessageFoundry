@@ -63,6 +63,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -187,7 +188,7 @@ async def _run_shape(
     store = await MessageStore.open(tmp_path / db)
     try:
         reg = _registry(tmp_path, handlers=handlers, outbounds=outbounds)
-        runner = RegistryRunner(reg, store)
+        runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
         for name in outbounds:
             runner._destinations[name] = _Sink()
         return await _drive(store, runner, outbounds)
@@ -329,7 +330,13 @@ async def test_live_per_lane_engine_pins_seven_commits_for_one_message(
 
     store = await MessageStore.open(tmp_path / "live.db")
     reg = _registry(tmp_path, handlers={"h": lambda m: Send("OB0", str(m))}, outbounds=["OB0"])
-    runner = RegistryRunner(reg, store, claim_mode="per_lane", connection_events=connection_events)
+    runner = RegistryRunner(
+        reg,
+        store,
+        claim_mode="per_lane",
+        connection_events=connection_events,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         # start() awaits its own setup, so every startup commit is already counted here. Measured: an

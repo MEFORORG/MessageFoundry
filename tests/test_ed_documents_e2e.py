@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -127,7 +128,12 @@ async def test_base64_pdf_survives_full_engine(
     inbox.mkdir()
     (inbox / "a.hl7").write_bytes(oru_with_pdf(pdf, seed=f"e2e-{size}").encode("utf-8"))
 
-    runner = RegistryRunner(_passthrough_registry(inbox, outdir), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _passthrough_registry(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         msgs = await _until_status(store, MessageStatus.PROCESSED.value)

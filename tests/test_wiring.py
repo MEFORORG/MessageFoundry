@@ -331,7 +331,7 @@ def test_build_check_registry_raises_port_conflict_error_on_api_port() -> None:
             reg,
             inbound_bind_host="127.0.0.1",
             env_values={},
-            egress=EgressSettings(),
+            egress=EgressSettings(deny_by_default=False),
             reserved_bindings=((API_LISTENER_LABEL, "127.0.0.1", 8765),),
         )
 
@@ -476,7 +476,10 @@ def _build_check(reg: Registry, env_values: dict[str, object]) -> None:
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
     build_check_registry(
-        reg, inbound_bind_host="127.0.0.1", env_values=env_values, egress=EgressSettings()
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values=env_values,
+        egress=EgressSettings(deny_by_default=False),
     )
 
 

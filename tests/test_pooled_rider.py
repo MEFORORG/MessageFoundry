@@ -86,6 +86,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -278,9 +279,12 @@ def _make_runner(
             store,
             claim_mode="pooled",
             pooled_sweep_interval=sweep,
+            egress=EgressSettings(deny_by_default=False),
             **extra,
         )
-    return RegistryRunner(reg, store, claim_mode="per_lane", **extra)
+    return RegistryRunner(
+        reg, store, claim_mode="per_lane", egress=EgressSettings(deny_by_default=False), **extra
+    )
 
 
 async def _stop_quiesced(runner: RegistryRunner, store: Any) -> None:

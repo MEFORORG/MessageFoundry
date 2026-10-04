@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     HopPosture,
     InsecureHopRefused,
@@ -244,7 +245,9 @@ class _StopBeforeDial(RuntimeError):
 def test_lookup_executor_prod_phi_attested_constructs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(PROD_PHI):
-        executor = DatabaseLookupExecutor({"clarity": dict(_ATTESTED_DB)})
+        executor = DatabaseLookupExecutor(
+            {"clarity": dict(_ATTESTED_DB)}, egress=EgressSettings(deny_by_default=False)
+        )
     dsn = executor._dsn["clarity"]
     assert "Encrypt=no" in dsn
     assert "ApplicationIntent=ReadOnly" in dsn  # the ADR 0010 read-only intent is unchanged
@@ -256,19 +259,21 @@ def test_lookup_executor_prod_phi_unattested_still_refused(
     # No-loosen control: with no attestation the clamp still refuses, escape variable set or not.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="weakened"):
-        DatabaseLookupExecutor({"clarity": dict(_WEAK_DB)})
+        DatabaseLookupExecutor(
+            {"clarity": dict(_WEAK_DB)}, egress=EgressSettings(deny_by_default=False)
+        )
 
 
 def test_lookup_executor_reason_without_flag_fails_loud() -> None:
     settings = {**_ATTESTED_DB, "tls_hop_attested": False}
     with pytest.raises(ValueError, match="tls_hop_attested_reason is set without"):
-        DatabaseLookupExecutor({"clarity": settings})
+        DatabaseLookupExecutor({"clarity": settings}, egress=EgressSettings(deny_by_default=False))
 
 
 def test_lookup_executor_flag_without_reason_fails_loud() -> None:
     settings = {k: v for k, v in _ATTESTED_DB.items() if k != "tls_hop_attested_reason"}
     with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
-        DatabaseLookupExecutor({"clarity": settings})
+        DatabaseLookupExecutor({"clarity": settings}, egress=EgressSettings(deny_by_default=False))
 
 
 def _fail_at_dial(monkeypatch: pytest.MonkeyPatch, seen: list[str]) -> None:
@@ -291,7 +296,7 @@ def test_reference_source_prod_phi_attested_builds_dsn(monkeypatch: pytest.Monke
     _fail_at_dial(monkeypatch, seen)
     settings = {**_ATTESTED_DB, "statement": "SELECT code, label FROM t", "key_column": "code"}
     with active_hop_posture(PROD_PHI), pytest.raises(_StopBeforeDial):
-        asyncio.run(_load_database_source(settings, None))
+        asyncio.run(_load_database_source(settings, EgressSettings(deny_by_default=False)))
     assert "Encrypt=no" in seen[0]
 
 
@@ -305,7 +310,7 @@ def test_reference_source_prod_phi_unattested_still_refused(
     _fail_at_dial(monkeypatch, seen)
     settings = {**_WEAK_DB, "statement": "SELECT code FROM t", "key_column": "code"}
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="weakened"):
-        asyncio.run(_load_database_source(settings, None))
+        asyncio.run(_load_database_source(settings, EgressSettings(deny_by_default=False)))
     assert seen == []  # refused BEFORE the pool was ever built
 
 
@@ -329,7 +334,7 @@ def test_reference_source_with_no_posture_refuses_even_with_escape(
     seen: list[str] = []
     _fail_at_dial(monkeypatch, seen)
     with active_hop_posture(None), pytest.raises(ValueError, match="weakened"):
-        asyncio.run(_load_database_source(dict(_WEAK_REF), None))
+        asyncio.run(_load_database_source(dict(_WEAK_REF), EgressSettings(deny_by_default=False)))
     assert seen == []
 
 
@@ -342,7 +347,11 @@ def test_reference_source_enforcing_posture_clamps_the_escape(
     seen: list[str] = []
     _fail_at_dial(monkeypatch, seen)
     with pytest.raises(ValueError, match="weakened"):
-        asyncio.run(_load_database_source(dict(_WEAK_REF), None, posture=PROD_PHI))
+        asyncio.run(
+            _load_database_source(
+                dict(_WEAK_REF), EgressSettings(deny_by_default=False), posture=PROD_PHI
+            )
+        )
     assert seen == []
 
 
@@ -362,7 +371,9 @@ def test_reference_source_verifying_tls_passes_under_enforce(
         "key_column": "code",
     }
     with pytest.raises(_StopBeforeDial):
-        asyncio.run(_load_database_source(settings, None, posture=PROD_PHI))
+        asyncio.run(
+            _load_database_source(settings, EgressSettings(deny_by_default=False), posture=PROD_PHI)
+        )
     assert "Encrypt=yes" in seen[0]
     assert "TrustServerCertificate=no" in seen[0]
 
@@ -377,7 +388,11 @@ def test_reference_source_non_enforcing_posture_honours_the_escape(
     seen: list[str] = []
     _fail_at_dial(monkeypatch, seen)
     with pytest.raises(_StopBeforeDial):
-        asyncio.run(_load_database_source(dict(_WEAK_REF), None, posture=STAGING_PHI))
+        asyncio.run(
+            _load_database_source(
+                dict(_WEAK_REF), EgressSettings(deny_by_default=False), posture=STAGING_PHI
+            )
+        )
     assert "Encrypt=no" in seen[0]
 
 
@@ -396,7 +411,13 @@ def test_reference_runner_threads_its_posture_into_the_sync(
     store: Any = object()  # never reached: the refusal comes before the snapshot write
 
     def runner(posture: HopPosture | None) -> ReferenceSyncRunner:
-        return ReferenceSyncRunner(store, lambda: [spec], ReferenceSettings(), hop_posture=posture)
+        return ReferenceSyncRunner(
+            store,
+            lambda: [spec],
+            ReferenceSettings(),
+            hop_posture=posture,
+            egress=EgressSettings(deny_by_default=False),
+        )
 
     with pytest.raises(ValueError, match="weakened"):
         asyncio.run(runner(PROD_PHI)._sync_one(spec))
@@ -427,7 +448,11 @@ def _build_check(reg: Any, posture: HopPosture | None) -> None:
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
     build_check_registry(
-        reg, inbound_bind_host="127.0.0.1", env_values={}, egress=EgressSettings(), posture=posture
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+        posture=posture,
     )
 
 
@@ -484,7 +509,14 @@ async def test_engine_hands_its_posture_to_the_reference_runner(tmp_path: Path) 
     try:
         for posture in (PROD_PHI, None):
             assert (
-                Engine(store, hop_posture=posture)._make_reference_runner()._hop_posture is posture
+                Engine(
+                    store,
+                    hop_posture=posture,
+                    egress_settings=EgressSettings(deny_by_default=False),
+                )
+                ._make_reference_runner()
+                ._hop_posture
+                is posture
             )
     finally:
         await store.close()

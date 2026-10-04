@@ -29,6 +29,7 @@ from messagefoundry.config.models import (
     Source,
     Validation,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -406,7 +407,7 @@ def _registry() -> Registry:
 
 async def test_P15_the_listener_naks_and_records_error(store: MessageStore) -> None:
     reg = _registry()
-    runner = wiring_runner.RegistryRunner(reg, store)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     ack = await runner._handle_inbound(reg.inbound["in"], EMBEDDED_SB.encode("utf-8"))
     assert ack is not None and "MSA|AR|" in ack and "MLLP frame byte in body" in ack
     cur = await store._db.execute("SELECT status, error FROM messages")
@@ -421,7 +422,7 @@ async def test_P15_the_listener_naks_and_records_error(store: MessageStore) -> N
 
 async def test_a_leading_frame_byte_is_still_received(store: MessageStore) -> None:
     reg = _registry()
-    runner = wiring_runner.RegistryRunner(reg, store)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     await runner._handle_inbound(reg.inbound["in"], (SB + CLEAN).encode("utf-8"))
     cur = await store._db.execute("SELECT status FROM messages")
     assert [dict(r)["status"] for r in await cur.fetchall()] == [MessageStatus.RECEIVED.value]
@@ -434,7 +435,7 @@ async def test_a_trailing_frame_byte_is_received_and_kept_in_the_stored_raw(
     # The encode drops it, which is what pass-through sends; a path that sent the stored raw would
     # meet rule 1 and dead-letter, as the last assertion shows.
     reg = _registry()
-    runner = wiring_runner.RegistryRunner(reg, store)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     await runner._handle_inbound(reg.inbound["in"], (CLEAN + EB).encode("utf-8"))
     cur = await store._db.execute("SELECT id, status FROM messages")
     ((mid, status),) = [tuple(r) for r in await cur.fetchall()]
@@ -533,7 +534,9 @@ async def test_a_shadow_outbound_records_what_a_live_send_would(
     # twin is in tests/test_outbound_batch.py, which runs on every store backend.
     (mid,) = await _enqueue(store, [body])
     dest = _SendRecorder(**field)
-    runner = wiring_runner.RegistryRunner(Registry(), store, poll_interval=0.02)
+    runner = wiring_runner.RegistryRunner(
+        Registry(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     runner._destinations[DEST] = dest
     runner._retry[DEST] = RetryPolicy()
     runner._simulate[DEST] = True

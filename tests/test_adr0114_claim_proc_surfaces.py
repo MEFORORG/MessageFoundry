@@ -45,6 +45,7 @@ from messagefoundry.api.models import (
     ServiceStatusInfo,
     SystemStatus,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import ClaimProcStatus
 from messagefoundry_webconsole.pages import monitoring
@@ -81,7 +82,11 @@ _VERBATIM = ClaimProcStatus(
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "gauge.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "gauge.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.started_at = 1.0
     yield eng
     await eng.stop()

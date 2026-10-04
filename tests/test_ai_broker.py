@@ -25,7 +25,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.ai_policy import AiDataScope, AiMode, resolve_effective_policy
-from messagefoundry.config.settings import AiSettings, AuthSettings
+from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.transports import ai_broker as ai_broker_mod
 from messagefoundry.transports.ai_broker import (
@@ -58,7 +58,11 @@ def _managed_ai(**over: object) -> AiSettings:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "ai_broker.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "ai_broker.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

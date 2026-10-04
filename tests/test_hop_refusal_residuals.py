@@ -149,7 +149,11 @@ def test_phi_read_disposition_prod_phi_escape_cannot_relax() -> None:
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "phi_read.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "phi_read.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
@@ -286,7 +290,13 @@ def _db_registry() -> Registry:
 
 async def test_runner_refuses_prod_phi_cleartext_fhir_lookup(store: MessageStore) -> None:
     # A prod-PHI instance building the live FHIR-lookup executor must REFUSE a cleartext http read hop.
-    runner = RegistryRunner(_fhir_registry(), store, poll_interval=0.02, hop_posture=PROD_PHI)
+    runner = RegistryRunner(
+        _fhir_registry(),
+        store,
+        poll_interval=0.02,
+        hop_posture=PROD_PHI,
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(InsecureHopRefused):
         runner._build_fhir_lookup_executor()
 
@@ -297,7 +307,13 @@ async def test_runner_refuses_synthetic_cleartext_fhir_lookup(store: MessageStor
     The residual this test belongs to is about the live-runner build reading the STAMPED posture rather
     than fail-closing — that is still what is under test. What changed is the expected answer for an
     enforcing synthetic instance: the label is no longer an input, so it refuses."""
-    runner = RegistryRunner(_fhir_registry(), store, poll_interval=0.02, hop_posture=SYNTHETIC)
+    runner = RegistryRunner(
+        _fhir_registry(),
+        store,
+        poll_interval=0.02,
+        hop_posture=SYNTHETIC,
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(InsecureHopRefused):
         runner._build_fhir_lookup_executor()
 
@@ -308,7 +324,11 @@ async def test_runner_allows_declared_cleartext_fhir_lookup(store: MessageStore)
     This is the half of the residual that still matters: an unstamped build would fail closed and
     wrongly refuse a legitimately-declared lane at serve, after build_check had already allowed it."""
     runner = RegistryRunner(
-        _fhir_registry(accepted=True), store, poll_interval=0.02, hop_posture=PROD_PHI
+        _fhir_registry(accepted=True),
+        store,
+        poll_interval=0.02,
+        hop_posture=PROD_PHI,
+        egress=EgressSettings(deny_by_default=False),
     )
     assert runner._build_fhir_lookup_executor() is not None
 
@@ -320,7 +340,13 @@ async def test_runner_refuses_prod_phi_weakened_db_lookup_even_with_escape(
     # STILL be refused (the production-PHI clamp). Before the stamp the live-runner build keyed on the
     # UNCLAMPED insecure_tls_allowed() (posture unstamped) → it would have been PERMITTED.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    runner = RegistryRunner(_db_registry(), store, poll_interval=0.02, hop_posture=PROD_PHI)
+    runner = RegistryRunner(
+        _db_registry(),
+        store,
+        poll_interval=0.02,
+        hop_posture=PROD_PHI,
+        egress=EgressSettings(deny_by_default=False),
+    )
     # The DATABASE weakened-TLS cell refuses with a ValueError (surfaced as a config-load error) — the
     # strict verify-off cell, keyed on the stamped posture through the production-PHI clamp.
     with pytest.raises(ValueError, match="weakened"):
@@ -333,7 +359,13 @@ async def test_runner_allows_synthetic_weakened_db_lookup_with_escape(
     # Byte-identical for a synthetic instance: with the escape set, a weakened-TLS lookup still builds —
     # the clamp only closes the production-PHI case, never a dev lane.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    runner = RegistryRunner(_db_registry(), store, poll_interval=0.02, hop_posture=SYNTHETIC)
+    runner = RegistryRunner(
+        _db_registry(),
+        store,
+        poll_interval=0.02,
+        hop_posture=SYNTHETIC,
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert runner._build_lookup_executor() is not None
 
 
@@ -477,8 +509,10 @@ def test_check_build_skips_without_service_toml(tmp_path: Path) -> None:
     assert result.skipped and result.ok
 
 
-def test_egress_default_allows_lookup_host() -> None:
-    # Guard: the residual-2 runner tests rely on the default egress not pre-refusing the lookup host
-    # (empty allowlist = unrestricted), so the posture guard is what decides. Assert that invariant.
-    e = EgressSettings()
+def test_the_runner_tests_policy_allows_the_lookup_host() -> None:
+    # Guard: the residual-2 runner tests must not have the lookup host pre-refused by egress, so the
+    # posture guard is what decides. The model default denies (vault BACKLOG #2605), so they pass
+    # the audited opt-out, where an empty allowlist is unrestricted. Assert both halves.
+    assert EgressSettings().deny_by_default
+    e = EgressSettings(deny_by_default=False)
     assert not e.allowed_http and not e.allowed_db and not e.deny_by_default

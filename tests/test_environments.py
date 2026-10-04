@@ -16,6 +16,7 @@ from messagefoundry.config.environments import (
     load_environment_values,
     resolve_values_base_dir,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     EnvRef,
     WiringError,
@@ -331,7 +332,12 @@ def test_build_resolves_env_outbound(tmp_path: Path) -> None:
         """,
     )
     reg = load_config(d)
-    dest = _dest_config(reg.outbound["OB"], {"peer_host": "10.0.0.2", "peer_port": "6000"})
+    dest = _dest_config(
+        reg.outbound["OB"],
+        {"peer_host": "10.0.0.2", "peer_port": "6000"},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
     assert dest.settings["host"] == "10.0.0.2"
     assert dest.settings["port"] == 6000
 
@@ -350,7 +356,12 @@ def test_build_check_fails_loud_on_missing_env_value(tmp_path: Path) -> None:
     # This guarantee is UNCHANGED by the #233 not-deployed carve-out below: it is scoped to the flag,
     # not a general softening — a DEPLOYED connection (the default, so: every existing one) still
     # fails loud on an env key the target environment does not define.
-    runner = RegistryRunner(reg, store=None, env_values={})  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        reg,
+        store=None,  # type: ignore[arg-type]
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(WiringError, match="peer_host"):
         runner.build_check(reg)
 
@@ -372,7 +383,12 @@ def test_build_check_does_not_resolve_env_for_a_not_deployed_connection(tmp_path
     )
     reg = load_config(d)
     assert "OB" in reg.outbound and reg.outbound["OB"].deployed is False  # still IN the graph
-    runner = RegistryRunner(reg, store=None, env_values={})  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        reg,
+        store=None,  # type: ignore[arg-type]
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     runner.build_check(reg)  # must not raise — 'peer_host' is never looked up
 
 

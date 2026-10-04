@@ -436,8 +436,8 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    outbound connectors** (and the sanctioned read-only `db_lookup` / `fhir_lookup`) can only reach
    approved destinations — **all eight**, plus the separate `[alerts]` allow-lists for the
    webhook / SMTP alert sinks, which `[egress]` does **not** cover (see
-   [egress allow-lists](#egress-allow-lists)). A PHI instance with *nothing* declared and
-   deny-by-default off **refuses to start**. **`[egress]` is not a boundary around Handler code** — see
+   [egress allow-lists](#egress-allow-lists)). A PHI instance with *nothing* declared, and
+   `block_unlisted_outbound` not written `true`, **refuses to start**. **`[egress]` is not a boundary around Handler code** — see
    the limit stated under [egress allow-lists](#egress-allow-lists).
 7. **Off-box logs + MFA** — **both are built** and pair with off-loopback exposure: enable
    `[logging].forward_*` to ship logs + (PHI-redacted) audit to your SIEM. Under the shipped
@@ -713,10 +713,13 @@ cannot deliver to an unapproved address — **all eight of them**, not just the 
 remember. An operator who takes the `block_unlisted_outbound = false` opt-out and then populates only
 the rows they recall leaves the rest of the estate's declared egress unrestricted while believing
 exfiltration is confined. The **global deny-by-default toggle is built** — `[security].block_unlisted_outbound`
-— and on a **PHI instance the serve gate turns it on for you** unless you set it explicitly, so a
-transport whose `allowed_*` list is empty then refuses *every* destination of that type. Related refusal:
-a PHI instance with **no** allow-list populated *and* deny-by-default off has fully unrestricted egress
-and **refuses to start** under `[security].enforcement = enforce` (it warns at `warn`).
+— and it is **on by default** for every entry point, not only `serve`, unless you write it false
+(vault BACKLOG #2605), so a transport whose `allowed_*` list is empty refuses *every* destination of
+that type. The check reads the host name a connection is configured with, at load. It does not see the
+address a connection finally reaches, and a native database driver makes its own connect, so a host
+firewall rule for the service account is still the layer that bounds those. Related refusal:
+a PHI instance with **no** allow-list populated, and `block_unlisted_outbound` not written `true`,
+**refuses to start** under `[security].enforcement = enforce` (it warns at `warn`).
 
 ---
 

@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import DatabasePoll, File, Ftp, Sftp
 from messagefoundry.transports import build_source, remotefile
 from messagefoundry.transports import database as db_mod
@@ -62,7 +63,10 @@ class _RecordingHandler:
 def _file_source(directory: Path, **over: Any) -> FileSource:
     settings: dict[str, Any] = {"directory": str(directory)}
     settings.update(over)
-    src = build_source(Source(type=ConnectorType.FILE, settings=settings))
+    src = build_source(
+        Source(type=ConnectorType.FILE, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(src, FileSource)
     src._prepare_subdirs()  # .processed/.error, which start() would otherwise create
     return src
@@ -369,7 +373,10 @@ def _remote_source(
         # what a connections.toml table that never mentions the knob looks like — and the two defaults
         # are pinned equal by test_remote_ceiling_is_on_by_default_and_operator_overridable.
         settings.pop("poll_max_files", None)
-    src = build_source(Source(type=ConnectorType.REMOTEFILE, settings=settings))
+    src = build_source(
+        Source(type=ConnectorType.REMOTEFILE, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(src, RemoteFileSource)
     return src
 
@@ -580,7 +587,10 @@ def _db_source(**over: Any) -> DatabaseSource:
         "body_column": "payload",
     }
     base.update(over)
-    src = build_source(Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings))
+    src = build_source(
+        Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(src, DatabaseSource)
     return src
 

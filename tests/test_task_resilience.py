@@ -16,6 +16,7 @@ import pytest
 
 from messagefoundry.api import app as api_app
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -86,7 +87,13 @@ async def test_delivery_worker_survives_store_error(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.01)
     store = _FlakyStore(fail_times=1)
     # per_lane: exercises the per-outbound delivery worker respawn (pooled has no per-outbound worker).
-    runner = RegistryRunner(Registry(), store, poll_interval=0.02, claim_mode="per_lane")  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        Registry(),
+        store,  # type: ignore[arg-type]
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     runner._running = True
     runner._spawn_worker("OB")
     try:
@@ -104,6 +111,7 @@ async def test_dead_worker_is_respawned_while_running() -> None:
         _FlakyStore(fail_times=0),  # type: ignore[arg-type]  # a stub: only the claim paths exist
         poll_interval=0.02,
         claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
     )
     runner._running = True
 
@@ -219,7 +227,11 @@ async def test_router_worker_recovers_claimed_row_after_handoff_fault_without_re
     store = await MessageStore.open(tmp_path / "repend.db")
     try:
         runner = RegistryRunner(
-            _repend_registry(tmp_path), store, poll_interval=0.02, claim_mode="per_lane"
+            _repend_registry(tmp_path),
+            store,
+            poll_interval=0.02,
+            claim_mode="per_lane",
+            egress=EgressSettings(deny_by_default=False),
         )
         mid = await store.enqueue_ingress(channel_id="IB", raw=RAW_1611)
 
@@ -315,7 +327,13 @@ async def test_every_per_lane_worker_repends_the_row_it_claimed(
     raises -- the exact shape of a fault after a committed claim."""
     monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.01)
     store = _OneRowThenFaultStore(stage)
-    runner = RegistryRunner(Registry(), store, poll_interval=0.02, claim_mode="per_lane")  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        Registry(),
+        store,  # type: ignore[arg-type]
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     runner._running = True
 
     raised = {"n": 0}
@@ -408,6 +426,7 @@ async def _start_runner(
         poll_interval=0.02,
         claim_mode=claim_mode,
         pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     collector = _Collector()
@@ -800,7 +819,11 @@ async def test_status_names_a_pooled_stage_whose_claimer_is_down(
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     outdir.mkdir()
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(_pooled_registry(inbox, outdir))
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))

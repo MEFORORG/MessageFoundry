@@ -32,7 +32,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.settings import EgressSettings, StoreSettings
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.store import MessageStore, crypto
 from messagefoundry.store import backup_codec as bc
@@ -620,7 +620,7 @@ async def test_uploaded_logs_encrypts_charge_the_SAME_persisted_bound(tmp_path: 
     store, cipher = await _keyed_store(tmp_path / "uploads.db")
     try:
         app = create_app(
-            Engine(store),
+            Engine(store, egress_settings=EgressSettings(deny_by_default=False)),
             store_settings=StoreSettings(
                 uploads_dir=str(tmp_path / "up"), max_upload_bytes=1_000_000
             ),
@@ -659,7 +659,11 @@ def test_managed_serve_binds_uploaded_logs_to_the_LIVE_store_cipher(tmp_path: Pa
         encryption_key=generate_key(),
         uploads_dir=str(tmp_path / "managed-uploads"),
     )
-    app = create_managed_app(store_settings=settings, poll_interval=0.05)
+    app = create_managed_app(
+        store_settings=settings,
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     with TestClient(app):  # drives the lifespan (opens the store, starts the engine)
         uploads = app.state.upload_store
         assert uploads is not None, "[store].uploads_dir was set — the subsystem must be wired"
@@ -685,7 +689,11 @@ def test_managed_serve_threads_upload_quotas_and_retention(tmp_path: Path) -> No
         max_upload_total_bytes_per_user=123_456,
         uploads_retention_days=3,
     )
-    app = create_managed_app(store_settings=settings, poll_interval=0.05)
+    app = create_managed_app(
+        store_settings=settings,
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     with TestClient(app):
         us = app.state.upload_store
         assert us is not None

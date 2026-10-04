@@ -39,6 +39,7 @@ import pytest
 
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing._builtin_hl7 import (
     MAX_ESCAPE_REPEAT,
@@ -523,7 +524,7 @@ async def test_over_budget_message_records_error_and_naks_before_any_ingress_row
     # listener's existing HL7PeekError catch, so the message is dead-lettered ERROR + NAK'd AR before
     # the ingress stage — counted and logged, never accepted-and-dropped and never silently blanked.
     reg = _hl7_registry()
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     body = _MSG.format(pid3=_ESCAPE * (_AT_BUDGET_REPEATS + 1)).encode("utf-8")
 
     ack = await runner._handle_inbound(reg.inbound["IB_HL7"], body)
@@ -542,7 +543,7 @@ async def test_over_budget_message_records_error_and_naks_before_any_ingress_row
 async def test_under_budget_message_still_reaches_the_ingress_stage(store: MessageStore) -> None:
     # Anti-vacuity twin: the same listener path with an at-budget composition still ACKs and commits.
     reg = _hl7_registry()
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     body = _MSG.format(pid3=_ESCAPE * _AT_BUDGET_REPEATS).encode("utf-8")
 
     ack = await runner._handle_inbound(reg.inbound["IB_HL7"], body)
@@ -644,7 +645,7 @@ async def test_a_parser_fault_records_error_and_naks_before_any_ingress_row(
     # ERROR, so the message is counted and logged, never accepted and dropped.
     monkeypatch.setattr(_builtin_hl7, "parse", _raise_builtin_fault)
     reg = _hl7_registry()
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(reg.inbound["IB_HL7"], _PHI_MSG.encode("utf-8"))
 

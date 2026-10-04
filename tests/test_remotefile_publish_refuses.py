@@ -37,6 +37,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Sftp
 from messagefoundry.transports import build_destination, remotefile
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
@@ -122,7 +123,10 @@ def _dest(
     base: dict[str, Any] = {"host": "sftp.example.com", "remote_dir": "/in"}
     base.update(over)
     dest = build_destination(
-        Destination(name="OB_REMOTE", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings)
+        Destination(
+            name="OB_REMOTE", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, RemoteFileDestination)
     return dest

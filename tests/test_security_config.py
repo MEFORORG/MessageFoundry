@@ -808,12 +808,16 @@ def test_open_egress_gate_counts_smtp_and_direct_when_deny_by_default_is_unset(
     # unrelated gates (retention, security-notification), so rc == 0 would be testing something else.
     _serve(tmp_path, monkeypatch, 'egress.allowed_smtp = ["smtp.partner.example"]\n', env="prod")
     err = capsys.readouterr().err
-    assert "egress is UNRESTRICTED" not in err, "a declared SMTP allowlist must satisfy the gate"
+    assert "no outbound destination is declared" not in err, (
+        "a declared SMTP allowlist must satisfy the gate"
+    )
     assert "block_unlisted_outbound defaulted ON" in err, "...and it must still start fail-closed"
 
     _serve(tmp_path, monkeypatch, 'egress.allowed_direct = ["hisp.example"]\n', env="prod")
     err = capsys.readouterr().err
-    assert "egress is UNRESTRICTED" not in err, "a declared Direct allowlist must satisfy the gate"
+    assert "no outbound destination is declared" not in err, (
+        "a declared Direct allowlist must satisfy the gate"
+    )
     assert "block_unlisted_outbound defaulted ON" in err
 
 

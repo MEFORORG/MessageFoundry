@@ -34,6 +34,7 @@ import httpx
 import pytest
 
 from messagefoundry.config.models import ActiveWindow, ConnectorType, Schedule
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -144,7 +145,12 @@ def test_build_check_skips_a_not_deployed_connection() -> None:
     reg.add_inbound(_unresolvable_in("IB_OFF", deployed=False))
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store=None, env_values={})  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        reg,
+        store=None,  # type: ignore[arg-type]
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     runner.build_check(reg)  # must not raise, though NOT ONE env() value exists
 
 
@@ -154,7 +160,12 @@ def test_build_check_still_fails_loud_for_a_deployed_connection() -> None:
     target never goes live"). The carve-out is scoped to the flag, not a general softening."""
     reg = Registry()
     reg.add_outbound(_unresolvable_out("OB_ON", deployed=True))
-    runner = RegistryRunner(reg, store=None, env_values={})  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        reg,
+        store=None,  # type: ignore[arg-type]
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(WiringError, match="partner_host"):
         runner.build_check(reg)
 
@@ -169,7 +180,12 @@ def test_a_not_deployed_listener_cannot_collide_on_a_port() -> None:
     reg.add_inbound(build_inbound_connection("IB_NEW", MLLP(port=port), router="r"))
     reg.add_router("r", lambda m: [])
     reg.validate()  # literal-port collisions (Registry.port_collisions)
-    runner = RegistryRunner(reg, store=None, env_values={})  # type: ignore[arg-type]
+    runner = RegistryRunner(
+        reg,
+        store=None,  # type: ignore[arg-type]
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     runner.build_check(reg)  # env-resolved conflicts (inbound_binding_conflicts)
 
 
@@ -182,7 +198,9 @@ async def test_engine_starts_clean_with_a_not_deployed_outbound(store: MessageSt
     not a DR park (#61) — a clean, deliberate, non-degraded 'stopped'."""
     reg = Registry()
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.running
@@ -211,7 +229,13 @@ async def test_not_deployed_outbound_spawns_no_delivery_worker(
     reg.add_outbound(_file_out("OB_OFF", tmp_path, deployed=False))
     reg.add_outbound(_file_out("OB_DISABLED", tmp_path, auto_start=False))
     reg.add_outbound(_file_out("OB_ON", tmp_path))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode="per_lane")
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert "OB_ON" in runner._workers
@@ -236,7 +260,13 @@ async def test_not_deployed_inbound_is_not_bound_but_still_drains_its_backlog(
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("OB_ON", str(m)))
     reg.add_outbound(_file_out("OB_ON", out))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode="per_lane")
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     # A row that predates the flag flip, already committed at the ingress stage.
     await store.enqueue_ingress(channel_id="IB", raw=ADT, control_id="MSG1", message_type="ADT^A01")
     await runner.start()
@@ -266,7 +296,14 @@ async def test_deployed_false_wins_over_auto_start(store: MessageStore, tmp_path
     reg.add_router("r", lambda m: [])
     assert reg.outbound["OB_OFF"].auto_start is True  # explicitly NOT start-disabled
     assert reg.inbound["IB_OFF"].auto_start is True
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode="per_lane", env_values={})
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert "OB_OFF" not in runner._workers  # the auto_start branch WOULD have spawned one
@@ -284,7 +321,13 @@ async def test_default_deployed_is_byte_identical(store: MessageStore, tmp_path:
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_file_out("OB", tmp_path))
     assert reg.inbound["IB"].deployed is True and reg.outbound["OB"].deployed is True
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode="per_lane")
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert runner.inbound_running("IB")
@@ -326,7 +369,9 @@ async def test_send_to_a_not_deployed_outbound_queues_no_outbound_row(
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("OB_OFF", str(m)))
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+    )
 
     mid = await _drive(runner, store)
 
@@ -344,7 +389,9 @@ async def test_a_deployed_sibling_still_delivers(store: MessageStore, tmp_path: 
     reg.add_handler("h", lambda m: [Send("OB_ON", str(m)), Send("OB_OFF", str(m))])
     reg.add_outbound(_file_out("OB_ON", tmp_path))
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+    )
 
     mid = await _drive(runner, store)
 
@@ -373,7 +420,9 @@ async def test_inline_fast_path_declines_without_double_logging(
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("OB_OFF", str(m)))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+    )
     # Activate the inline fast-path WITHOUT start() (whose pooled dispatchers would race _drive's manual
     # claims): the graph declares no lookup, so recompute yields inline_ok=True directly.
     runner._lookup_executor = None
@@ -418,7 +467,14 @@ async def test_already_queued_rows_are_retained_not_dead_lettered(
     reg = Registry()
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
     await store.enqueue_message(channel_id="IB", raw=ADT, deliveries=[("OB_OFF", ADT)])
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode="per_lane", env_values={})
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert "OB_OFF" in runner.registry.outbound  # still in the graph — the sweep's key
@@ -449,7 +505,12 @@ async def test_reload_cannot_resurrect_a_not_deployed_outbound(
         r.add_outbound(_file_out("OB_OFF", out, deployed=deployed))
         return r
 
-    runner = RegistryRunner(_reg(deployed=False), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _reg(deployed=False),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         await store.enqueue_message(channel_id="IB", raw=ADT, deliveries=[("OB_OFF", ADT)])
@@ -483,7 +544,9 @@ async def test_reload_cannot_bind_a_not_deployed_inbound(store: MessageStore) ->
         r.add_router("r", lambda m: [])
         return r
 
-    runner = RegistryRunner(_reg(), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _reg(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert not runner.inbound_running("IB_OFF")
@@ -515,7 +578,13 @@ async def test_scheduler_cannot_start_a_not_deployed_connection(
     )
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_file_out("OB_OFF", tmp_path, deployed=False, schedule=schedule))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, schedule_clock=lambda: inside)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=lambda: inside,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         await runner._reconcile_schedule("IB_OFF", "inbound", schedule)
@@ -537,7 +606,9 @@ async def test_operator_start_refuses_a_not_deployed_connection(
     reg.add_inbound(_unresolvable_in("IB_OFF", deployed=False))
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         with pytest.raises(NotDeployedError, match="NOT deployed"):
@@ -591,7 +662,9 @@ async def test_sole_not_deployed_target_finalizes_not_deployed(
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: Send("OB_OFF", str(m)))
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+    )
 
     mid = await _drive(runner, store)
 
@@ -612,7 +685,9 @@ async def test_filtered_message_stays_distinguishable_from_not_deployed(
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=1), router="r"))
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: [])  # a real filter — no Send at all
-    runner = RegistryRunner(reg, store, poll_interval=0.02, env_values={})
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+    )
 
     mid = await _drive(runner, store)
 
@@ -635,7 +710,13 @@ async def test_deployed_sibling_delivers_message_processed_event_retained(
     reg.add_handler("h", lambda m: [Send("OB_ON", str(m)), Send("OB_OFF", str(m))])
     reg.add_outbound(_file_out("OB_ON", out))
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02, claim_mode="per_lane")
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
     mid = await store.enqueue_ingress(
         channel_id="IB", raw=ADT, control_id="MSG1", message_type="ADT^A01"
     )
@@ -668,7 +749,9 @@ async def test_not_deployed_record_and_disposition_survive_thinned_logs(
         reg.add_router("r", lambda m: ["h"])
         reg.add_handler("h", lambda m: Send("OB_OFF", str(m)))
         reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-        runner = RegistryRunner(reg, s, poll_interval=0.02, env_values={})
+        runner = RegistryRunner(
+            reg, s, poll_interval=0.02, env_values={}, egress=EgressSettings(deny_by_default=False)
+        )
 
         mid = await _drive(runner, s)
 
@@ -706,7 +789,11 @@ async def test_connections_surfaces_not_deployed_distinct_from_stopped(tmp_path:
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_file_out("OB_OFF", tmp_path, deployed=False))  # present, NOT deployed
     reg.add_outbound(_file_out("OB_STOPPED", tmp_path, auto_start=False))  # deployed, just not up
-    engine = await Engine.create(tmp_path / "conns.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "conns.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(reg)
     await engine.start()
     try:
@@ -733,7 +820,11 @@ async def test_connections_not_deployed_outbound_edge_row_carries_the_status(
     reg.add_inbound(build_inbound_connection("IB", MLLP(port=_free_port()), router="r"))
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    engine = await Engine.create(tmp_path / "edge.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "edge.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(reg)
     # A retained row from before the flip → a (IB, OB_OFF) outbound metrics edge.
     await engine.store.enqueue_message(channel_id="IB", raw=ADT, deliveries=[("OB_OFF", ADT)])
@@ -757,7 +848,11 @@ async def test_operator_start_restart_refuses_not_deployed_with_409(tmp_path: Pa
     reg.add_inbound(_unresolvable_in("IB_OFF", deployed=False))
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    engine = await Engine.create(tmp_path / "ctrl.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "ctrl.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(reg)
     await engine.start()
     try:
@@ -792,7 +887,11 @@ async def test_resend_and_edit_resend_to_not_deployed_are_409_and_queue_no_row(
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_file_out("OB_ON", tmp_path))
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    engine = await Engine.create(tmp_path / "resend.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "resend.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(reg)  # sets registry_runner; the resend routes need no started engine
     mid = await engine.store.enqueue_message(
         channel_id="IB", raw=ADT, deliveries=[("OB_ON", ADT)], source_type="file"
@@ -827,7 +926,11 @@ async def test_status_kpi_counts_not_deployed_in_its_own_bucket(tmp_path: Path) 
     reg.add_router("r", lambda m: [])
     reg.add_outbound(_file_out("OB_ON", tmp_path))
     reg.add_outbound(_unresolvable_out("OB_OFF", deployed=False))
-    engine = await Engine.create(tmp_path / "kpi.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "kpi.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(reg)
     await engine.start()
     try:

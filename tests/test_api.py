@@ -19,6 +19,7 @@ from starlette.testclient import TestClient
 
 from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -55,7 +56,11 @@ TRANSFORMED = (
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
@@ -1474,7 +1479,12 @@ async def test_connection_control_audits_the_resolved_role(
 
 
 def test_ws_stats_pushes_queue_depth(tmp_path: Path) -> None:
-    app = create_managed_app(db_path=tmp_path / "ws.db", poll_interval=0.05, allow_no_auth=True)
+    app = create_managed_app(
+        db_path=tmp_path / "ws.db",
+        poll_interval=0.05,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     # TestClient drives the lifespan, so the engine is created/started on its own loop.
     with TestClient(app) as tc, tc.websocket_connect("/ws/stats") as ws:
         data = ws.receive_json()

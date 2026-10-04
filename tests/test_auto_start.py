@@ -26,6 +26,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.config.models import ActiveWindow, ConnectorType, Schedule
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -88,7 +89,9 @@ async def test_auto_start_false_is_not_bound_at_boot(store: MessageStore, tmp_pa
     )
     reg.add_outbound(_file_out("out_off", tmp_path, auto_start=False))
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.running
@@ -114,7 +117,9 @@ async def test_start_disabled_inbound_is_startable_at_runtime(
         build_inbound_connection("in_off", MLLP(port=off_port), router="r", auto_start=False)
     )
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert not runner.inbound_running("in_off")
@@ -130,7 +135,9 @@ async def test_default_auto_start_is_byte_identical(store: MessageStore, tmp_pat
     reg = Registry()
     reg.add_inbound(build_inbound_connection("in_default", MLLP(port=port), router="r"))
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.inbound_running("in_default")
@@ -166,7 +173,9 @@ async def test_start_disabled_outbound_reports_stopped(store: MessageStore, tmp_
     reg = Registry()
     reg.add_outbound(_file_out("out_on", tmp_path))
     reg.add_outbound(_file_out("out_off", tmp_path, auto_start=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert runner.outbound_status("out_on") == "running"
@@ -186,7 +195,11 @@ async def test_start_disabled_outbound_is_visible_in_connections(tmp_path: Path)
     """A never-trafficked start-disabled outbound has no metrics edge, so its only chance of appearing
     in /connections is the standalone-row rescue — which only fires for a "stopping"/"stopped" status.
     With the boot gate reporting "running" it was INVISIBLE: no edge row, no standalone row."""
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         reg = Registry()
         reg.add_outbound(_file_out("OB_PARTNER_ADT", tmp_path, auto_start=False))
@@ -216,7 +229,9 @@ async def test_operator_start_builds_the_connector_and_drains(
     out_dir.mkdir()
     reg = Registry()
     reg.add_outbound(_file_out("out_off", out_dir, auto_start=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         await store.enqueue_message(channel_id="ch", raw=ADT, deliveries=[("out_off", ADT)])
@@ -249,7 +264,9 @@ async def test_reload_does_not_resurrect_a_start_disabled_outbound(
     out_dir.mkdir()
     reg = Registry()
     reg.add_outbound(_file_out("out_off", out_dir, auto_start=False))
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         await store.enqueue_message(channel_id="ch", raw=ADT, deliveries=[("out_off", ADT)])
@@ -280,7 +297,9 @@ async def test_reload_does_not_bind_a_start_disabled_inbound(store: MessageStore
         r.add_router("r", lambda m: [])
         return r
 
-    runner = RegistryRunner(_reg(), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _reg(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         assert not runner.inbound_running("in_off")
@@ -307,7 +326,9 @@ async def test_reload_does_not_undo_an_operator_start(store: MessageStore, tmp_p
         r.add_outbound(_file_out("out_off", tmp_path, auto_start=False))
         return r
 
-    runner = RegistryRunner(_reg(), store, poll_interval=0.02)
+    runner = RegistryRunner(
+        _reg(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     await runner.start()
     try:
         await runner.start_inbound("in_off")
@@ -353,7 +374,13 @@ async def test_scheduler_tick_does_not_start_a_start_disabled_connection(
             schedule=schedule,
         )
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, schedule_clock=lambda: inside)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        schedule_clock=lambda: inside,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         await runner._reconcile_schedule("in_off", "inbound", schedule)

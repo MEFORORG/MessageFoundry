@@ -26,6 +26,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
@@ -201,7 +202,10 @@ async def test_a_reload_carrying_an_unaccepted_static_hop_is_refused(tmp_path: P
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
     eng = await Engine.create(
-        tmp_path / "e.db", poll_interval=0.02, registry_guard=_guard(_settings(gate=True))
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=_guard(_settings(gate=True)),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         with pytest.raises(WiringError, match="OB_REST") as exc:
@@ -221,7 +225,10 @@ async def test_the_same_graph_passes_the_guard_with_an_opt_out(tmp_path: Path) -
     _write_graph(cfg, basic=True)
     settings = _settings(gate=True, accepted={"OB_REST": "partner offers HTTP Basic only"})
     eng = await Engine.create(
-        tmp_path / "e.db", poll_interval=0.02, registry_guard=_guard(settings)
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=_guard(settings),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         eng.guard_registry(load_config(cfg))
@@ -234,7 +241,12 @@ async def test_with_the_gate_off_there_is_no_guard_and_the_graph_passes(tmp_path
     _write_graph(cfg, basic=True)
     guard = make_static_credential_guard(_settings(gate=False), enforcing=True, log=_LOG)
     assert guard is None
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_guard=guard)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=guard,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         eng.guard_registry(load_config(cfg))
     finally:
@@ -295,7 +307,9 @@ async def test_the_posture_view_carries_the_inventory_and_its_scope(tmp_path: Pa
 
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(cfg))
     app = create_app(eng, allow_no_auth=True)
     app.state.static_credential_settings = _settings(gate=True, accepted={"OB_REST": "r"})
@@ -349,7 +363,9 @@ async def _get_posture(
 
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         if graph:
             registry = load_config(cfg)
@@ -495,6 +511,7 @@ async def test_a_first_load_refusal_closes_the_store(
         db_path=tmp_path / "m.db",
         config_dir=cfg,
         registry_guard=_guard(_settings(gate=True)),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with pytest.raises(WiringError, match="OB_REST"):
         async with app.router.lifespan_context(app):
@@ -516,7 +533,11 @@ async def test_a_raise_from_add_registry_closes_the_store(
     monkeypatch.setattr(Engine, "add_registry", _boom)
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=False)
-    app = create_managed_app(db_path=tmp_path / "m.db", config_dir=cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(RuntimeError, match="add_registry failed"):
         async with app.router.lifespan_context(app):
             pass
@@ -581,7 +602,9 @@ async def test_the_probes_do_not_reach_the_posture_response(tmp_path: Path) -> N
 
     from messagefoundry.api.app import create_app
 
-    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     eng.add_registry(load_config(_probe_config(tmp_path), allow_empty=True))
     app = create_app(eng, allow_no_auth=True)
     app.state.static_credential_settings = _settings(gate=False)
@@ -751,7 +774,10 @@ async def test_a_reload_is_judged_against_the_opt_outs_the_engine_started_with(
         )
     settings = _settings(gate=True, accepted={"OB_REST": "partner offers HTTP Basic only"})
     eng = await Engine.create(
-        tmp_path / "e.db", poll_interval=0.02, registry_guard=_guard(settings)
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        registry_guard=_guard(settings),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         with pytest.raises(WiringError) as exc:

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import Engine
 
@@ -67,7 +68,12 @@ def _config_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 async def engine(tmp_path: Path):
     cfg = _config_dir(tmp_path)
-    eng = await Engine.create(tmp_path / "flag.db", poll_interval=0.02, config_dir=cfg)
+    eng = await Engine.create(
+        tmp_path / "flag.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     # Load + attach the graph WITHOUT starting listeners (no socket binds needed for this test).
     eng.add_registry(load_config(cfg))
     yield eng

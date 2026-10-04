@@ -40,7 +40,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.service import AuthService, TemporaryPasswordUnavailable
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore, WebAuthnCredential
 from tests._admin_account import (
@@ -157,7 +157,11 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "unissuable.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "unissuable.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

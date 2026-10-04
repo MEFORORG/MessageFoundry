@@ -30,6 +30,7 @@ import pytest
 
 from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import _SummaryAuditCoalescer
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.store import Row, Store, open_store, sqlite_settings
 
 
@@ -51,7 +52,7 @@ async def _summary_rows(db_path: Path) -> list[Row]:
 
 async def test_the_open_window_is_flushed_at_shutdown(tmp_path: Path) -> None:
     db_path = tmp_path / "flush.db"
-    app = create_managed_app(db_path=db_path)
+    app = create_managed_app(db_path=db_path, egress_settings=EgressSettings(deny_by_default=False))
 
     async with app.router.lifespan_context(app):
         store = app.state.engine.store
@@ -71,7 +72,7 @@ async def test_the_open_window_is_flushed_at_shutdown(tmp_path: Path) -> None:
 async def test_the_assertion_can_fail(tmp_path: Path, monkeypatch: Any) -> None:
     """Neutralise the flush and the row must disappear. This is the pre-fix behaviour."""
     db_path = tmp_path / "noflush.db"
-    app = create_managed_app(db_path=db_path)
+    app = create_managed_app(db_path=db_path, egress_settings=EgressSettings(deny_by_default=False))
 
     async with app.router.lifespan_context(app):
         store = app.state.engine.store
@@ -99,7 +100,7 @@ async def test_a_flush_failure_does_not_abort_the_teardown(
     audit row. A guard that swallowed the error but skipped the stop would pass the first alone.
     """
     db_path = tmp_path / "boom.db"
-    app = create_managed_app(db_path=db_path)
+    app = create_managed_app(db_path=db_path, egress_settings=EgressSettings(deny_by_default=False))
 
     async def _boom(_store: object) -> None:
         raise RuntimeError("PROBE: deliberate flush failure")

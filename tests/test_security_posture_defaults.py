@@ -31,6 +31,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
@@ -1683,7 +1684,11 @@ async def _posture_body(engine: Engine, **state: object) -> dict[str, object]:
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "posture.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "posture.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
@@ -2318,6 +2323,7 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
         # object that exists but is disabled is still the resolved settings the registry must read.
         auth_settings=_ad(ad_session_recheck_seconds=0, enabled=False),
         allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     transport = httpx.ASGITransport(app=app)
     async with (

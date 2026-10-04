@@ -23,6 +23,7 @@ import uvicorn
 from harness.__main__ import main
 from harness.load.profile import load_profile_text
 from harness.load.runner import PreflightError, run_load
+from messagefoundry.config.settings import EgressSettings
 
 # A genuine failure burns the full budgets back-to-back (5s stop grace + 30s await_drain + up to 30s
 # settle-poll + the 1.5s phase + fixture startup) — past the global 60s watchdog, which would kill the
@@ -93,6 +94,7 @@ def engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[st
         config_dir=_LOAD_CONFIG,
         poll_interval=0.05,
         allow_no_auth=True,  # the load runner reads /stats with no bearer token
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="warning"))
     # Release the MLLP ports at the last moment (SO_REUSEADDR + never-listened sockets → immediately

@@ -40,10 +40,11 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.parsing import FhirPeekError
 from messagefoundry.pipeline import dryrun, wiring_runner
-from messagefoundry.pipeline.wiring_runner import RegistryRunner, check_fhir_lookup_allowed
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.bounded_read import AmbiguousFramingError
+from messagefoundry.transports.egress import check_fhir_lookup_allowed
 from messagefoundry.transports.fhir import (
     FhirLookupExecutor,
     _encode_search_params,
@@ -117,7 +118,7 @@ def _executor(
     status: int = 200,
     conn: dict | None = None,
 ) -> tuple[FhirLookupExecutor, _FakeOpener]:
-    ex = FhirLookupExecutor(conn or _CONN)
+    ex = FhirLookupExecutor(conn or _CONN, egress=EgressSettings(deny_by_default=False))
     opener = _FakeOpener(exc=exc, body=body, status=status)
     for name in ex.connections:  # swap the per-connection opener for the fake
         ex._opener[name] = opener  # type: ignore[assignment]
@@ -651,7 +652,7 @@ async def test_smart_bearer_applied_and_reminted_on_401() -> None:  # AC-5
     assert prov.minted == 1 and prov.invalidated == 0
 
     # On a 401 the provider is invalidated so the next read re-mints.
-    ex2 = FhirLookupExecutor(_CONN)
+    ex2 = FhirLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     opener2 = _FakeOpener(exc=_http_error(401))
     ex2._opener["epic"] = opener2  # type: ignore[assignment]
     prov2 = _FakeProvider()
@@ -957,7 +958,7 @@ async def test_a_retry_does_not_start_a_second_live_read_beside_an_abandoned_one
     # that retried at once used to start another live read beside it. The wait is long enough for
     # the first read to reach the server on a slow runner; `entered` proves that it did.
     monkeypatch.setattr(wiring_runner, "_LOOKUP_RESULT_TIMEOUT_SECONDS", 2.0)
-    ex = FhirLookupExecutor(_CONN)
+    ex = FhirLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     opener = _HungOpener()
     ex._opener["epic"] = opener  # type: ignore[assignment]
     runner = types.SimpleNamespace(_fhir_lookup_executor=ex, _loop=asyncio.get_running_loop())
@@ -1090,12 +1091,16 @@ def test_fhir_lookup_duplicate_name(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_executor_requires_url() -> None:
     with pytest.raises(ValueError, match="requires a 'url'"):
-        FhirLookupExecutor({"bad": {"fhir_version": "R4B"}})
+        FhirLookupExecutor(
+            {"bad": {"fhir_version": "R4B"}}, egress=EgressSettings(deny_by_default=False)
+        )
 
 
 def test_executor_rejects_non_http_scheme() -> None:
     with pytest.raises(ValueError, match="must be http or https"):
-        FhirLookupExecutor({"bad": {"url": "ftp://h/fhir"}})
+        FhirLookupExecutor(
+            {"bad": {"url": "ftp://h/fhir"}}, egress=EgressSettings(deny_by_default=False)
+        )
 
 
 @pytest.mark.parametrize(
@@ -1118,12 +1123,14 @@ def test_executor_rejects_control_char_in_url(url: str) -> None:  # #1241
     stream of reads that were never at fault.
     """
     with pytest.raises(ValueError, match="control character"):
-        FhirLookupExecutor({"bad": {"url": url}})
+        FhirLookupExecutor({"bad": {"url": url}}, egress=EgressSettings(deny_by_default=False))
 
 
 def test_executor_clean_url_still_constructs() -> None:  # #1241
     """Positive control: the screen must admit what it is not screening for."""
-    ex = FhirLookupExecutor({"ok": {"url": "https://h/fhir"}})
+    ex = FhirLookupExecutor(
+        {"ok": {"url": "https://h/fhir"}}, egress=EgressSettings(deny_by_default=False)
+    )
     assert "ok" in ex.connections
 
 
@@ -1148,7 +1155,9 @@ def test_check_fhir_lookup_deny_by_default_refuses_empty_allowlist() -> None:  #
 
 
 def test_check_fhir_lookup_unrestricted_when_empty() -> None:
-    check_fhir_lookup_allowed("epic", {"url": BASE}, EgressSettings())  # no raise
+    check_fhir_lookup_allowed(
+        "epic", {"url": BASE}, EgressSettings(deny_by_default=False)
+    )  # no raise
 
 
 def test_check_fhir_lookup_denies_unlisted_smart_token_url() -> None:  # DELTA-04

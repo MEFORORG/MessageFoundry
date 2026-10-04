@@ -112,7 +112,7 @@ port = 8765
 # production_instance = true          # production tier? (drives the prod-DEBUG refusal + the AI data-scope ceiling)
 # EVERY instance carries patient data (ADR 0186) - there is no data-class switch to set here, and the
 # retired one is REFUSED at load. To relax a specific PHI gate, name that gate's own switch.
-# block_unlisted_outbound = true      # lock outbound destinations down (recommended for Test/Prod)
+# block_unlisted_outbound = false     # the audited opt-out: an empty [egress] list allows any destination
 
 [ai]
 # The active-environment NAME — REQUIRED (also passable as `serve --env <name>`). Free-form: name
@@ -129,7 +129,10 @@ environment = "dev"
 # base_dir = "C:/srv/mefor/this-config-repo"
 
 [egress]
-# The outbound allow-lists. The deny-by-default SWITCH is [security].block_unlisted_outbound above.
+# The outbound allow-lists. A transport with an empty list may send nowhere: deny is the default, and
+# [security].block_unlisted_outbound above is the switch. The starter feed writes under ./out, so that
+# directory is listed; add each destination you wire.
+allowed_file_dirs = ["./out"]
 # allowed_mllp = ["receiver.test.example:2601"]
 """
 

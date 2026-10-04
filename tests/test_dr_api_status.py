@@ -15,7 +15,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.config.models import ConnectorType, Priority
-from messagefoundry.config.settings import DrSettings, StoreSettings
+from messagefoundry.config.settings import DrSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -40,6 +40,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         # A DR box ALREADY activated under the profile this boot (enabled + activate): the run-profile
         # threshold is CRITICAL, so a normal-tier inbound is parked status:"filtered" at start.
         dr_settings=DrSettings(enabled=True, activate=True, priority_threshold=Priority.CRITICAL),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     yield eng
     await eng.stop()

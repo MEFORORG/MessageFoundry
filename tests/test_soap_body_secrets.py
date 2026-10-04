@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     Registry,
     Soap,
@@ -100,7 +101,10 @@ def _dest(
         "body_secret_value_0": secret,
     }
     settings.update(over)
-    d = build_destination(Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=settings))
+    d = build_destination(
+        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(d, SoapDestination)
     op = _Opener(resp=resp, exc=exc)
     d._opener = op  # type: ignore[assignment]
@@ -231,7 +235,8 @@ async def test_literal_braces_round_trip() -> None:
 async def test_no_body_secrets_is_byte_identical() -> None:
     # A SOAP dest with no body_secrets sends the payload verbatim (the whole feature is inert).
     plain = build_destination(
-        Destination(name="OB", type=ConnectorType.SOAP, settings={"url": URL, "soap_action": "u"})
+        Destination(name="OB", type=ConnectorType.SOAP, settings={"url": URL, "soap_action": "u"}),
+        egress=EgressSettings(deny_by_default=False),
     )
     op = _Opener()
     plain._opener = op  # type: ignore[attr-defined]
@@ -250,7 +255,8 @@ def test_construction_rejects_empty_or_control_char_secret_without_leaking(bad: 
                 name="OB",
                 type=ConnectorType.SOAP,
                 settings={"url": URL, "body_secret_tokens": [TOKEN], "body_secret_value_0": bad},
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     msg = str(ei.value)
     assert TOKEN in msg  # names the placeholder
@@ -273,7 +279,8 @@ def test_construction_rejects_secret_not_encodable_in_the_connection_encoding() 
                     "body_secret_tokens": [TOKEN],
                     "body_secret_value_0": non_ascii,
                 },
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     msg = str(ei.value)
     assert TOKEN in msg and "ascii" in msg  # names the token + the codec
@@ -305,7 +312,8 @@ async def test_cleartext_http_hop_with_body_secret_is_refused() -> None:
                     "body_secret_tokens": [TOKEN],
                     "body_secret_value_0": SECRET,
                 },
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     assert SECRET not in str(ei.value)  # the refusal names no credential
 
@@ -385,7 +393,13 @@ async def _stored_payloads(store: MessageStore, mid: str) -> str:
 
 
 def _runner(store: MessageStore) -> RegistryRunner:
-    return RegistryRunner(Registry(), store, poll_interval=0.02, alert_sink=LoggingAlertSink())
+    return RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.02,
+        alert_sink=LoggingAlertSink(),
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 async def test_stored_rows_hold_only_the_token_while_the_wire_gets_the_secret(

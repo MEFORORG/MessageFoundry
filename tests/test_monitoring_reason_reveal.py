@@ -31,7 +31,7 @@ from messagefoundry.api.models import AlertInstanceInfo, ConnectionRow
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 
@@ -45,7 +45,11 @@ _ALERT = "delivery failed: partner refused ZQX7"
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "reason.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "reason.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     await eng.store.record_connection_event(
         connection="OB_X",
         transport="mllp",
@@ -320,7 +324,11 @@ def _broken_outbound(name: str) -> Any:
 async def dash(tmp_path: Path) -> AsyncIterator[Engine]:
     from messagefoundry.config.wiring import Registry
 
-    eng = await Engine.create(tmp_path / "dash.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "dash.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         from messagefoundry.config.models import ConnectorType
         from messagefoundry.config.wiring import (

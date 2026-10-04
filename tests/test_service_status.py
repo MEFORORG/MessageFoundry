@@ -18,7 +18,7 @@ from messagefoundry import service_status
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings, ServiceStatusSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings, ServiceStatusSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 
@@ -27,7 +27,11 @@ PW = "a-strong-test-passphrase"
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "svc.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "svc.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

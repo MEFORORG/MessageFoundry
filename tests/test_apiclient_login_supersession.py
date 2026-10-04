@@ -30,7 +30,7 @@ from messagefoundry.api.auth_models import CurrentUser, LoginResponse
 from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 
@@ -66,7 +66,11 @@ class _LoopBridge(httpx.BaseTransport):
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "login_supersession.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "login_supersession.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

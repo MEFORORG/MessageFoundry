@@ -20,7 +20,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, RetryPolicy
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -296,7 +296,11 @@ async def test_resend_endpoint_resent_then_duplicate_and_audited(tmp_path: Path)
     pytest.importorskip("psutil")  # the API pulls metrics -> psutil (an extra); skip if absent
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
     try:
@@ -331,7 +335,11 @@ async def test_resend_endpoint_unknown_target_and_not_running(tmp_path: Path) ->
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(_running_registry(tmp_path))
     try:
         mid = await engine.store.enqueue_message(
@@ -365,7 +373,11 @@ async def test_resend_endpoint_retention_nulled_source_is_409(tmp_path: Path) ->
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(_running_registry(tmp_path))
     await engine.start()
     try:
@@ -399,7 +411,11 @@ async def test_resend_requires_access_to_the_alternate_outbound_channel(tmp_path
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "rbac.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "rbac.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
@@ -452,7 +468,11 @@ async def test_resend_denied_without_the_resend_permission(tmp_path: Path) -> No
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "perm.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "perm.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
@@ -504,7 +524,11 @@ async def test_resend_grant_is_audited_even_when_it_fails_downstream(tmp_path: P
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "grant.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "grant.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(
         _running_registry(tmp_path)
     )  # registered but engine NOT started -> not running

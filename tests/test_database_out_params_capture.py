@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Database, WiringError, build_outbound_connection
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.database import DatabaseDestination
@@ -28,7 +29,8 @@ def _dest(**over: Any) -> DatabaseDestination:
     )
     base.update(over)
     d = build_destination(
-        Destination(name="OB_DB", type=ConnectorType.DATABASE, settings=Database(**base).settings)
+        Destination(name="OB_DB", type=ConnectorType.DATABASE, settings=Database(**base).settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, DatabaseDestination)
     return d
@@ -79,7 +81,8 @@ def test_capture_response_default_off_is_byte_identical() -> None:
             settings=Database(
                 server="s", database="d", statement="INSERT INTO t VALUES (1)"
             ).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, DatabaseDestination)
     assert d.capture_out_params is False and d.capture_response is False

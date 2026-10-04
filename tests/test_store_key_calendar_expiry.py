@@ -40,6 +40,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
     StoreSettings,
@@ -374,6 +375,7 @@ async def _start_engine(tmp_path: Path, settings: SecretRotationSettings) -> Non
         store,
         secret_rotation_settings=settings,
         security_enforcement=SecurityEnforcement.ENFORCE,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         await engine.start()
@@ -468,6 +470,7 @@ def _managed_app(tmp_path: Path, settings: SecretRotationSettings) -> FastAPI:
         poll_interval=0.05,
         secret_rotation_settings=settings,
         security_enforcement=SecurityEnforcement.ENFORCE,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
 
 

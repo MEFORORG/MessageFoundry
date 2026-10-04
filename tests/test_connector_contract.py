@@ -35,6 +35,7 @@ import pytest
 
 import messagefoundry.transports  # noqa: F401 - the import runs every register_source(...)
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.transports import base as transport_base
 from messagefoundry.transports.base import (
     DestinationConnector,
@@ -127,7 +128,10 @@ def _build(kind: ConnectorType, tmp_path: Path) -> SourceConnector:
     if kind in _LISTENERS or kind is ConnectorType.DIMSE:
         settings["port"] = 0
     name = f"IB_CONTRACT_{kind.value.upper()}"
-    return build_source(Source(type=kind, name=name, settings=settings))
+    return build_source(
+        Source(type=kind, name=name, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 async def _assert_stop_idempotent(source: SourceConnector, timeout: float = _STOP_TIMEOUT) -> None:
@@ -171,7 +175,10 @@ def test_re_registering_a_built_in_source_raises_and_keeps_the_original() -> Non
 
     with pytest.raises(ValueError, match="already registered for 'mllp'"):
         register_source(ConnectorType.MLLP, _impostor)
-    built = build_source(Source(type=ConnectorType.MLLP, settings={"port": 2575}))
+    built = build_source(
+        Source(type=ConnectorType.MLLP, settings={"port": 2575}),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(built, MLLPSource)
 
 
@@ -182,7 +189,8 @@ def test_re_registering_a_built_in_destination_raises_and_keeps_the_original() -
     with pytest.raises(ValueError, match="already registered for 'mllp'"):
         register_destination(ConnectorType.MLLP, _impostor)
     built = build_destination(
-        Destination(name="OB_MLLP", type=ConnectorType.MLLP, settings={"host": "h", "port": 2575})
+        Destination(name="OB_MLLP", type=ConnectorType.MLLP, settings={"host": "h", "port": 2575}),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(built, MLLPDestination)
 

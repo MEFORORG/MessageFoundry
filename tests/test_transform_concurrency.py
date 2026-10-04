@@ -44,6 +44,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.state import state_get
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -149,7 +150,12 @@ def _runner(reg: Registry, store: MessageStore, *, concurrency: int, batch: int)
     # (the default claim_mode) drains the routed lane one head at a time and is an explicit follow-up
     # (design brief §2), so the concurrency tests select claim_mode="per_lane".
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, fifo_claim_batch=batch, claim_mode="per_lane"
+        reg,
+        store,
+        poll_interval=0.02,
+        fifo_claim_batch=batch,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
     )
     runner._transform_concurrency = concurrency
     return runner
@@ -416,7 +422,9 @@ async def test_concurrency_default_is_sequential(
     reg.add_router("r", lambda m: [f"h{i}" for i in range(n)])
 
     # Default fifo_claim_batch is 1 too, so rows drain one-at-a-time; assert byte-identical FIFO output.
-    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
     assert runner._transform_concurrency == 1  # default OFF
     await runner.start()
     try:

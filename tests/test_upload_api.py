@@ -28,7 +28,7 @@ from messagefoundry.auth.permissions import (
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import ConnectorType
-from messagefoundry.config.settings import AuthSettings, StoreSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -48,7 +48,11 @@ BATCH = ADT + ADT2
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    e = await Engine.create(tmp_path / "up.db", poll_interval=0.02)
+    e = await Engine.create(
+        tmp_path / "up.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         yield e
     finally:
@@ -1031,7 +1035,11 @@ async def test_the_RUNNER_prune_audit_row_also_names_the_system(tmp_path: Path) 
 
     # PRUNE -- one app over the same db and uploads dir. Its startup sweep finds the aged file and
     # calls the REAL _audit_upload_prune closure.
-    app = create_managed_app(store_settings=settings, poll_interval=0.05)
+    app = create_managed_app(
+        store_settings=settings,
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     rows: list[Any] = []
     async with app.router.lifespan_context(app):
         assert app.state.upload_store is not None, "[store].uploads_dir was set -- must be wired"

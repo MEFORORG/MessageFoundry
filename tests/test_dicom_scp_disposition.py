@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
+
 pytest.importorskip("pydicom", reason="DICOM SCP tests need the [dicom] extra")
 pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra")
 
@@ -105,7 +107,7 @@ async def _send_through_runner(store: MessageStore, data: bytes) -> int:
         )
     )
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     await runner.start()
     try:
         source = runner._sources[_NAME]
@@ -363,7 +365,10 @@ def test_the_clamp_warning_through_the_real_build_path(
         content_type=ContentType.DICOM,
     )
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"):
-        build_source(wiring_runner._source_config(ic, "127.0.0.1", {}))
+        build_source(
+            wiring_runner._source_config(ic, "127.0.0.1", {}),
+            egress=EgressSettings(deny_by_default=False),
+        )
 
     hits = _clamp_warnings(caplog)
     assert len(hits) == (1 if warns else 0)

@@ -35,6 +35,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
     ServiceSettings,
@@ -81,7 +82,11 @@ WARD = ["10.0.0.0/8"]
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "clientnet.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "clientnet.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
