@@ -503,10 +503,11 @@ def test_no_logged_settings_text_is_named_like_a_password() -> None:
     assert not _named_like_a_password_and_logged(
         "OIDC_SECOND_FACTOR_CLAIM_EXCEPTION", "a fixed sentence"
     )
+    # The walk must cover something: an empty module namespace would pass the absence below.
+    bound = vars(settings_module)
+    assert len(bound) >= 20
     offenders = sorted(
-        name
-        for name, value in vars(settings_module).items()
-        if _named_like_a_password_and_logged(name, value)
+        name for name, value in bound.items() if _named_like_a_password_and_logged(name, value)
     )
     assert offenders == []
 
