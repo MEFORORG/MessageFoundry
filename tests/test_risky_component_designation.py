@@ -24,8 +24,8 @@ support, vulnerability history), from a dated snapshot of public PyPI and OSV da
 ``security/risky-component-readings.json``, written by ``scripts/security/component_readings.py``.
 The tests for it need NO network. They hold the snapshot to the population, which is the core
 closure plus what each assessed extra adds (BACKLOG #2414 brought ``harness`` in). They re-derive
-each verdict from its recorded readings, and hold the page's tables, counts and dates to the snapshot. None of
-them reads today's date, so none goes red when the re-read date passes.
+each verdict from its recorded readings, and hold the page's tables, counts and dates to the
+snapshot. None of them reads today's date, so none goes red when the re-read date passes.
 
 Each test names the mutation that must turn it RED.
 """
