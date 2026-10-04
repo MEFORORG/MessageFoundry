@@ -10,6 +10,7 @@ AC-5 (the read-only posture view) is in ``tests/test_api_security_posture.py``.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+import messagefoundry.config.settings as settings_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import (
     KEYLESS_REFUSED_BY_NO_STRICT_ACK,
@@ -428,15 +430,16 @@ def test_require_mfa_advisory_keeps_an_enrolled_factor_and_the_oidc_claim() -> N
     ``second_factor_enrolled=False``, which answers False here, so the holder may remove the last. The
     OIDC claim gate (``auth/oidc/claims.py:_check_mfa_gate``) reads only
     ``[auth].oidc_require_mfa_claim``, and the OIDC mint stamps the session verified on that setting,
-    so the claim stands in for an enrolled factor. What the switch frees is an account with no factor
-    enrolled, which is where a Kerberos ticket that asserts no strength gets in on its own."""
+    so the checked claim counts as the second factor whether or not one is enrolled. What the switch
+    frees is an account with no factor enrolled, which is where a Kerberos ticket that asserts no
+    strength gets in on its own."""
     loos = dict(_loosenings(SecuritySettings(require_mfa=False)))
     assert loos["require_mfa"] == (
         "an account with no second factor enrolled is single-factor, so a Kerberos session enters "
         "on a ticket that asserts no strength. An enrolled account owes its factor only while it "
         "keeps one, and its holder may remove the last. Where an OIDC sign-in carries an amr/acr "
-        "claim checked while [auth].oidc_require_mfa_claim is on, that claim stands in for the "
-        "enrolled factor"
+        "claim checked while [auth].oidc_require_mfa_claim is on, that claim counts as the second "
+        "factor, whether or not one is enrolled"
     )
 
 
@@ -464,6 +467,49 @@ def test_startup_texts_name_the_oidc_exception_only_where_it_exists(
         oidc_enabled=oidc_enabled, oidc_require_mfa_claim=claim_gate
     )
     assert oidc_second_factor_claim_exception(auth) == expected
+
+
+#: CodeQL's password-name heuristic as PR 1959 measured it at 2.27.1: ``mfa`` as a separate word.
+_CODEQL_PASSWORD_WORD = re.compile(r"(?:^|[_-])mfa(?:[_-]|$)", re.IGNORECASE)
+
+
+def _named_like_a_password_and_logged(name: str, value: object) -> bool:
+    """A module-level text, or a helper here that returns one, under a name CodeQL reads as a
+    password. Such a text reaching a log line raises ``py/clear-text-logging-sensitive-data``."""
+    if not _CODEQL_PASSWORD_WORD.search(name):
+        return False
+    if isinstance(value, str):
+        return True
+    return (
+        inspect.isfunction(value)
+        and value.__module__ == settings_module.__name__
+        and inspect.signature(value).return_annotation in (str, "str")
+    )
+
+
+def test_no_logged_settings_text_is_named_like_a_password() -> None:
+    """Vault BACKLOG #1133. RED when a text constant or a text helper in ``config.settings`` takes
+    ``mfa`` as a separate word in its name, as ``OIDC_MFA_CLAIM_EXCEPTION`` did on PR 1959.
+
+    CodeQL is not a required check, so before this test the rule lived only in a comment. Scoped to
+    the names bound in this module, ``__all__`` among them. An imported text constant counts too;
+    a helper counts only when defined here and annotated ``-> str``. ADR 0034's 2026-10-03
+    amendment holds the rule and says what this guard does not see."""
+    # Positive control: the two names PR 1959 renamed away from, and the names it chose instead.
+    assert _named_like_a_password_and_logged("OIDC_MFA_CLAIM_EXCEPTION", "a fixed sentence")
+    assert _named_like_a_password_and_logged(
+        "oidc_mfa_claim_exception", oidc_second_factor_claim_exception
+    )
+    assert not _named_like_a_password_and_logged(
+        "OIDC_SECOND_FACTOR_CLAIM_EXCEPTION", "a fixed sentence"
+    )
+    # The walk must cover something: an empty module namespace would pass the absence below.
+    bound = vars(settings_module)
+    assert len(bound) >= 20
+    offenders = sorted(
+        name for name, value in bound.items() if _named_like_a_password_and_logged(name, value)
+    )
+    assert offenders == []
 
 
 def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
@@ -506,9 +552,10 @@ def test_ide_security_editor_risk_mirrors_the_mfa_advisories(
     ).read_text(encoding="utf-8")
     # One FIELDS entry is one `{ ... }` with no nested braces, so `[^{}]` keeps the match inside it,
     # and the captured literal is decoded as JSON so a backslash-u escape compares as its character.
-    entry = re.search(rf'\{{ key: "{re.escape(switch)}",[^{{}}]*\}}', source)
+    # Whitespace is optional around every token, so reformatting the entry still matches it.
+    entry = re.search(rf'\{{\s*key\s*:\s*"{re.escape(switch)}"\s*,[^{{}}]*\}}', source)
     assert entry is not None, f"no FIELDS entry for {switch} in securityEditorWebview.ts"
-    risk = re.search(r'risk: ("(?:[^"\\]|\\.)*")', entry.group(0))
+    risk = re.search(r'\brisk\s*:\s*("(?:[^"\\]|\\.)*")', entry.group(0))
     assert risk is not None, f"the {switch} entry has no risk string"
     assert json.loads(risk.group(1)) == dict(_loosenings(sec))[switch]
 
