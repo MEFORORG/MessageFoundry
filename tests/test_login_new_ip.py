@@ -14,18 +14,32 @@ Synthetic accounts and RFC 5737 / RFC 1918 addresses only.
 
 from __future__ import annotations
 
+import json
+import urllib.parse
+from typing import Any
+
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth import Role
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.notifications import LOGIN_NEW_IP, SecurityEvent
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests.test_auth_oidc_service import (
+    AUTH_CODE,
+    DEFAULT_SUB,
+    _bind,
+    _claims,
+    _mint,
+    _stub_exchange,
+)
+from tests.test_auth_oidc_service import _service as _oidc_service
 
 PW = "a-strong-test-passphrase"  # >= 15, no app/vendor terms: satisfies the ASVS policy (WP-3)
 
@@ -90,6 +104,11 @@ def _new_ip_notices(notifier: _FakeNotifier) -> list[SecurityEvent]:
     return [e for e in notifier.events if e.event_type == LOGIN_NEW_IP]
 
 
+async def _no_sleep(deadline: float) -> None:
+    """Stands in for the real-time pad on a failed federated sign-in (BACKLOG #1947)."""
+    return None
+
+
 async def test_first_login_ever_fails_open_and_audits_no_baseline() -> None:
     store = await MessageStore.open(":memory:")
     try:
@@ -142,11 +161,13 @@ async def test_a_first_seen_address_is_audited_notified_and_unseeded() -> None:
         rows = await store.list_audit(actor="oper", action="auth.login_new_ip")
         assert len(rows) == 1
         assert rows[0]["client"] == "198.51.100.7"
-        assert '"provider": "local"' in str(rows[0]["detail"])
+        # The local leg names no mechanism: only the directory leg needs one (vault BACKLOG #2156).
+        assert json.loads(str(rows[0]["detail"])) == {"provider": "local"}
         notices = _new_ip_notices(notifier)
         assert len(notices) == 1
         assert notices[0].client_ip == "198.51.100.7"
         assert notices[0].email == "oper@example.org"
+        assert notices[0].detail == {"provider": "local"}
         assert (await _actions(store, "oper"))[-1] == "auth.login_success"
         # Once signed in from it, the address is known: the next sign-in is not challenged.
         again = await service.login("oper", PW, client="198.51.100.7")
@@ -292,10 +313,177 @@ async def test_the_directory_leg_audits_and_notifies_a_first_seen_address() -> N
         )
         assert new.ok
         rows = await store.list_audit(actor="jsmith", action="auth.login_new_ip")
-        assert len(rows) == 1 and '"provider": "ad"' in str(rows[0]["detail"])
+        # vault BACKLOG #2156: the row names the mechanism, since ``provider`` is ``ad`` for OIDC too.
+        assert len(rows) == 1
+        assert json.loads(str(rows[0]["detail"])) == {"provider": "ad", "mech": "kerberos"}
         assert [e.client_ip for e in _new_ip_notices(notifier)] == ["198.51.100.44"]
+        assert _new_ip_notices(notifier)[0].detail == {"provider": "ad", "mech": "kerberos"}
         # Every directory login is already born unseeded; the signal does not change that.
         assert not await _seeded(store, new.token)
+    finally:
+        await store.close()
+
+
+class _ResolvingLdap(_FakeLdap):
+    """Resolves the ticket's principal, as the Windows-SSO leg needs."""
+
+    def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
+        return _principal(username)
+
+
+async def test_the_windows_sso_entry_point_records_the_kerberos_mechanism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The test above calls ``_complete_ad_login`` directly and so takes its Kerberos default. This
+    one goes through ``authenticate_kerberos``, so the mechanism comes from the Kerberos caller."""
+    monkeypatch.setattr(service_module, "kerberos_principal", lambda token, settings: "jsmith")
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        settings = AuthSettings(
+            ad_enabled=True,
+            kerberos_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        )
+        service = AuthService(
+            store,
+            settings,
+            ldap=_ResolvingLdap(),  # type: ignore[arg-type]
+            security_notifier=notifier,
+        )
+        await service.initialize()
+        await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
+        assert (await service.authenticate_kerberos(b"ticket", client="10.2.2.2")).ok
+        [unevaluated] = await store.list_audit(
+            actor="jsmith", action="auth.login_address_unevaluated"
+        )
+        assert json.loads(str(unevaluated["detail"])) == {
+            "provider": "ad",
+            "mech": "kerberos",
+            "reason": "no_baseline",
+        }
+        assert (await service.authenticate_kerberos(b"ticket", client="198.51.100.47")).ok
+        [row] = await store.list_audit(actor="jsmith", action="auth.login_new_ip")
+        assert json.loads(str(row["detail"])) == {"provider": "ad", "mech": "kerberos"}
+        [notice] = _new_ip_notices(notifier)
+        assert notice.detail == {"provider": "ad", "mech": "kerberos"}
+    finally:
+        await store.close()
+
+
+# --- the federated leg: a real OIDC mint through the callback seam (vault BACKLOG #2156) --------
+
+
+@pytest.fixture(scope="module")
+def rsa_key() -> rsa.RSAPrivateKey:
+    """Local: a fixture resolves by name in the module that requests it."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
+
+
+async def _oidc_callback_from(
+    service: AuthService,
+    monkeypatch: pytest.MonkeyPatch,
+    rsa_key: rsa.RSAPrivateKey,
+    client: str,
+) -> LoginOutcome:
+    """One federated sign-in for the bound ``jdoe`` through the seam ``GET /ui/oidc/callback``
+    calls: stage a flow from ``client``, then redeem it from the same address. The id_token
+    carries the nonce the start leg minted, read back from the authorization URL."""
+    flow_id, url = await service.begin_oidc_login(
+        client=client, public_origin="https://ops.example"
+    )
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+    _stub_exchange(monkeypatch, _mint(rsa_key, _claims(nonce=query["nonce"])))
+    return await service.complete_oidc_login(
+        flow_id=flow_id,
+        state=query["state"],
+        code=AUTH_CODE,
+        client=client,
+        public_origin="https://ops.example",
+    )
+
+
+async def test_an_oidc_mint_from_a_first_seen_address_records_the_oidc_mechanism(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through ``complete_oidc_login``, the seam the callback route calls, so the mechanism comes
+    from the OIDC caller and not from ``_complete_ad_login``'s default, and the client address
+    must reach the signal along the route's own path."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _oidc_service(store, rsa_key, notifier=notifier)
+        first = await _oidc_callback_from(service, monkeypatch, rsa_key, "10.3.3.3")
+        assert first.ok
+        [unevaluated] = await store.list_audit(
+            actor="jdoe", action="auth.login_address_unevaluated"
+        )
+        assert json.loads(str(unevaluated["detail"])) == {
+            "provider": "ad",
+            "mech": "oidc",
+            "reason": "no_baseline",
+        }
+        new = await _oidc_callback_from(service, monkeypatch, rsa_key, "198.51.100.45")
+        assert new.ok
+        [row] = await store.list_audit(actor="jdoe", action="auth.login_new_ip")
+        assert json.loads(str(row["detail"])) == {"provider": "ad", "mech": "oidc"}
+        [notice] = _new_ip_notices(notifier)
+        assert notice.client_ip == "198.51.100.45"
+        assert notice.detail == {"provider": "ad", "mech": "oidc"}
+    finally:
+        await store.close()
+
+
+async def test_a_binding_withdrawn_at_the_oidc_mint_leaves_no_new_address_row(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_record_login_address`` runs AFTER the mint, so a federated login the mint refuses -- an
+    administrator withdrew the binding between the login's checks and its session insert -- leaves
+    no row claiming a sign-in happened.
+
+    The CONTROL is the last login: the same address, unwedged after a re-bind, does write the row.
+    So the zero above it is the ordering, not an address that had stopped reading as new."""
+    monkeypatch.setattr(service_module, "_sleep_until", _no_sleep)
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = await _oidc_service(store, rsa_key, notifier=notifier)
+        assert (await _oidc_callback_from(service, monkeypatch, rsa_key, "10.3.3.3")).ok
+        account = await store.get_user_by_username("jdoe")
+        assert account is not None and account.oidc_subject is not None
+
+        real_create = store.create_session
+        fired = False
+
+        async def unbinding_create_session(**kw: Any) -> bool:
+            nonlocal fired
+            if not fired:
+                fired = True
+                await service.unbind_federated_subject(
+                    account.id,
+                    expected_issuer=account.oidc_issuer,
+                    expected_subject=account.oidc_subject,
+                    actor="admin",
+                )
+            return await real_create(**kw)
+
+        monkeypatch.setattr(store, "create_session", unbinding_create_session)
+        raced = await _oidc_callback_from(service, monkeypatch, rsa_key, "198.51.100.46")
+        monkeypatch.setattr(store, "create_session", real_create)
+
+        assert fired, "the wedge never ran, so no unbind raced this login"
+        assert not raced.ok and raced.reason == "federated_subject_unbound"
+        assert await store.list_audit(actor="jdoe", action="auth.login_new_ip") == []
+        assert _new_ip_notices(notifier) == []
+
+        await _bind(service, store, DEFAULT_SUB)
+        control = await _oidc_callback_from(service, monkeypatch, rsa_key, "198.51.100.46")
+        assert control.ok
+        assert len(await store.list_audit(actor="jdoe", action="auth.login_new_ip")) == 1
+        assert [e.client_ip for e in _new_ip_notices(notifier)] == ["198.51.100.46"]
     finally:
         await store.close()
 

@@ -301,8 +301,8 @@ false premise.
 - **When acceptable:** a synthetic/dev instance, or where every destination is otherwise controlled.
 - **Compensating controls:** enumerate `[egress].allowed_*` per transport; network egress filtering.
 - **Still refused:** a **PHI** instance with fully-open egress refuses to start under **strict enforcement**
-  (`enforcement = enforce`, the default; warns at `enforcement = warn`); a PHI instance that leaves this unset
-  gets deny-by-default flipped **on**.
+  (`enforcement = enforce`, the default; warns at `enforcement = warn`). Leaving this unset keeps
+  deny-by-default **on**; [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) says what that does.
 
 ### `delete_message_bodies_after_days = 0` / `allow_keeping_phi_indefinitely = true` — unbounded PHI retention
 - **What you lose:** PHI message bodies accumulate at rest without bound (data-minimization failure).

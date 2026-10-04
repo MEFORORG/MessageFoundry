@@ -170,7 +170,7 @@ _BASELINE: dict[str, int] = {
     "tests/test_required_contexts.py": 1,
     "tests/test_required_contexts_drift.py": 1,
     "tests/test_retention_classification_drift.py": 2,
-    "tests/test_risky_component_designation.py": 3,
+    "tests/test_risky_component_designation.py": 2,
     "tests/test_sandbox_import_boundary.py": 1,
     "tests/test_scan_forbidden.py": 1,
     "tests/test_scan_tokens_source.py": 1,

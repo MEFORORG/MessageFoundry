@@ -152,17 +152,19 @@ async def test_a_pending_webauthn_ceremony_survives_rotation(engine: Engine) -> 
 async def test_the_new_ip_dedupe_survives_rotation(engine: Engine) -> None:
     """RED when: _rekey_token_state stops moving _new_ip_seen.
 
-    Stranded, the caller is charged a SECOND new-IP step-up (and a second audit row) for an address
-    the session already re-verified from.
+    Stranded, a rotation that is not a re-verification would re-audit and re-notify every address
+    the session already reported this epoch (BACKLOG #2159). The epoch-level behaviour is pinned in
+    tests/test_admin_new_ip.py; this pins only that the entry moves.
     """
     service, token = await _service_and_token(engine)
-    service._new_ip_seen[hash_token(token)] = "10.11.12.13"
+    flagged = {"10.11.12.13"}
+    service._new_ip_seen[hash_token(token)] = flagged
 
     rotated = await service._rotate_session_token(token)
     assert rotated is not None
 
     assert hash_token(token) not in service._new_ip_seen
-    assert service._new_ip_seen.get(hash_token(rotated)) == "10.11.12.13"
+    assert service._new_ip_seen.get(hash_token(rotated)) is flagged
 
 
 async def test_the_reproof_budget_survives_rotation(engine: Engine) -> None:

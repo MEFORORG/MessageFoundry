@@ -18,7 +18,7 @@ import json
 import sys
 import time
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -42,6 +42,7 @@ from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore, WebAuthnCredential
 from tests._admin_account import PROVISION_TOTP_SECRET, provision_totp
+from tests._totp_clock import fresh_totp
 
 # The directory-sign-in precondition, imported rather than re-derived: that module is where it is
 # measured, and this one only builds on it. Same convention as its own `_BACKENDS` import.
@@ -1785,10 +1786,15 @@ _TERMINAL_SECRET = PROVISION_TOTP_SECRET
 
 class _Terminal:
     """A console for the TOTP prompt: ``isatty`` True, ``readline`` answers the queued codes, and
-    ``shown`` records what reached the console device (``_show_on_terminal``)."""
+    ``shown`` records what reached the console device (``_show_on_terminal``).
 
-    def __init__(self, codes: list[str]) -> None:
-        self._codes = codes
+    An entry is a fixed string, or a callable that ``readline`` calls when the prompt asks. The
+    callable form is how a LIVE code is queued: an operator reads the authenticator at the prompt,
+    not before the command starts, and a code computed earlier belongs to whatever 30 s step that
+    earlier moment fell in (BACKLOG #2556)."""
+
+    def __init__(self, codes: Sequence[str | Callable[[], str]]) -> None:
+        self._codes = list(codes)
         self.asked = 0
         self.shown: list[str] = []
 
@@ -1804,7 +1810,10 @@ class _Terminal:
 
     def readline(self) -> str:
         self.asked += 1
-        return self._codes.pop(0) + "\n" if self._codes else ""
+        if not self._codes:
+            return ""
+        entry = self._codes.pop(0)
+        return (entry if isinstance(entry, str) else entry()) + "\n"
 
 
 def _drive_the_real_prompt(
@@ -1812,14 +1821,21 @@ def _drive_the_real_prompt(
 ) -> _Terminal:
     """Replace the suite-wide stub with the REAL ``_enrol_totp_at_terminal``, pin the generated
     secret so a correct code can be computed, and present a terminal that answers ``codes`` (one
-    live code by default). ``getpass`` answers the two password prompts."""
+    live code by default). ``getpass`` answers the two password prompts.
+
+    The default code is computed WHEN THE PROMPT ASKS, through ``fresh_totp``. The CLI checks the
+    code at its own ``time.time()`` with a skew of zero steps, so a code computed here, before the
+    command ran its argument checks, its policy build and two password prompts, was refused
+    whenever a step boundary fell in between. The prompt then asked again, found the queue empty,
+    and the command stopped on "empty authenticator code" (BACKLOG #2556)."""
     import messagefoundry.__main__ as cli
     from messagefoundry.auth import totp
 
     real = cli._enrol_totp_at_terminal.__wrapped__  # type: ignore[attr-defined]
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", real)
     monkeypatch.setattr(totp, "generate_secret", lambda: _TERMINAL_SECRET)
-    terminal = _Terminal(codes if codes is not None else [totp.totp(_TERMINAL_SECRET)])
+    live: list[str | Callable[[], str]] = [lambda: fresh_totp(_TERMINAL_SECRET)]
+    terminal = _Terminal(codes if codes is not None else live)
     monkeypatch.setattr(sys, "stdin", terminal)
     monkeypatch.setattr(cli, "_show_on_terminal", terminal.show)
     queued = [_PASSWORD, _PASSWORD]
@@ -1886,6 +1902,28 @@ def test_the_cli_enrols_totp_and_the_administrator_passes_a_live_lock_with_a_com
             await store.close()
 
     asyncio.run(check())
+
+
+def test_the_default_prompt_code_is_computed_when_the_prompt_asks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The terminal stub answers with the code of the step the PROMPT falls in, not the step the
+    helper was called in. The two differ whenever a 30 s boundary falls between them, and the CLI
+    checks with no skew, so a code from the earlier step is refused (BACKLOG #2556).
+
+    RED when: ``_drive_the_real_prompt`` computes its default code up front."""
+    from messagefoundry.auth import totp
+    from tests._totp_clock import pin_totp_clock
+
+    set_up_at = 1_700_000_000.0
+    asked_at = set_up_at + totp.DEFAULT_PERIOD
+    stale = totp.totp(_TERMINAL_SECRET, now=set_up_at)
+    live = totp.totp(_TERMINAL_SECRET, now=asked_at)
+    assert stale != live, "the two pinned steps must give different codes for this to discriminate"
+    pin_totp_clock(monkeypatch, set_up_at)
+    terminal = _drive_the_real_prompt(monkeypatch)
+    pin_totp_clock(monkeypatch, asked_at)
+    assert terminal.readline().strip() == live
 
 
 def test_a_wrong_code_at_the_prompt_writes_nothing(
