@@ -1661,6 +1661,15 @@ class AuditStore(Protocol):
         :func:`~messagefoundry.store.store.audit_row_hash`."""
         ...
 
+    async def latest_audit_of(self, actions: Sequence[str]) -> dict[str, Any] | None:
+        """The newest audit row whose ``action`` is one of ``actions``, as a dict of ``id``, ``ts``,
+        ``actor``, ``action`` and ``detail``; ``None`` when no row matches or ``actions`` is empty.
+
+        The start reads its config baseline through this (vault BACKLOG #2597): one indexed
+        ``WHERE action IN (...) ORDER BY id DESC`` read, so it stays cheap on a long chain. Every
+        action is a bound parameter."""
+        ...
+
     async def list_audit(
         self,
         *,

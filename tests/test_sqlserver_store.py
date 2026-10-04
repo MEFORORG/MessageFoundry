@@ -4491,6 +4491,23 @@ async def test_direct_edit_parity_ss(store) -> None:
     assert len(ob3) == 1 and ob3[0]["id"] == first.outbox_id
 
 
+async def test_latest_audit_of_reads_the_newest_matching_row_ss(store) -> None:
+    # vault BACKLOG #2597: the start's config baseline read, on the real backend.
+    assert await store.latest_audit_of(["config_loaded", "config_reload"]) is None
+    await store.record_audit("config_loaded", actor="system", detail='{"fingerprint": "a"}')
+    await store.record_audit("config_reload", actor="alice", detail='{"fingerprint": "b"}')
+    await store.record_audit("export", actor="bob", detail="not a baseline")
+    row = await store.latest_audit_of(["config_loaded", "config_reload"])
+    assert row is not None
+    assert (row["action"], row["actor"], row["detail"]) == (
+        "config_reload",
+        "alice",
+        '{"fingerprint": "b"}',
+    )
+    assert isinstance(row["ts"], float) and row["id"] > 0
+    assert await store.latest_audit_of([]) is None
+
+
 # --- RBAC-8: server-side summary_access census (record_audit + list_audit), on real SQL Server ------
 
 

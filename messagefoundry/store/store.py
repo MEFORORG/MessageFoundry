@@ -4580,6 +4580,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     row_hash    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
+-- The newest row of a few actions (latest_audit_of): the start's config baseline read, vault BACKLOG
+-- #2597. Without it that read walks the whole chain newest-first until one of the actions turns up.
+CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action, id);
 
 -- There is no table beside audit_log that says where its keying starts. Whether a chain is keyed is
 -- decided by the process that holds the key, and the first range's key is named by the chain's own
@@ -10901,6 +10904,23 @@ class MessageStore:
                 f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", params
             )
             return list(await cur.fetchall())
+
+    async def latest_audit_of(self, actions: Sequence[str]) -> dict[str, Any] | None:
+        """The newest audit row whose action is one of ``actions``, or ``None`` (vault BACKLOG #2597).
+
+        Returns ``id``, ``ts``, ``actor``, ``action`` and ``detail``. Each action is a bound ``?``;
+        only the placeholder count is formatted into the SQL. An empty ``actions`` matches nothing."""
+        if not actions:
+            return None
+        marks = ",".join("?" * len(actions))
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, ts, actor, action, detail FROM audit_log"
+                f" WHERE action IN ({marks}) ORDER BY id DESC LIMIT 1",
+                tuple(actions),
+            )
+            row = await cur.fetchone()
+        return dict(row) if row is not None else None
 
     async def security_events_for_user(
         self, username: str, *, limit: int = 100

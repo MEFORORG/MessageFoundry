@@ -836,6 +836,23 @@ async def test_audit_chain_verifies(store) -> None:
     assert [r["action"] for r in rows] == ["export", "message_view"]  # newest first
 
 
+async def test_latest_audit_of_reads_the_newest_matching_row(store) -> None:
+    # vault BACKLOG #2597: the start's config baseline read, on the real backend.
+    assert await store.latest_audit_of(["config_loaded", "config_reload"]) is None
+    await store.record_audit("config_loaded", actor="system", detail='{"fingerprint": "a"}')
+    await store.record_audit("config_reload", actor="alice", detail='{"fingerprint": "b"}')
+    await store.record_audit("export", actor="bob", detail="not a baseline")
+    row = await store.latest_audit_of(["config_loaded", "config_reload"])
+    assert row is not None
+    assert (row["action"], row["actor"], row["detail"]) == (
+        "config_reload",
+        "alice",
+        '{"fingerprint": "b"}',
+    )
+    assert isinstance(row["ts"], float) and row["id"] > 0
+    assert await store.latest_audit_of([]) is None
+
+
 async def test_record_audit_tees_off_box_redacted(store) -> None:
     # The off-box audit tee must fire on the real backend too (sec-offbox-log), via the same shared
     # emit_audit_tee path as SQLite — metadata only, with any HL7 in `detail` redacted.

@@ -1787,6 +1787,9 @@ _SCHEMA: list[str] = [
     # share one width.
     """IF INDEXPROPERTY(OBJECT_ID('audit_log'),'ix_audit_ts','IndexID') IS NULL
         CREATE INDEX ix_audit_ts ON audit_log(ts)""",
+    # latest_audit_of: the start's config baseline read (vault BACKLOG #2597).
+    """IF INDEXPROPERTY(OBJECT_ID('audit_log'),'ix_audit_action','IndexID') IS NULL
+        CREATE INDEX ix_audit_action ON audit_log(action, id)""",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
     # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
@@ -11015,6 +11018,20 @@ class SqlServerStore:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT TOP (?) * FROM audit_log{where} ORDER BY id DESC"
         return await self._fetchall(sql, tuple(params))
+
+    async def latest_audit_of(self, actions: Sequence[str]) -> dict[str, Any] | None:
+        """The newest audit row whose action is one of ``actions``, or ``None`` (vault BACKLOG #2597).
+
+        Returns ``id``, ``ts``, ``actor``, ``action`` and ``detail``. Each action is a bound ``?``;
+        only the placeholder count is formatted into the SQL. An empty ``actions`` matches nothing."""
+        if not actions:
+            return None
+        marks = ",".join("?" * len(actions))
+        return await self._fetchone(
+            "SELECT TOP (1) id, ts, actor, action, detail FROM audit_log"
+            f" WHERE action IN ({marks}) ORDER BY id DESC",
+            tuple(actions),
+        )
 
     async def security_events_for_user(
         self, username: str, *, limit: int = 100
