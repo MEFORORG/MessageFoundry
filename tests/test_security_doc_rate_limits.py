@@ -556,10 +556,10 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
             "admin_write_rate_limit_enabled no longer names all three chargers of the bucket"
         )
     new_ip = _row(section, "admin_new_ip_step_up")
-    if "until the session re-verifies" not in new_ip or "_NEW_IP_PER_SESSION_MAX" not in new_ip:
+    if "a switch to a different new address does" in new_ip:
         problems.append(
-            "admin_new_ip_step_up no longer says the notice dedupe resets at a re-verification and "
-            "is capped per session; both are true since BACKLOG #2159"
+            "admin_new_ip_step_up says a switch to a different new address re-fires the notice; "
+            "since BACKLOG #2159 each address fires once per re-verification, as SECURITY.md states"
         )
 
     intake = _row(connections_text, "intake_auth")

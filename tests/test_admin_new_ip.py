@@ -292,8 +292,9 @@ def test_same_host_folds_mapped_loopback_and_case() -> None:
 
 async def test_one_epoch_audits_at_most_the_per_session_cap() -> None:
     """The signal runs on every sensitive request, so one session audits at most
-    ``_NEW_IP_PER_SESSION_MAX`` addresses between re-verifications. Past the cap the step-up is still
-    forced; only the row and the notice are held back."""
+    ``_NEW_IP_PER_SESSION_MAX`` addresses between re-verifications, plus ONE row carrying
+    ``cap_reached`` that names the first address past the cap. After that the step-up is still
+    forced; only the row and the notice are held back. A re-verification gives the cap back."""
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
@@ -301,16 +302,108 @@ async def test_one_epoch_audits_at_most_the_per_session_cap() -> None:
             store, AuthSettings(admin_new_ip_step_up=True), security_notifier=notifier
         )
         await service.initialize()
-        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        token, identity = await _enabled_admin(service, client="10.1.1.1")
         addresses = [f"10.9.0.{n}" for n in range(1, _NEW_IP_PER_SESSION_MAX + 3)]
         for _ in range(2):
             for seen in addresses:
                 assert await service.flag_new_client_ip(token, seen, path="/users") is True
-        assert await _new_ip_rows(store) == addresses[:_NEW_IP_PER_SESSION_MAX]
-        assert (
-            sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP)
-            == _NEW_IP_PER_SESSION_MAX
-        )
+        reported = addresses[: _NEW_IP_PER_SESSION_MAX + 1]
+        assert await _new_ip_rows(store) == reported
+        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == len(reported)
+        details = [
+            json.loads(str(r["detail"]))
+            for r in await store.list_audit(action="auth.admin_action_new_ip", limit=100)
+        ]
+        capped = [d for d in details if "cap_reached" in d]
+        assert [d["seen_ip"] for d in capped] == [addresses[_NEW_IP_PER_SESSION_MAX]]
+        assert capped[0]["cap_reached"] == _NEW_IP_PER_SESSION_MAX
+        # Re-verifying from the anchor opens a new epoch with a fresh cap.
+        reauthed = await service.reauth(identity, PW, token=token, client="10.1.1.1")
+        assert reauthed.ok is True and reauthed.token is not None
+        assert await service.flag_new_client_ip(reauthed.token, addresses[-1], path="/users")
+        assert await _new_ip_rows(store) == [*reported, addresses[-1]]
+    finally:
+        await store.close()
+
+
+def test_the_per_session_cap_is_the_value_security_md_states() -> None:
+    """SECURITY.md item 6 gives the cap as a number an operator can read. Move both together."""
+    assert _NEW_IP_PER_SESSION_MAX == 8
+    text = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text("utf-8")
+    assert "at most **eight** addresses (`_NEW_IP_PER_SESSION_MAX`" in " ".join(text.split())
+
+
+async def test_a_rotation_without_a_reverification_keeps_the_dedupe() -> None:
+    """A rotation that proves nothing (a passkey assertion, an enrolment confirm) leaves
+    ``reauth_at`` alone, so the epoch and its flags carry across to the new token."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        rotated = await service._rotate_session_token(token)
+        assert rotated is not None
+        assert await service.flag_new_client_ip(rotated, "10.2.2.2", path="/users") is True
+        assert await _new_ip_rows(store) == ["10.2.2.2"]
+    finally:
+        await store.close()
+
+
+async def test_a_failed_audit_write_does_not_mark_the_address_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the row is not written, the next request from that address must try again rather than
+    be suppressed for the rest of the epoch."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        real_audit = service._audit
+
+        async def failing_audit(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("transient store fault")
+
+        monkeypatch.setattr(service, "_audit", failing_audit)
+        with pytest.raises(RuntimeError):
+            await service.flag_new_client_ip(token, "10.2.2.2", path="/users")
+        monkeypatch.setattr(service, "_audit", real_audit)
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+        assert await _new_ip_rows(store) == ["10.2.2.2"]
+    finally:
+        await store.close()
+
+
+async def test_a_stale_session_read_does_not_roll_the_epoch_back() -> None:
+    """A request that read the session just before a re-verification landed carries the OLDER
+    ``reauth_at``. It is checked against the current epoch; it must not clear what that epoch has
+    already reported."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        assert service._first_new_ip_flag("h", 1.0, "10.2.2.2") == "audit"
+        assert service._first_new_ip_flag("h", 2.0, "10.3.3.3") == "audit"
+        assert service._first_new_ip_flag("h", 1.0, "10.3.3.3") == "repeat"
+        assert service._first_new_ip_flag("h", 2.0, "10.3.3.3") == "repeat"
+        # The epoch-2 set no longer holds the epoch-1 address, so it reports again, once.
+        assert service._first_new_ip_flag("h", 1.0, "10.2.2.2") == "audit"
+        assert service._first_new_ip_flag("h", 2.0, "10.2.2.2") == "repeat"
+    finally:
+        await store.close()
+
+
+async def test_the_sign_in_notice_debounce_folds_ipv4_mapped() -> None:
+    """The sign-in signal's notice debounce keys on the host, as its comparison does, so one host
+    seen as ``::ffff:a.b.c.d`` and then ``a.b.c.d`` gets one notice per window, not two."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        assert service._login_new_ip_notice_due("u1", "::ffff:10.9.9.9") is True
+        assert service._login_new_ip_notice_due("u1", "10.9.9.9") is False
+        assert service._login_new_ip_notice_due("u1", "10.9.9.8") is True
     finally:
         await store.close()
 
