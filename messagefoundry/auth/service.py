@@ -4378,7 +4378,11 @@ class AuthService:
             detail["mech"] = mech
         if evidence:
             detail["evidence"] = dict(evidence)
-        await self._record_login_address(address, user, client=client, provider="ad")
+        # vault BACKLOG #2156: the address rows name the session mechanism, because ``provider`` is
+        # ``ad`` on both directory legs and could not tell a Kerberos sign-in from an OIDC one.
+        await self._record_login_address(
+            address, user, client=client, provider="ad", mechanism=session_mechanism
+        )
         await self._audit(
             "auth.login_success", actor=user.username, detail=_json(detail), client=client
         )
@@ -6947,7 +6951,13 @@ class AuthService:
         return True
 
     async def _record_login_address(
-        self, verdict: _LoginAddress, user: UserRecord, *, client: str | None, provider: str
+        self,
+        verdict: _LoginAddress,
+        user: UserRecord,
+        *,
+        client: str | None,
+        provider: str,
+        mechanism: SessionMechanism | None = None,
     ) -> None:
         """Write what :meth:`_classify_login_address` decided, after the session is minted.
 
@@ -6957,14 +6967,22 @@ class AuthService:
         ``auth.login_new_ip`` and sends the ``login_new_ip`` notice, debounced per account. The
         fail-open verdicts audit ``auth.login_address_unevaluated`` with the reason and notify
         nobody. This never refuses a login: the challenge is the session minted without step-up
-        freshness, which the caller arranges."""
+        freshness, which the caller arranges.
+
+        ``mechanism`` is passed by the directory leg only, where ``provider`` is ``ad`` for Kerberos
+        and OIDC alike, and lands in every row and notice as ``mech``, the key and spellings the
+        directory leg's other audit rows already use (vault BACKLOG #2156). The local leg passes
+        none, so its rows keep exactly ``{provider}``."""
         if verdict is _LoginAddress.KNOWN:
             return
+        detail: dict[str, object] = {"provider": provider}
+        if mechanism is not None:
+            detail["mech"] = mechanism.value
         if verdict is _LoginAddress.NEW:
             await self._audit(
                 "auth.login_new_ip",
                 actor=user.username,
-                detail=_json({"provider": provider}),
+                detail=_json(detail),
                 client=client,
             )
             if self._login_new_ip_notice_due(user.id, client):
@@ -6973,13 +6991,13 @@ class AuthService:
                     username=user.username,
                     email=user.notify_email,
                     client=client,
-                    detail={"provider": provider},
+                    detail=detail,
                 )
             return
         await self._audit(
             "auth.login_address_unevaluated",
             actor=user.username,
-            detail=_json({"provider": provider, "reason": verdict.value}),
+            detail=_json({**detail, "reason": verdict.value}),
             client=client,
         )
 
