@@ -12,11 +12,11 @@ public metadata only.
 
 THE POPULATION is every distribution the page assesses: each name in the core runtime closure,
 ``security/runtime-closure-core.txt``, plus each name an assessed extra's closure adds to it. ``EXTRAS``
-names those extras and their closure files: ``sqlserver`` and ``harness`` (BACKLOG #2414 brought the
-second in). It is not only the designated set, because a component can be risky by maintenance or
-history even where the exposure criterion did not designate it. Each reading records which extras
-add its name, and ``tests/test_risky_component_designation.py`` holds the population to the closure
-files, so a closure the page assesses and this script does not read turns that test red.
+names those extras and their closure files (BACKLOG #2414 brought ``harness`` in). It is not only
+the designated set, because a component can be risky by maintenance or history even where the
+exposure criterion did not designate it. Each reading records which extras add its name, and
+``tests/test_risky_component_designation.py`` holds the population to the closure files, so a
+closure the page assesses and this script does not read turns that test red.
 
 OSV MATCHES AN ADVISORY BY PYPI NAME. A flaw in code a wheel carries inside it, such as a compiled
 library, is counted only where an advisory names the PyPI package. So a reading with no advisory
@@ -793,6 +793,12 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         names = [r["name"] for r in clean if (r["name"] in labels) == yes]
         if names:
             out.append(f"| {', '.join(f'`{n}`' for n in names)} | {'yes' if yes else 'no'} |")
+    out += [
+        "",
+        "Not risky here means that none of the three tests fired. It is not a clean result "
+        "beyond them: the vulnerability-history test reads advisories by PyPI name only, as "
+        "stated with the tests above.",
+    ]
     risky = [r for r in readings if any(r["risky"].values())]
     both = [r for r in risky if r["name"] in labels]
     only = [r for r in risky if r["name"] not in labels]
@@ -838,17 +844,19 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
             EXTRAS_HEADING,
             "",
             "The same readings again, for the names an assessed extra adds to the core closure. "
-            "The advisory column counts every advisory OSV lists under that PyPI name, of any "
-            "severity and any date. Read it under the limit stated above: a 0 is about the name, "
+            "The advisory column is how many advisories this reading counted under that PyPI "
+            "name, of any severity and any date, after the merging and the leaving out described "
+            "with the tests above. Read it under the limit stated there: a 0 is about the name, "
             "not about the code inside the wheel.",
             "",
-            "| Component | Added by | Newest release | Advisories OSV lists under the name "
+            "| Component | Added by | Pinned | Newest release | Advisories counted under the name "
             "| Risky on |",
-            "|---|---|---|---|---|",
+            "|---|---|---|---|---|---|",
         ]
         out += [
             f"| `{r['name']}` | {_series([f'`{e}`' for e in r['added_by']], 'and')} | "
-            f"{r['newest_upload'] or 'none'} | {len(r['advisories'])} | {axes(r) or 'none'} |"
+            f"{r['pinned']} | {r['newest_upload'] or 'none'} | {len(r['advisories'])} | "
+            f"{axes(r) or 'none'} |"
             for r in added
         ]
     return "\n".join(_wrap(line) for line in out)

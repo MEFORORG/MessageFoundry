@@ -421,8 +421,9 @@ def test_the_generator_reads_every_extra_the_page_assesses() -> None:
 
 
 def test_the_harness_section_rests_on_the_generated_reading() -> None:
-    """RED when: the harness section stops naming the rendered table it rests on, or stops saying
-    that a 0 there is about the PyPI names and not about the Qt inside the wheels.
+    """RED when: the harness section stops naming the rendered table it rests on, stops saying
+    that a 0 there is about the PyPI names and not about the Qt inside the wheels, or names other
+    PyPI packages than the ones the extra adds.
 
     OSV matches an advisory by PyPI name, so a 0 for these names is not a clean result for Qt. The
     section copies no figure from the snapshot, so a re-read cannot leave it behind.
@@ -430,6 +431,11 @@ def test_the_harness_section_rests_on_the_generated_reading() -> None:
     section = " ".join(_region(_HARNESS_START, _ASVS_START).split())
     assert f"*{_EXTRA_NAMES.removeprefix('### ')}*" in section, (
         "the harness section no longer names the rendered table that carries its readings"
+    )
+    *head, last = (f"`{name}`" for name in sorted(_additions(_HARNESS_CLOSURE)))
+    names = f"{', '.join(head)} or {last}"
+    assert f"it counted no advisory naming the {names} PyPI packages" in section, (
+        f"the harness section's statement of what a 0 means does not name {names}"
     )
     assert "It does not mean the Qt code inside those wheels has no known flaws." in section, (
         "the harness section no longer states the limit of an OSV reading by PyPI name"
@@ -702,6 +708,13 @@ _FIT = "### How this reading and the tiers fit together"
 #: The rendered section's last table: what was read for the names the assessed extras add. Each
 #: extra's own section points at it instead of copying its figures.
 _EXTRA_NAMES = "### The names the assessed extras add"
+#: The page's word for each example in a "Risky on" cell. This module's own copy, so the checks
+#: that read those cells do not go through the generator's.
+_AXIS_WORDS = {
+    "maintenance": "maintenance",
+    "support": "support",
+    "advisory_history": "vulnerability history",
+}
 #: Each ASVS example's subsection in the rendered section, and the subsection after it.
 _AXIS_SECTIONS = (
     ("maintenance", "### Poorly maintained", "### Unsupported or end of life"),
@@ -773,10 +786,42 @@ def _stated_facts_drift(page: str, data: dict[str, Any]) -> list[str]:
     named = _table_names(_region(_NOT_RISKY, _FIT, page))
     if named != clean:
         problems.append(f"not risky: page names {sorted(named)}, snapshot {sorted(clean)}")
-    named = _table_names(_region(_EXTRA_NAMES, _END, page))
-    added = {n for n, r in readings.items() if r["added_by"]}
-    if named != added:
+    added = {n: r for n, r in readings.items() if r["added_by"]}
+    stated = (
+        f"All {size} distributions this page assesses are read: the {size - len(added)} in the "
+        f"core closure and the {len(added)} that the assessed extras add to it."
+    )
+    if stated not in flat:
+        problems.append(f"the page does not state {stated!r}")
+    for extra in data["population"]["extras"]:
+        adds = sum(extra in r["added_by"] for r in added.values())
+        if f"The `{extra}` extra adds {adds}" not in flat:
+            problems.append(f"the page does not state that the {extra} extra adds {adds}")
+    table = _region(_EXTRA_NAMES, _END, page)
+    named = _table_names(table)
+    if named != added.keys():
         problems.append(f"extras' names: page names {sorted(named)}, snapshot {sorted(added)}")
+    # Each row's cells, read here and not through the renderer. An extra's own section rests on
+    # this table, so a wrong column printed consistently must not pass.
+    rows = {
+        cells[1].strip(" `"): [c.strip() for c in cells[2:-1]]
+        for cells in (ln.split("|") for ln in table.splitlines() if ln.startswith("| `"))
+    }
+    for name in sorted(named & added.keys()):
+        reading = added[name]
+        risky_on = [_AXIS_WORDS[axis] for axis, _, _ in _AXIS_SECTIONS if reading["risky"][axis]]
+        by, *figures, on = rows[name]
+        expected = [
+            reading["pinned"],
+            reading["newest_upload"] or "none",
+            str(len(reading["advisories"])),
+        ]
+        if (
+            sorted(re.findall(r"`([^`]+)`", by)) != sorted(reading["added_by"])
+            or figures != expected
+            or on != (" and ".join(risky_on) or "none")
+        ):
+            problems.append(f"extras' row for {name} is {rows[name]}, not what the snapshot reads")
     return problems
 
 
@@ -1048,6 +1093,21 @@ def test_the_section_checks_can_fail() -> None:
     row = next(ln for ln in extras_table.splitlines() if ln.startswith("| `"))
     drift = _stated_facts_drift(page.replace(row + "\n", ""), data)
     assert any(line.startswith("extras' names") for line in drift), drift
+    # One more advisory for a name an extra adds: only that row's count moves, and the per-extra
+    # count when the name stops being an addition.
+    added = next(r for r in data["readings"] if r["added_by"])
+    extra = {"id": "GHSA-test", "severity": "LOW", "rated_by": "github", "published": "2000-01-01"}
+    for change, problem in (
+        ({"advisories": [*added["advisories"], extra]}, "extras' row for"),
+        ({"pinned": "0.0.0-not-the-pin"}, "extras' row for"),
+        ({"added_by": []}, "the page does not state that the"),
+    ):
+        changed = {
+            **data,
+            "readings": [{**r, **change} if r is added else r for r in data["readings"]],
+        }
+        drift = _stated_facts_drift(page, changed)
+        assert any(line.startswith(problem) for line in drift), (change, drift)
 
 
 def test_the_generator_reads_a_component_from_fake_replies() -> None:

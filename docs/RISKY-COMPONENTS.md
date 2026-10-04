@@ -246,25 +246,27 @@ nothing about trust.
 All of Qt is compiled C++, so a fault in its socket or text handling is a memory-safety event in the
 harness's process, not a Python exception.
 
-### What the ASVS reading shows for these four, and what it cannot show
+### What the ASVS reading shows for these names, and what it cannot show
 
-The generated reading further down reads these four names with every other component on this page,
-on all three of ASVS's examples. Its last table is *The names the assessed extras add*. For each of
-the four it gives the newest release, the count of advisories OSV lists under the name, and the
-examples it is risky on. OSV is the Open Source Vulnerabilities database.
+The generated reading further down reads these names with every other component on this page, on
+all three of ASVS's examples. Its last table is *The names the assessed extras add*. For each name
+it gives the pinned version, the newest release, the count of advisories read under the name, and
+the examples it is risky on.
 
 The results are stated there and not copied here, so a later re-read cannot leave this section
 behind.
 
-**A 0 in that table's advisory column is about a PyPI name, not about Qt.** OSV matches an advisory
-to a component by its PyPI name. For these four, a 0 means OSV lists no advisory naming the
-`pyside6`, `pyside6-addons`, `pyside6-essentials` or `shiboken6` PyPI packages. It does not mean the
-Qt code inside those wheels has no known flaws.
+**A 0 in that table's advisory column is about a PyPI name, not about Qt.** That reading matches an
+advisory to a component by its PyPI name, and says so with its tests. For these wheels, a 0 means it
+counted no advisory naming the `pyside6`, `pyside6-addons`, `pyside6-essentials` or `shiboken6` PyPI
+packages. It does not mean the Qt code inside those wheels has no known flaws.
 
 A flaw filed against Qt itself, and not against one of those PyPI names, does not show up in that
 reading. So the vulnerability-history example is read for the names of the wheels and not for the Qt
-they carry. That is a limit of the instrument, and this page does not close it. A reader who needs
-the Qt side has to check Qt's own security notices against the Qt version the pinned wheels carry.
+they carry. A name in that reading's *Not risky on any of the three* table is under the same limit.
+
+That is a limit of the instrument, and this page does not close it. A reader who needs the Qt side
+has to check Qt's own security notices against the Qt version the pinned wheels carry.
 
 ## Risky by ASVS's own examples, read from public data
 
@@ -360,6 +362,9 @@ Every advisory in the window carries a rating from one of the two sources.
 | `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyside6-essentials`, `pyspnego`, `shiboken6`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
 | `aiosqlite`, `annotated-doc`, `annotated-types`, `psutil`, `pyside6`, `pyside6-addons`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
 
+Not risky here means that none of the three tests fired. It is not a clean result beyond them: the
+vulnerability-history test reads advisories by PyPI name only, as stated with the tests above.
+
 ### How this reading and the tiers fit together
 
 The tiers stay the designation. This reading does not move a component into or out of them. Where
@@ -385,17 +390,18 @@ names them so that choice stays visible, and a reviewer can revisit it.
 ### The names the assessed extras add
 
 The same readings again, for the names an assessed extra adds to the core closure. The advisory
-column counts every advisory OSV lists under that PyPI name, of any severity and any date. Read it
-under the limit stated above: a 0 is about the name, not about the code inside the wheel.
+column is how many advisories this reading counted under that PyPI name, of any severity and any
+date, after the merging and the leaving out described with the tests above. Read it under the limit
+stated there: a 0 is about the name, not about the code inside the wheel.
 
-| Component | Added by | Newest release | Advisories OSV lists under the name | Risky on |
-|---|---|---|---|---|
-| `aioodbc` | `sqlserver` | 2023-10-28 | 0 | maintenance |
-| `pyodbc` | `sqlserver` | 2025-10-17 | 0 | none |
-| `pyside6` | `harness` | 2026-08-18 | 0 | none |
-| `pyside6-addons` | `harness` | 2026-08-18 | 0 | none |
-| `pyside6-essentials` | `harness` | 2026-08-18 | 0 | none |
-| `shiboken6` | `harness` | 2026-08-18 | 0 | none |
+| Component | Added by | Pinned | Newest release | Advisories counted under the name | Risky on |
+|---|---|---|---|---|---|
+| `aioodbc` | `sqlserver` | 0.5.0 | 2023-10-28 | 0 | maintenance |
+| `pyodbc` | `sqlserver` | 5.3.0 | 2025-10-17 | 0 | none |
+| `pyside6` | `harness` | 6.11.2 | 2026-08-18 | 0 | none |
+| `pyside6-addons` | `harness` | 6.11.2 | 2026-08-18 | 0 | none |
+| `pyside6-essentials` | `harness` | 6.11.2 | 2026-08-18 | 0 | none |
+| `shiboken6` | `harness` | 6.11.2 | 2026-08-18 | 0 | none |
 
 <!-- END component-readings -->
 
@@ -437,11 +443,12 @@ out of both tables is not available.
 The same test holds the ASVS reading to its snapshot,
 [`security/risky-component-readings.json`](../security/risky-component-readings.json), with no
 network. Every name this page assesses must have exactly one reading. That is each name in the core
-closure, and each name the `sqlserver` or `harness` closure adds to it. No reading may name anything
-else. So an extra that has a section on this page, and that the script does not read, turns the test
-red. Each verdict must follow from its recorded readings under the recorded criteria. The section
-between the markers must be exactly what the snapshot and the tiers above render, so a tier change
-needs `python scripts/security/component_readings.py --render-only`.
+closure, and each name an assessed extra's closure adds to it. No reading may name anything else. So
+an extra that has a section on this page, and that the script does not read, turns the test red.
+
+Each verdict must follow from its recorded readings under the recorded criteria. The section between
+the markers must be exactly what the snapshot and the tiers above render, so a tier change needs
+`python scripts/security/component_readings.py --render-only`.
 
 The test does not go red when the re-read date passes, because a date alone would then fail every
 unrelated pull request. Keeping the re-read date is a maintainer task. Run
