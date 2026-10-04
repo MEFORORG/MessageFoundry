@@ -13,7 +13,7 @@ refusal (vault BACKLOG #2606). This module holds those controls once.
 * :class:`RefusalLog` is the per-address, windowed log throttle the DICOM server introduced, moved here
   so the four socket listeners and the DICOM server share one.
 * :class:`FrameClock` is the frame deadline: the bound on one frame from its first byte to its last.
-  The MLLP read loop keeps its own copy of the logic and reads its arithmetic from here.
+  The MLLP, raw-TCP and X12 read loops all run it (vault BACKLOG #2847 moved MLLP onto it).
 
 Everything here runs before ingress, so no message is read, persisted or acknowledged by it. The
 ACK-on-receipt and count-and-log invariants are untouched: a refused connection has delivered
@@ -41,8 +41,6 @@ __all__ = [
     "ListenerAdmission",
     "Refusal",
     "RefusalLog",
-    "frame_seconds_left",
-    "read_budget",
 ]
 
 logger = logging.getLogger(__name__)
@@ -248,7 +246,7 @@ class ListenerAdmission:
         )
 
 
-def frame_seconds_left(opened_at: float | None, max_frame_seconds: float | None) -> float | None:
+def _frame_seconds_left(opened_at: float | None, max_frame_seconds: float | None) -> float | None:
     """Seconds left on the open frame's deadline, or ``None`` when no deadline is running.
 
     ``None`` means the bound has nothing to say: it is off, or no frame is open. The result may be
@@ -259,7 +257,7 @@ def frame_seconds_left(opened_at: float | None, max_frame_seconds: float | None)
     return max_frame_seconds - (time.monotonic() - opened_at)
 
 
-def read_budget(receive_timeout: float | None, frame_left: float | None) -> float | None:
+def _read_budget(receive_timeout: float | None, frame_left: float | None) -> float | None:
     """How long the next read may block: the idle bound, the open frame's remaining life, or the
     smaller of the two. ``None`` only when neither bound is configured."""
     if frame_left is None:
@@ -307,12 +305,12 @@ class FrameClock:
         decided before it, never re-measured after a timeout: at the boundary a re-measure would read
         a small positive remainder and misname a frame deadline as an idle timeout.
         """
-        left = frame_seconds_left(self.opened_at, self.max_frame_seconds)
+        left = _frame_seconds_left(self.opened_at, self.max_frame_seconds)
         if left is not None and left <= 0.0:
             # Spent while we were not waiting on the socket: bytes arrived at or past the deadline.
             self._log_frame_deadline(writer)
             return b"", "frame_deadline"
-        budget = read_budget(self.receive_timeout, left)
+        budget = _read_budget(self.receive_timeout, left)
         if budget is None:
             return await reader.read(4096), None
         try:

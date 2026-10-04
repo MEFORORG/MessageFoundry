@@ -79,13 +79,7 @@ from messagefoundry.parsing._builtin_hl7 import DelimiterRewriteRefused
 from messagefoundry.parsing.message import emit_raw_separators, reencode_with_separators
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek, normalize
 from messagefoundry.redaction import clamp_untrusted, safe_exc
-from messagefoundry.transports.admission import (
-    ListenerAdmission,
-    frame_seconds_left,
-)
-from messagefoundry.transports.admission import (
-    read_budget as _shared_read_budget,
-)
+from messagefoundry.transports.admission import FrameClock, ListenerAdmission
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -93,7 +87,6 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
-    intake_open,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -142,7 +135,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_CONNECTIONS = 256  # bound concurrent inbound clients (connection-flood guard)
 DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this long (slowloris guard)
 
-#: Seconds one frame may take from its START byte to its END byte (BACKLOG #1725).
+#: Seconds one frame may take to complete, counted from the first byte of any kind after the last
+#: completed frame (BACKLOG #1725; the start point is vault BACKLOG #2847).
 #:
 #: :data:`DEFAULT_RECEIVE_TIMEOUT` bounds SILENCE between reads and resets on every byte received, so
 #: a peer trickling one byte at a time INSIDE A FRAME is never idle: it would hold its slot — and up
@@ -152,13 +146,19 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 #: which is a separate property and still wanted (a peer that opens a socket and says nothing at all
 #: never opens a frame, so no frame deadline would ever fire on it).
 #:
-#: **The clock runs from a START byte, and a peer that never sends one is outside it.** Inter-frame
-#: noise is discarded by the decoder without opening a frame, so a peer trickling bytes that are not
-#: an MLLP frame is neither idle nor in-frame and holds its slot. It buffers nothing, so the memory
-#: half of the threat is absent, and ``max_connections_per_host`` bounds how many slots one address
-#: can hold that way — but it is not bounded by THIS key, and reading it as "no peer can hold a slot
-#: without sending a message" would be wrong. Closing that needs a bound on a different unit
-#: (connected time without a completed message), which is a separate decision from this one.
+#: **The clock starts on ANY byte, not only a START byte (vault BACKLOG #2847).** Inter-frame noise
+#: is discarded by the decoder without opening a frame, yet it resets the idle bound like any byte.
+#: A clock that waited for a start byte therefore never reached a peer trickling noise, which held
+#: its slot while neither idle nor in a frame. So any bytes must now lead to a completed frame
+#: within this many seconds; a completed frame stops the clock, and a quiet socket after it is left
+#: to ``receive_timeout``. This is the unit the raw-TCP and X12 listeners use, on the same
+#: :class:`~messagefoundry.transports.admission.FrameClock` (vault BACKLOG #2606). A bound on
+#: connected time without a completed message was the other option, and it was not taken.
+#:
+#: One consequence an operator can see: a lone trailer byte that reaches the listener in its own
+#: read, after the end byte of a frame, starts the clock too. A peer that then goes quiet is closed
+#: at ``max_frame_seconds`` with a ``frame_deadline`` reason, even where ``receive_timeout`` is
+#: longer or off.
 #:
 #: 60 s matches the idle bound, so the shipped posture reads as "a frame gets about as long to arrive
 #: as a quiet socket gets to stay open". ``None``/``0`` disables it, like every cap here.
@@ -2042,63 +2042,67 @@ class MLLPSource(SourceConnector):
         # mid-handler still finishes its commit (the body is durably stored before any ACK, so
         # at-least-once holds — only a not-yet-sent ACK is lost, which the sender retries). Then
         # await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
-        for writer in list(self._clients):
-            writer.close()
-        # Where this listener upgrades TLS itself, a socket still in its handshake is in `_clients`
-        # from its accept on (BACKLOG #1606; `_on_tls_accept`), so the loop above closes it and its
-        # handshake fails rather than completing mid-stop.
-        #
-        # Then close every transport the SERVER tracks, a wider set than `_clients`: a plain-TCP
-        # socket accepted in the same turn stop() began, before `_on_client` first ran, and where
-        # the LOOP runs the handshake (`_upgrades_tls_itself`), a socket still in it, which never
-        # reached `_on_client`. That comes BEFORE the task wait below, or such a socket could finish
-        # its handshake during it and have a message handled mid-stop. For an established TLS client
-        # this closes the raw socket under the writer just closed; its close_notify is already
-        # queued, and close() sends what is queued before it closes, so stop() does not wait out
-        # `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is untouched, as with writer.close(). It
-        # awaits nothing, so it cannot wedge on the Proactor (#55).
-        #
-        # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(), and
-        # uvicorn runs the engine on uvloop wherever it is installed, and the engine's own uvloop
-        # dependency installs it for CPython outside Windows. Called unguarded, it raised
-        # AttributeError here, so a reload's first stop() failed, left that listener unbound, and
-        # the reload restarted nothing.
-        # What uvloop loses, and what still holds there:
-        # * the same-turn plain-TCP socket above. The one-turn yield below lets it reach
-        #   `_on_client`, which refuses it unread on `_stopping`.
-        # * a TLS socket still in its handshake, since uvloop keeps the loop-level handshake.
-        #   `_TLS_HANDSHAKE_TIMEOUT` still bounds it, and `_stopping` refuses it unread if it
-        #   finishes.
-        # * stop() can wait, inside the grace below, for an established TLS peer's close_notify, up
-        #   to `_TLS_SHUTDOWN_TIMEOUT`: `_on_client`'s finally waits for the close exchange.
-        # * uvloop's wait_closed() returns once the listening socket is closed, so the wait this
-        #   block exists to cut short does not happen there.
-        close_clients = getattr(self._server, "close_clients", None)
-        if close_clients is not None:
-            close_clients()
-        # One loop turn, so a client task created but not yet started (its handshake completed in
-        # the same turn stop() began) runs now and meets `_stopping`, rather than first running
-        # after stop() has returned. That narrows the window to asyncio's own scheduling; it does
-        # not claim to close every interleaving.
-        await asyncio.sleep(0)
-        pending = [task for task in self._client_tasks if not task.done()]
-        if pending:
-            _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
-            for task in still_running:
-                task.cancel()
-            if still_running:
-                await asyncio.gather(*still_running, return_exceptions=True)
-        self._clients.clear()
-        self._client_tasks.clear()
-        # Clear the per-host tables with them. A client task cancelled past its grace above, or one
-        # the runner ABANDONS when a stop() overruns (wiring_runner's demotion path leaves the drain
-        # running and reuses this same instance at the next promotion), never runs its `finally` —
-        # so a stale count would survive into the restarted listener, and `release`'s own docstring
-        # names what that costs: a per-host count left behind by a missed release locks that peer
-        # out. A straggler that does run later decrements a missing key, which `release` already
-        # treats as a no-op. `active` keeps its existing behaviour: it is read by the global cap
-        # that predates this row, and resetting it here would be a separate change.
-        self._admission.reset()
+        try:
+            for writer in list(self._clients):
+                writer.close()
+            # Where this listener upgrades TLS itself, a socket still in its handshake is in
+            # `_clients` from its accept on (BACKLOG #1606; `_on_tls_accept`), so the loop above
+            # closes it and its handshake fails rather than completing mid-stop.
+            #
+            # Then close every transport the SERVER tracks, a wider set than `_clients`: a plain-TCP
+            # socket accepted in the same turn stop() began, before `_on_client` first ran, and
+            # where the LOOP runs the handshake (`_upgrades_tls_itself`), a socket still in it,
+            # which never reached `_on_client`. That comes BEFORE the task wait below, or such a
+            # socket could finish its handshake during it and have a message handled mid-stop. For
+            # an established TLS client this closes the raw socket under the writer just closed; its
+            # close_notify is already queued, and close() sends what is queued before it closes, so
+            # stop() does not wait out `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is untouched,
+            # as with writer.close(). It awaits nothing, so it cannot wedge on the Proactor (#55).
+            #
+            # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(),
+            # and uvicorn runs the engine on uvloop wherever it is installed, and the engine's own
+            # uvloop dependency installs it for CPython outside Windows. Called unguarded, it raised
+            # AttributeError here, so a reload's first stop() failed, left that listener unbound,
+            # and the reload restarted nothing. What uvloop loses, and what still holds there:
+            # * the same-turn plain-TCP socket above. The one-turn yield below lets it reach
+            #   `_on_client`, which refuses it unread on `_stopping`.
+            # * a TLS socket still in its handshake, since uvloop keeps the loop-level handshake.
+            #   `_TLS_HANDSHAKE_TIMEOUT` still bounds it, and `_stopping` refuses it unread if it
+            #   finishes.
+            # * stop() can wait, inside the grace below, for an established TLS peer's close_notify,
+            #   up to `_TLS_SHUTDOWN_TIMEOUT`: `_on_client`'s finally waits for the close exchange.
+            # * uvloop's wait_closed() returns once the listening socket is closed, so the wait this
+            #   block exists to cut short does not happen there.
+            close_clients = getattr(self._server, "close_clients", None)
+            if close_clients is not None:
+                close_clients()
+            # One loop turn, so a client task created but not yet started (its handshake completed
+            # in the same turn stop() began) runs now and meets `_stopping`, rather than first
+            # running after stop() has returned. That narrows the window to asyncio's own
+            # scheduling; it does not claim to close every interleaving.
+            await asyncio.sleep(0)
+            pending = [task for task in self._client_tasks if not task.done()]
+            if pending:
+                _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
+                for task in still_running:
+                    task.cancel()
+                if still_running:
+                    await asyncio.gather(*still_running, return_exceptions=True)
+            self._clients.clear()
+            self._client_tasks.clear()
+        finally:
+            # Clear the per-host tables with them, in a `finally` so a stop() cancelled or failing
+            # anywhere above still clears them (vault BACKLOG #2847), as the raw-TCP, X12 and HTTP
+            # listeners already did. A client task cancelled
+            # past its grace, or one the runner ABANDONS when a stop() overruns (wiring_runner's
+            # demotion path leaves the drain running and reuses this same instance at the next
+            # promotion), never runs its `finally` — so a stale count would survive into the
+            # restarted listener, and `release`'s own docstring names what that costs: a per-host
+            # count left behind by a missed release locks that peer out. A straggler that does run
+            # later decrements a missing key, which `release` already treats as a no-op. `active`
+            # keeps its existing behaviour: it is read by the global cap that predates this row,
+            # and resetting it here would be a separate change.
+            self._admission.reset()
         # Now that no client handlers are in flight, this should complete promptly — but on the Windows
         # ProactorEventLoop a still-pending overlapped accept/read can make wait_closed() never return,
         # which (on the suite's single shared session loop) wedges every subsequent test with no output
@@ -2233,53 +2237,6 @@ class MLLPSource(SourceConnector):
         await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
         return owed, nak
 
-    def _log_frame_deadline(self, writer: asyncio.StreamWriter) -> None:
-        """Say which bound dropped the connection (BACKLOG #1725). The `closed` event's reason says
-        `frame_deadline`, but only when connection-event capture is on; this line lands either way,
-        and an operator reading `idle_timeout` for a peer that was never idle would look in the wrong
-        place. Socket metadata only — no frame bytes, which is the whole point of the partial frame
-        this drops.
-
-        Unthrottled, unlike the per-host refusal line in :mod:`~messagefoundry.transports.admission`,
-        and the difference is the rate rather
-        than a difference of opinion. A refused connection is free to the peer, so that path could be
-        driven as fast as it could call ``connect()``. Reaching this one costs a connection held for
-        ``max_frame_seconds``, so the caps already bound it: at the defaults, 32 lines per minute per
-        address. That is the same shape as the existing `frame_oversize` warning beside it, which is
-        also one line per dropped connection."""
-        logger.warning(
-            "MLLP frame from %s did not complete within max_frame_seconds (%.1fs); "
-            "dropping the connection",
-            writer.get_extra_info("peername"),
-            self.max_frame_seconds,
-        )
-
-    def _frame_seconds_left(self, frame_opened_at: float | None) -> float | None:
-        """Seconds left on the open frame's deadline, or ``None`` when no deadline is running.
-
-        ``None`` means "this bound has nothing to say" — either ``max_frame_seconds`` is off or no
-        frame is open. The result may be NEGATIVE, and the sign is the answer: at or below zero the
-        frame has outlived its budget, which is what both callers test. The arithmetic is shared with
-        the raw-TCP and X12 listeners (vault BACKLOG #2606).
-        """
-        return frame_seconds_left(frame_opened_at, self.max_frame_seconds)
-
-    def _read_budget(self, frame_left: float | None) -> float | None:
-        """How long the next read may block: the idle bound, the open frame's remaining life, or the
-        smaller of the two. ``None`` only when neither bound is configured (an unbounded read).
-
-        There is no clamp on the result. ``frame_left`` cannot be negative here — the caller has
-        already broken out of the loop on a spent one — and ``receive_timeout`` is ``None`` rather
-        than falsy when it is off, so neither ordinary input can produce one. An earlier draft
-        carried ``max(0.0, ...)`` and it was dead on those inputs, which is a claim nobody can check.
-
-        ``receive_timeout`` cannot be negative either: ``__init__`` refuses a negative or NaN one at
-        build (BACKLOG #1872). It used to reach this function and close every peer at once as
-        ``idle_timeout``. The guard sits in ``__init__`` rather than as a clamp here, because a clamp
-        would turn a typo into a silent bound.
-        """
-        return _shared_read_budget(self.receive_timeout, frame_left)
-
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         if self._stopping:
@@ -2343,68 +2300,36 @@ class MLLPSource(SourceConnector):
                 pacer = _MessagePacer.for_rate(
                     self.max_messages_per_second, self.message_burst, name=self._pacing_name
                 )
-                # Monotonic stamp of the read that carried the CURRENT frame's first byte, or None
-                # when no frame is open (BACKLOG #1725). A wall clock would let a DST jump either
-                # expire a healthy frame or reprieve a stalled one.
-                frame_opened_at: float | None = None
+                # The frame deadline (BACKLOG #1725), on the clock the raw-TCP and X12 listeners
+                # share (vault BACKLOG #2606). It runs from the first byte of ANY kind after the
+                # last completed frame (vault BACKLOG #2847); DEFAULT_MAX_FRAME_SECONDS says why.
+                clock = FrameClock(
+                    transport="MLLP",
+                    max_frame_seconds=self.max_frame_seconds,
+                    receive_timeout=self.receive_timeout,
+                )
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
+                    # The engine's own waits (pacing, an intake pause) do not spend the frame budget:
+                    # `_MessagePacer` promises it "never drops, never NAKs and never refuses", and a
+                    # pace that spent it could close a connection holding a partial frame.
+                    withheld_from = time.monotonic()
                     if pacer is not None:
-                        paced_from = time.monotonic()
                         await pacer.pace()
-                        if frame_opened_at is not None:
-                            # Deliberate back-pressure is the ENGINE declining to read, not the peer
-                            # being slow, so it must not spend the peer's frame budget. Push the
-                            # frame's start stamp forward by exactly what we withheld.
-                            # `_MessagePacer` promises it "never drops, never NAKs and never
-                            # refuses"; without this line a paced connection with a partial frame
-                            # buffered could be closed BY the pacing, which is that promise broken
-                            # and a partial frame discarded outside the count-and-log boundary.
-                            frame_opened_at += time.monotonic() - paced_from
                     # BACKLOG #290: the engine-wide intake pause, BEFORE the read for the
                     # same reason as the pacer. Every frame already read was handled and ACKed
                     # above, so nothing waits here un-committed; the peer's unread bytes stay its
-                    # own. The withheld time does not spend the peer's frame budget either.
-                    if not intake_open(self.intake_gate):
-                        paused_from = time.monotonic()
-                        if not await wait_for_intake(
-                            self.intake_gate,
-                            stopped=lambda: (
-                                self._stopping or writer.is_closing() or reader.at_eof()
-                            ),
-                        ):
-                            break  # stopping while paused: close as on EOF, nothing was read
-                        if frame_opened_at is not None:
-                            frame_opened_at += time.monotonic() - paused_from
-                    frame_left = self._frame_seconds_left(frame_opened_at)
-                    if frame_left is not None and frame_left <= 0.0:
-                        # The budget went while we were NOT waiting on the socket — bytes arrived at
-                        # or past the deadline, so the read below returned instead of timing out.
-                        # The trickle case is caught by the TimeoutError arm, not here: the read is
-                        # armed with the frame's remaining life whenever that is the smaller bound.
-                        self._log_frame_deadline(writer)
-                        close_reason = "frame_deadline"
+                    # own.
+                    if not await wait_for_intake(
+                        self.intake_gate,
+                        stopped=lambda: self._stopping or writer.is_closing() or reader.at_eof(),
+                    ):
+                        break  # stopping while paused: close as on EOF, nothing was read
+                    clock.withhold(withheld_from)
+                    chunk, bound = await clock.read(reader, writer)
+                    if bound is not None:
+                        close_reason = bound  # past the idle bound or the frame deadline
                         break
-                    read_budget = self._read_budget(frame_left)
-                    # WHICH bound armed the wait, decided here rather than re-measured in the
-                    # handler below. Re-measuring loses at the boundary: when the two budgets are
-                    # close, or wait_for fires a hair early, the frame's remaining life reads as a
-                    # small POSITIVE number and a peer that was never idle is closed as
-                    # `idle_timeout` — the exact misdiagnosis this reason exists to prevent.
-                    armed_by_frame = frame_left is not None and frame_left == read_budget
-                    if read_budget is not None:
-                        try:
-                            chunk = await asyncio.wait_for(reader.read(4096), read_budget)
-                        except TimeoutError:
-                            # One wait_for serves both bounds, so name whichever armed it.
-                            if armed_by_frame:
-                                self._log_frame_deadline(writer)
-                                close_reason = "frame_deadline"
-                            else:
-                                close_reason = "idle_timeout"
-                            break  # past one of the two read bounds — close the connection
-                    else:
-                        chunk = await reader.read(4096)
                     if not chunk:
                         break
                     try:
@@ -2466,23 +2391,10 @@ class MLLPSource(SourceConnector):
                             "framing_error", peer_host=peer_host, reason=safe_exc(exc)
                         )
                         break
-                    # Run the frame clock off the DECODER, after it has consumed this read — it is
-                    # the only thing that knows whether a start byte arrived without its end byte.
-                    # Reached on the success path alone (every arm above breaks), so a connection
-                    # already being dropped never re-stamps.
-                    #
-                    # `decoded` is what makes this PER FRAME rather than per connection, and getting
-                    # it wrong is not a small error. A pipelined sender's reads almost never end on a
-                    # frame boundary, so `in_frame` stays True read after read across DIFFERENT
-                    # frames; stamping only when `frame_opened_at is None` would therefore measure
-                    # every later frame from the FIRST one's start byte and reset a perfectly healthy
-                    # feed once per `max_frame_seconds`, forever. Any frame that was being timed is
-                    # finished once this read completed one, so an open frame after that is a new one
-                    # and its clock starts here.
-                    if not decoder.in_frame:
-                        frame_opened_at = None  # the frame closed, or none was ever open
-                    elif decoded or frame_opened_at is None:
-                        frame_opened_at = time.monotonic()  # this read carried a frame's first byte
+                    # Reached on the success path alone: every arm above breaks or raises.
+                    # `FrameClock.after_read` says why `decoded` makes the clock per frame, and why
+                    # bytes outside a frame start it too (vault BACKLOG #2847).
+                    clock.after_read(in_frame=decoder.in_frame, decoded=decoded)
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
