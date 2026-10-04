@@ -83,12 +83,13 @@ def test_disabled_action_is_not_dispatchable() -> None:
     ],
 )
 def test_launcher_command_starts_a_checkout_through_the_bootstrap(
-    pythonw: str, written: str
+    monkeypatch: pytest.MonkeyPatch, pythonw: str, written: str
 ) -> None:
     """Vault BACKLOG #2822: for a source checkout the login command starts the first tray process
     like the engine's own Python children, so no working directory leads its import path. The flags
     are typed out rather than read from childenv, so the test does not check a list against itself.
     ``-E`` leads them (vault BACKLOG #2852)."""
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     bootstrap = subprocess.list2cmdline([str(Path(_child_bootstrap.__file__).resolve())])
     assert launcher_command(pythonw, installed=False) == (
         f"{written} -E -P -X disable-remote-debug {bootstrap} messagefoundry.tray"
@@ -102,27 +103,29 @@ def test_launcher_command_starts_a_checkout_through_the_bootstrap(
         (r"C:\Program Files\Py\pythonw.exe", r'"C:\Program Files\Py\pythonw.exe"'),
     ],
 )
-def test_launcher_command_starts_an_installed_tray_by_module(pythonw: str, written: str) -> None:
+def test_launcher_command_starts_an_installed_tray_by_module(
+    monkeypatch: pytest.MonkeyPatch, pythonw: str, written: str
+) -> None:
     """Vault BACKLOG #2837: an installed package takes the short form. ``-P`` keeps the working
     directory off a ``-m`` start's import path. Vault BACKLOG #2852: ``-E`` keeps the user's
     ``PYTHON*`` variables from stopping a pythonw start that has no stderr."""
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     assert launcher_command(pythonw, installed=True) == (
         f"{written} -E -P -X disable-remote-debug -m messagefoundry.tray"
     )
 
 
-def test_a_user_who_turned_the_user_site_off_gets_the_bootstrap_form(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("installed", [False, True])
+def test_a_user_who_turned_the_user_site_off_keeps_it_off_at_login(
+    monkeypatch: pytest.MonkeyPatch, installed: bool
 ) -> None:
-    """Vault BACKLOG #2852: ``-E`` ignores ``PYTHONNOUSERSITE``, so the login interpreter would
-    search the user site-packages ahead of site-packages. The bootstrap form loads this build by its
-    location instead."""
-    monkeypatch.setattr(autostart, "installed_in_site_packages", lambda *a, **k: True)
-    bootstrap = subprocess.list2cmdline([str(Path(_child_bootstrap.__file__).resolve())])
+    """Vault BACKLOG #2852: ``-E`` ignores ``PYTHONNOUSERSITE``, so the login command adds ``-s``
+    where it is set, and only there."""
+    pythonw = r"C:\py\pythonw.exe"
     monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
-    assert launcher_command(r"C:\py\pythonw.exe").endswith(" -m messagefoundry.tray")
+    assert launcher_command(pythonw, installed=installed).startswith(f"{pythonw} -E -P ")
     monkeypatch.setenv("PYTHONNOUSERSITE", "1")
-    assert launcher_command(r"C:\py\pythonw.exe").endswith(f" {bootstrap} messagefoundry.tray")
+    assert launcher_command(pythonw, installed=installed).startswith(f"{pythonw} -E -s -P ")
 
 
 def test_installed_means_the_package_sits_in_a_site_packages_folder(
@@ -245,10 +248,11 @@ def _windows_argv(command_line: str) -> list[str]:
 )
 @pytest.mark.parametrize("installed", [False, True])
 def test_windows_reads_the_launcher_command_back_as_the_child_command_line(
-    pythonw: str, installed: bool
+    monkeypatch: pytest.MonkeyPatch, pythonw: str, installed: bool
 ) -> None:
     """Windows splits the Run-key string into exactly the argument list a child gets, with a space
     in a path and without one, in both forms."""
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     child = (
         [pythonw, *CHILD_INTERPRETER_FLAGS, "-m", "messagefoundry.tray"]
         if installed

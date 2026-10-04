@@ -14,8 +14,7 @@ So the command carries :data:`~messagefoundry.childenv.CHILD_INTERPRETER_FLAGS`,
 * Where the package sits directly in a site-packages folder, the short form from
   :func:`~messagefoundry.childenv.python_module_argv`: ``-m messagefoundry.tray``. On a ``-m``
   start, ``-P`` drops the working directory.
-* Anywhere else, editable installs included, and wherever the user set ``PYTHONNOUSERSITE``, the
-  child bootstrap script by its absolute path, from
+* Anywhere else, editable installs included, the child bootstrap script by its absolute path, from
   :func:`~messagefoundry.childenv.python_child_argv`. It loads this build by its location, which a
   ``-m`` start cannot promise for a checkout.
 
@@ -61,9 +60,9 @@ RUN_VALUE_LIMIT = 260
 #: What else ``-E`` does at login. ``PYTHONPATH`` is ignored, so an entry naming another copy no
 #: longer answers a short-form start. ``PYTHONDONTWRITEBYTECODE``, ``PYTHONPYCACHEPREFIX`` and
 #: ``PYTHONHOME`` are ignored as well. An interpreter that needs ``PYTHONHOME`` to find its
-#: standard library would not start. ``PYTHONNOUSERSITE`` is ignored too, which
-#: :func:`_login_turns_user_site_back_on` answers. ``PYTHONUSERBASE`` still counts, because
-#: ``site`` reads it from the environment itself.
+#: standard library would not start. ``PYTHONNOUSERSITE`` is ignored too, so :func:`login_flags`
+#: adds ``-s`` where it is set. ``PYTHONUSERBASE`` still counts, because ``site`` reads it from the
+#: environment itself.
 #:
 #: Not ``-I``. It implies ``-s``, which drops the user site-packages. A ``pip install --user``
 #: tray counts as installed, so its short-form login would stop importing.
@@ -108,24 +107,24 @@ def launcher_command(pythonw: str | None = None, *, installed: bool | None = Non
     """The HKCU Run command string, quoted by ``subprocess.list2cmdline`` the way the Windows
     command-line parser reads it back. ``installed`` defaults to :func:`installed_in_site_packages`
     for the RUNNING interpreter, so pass ``pythonw`` only for that interpreter or with
-    ``installed``. The default is False where :func:`_login_turns_user_site_back_on`. The module
-    docstring describes both forms."""
+    ``installed``. The module docstring describes both forms."""
     exe = pythonw or pythonw_executable()
     if installed is None:
-        installed = installed_in_site_packages() and not _login_turns_user_site_back_on()
+        installed = installed_in_site_packages()
     build = python_module_argv if installed else python_child_argv
-    return subprocess.list2cmdline(
-        build(ENTRY_MODULE, executable=exe, extra_flags=LOGIN_INTERPRETER_FLAGS)
-    )
+    return subprocess.list2cmdline(build(ENTRY_MODULE, executable=exe, extra_flags=login_flags()))
 
 
-def _login_turns_user_site_back_on() -> bool:
-    """Whether ``-E`` would put back a user site-packages folder the user turned off.
+def login_flags() -> tuple[str, ...]:
+    """:data:`LOGIN_INTERPRETER_FLAGS`, plus ``-s`` where this process has ``PYTHONNOUSERSITE``.
 
-    ``PYTHONNOUSERSITE`` turns that folder off, and ``-E`` ignores the variable. The folder is
-    searched ahead of site-packages, so a copy of the package there would answer a short-form
-    start. The bootstrap form loads this build by its location, so the login command takes it."""
-    return bool(os.environ.get("PYTHONNOUSERSITE"))
+    That variable turns the user site-packages off, and ``-E`` ignores it. Turned back on, the
+    folder's ``.pth`` files and ``usercustomize`` would run in the first process. ``-s`` keeps it
+    off, as the variable did. Like the form, this is read when Start at Login is turned on, from
+    this process's environment. A later change to the variable needs a toggle off and on."""
+    if os.environ.get("PYTHONNOUSERSITE"):
+        return (*LOGIN_INTERPRETER_FLAGS, "-s")
+    return LOGIN_INTERPRETER_FLAGS
 
 
 def _windows_length(command: str) -> int:

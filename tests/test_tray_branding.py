@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 import messagefoundry
-from messagefoundry import _child_bootstrap
+from messagefoundry import _child_bootstrap, childenv
 from messagefoundry.tray import autostart, branding
 from tests.test_isolated_launch import _decoy
 
@@ -217,10 +217,12 @@ def _skip_unless_installed(cwd: Path, env: dict[str, str] | None, *flags: str) -
 
 
 def _login_command_without_the_login_flags(executable: str, installed: bool | None) -> str:
-    """The login command as it was before vault BACKLOG #2852 added ``-E``."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(autostart, "LOGIN_INTERPRETER_FLAGS", ())
-        return autostart.launcher_command(executable, installed=installed)
+    """The login command as it was before vault BACKLOG #2852 added ``-E``: the child builders
+    with no options of the login command's own."""
+    if installed is None:
+        installed = autostart.installed_in_site_packages()
+    build = childenv.python_module_argv if installed else childenv.python_child_argv
+    return subprocess.list2cmdline(build("messagefoundry.tray", executable=executable))
 
 
 def _running(command: str, *module_and_args: str) -> str:
@@ -290,7 +292,8 @@ def test_the_login_command_starts_pythonw_with_no_stderr_under_the_users_python_
     if Path(pythonw).name.lower() != "pythonw.exe":
         pytest.skip("no pythonw.exe beside this interpreter")
     cwd = _decoy(tmp_path)
-    env = {k: v for k, v in os.environ.items() if k.upper() not in _NEEDS_A_STDERR}
+    # No other interpreter variable, so the start without -E can fail only on this one.
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PYTHON")}
     env[variable] = "1"
     if installed is True:
         _skip_unless_installed(tmp_path, None, _LOGIN_FLAG)

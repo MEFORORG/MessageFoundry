@@ -221,7 +221,7 @@ def python_child_argv(
     working directory on the child's import path.
 
     ``extra_flags`` go ahead of the shared flags, for one caller's own options. The tray's login
-    command is the one caller that passes any (vault BACKLOG #2852).
+    command passes ``-E`` this way (vault BACKLOG #2852).
     """
     return [executable or sys.executable, *_flags(extra_flags), _BOOTSTRAP, module]
 
@@ -236,7 +236,8 @@ def python_module_argv(
     ``-m`` start, so a source checkout that is not installed cannot be found this way. Nothing
     pins this build either: the first ``messagefoundry`` on the import path answers. The tray's
     login command is the one user. It passes ``-E`` in ``extra_flags``, so an absolute
-    ``PYTHONPATH`` entry naming another copy does not answer there (vault BACKLOG #2852).
+    ``PYTHONPATH`` entry naming another copy does not answer that start (vault BACKLOG #2852). The
+    tray it relaunches still reads the user's ``PYTHONPATH``, less any empty or relative entry.
     """
     return [executable or sys.executable, *_flags(extra_flags), "-m", module]
 

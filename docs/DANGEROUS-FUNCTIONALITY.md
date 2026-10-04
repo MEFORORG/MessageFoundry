@@ -188,8 +188,10 @@ A Run value gives `pythonw.exe` no stderr. Without `-E`, `PYTHONFAULTHANDLER=1` 
 `PYTHONDEVMODE=1` then made it exit 1 before any code ran. Measured 2026-10-04 on Windows, Python
 3.14.6, in both forms, from a start with no standard handles. That is the start a Run value gives;
 a real login was not measured. `-E` also drops `PYTHONHOME`, `PYTHONDONTWRITEBYTECODE` and
-`PYTHONPYCACHEPREFIX` at login. It drops `PYTHONNOUSERSITE` too, so where the user set that, the
-login command takes the script form.
+`PYTHONPYCACHEPREFIX` at login. An interpreter that needs `PYTHONHOME` would not start. `-E` drops
+`PYTHONNOUSERSITE` too, so where the user set that, the login command adds `-s`. That keeps the
+user site-packages off, as the variable did. Both choices are made when Start at Login is turned
+on, from the tray's own environment. After changing either variable, turn it off and on again.
 
 - An installed engine gets `-m messagefoundry.tray`. Installed means the package sits directly in
   a site-packages folder. On a `-m` start, `-P` keeps the working directory off the import path.
@@ -205,7 +207,8 @@ login command takes the script form.
 Microsoft documents a Run value as a command line of at most 260 characters. The code counts UTF-16
 code units, as Windows stores the value. The installed form fits a venv folder of up to 185
 characters. The script form names the checkout folder twice. With the venv inside the checkout, it
-passes 260 once that folder reaches about 73 characters. When the command is
+passes 260 once that folder reaches about 73 characters. Where the command adds `-s`, those two
+figures are 182 and about 71. When the command is
 longer than 260, enabling does not write it. It logs a warning naming the length and the limit to
 `tray.log`, removes any value already there, and leaves Start at Login off. It never falls back to a
 command without the options. What Windows does at login with a longer value was not measured.
@@ -287,7 +290,8 @@ environment, less any empty or relative `PYTHONPATH` entry. Autostart starts the
 process with the same interpreter options plus `-E`, under the plain `pythonw.exe`. It goes through
 the script only from a checkout. Windows hands that process the user's environment unfiltered.
 `-E` makes the interpreter ignore its `PYTHON*` variables, so no `PYTHONPATH` entry reaches that
-process's import path (vault BACKLOG #2852). A tray started by hand gets none of the options. Section 3, under
+process's import path (vault BACKLOG #2852). The relaunch it starts does read the user's
+`PYTHONPATH`, as above. A tray started by hand gets none of the options. Section 3, under
 *Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The other
 starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
