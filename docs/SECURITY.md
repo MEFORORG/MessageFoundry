@@ -115,9 +115,11 @@ flowchart TB
 Four more facts:
 
 - Egress is closed by default. Under the default posture `serve` refuses to start until the
-  operator says where the engine may send. That means at least one `[egress].allowed_*` list, or
-  `[security].block_unlisted_outbound = true`. With that setting left unset, `serve` turns it on.
-  A transport whose list is empty then refuses every destination of its type.
+  operator says where the engine may send. That means at least one `[egress]` destination list
+  the startup gate counts, or `[security].block_unlisted_outbound = true`.
+  [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) says which lists count. That setting is on
+  unless it is written false, for every entry point and not only `serve` (vault BACKLOG #2605). A
+  transport whose list is empty refuses every destination of its type.
 - Full message bodies belong in the message store, not in the general log. Treat the log files and
   the off-box copy as sensitive all the same.
   [PHI.md section 7](PHI.md#7-logging--phi-redaction) covers redaction and the logging rules.
@@ -172,10 +174,13 @@ the route takes a body.
 
 - `create_app` sets the class on the app's router. Each route registered on the app gets the
   check with nothing to remember, and no list of routes is kept.
-- Some route shapes are not covered, and the engine has none of them. The class docstring is the
-  one list. It names at least a route added through `include_router`, a gate nested inside
-  another dependency, and an unmarked dependency ahead of a gate. An embedder who adds routes in
-  one of those ways must check them.
+- Some route shapes are not covered. The class docstring is the one list. It names at least a
+  route added through `include_router`, a gate nested inside another dependency, and an unmarked
+  dependency ahead of a gate. The engine adds no route through `include_router`, and every gated
+  engine HTTP route keeps its gate at the top level. The third shape is present. Every route carries
+  `refuse_undeclared_route`, described below, which never refuses a route that has a gate. Some
+  routes carry others, such as `_no_store_reply` in `messagefoundry/api/auth_routes.py`. An
+  embedder who adds routes in one of those ways must check them.
 - The gate itself does not change. After the body is read it runs in full, as before: sign-in
   again, then the password and factor checks, the permission check and its audit rows, pacing and
   step-up. So a signed-in caller that the gate then refuses still gets the parser's answer first
@@ -184,13 +189,44 @@ the route takes a body.
   arriving is refused by the gate. The price is one more identity lookup for a signed-in
   request to a route with a body. That lookup reads the session, its user and the user's roles.
   It writes nothing, so it does not move the session's idle clock.
-- A route with no gate is not touched. `POST /auth/login` has to parse a body from a caller with
-  no session. A gated route that declares no body is not touched either, because FastAPI already
+- A route with no gate that is declared public is not touched. `POST /auth/login` has to parse a
+  body from a caller with no session. A route with no gate and no declaration is refused before
+  its body is read, as described below. A gated route that declares no body is not touched either, because FastAPI already
   runs its gate first. That includes the web console's `/ui` routes, which read their forms
   inside the handler.
 
 `tests/test_auth_before_body.py` tests the mechanism. `tests/test_preauth_malformed_body.py` pins
 what an unauthenticated caller gets on every operation that takes a body.
+
+**A route that does not declare how it is authorized is refused (vault BACKLOG #2604).**
+`create_app` adds one app-level dependency, `refuse_undeclared_route`
+(`messagefoundry/api/security.py`). It applies to every FastAPI route registered on the app, web
+console routes included, and runs first among each route's dependencies. On a gated route that takes a
+body, the early sign-in check above still answers before it. A route passes in one of two ways:
+
+- It has a top-level gate dependency. Every `require*()` factory, and each of the web console's
+  `require_ui*()` factories, marks its gate with `mark_route_gate`. The check reads that mark,
+  never a function's name.
+- Its endpoint carries a declaration with a reason. `public_route` marks a route that no gate
+  dependency guards by design, such as sign-in. Some web console routes of this kind still read a
+  pending session inside the handler, such as `/ui/mfa`. `authorizes_in_body` marks a WebSocket
+  that authorizes the caller inside its own body, and `/ws/stats` is the engine route that uses it.
+  On an HTTP route with no gate, that mark does not count, so the route is refused.
+
+Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
+before it is accepted. The first refusal on a route is logged at ERROR, because such a route is a
+defect in the code that registered it. On a body-taking route built by the app's route class, the
+refusal comes before the body is read. The check asks only that a route declared a gate. It does not check that
+the gate is correct.
+
+- A route whose gate is nested inside another dependency, or added only by `include_router`, is
+  refused. That is the safe side.
+- At least two kinds of route sit outside the check, because they carry no dependencies. One is a
+  route inside a mounted application; `/ui/static` is the only mount. The other is a plain
+  Starlette route; the interactive docs and the schema that `expose_docs` turns on are the only ones.
+
+The route walk in `scripts/security/route_gates.py` reads the same mark. `tests/test_route_deny_default.py`
+checks that every shipped route declares itself and still answers an anonymous caller as before.
 
 **The proxy-to-engine hop is yours to secure, and `serve` makes you say so (BACKLOG #1179).** With
 `tls_terminated_upstream`, the proxy terminates TLS and the engine mints no certificate
@@ -1004,7 +1040,9 @@ not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
 
-These are the routes the requirement equally demands be defined.
+These are the routes the requirement equally demands be defined. Each endpoint carries a
+`public_route` declaration with its reason; without one the engine would refuse it, as
+[Enforcement model](#enforcement-model) says.
 
 | Method | Path | Why | Compensating control |
 |---|---|---|---|
@@ -3883,7 +3921,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`, so the message retries and then dead-letters like any other reply the engine could not read; a `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its interstitial is skipped, and the step-up start `POST /ui/reauth/oidc` (`begin_oidc_step_up`) — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited` on the sign-in start; 429 re-rendering the step-up page, no `Retry-After`, on `POST /ui/reauth/oidc`; WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one. The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP listener** — `max_connections_per_host` (32), BACKLOG #1725 — and it is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The raw-TCP, X12, HTTP and DICOM intakes carry no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP listener's `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s, one frame start-byte to end-byte; `receive_timeout` resets on every byte received and so bounds only silence), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist` |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one. The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP, raw-TCP and X12 listeners** — `max_connections_per_host` (32). BACKLOG #1725 added it to MLLP, and vault BACKLOG #2606 to the other two. It is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The HTTP listener takes the same key but **ships it off**. Behind a reverse proxy every partner arrives from one address, so a cap there would be the listener's whole capacity. The DICOM intake carries no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP, raw-TCP and X12 listeners' `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist`. On the MLLP, raw-TCP and X12 listeners `receive_timeout` resets on every byte received, so it bounds only silence; `max_frame_seconds` bounds the frame. On MLLP that deadline runs from a start byte to its end byte. On raw TCP and X12 it starts on any bytes, inside a frame or not, and an X12 frame is one interchange from `ISA` to `IEA`. |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is
