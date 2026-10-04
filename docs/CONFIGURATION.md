@@ -1216,13 +1216,14 @@ of its resume line. This clears a pause that an earlier run left open when it st
 measured between its resume line and its limit reports nothing until it leaves that band, because
 another node on the same store may still be paused there.
 
-**`config_changed` says a start loaded different config bytes than the store last recorded** (vault
+**`config_changed` says a start loaded different config bytes than the store's baseline** (vault
 BACKLOG #2597). At each start the engine compares its config fingerprint (ADR 0041 D1) with the
-newest `config_loaded`, `config_reload` or `connection_flag_set` audit row. That row may come from
-any node or engine shard, because they all share one config directory. A start that sees a change
-raises `config_changed` once, and its `config_loaded` row records `previous_fingerprint` and
-`changed`. Starts that race, such as engine shards started together, can each raise it; the alert
-list folds them into one instance.
+newest usable `config_loaded`, `config_reload` or `connection_flag_set` audit row. That row may come
+from any node or engine shard, because they all share one config directory. A start that sees a
+change raises `config_changed` once. Its `config_loaded` row records the outcome as `comparison`
+(`compared`, `no_start_digest`, `no_baseline`, `degraded_baseline`, `scheme_mismatch` or
+`read_failed`), plus `previous_fingerprint` and `changed`. Starts that race, such as engine shards
+started together, can each raise it; the alert list folds them into one instance.
 
 - A change applied with `POST /config/reload` and then restarted does not alert. A change that only
   a restart picked up does, by design: nothing else tells that deploy apart from an unrecorded edit.
@@ -1231,9 +1232,15 @@ list folds them into one instance.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
-  WARNING, and the start goes on. Its row records `comparison = "read_failed"`, and later starts
-  pass over that row, so they still compare against the last checked baseline. They also pass
-  over a row that is not JSON. Every row records its `comparison` outcome.
+  WARNING, and the start goes on.
+- A start that never checked its config, because its read failed or it took no fingerprint,
+  marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
+  later start passes over those rows, and over any row whose detail is not a JSON object (at
+  WARNING), and compares against the newest usable row before them. So the change the unchecked
+  start could not see is reported by the next start that can read. A config reload is not marked:
+  applying the directory by reload vouches for it.
+- The pass-over looks through the newest 50 config rows at most. If none is usable, the start
+  begins a new baseline and says at WARNING that a change made before those rows is not reported.
 
 Its `connection` is `config:` plus the first 12 hex characters of the new fingerprint, so each
 distinct config is its own alert. Nothing resolves it; an operator does. A rule cannot attach a

@@ -213,21 +213,27 @@ async def test_a_fresh_store_raises_no_alert(
 
 
 async def test_a_degraded_baseline_raises_no_alert(
-    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
 ) -> None:
-    def _unreadable(_path: Path) -> dict[str, object]:
-        raise OSError("unreadable bundle")
-
-    with monkeypatch.context() as m:
-        m.setattr(fp_mod, "config_fingerprint_detail", _unreadable)
-        first = await _start(tmp_path, cfg)
-    assert "fingerprint" not in first[0], "control: the first start's row has no digest"
+    """A reload whose digest failed writes a row with none. A start without a digest of its own is
+    a different case: it is passed over (see the no-digest test below)."""
+    await _start(tmp_path, cfg)
+    store = await MessageStore.open(tmp_path / "start.db")
+    try:
+        await store.record_audit(
+            "config_reload",
+            actor="alice",
+            detail='{"degraded": true, "failed_steps": ["config_fingerprint"]}',
+        )
+    finally:
+        await store.close()
     _edit(cfg)
     rows = await _start(tmp_path, cfg)
     assert alerts == []
     assert rows[-1]["changed"] is None and rows[-1]["previous_fingerprint"] is None
     # A usable row for the next start, not one it passes over: see the scheme test below.
     assert rows[-1]["comparison"] == "degraded_baseline"
+    assert "baseline_unchecked" not in rows[-1]
 
 
 @pytest.mark.parametrize("scheme", ["mefor-cfg-fp:v0", None], ids=["other-scheme", "no-scheme"])
@@ -322,6 +328,7 @@ async def test_a_restart_after_a_failed_read_still_alerts_against_the_older_base
         m.setattr(MessageStore, "recent_audit_of", _failing_read(kind))
         failed = await _start(tmp_path, cfg)
     assert failed[-1]["comparison"] == "read_failed"
+    assert failed[-1]["baseline_unchecked"] is True
     assert alerts == [], "control: the failed read raised nothing"
     rows = await _start(tmp_path, cfg)  # the SAME changed bytes, with a working read
     assert len(alerts) == 1
@@ -330,14 +337,64 @@ async def test_a_restart_after_a_failed_read_still_alerts_against_the_older_base
     assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is True
 
 
-async def test_an_undecodable_newest_row_is_passed_over_for_an_older_one(
-    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+async def test_a_start_that_took_no_digest_is_passed_over_too(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Review round 3: a start with no digest of its own checked nothing either. Stopping at its
+    digest-less row would read as a degraded baseline and adopt the change unreported."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    _edit(cfg)
+
+    def _unreadable(_path: Path) -> dict[str, object]:
+        raise OSError("unreadable bundle")
+
+    with monkeypatch.context() as m:
+        m.setattr(fp_mod, "config_fingerprint_detail", _unreadable)
+        failed = await _start(tmp_path, cfg)
+    assert failed[-1]["comparison"] == "no_start_digest"
+    assert failed[-1]["baseline_unchecked"] is True
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
+    assert rows[-1]["comparison"] == "compared"
+
+
+async def test_a_flag_toggle_in_an_unchecked_process_vouches_for_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Review round 3: the toggle would vouch for the digest the unchecked start loaded, and the
+    next start would take the toggle's row as its baseline. The process marks it unchecked."""
+    cfg = _toml_config(tmp_path)
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    with (cfg / "logic.py").open("a", encoding="utf-8") as fh:
+        fh.write("# an edit nobody reloaded\n")
+    with monkeypatch.context() as m:
+        m.setattr(MessageStore, "recent_audit_of", _failing_read("raises"))
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app), _client(app) as c:
+            r = await c.post(
+                "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}
+            )
+            assert r.status_code == 200, r.text
+            engine: Engine = app.state.engine
+            flag_rows = await engine.store.list_audit(action="connection_flag_set")
+    assert json.loads(flag_rows[0]["detail"])["baseline_unchecked"] is True
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1
+    assert alerts[0]["previous_fingerprint"] == before
+    assert rows[-1]["comparison"] == "compared"
+
+
+@pytest.mark.parametrize("detail", ["{not json", "null", "[1]"], ids=["not-json", "null", "list"])
+async def test_a_row_that_is_not_a_json_object_is_passed_over_for_an_older_one(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]], detail: str
 ) -> None:
     before = config_fingerprint(cfg)
     await _start(tmp_path, cfg)
     store = await MessageStore.open(tmp_path / "start.db")
     try:
-        await store.record_audit("config_reload", actor="mallory", detail="{not json")
+        await store.record_audit("config_reload", actor="mallory", detail=detail)
     finally:
         await store.close()
     _edit(cfg)
@@ -346,6 +403,39 @@ async def test_an_undecodable_newest_row_is_passed_over_for_an_older_one(
     assert alerts[0]["previous_fingerprint"] == before
     assert alerts[0]["baseline_action"] == "config_loaded"
     assert rows[-1]["comparison"] == "compared"
+
+
+async def test_a_full_window_of_unusable_rows_begins_a_new_baseline(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    await _start(tmp_path, cfg)
+    store = await MessageStore.open(tmp_path / "start.db")
+    try:
+        for _ in range(2):
+            await store.record_audit(
+                "config_loaded", actor="system", detail='{"baseline_unchecked": true}'
+            )
+    finally:
+        await store.close()
+    _edit(cfg)
+    monkeypatch.setattr(app_module, "_CONFIG_BASELINE_WINDOW", 2)
+    rows = await _start(tmp_path, cfg)
+    assert alerts == []
+    assert rows[-1]["comparison"] == "no_baseline"
+    assert "baseline_unchecked" not in rows[-1], "a new baseline is a usable row"
+    # Control: with room to look past the two rows, the same store reaches the checked one.
+    monkeypatch.setattr(app_module, "_CONFIG_BASELINE_WINDOW", 50)
+    store = await MessageStore.open(tmp_path / "start.db")
+    try:
+        for _ in range(2):
+            await store.record_audit(
+                "config_loaded", actor="system", detail='{"baseline_unchecked": true}'
+            )
+    finally:
+        await store.close()
+    _edit(cfg)
+    await _start(tmp_path, cfg)
+    assert len(alerts) == 1
 
 
 async def test_a_start_row_records_its_comparison_outcome(
@@ -614,7 +704,7 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
     (event,) = transport.events
     assert event["type"] == "config_changed" and event["connection"] == "config:aaaaaaaaaaaa"
     assert event["detail"] == (
-        "this process started with config aaaaaaaaaaaa; the store last recorded config "
+        "this process started with config aaaaaaaaaaaa; the store's baseline is config "
         "bbbbbbbbbbbb (node host:2:y, action config_reload, time 2026-10-04T00:00:00+00:00)"
     )
     assert (event["fingerprint"], event["previous_fingerprint"]) == ("a" * 64, "b" * 64)

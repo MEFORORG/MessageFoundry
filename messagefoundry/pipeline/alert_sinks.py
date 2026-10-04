@@ -1147,7 +1147,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         baseline_at: str,
         baseline_node: str | None,
     ) -> None:
-        # vault BACKLOG #2597: the start's config differs from the store's last recorded one. The
+        # vault BACKLOG #2597: the start's config differs from the store's baseline. The
         # subject (`config:<12 hex>`) stands in for "connection", so each distinct config is its own
         # instance; nothing auto-resolves it. Digests, node and shard labels, an action name, a
         # username and a time only: never the config dir, a git commit or message content.

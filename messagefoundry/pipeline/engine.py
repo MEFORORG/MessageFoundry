@@ -553,6 +553,10 @@ class Engine:
         # fingerprinting failed. Read by GET /config/provenance to report the running commit
         # and detect on-disk DRIFT. Holds only a one-way hash + a commit sha — never resolved env values.
         self.loaded_config_fingerprint: dict[str, object] | None = None
+        # vault BACKLOG #2597: True when this process's start never checked its config against the
+        # store's baseline (the read failed, or the start took no digest). Every config row it writes
+        # is then marked, so a later start passes over it to the last checked baseline.
+        self.config_baseline_unchecked = False
 
     @classmethod
     async def create(

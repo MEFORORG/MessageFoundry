@@ -1104,15 +1104,29 @@ _CONFIG_BASELINE_ACTIONS: tuple[str, ...] = (
 _CONFIG_BASELINE_TIMEOUT_SECONDS = 5.0
 
 #: How many of the newest baseline rows the start looks through for one it can use. Past this many
-#: unusable rows it takes the newest as gone and starts a new baseline, so a run of failed reads can
-#: never leave every later start with nothing to compare against.
+#: unusable rows it starts a new baseline and says so at WARNING: a change made before that run of
+#: rows then goes unreported, but a longer run can never leave every later start with nothing to
+#: compare against.
 _CONFIG_BASELINE_WINDOW = 50
 
-#: The ``comparison`` value a start's ``config_loaded`` row records when its baseline read failed,
-#: timed out or was cancelled. The next start passes over such a row: its digest was never checked,
-#: so taking it as the baseline would hide the change this start could not see (vault BACKLOG
-#: #2597). Every other outcome leaves the row usable as a baseline.
-_COMPARISON_READ_FAILED = "read_failed"
+#: The detail key that marks a config row whose digest this process never checked against the
+#: store's baseline (vault BACKLOG #2597): a start whose baseline read failed or that took no digest,
+#: and any flag toggle that process writes. A later start passes over such a row to the last checked
+#: one, so the change the unchecked start could not see is still reported.
+_BASELINE_UNCHECKED = "baseline_unchecked"
+
+#: What a start's ``config_loaded`` row records as ``comparison``.
+type _StartOutcome = Literal[
+    "compared",
+    "no_start_digest",
+    "no_baseline",
+    "degraded_baseline",
+    "scheme_mismatch",
+    "read_failed",
+]
+
+#: The outcomes that leave this start unchecked; see :data:`_BASELINE_UNCHECKED`.
+_UNCHECKED_OUTCOMES: frozenset[str] = frozenset({"read_failed", "no_start_digest"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -1170,31 +1184,28 @@ async def _bounded[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
 
 async def _compare_start_config(
     engine: Engine, snapshot: Mapping[str, object] | None
-) -> tuple[str, _StartConfigComparison | None]:
+) -> tuple[_StartOutcome, _StartConfigComparison | None]:
     """Compare the start's config ``snapshot`` with the store's baseline (vault BACKLOG #2597), and
     return the outcome the start's ``config_loaded`` row records as ``comparison``, with the
     comparison itself when one was made.
 
     Keyed on the store, not on a node: every engine shard and cluster node shares one config
     directory by contract, and a node id changes on every restart. The baseline is the newest
-    ``config_loaded``, ``config_reload`` or ``connection_flag_set`` row the start can use. It passes
-    over a row that is not JSON and a start row marked :data:`_COMPARISON_READ_FAILED`, and falls
-    back to the next older one.
+    ``config_loaded``, ``config_reload`` or ``connection_flag_set`` row the start can use: it passes
+    over a row whose detail is not a JSON object (at WARNING, since only the engine writes these
+    rows) and a row marked :data:`_BASELINE_UNCHECKED`, and falls back to the next older one.
 
     The caller passes the digest :meth:`Engine.capture_start_provenance` took, not a later read of
     :attr:`Engine.loaded_config_fingerprint`, so a reload that lands before the row is written
     cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
     since ``git_head``, ``dir`` and ``node`` differ between nodes running the same bytes.
 
-    Outcomes: ``compared``; ``no_start_digest``; ``no_baseline`` (a fresh store, or no usable row in
-    the window); ``degraded_baseline`` (the baseline has no digest); ``scheme_mismatch``; and
-    ``read_failed``. Only ``compared`` carries a comparison. Only ``read_failed`` makes the row one a
-    later start passes over: a fresh store, a degraded baseline or a new scheme each starts a new
-    baseline, since passing over those rows would leave every later start in the same place.
-
-    It never raises, except on cancellation: the read is bounded by
-    :data:`_CONFIG_BASELINE_TIMEOUT_SECONDS`, and a failed read is logged at WARNING and costs only
-    the comparison."""
+    Only ``compared`` carries a comparison. ``read_failed`` and ``no_start_digest`` leave the start
+    unchecked (:data:`_UNCHECKED_OUTCOMES`). A fresh store, a degraded baseline or a new scheme each
+    starts a new baseline, since passing over those rows would leave every later start in the same
+    place. It never raises, except on cancellation: the read is bounded by
+    :data:`_CONFIG_BASELINE_TIMEOUT_SECONDS`, and any failure, in the read or in a row it returns,
+    is logged at WARNING and costs only the comparison."""
     current = snapshot.get("fingerprint") if snapshot is not None else None
     if snapshot is None or not isinstance(current, str) or not current:
         _log.info("config change check skipped: this start has no config fingerprint")
@@ -1205,63 +1216,61 @@ async def _compare_start_config(
             engine.store.recent_audit_of(_CONFIG_BASELINE_ACTIONS, limit=_CONFIG_BASELINE_WINDOW),
             _CONFIG_BASELINE_TIMEOUT_SECONDS,
         )
+        for row in rows:
+            detail, refusal = json_loads_or_refusal(row.get("detail") or "null")
+            if refusal is not None or not isinstance(detail, dict):
+                _log.warning(
+                    "config change check: passing over a %s row whose detail is not a JSON "
+                    "object (%s); only the engine writes these rows",
+                    row.get("action"),
+                    refusal or "not an object",
+                )
+                continue
+            if detail.get(_BASELINE_UNCHECKED) is True:
+                continue  # its digest was never checked; see _BASELINE_UNCHECKED
+            break
+        else:
+            if rows:
+                _log.warning(
+                    "config change check: none of the newest %d config rows is usable, so this "
+                    "start begins a new baseline; a change made before them is not reported",
+                    len(rows),
+                )
+            else:
+                _log.info("config change check: no earlier config row; this start is the baseline")
+            return "no_baseline", None
+        previous = detail.get("fingerprint")
+        if not isinstance(previous, str) or not previous:
+            _log.info(
+                "config change check skipped: the store's newest usable %s row has no fingerprint",
+                row.get("action"),
+            )
+            return "degraded_baseline", None
+        if scheme is None or detail.get("scheme") != scheme:
+            _log.info(
+                "config change check skipped: the store's newest usable %s row used fingerprint "
+                "scheme %r and this start uses %r, so the two digests are not comparable",
+                row.get("action"),
+                detail.get("scheme"),
+                scheme,
+            )
+            return "scheme_mismatch", None
+        node = detail.get("node")
+        actor = row.get("actor")
+        return "compared", _StartConfigComparison(
+            fingerprint=current,
+            previous_fingerprint=previous,
+            baseline_action=str(row.get("action")),
+            baseline_actor=actor if isinstance(actor, str) else None,
+            baseline_at=_iso_utc(row.get("ts")),
+            baseline_node=node if isinstance(node, str) else None,
+        )
     except Exception as exc:  # noqa: BLE001 - alert-only (step 5): no failure here may stop a start
         _log.warning(
             "config change check skipped: the store's config baseline could not be read: %s",
             safe_exc(exc),
         )
-        return _COMPARISON_READ_FAILED, None
-    for row in rows:
-        detail, refusal = json_loads_or_refusal(row.get("detail") or "null")
-        if refusal is not None or not isinstance(detail, dict):
-            _log.info(
-                "config change check: passing over a %s row that is not a JSON object (%s)",
-                row.get("action"),
-                refusal or "not an object",
-            )
-            continue
-        if (
-            row.get("action") == "config_loaded"
-            and detail.get("comparison") == _COMPARISON_READ_FAILED
-        ):
-            continue  # that start never checked its digest; see _COMPARISON_READ_FAILED
-        break
-    else:
-        if rows:
-            _log.warning(
-                "config change check: none of the newest %d config rows is usable, so this start "
-                "begins a new baseline",
-                len(rows),
-            )
-        else:
-            _log.info("config change check: no earlier config row; this start is the baseline")
-        return "no_baseline", None
-    previous = detail.get("fingerprint")
-    if not isinstance(previous, str) or not previous:
-        _log.info(
-            "config change check skipped: the store's newest usable %s row has no fingerprint",
-            row.get("action"),
-        )
-        return "degraded_baseline", None
-    if scheme is None or detail.get("scheme") != scheme:
-        _log.info(
-            "config change check skipped: the store's newest usable %s row used fingerprint "
-            "scheme %r and this start uses %r, so the two digests are not comparable",
-            row.get("action"),
-            detail.get("scheme"),
-            scheme,
-        )
-        return "scheme_mismatch", None
-    node = detail.get("node")
-    actor = row.get("actor")
-    return "compared", _StartConfigComparison(
-        fingerprint=current,
-        previous_fingerprint=previous,
-        baseline_action=str(row.get("action")),
-        baseline_actor=actor if isinstance(actor, str) else None,
-        baseline_at=_iso_utc(row.get("ts")),
-        baseline_node=node if isinstance(node, str) else None,
-    )
+        return "read_failed", None
 
 
 def _raise_config_changed(
@@ -1291,7 +1300,7 @@ async def _record_start_audit(
     engine: Engine,
     *,
     fingerprint_failed: bool = False,
-    outcome: str | None = None,
+    outcome: _StartOutcome | None = None,
     comparison: _StartConfigComparison | None = None,
 ) -> None:
     """Write the start's ``config_loaded`` row through :func:`_record_reload_audit` (vault BACKLOG
@@ -1327,6 +1336,7 @@ async def _record_start_audit(
         extra={
             "loosenings": switches,
             "comparison": outcome,
+            **({_BASELINE_UNCHECKED: True} if outcome in _UNCHECKED_OUTCOMES else {}),
             "previous_fingerprint": comparison.previous_fingerprint if comparison else None,
             "changed": comparison.changed if comparison else None,
         },
@@ -3262,6 +3272,8 @@ def create_app(
                     "flagged": req.flagged,
                     "node": engine.coordinator.node_id,
                     **(fingerprint or {}),
+                    # A process whose start never checked its config cannot vouch for it.
+                    **({_BASELINE_UNCHECKED: True} if engine.config_baseline_unchecked else {}),
                 }
             ),
             client=client_ip(request),
@@ -8368,7 +8380,7 @@ def create_managed_app(
         )
         # Bound before the branch so no later read can meet an unbound name (the #1257 lesson below).
         start_fingerprint_failure: str | None = None
-        start_outcome: str | None = None
+        start_outcome: _StartOutcome | None = None
         start_config: _StartConfigComparison | None = None
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
@@ -8401,6 +8413,8 @@ def create_managed_app(
                 start_outcome, start_config = await _compare_start_config(
                     engine, engine.loaded_config_fingerprint
                 )
+                # This process cannot vouch for a config it never checked: its flag rows say so.
+                engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
                 # still page on every attempt of a crash loop. Never raises.
                 if start_config is not None and start_config.changed:

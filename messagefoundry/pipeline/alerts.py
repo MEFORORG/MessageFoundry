@@ -67,7 +67,7 @@ def config_changed_detail(
     so it states the two digests and where the older one came from and judges neither. Digests are
     cut to 12 hex characters here; the event carries them whole. No path and no git commit."""
     return (
-        f"this process started with config {fingerprint[:12]}; the store last recorded config "
+        f"this process started with config {fingerprint[:12]}; the store's baseline is config "
         f"{previous_fingerprint[:12]} (node {baseline_node or 'unknown'}, action "
         f"{baseline_action}, time {baseline_at or 'unknown'})"
     )
@@ -446,10 +446,11 @@ class AlertSink(Protocol):
         baseline_at: str,
         baseline_node: str | None,
     ) -> None:
-        """This process started with a config whose ADR 0041 D1 fingerprint differs from the one the
-        store last recorded (vault BACKLOG #2597). The baseline is the newest ``config_loaded``,
+        """This process started with a config whose ADR 0041 D1 fingerprint differs from the store's
+        baseline (vault BACKLOG #2597). The baseline is the newest usable ``config_loaded``,
         ``config_reload`` or ``connection_flag_set`` audit row from any node or engine shard, since
-        every one of them shares one config directory. So an edit applied first by ``POST
+        every one of them shares one config directory; a row whose digest its process never checked
+        is passed over, so the baseline can be older than the newest row. So an edit applied first by ``POST
         /config/reload`` and then restarted does not fire it, and an edit that only a restart picked
         up does, by design: nothing else separates that deploy from an unrecorded edit.
 
